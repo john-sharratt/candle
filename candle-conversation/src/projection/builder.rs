@@ -40,17 +40,16 @@
 
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
-use super::project::FIXED_FORMULA;
+use super::policy::SelectionPolicy;
 use super::project::{
-    run, run_with_sink, Projection, ProjectionMode, ProjectionTarget, SelectionState,
+    run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
 };
 use super::schema::{
-    Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
-    Schema, ScoreFormula, SectionCollection, SectionSchema, SelectionRule, SummaryMode,
-    SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
+    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
+    Schema, SectionCollection, SectionSchema, SelectionRule, SummaryMode, SystemPromptItem,
+    SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
-use crate::provenance::DEFAULT_SPAN_ALPHA;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::SelectionDiagnostics;
 
@@ -205,6 +204,11 @@ fn validate_selection(name: &str, rule: &SelectionRule) -> Result<(), Constructi
             historical_top_k,
         } if *recent == 0 && *historical_top_k == 0 => {
             Err(ConstructionError::InvalidConversationK {
+                name: name.to_string(),
+            })
+        }
+        SelectionRule::Named { selector } if selector.trim().is_empty() => {
+            Err(ConstructionError::EmptyNamedSelector {
                 name: name.to_string(),
             })
         }
@@ -587,20 +591,6 @@ impl Builder {
         }
     }
 
-    /// The span α used by [`super::project::FIXED_FORMULA`].
-    ///
-    /// The BDP scanner in the reprojection path must use the same alpha so
-    /// scores accumulated during live decode are consistent with the scores
-    /// the projection engine reads at group-scoring time (step 5 of the
-    /// pipeline).  Returns `DEFAULT_SPAN_ALPHA` for non-Span formulas as a
-    /// safe fallback.
-    pub fn span_alpha(&self) -> f32 {
-        match FIXED_FORMULA {
-            ScoreFormula::Span { alpha } => alpha,
-            _ => DEFAULT_SPAN_ALPHA,
-        }
-    }
-
     // ── Runtime mutators ─────────────────────────────────────────────────────
     //
     // These mutate the schema after YAML parse, before the first
@@ -689,6 +679,23 @@ impl Builder {
             });
         }
         let new_id = CollectionId::new(self.next_collection_id_raw());
+        // Derive the belief policy from a `top_k` rule (budget max = k,
+        // min/evict = threshold) so a runtime-added collection selects like the
+        // old top_k; other rules keep the default policy.
+        let policy = match &selection {
+            SelectionRule::TopK { k } => {
+                let mut config = SelectionPolicy::default_policy().config;
+                config.min_score = score_threshold;
+                config.evict_score = score_threshold;
+                config.budget_min = 0;
+                config.budget_max = *k;
+                SelectionPolicy {
+                    config,
+                    tags: Vec::new(),
+                }
+            }
+            _ => SelectionPolicy::default_policy(),
+        };
         self.schema.layers[layer_idx]
             .system_prompt
             .items
@@ -698,13 +705,14 @@ impl Builder {
                 sections: Vec::new(),
                 selection,
                 score_threshold,
-                depth_weights: None,
+                policy,
                 // Runtime-added collections carry a placeholder summary; no
                 // compression path reads a group summary.
                 summary: GroupSummary::default(),
                 summary_section: None,
                 member_glue: String::new(),
                 member_glue_tokens: None,
+                default: None,
             }));
         self.name_maps
             .collection_names
@@ -1025,9 +1033,20 @@ impl Builder {
         resolver: &R,
         mode: ProjectionMode,
         selection: &SelectionState,
+        prior: &PriorBelief,
+        decode_pos: Option<usize>,
         sink: &mut dyn FnMut(SelectionDiagnostics),
     ) -> Projection {
-        run_with_sink(&self.schema, target, resolver, mode, selection, sink)
+        run_with_sink(
+            &self.schema,
+            target,
+            resolver,
+            mode,
+            selection,
+            prior,
+            decode_pos,
+            sink,
+        )
     }
 
     /// Token-window budget configured for `layer`.  Used by the
@@ -1077,6 +1096,34 @@ impl Builder {
             LayerId::reserved(kind),
             GroupId::reserved(kind),
             SectionId::reserved(kind),
+        )
+    }
+
+    /// Like [`Self::for_plain_prompt_reserved`], but bases the synthetic schema's
+    /// **section** ids at `section_base` instead of the single reserved-slot id.
+    /// The layer and group still occupy the reserved slot — the conversation's
+    /// turns never enter a user projection — but the frame plus any sections later
+    /// added via [`Self::add_collection`] / [`Self::add_section_to_collection`]
+    /// allocate upward from `section_base`, occupying a dedicated id partition.
+    ///
+    /// This is for engine-internal conversations that hold a whole *corpus* of
+    /// sections (more than the one-per-kind the [`Reserved`] band at the top of
+    /// u32 allows). The partition keeps every section id clear of the user
+    /// schema's low `1..n` ids, the tool ids allocated above them, and the
+    /// reserved band — however much the user schema grows — since the substrate
+    /// keys section state globally by id.
+    ///
+    /// [`Reserved`]: super::Reserved
+    pub fn for_reserved_corpus(
+        system_prompt_text: &str,
+        kind: Reserved,
+        section_base: u32,
+    ) -> Self {
+        Self::synthetic_single_section(
+            system_prompt_text,
+            LayerId::reserved(kind),
+            GroupId::reserved(kind),
+            SectionId::new(section_base),
         )
     }
 
@@ -1185,13 +1232,16 @@ impl Builder {
                     name: "primary_conversation".to_string(),
                     selection: SelectionRule::AlwaysVisible,
                     score_threshold: 0.0,
+                    policy: SelectionPolicy::default_policy(),
                     budget: Budget {
                         priority: 100.0,
                         min_percent: None,
                         max_percent: None,
                     },
+                    default: None,
                 }],
-                depth_weights: DepthWeights::default(),
+                policy: SelectionPolicy::default_policy(),
+                gather_scope: GatherScope::default(),
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

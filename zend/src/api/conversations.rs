@@ -2,6 +2,7 @@
 //! `GET /v1/conversations/{id}` — recovered turn history.
 //! `POST /v1/conversations/{id}/archive` — set archived = true.
 //! `POST /v1/conversations/{id}/unarchive` — set archived = false.
+//! `DELETE /v1/conversations/{id}` — tombstone (permanent; reclaimed at compaction).
 //!
 //! Archive/unarchive append a `RecordType::ConvState` record
 //! (last-writer-wins) and update the in-RAM substrate. The sidebar
@@ -51,6 +52,21 @@ pub async fn unarchive(
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     set_archived(&session, &id, false)
+}
+
+pub async fn delete(
+    State(session): State<Arc<ZendSession>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    match session.tombstone_conversation(&id) {
+        Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
+        Some(Err(e)) => {
+            tracing::warn!(conv_id = %id, "tombstone failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        // Model not loaded yet — same shape as `get`/`archive` return.
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 fn set_archived(session: &ZendSession, id: &str, archived: bool) -> Result<StatusCode, StatusCode> {

@@ -9,10 +9,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PingRequest {
+    /// Hostname or IP address to ping.
     #[validate(length(min = 1))]
     pub host: String,
+    /// Number of echo requests to send (1-10). Default: 4.
     #[validate(range(min = 1, max = 10))]
     pub count: Option<u32>,
+    /// Per-reply timeout in seconds. Default: 5.
     pub timeout_sec: Option<u32>,
 }
 

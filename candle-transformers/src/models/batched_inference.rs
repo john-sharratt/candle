@@ -482,7 +482,7 @@ fn build_glue_meta(
     let n = write_slice.len();
     // Confirms the gap-fill forward took the paged-glue route (HD128) — one line
     // per reproject, under the scheduler's reproject log target.
-    tracing::info!(
+    tracing::trace!(
         target: "candle_conversation::scheduler::reproject",
         slots = pending.len(),
         total_glue = total,
@@ -700,6 +700,27 @@ impl BatchedInferenceSession {
         });
 
         Ok(idx)
+    }
+
+    /// Refresh the persistent decode GPU slot-state for `seq_idx` across every
+    /// layer after a multi-token prefill wrote tokens without the decode
+    /// kernel's self-increment (a stencil static-run injection, a think-steer
+    /// continuation prefill).
+    ///
+    /// The decode hot path trusts the cached GPU slot buffer, whose tail
+    /// length self-increments only on decode steps — without this refresh the
+    /// injected tokens sit beyond the buffer's stale tail length, invisible to
+    /// subsequent decode attention (and progressively clobbered by the next
+    /// decode writes). Only the WRITER chunk's slice is re-serialised (O(1)
+    /// per layer); a prefill that crossed a chunk boundary already dropped the
+    /// buffer at the mutation site, and a sequence that has not decoded yet
+    /// has none — both rebuild fully on the next decode sync. No-op on
+    /// contiguous backings.
+    pub fn refresh_decode_slot_state(&self, seq_idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            backing.refresh_decode_writer_slice(&[(seq_idx, 0)])?;
+        }
+        Ok(())
     }
 
     /// Create KvCaches for a sequence, wiring up chunked backing.
@@ -1621,6 +1642,21 @@ impl BatchedInferenceSession {
                 None => Ok(vec![]),
             })
             .collect()
+    }
+
+    /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the
+    /// exact layout attention reads, so a provenance / diagnostic gather can check
+    /// only real slots and skip partial-chunk padding. Chunk structure is identical
+    /// across layer backings, so layer 0 is authoritative.
+    pub fn provenance_chunk_layout(
+        &self,
+        seq_idx: usize,
+        seq_offset: usize,
+    ) -> Vec<(u16, u16, usize)> {
+        self.backings
+            .first()
+            .map(|b| b.provenance_chunk_layout(seq_idx, seq_offset))
+            .unwrap_or_default()
     }
 
     /// Number of KV heads in this session's backing.

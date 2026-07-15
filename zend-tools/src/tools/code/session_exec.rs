@@ -1,21 +1,23 @@
 //! code_session_exec tool.
 
-use std::io::{BufRead as _, Write as _};
-use std::time::Instant;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::engine::run_js;
 use super::{now, CodeError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SessionExecReq {
+    /// The session id returned by the code_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// JavaScript to execute in the session. Definitions persist across calls.
     #[validate(length(min = 1))]
     pub code: String,
+    /// Advisory wall-clock hint. Runaway scripts are bounded by the VM's
+    /// loop/recursion limits rather than a wall-clock timeout.
     pub timeout_sec: Option<u32>,
 }
 
@@ -26,6 +28,9 @@ pub struct SessionExecResp {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The final expression's value, stringified. Absent when it was `undefined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 pub struct CodeSessionExec;
@@ -33,8 +38,9 @@ pub struct CodeSessionExec;
 impl Tool for CodeSessionExec {
     const NAME: &'static str = "code_session_exec";
     const DESCRIPTION: &'static str =
-        "Execute code in a persistent session. State is shared between calls. \
-         Returns stdout, stderr, and ok flag. Error details in the error field if ok=false.";
+        "Execute JavaScript in a persistent session. Variable/function/const definitions from \
+         earlier calls remain in scope. Returns stdout, stderr, an ok flag, the final \
+         expression's value in result, and error details when ok=false.";
     type Request = SessionExecReq;
     type Response = SessionExecResp;
     type Error = CodeError;
@@ -47,113 +53,25 @@ impl Tool for CodeSessionExec {
         let mut guard = entry.lock().unwrap();
         guard.meta.last_activity = now();
 
-        let timeout = req.timeout_sec.unwrap_or(30) as u64;
-        let deadline = Instant::now() + std::time::Duration::from_secs(timeout);
+        // Replay accumulated history (silently) to rebuild state, then run the
+        // new snippet.
+        let outcome = run_js(&guard.history, &req.code);
+        let ok = outcome.error.is_none();
 
-        let lang = guard.language.clone();
-        let is_repl = matches!(
-            lang.as_str(),
-            "python" | "python3" | "javascript" | "js" | "node"
-        );
-
-        if is_repl {
-            let code_bytes = req.code.as_bytes();
-            let header = format!("{}\n", code_bytes.len());
-            guard
-                .stdin
-                .write_all(header.as_bytes())
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-            guard
-                .stdin
-                .write_all(code_bytes)
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-            guard
-                .stdin
-                .flush()
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-
-            let sentinel = "__ZEND_DONE__";
-            let mut json_line = String::new();
-            loop {
-                if Instant::now() > deadline {
-                    return Err(CodeError::Timeout);
-                }
-                let mut line = String::new();
-                guard
-                    .stdout_reader
-                    .read_line(&mut line)
-                    .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                if line.is_empty() {
-                    return Err(CodeError::ExecutionFailed(
-                        "process exited unexpectedly".into(),
-                    ));
-                }
-                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                if trimmed == sentinel {
-                    break;
-                }
-                json_line = trimmed.to_string();
-            }
-
-            let parsed: serde_json::Value = serde_json::from_str(&json_line)
-                .unwrap_or(serde_json::json!({"ok": false, "error": "invalid response", "stdout": "", "stderr": ""}));
-            Ok(SessionExecResp {
-                stdout: parsed["stdout"].as_str().unwrap_or("").to_string(),
-                stderr: parsed["stderr"].as_str().unwrap_or("").to_string(),
-                ok: parsed["ok"].as_bool().unwrap_or(false),
-                error: parsed["error"].as_str().map(|s| s.to_string()),
-            })
-        } else {
-            let exit_sentinel = "__ZEND_EXIT__";
-            let payload = format!("{}\necho '{}:'$?\n", req.code, exit_sentinel);
-            guard
-                .stdin
-                .write_all(payload.as_bytes())
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-            guard
-                .stdin
-                .flush()
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-
-            let mut stdout_lines: Vec<String> = Vec::new();
-            #[allow(unused_assignments)]
-            let mut exit_code: Option<i32> = None;
-            loop {
-                if Instant::now() > deadline {
-                    return Err(CodeError::Timeout);
-                }
-                let mut line = String::new();
-                guard
-                    .stdout_reader
-                    .read_line(&mut line)
-                    .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                if line.is_empty() {
-                    return Err(CodeError::ExecutionFailed(
-                        "process exited unexpectedly".into(),
-                    ));
-                }
-                let trimmed = line
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r')
-                    .to_string();
-                if let Some(rest) = trimmed.strip_prefix(&format!("{exit_sentinel}:")) {
-                    exit_code = rest.parse::<i32>().ok();
-                    break;
-                }
-                stdout_lines.push(trimmed);
-            }
-
-            let ok = exit_code == Some(0);
-            let stdout = stdout_lines.join("\n");
-            Ok(SessionExecResp {
-                stdout,
-                stderr: String::new(),
-                ok,
-                error: exit_code
-                    .filter(|&c| c != 0)
-                    .map(|c| format!("exited with code {c}")),
-            })
+        // Only successful snippets join the history — a throwing snippet must not
+        // poison every future replay.
+        if ok {
+            guard.history.push_str(&req.code);
+            guard.history.push('\n');
         }
+
+        Ok(SessionExecResp {
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            ok,
+            error: outcome.error,
+            result: outcome.result,
+        })
     }
 }
 

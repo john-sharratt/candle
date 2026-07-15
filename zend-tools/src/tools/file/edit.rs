@@ -10,9 +10,12 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct EditRequest {
+    /// VFS path of the file to edit (session-relative, e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
+    /// Substring to replace; must match exactly once in the file (multiple matches are rejected as ambiguous). Required.
     pub old_str: String,
+    /// Replacement text for old_str; an empty string deletes the matched substring. Required.
     pub new_str: String,
 }
 

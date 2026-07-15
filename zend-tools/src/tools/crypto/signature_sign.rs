@@ -7,15 +7,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{decode_data, CryptoError};
+use super::{decode_data, normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SigSignRequest {
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
+    /// Name of a stored `signing_key` credential holding the PEM private key.
     #[validate(length(min = 1))]
     pub credential_name: String,
+    /// Signature scheme. One of: ed25519, p256_sha256.
+    #[schemars(with = "super::SignatureAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
 }
@@ -52,7 +57,7 @@ impl Tool for SignatureSign {
         let enc = req.data_encoding.as_deref().unwrap_or("text");
         let data = decode_data(&req.data, enc).map_err(CryptoError::InvalidDataEncoding)?;
 
-        let sig_hex = match req.algorithm.as_str() {
+        let sig_hex = match normalize_algorithm(&req.algorithm).as_str() {
             "ed25519" => {
                 use ed25519_dalek::pkcs8::DecodePrivateKey;
                 use ed25519_dalek::Signer;
@@ -61,7 +66,7 @@ impl Tool for SignatureSign {
                 let sig = sk.sign(&data);
                 hex::encode(sig.to_bytes())
             }
-            "p256_sha256" => {
+            "p256sha256" => {
                 use p256::pkcs8::DecodePrivateKey;
                 let sk = P256SigningKey::from_pkcs8_pem(&cred.secret)
                     .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;

@@ -51,12 +51,18 @@ fn code_read_emits_one_prefill_per_part() {
         "expected ≥2 scopes (alpha + beta), got {n_scopes}"
     );
 
-    // Single file → exactly one prefill turn per carved part, no summary decode.
+    // Single file → exactly one prefill turn per carved part, no summary decode
+    // (the whole-file summary is the async summariser's rollup, not inline).
     assert_eq!(
         sink.turns.len(),
         n_scopes,
         "one prefill turn per carved part"
     );
+    // Gather-scope tags: every scope turn carries `["code", <path>]` so it lands
+    // in the code-tagged provenance gallery.
+    for (_, _, tags) in &sink.turns {
+        assert_eq!(tags, &["code", "src/lib.rs"]);
+    }
 }
 
 #[test]
@@ -76,7 +82,7 @@ fn code_read_every_turn_is_a_part_prefill() {
 
     // Every recorded turn is a prefilled part read — the file summary is not
     // decoded inline anymore.
-    for (user, _) in &sink.turns {
+    for (user, _, _) in &sink.turns {
         assert!(
             user.starts_with("Source excerpt — `src/lib.rs` lines "),
             "part user prompt reads a line range, got: {user:?}"
@@ -127,7 +133,7 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
     let tr = sink
         .turns
         .iter()
-        .find(|(_, a)| a.contains("<tool_response>") && a.contains("pub fn two"))
+        .find(|(_, a, _)| a.contains("<tool_response>") && a.contains("pub fn two"))
         .expect("part turn carrying fn two in its tool_response");
     // The content lives in the assistant slot of a prefill turn.
     assert!(tr.1.contains("<tool_response>\n"));
@@ -154,7 +160,7 @@ fn code_read_user_prompts_never_carry_tool_markup() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (user, _) in &sink.turns {
+    for (user, _, _) in &sink.turns {
         assert!(
             !user.contains("<tool_call>"),
             "user prompt must not contain <tool_call>: {user:?}"
@@ -179,7 +185,7 @@ fn code_read_skips_files_outside_watch_patterns() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (u, a) in &sink.turns {
+    for (u, a, _) in &sink.turns {
         assert!(!u.contains("blob.bin") && !a.contains("blob.bin"));
         assert!(!u.contains("image.svg") && !a.contains("image.svg"));
     }
@@ -202,8 +208,8 @@ fn code_read_falls_back_to_fixed_window_on_unknown_language() {
     let part_reads: Vec<&str> = sink
         .turns
         .iter()
-        .filter(|(u, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
-        .map(|(u, _)| u.as_str())
+        .filter(|(u, _, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
+        .map(|(u, _, _)| u.as_str())
         .collect();
     assert!(
         part_reads.len() >= 3,

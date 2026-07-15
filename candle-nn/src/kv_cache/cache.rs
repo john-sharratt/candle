@@ -465,17 +465,6 @@ impl Cache {
         }
     }
 
-    /// Invalidate the persistent GPU slot-state buffer for this cache's sequence.
-    ///
-    /// Forces a full rebuild on the next decode step.  Call this after any
-    /// operation (e.g. prefill) that modifies chunk layout or lengths without
-    /// going through the decode kernel's self-increment path.
-    pub fn chunked_invalidate_decode_gpu_chunks(&self) {
-        if let CacheStorage::Chunked(c) = &self.storage {
-            c.backing.invalidate_decode_gpu_chunks(&[(c.batch_idx, 0)]);
-        }
-    }
-
     /// Get chunk references for a chunked cache's blocks.
     ///
     /// Returns None for contiguous caches.

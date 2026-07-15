@@ -68,13 +68,18 @@ pub enum Reserved {
     /// Restricted-mode projection points the `tools` collection at this section
     /// instead of [`Reserved::ToolSummary`]; "None" mode emits neither.
     ToolSummaryRestricted,
+    /// The hidden tool-calibration layer — per-tool example conversations are decoded
+    /// under forced tool-selection into this reserved layer (the "Calibrating sections"
+    /// load phase) so they seed the wide-Q (`Q·Q`) reference substrate without ever
+    /// entering a user conversation's projection.
+    Calibration,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 3;
+    pub const COUNT: u32 = 4;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -83,6 +88,7 @@ impl Reserved {
             Reserved::Titler => 0,
             Reserved::ToolSummary => 1,
             Reserved::ToolSummaryRestricted => 2,
+            Reserved::Calibration => 3,
         }
     }
 
@@ -207,6 +213,11 @@ pub struct CollectionId(pub(super) NonZeroU32);
 impl CollectionId {
     pub(super) fn new(n: u32) -> Self {
         Self(NonZeroU32::new(n).expect("CollectionId must be non-zero"))
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn for_test(n: u32) -> Self {
+        Self(NonZeroU32::new(n.max(1)).unwrap())
     }
 
     pub fn raw(self) -> u32 {

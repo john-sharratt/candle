@@ -38,18 +38,24 @@ fn three_tool_catalog() -> Vec<super::tool_call::ToolSpec> {
     .unwrap()
 }
 
+/// Compile a catalog into a walkable tool-call tree under the Qwen3 envelope —
+/// the one-liner every full-walk test starts from.
+fn tree_of(catalog: &[super::tool_call::ToolSpec], v: &TestVocab) -> Arc<super::tree::StencilTree> {
+    Arc::new(
+        compile(
+            &compile_tool_call_tree(catalog, &ToolCallEnvelope::qwen3()).unwrap(),
+            v,
+        )
+        .unwrap(),
+    )
+}
+
 // ── Full tool-call walks (Scripted oracle, exact output, JSON-valid) ─────────
 
 #[test]
 fn read_file_minimal_call() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     // Decode steps: tool name, then the path value + closing quote.
     let mut script = bytes_of("read_file\"");
     script.extend(bytes_of("src/main.rs\""));
@@ -68,13 +74,7 @@ fn read_file_minimal_call() {
 #[test]
 fn write_file_with_optional_included() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     // name "write_file"; path value "a.txt\""; then the optional gate must be
     // chosen via the `create` arm — but that's a Branch, so the decode step that
     // selects it is the first token of `, "create": ` which is ','.
@@ -94,13 +94,7 @@ fn write_file_with_optional_included() {
 #[test]
 fn write_file_with_optional_skipped() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     let mut script = bytes_of("write_file\"");
     script.extend(bytes_of("a.txt\""));
     // optional gate: choose the close arm "}}\n</tool_call>" (starts with '}').
@@ -116,13 +110,7 @@ fn write_file_with_optional_skipped() {
 #[test]
 fn set_mode_enum_value() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     // name "set_mode"; enum value "exec" (inside the value's quote branch). The
     // only param is required, so the close is prefilled — no further decode.
     let mut script = bytes_of("set_mode\"");
@@ -132,6 +120,88 @@ fn set_mode_enum_value() {
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
     assert_eq!(parsed["name"], "set_mode");
     assert_eq!(parsed["arguments"]["mode"], "exec");
+}
+
+// ── Calculator tool: does the stencil mangle the `expression` value? ─────────
+//
+// Reproduces the live daemon's tool-call path for the calculator tool, built the
+// SAME way the daemon builds it (`zend/src/session.rs`): `ToolSpec::from_json_
+// schema` over each tool's schemars JSON Schema.  Several tools so the name is a
+// real Branch (as in the 93-tool live catalog), not a folded single-tool static.
+fn calc_catalog() -> Vec<super::tool_call::ToolSpec> {
+    use super::tool_call::ToolSpec;
+    vec![
+        ToolSpec::from_json_schema(
+            "datetime",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "timezone": { "type": "string" } },
+            }),
+        ),
+        ToolSpec::from_json_schema(
+            "calculator",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Arithmetic/scientific expression to evaluate",
+                    }
+                },
+                "required": ["expression"],
+            }),
+        ),
+        ToolSpec::from_json_schema(
+            "write",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"],
+            }),
+        ),
+    ]
+}
+
+fn calc_tree(v: &TestVocab) -> Arc<super::tree::StencilTree> {
+    tree_of(&calc_catalog(), v)
+}
+
+// The model selects `calculator` and free-decodes `sqrt(324523452345)` for the
+// expression.  If the stencil is faithful, the emitted JSON carries that exact
+// expression — proving the stencil is NOT the source of the live `" , "` garbage.
+#[test]
+fn calculator_passes_sqrt_expression_verbatim() {
+    let v = TestVocab::new();
+    let tree = calc_tree(&v);
+    let mut script = bytes_of("calculator\""); // name branch + closing quote
+    script.extend(bytes_of("sqrt(324523452345)\"")); // free expression value + close
+    let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
+    assert_eq!(parsed["name"], "calculator");
+    assert_eq!(parsed["arguments"]["expression"], "sqrt(324523452345)");
+    // No mid-token heals, no forced close — the value span ran to the model's own
+    // closing quote, exactly as long as the model drove it.
+    assert_eq!(run.healed_bytes, 0);
+    assert_eq!(run.forced_closes, 0);
+}
+
+// The live daemon produced `{"expression": " , "}`.  This confirms the stencil is
+// a faithful pass-through of whatever the model free-decodes: feed the SAME bytes
+// the daemon observed and the stencil reflects them unchanged.  Together with the
+// test above, this proves the garbage originated in the model's decode (a context
+// / logits problem), not in constrained decoding.
+#[test]
+fn calculator_reflects_model_value_verbatim_even_when_garbage() {
+    let v = TestVocab::new();
+    let tree = calc_tree(&v);
+    let mut script = bytes_of("calculator\"");
+    script.extend(bytes_of(" , \"")); // the exact garbage the daemon emitted, + close
+    let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
+    assert_eq!(parsed["name"], "calculator");
+    assert_eq!(parsed["arguments"]["expression"], " , ");
 }
 
 // Numbers and arrays are emitted as JSON values, lookahead-terminated and
@@ -190,13 +260,7 @@ fn array_value_via_pushback() {
 #[test]
 fn string_value_with_escaped_quote() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     // path value contains an escaped quote: a\"b  — must not close early.
     let mut script = bytes_of("read_file\"");
     script.extend(bytes_of("a\\\"b\"")); // a \ " b "  → closes only at the final "
@@ -324,13 +388,7 @@ fn every_tool_path_yields_valid_json() {
 #[test]
 fn out_of_mask_token_bails_gracefully() {
     let v = TestVocab::new();
-    let tree = Arc::new(
-        compile(
-            &compile_tool_call_tree(&three_tool_catalog(), &ToolCallEnvelope::qwen3()).unwrap(),
-            &v,
-        )
-        .unwrap(),
-    );
+    let tree = tree_of(&three_tool_catalog(), &v);
     // First decode is the tool-name branch; 'Z' is not a legal first byte.  The
     // failsafe bails: it does NOT error, it emits the bail (close) tokens and
     // exits so the partial output is terminated.

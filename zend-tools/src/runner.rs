@@ -14,6 +14,7 @@
 use serde_json::{json, Value};
 
 use crate::context::ToolContext;
+use crate::numfmt;
 use crate::registry;
 use crate::tool::ConfirmationDetails;
 
@@ -38,8 +39,15 @@ pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext)
     };
 
     tracing::debug!("dispatch start");
-    let result = (tool.run)(ctx, args);
+    let mut result = (tool.run)(ctx, args);
     tracing::debug!(success = !is_error_response(&result), "dispatch complete");
+    // Annotate large/tiny numeric fields with `<key>_display` renderings
+    // (digit-grouped, magnitude-tagged) so the model quotes magnitudes instead
+    // of re-deriving them from long digit runs — one pass here covers every
+    // tool. See `numfmt`.
+    if !is_error_response(&result) {
+        numfmt::annotate_json(&mut result);
+    }
     result
 }
 

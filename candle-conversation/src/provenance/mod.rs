@@ -1,40 +1,40 @@
 //! Attentional provenance retrieval subsystem.
 //!
-//! Provides binary directional signatures for each token's Q vector (captured
-//! in R16 KV format) and a mmap-backed file that stores and scans them.
+//! Captures each token's `sign(Q)` from the R16 KV format as a compact folded
+//! [`WideQSig`], and scores a live decode window against a gallery of past turns'
+//! signatures to drive belief-based section/tool selection.
 //!
 //! # Pipeline
 //!
 //! ## Index side (automatic, per turn seal)
 //!
-//! The R16 KV format co-stores raw F16 Q vectors alongside K values.  Inside
-//! the post-Done seal step, the scheduler extracts Q sign-bits at three layer depths
-//! (syntactic ~15%, semantic ~50%, pragmatic ~85%), appends one chunk-group
-//! triplet per 32-token block to the shared `ProvenanceFile`, and stashes the
-//! new `SigEntry` values on the workspace substrate's per-`(group, turn)` entry.
+//! At the post-Done seal step the scheduler gathers each real token's `sign(Q)`
+//! across all heads/layers, [`fold_provenance`]-folds it to the locked 1536-bit
+//! [`WideQSig`], and stores the per-turn window on the substrate
+//! (`wide_q_sigs`). See `docs/tool_selection_provenance_results.md` §23.
 //!
 //! ## Query side (continuous, in-decode)
 //!
-//! The scheduler's reprojection path extracts live Q sign-bits from
-//! the active decode at every reprojection cadence trigger, runs a
-//! BDP scan against the per-turn `SigEntry` directory in the
-//! workspace `Conversation` (substrate), updates per-turn scores,
-//! and re-projects the visible window.  No fork, no separate query
-//! API — the live sequence is its own probe.
+//! Each reprojection gathers the live decode window's folded signatures as a
+//! probe, scans it against the tag-scoped gallery of past turns
+//! ([`crate::projection::Conversation::belief_gallery`] +
+//! [`score_slots`]), and updates the online belief
+//! ([`belief_step`]) that drives selection — the live sequence is its own probe.
 
+pub mod belief;
+pub mod gather;
+pub mod gpu;
+pub mod packed;
 pub mod raw_store;
 pub mod scan;
-pub mod signature;
-pub mod store;
+pub mod selection;
+pub mod wide_sig;
 
-pub use raw_store::{
-    band_layer_indices, build_token_blob, extract_k_vector, extract_q_vector_r16, RawFileHeader,
-    RawProvenanceFile, RawSigEntry,
-};
-pub use scan::{BdpScanner, TokenHit, DEFAULT_HIT_THRESHOLD, DEFAULT_SPAN_ALPHA, DEFAULT_TOP_K};
-pub use signature::{
-    extract_mh_signatures_from_r16_dump, extract_signatures_from_r16_dump,
-    merge_turn_signatures_xor, r16_block_to_turn_signatures, r16_block_to_turn_signatures_mh,
-    TokenSignature, TurnSignatures,
-};
-pub use store::{ProbeSignatures, ProvenanceFile, SigEntry, TurnChunkRank};
+pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
+pub use gather::{belief_step, score_slots, SlotBelief};
+pub use gpu::{score_batched_gpu, BatchedGpuGallery};
+pub use packed::{score_packed, PackedGallery};
+pub use raw_store::extract_q_vector_r16;
+pub use scan::score_provenance_late_fusion;
+pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
+pub use wide_sig::{decode_wide_sigs, encode_wide_sigs, fold_provenance, WideQSig};

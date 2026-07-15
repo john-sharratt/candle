@@ -60,6 +60,9 @@ tree-sitter-css         = "0.21"
 [dev-dependencies]
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+rayon = { workspace = true }
+half = { workspace = true }
+candle-nn = { workspace = true }
 # GUI/API integration harness (zend/tests/gui_api_harness.rs): boots the real
 # axum router model-less and drives it over HTTP. These mirror the runtime deps
 # so the test crate can construct the server + issue requests itself.

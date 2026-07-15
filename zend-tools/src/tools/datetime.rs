@@ -11,6 +11,8 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// IANA timezone name (e.g. "America/New_York", "Europe/London",
+    /// "Asia/Tokyo"). Defaults to "UTC" if omitted.
     pub timezone: Option<String>,
 }
 

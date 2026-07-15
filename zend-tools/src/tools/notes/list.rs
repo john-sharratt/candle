@@ -9,8 +9,11 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
+    /// Key prefix to filter notes (e.g. `infra/`). Defaults to "" (lists all notes).
     pub prefix: Option<String>,
+    /// Tags that returned notes must include. Defaults to none (no tag filter).
     pub tags: Option<Vec<String>>,
+    /// Maximum notes to return (1–200). Defaults to 50.
     #[validate(range(min = 1, max = 200))]
     pub max_results: Option<u32>,
 }

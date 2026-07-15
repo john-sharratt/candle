@@ -52,10 +52,33 @@ pub struct SequenceSamplingState {
     /// own look-back window, independent of the think segment).
     pub dry_span_len: i32,
 
-    /// True while this sequence is inside a tool call (stencil active).  DRY is
-    /// suppressed (`dry_lens` forced to 0) because the tool-call grammar is
-    /// already steered by the stencil.
+    /// True while this sequence is inside ANY stencil-steered span (think block
+    /// OR tool call).  DRY is suppressed (`dry_lens` forced to 0) because the
+    /// grammar is already steered.
     pub dry_suppressed: bool,
+
+    /// True while this sequence is inside a TOOL CALL specifically (not the think
+    /// block).  The remaining repetition penalties (repeat/frequency/presence)
+    /// are suppressed for these rows: a tool call's arguments legitimately
+    /// reproduce prompt content verbatim — the query's numbers, file paths,
+    /// identifiers — which those penalties would otherwise demote, corrupting the
+    /// value.  Kept distinct from `dry_suppressed` so reasoning (the think block)
+    /// retains full repetition control.
+    pub in_tool_call: bool,
+
+    /// Next index into [`crate::SamplingConfig::segment_close_script`] while the
+    /// hard-cap closer script is playing; `None` when no script is in flight.
+    /// The script overrides sampling until every phrase token has played, then
+    /// the sampler emits the segment-close token itself and clears this.
+    pub close_script_pos: Option<usize>,
+
+    /// True while the active steering span SUPPRESSES its close token — a
+    /// forced close here is dropped by the stencil and steered into a
+    /// continuation ("But wait, "), i.e. more reasoning follows, so the
+    /// hard-cap closer script must NOT play (it is a terminal closing
+    /// statement). Synced from the stencil each decode step; false for
+    /// unsteered blocks and terminal spans.
+    pub close_would_continue: bool,
 
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
@@ -73,6 +96,9 @@ impl SequenceSamplingState {
             segment_len: 0,
             dry_span_len: 0,
             dry_suppressed: false,
+            in_tool_call: false,
+            close_script_pos: None,
+            close_would_continue: false,
             rng_offset: 0,
         }
     }
@@ -135,6 +161,9 @@ impl SequenceSamplingState {
         self.segment_len = 0;
         self.dry_span_len = 0;
         self.dry_suppressed = false;
+        self.in_tool_call = false;
+        self.close_script_pos = None;
+        self.close_would_continue = false;
         self.rng_offset = 0;
     }
 
@@ -159,10 +188,14 @@ impl SequenceSamplingState {
         // Reset per-turn state (frequency/presence penalties are per-turn)
         self.token_counts.fill(0);
         self.current_len = 0;
-        // A new turn starts a fresh DRY span; any tool-call suppression from the
-        // prior turn is cleared.
+        // A new turn starts a fresh DRY span; any tool-call suppression, open
+        // segment, or in-flight closer script from the prior turn is cleared.
         self.dry_span_len = 0;
         self.dry_suppressed = false;
+        self.in_segment = false;
+        self.segment_len = 0;
+        self.close_script_pos = None;
+        self.close_would_continue = false;
     }
 
     /// Advance RNG offset (called after each sampling).
@@ -177,6 +210,8 @@ impl SequenceSamplingState {
         self.in_segment = true;
         self.segment_len = 0;
         self.dry_span_len = 0;
+        // A fresh segment cannot inherit a closer script from a previous one.
+        self.close_script_pos = None;
     }
 
     /// Close the segment (the caller signals this when the segment-close token is
@@ -185,6 +220,8 @@ impl SequenceSamplingState {
         self.in_segment = false;
         self.segment_len = 0;
         self.dry_span_len = 0;
+        // The segment is closed; any in-flight closer script is finished or moot.
+        self.close_script_pos = None;
     }
 
     /// Enter a tool call (the caller signals this when the `<tool_call>` trigger
@@ -221,6 +258,78 @@ impl SequenceSamplingState {
             self.exit_segment();
         }
     }
+
+    /// True when the most recent token ends a sentence (`.`, `!`, `?`, `\n`).
+    /// Used by the graceful segment close and the graceful EOS failsafe to let
+    /// the current sentence complete before terminating.
+    fn at_sentence_end(&self, config: &SamplingConfig) -> bool {
+        self.recent_tokens
+            .last()
+            .map(|&t| config.sentence_end_token_ids.contains(&t))
+            .unwrap_or(false)
+    }
+}
+
+/// Segment-close override for one sampled token, applied after sampling on
+/// both the CPU and GPU paths.
+///
+/// Three tiers:
+/// - a closer script in flight overrides everything: it plays the configured
+///   phrase to its end, then emits the segment-close token itself (the close
+///   is appended by this function, not stored in the script, so a played
+///   script can never fail to close the segment);
+/// - the GRACEFUL cap closes with the bare token at a completed sentence — no
+///   rescue needed;
+/// - the HARD cap starts the configured closer script (a canned
+///   self-interruption that turns the mid-sentence amputation into sensible
+///   prose and primes the answer with an explicit commitment). It falls back
+///   to the bare close token when no script is configured, when the sentence
+///   happens to already be complete, or when the steering span would drop the
+///   close and continue reasoning ("But wait, ") — the steering's own
+///   continuation phrase is the bridge there, not a terminal closing
+///   statement.
+///
+/// When this returns `Some`, the token is authoritative for the step: the EOS
+/// failsafes must not replace it (they fire on a later step, once the segment
+/// is closed and `in_segment` is false).
+fn segment_close_override(
+    config: &SamplingConfig,
+    state: &mut SequenceSamplingState,
+) -> Option<u32> {
+    if config.segment_close_token_id < 0 || !state.in_segment {
+        return None;
+    }
+    if let Some(pos) = state.close_script_pos {
+        return Some(if pos < config.segment_close_script.len() {
+            state.close_script_pos = Some(pos + 1);
+            config.segment_close_script[pos]
+        } else {
+            state.close_script_pos = None;
+            config.segment_close_token_id as u32
+        });
+    }
+    let at_sentence_end = state.at_sentence_end(config);
+    if config.graceful_segment_close_after > 0
+        && state.segment_len >= config.graceful_segment_close_after
+        && at_sentence_end
+    {
+        return Some(config.segment_close_token_id as u32);
+    }
+    if config.force_segment_close_after > 0 && state.segment_len >= config.force_segment_close_after
+    {
+        return Some(
+            if config.segment_close_script.is_empty()
+                || at_sentence_end
+                || state.close_would_continue
+            {
+                config.segment_close_token_id as u32
+            } else {
+                state.close_script_pos = Some(1);
+                config.segment_close_script[0]
+            },
+        );
+    }
+    None
 }
 
 /// Stateless batched sampler that invokes the CUDA kernel.
@@ -457,26 +566,21 @@ impl BatchedSampler {
             let mut processor = LogitsProcessor::from_sampling(seed, sampling);
             let mut token = processor.sample(&seq_logits)?;
 
-            // Segment-close overrides: force the close token when the segment budget is exhausted.
-            if config.segment_close_token_id >= 0 && state.in_segment {
-                let should_force = (config.graceful_segment_close_after > 0
-                    && state.segment_len >= config.graceful_segment_close_after
-                    && state
-                        .recent_tokens
-                        .last()
-                        .map(|&t| config.sentence_end_token_ids.contains(&t))
-                        .unwrap_or(false))
-                    || (config.force_segment_close_after > 0
-                        && state.segment_len >= config.force_segment_close_after);
-
-                if should_force {
-                    token = config.segment_close_token_id as u32;
-                }
+            // Segment-close overrides: force the close token when the segment
+            // budget is exhausted.  A segment override is authoritative for the
+            // step — the EOS failsafes below must not clobber the close token or
+            // a closer-script token (they fire on a later step, once the segment
+            // is closed).
+            let segment_override = segment_close_override(config, state);
+            if let Some(t) = segment_override {
+                token = t;
             }
 
             // EOS failsafe overrides (post-sampler)
             let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
-            if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
+            if segment_override.is_some() {
+                // Segment close in progress; EOS failsafes wait for the next step.
+            } else if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
                 token = eos_token_id;
                 tracing::debug!(
@@ -494,12 +598,7 @@ impl BatchedSampler {
                 // token (`.`, `!`, `?`, `\n`).  This lets the current sentence complete
                 // before termination, preventing mid-sentence truncation.
                 // `forced_eos_after` acts as the hard backstop if no boundary is seen.
-                if state
-                    .recent_tokens
-                    .last()
-                    .map(|&t| config.sentence_end_token_ids.contains(&t))
-                    .unwrap_or(false)
-                {
+                if state.at_sentence_end(config) {
                     token = eos_token_id;
                     tracing::debug!(
                         target: "candle_conversation::eos",
@@ -527,6 +626,11 @@ impl BatchedSampler {
 
             // Record the token and advance RNG
             state.record_token(token, self.max_recent_len);
+            state.update_segment_state(
+                token,
+                config.segment_open_token_id,
+                config.segment_close_token_id,
+            );
             state.advance_rng();
 
             results.push(token);
@@ -749,25 +853,20 @@ impl BatchedSampler {
                 );
             }
 
-            // Segment-close overrides: force the close token when the segment budget is exhausted.
-            if config.segment_close_token_id >= 0 && state.in_segment {
-                let should_force = (config.graceful_segment_close_after > 0
-                    && state.segment_len >= config.graceful_segment_close_after
-                    && state
-                        .recent_tokens
-                        .last()
-                        .map(|&t| config.sentence_end_token_ids.contains(&t))
-                        .unwrap_or(false))
-                    || (config.force_segment_close_after > 0
-                        && state.segment_len >= config.force_segment_close_after);
-
-                if should_force {
-                    token = config.segment_close_token_id as u32;
-                }
+            // Segment-close overrides: force the close token when the segment
+            // budget is exhausted.  A segment override is authoritative for the
+            // step — the EOS failsafes below must not clobber the close token or
+            // a closer-script token (they fire on a later step, once the segment
+            // is closed).
+            let segment_override = segment_close_override(config, state);
+            if let Some(t) = segment_override {
+                token = t;
             }
 
             // EOS failsafe overrides (post-sampler)
-            if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
+            if segment_override.is_some() {
+                // Segment close in progress; EOS failsafes wait for the next step.
+            } else if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
                 token = eos_token_id;
                 tracing::debug!(
@@ -785,12 +884,7 @@ impl BatchedSampler {
                 // current sentence completes before generation stops.  Prevents the
                 // mid-sentence truncation that occurred when EOS was unconditionally
                 // forced here.  `forced_eos_after` is the hard backstop.
-                if state
-                    .recent_tokens
-                    .last()
-                    .map(|&t| config.sentence_end_token_ids.contains(&t))
-                    .unwrap_or(false)
-                {
+                if state.at_sentence_end(config) {
                     token = eos_token_id;
                     tracing::debug!(
                         target: "candle_conversation::eos",
@@ -839,16 +933,36 @@ impl BatchedSampler {
     ) -> candle::Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let batch_size = states.len();
 
+        // Inside a TOOL CALL, all repetition penalties are suppressed, not just
+        // DRY.  Tool-call arguments legitimately reproduce content verbatim from
+        // the prompt or an earlier span — the query's numbers, file paths,
+        // identifiers — so frequency/presence/repeat penalties (which see the
+        // `<think>`/prior-span tokens via `token_counts` and `recent_tokens`)
+        // would demote exactly those tokens, corrupting the value.  This mirrors
+        // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
+        // think block keeps full repetition control.  Presenting empty penalty
+        // state for these rows is the per-row equivalent of turning them off;
+        // `resize` appends the zeros in place (no scratch buffer on this
+        // per-decode-step path).
+
         // Flatten token counts: [batch_size * vocab_size]
         let mut token_counts = Vec::with_capacity(batch_size * self.vocab_size);
         for state in states.iter() {
-            token_counts.extend_from_slice(&state.token_counts);
+            if state.in_tool_call {
+                token_counts.resize(token_counts.len() + self.vocab_size, 0);
+            } else {
+                token_counts.extend_from_slice(&state.token_counts);
+            }
         }
 
         // Flatten cross-turn counts: [batch_size * vocab_size]
         let mut cross_turn_counts = Vec::with_capacity(batch_size * self.vocab_size);
         for state in states.iter() {
-            cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
+            if state.in_tool_call {
+                cross_turn_counts.resize(cross_turn_counts.len() + self.vocab_size, 0);
+            } else {
+                cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
+            }
         }
 
         // Log penalty state if a log path is configured
@@ -887,7 +1001,11 @@ impl BatchedSampler {
             let window = repeat_win.max(dry_win).min(total);
             // Copy the newest `window` tokens (tail of the oldest-first buffer)
             let start = total - window;
-            recent_lens.push(window as i32);
+            // Inside a tool call, present a zero-length repeat window so the repeat
+            // penalty sees no history (DRY is already gated via `dry_lens`).  Tool
+            // arguments must be free to reproduce the query's numbers/paths/names
+            // verbatim. The buffer is still padded to keep the batch stride fixed.
+            recent_lens.push(if state.in_tool_call { 0 } else { window as i32 });
             recent_tokens.extend_from_slice(&state.recent_tokens[start..]);
             recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
@@ -1354,6 +1472,214 @@ mod tests {
 
     fn make_state() -> SequenceSamplingState {
         SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT)
+    }
+
+    // ── Hard-cap closer script (segment_close_override tiers) ──────────
+
+    /// Config with segment tracking on: close=90, graceful after 4 at sentence
+    /// end (token 7), hard cap at 8, closer phrase "A B C" (the sampler
+    /// appends the close token 90 itself).
+    fn closer_config() -> SamplingConfig {
+        let mut c = SamplingConfig::argmax();
+        c.segment_close_token_id = 90;
+        c.segment_open_token_id = 89;
+        c.graceful_segment_close_after = 4;
+        c.force_segment_close_after = 8;
+        c.sentence_end_token_ids = vec![7];
+        c.segment_close_script = vec![100, 101, 102];
+        c
+    }
+
+    /// A state `n` tokens into an open segment, last token `last`.
+    fn in_segment_state(n: i32, last: u32) -> SequenceSamplingState {
+        let mut s = make_state();
+        s.record_token(last, MAX_RECENT);
+        s.in_segment = true;
+        s.segment_len = n;
+        s
+    }
+
+    #[test]
+    fn hard_cap_plays_the_closer_script_to_the_close_token() {
+        let config = closer_config();
+        let mut state = in_segment_state(8, 42); // past force, mid-sentence
+        let mut played = Vec::new();
+        for _ in 0..4 {
+            played.push(segment_close_override(&config, &mut state).expect("override"));
+        }
+        assert_eq!(
+            played,
+            vec![100, 101, 102, 90],
+            "phrase then the sampler-appended close, in order"
+        );
+        assert_eq!(
+            state.close_script_pos, None,
+            "script state cleared at the end"
+        );
+    }
+
+    #[test]
+    fn graceful_close_at_sentence_end_skips_the_script() {
+        let config = closer_config();
+        // Past graceful (not force), last token IS a sentence end.
+        let mut state = in_segment_state(5, 7);
+        assert_eq!(
+            segment_close_override(&config, &mut state),
+            Some(90),
+            "soft cut closes bare — a completed sentence needs no rescue"
+        );
+        assert_eq!(state.close_script_pos, None);
+    }
+
+    #[test]
+    fn continuation_span_gets_the_bare_close_not_the_script() {
+        let config = closer_config();
+        let mut state = in_segment_state(8, 42);
+        // A deep/exhaustive continuation span: the steering drops the close and
+        // injects "But wait, " — more reasoning follows, so no closing statement.
+        state.close_would_continue = true;
+        assert_eq!(segment_close_override(&config, &mut state), Some(90));
+        assert_eq!(state.close_script_pos, None, "no script started");
+    }
+
+    #[test]
+    fn hard_cap_at_a_completed_sentence_closes_bare() {
+        let config = closer_config();
+        // Past force, but the last token IS a sentence end — the amputation
+        // rescue is for dangling fragments only.
+        let mut state = in_segment_state(8, 7);
+        assert_eq!(segment_close_override(&config, &mut state), Some(90));
+        assert_eq!(state.close_script_pos, None, "no script started");
+    }
+
+    #[test]
+    fn segment_close_override_is_inert_outside_a_segment_or_unconfigured() {
+        let config = closer_config();
+        let mut state = in_segment_state(8, 42);
+        state.in_segment = false;
+        assert_eq!(segment_close_override(&config, &mut state), None);
+
+        let mut unconfigured = closer_config();
+        unconfigured.segment_close_token_id = -1;
+        let mut state = in_segment_state(8, 42);
+        assert_eq!(segment_close_override(&unconfigured, &mut state), None);
+    }
+
+    #[test]
+    fn below_both_caps_no_override() {
+        let config = closer_config();
+        let mut state = in_segment_state(3, 7);
+        assert_eq!(segment_close_override(&config, &mut state), None);
+    }
+
+    #[test]
+    fn hard_cap_without_script_falls_back_to_bare_close() {
+        let mut config = closer_config();
+        config.segment_close_script = Vec::new();
+        let mut state = in_segment_state(8, 42);
+        assert_eq!(segment_close_override(&config, &mut state), Some(90));
+    }
+
+    #[test]
+    fn script_in_flight_overrides_graceful_and_force_conditions() {
+        let config = closer_config();
+        let mut state = in_segment_state(9, 7); // sentence end AND past force
+        state.close_script_pos = Some(2);
+        // Mid-script: the next scripted token wins over every other tier.
+        assert_eq!(segment_close_override(&config, &mut state), Some(102));
+        assert_eq!(segment_close_override(&config, &mut state), Some(90));
+        assert_eq!(state.close_script_pos, None);
+    }
+
+    #[test]
+    fn segment_close_wins_over_eos_failsafes_for_the_step() {
+        let sampler = make_sampler();
+        let mut config = closer_config();
+        config.forced_eos_after = 5; // far exceeded — EOS wants to fire every step
+        let mut state = in_segment_state(8, 42);
+        for _ in 0..7 {
+            state.record_token(42, MAX_RECENT);
+        }
+        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
+        logits_data[42] = 100.0;
+        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
+            .expect("tensor");
+
+        // The closer script plays to completion; the EOS failsafe never
+        // clobbers a scripted step or the close itself.
+        let mut played = Vec::new();
+        for _ in 0..4 {
+            played.push(
+                sampler
+                    .sample_batch(&logits, &mut [&mut state], &[&config])
+                    .expect("sample")[0],
+            );
+        }
+        assert_eq!(played, vec![100, 101, 102, 90]);
+        assert!(
+            !state.in_segment,
+            "the sampled close token exits the segment on the CPU path"
+        );
+
+        // With the segment closed, the deferred EOS failsafe fires next step.
+        let next = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample")[0];
+        assert_eq!(next, EOS_TOKEN);
+    }
+
+    #[test]
+    fn segment_boundaries_and_turn_end_cancel_a_stranded_script() {
+        let mut state = make_state();
+        state.enter_segment();
+        state.close_script_pos = Some(1);
+        state.exit_segment();
+        assert_eq!(state.close_script_pos, None, "exit cancels the script");
+
+        state.enter_segment();
+        state.close_script_pos = Some(2);
+        state.enter_segment();
+        assert_eq!(
+            state.close_script_pos, None,
+            "a fresh segment cannot inherit a script"
+        );
+
+        state.close_script_pos = Some(1);
+        state.close_would_continue = true;
+        state.end_turn();
+        assert!(!state.in_segment, "turn end closes a dangling segment");
+        assert_eq!(state.segment_len, 0);
+        assert_eq!(state.close_script_pos, None);
+        assert!(!state.close_would_continue);
+    }
+
+    // ── Tool-call penalty suppression ──────────────────────────────────
+
+    #[test]
+    fn tool_call_row_penalty_state_is_zeroed_and_think_row_is_not() {
+        let sampler = make_sampler();
+        let mut in_call = make_state();
+        let mut thinking = make_state();
+        // Both rows generated the same tokens (e.g. digits reasoned in <think>).
+        for _ in 0..5 {
+            in_call.record_token(42, MAX_RECENT);
+            thinking.record_token(42, MAX_RECENT);
+        }
+        in_call.in_tool_call = true;
+
+        let (token_counts, cross_turn_counts, _recent, recent_lens, _cur) = sampler
+            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0)
+            .expect("buffers");
+
+        // Row 0 (tool call): all penalty inputs empty — the model is free to
+        // reproduce the query's tokens verbatim in the arguments.
+        assert!(token_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        assert!(cross_turn_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        assert_eq!(recent_lens[0], 0);
+
+        // Row 1 (think block): full repetition control retained.
+        assert_eq!(token_counts[VOCAB_SIZE + 42], 5);
+        assert_eq!(recent_lens[1], 5);
     }
 
     // ── EOS failsafe override tests ────────────────────────────────────

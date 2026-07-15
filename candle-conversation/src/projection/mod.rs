@@ -199,6 +199,7 @@ mod builder;
 mod error;
 pub(crate) mod event;
 mod ids;
+mod policy;
 mod project;
 mod reconcile;
 mod resolver;
@@ -212,29 +213,29 @@ mod tests;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
-pub use crate::substrate::{
-    ContentResolver, PerDepthScores, Substrate, SubstrateRead, SubstrateWrite, TurnScores,
-};
+pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use event::{
     aggregate, decode_events, encode_events, from_projection, from_projection_with_origins,
-    BucketKind, MaterializedPiece, ProjectionBucket, ProjectionEvent, ProjectionSelection,
-    SelectedSection, SelectedTurn, SystemItem,
+    staged_ingest_event, summary_node_event, BucketKind, MaterializedPiece, ProjectionBucket,
+    ProjectionEvent, ProjectionSelection, SelectedSection, SelectedTurn, SelectionScores,
+    SystemItem,
 };
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
     TurnIndex, TurnKey,
 };
+pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub use project::{
-    GeneratedIdentity, OptionalState, Projection, ProjectionMode, ProjectionSegment,
-    ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn, SealedKind, SelectionState,
-    NO_THINK_SELECTOR,
+    GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
+    ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,
+    SealedKind, SelectionState, NO_THINK_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
 pub use schema::{
-    Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, GroupSummaryStage,
+    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection, SectionSchema, SectionTree,
     SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
     TreeOption, TreeVariant, TurnSummary,

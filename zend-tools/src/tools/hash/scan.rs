@@ -9,10 +9,16 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ScanRequest {
+    /// The candidate input, interpreted according to `data_encoding`.
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
+    /// The known digest to identify, interpreted according to `hash_encoding`.
     #[validate(length(min = 1))]
     pub known_hash: String,
+    /// How `known_hash` is encoded. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub hash_encoding: Option<String>,
 }
 
@@ -28,9 +34,11 @@ pub struct HashScan;
 impl Tool for HashScan {
     const NAME: &'static str = "hash_scan";
     const DESCRIPTION: &'static str =
-        "Given a digest of unknown origin, identify which algorithm produced \
-         it by recomputing the candidate input's hash under every supported \
-         algorithm and matching. Returns the algorithm name when found.";
+        "Given a candidate input (`data`) and a digest (`known_hash`), identify \
+         which algorithm produced the digest by recomputing the input's hash \
+         under every supported algorithm and matching. Returns the algorithm \
+         name when found. Always call this tool to identify the algorithm; \
+         never deduce it from the digest yourself.";
 
     type Request = ScanRequest;
     type Response = ScanResponse;

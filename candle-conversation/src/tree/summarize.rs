@@ -257,6 +257,8 @@ impl SummarizationTask {
                 user_content_end: 0,
                 assistant_content_start: 0,
                 no_think: false,
+                tags: Vec::new(),
+                projection_offsets: Vec::new(),
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens: config.summarization_max_tokens as usize,

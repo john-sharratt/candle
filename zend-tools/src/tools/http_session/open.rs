@@ -14,10 +14,17 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Base URL prepended to relative request paths (e.g. "https://api.example.com").
+    /// Omit to require absolute URLs on each request.
     pub base_url: Option<String>,
+    /// Name of a stored credential to apply as auth on every request. Prefer this over putting
+    /// raw tokens in `headers`. Omit for no authentication.
     pub credential_name: Option<String>,
+    /// Default headers applied to every request in the session. Omit for none.
     pub headers: Option<HashMap<String, String>>,
+    /// Per-request timeout in seconds. Default: 30.
     pub timeout_sec: Option<u32>,
+    /// Whether to follow HTTP redirects. Default: true.
     pub follow_redirects: Option<bool>,
 }
 

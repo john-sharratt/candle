@@ -20,17 +20,25 @@ use candle_conversation::{ScopeTurn, Sequence};
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
 pub trait InsertTurnSink {
-    /// Prefill a complete user/assistant exchange with no model
-    /// decode.  Returns the number of tokens prefilled — the ingest
-    /// path sums it into the upload's "tokens ingested" stat.
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize>;
+    /// Prefill a complete user/assistant exchange with no model decode. Returns
+    /// the number of tokens prefilled — the ingest path sums it into the upload's
+    /// "tokens ingested" stat. `tags` (e.g. `["code", <path>]`) are persisted on
+    /// the TurnDecl so tag-scoped provenance galleries admit the turn, alongside
+    /// the staged projection events the production sink records for it.
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<usize>;
 
     /// Prefill every `(user, assistant)` scope of one file **in parallel** — each
     /// on its own scratch slot so the file's scopes (and scopes across
     /// concurrently-ingesting files) batch into large amortising forwards instead
     /// of prefilling one-at-a-time — then record them into the conversation's
     /// timeline in scope order. Returns the per-scope prefilled token counts, in
-    /// order, so the ingest bar can advance one unit per scope.
+    /// order, so the ingest bar can advance one unit per scope. `tags` apply to
+    /// every scope turn (provenance scoping), exactly as [`Self::insert_prefill_turn`].
     ///
     /// `on_prefilled(tokens)` fires as each scope's prefill lands, so the caller
     /// can advance a live per-scope progress bar + token count instead of only
@@ -41,12 +49,13 @@ pub trait InsertTurnSink {
     fn insert_prefill_turns_parallel(
         &mut self,
         scopes: &[(String, String)],
+        tags: Vec<String>,
         on_prefilled: candle_conversation::ScopeProgressFn,
     ) -> anyhow::Result<Vec<usize>> {
         scopes
             .iter()
             .map(|(user, assistant)| {
-                let tokens = self.insert_prefill_turn(user, assistant)?;
+                let tokens = self.insert_prefill_turn(user, assistant, tags.clone())?;
                 on_prefilled(tokens);
                 Ok(tokens)
             })
@@ -81,18 +90,23 @@ impl<'a> SequenceTurnSink<'a> {
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize> {
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<usize> {
         let start = std::time::Instant::now();
         tracing::debug!(
             target: "zend::turn_sink",
             user_bytes = user.len(),
             assistant_bytes = assistant.len(),
-            "insert_prefill_turn: calling Sequence::insert_turn",
+            "insert_prefill_turn: calling Sequence::insert_turn_staged",
         );
         let result = self
             .inner
-            .insert_turn(user, assistant)
-            .map_err(|e| anyhow::anyhow!("insert_turn: {e}"));
+            .insert_turn_staged(user, assistant, tags)
+            .map_err(|e| anyhow::anyhow!("insert_turn_staged: {e}"));
         tracing::debug!(
             target: "zend::turn_sink",
             ms = start.elapsed().as_millis() as u64,
@@ -105,6 +119,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
     fn insert_prefill_turns_parallel(
         &mut self,
         scopes: &[(String, String)],
+        tags: Vec<String>,
         on_prefilled: candle_conversation::ScopeProgressFn,
     ) -> anyhow::Result<Vec<usize>> {
         let start = std::time::Instant::now();
@@ -122,7 +137,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         );
         let result = self
             .inner
-            .ingest_scopes_parallel(&turns, on_prefilled)
+            .ingest_scopes_parallel(&turns, tags, on_prefilled)
             .map_err(|e| anyhow::anyhow!("ingest_scopes_parallel: {e}"));
         tracing::debug!(
             target: "zend::turn_sink",
@@ -151,12 +166,13 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
 }
 
 /// Recording sink for integration tests.  Stores every
-/// `(user, assistant)` prefill pair the ingestion path emits, in order, so
-/// test cases can verify the conversation shape without loading a model.
+/// `(user, assistant, tags)` prefill entry the ingestion path emits, in order,
+/// so test cases can verify the conversation shape (and its provenance tags)
+/// without loading a model.
 #[allow(dead_code)]
 #[derive(Default)]
 pub struct RecordingTurnSink {
-    pub turns: Vec<(String, String)>,
+    pub turns: Vec<(String, String, Vec<String>)>,
 }
 
 #[allow(dead_code)]
@@ -167,8 +183,14 @@ impl RecordingTurnSink {
 }
 
 impl InsertTurnSink for RecordingTurnSink {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize> {
-        self.turns.push((user.to_string(), assistant.to_string()));
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<usize> {
+        self.turns
+            .push((user.to_string(), assistant.to_string(), tags));
         // No tokenizer in the recording sink — approximate the prefilled token
         // count by whitespace words so callers that surface a stat see a
         // plausible non-zero value in model-less tests.

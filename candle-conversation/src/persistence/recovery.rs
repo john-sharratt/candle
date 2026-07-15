@@ -15,7 +15,7 @@
 //! index record, a non-monotonic chain — degrades to the **full
 //! filtered forward walk**: correct on any log, just slower. The walk
 //! reads payload bytes only for the metadata types; the bulk types
-//! (`Chunk` / `Tokens` / `Signatures`) contribute headers only.
+//! (`Chunk` / `Tokens`) contribute headers only.
 //!
 //! The recovery also reports the digests of every record past the
 //! hinted index (the un-indexed tail) so the writer can seed its
@@ -54,7 +54,7 @@ pub struct Recovered {
 
 /// Whether recovery needs a record's payload bytes in RAM.
 ///
-/// `Chunk` / `Tokens` / `Signatures` payloads are stored by reference —
+/// `Chunk` / `Tokens` payloads are stored by reference —
 /// `Substrate::apply_walker_entry` keeps only their `(offset, len)` — and
 /// the `ModelSpec` / `Template` / `Tokenizer` singleton payloads are read
 /// back individually after recovery from their manifest locations.
@@ -65,7 +65,6 @@ fn payload_needed(rt: RecordType) -> bool {
         rt,
         RecordType::Chunk
             | RecordType::Tokens
-            | RecordType::Signatures
             | RecordType::ModelSpec
             | RecordType::Template
             | RecordType::Tokenizer

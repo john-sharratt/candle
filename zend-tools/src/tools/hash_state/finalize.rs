@@ -9,9 +9,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct FinalizeRequest {
+    /// State id returned by hash_state_init. Required.
     #[validate(length(min = 1))]
     pub id: String,
+    /// Encoding for the returned digest. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub output_encoding: Option<String>,
+    /// Whether to retain the state after finalizing instead of discarding it. Defaults to false.
     pub keep: Option<bool>,
 }
 

@@ -12,7 +12,9 @@
 //!
 //! 2. **Chained tool turns** — after a turn's response is decoded,
 //!    [`extract_tool_calls`] scans for `<tool_call>{json}</tool_call>`
-//!    blocks.  Each call is dispatched via [`zend_tools::runner::run`];
+//!    blocks *outside* the model's `<think>…</think>` reasoning (a call written
+//!    mid-thought is deliberation, not an invocation, and is left inline).  Each
+//!    call is dispatched via [`zend_tools::runner::run`];
 //!    the JSON results are wrapped in `<tool_response>...</tool_response>`,
 //!    concatenated, and submitted as the next turn's user message.  The
 //!    loop continues until a turn produces no further calls or the
@@ -22,10 +24,14 @@
 //! output presented to the client — the user sees only the assistant's
 //! final natural-language answer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, SectionId};
+use candle_conversation::models::Dialect;
+use candle_conversation::projection::{
+    Builder as ProjectionBuilder, GroupId, LayerId, Reserved, SectionId, SelectionRule,
+};
+use candle_conversation::think_strip::strip_think_blocks_keep_layout;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -41,47 +47,6 @@ pub fn safe_tool_names() -> HashSet<String> {
         .filter(|t| !t.high_risk)
         .map(|t| t.name.to_string())
         .collect()
-}
-
-/// Build the tool-catalog summary **deterministically** from each tool's
-/// `category` metadata — no model decode. Tools are grouped under
-/// `## <category>` headers in registry (group) order; `restricted` drops every
-/// high-risk tool (the "Restricted" tools-mode subset). This is the text
-/// prefilled into the reserved tool-summary section and shown to the model just
-/// before the selected tools, so it always knows the full breadth of the
-/// catalog even when top-k surfaced only a few definitions.
-pub fn build_tool_summary(restricted: bool) -> String {
-    // Collect tool names per category, preserving first-seen (group) order.
-    let mut order: Vec<&'static str> = Vec::new();
-    let mut by_cat: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
-    for tool in registry::all_tools() {
-        if restricted && tool.high_risk {
-            continue;
-        }
-        let cat = if tool.category.is_empty() {
-            "Other"
-        } else {
-            tool.category
-        };
-        by_cat
-            .entry(cat)
-            .or_insert_with(|| {
-                order.push(cat);
-                Vec::new()
-            })
-            .push(tool.name);
-    }
-    // Pre-prose: frame the list so the model reads it as the full catalog, of
-    // which only the most relevant few are detailed in the `<tools>` block.
-    let mut out = String::from(
-        "These are the tools available to you, grouped by category. Only the most relevant \
-         few are detailed in the <tools> block below, but every tool listed here is available \
-         — call any of them by name when it fits the request.\n\n",
-    );
-    for cat in order {
-        out.push_str(&format!("## {cat}\n  {}\n", by_cat[cat].join(", ")));
-    }
-    out.trim_end().to_string()
 }
 
 /// One Hermes tool-call block parsed from a model response.
@@ -154,9 +119,12 @@ pub fn install_tool_catalog(
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
         out.push((tool.name.to_string(), id, json_line));
     }
-    // The tool-catalog overview is the `tool_summary` tree section (a real link
-    // in the K/V chain, sealed before `<tools>`), not a separately-injected
-    // reserved section — so no summary association is needed on the collection.
+    // This function only lays down the per-tool sections. The tool-catalog
+    // *overview* is sealed separately into the `ToolSummary` /
+    // `ToolSummaryRestricted` reserved sections at session startup and associated
+    // with this collection per mode in `build_mode_builder` (via
+    // `set_collection_summary_section`), so projection emits the full name listing
+    // ahead of the provenance-selected subset.
     Ok(out)
 }
 
@@ -181,6 +149,93 @@ fn render_tool_json_line(tool: &registry::RegisteredTool) -> String {
     // (`member_glue` on the `tools` collection), injected between selected members
     // at projection so it is independent of which tools provenance surfaces.
     serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The selector id the calibration projection's `tools` collection reads
+/// ([`SelectionRule::Named`]) to pin exactly one tool. The "Calibrating sections"
+/// driver sets it per run via [`candle_conversation::TurnOptions::selection`].
+pub const CALIB_TOOL_SELECTOR: &str = "tool";
+
+/// Section-id partition for the calibration projection: high in the u32 space,
+/// just below the per-kind reserved singleton band (`u32::MAX - 0..3`) and far
+/// above the user schema's low 1..n ids and the tool ids allocated above them.
+/// 4096 ids is ample headroom for the frame, its summary framing, the whole tool
+/// catalog (one section each), and the outro.
+const CALIB_SECTION_BASE: u32 = u32::MAX - 4096;
+
+/// Build the hidden **calibration projection** used by the "Calibrating sections"
+/// load phase.
+///
+/// A single `Reserved::Calibration` layer whose system prompt frames a `tools`
+/// collection holding the **whole** catalog — one name-keyed section per tool —
+/// governed by [`SelectionRule::Named`] on the [`CALIB_TOOL_SELECTOR`] selector.
+/// A calibration run pins one tool by setting that selector to the tool's name
+/// (via `TurnOptions::selection`), so the projection emits exactly that tool,
+/// wrapped in the proven Hermes `<tools>…</tools>` envelope. The model then sees
+/// a single available tool and free-decodes the full think→call trajectory (and
+/// its reprojection wide-Q windows) — the same conditions under which the
+/// `datetime` case calibrated cleanly, now reproduced for every tool.
+///
+/// The reserved layer keeps these conversations off every user projection (their
+/// turns never enter dialogue retrieval), and the `tools` collection's distinct,
+/// name-keyed member sections mean no two tools ever collide on one slot — the
+/// failure mode of the earlier single-reserved-section approach.
+///
+/// The system-prompt envelope markers live in the section *content* (the
+/// assembler does not wrap system sections): the frame opens with
+/// `dialect.system_start` and the outro closes with `dialect.system_end`.
+pub fn build_calibration_projection(
+    dialect: &Dialect,
+) -> anyhow::Result<(ProjectionBuilder, LayerId, GroupId)> {
+    let layer = LayerId::reserved(Reserved::Calibration);
+    let group = GroupId::reserved(Reserved::Calibration);
+
+    // Frame: system-open marker + framing prose + the opening `<tools>` marker.
+    // The collection's one selected tool line emits next; the outro closes it.
+    let frame = format!(
+        "{sys_start}You are a coding assistant. Use the available tool to satisfy the \
+         user's request.\n\n# Tools\n\nYou may call the tool below. Return the call as a \
+         JSON object with its name and arguments inside <tool_call></tool_call> XML tags.\n\n\
+         <tools>\n",
+        sys_start = dialect.system_start,
+    );
+    let mut builder =
+        ProjectionBuilder::for_reserved_corpus(&frame, Reserved::Calibration, CALIB_SECTION_BASE);
+
+    let collection = builder
+        .add_collection(
+            layer,
+            "tools",
+            SelectionRule::Named {
+                selector: CALIB_TOOL_SELECTOR.to_string(),
+            },
+            0.0,
+        )
+        .map_err(|e| anyhow::anyhow!("calibration add_collection: {e}"))?;
+    for tool in registry::all_tools() {
+        builder
+            .add_section_to_collection(
+                layer,
+                collection,
+                tool.name.to_string(),
+                render_tool_json_line(tool),
+                100.0,
+            )
+            .map_err(|e| anyhow::anyhow!("calibration add tool {}: {e}", tool.name))?;
+    }
+
+    // Outro: close the `<tools>` block, give the call instruction, and emit the
+    // system-close marker so the whole system message is well-formed.
+    let outro = format!(
+        "</tools>\n\nFor a tool call, return:\n<tool_call>\n\
+         {{\"name\": <tool-name>, \"arguments\": <args-json-object>}}\n</tool_call>{sys_end}",
+        sys_end = dialect.system_end,
+    );
+    builder
+        .add_section(layer, "tools_outro", outro, 50.0)
+        .map_err(|e| anyhow::anyhow!("calibration add outro: {e}"))?;
+
+    Ok((builder, layer, group))
 }
 
 // ── Tool-call extraction ─────────────────────────────────────────────────────
@@ -228,7 +283,12 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Scan a model response for tool-call blocks.
+/// Scan a model response for tool-call blocks **outside** its reasoning.
+///
+/// `<think>…</think>` blocks are stripped before scanning: a tool call the model
+/// writes while thinking is deliberation, not an invocation, so it is left inline
+/// in the streamed text and never dispatched. Only calls in the post-think answer
+/// are returned.
 ///
 /// The canonical Hermes format is `<tool_call>{json}</tool_call>`, but
 /// Qwen3-A3B (especially in `/no_think` mode) is unreliable about the tags:
@@ -248,6 +308,12 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     use regex::Regex;
     use std::sync::OnceLock;
+    // A `<tool_call>` emitted *inside* a `<think>…</think>` reasoning block is the
+    // model thinking out loud, not an invocation to dispatch. Strip the reasoning
+    // blocks first so only calls in the post-think answer are extracted — the JSON
+    // still streams to the client inline, it is simply never executed.
+    let response_text = strip_think_blocks_keep_layout(response_text);
+    let response_text = response_text.as_str();
     // Strict, well-formed match: <tool_call>...{...}...</tool_call>
     static STRICT_RE: OnceLock<Regex> = OnceLock::new();
     let strict_re = STRICT_RE.get_or_init(|| {
@@ -677,6 +743,58 @@ some text
     }
 
     #[test]
+    fn extract_tool_calls_ignores_call_inside_think_block() {
+        // A tool call the model writes while reasoning is deliberation, not an
+        // invocation — it must not be dispatched.
+        let text = r#"<think>
+Maybe I should call <tool_call>{"name": "datetime", "arguments": {}}</tool_call> to check.
+</think>
+The time doesn't matter here."#;
+        let calls = extract_tool_calls(text);
+        assert!(calls.is_empty(), "in-think call was dispatched: {calls:?}");
+    }
+
+    #[test]
+    fn extract_tool_calls_dispatches_call_after_think_block() {
+        // The model reasons, closes the block, then emits the real call.
+        let text = r#"<think>
+I'll check the time.
+</think>
+<tool_call>{"name": "datetime", "arguments": {"timezone": "UTC"}}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "post-think call not dispatched: {calls:?}");
+        assert_eq!(calls[0].name, "datetime");
+    }
+
+    #[test]
+    fn extract_tool_calls_ignores_in_think_keeps_post_think() {
+        // A call mid-thought is ignored; the one after `</think>` is kept.
+        let text = r#"<think>
+I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_call> but no.
+</think>
+<tool_call>{"name": "datetime", "arguments": {}}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected only the post-think call: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "datetime");
+    }
+
+    #[test]
+    fn extract_tool_calls_ignores_bare_json_call_inside_think() {
+        // The bare-JSON recovery pass must also respect the think boundary.
+        let text =
+            "<think>\n{\"name\": \"datetime\", \"arguments\": {}}\n</think>\nNo tool needed.";
+        let calls = extract_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "bare in-think call was dispatched: {calls:?}"
+        );
+    }
+
+    #[test]
     fn run_tool_unknown_returns_error_shape() {
         let ctx = ToolContext::default();
         let call = ToolCall {
@@ -746,34 +864,5 @@ some text
         assert_eq!(parsed["name"], "datetime");
         assert!(parsed["description"].is_string());
         assert!(parsed["parameters"].is_object());
-    }
-
-    #[test]
-    fn build_tool_summary_groups_by_category() {
-        let comp = build_tool_summary(false);
-        // Headers come from the registry's category labels; tools list under them.
-        assert!(comp.contains("## Files"), "missing Files header:\n{comp}");
-        assert!(comp.contains("file_read"), "missing a Files tool:\n{comp}");
-        assert!(
-            comp.contains("## Code execution") && comp.contains("code_run"),
-            "missing Code execution group:\n{comp}"
-        );
-        // Every category header that appears is `## <label>`; no decode artefacts.
-        assert!(!comp.contains("<think>"), "summary must be decode-free");
-    }
-
-    #[test]
-    fn build_tool_summary_restricted_drops_high_risk() {
-        let restricted = build_tool_summary(true);
-        // `code_run` is high-risk → absent from the restricted summary; a safe
-        // tool like `file_read` remains.
-        assert!(
-            !restricted.contains("code_run"),
-            "high-risk tool leaked into restricted summary:\n{restricted}"
-        );
-        assert!(
-            restricted.contains("file_read"),
-            "safe tool missing from restricted summary:\n{restricted}"
-        );
     }
 }

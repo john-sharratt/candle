@@ -120,16 +120,12 @@ impl TurnChunkGrid {
 }
 
 /// A turn's reload metadata — everything the substrate's restore loop
-/// needs, none of the KV bytes. Recovered from the `Tokens` /
-/// `Signatures` records plus the in-RAM chunk index; the chunk
-/// **payloads** stay on disk until a cold→hot elevation reads them via
-/// [`recover_turn_grid`].
+/// needs, none of the KV bytes. Recovered from the `Tokens` record plus
+/// the in-RAM chunk index; the chunk **payloads** stay on disk until a
+/// cold→hot elevation reads them via [`recover_turn_grid`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveredTurnMeta {
     pub token_ids: Vec<u32>,
-    /// Per-chunk BDP provenance signatures `(token_count, syn‖sem‖prag bytes)`,
-    /// in chunk order — empty if the turn has no `Signatures` record.
-    pub signatures: Vec<(u16, Vec<u8>)>,
     /// Sum of the turn's per-chunk token counts (one layer's worth — all
     /// layers seal in lockstep). `0` when no `Chunk` records exist yet.
     pub token_count: usize,
@@ -149,52 +145,6 @@ pub fn encode_token_ids(ids: &[u32]) -> Vec<u8> {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out
-}
-
-/// Encode a turn's per-chunk BDP signatures as the `Signatures` record
-/// payload. Each entry is `(token_count, raw bytes)` — the bytes are the
-/// concatenated syn/sem/prag `TokenSignature`s read from the provenance
-/// file (`token_count * 48` bytes). Inverse of [`decode_signatures`].
-pub fn encode_signatures(entries: &[(u16, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (token_count, bytes) in entries {
-        out.extend_from_slice(&token_count.to_le_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(bytes);
-    }
-    out
-}
-
-/// Decode a `Signatures` record payload into `(token_count, raw bytes)`
-/// entries — one per sealed chunk, in chunk order.
-pub fn decode_signatures(payload: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
-    let mut pos = 0usize;
-    let take = |p: &mut usize, n: usize| -> Result<&[u8]> {
-        if *p + n > payload.len() {
-            return Err(PersistenceError::Truncated {
-                need: n,
-                have: payload.len().saturating_sub(*p),
-            });
-        }
-        let s = &payload[*p..*p + n];
-        *p += n;
-        Ok(s)
-    };
-    let n_entries = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(n_entries);
-    for _ in 0..n_entries {
-        let token_count = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap());
-        let n_bytes = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
-        out.push((token_count, take(&mut pos, n_bytes)?.to_vec()));
-    }
-    if pos != payload.len() {
-        return Err(PersistenceError::Corrupt(format!(
-            "Signatures payload has {} trailing bytes",
-            payload.len() - pos
-        )));
-    }
-    Ok(out)
 }
 
 /// Decode a `Tokens` record payload back into token ids.
@@ -471,12 +421,12 @@ pub fn recover_turn_grid(
     }
 }
 
-/// Recover a turn's reload metadata: token ids, BDP signatures, and the
-/// per-layer token count. Reads only the (small) `Tokens` and
-/// `Signatures` records; the token count comes straight from the in-RAM
-/// chunk index, so the turn's KV payload bytes are never touched. This
-/// is what the startup restore loop calls per turn — cold KV stays on
-/// disk until a projection elevates it via [`recover_turn_grid`].
+/// Recover a turn's reload metadata: token ids and the per-layer token
+/// count. Reads only the (small) `Tokens` record; the token count comes
+/// straight from the in-RAM chunk index, so the turn's KV payload bytes
+/// are never touched. This is what the startup restore loop calls per
+/// turn — cold KV stays on disk until a projection elevates it via
+/// [`recover_turn_grid`].
 pub fn recover_turn_meta(
     p: &mut SubstratePersistence,
     substrate: &Substrate,
@@ -503,14 +453,8 @@ pub fn recover_turn_meta(
         None => Vec::new(),
     };
 
-    let signatures = match p.read_signatures(substrate, stream_id)? {
-        Some(bytes) => decode_signatures(&bytes)?,
-        None => Vec::new(),
-    };
-
     Ok(RecoveredTurnMeta {
         token_ids,
-        signatures,
         token_count,
     })
 }
@@ -682,7 +626,6 @@ pub fn recovered_turn_decls(substrate: &Substrate) -> Vec<TurnDecl> {
 mod tests {
     use super::*;
     use crate::persistence::record::ChunkPayload;
-    use crate::persistence::streams::PerDepthScores;
     use crate::persistence::SUBSTRATE_DIR;
     use std::path::PathBuf;
 
@@ -726,8 +669,8 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: PerDepthScores::default(),
             segments: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -769,23 +712,6 @@ mod tests {
     #[test]
     fn decode_token_ids_rejects_a_ragged_payload() {
         assert!(decode_token_ids(&[0u8, 1, 2]).is_err());
-    }
-
-    #[test]
-    fn signatures_round_trip() {
-        let entries = vec![
-            (32u16, (0..32u32 * 48).map(|i| i as u8).collect::<Vec<u8>>()),
-            (12u16, vec![0xABu8; 12 * 48]),
-            (0u16, Vec::new()),
-        ];
-        let bytes = encode_signatures(&entries);
-        assert_eq!(decode_signatures(&bytes).unwrap(), entries);
-    }
-
-    #[test]
-    fn decode_signatures_rejects_truncation() {
-        let bytes = encode_signatures(&[(4u16, vec![1u8; 4 * 48])]);
-        assert!(decode_signatures(&bytes[..bytes.len() - 3]).is_err());
     }
 
     #[test]
@@ -897,6 +823,46 @@ mod tests {
                 .expect("projection events recovered after restart");
             assert_eq!(blob, payload.as_slice());
             assert_eq!(decode_events(blob), events);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wide_q_sigs_persist_and_recover() {
+        use crate::projection::{TimelineId, TurnIndex};
+        use crate::provenance::{decode_wide_sigs, encode_wide_sigs, WideQSig};
+
+        let dir = tmp_dir("wide_q_sigs");
+        let decl = turn_decl(9, 0, 3);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+
+        // A 3-token wide history, 4 heads × head_dim 128, alternating signs per token.
+        let history: Vec<WideQSig> = (0..3)
+            .map(|t| {
+                let band: Vec<f32> = (0..4 * 128)
+                    .map(|i| if (i + t) % 2 == 0 { 1.0 } else { -1.0 })
+                    .collect();
+                WideQSig::from_band(&band, 128)
+            })
+            .collect();
+        let payload = encode_wide_sigs(&history);
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            sp.append_wide_q_sigs(stream_id, &payload).unwrap();
+            sp.commit().unwrap();
+        }
+        // Reopen — simulated daemon restart — and recover the window.
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            let blob = substrate
+                .wide_q_sigs_blob(tl, TurnIndex(decl.turn_index))
+                .expect("wide-Q sigs recovered after restart");
+            assert_eq!(blob, payload.as_slice());
+            assert_eq!(decode_wide_sigs(blob), Some(history));
         }
         std::fs::remove_dir_all(&dir).ok();
     }

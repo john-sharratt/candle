@@ -16,12 +16,18 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ExecAsyncRequest {
+    /// The session id returned by the corresponding ssh_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// The shell command to start on the remote host.
     #[validate(length(min = 1))]
     pub command: String,
+    /// Environment variables to set for the command, as name→value pairs.
+    /// Defaults to none (inherits the session environment).
     pub env: Option<HashMap<String, String>>,
+    /// Working directory to run the command in. Defaults to the session's current directory.
     pub cwd: Option<String>,
+    /// Maximum seconds to let the command run. No default is applied.
     pub timeout_sec: Option<u32>,
 }
 

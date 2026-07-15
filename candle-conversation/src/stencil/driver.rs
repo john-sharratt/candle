@@ -115,6 +115,13 @@ impl StencilDriver {
         self.session.tree()
     }
 
+    /// Whether the cursor sits in a terminal free-text span — the only place
+    /// the sampler's hard-cap closing-statement script may play — see
+    /// [`StencilSession::in_terminal_close_span`].
+    pub fn in_terminal_close_span(&self) -> bool {
+        self.session.in_terminal_close_span()
+    }
+
     /// What to do for the next decode step: prefill a static run, mask a branch,
     /// free-decode a span, or finish.  After a `Prefill` the caller injects the
     /// run and calls `step` again; after `Branch`/`Free` it samples a token under
@@ -307,6 +314,15 @@ mod tests {
         {"name":"path","type":"string","required":true}]}]"#;
     const INT_ONLY: &str = r#"[{"name":"wait","params":[
         {"name":"secs","type":"integer","required":true}]}]"#;
+
+    #[test]
+    fn tool_call_value_span_is_never_a_terminal_close_span() {
+        // A tool-call value consumes its own close token (no suppress_close):
+        // the sampler's closing-statement script must not play there.
+        let v = TestVocab::new();
+        let driver = driver_at_first_value(STR_ONLY, &v);
+        assert!(!driver.in_terminal_close_span());
+    }
 
     #[test]
     fn clean_string_close_does_not_heal() {

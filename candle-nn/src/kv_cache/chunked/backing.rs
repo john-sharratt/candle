@@ -924,12 +924,30 @@ impl ChunkedKvBacking {
         Some(seq.writer_start_idx())
     }
 
+    /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the
+    /// exact layout attention reads (writer chunk gets the `seq_offset`-derived
+    /// length). A provenance / diagnostic gather consults this to check only real
+    /// slots and skip partial-chunk padding. See
+    /// [`super::types::SequenceState::provenance_chunk_layout`].
+    pub fn provenance_chunk_layout(
+        &self,
+        batch_idx: usize,
+        seq_offset: usize,
+    ) -> Vec<(u16, u16, usize)> {
+        let Ok(state) = self.state.read() else {
+            return Vec::new();
+        };
+        match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
+            Some(seq) => seq.provenance_chunk_layout(seq_offset),
+            None => Vec::new(),
+        }
+    }
+
     /// Visit `batch_idx`'s live chunks as borrowed [`LiveChunkRef`]s under
     /// the state read lock — the zero-clone path for per-forward metadata
-    /// builds. [`Self::live_chunks_as_sealed`] stays for callers that need
-    /// OWNED snapshots (seal/persist/migration); this path exists because
-    /// its per-chunk clones + `arena_byte_size` walks were the dominant
-    /// host cost of a prefill call at deep prefixes.
+    /// builds, avoiding the per-chunk clones + `arena_byte_size` walks that
+    /// dominate host cost at deep prefixes. [`Self::live_chunks_as_sealed`]
+    /// serves callers that need OWNED snapshots (seal/persist/migration).
     pub fn visit_live_chunks<R>(
         &self,
         batch_idx: usize,
@@ -981,22 +999,26 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Rebuild the GPU slot-state buffers for all sequences in `batch_entries`
-    /// and return `(device_ptr, n_chunks, write_chunk_idx)` per entry.
-    ///
-    /// Invalidate the persistent GPU slot-state buffers for all sequences in
-    /// `batch_entries`.
-    ///
-    /// Explicitly clear the persistent decode GPU buffers for the selected
-    /// sequences so the next decode sync is forced to rebuild them.
-    pub fn invalidate_decode_gpu_chunks(&self, batch_entries: &[(usize, usize)]) {
-        if let Ok(mut state) = self.state.write() {
-            for &(seq_idx, _) in batch_entries {
-                if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
-                    seq.invalidate_gpu_chunks();
-                }
+    /// Patch each sequence's cached decode slot-state WRITER slice after a
+    /// mid-decode prefill wrote tokens into the writer chunk in place — see
+    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(1) per
+    /// sequence per layer; sequences with no cached buffer (never decoded, or
+    /// cleared by a chunk-boundary append) rebuild fully on the next decode
+    /// sync instead.
+    pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let arena_info = self.resolve_arena_info()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        for &(seq_idx, _) in batch_entries {
+            if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
+                seq.refresh_decode_writer_slice(n_kv_head, head_dim, &arena_info)?;
             }
         }
+        Ok(())
     }
 
     /// Lightweight host-side validation for the paged decode hot path.

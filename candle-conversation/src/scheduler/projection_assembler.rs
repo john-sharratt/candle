@@ -295,6 +295,11 @@ pub(crate) fn materialize_conversation(
                     kind: resolver.turn_kind(group, index),
                     reason: origins.get(&(group, index)).copied(),
                     timeline: timeline.map(|tl| tl.raw()),
+                    // Materialized display spine — the turn is shown, and the
+                    // belief score isn't threaded here (the carry reads
+                    // `ProjectionSelection::turns`, not the materialized pieces).
+                    selected: true,
+                    score: 0.0,
                 },
             }),
             // The live user message is a separate prefill unit (not part of

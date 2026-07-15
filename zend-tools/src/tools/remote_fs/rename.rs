@@ -11,10 +11,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RenameRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Existing remote path to rename or move.
     #[validate(length(min = 1))]
     pub from: String,
+    /// New remote path.
     #[validate(length(min = 1))]
     pub to: String,
 }

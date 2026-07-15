@@ -103,6 +103,42 @@ impl StencilSession {
         &self.tree
     }
 
+    /// Whether the cursor sits in a free-text span where a sampled close ends
+    /// the whole block (a TERMINAL span) — the only place the sampler's
+    /// hard-cap closing-statement script may play.
+    ///
+    /// Every think span suppresses its close (the tree injects the real
+    /// `</think>` as a static), so suppression alone doesn't distinguish the
+    /// cases — what does is the walk AFTER the span: a chain of statics
+    /// running to `End` means the block is closing here, while any further
+    /// free/branch content means the steering re-opens reasoning (a
+    /// deep/exhaustive "But wait, " continuation) and the injected
+    /// continuation phrase — not a closing statement — is the bridge.
+    ///
+    /// Anywhere else — a continuation span, a span that consumes its own
+    /// close token (tool-call values), or a cursor not in free text at all
+    /// (static prefill, a branch decision) — this is false and a forced close
+    /// stays bare.
+    pub fn in_terminal_close_span(&self) -> bool {
+        let Cursor::InFreeText { node, .. } = self.cursor else {
+            return false;
+        };
+        let StencilNode::FreeText(span) = self.tree.node(node) else {
+            return false;
+        };
+        if !span.suppress_close {
+            return false;
+        }
+        let mut cur = span.next;
+        loop {
+            match self.tree.node(cur) {
+                StencilNode::Static { next, .. } => cur = *next,
+                StencilNode::End => return true,
+                _ => return false,
+            }
+        }
+    }
+
     /// What to do at the current cursor.  For static structure this advances the
     /// cursor and returns `Prefill`; for a branch/free-text it leaves the cursor
     /// awaiting a decoded token.

@@ -69,20 +69,29 @@ impl ThinkMode {
     /// closes the block at the next clause boundary once passed, `force` is the
     /// hard token cap that rewrites the next token to `</think>`.  Higher dials get
     /// more room per span — and, because they also have more spans, far more total
-    /// (Quick: 1×80; Balanced: 1×240; Deep: 3×360; Exhaustive: 5×560).
+    /// (Quick: 1×300; Balanced: 1×400; Deep: 3×672; Exhaustive: 4×1120).
     ///
-    /// Each `force` sits below that mode's tree `forced_after` (Quick 96, Balanced
-    /// /Deep 512, Exhaustive 768 — the stencil's hard backstop) so the EOT ramp
+    /// Each `force` sits below that mode's tree `forced_after` (Quick/Balanced 512,
+    /// Deep 1024, Exhaustive 1536 — the stencil's hard backstop) so the EOT ramp
     /// closes a span gracefully before the stencil force-cuts it.  `Off` has no
-    /// steered spans, so its budget bounds the whole block.  Worth A/B-ing on the
-    /// real checkpoint.
+    /// steered spans, so its budget bounds the whole block.
+    ///
+    /// Tuned on Qwen3-30B-A3B: the model's tool-decision pattern spends ~40–60
+    /// tokens surveying the request and the available tools before the call
+    /// decision forms (~token 90–150), so every dial's force cap sits well
+    /// above that point — a block cut before the decision forms leaves the
+    /// plan unresolved and the model falls into answer mode, fabricating a
+    /// result instead of calling.  `Quick` matches `Off`'s whole-block budget
+    /// exactly: quick steering primes a short thought, it must never allow
+    /// LESS room than an unsteered block gets.  The dials above blend up to
+    /// Exhaustive's ceiling (graceful ≈ ⅔ of force).
     pub fn eot_budget(self) -> (i32, i32) {
         match self {
             ThinkMode::Off => (220, 300),
-            ThinkMode::Quick => (48, 80),
-            ThinkMode::Balanced => (160, 240),
-            ThinkMode::Deep => (240, 360),
-            ThinkMode::Exhaustive => (384, 560),
+            ThinkMode::Quick => (220, 300),
+            ThinkMode::Balanced => (264, 400),
+            ThinkMode::Deep => (448, 672),
+            ThinkMode::Exhaustive => (744, 1120),
         }
     }
 
@@ -192,10 +201,10 @@ fn close_tag_then_end(spec: &mut TreeSpec) -> SpecId {
 /// The EOT close ramp ([`ThinkMode::eot_budget`]) is tuned to fire below these, so
 /// a span closes gracefully on a clause boundary before the stencil force-cuts it;
 /// these are the last-resort caps that apply only if the ramp never fires.
-const QUICK_SPAN_CAP: u32 = 96;
+const QUICK_SPAN_CAP: u32 = 512;
 const BALANCED_SPAN_CAP: u32 = 512;
-const DEEP_SPAN_CAP: u32 = 512;
-const EXHAUSTIVE_SPAN_CAP: u32 = 768;
+const DEEP_SPAN_CAP: u32 = 1024;
+const EXHAUSTIVE_SPAN_CAP: u32 = 1536;
 
 /// `Deep`'s continuation phrases — prefilled after a dropped close to re-steer
 /// the next span: one `"But wait, "` reconsideration, then a closing statement
@@ -364,6 +373,65 @@ mod tests {
     #[test]
     fn off_registers_no_tree() {
         assert!(compile_think_tree(ThinkMode::Off, &env()).is_none());
+    }
+
+    /// The hard-cap closer gate: a close in quick/balanced's single span (and
+    /// in deep's FINAL span) ends the block — the sampler's closing-statement
+    /// script applies. A close in deep's earlier spans is re-steered into more
+    /// reasoning ("But wait, ") — the script must not play there, and it must
+    /// never play while the cursor is outside free text (static prefill).
+    #[test]
+    fn in_terminal_close_span_distinguishes_terminal_spans_from_continuations() {
+        let v = vocab();
+
+        // Quick: single span straight to the injected close — terminal. Before
+        // the free span (opener prefill pending) the cursor is not in free
+        // text, so the gate is closed there.
+        let mut d = StencilDriver::new(tree_for(ThinkMode::Quick));
+        assert!(
+            !d.in_terminal_close_span(),
+            "not in free text yet — the gate is closed during static prefill"
+        );
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            d.in_terminal_close_span(),
+            "quick's only span is terminal — the closer script applies"
+        );
+
+        // Deep: spans 1..n retire into continuation phrases; only the last is
+        // terminal.
+        let mut d = StencilDriver::new(tree_for(ThinkMode::Deep));
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            !d.in_terminal_close_span(),
+            "deep span 1 retires into 'But wait, ' — more reasoning follows"
+        );
+        free_decode(&mut d, 3);
+        assert_eq!(
+            d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
+            Healed::Drop
+        );
+        let (mask, text) = step_to_decode(&mut d, &v);
+        assert!(text.contains("But wait"));
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            !d.in_terminal_close_span(),
+            "the 'But wait' span still retires into the closing statement"
+        );
+        free_decode(&mut d, 3);
+        assert_eq!(
+            d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
+            Healed::Drop
+        );
+        let (mask, text) = step_to_decode(&mut d, &v);
+        assert!(text.contains("So, where I land"));
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            d.in_terminal_close_span(),
+            "deep's final span is terminal — the closer script applies"
+        );
     }
 
     #[test]

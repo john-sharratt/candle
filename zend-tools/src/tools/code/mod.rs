@@ -1,48 +1,50 @@
 //! Code execution tools: `code_run`, `code_session_{open,exec,list,close}`.
 //!
-//! Run code in a subprocess interpreter.  Two modes:
+//! Runs **JavaScript** on the embedded pure-Rust [`boa_engine`] VM — no external
+//! interpreter, no subprocess. The VM is sandboxed by construction (no
+//! filesystem / network / process access) and bounds runaway scripts with loop
+//! and recursion limits. See [`engine`].
 //!
 //! # `code_run` — one-shot execution
 //!
-//! Spawn an interpreter, execute a snippet, return stdout/stderr/exit_code,
-//! then terminate.  Right for short scripts where you don't need persistent
-//! state across calls.
+//! Evaluate a snippet in a fresh VM and return its console output, final value,
+//! and success flag. Right for short scripts with no state across calls.
 //!
 //! # `code_session_*` — persistent REPL
 //!
-//! Open a long-lived interpreter process with shared namespace state.  Each
-//! `code_session_exec` call sends code to the running REPL and reads back the
-//! result.  State (variables, imports, function definitions) persists across
-//! calls within the same session.
+//! A session accumulates the source of every successful `code_session_exec`
+//! call. Each subsequent exec replays that history in a fresh VM (silently) to
+//! rebuild variable / function state, then runs the new snippet. State
+//! (`let`/`const`/`function` bindings) therefore persists across calls without
+//! keeping a live VM around — which matters because `boa_engine::Context` is not
+//! `Send` and the session registry is shared across threads. The cost is that
+//! non-deterministic prior expressions (`Math.random()`, `Date.now()`)
+//! re-evaluate on replay; pure state rebuilds exactly.
 //!
-//! # Supported languages
-//!
-//! - **Python** — uses the embedded REPL defined by [`PYTHON_REPL`]; requires
-//!   `python3` on PATH
-//! - **JavaScript/Node** — uses the embedded REPL defined by [`NODE_REPL`];
-//!   requires `node` on PATH
-//!
-//! # Communication protocol
-//!
-//! The REPL scripts use a length-prefixed stdin protocol:
-//! 1. Orchestrator writes `<byte_count>\n` then the code bytes
-//! 2. REPL executes, captures stdout/stderr via redirect
-//! 3. REPL writes a JSON result line then the sentinel `__ZEND_DONE__\n`
-//!
-//! This avoids PTY complexity and makes the output boundary unambiguous.
+//! Because replay concatenates each snippet's source into one script, a
+//! top-level `let`/`const` name may be declared **once** per session — a later
+//! snippet that re-declares the same name (`let x = …` after an earlier
+//! `let x = …`) fails with a redeclaration `SyntaxError`, exactly as it would in
+//! a single script. Re-assign (`x = …`) to update a binding across calls, or use
+//! a fresh name; this is a deliberate consequence of the state-rebuild model, not
+//! a bug.
 //!
 //! # Error codes
 //!
 //! | Code | Cause |
 //! |------|-------|
-//! | `interpreter_not_found` | `python3` or `node` not found on PATH |
-//! | `timeout` | Execution exceeded `timeout_sec` |
-//! | `execution_failed` | Interpreter process died unexpectedly |
-//! | `session_not_found` | Session ID not in registry |
+//! | `interpreter_not_found` | requested a language other than JavaScript |
+//! | `execution_failed` | engine setup failed (should not occur) |
+//! | `session_not_found` | session ID not in registry |
+//!
+//! A thrown JS exception or a hit VM limit is **not** an error envelope: the
+//! call succeeds with `ok: false` and the message in `error`, mirroring how a
+//! REPL reports a runtime fault.
 
 use crate::ToolError;
 use thiserror::Error;
 
+pub mod engine;
 pub mod run;
 pub mod session_close;
 pub mod session_exec;
@@ -55,12 +57,19 @@ pub use session_exec::CODE_SESSION_EXEC;
 pub use session_list::CODE_SESSION_LIST;
 pub use session_open::CODE_SESSION_OPEN;
 
+/// Canonical language check: the code tools run JavaScript only. Accepts the
+/// common aliases the model might use.
+pub fn is_javascript(language: &str) -> bool {
+    matches!(
+        language.trim().to_ascii_lowercase().as_str(),
+        "javascript" | "js" | "node" | "nodejs" | "ecmascript"
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum CodeError {
     #[error("interpreter not found: {0}")]
     InterpreterNotFound(String),
-    #[error("execution timed out")]
-    Timeout,
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
     #[error("session not found: {0}")]
@@ -71,7 +80,6 @@ impl ToolError for CodeError {
     fn code(&self) -> &'static str {
         match self {
             CodeError::InterpreterNotFound(_) => "interpreter_not_found",
-            CodeError::Timeout => "timeout",
             CodeError::ExecutionFailed(_) => "execution_failed",
             CodeError::SessionNotFound(_) => "session_not_found",
         }
@@ -81,60 +89,3 @@ impl ToolError for CodeError {
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
-
-pub const PYTHON_REPL: &str = r#"import sys, json, traceback, io, contextlib
-SENTINEL = '__ZEND_DONE__'
-_ns = {}
-while True:
-    line = sys.stdin.readline()
-    if not line: break
-    try: n = int(line.strip())
-    except ValueError: continue
-    code = sys.stdin.read(n)
-    out, err = io.StringIO(), io.StringIO()
-    try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            exec(compile(code, '<cell>', 'exec'), _ns)
-        r = {'ok': True, 'stdout': out.getvalue(), 'stderr': err.getvalue()}
-    except SystemExit as e:
-        r = {'ok': False, 'error': 'SystemExit:'+str(e.code), 'stdout': out.getvalue(), 'stderr': err.getvalue()}
-    except Exception:
-        r = {'ok': False, 'error': traceback.format_exc(), 'stdout': out.getvalue(), 'stderr': err.getvalue()}
-    sys.stdout.write(json.dumps(r)+'\n'+SENTINEL+'\n')
-    sys.stdout.flush()
-"#;
-
-pub const NODE_REPL: &str = r#"const vm = require('vm');
-const readline = require('readline');
-const ctx = vm.createContext({require, console, process, Buffer, Math, JSON, Date, Array, Object, String, Number, Boolean, Error, Promise, Map, Set, setTimeout, clearTimeout, setInterval, clearInterval});
-const SENTINEL = '__ZEND_DONE__';
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => {
-    buf += d;
-    while (true) {
-        const nl = buf.indexOf('\n');
-        if (nl < 0) break;
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        const n = parseInt(line, 10);
-        if (isNaN(n)) continue;
-        if (buf.length < n) { buf = line + '\n' + buf; break; }
-        const code = buf.slice(0, n);
-        buf = buf.slice(n);
-        const logs = [];
-        const origLog = console.log, origErr = console.error;
-        console.log = (...a) => logs.push(a.map(String).join(' '));
-        console.error = (...a) => logs.push('[err] '+a.map(String).join(' '));
-        let r;
-        try {
-            vm.runInContext(code, ctx);
-            r = {ok: true, stdout: logs.join('\n'), stderr: ''};
-        } catch(e) {
-            r = {ok: false, error: e.stack, stdout: logs.join('\n'), stderr: ''};
-        }
-        console.log = origLog; console.error = origErr;
-        process.stdout.write(JSON.stringify(r)+'\n'+SENTINEL+'\n');
-    }
-});
-"#;

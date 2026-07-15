@@ -149,6 +149,12 @@ impl ToolCallEnvelope {
     }
 }
 
+/// The tool-call stencil tree's label. The scheduler keys tool-call-specific
+/// behavior off the active stencil's tree label (repetition-penalty
+/// suppression, the in-call reprojection freeze at first-token promotion), so
+/// the label is a shared constant rather than a string literal in each place.
+pub const TOOL_CALL_TREE_LABEL: &str = "tool_call";
+
 /// Compile a tool catalog into a [`TreeSpec`].  Errors on an empty catalog or a
 /// name/enum collision the trie rejects.
 pub fn compile_tool_call_tree(
@@ -159,7 +165,7 @@ pub fn compile_tool_call_tree(
         return Err(BuildError::ToolSchema("empty tool catalog".into()));
     }
     let mut b = ToolTreeBuilder {
-        spec: TreeSpec::new("tool_call"),
+        spec: TreeSpec::new(TOOL_CALL_TREE_LABEL),
         env,
     };
     let end = b.spec.push(NodeSpec::End);

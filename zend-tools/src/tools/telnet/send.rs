@@ -12,11 +12,14 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SendRequest {
+    /// The session id returned by the corresponding telnet_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Text to send. A trailing "\r\n" is appended automatically if absent.
     pub send: String,
     /// Regex to wait for. Defaults to the session's prompt_pattern.
     pub expect: Option<String>,
+    /// Maximum seconds to wait for the expect pattern (0–300). Defaults to 30.
     #[validate(range(max = 300))]
     pub timeout_sec: Option<u32>,
 }

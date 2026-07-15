@@ -1592,6 +1592,7 @@ fn test_quantized_read_single_token() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
 
     // Read it back
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
@@ -1627,6 +1628,7 @@ fn test_quantized_read_multiple_tokens() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, seq_len);
 
     // Read all back
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, seq_len)?;
@@ -1661,6 +1663,7 @@ fn test_quantized_roundtrip_accuracy_q8_0() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
 
     // Read back and compare (cast to F32 for comparison since backing may use F16)
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
@@ -1702,6 +1705,7 @@ fn test_quantized_roundtrip_accuracy_q4_0() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
 
     // Read back and compare (cast to F32 for comparison since backing may use F16)
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
@@ -1734,6 +1738,7 @@ fn test_float_read_contiguous() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, seq_len);
 
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, seq_len)?;
 
@@ -2064,6 +2069,7 @@ fn test_quantized_roundtrip_accuracy_q4_ks() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
     let k_read = k_read.to_dtype(candle::DType::F32)?;
     let v_read = v_read.to_dtype(candle::DType::F32)?;
@@ -2094,6 +2100,7 @@ fn test_quantized_roundtrip_accuracy_q8_ks() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
     let k_read = k_read.to_dtype(candle::DType::F32)?;
     let v_read = v_read.to_dtype(candle::DType::F32)?;
@@ -2124,6 +2131,7 @@ fn test_quantized_roundtrip_accuracy_q2_0() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
     let k_read = k_read.to_dtype(candle::DType::F32)?;
     let v_read = v_read.to_dtype(candle::DType::F32)?;
@@ -2154,6 +2162,7 @@ fn test_quantized_roundtrip_accuracy_q3_0() -> Result<()> {
     let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, 1, head_dim), &device)?;
     backing.write_contiguous(batch_idx, 0, &k, &v)?;
+    backing.set_len(batch_idx, 1);
     let (k_read, v_read) = backing.read_contiguous(batch_idx, 0, 1)?;
     let k_read = k_read.to_dtype(candle::DType::F32)?;
     let v_read = v_read.to_dtype(candle::DType::F32)?;

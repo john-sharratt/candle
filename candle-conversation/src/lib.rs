@@ -79,9 +79,6 @@ pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
-pub use provenance::{
-    ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnChunkRank, TurnSignatures,
-};
 pub use scheduler::ScopeProgressFn;
 pub use sequence_handle::SequenceId;
 pub use stats::TurnStats;

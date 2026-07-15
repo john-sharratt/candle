@@ -16,11 +16,17 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Target hostname (also used for TLS certificate verification / SNI).
     #[validate(length(min = 1))]
     pub host: String,
+    /// Target TCP port (0–65535).
     pub port: u16,
+    /// If true, skip certificate validation (accept invalid/self-signed certs).
+    /// Default false.
     pub accept_invalid_certs: Option<bool>,
+    /// Name of a stored client credential to present. Default none.
     pub credential_name: Option<String>,
+    /// Connection timeout in milliseconds. Default 5000.
     pub timeout_ms: Option<u64>,
 }
 

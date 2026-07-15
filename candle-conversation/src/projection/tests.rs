@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::SummaryMode;
+use super::schema::{GatherScope, SummaryMode};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
@@ -48,6 +48,9 @@ struct MockResolver {
     /// reported by `node_covers`. Empty/absent ⇒ a raw leaf that covers
     /// nothing. Drives the rule-based descendant-dedup tests.
     covers: HashMap<u32, Vec<u32>>,
+    /// (group_raw, tag) → turn_raw, backing `turn_with_tag` so tests can assert
+    /// the default-fallback path resolves a declared default to a real turn.
+    tag_turns: HashMap<(u32, String), u32>,
 }
 
 impl MockResolver {
@@ -89,6 +92,13 @@ impl MockResolver {
 
     fn with_timeline(mut self, timeline: TimelineId) -> Self {
         self.timeline = Some(timeline);
+        self
+    }
+
+    /// Bind `tag` to `idx` in `group` so `turn_with_tag` resolves it — the
+    /// substrate-side counterpart is a `TurnDecl.tags` scan.
+    fn with_tag(mut self, group: GroupId, tag: &str, idx: TurnIndex) -> Self {
+        self.tag_turns.insert((group.raw(), tag.to_string()), idx.0);
         self
     }
 
@@ -138,32 +148,21 @@ impl ContentResolver for MockResolver {
             .unwrap_or(&self.default_tokens)
     }
 
-    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
-        self.timeline
-    }
-
-    fn turn_score(
-        &self,
-        group: GroupId,
-        index: TurnIndex,
-        _formula: super::schema::ScoreFormula,
-        _weights: &super::schema::DepthWeights,
-    ) -> f32 {
-        // Mock returns a single explicit score regardless of formula/weights.
-        // The projection engine still drives the depth-aware path; tests just
-        // bypass the multi-stat machinery.
+    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
+        // Mock returns a single explicit belief score.
         *self
             .scores
             .get(&(group.raw(), index.0))
             .unwrap_or(&self.default_score)
     }
 
-    fn section_score(
-        &self,
-        section: SectionId,
-        _formula: super::schema::ScoreFormula,
-        _weights: &super::schema::DepthWeights,
-    ) -> f32 {
+    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+        // Mirror the real target-aware resolver: stamp the configured timeline
+        // onto every emitted turn.
+        self.timeline
+    }
+
+    fn section_score(&self, section: SectionId) -> f32 {
         // Default 0.0 for any section the test didn't assign a score to.
         // Sections without explicit scores will lose to those with scores.
         *self.section_scores.get(&section.raw()).unwrap_or(&0.0)
@@ -194,11 +193,14 @@ impl ContentResolver for MockResolver {
         &self,
         _timeline: TimelineId,
         _budget: u32,
-        _floor: usize,
-        _formula: super::schema::ScoreFormula,
-        _weights: &super::schema::DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
         self.tree_picks.clone()
+    }
+
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
+        self.tag_turns
+            .get(&(group.raw(), tag.to_string()))
+            .map(|&raw| TurnIndex(raw))
     }
 }
 
@@ -299,6 +301,96 @@ fn yaml_parses_and_assigns_ids() {
     let frame = b.id_for_section_in(dialogue, "frame").unwrap();
     let values = b.id_for_section_in(dialogue, "values").unwrap();
     assert!(frame.raw() < values.raw());
+}
+
+#[test]
+fn group_default_parses_present_and_absent() {
+    // Present: the `structure` group carries a resolved SelectionDefault.
+    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+    let def = b.group(structure).unwrap().default.as_ref();
+    assert_eq!(def.map(|d| d.tag.as_str()), Some("root"));
+
+    // Absent: no `default:` key ⇒ None (every existing fixture stays this way).
+    let b2 = Builder::from_yaml(NO_DEFAULT_YAML).unwrap();
+    let s2 = b2.id_for_group("structure").unwrap();
+    assert!(b2.group(s2).unwrap().default.is_none());
+
+    // Whitespace-only tag is dropped to None by `parse_default`.
+    let blank =
+        DEFAULT_FALLBACK_YAML.replace(r#"default: { tag: "root" }"#, r#"default: { tag: "  " }"#);
+    let b3 = Builder::from_yaml(&blank).unwrap();
+    let s3 = b3.id_for_group("structure").unwrap();
+    assert!(b3.group(s3).unwrap().default.is_none());
+}
+
+#[test]
+fn policy_inherits_default_then_layer_overrides() {
+    let yaml = SIMPLE_YAML
+        .replace(
+            "layers:",
+            "default_policy:\n  preset: high_recall_scope\nlayers:",
+        )
+        .replace(
+            "  - name: dialogue\n    window: 8000\n",
+            "  - name: dialogue\n    window: 8000\n    policy:\n      beta: 0.5\n",
+        );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    // ground inherits the schema default preset verbatim.
+    assert_eq!(
+        b.layer(ground).unwrap().policy.config,
+        super::PolicyPreset::HighRecallScope.config()
+    );
+    // dialogue overrides only beta on top of the inherited high-recall base.
+    let dp = b.layer(dialogue).unwrap().policy.config;
+    assert_eq!(dp.beta, 0.5);
+    assert_eq!(
+        dp.budget_max,
+        super::PolicyPreset::HighRecallScope.config().budget_max
+    );
+}
+
+#[test]
+fn policy_unknown_preset_is_error() {
+    let yaml = SIMPLE_YAML.replace("layers:", "default_policy:\n  preset: nope\nlayers:");
+    assert!(matches!(
+        Builder::from_yaml(&yaml),
+        Err(super::ConstructionError::UnknownPolicyPreset { .. })
+    ));
+}
+
+#[test]
+fn policy_evict_above_min_is_error() {
+    let yaml = SIMPLE_YAML.replace(
+        "  - name: dialogue\n    window: 8000\n",
+        "  - name: dialogue\n    window: 8000\n    policy:\n      min_score: 5\n      evict_score: 10\n",
+    );
+    assert!(matches!(
+        Builder::from_yaml(&yaml),
+        Err(super::ConstructionError::InvalidPolicy { .. })
+    ));
+}
+
+#[test]
+fn gather_scope_defaults_to_shared_and_parses_conversation() {
+    // Unset → Shared.
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert_eq!(b.layer(dialogue).unwrap().gather_scope, GatherScope::Shared);
+
+    // Flagging the dialogue layer parses to Conversation.
+    let yaml = SIMPLE_YAML.replace(
+        "  - name: dialogue\n    window: 8000",
+        "  - name: dialogue\n    gather_scope: conversation\n    window: 8000",
+    );
+    let b2 = Builder::from_yaml(&yaml).unwrap();
+    let d2 = b2.id_for_layer("dialogue").unwrap();
+    assert_eq!(
+        b2.layer(d2).unwrap().gather_scope,
+        GatherScope::Conversation
+    );
 }
 
 #[test]
@@ -3075,135 +3167,6 @@ fn zend_projection_yaml_parses() {
             "{single} should stay single-pass"
         );
     }
-
-    // The dialogue tree's `noop_tool` placeholder injects the `tools` collection:
-    // it seals the stable anchor below the tool block but at projection emits the
-    // provenance-selected real tools, and the collection defers its own emission.
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let tools_cid = b.id_for_collection_in(dialogue, "tools").unwrap();
-    let tree = b
-        .layer(dialogue)
-        .unwrap()
-        .system_prompt
-        .items
-        .iter()
-        .find_map(|it| match it {
-            crate::projection::SystemPromptItem::SectionTree(t) => Some(t),
-            _ => None,
-        })
-        .expect("dialogue layer has a section_tree");
-    let noop = tree
-        .nodes
-        .iter()
-        .find(|n| n.name == "noop_tool")
-        .expect("dialogue tree has a noop_tool placeholder");
-    assert_eq!(
-        noop.inject_collection,
-        Some(tools_cid),
-        "noop_tool must inject the tools collection"
-    );
-    let tools = tree
-        .nodes
-        .iter()
-        .find(|n| n.name == "tools")
-        .and_then(|n| n.collection.as_ref())
-        .expect("dialogue tree has a tools collection node");
-    assert!(
-        tools.deferred_projection,
-        "tools collection must defer its projection to the noop_tool placeholder"
-    );
-}
-
-/// Reproduces the daemon path: load the REAL zend schema, install a tool catalog
-/// at runtime exactly like `install_tool_catalog` does (`add_section_to_collection`),
-/// then project the dialogue layer with `no_think:present` and a resolver that
-/// scores every section 0.0.  With `score_threshold: 0.0` and `top_k: 3`, the
-/// placeholder MUST inject three real tool members.  Guards the inject/defer +
-/// runtime-seal path against silently emitting nothing.
-#[test]
-fn real_yaml_injects_topk_runtime_tools_under_no_think_present() {
-    use crate::projection::{ProjectionMode, SelectionState, SystemPromptItem};
-    use candle_transformers::models::dialect::Dialect;
-
-    let yaml = include_str!("../../../zend/src/prompts/projection.yaml");
-    let dlct = Dialect::chat_ml();
-    let mut b =
-        Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", "candle")], Some(&dlct))
-            .unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let cid = b.id_for_collection_in(dialogue, "tools").unwrap();
-
-    // Runtime catalog install (mimics zend::tools::install_tool_catalog).
-    for i in 0..6 {
-        b.add_section_to_collection(
-            dialogue,
-            cid,
-            format!("tool_{i}"),
-            format!("{{\"name\":\"tool_{i}\"}}"),
-            100.0,
-        )
-        .unwrap();
-    }
-    b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
-        .unwrap();
-
-    // Every runtime-sealed member variant id (all branches), so we can count how
-    // many actually land in the projection regardless of which branch fires.
-    let tree = b
-        .layer(dialogue)
-        .unwrap()
-        .system_prompt
-        .items
-        .iter()
-        .find_map(|it| match it {
-            SystemPromptItem::SectionTree(t) => Some(t),
-            _ => None,
-        })
-        .unwrap();
-    let tc = tree
-        .nodes
-        .iter()
-        .find_map(|n| n.collection.as_ref())
-        .unwrap();
-    let member_ids: std::collections::HashSet<SectionId> =
-        tc.variants.iter().flatten().map(|v| v.id).collect();
-
-    let target = ProjectionTarget {
-        layer: dialogue,
-        group: b.id_for_group("primary_conversation").unwrap(),
-        timeline: TimelineId::for_test(1),
-    };
-    let resolver = MockResolver::new(); // section_score → 0.0 for all
-    let count_tools = |tools_enabled: &str| -> (usize, usize) {
-        let mut sel = SelectionState::new();
-        sel.select("no_think", "present");
-        sel.select("tools_enabled", tools_enabled);
-        let proj = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel);
-        let total = proj.sealed_sections().count();
-        let tools = proj
-            .sealed_sections()
-            .filter(|s| member_ids.contains(&s.id))
-            .count();
-        (tools, total)
-    };
-
-    // Tools ENABLED: the placeholder injects the top-3 real members.
-    let (tools_on, total_on) = count_tools("present");
-    assert_eq!(
-        tools_on, 3,
-        "placeholder must inject top-3 tools (threshold 0.0); got {tools_on}"
-    );
-
-    // Tools DISABLED: the `tools_enabled` optional_group omits the WHOLE block —
-    // zero tool members, and the projection is strictly shorter (the overview +
-    // `<tools>`/`</tools>` markers are gone too, not just the catalog).
-    let (tools_off, total_off) = count_tools("absent");
-    assert_eq!(tools_off, 0, "no tools when the block is gated off");
-    assert!(
-        total_off < total_on,
-        "the gated-off projection must drop the whole block (markers included): \
-         off={total_off} on={total_on}"
-    );
 }
 
 #[test]
@@ -3253,619 +3216,13 @@ layers:
     );
 }
 
-// —— DepthWeights ——————————————————————————————————————————————————————————————
-
-#[test]
-fn depth_weights_default_is_universal_optimum() {
-    use super::schema::DepthWeights;
-    let w = DepthWeights::default();
-    // Universal calibration optimum: syn:1 / sem:1 / prag:4
-    // (1*3 + 1*6 + 4*9) / 6 = 45/6 = 7.5
-    assert!((w.combine(3.0, 6.0, 9.0) - 7.5).abs() < 1e-6);
-}
-
-#[test]
-fn depth_weights_unequal_weights_normalise_correctly() {
-    use super::schema::DepthWeights;
-    let w = DepthWeights {
-        syntactic: 1.0,
-        semantic: 2.0,
-        pragmatic: 1.0,
-    };
-    // (1*4 + 2*8 + 1*12) / 4 = 32/4 = 8.0
-    assert_eq!(w.combine(4.0, 8.0, 12.0), 8.0);
-}
-
-#[test]
-fn depth_weights_all_zero_returns_zero() {
-    use super::schema::DepthWeights;
-    let w = DepthWeights {
-        syntactic: 0.0,
-        semantic: 0.0,
-        pragmatic: 0.0,
-    };
-    // Defensive: division by zero would NaN; we return 0.0 instead.
-    assert_eq!(w.combine(10.0, 20.0, 30.0), 0.0);
-}
-
-#[test]
-fn depth_weights_single_depth_dominant() {
-    use super::schema::DepthWeights;
-    let w = DepthWeights {
-        syntactic: 0.0,
-        semantic: 1.0,
-        pragmatic: 0.0,
-    };
-    // Only semantic contributes.
-    assert_eq!(w.combine(99.0, 5.0, 99.0), 5.0);
-}
-
-#[test]
-fn yaml_depth_weights_default_when_omitted() {
-    use super::schema::DepthWeights;
-    let yaml = r#"
-layers:
-  - name: layer
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let layer_id = b.id_for_layer("layer").unwrap();
-    let layer = b.layer(layer_id).unwrap();
-    assert_eq!(layer.depth_weights, DepthWeights::default());
-}
-
-#[test]
-fn yaml_depth_weights_override() {
-    let yaml = r#"
-layers:
-  - name: layer
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    depth_weights:
-      syntactic: 0.2
-      semantic: 0.6
-      pragmatic: 0.2
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let layer_id = b.id_for_layer("layer").unwrap();
-    let layer = b.layer(layer_id).unwrap();
-    assert!((layer.depth_weights.syntactic - 0.2).abs() < 1e-6);
-    assert!((layer.depth_weights.semantic - 0.6).abs() < 1e-6);
-    assert!((layer.depth_weights.pragmatic - 0.2).abs() < 1e-6);
-}
-
-#[test]
-fn yaml_depth_weights_partial_override_uses_defaults() {
-    use super::schema::DepthWeights;
-    let yaml = r#"
-layers:
-  - name: layer
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    depth_weights:
-      semantic: 5.0
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let layer_id = b.id_for_layer("layer").unwrap();
-    let layer = b.layer(layer_id).unwrap();
-    let default = DepthWeights::default();
-    assert_eq!(layer.depth_weights.syntactic, default.syntactic);
-    assert_eq!(layer.depth_weights.semantic, 5.0);
-    assert_eq!(layer.depth_weights.pragmatic, default.pragmatic);
-}
-
-#[test]
-fn yaml_negative_depth_weight_is_error() {
-    use super::error::ConstructionError;
-    let yaml = r#"
-layers:
-  - name: layer
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    depth_weights:
-      semantic: -0.5
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    match Builder::from_yaml(yaml) {
-        Err(ConstructionError::NegativeDepthWeight { layer, depth, .. }) => {
-            assert_eq!(layer, "layer");
-            assert_eq!(depth, "semantic");
-        }
-        other => panic!("expected NegativeDepthWeight, got {other:?}"),
-    }
-}
-
-// —— End-to-end: Substrate + BDP scores + projection —————————————————————
-
-#[test]
-fn session_resolver_picks_correct_metric_per_score_formula() {
-    use super::schema::{DepthWeights, ScoreFormula};
-    use super::ContentResolver;
-    use crate::substrate::{
-        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
-    };
-
-    let mut r = Substrate::new();
-    let yaml = r#"
-layers:
-  - name: l
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let l = b.id_for_layer("l").unwrap();
-    let g = b.id_for_group("g").unwrap();
-
-    let idx = r.append_with_blocks_for_test(l, g, 10, 0, 1);
-    let mut scores = ProjectionScores::new();
-    scores.set_for_group_test(
-        &r,
-        g,
-        idx,
-        PerDepthScores {
-            syn: TurnScores {
-                max: 1.0,
-                sum: 2.0,
-                mean: 3.0,
-                top_k_mean: 4.0,
-                count: 5.0,
-                span: 0.0,
-                pertok_excess: 0.0,
-            },
-            sem: TurnScores {
-                max: 1.0,
-                sum: 2.0,
-                mean: 3.0,
-                top_k_mean: 4.0,
-                count: 5.0,
-                span: 0.0,
-                pertok_excess: 0.0,
-            },
-            prag: TurnScores {
-                max: 1.0,
-                sum: 2.0,
-                mean: 3.0,
-                top_k_mean: 4.0,
-                count: 5.0,
-                span: 0.0,
-                pertok_excess: 0.0,
-            },
-        },
-    );
-    let r = ScoredSubstrate::new(&r, &scores);
-
-    let w = DepthWeights::default();
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Max, &w), 1.0);
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Sum, &w), 2.0);
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Mean, &w), 3.0);
-    assert_eq!(
-        r.turn_score(g, idx, ScoreFormula::TopKMean { k: 8 }, &w),
-        4.0
-    );
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Count, &w), 5.0);
-}
-
-#[test]
-fn session_resolver_combines_depths_with_weights() {
-    use super::schema::{DepthWeights, ScoreFormula};
-    use super::ContentResolver;
-    use crate::substrate::{
-        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
-    };
-
-    let yaml = r#"
-layers:
-  - name: l
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let l = b.id_for_layer("l").unwrap();
-    let g = b.id_for_group("g").unwrap();
-
-    let mut r = Substrate::new();
-    let idx = r.append_with_blocks_for_test(l, g, 10, 0, 1);
-
-    // Distinct max values per depth so the combine weighting is observable.
-    let mut scores = ProjectionScores::new();
-    scores.set_for_group_test(
-        &r,
-        g,
-        idx,
-        PerDepthScores {
-            syn: TurnScores {
-                max: 10.0,
-                ..Default::default()
-            },
-            sem: TurnScores {
-                max: 50.0,
-                ..Default::default()
-            },
-            prag: TurnScores {
-                max: 100.0,
-                ..Default::default()
-            },
-        },
-    );
-    let r = ScoredSubstrate::new(&r, &scores);
-
-    // Equal weights: (10 + 50 + 100) / 3 = 53.333...
-    let equal = DepthWeights {
-        syntactic: 1.0,
-        semantic: 1.0,
-        pragmatic: 1.0,
-    };
-    let s = r.turn_score(g, idx, ScoreFormula::Max, &equal);
-    assert!((s - 53.333_33).abs() < 1e-3);
-
-    // Pragmatic-only: 100
-    let prag_only = DepthWeights {
-        syntactic: 0.0,
-        semantic: 0.0,
-        pragmatic: 1.0,
-    };
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Max, &prag_only), 100.0);
-
-    // Weighted: w=(1, 2, 1) → (1*10 + 2*50 + 1*100) / 4 = 210 / 4 = 52.5
-    let weighted = DepthWeights {
-        syntactic: 1.0,
-        semantic: 2.0,
-        pragmatic: 1.0,
-    };
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::Max, &weighted), 52.5);
-}
-
-#[test]
-fn projection_uses_bdp_scores_to_pick_top_k() {
-    use crate::substrate::{
-        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
-    };
-
-    // Five turns, top_k=2 by score.  Without BDP scores all are tied; we
-    // set distinct max values to force a stable ordering.
-    let yaml = r#"
-layers:
-  - name: l
-    window: 10000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    score_formula: max
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-        selection: { kind: top_k, k: 2 }
-"#;
-    let b = Builder::from_yaml(yaml).unwrap();
-    let layer = b.id_for_layer("l").unwrap();
-    let g = b.id_for_group("g").unwrap();
-
-    let mut r = Substrate::new();
-    let mut bdp_scores = ProjectionScores::new();
-    // Distinct scores; turn 2 (idx=2) and turn 4 (idx=4) should win.
-    let scores = [10.0_f32, 20.0, 50.0, 30.0, 100.0];
-    for (i, &s) in scores.iter().enumerate() {
-        let idx = r.append_with_blocks_for_test(layer, g, 10, i as u64, (i + 1) as u64);
-        bdp_scores.set_for_group_test(
-            &r,
-            g,
-            idx,
-            PerDepthScores {
-                syn: TurnScores {
-                    span: s,
-                    ..Default::default()
-                },
-                sem: TurnScores {
-                    span: s,
-                    ..Default::default()
-                },
-                prag: TurnScores {
-                    span: s,
-                    ..Default::default()
-                },
-            },
-        );
-    }
-    let r = ScoredSubstrate::new(&r, &bdp_scores);
-
-    let proj = b.project(
-        ProjectionTarget {
-            layer,
-            group: g,
-            timeline: TimelineId::for_test(1),
-        },
-        &r,
-    );
-    let picked: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
-    // The top-2 by max score are idx 4 (100.0) and idx 2 (50.0); they emit
-    // in insertion order regardless of selection order.
-    assert_eq!(picked, vec![2, 4]);
-}
-
-#[test]
-fn projection_per_layer_depth_weights_alter_ranking() {
-    use crate::substrate::{
-        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
-    };
-
-    // Two turns; turn A has high syn but low prag, turn B has low syn but
-    // high prag.  By tilting depth_weights toward one or the other, we
-    // expect different winners under a top_k=1 rule.
-    let yaml_syn_heavy = r#"
-layers:
-  - name: l
-    window: 10000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    score_formula: max
-    depth_weights:
-      syntactic: 10.0
-      semantic: 0.0
-      pragmatic: 1.0
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-        selection: { kind: top_k, k: 1 }
-"#;
-    let yaml_prag_heavy = yaml_syn_heavy.replace(
-        "syntactic: 10.0\n      semantic: 0.0\n      pragmatic: 1.0",
-        "syntactic: 1.0\n      semantic: 0.0\n      pragmatic: 10.0",
-    );
-
-    let b_syn = Builder::from_yaml(yaml_syn_heavy).unwrap();
-    let g = b_syn.id_for_group("g").unwrap();
-    let layer = b_syn.id_for_layer("l").unwrap();
-
-    let mut r = Substrate::new();
-    let a = r.append_with_blocks_for_test(layer, g, 10, 0, 1);
-    let bturn = r.append_with_blocks_for_test(layer, g, 10, 1, 2);
-    let mut bdp = ProjectionScores::new();
-    bdp.set_for_group_test(
-        &r,
-        g,
-        a,
-        PerDepthScores {
-            syn: TurnScores {
-                span: 100.0,
-                ..Default::default()
-            },
-            sem: TurnScores::default(),
-            prag: TurnScores {
-                span: 1.0,
-                ..Default::default()
-            },
-        },
-    );
-    bdp.set_for_group_test(
-        &r,
-        g,
-        bturn,
-        PerDepthScores {
-            syn: TurnScores {
-                span: 1.0,
-                ..Default::default()
-            },
-            sem: TurnScores::default(),
-            prag: TurnScores {
-                span: 100.0,
-                ..Default::default()
-            },
-        },
-    );
-    let r_view = ScoredSubstrate::new(&r, &bdp);
-
-    // Syn-heavy weights: turn A wins.
-    let proj = b_syn.project(
-        ProjectionTarget {
-            layer,
-            group: g,
-            timeline: TimelineId::for_test(1),
-        },
-        &r_view,
-    );
-    assert_eq!(proj.sealed_turns().count(), 1);
-    assert_eq!(proj.sealed_turns().next().unwrap().index(), a);
-
-    // Prag-heavy weights: turn B wins.
-    let b_prag = Builder::from_yaml(&yaml_prag_heavy).unwrap();
-    let g2 = b_prag.id_for_group("g").unwrap();
-    let layer2 = b_prag.id_for_layer("l").unwrap();
-    // Re-build resolver against the new schema's GroupId (which equals g2).
-    // GroupIds are deterministic per yaml shape but for safety we re-append.
-    let mut r2 = Substrate::new();
-    let a2 = r2.append_with_blocks_for_test(layer2, g2, 10, 0, 1);
-    let b2 = r2.append_with_blocks_for_test(layer2, g2, 10, 1, 2);
-    let mut bdp2 = ProjectionScores::new();
-    bdp2.set_for_group_test(
-        &r2,
-        g2,
-        a2,
-        PerDepthScores {
-            syn: TurnScores {
-                span: 100.0,
-                ..Default::default()
-            },
-            sem: TurnScores::default(),
-            prag: TurnScores {
-                span: 1.0,
-                ..Default::default()
-            },
-        },
-    );
-    bdp2.set_for_group_test(
-        &r2,
-        g2,
-        b2,
-        PerDepthScores {
-            syn: TurnScores {
-                span: 1.0,
-                ..Default::default()
-            },
-            sem: TurnScores::default(),
-            prag: TurnScores {
-                span: 100.0,
-                ..Default::default()
-            },
-        },
-    );
-    let r2_view = ScoredSubstrate::new(&r2, &bdp2);
-    let proj = b_prag.project(
-        ProjectionTarget {
-            layer: layer2,
-            group: g2,
-            timeline: TimelineId::for_test(1),
-        },
-        &r2_view,
-    );
-    assert_eq!(proj.sealed_turns().count(), 1);
-    assert_eq!(proj.sealed_turns().next().unwrap().index(), b2);
-}
-
-#[test]
-fn yaml_all_zero_depth_weights_is_error() {
-    use super::error::ConstructionError;
-    let yaml = r#"
-layers:
-  - name: layer
-    window: 1000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    depth_weights:
-      syntactic: 0.0
-      semantic: 0.0
-      pragmatic: 0.0
-    system_prompt:
-      sections:
-        - id: s
-          content: "x"
-    groups:
-      - id: g
-"#;
-    match Builder::from_yaml(yaml) {
-        Err(ConstructionError::AllDepthWeightsZero { layer }) => {
-            assert_eq!(layer, "layer");
-        }
-        other => panic!("expected AllDepthWeightsZero, got {other:?}"),
-    }
-}
-
 // —— Section + collection emission tests ——————————————————————————————————————
 //
 // These tests cover the `SystemPromptItem` model: the layer's
 // `system_prompt` is an ordered list of items, each either a single
 // always-emit section or a `SectionCollection` with its own selection
 // rule (TopK / Single / AlwaysVisible).  Emission preserves declaration
-// order; selection picks by salience (BDP-derived score).
+// order; selection picks by salience (provenance-derived score).
 
 const SECTIONS_YAML_FLAT: &str = r#"
 layers:
@@ -4539,6 +3896,146 @@ layers:
 }
 
 #[test]
+fn collection_named_pins_member_by_runtime_selector() {
+    use crate::projection::{ProjectionMode, SelectionState};
+    const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget: { priority: 100 }
+    system_prompt:
+      items:
+        - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
+          name: tools
+          selection: { kind: named, selector: tool }
+          sections:
+            - id: datetime
+              content: "datetime def"
+            - id: web_search
+              content: "web_search def"
+            - id: calc
+              content: "calc def"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let b = Builder::from_yaml(YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let web_search = b.id_for_section_in(dialogue, "web_search").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    // Scores are deliberately hostile (the two *unwanted* members rank highest):
+    // Named must ignore them entirely and pin the named member.
+    let resolver = MockResolver::new()
+        .with_section_score(b.id_for_section_in(dialogue, "datetime").unwrap(), 0.99)
+        .with_section_score(web_search, 0.01)
+        .with_section_score(b.id_for_section_in(dialogue, "calc").unwrap(), 0.99);
+
+    // Pin web_search by name → exactly that one member, score notwithstanding.
+    let mut sel = SelectionState::new();
+    sel.select("tool", "web_search");
+    let p = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel);
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(
+        ids,
+        vec![web_search],
+        "named must pin exactly the selected member, ignoring score"
+    );
+
+    // Unset selector → no member emitted.
+    let p_unset = b.project_with_selection(
+        target,
+        &resolver,
+        ProjectionMode::Decode,
+        &SelectionState::default(),
+    );
+    assert_eq!(
+        p_unset.sealed_sections().count(),
+        0,
+        "unset selector selects no member"
+    );
+
+    // Selector names a non-member → no member emitted.
+    let mut sel_bad = SelectionState::new();
+    sel_bad.select("tool", "nonexistent");
+    let p_bad = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel_bad);
+    assert_eq!(
+        p_bad.sealed_sections().count(),
+        0,
+        "unknown member name selects nothing"
+    );
+}
+
+#[test]
+fn named_selection_rejects_empty_selector() {
+    use crate::projection::ConstructionError;
+    const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
+          name: tools
+          selection: { kind: named }
+          sections:
+            - id: datetime
+              content: "datetime def"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let err = Builder::from_yaml(YAML).unwrap_err();
+    assert!(
+        matches!(err, ConstructionError::EmptyNamedSelector { .. }),
+        "named without a selector must fail construction, got {err:?}"
+    );
+}
+
+#[test]
 fn collection_always_visible_emits_every_section() {
     const YAML: &str = r#"
 layers:
@@ -4645,8 +4142,13 @@ layers:
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
     let high = b.id_for_section_in(dialogue, "high_priority").unwrap();
+    let low = b.id_for_section_in(dialogue, "low_priority").unwrap();
 
-    let resolver = MockResolver::new(); // both score 0 by default → tie → priority wins
+    // The `priority:` field parses (the YAML built); selection is now
+    // belief-driven by score, so the higher-scored section is the single pick.
+    let resolver = MockResolver::new()
+        .with_section_score(high, 1.0)
+        .with_section_score(low, 0.1);
     let p = b.project(
         ProjectionTarget {
             layer: dialogue,
@@ -4908,6 +4410,343 @@ fn add_section_invalid_priority_fails() {
         result,
         Err(super::error::ConstructionError::InvalidPriority { .. })
     ));
+}
+
+// ── Tag-based selection default ──────────────────────────────────────────────
+//
+// A group/collection may declare `default: { tag: … }`. When belief, scores, and
+// the selection rule all pick nothing, the tagged member is injected so the
+// group — and its layer — never drops out of the projection. The default fires
+// only on an otherwise-empty selection, so a group with real picks ignores it.
+
+/// A group whose every turn scores below its threshold selects nothing on the
+/// rule path; with a `default` declared and its tag bound to a turn, that turn
+/// is injected so the group survives instead of vanishing at the empty-group
+/// retain.
+const DEFAULT_FALLBACK_YAML: &str = r#"
+layers:
+  - name: ground
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    system_prompt:
+      sections:
+        - id: frame
+          content: "frame"
+    groups:
+      - id: structure
+        selection: { kind: top_k, k: 2 }
+        score_threshold: 0.5
+        default: { tag: "root" }
+"#;
+
+/// Identical to the fixture above but with no `default:` declared, proving the
+/// injection is what keeps the group alive — absent it, an all-below-threshold
+/// group emits nothing.
+const NO_DEFAULT_YAML: &str = r#"
+layers:
+  - name: ground
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    system_prompt:
+      sections:
+        - id: frame
+          content: "frame"
+    groups:
+      - id: structure
+        selection: { kind: top_k, k: 2 }
+        score_threshold: 0.5
+"#;
+
+#[test]
+fn default_injected_when_selection_empty() {
+    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+
+    // Three turns, all scoring 0.1 — below the group's 0.5 threshold, so the
+    // top_k rule selects nothing. Bind the default tag to turn 0.
+    let mut resolver = MockResolver::new().with_default_score(0.1);
+    resolver.append(structure);
+    resolver.append(structure);
+    resolver.append(structure);
+    resolver = resolver.with_tag(structure, "root", TurnIndex(0));
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: ground,
+            group: structure,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let turns: Vec<&super::project::ResolvedTurn> = proj.sealed_turns().collect();
+    assert_eq!(turns.len(), 1, "only the default turn should survive");
+    assert_eq!(turns[0].group(), structure);
+    assert_eq!(turns[0].index(), TurnIndex(0), "default resolves to turn 0");
+}
+
+#[test]
+fn no_default_leaves_group_empty() {
+    let b = Builder::from_yaml(NO_DEFAULT_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+
+    let mut resolver = MockResolver::new().with_default_score(0.1);
+    resolver.append(structure);
+    resolver.append(structure);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: ground,
+            group: structure,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    assert_eq!(
+        group_turn_count(proj.sealed_turns(), structure),
+        0,
+        "no default ⇒ all-below-threshold group emits nothing",
+    );
+}
+
+#[test]
+fn default_ignored_when_selection_non_empty() {
+    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+
+    // Turns 1 and 2 clear the 0.5 threshold; the top_k rule fills two slots, so
+    // the default must NOT fire (turn 0, the default, scores below threshold and
+    // stays out).
+    let mut resolver = MockResolver::new().with_default_score(0.1);
+    let t0 = resolver.append(structure);
+    let t1 = resolver.append(structure);
+    let t2 = resolver.append(structure);
+    resolver = resolver
+        .with_score(structure, t1, 0.9)
+        .with_score(structure, t2, 0.8)
+        .with_tag(structure, "root", t0);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: ground,
+            group: structure,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let mut idxs: Vec<TurnIndex> = proj
+        .sealed_turns()
+        .filter(|t| t.group() == structure)
+        .map(|t| t.index())
+        .collect();
+    idxs.sort();
+    assert_eq!(
+        idxs,
+        vec![t1, t2],
+        "real picks fill the budget; the default turn stays out",
+    );
+}
+
+/// Collection analogue: a `top_k` collection whose members all score below the
+/// threshold selects nothing, and the `default` (a section named by tag) is the
+/// floor so the collection still contributes one section.
+const COLLECTION_DEFAULT_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget: { priority: 100 }
+    system_prompt:
+      items:
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 2 }
+          score_threshold: 0.5
+          default: { tag: "tool_c" }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose categories.
+              user_prompt: Propose categories.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign by number.
+              user_prompt: Assign by number.
+          sections:
+            - id: tool_a
+              content: "A"
+            - id: tool_b
+              content: "B"
+            - id: tool_c
+              content: "C"
+            - id: tool_d
+              content: "D"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+#[test]
+fn collection_default_parses() {
+    let b = Builder::from_yaml(COLLECTION_DEFAULT_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let coll = b
+        .layer(dialogue)
+        .unwrap()
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
+            super::schema::SystemPromptItem::Collection(c) if c.name == "tools" => Some(c),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        coll.default.as_ref().map(|d| d.tag.as_str()),
+        Some("tool_c")
+    );
+}
+
+#[test]
+fn collection_default_injected_when_selection_empty() {
+    let b = Builder::from_yaml(COLLECTION_DEFAULT_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tool_c = b.id_for_section_in(dialogue, "tool_c").unwrap();
+
+    // Every section scores 0.0 (MockResolver default) — below the collection's
+    // 0.5 min_score — so the belief pass selects no tool. The default injects
+    // tool_c so the collection still contributes exactly one member.
+    let resolver = MockResolver::new();
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let tool_names: HashSet<&str> = ["tool_a", "tool_b", "tool_c", "tool_d"]
+        .into_iter()
+        .collect();
+    let tool_ids: HashSet<SectionId> = tool_names
+        .iter()
+        .filter_map(|n| b.id_for_section_in(dialogue, n))
+        .collect();
+    let emitted_tools: Vec<SectionId> = proj
+        .sealed_sections()
+        .map(|s| s.id)
+        .filter(|id| tool_ids.contains(id))
+        .collect();
+    assert_eq!(
+        emitted_tools,
+        vec![tool_c],
+        "only the default tool survives"
+    );
+}
+
+// ── Belief-driven turn selection ─────────────────────────────────────────────
+//
+// A non-`Sequence` turn group is belief-driven: its turns are selected by
+// RelLeak over their fresh wide-Q scores (budget + gates from the selection
+// rule), the turn-axis analogue of the tool catalog. These tests drive the
+// belief path via the MockResolver's per-turn scores.
+
+#[test]
+fn belief_config_takes_budget_and_gates_from_the_rule() {
+    // structure = top_k(2), score_threshold 0.5.
+    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+    let group = b.group(structure).unwrap();
+    assert!(group.is_belief_driven());
+    let cfg = group.belief_config(10);
+    assert_eq!(cfg.budget_max, 2, "budget cap comes from top_k k");
+    assert_eq!(cfg.budget_min, 0);
+    assert_eq!(
+        cfg.min_score, 0.5,
+        "min/evict gate comes from score_threshold"
+    );
+    assert_eq!(cfg.evict_score, 0.5);
+}
+
+#[test]
+fn belief_driven_group_selects_top_k_by_score() {
+    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let structure = b.id_for_group("structure").unwrap();
+
+    // Four candidate turns; the two above the 0.5 threshold with the highest
+    // scores must win the two slots (top_k k=2).
+    let mut resolver = MockResolver::new().with_default_score(0.0);
+    for _ in 0..4 {
+        resolver.append(structure);
+    }
+    resolver = resolver
+        .with_score(structure, TurnIndex(0), 0.9)
+        .with_score(structure, TurnIndex(1), 0.6)
+        .with_score(structure, TurnIndex(2), 0.95)
+        .with_score(structure, TurnIndex(3), 0.55);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: ground,
+            group: structure,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let mut idxs: Vec<u32> = proj
+        .sealed_turns()
+        .filter(|t| t.group() == structure)
+        .map(|t| t.index().0)
+        .collect();
+    idxs.sort();
+    // Highest two above threshold: turn 2 (0.95) and turn 0 (0.9).
+    assert_eq!(
+        idxs,
+        vec![0, 2],
+        "belief selects the two highest-scored turns"
+    );
 }
 
 // ── Dialect-template parsing ─────────────────────────────────────────────────
@@ -6397,8 +6236,15 @@ layers:
         sel.select("tools_on", "present");
         let proj =
             b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
-        let ev =
-            crate::projection::from_projection(&proj.segments, b.schema(), &resolver, 0, 0, 1.0);
+        let ev = crate::projection::from_projection(
+            &proj.segments,
+            b.schema(),
+            &resolver,
+            &crate::projection::SelectionScores::default(),
+            0,
+            0,
+            1.0,
+        );
         use crate::projection::SystemItem;
         assert!(
             ev.selection.system.iter().any(|it| matches!(

@@ -120,8 +120,15 @@ fn emit_file_turns<S: InsertTurnSink>(
     }
     // `on_prefilled` fires per scope as it lands on the wave, so the ingest bar
     // and token count advance live instead of jumping only when the file's whole
-    // batch flushes.
-    sink.insert_prefill_turns_parallel(&scope_turns, on_prefilled)?;
+    // batch flushes. Gather-scope tags `["code", <path>]` scope every scope turn
+    // into a code-tagged provenance gallery (and out of the untagged dialogue
+    // partition); the path tag doubles as the slot label. The whole-file summary
+    // is the async summariser's rollup — not decoded inline here.
+    sink.insert_prefill_turns_parallel(
+        &scope_turns,
+        vec!["code".to_string(), path.to_string()],
+        on_prefilled,
+    )?;
     Ok(())
 }
 

@@ -4,7 +4,12 @@ use serde_json::json;
 
 #[test]
 fn remote_fs_session_not_sftp() {
-    let resp = harness::invoke("remote_fs_session_open", json!({"uri": "ftp://host/path"}));
+    // The scheme is rejected before the credential is ever looked up, so an
+    // unsupported URI reports `not_supported` regardless of the credential.
+    let resp = harness::invoke(
+        "remote_fs_session_open",
+        json!({"uri": "ftp://host/path", "credential_name": "any"}),
+    );
     harness::expect_error(&resp, "not_supported");
 }
 
@@ -34,7 +39,10 @@ fn remote_fs_session_close_noop() {
 
 #[test]
 fn remote_fs_session_nfs_not_supported() {
-    let resp = harness::invoke("remote_fs_session_open", json!({"uri": "nfs://host/path"}));
+    let resp = harness::invoke(
+        "remote_fs_session_open",
+        json!({"uri": "nfs://host/path", "credential_name": "any"}),
+    );
     harness::expect_error(&resp, "not_supported");
 }
 
@@ -42,7 +50,7 @@ fn remote_fs_session_nfs_not_supported() {
 fn remote_fs_session_smb_not_supported() {
     let resp = harness::invoke(
         "remote_fs_session_open",
-        json!({"uri": "smb://fileserver/share"}),
+        json!({"uri": "smb://fileserver/share", "credential_name": "any"}),
     );
     harness::expect_error(&resp, "not_supported");
 }

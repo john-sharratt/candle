@@ -9,7 +9,7 @@
 //!
 //! The live set is streamed into a fresh file in dependency order
 //! (`ModelSpec`, `Template`, then per stream its `StreamDecl`, `Chunk`s,
-//! `Tokens`, `Signatures`, `Commit`). The orchestration that swaps the new
+//! `Tokens`, `Commit`). The orchestration that swaps the new
 //! file in is [`SubstratePersistence::compact`], and the automatic trigger
 //! is the O(1) dead-byte accounting behind
 //! [`SubstratePersistence::should_compact`] (see [`super::accounting`]).
@@ -30,7 +30,7 @@ use crate::substrate::Substrate;
 /// Collect every **live** record from `log`, in dependency order, as
 /// `(header, payload)` pairs ready to re-encode.
 ///
-/// `ModelSpec` / `Template` / `Chunk` / `Tokens` / `Signatures` are read
+/// `ModelSpec` / `Template` / `Chunk` / `Tokens` are read
 /// back from the log at their manifest offsets; `StreamDecl` and `Commit`
 /// are synthesised from the manifest (the manifest holds the decoded
 /// declaration and the durable-through index directly).
@@ -53,14 +53,6 @@ pub fn collect_live_records(
         let r = read_record_at(log, loc.offset, loc.record_size)?;
         out.push((r.header, r.payload));
     }
-    // Only the latest `ToolSummary` is live; every superseded copy is dropped
-    // (the same last-writer-wins reclaim as the model/template/tokenizer
-    // singletons — this is what "tombstones" an out-of-date tool summary).
-    if let Some(loc) = manifest.tool_summary {
-        let r = read_record_at(log, loc.offset, loc.record_size)?;
-        out.push((r.header, r.payload));
-    }
-
     // Tombstoned timelines drop out of the compacted log entirely
     // — their records are physically gone, not merely hidden.  This
     // is what reclaims disk after a refresh cycle replaces a
@@ -70,15 +62,28 @@ pub fn collect_live_records(
         .iter()
         .map(|t| t.raw())
         .collect();
+    let distilled: std::collections::HashSet<u64> = substrate
+        .distilled_timelines()
+        .iter()
+        .map(|t| t.raw())
+        .collect();
 
     // Per-stream live records — sourced from the substrate's in-RAM
     // stream index, the authoritative source.
     for (stream_id, entry) in substrate.all_streams() {
-        if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
-            if tombstoned.contains(&t.timeline_id) {
-                continue;
-            }
-        }
+        // A turn on a distilled timeline (e.g. the calibration corpus) sheds its
+        // content at compaction: keep its `StreamDecl` + `WideQSig` — the belief
+        // gallery reads only the sig — and reclaim the KV chunks + tokens.
+        // Tombstoned timelines drop entirely, as before.
+        let provenance_only =
+            if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
+                if tombstoned.contains(&t.timeline_id) {
+                    continue;
+                }
+                distilled.contains(&t.timeline_id)
+            } else {
+                false
+            };
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
             out.push((
@@ -94,25 +99,39 @@ pub fn collect_live_records(
                 payload,
             ));
         }
-        for loc in entry.chunks.values() {
-            let r = read_record_at(log, loc.offset, loc.record_size)?;
-            out.push((r.header, r.payload));
-        }
-        if let Some(loc) = entry.tokens {
-            let r = read_record_at(log, loc.offset, loc.record_size)?;
-            out.push((r.header, r.payload));
-        }
-        if let Some(loc) = entry.signatures {
-            let r = read_record_at(log, loc.offset, loc.record_size)?;
-            out.push((r.header, r.payload));
+        if !provenance_only {
+            for loc in entry.chunks.values() {
+                let r = read_record_at(log, loc.offset, loc.record_size)?;
+                out.push((r.header, r.payload));
+            }
+            if let Some(loc) = entry.tokens {
+                let r = read_record_at(log, loc.offset, loc.record_size)?;
+                out.push((r.header, r.payload));
+            }
         }
         // Per-turn projection-event timeline — re-emitted from the resident
-        // bytes (not read back from disk like signatures), so the GUI dots
-        // survive a compaction pass.
+        // bytes rather than read back from disk, so the GUI dots survive a
+        // compaction pass.
         if let Some(payload) = &entry.projection_events {
             out.push((
                 RecordHeader {
                     record_type: RecordType::ProjectionEvents,
+                    format: 0,
+                    payload_len: payload.len() as u64,
+                    crc: 0,
+                    stream_id: stream_id.0,
+                    chunk_index: 0,
+                    token_count: 0,
+                },
+                payload.clone(),
+            ));
+        }
+        // Per-turn wide-Q signature window — same resident-bytes re-emit so the
+        // decode→decode consensus substrate survives a compaction pass.
+        if let Some(payload) = &entry.wide_q_sigs {
+            out.push((
+                RecordHeader {
+                    record_type: RecordType::WideQSig,
                     format: 0,
                     payload_len: payload.len() as u64,
                     crc: 0,
@@ -410,8 +429,8 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: super::super::streams::PerDepthScores::default(),
             segments: Vec::new(),
+            tags: Vec::new(),
         };
         let dead_decl = StreamDecl::Turn(turn_decl(dead_tl));
         let alive_decl = StreamDecl::Turn(turn_decl(alive_tl));
@@ -507,8 +526,8 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: super::super::streams::PerDepthScores::default(),
             segments: Vec::new(),
+            tags: Vec::new(),
         });
         let sid = 4242u64; // header stream id ties the two records to one stream
         let proj_payload = br#"[{"start_token":0,"seconds":3.0,"buckets":[]}]"#.to_vec();
@@ -526,6 +545,119 @@ mod tests {
             live.iter()
                 .any(|(h, p)| h.record_type == RecordType::ProjectionEvents && p == &proj_payload),
             "ProjectionEvents record must survive compaction with its payload intact",
+        );
+    }
+
+    #[test]
+    fn wide_q_sigs_record_survives_compaction() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 43,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = 4343u64; // header stream id ties the two records to one stream
+        let wide_payload =
+            crate::provenance::encode_wide_sigs(&[crate::provenance::WideQSig::from_band(
+                &vec![1.0f32; 4 * 128],
+                128,
+            )]);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::WideQSig, sid, 0, &wide_payload));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+
+        assert!(
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::WideQSig && p == &wide_payload),
+            "WideQSig record must survive compaction with its payload intact",
+        );
+    }
+
+    #[test]
+    fn distilled_turn_keeps_sig_drops_content() {
+        use crate::persistence::record::DistillPayload;
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let tl = 77u64;
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: tl,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            // A calibration turn: gather-scope tags (unchanged by distillation).
+            tags: vec!["tool".to_string(), "calculator".to_string()],
+        });
+        let sid = 7777u64;
+        let wide_payload =
+            crate::provenance::encode_wide_sigs(&[crate::provenance::WideQSig::from_band(
+                &vec![1.0f32; 4 * 128],
+                128,
+            )]);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, sid, 0, b"kv-chunk-content"));
+        blob.extend_from_slice(&record(RecordType::Tokens, sid, 0, b"token-content"));
+        blob.extend_from_slice(&record(RecordType::WideQSig, sid, 0, &wide_payload));
+        // The distillation marker for the timeline.
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload { timeline_id: tl }.encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+
+        // The declaration and the sig survive — the belief gallery still finds it.
+        assert!(
+            live.iter()
+                .any(|(h, _)| h.record_type == RecordType::StreamDecl),
+            "provenance-only turn keeps its StreamDecl (tags + gallery scope)",
+        );
+        assert!(
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::WideQSig && p == &wide_payload),
+            "provenance-only turn keeps its WideQSig",
+        );
+        // The content is reclaimed.
+        assert!(
+            !live.iter().any(|(h, _)| h.record_type == RecordType::Chunk),
+            "provenance-only turn drops its KV chunks",
+        );
+        assert!(
+            !live
+                .iter()
+                .any(|(h, _)| h.record_type == RecordType::Tokens),
+            "provenance-only turn drops its tokens",
         );
     }
 }

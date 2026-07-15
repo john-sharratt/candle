@@ -12,10 +12,14 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PutRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// VFS path of the file to upload. Must already exist in the VFS (write it
+    /// with the `write` tool first).
     #[validate(length(min = 1))]
     pub local_vfs_path: String,
+    /// Destination path on the remote host.
     #[validate(length(min = 1))]
     pub remote_path: String,
 }

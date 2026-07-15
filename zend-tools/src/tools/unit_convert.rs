@@ -9,9 +9,16 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// Numeric value to convert, expressed in the `from` unit. Required.
     pub value: f64,
+    /// Source unit name or alias (e.g. "kg", "celsius", "GiB", "mi"). Case
+    /// -insensitive. Required; must be a recognised unit. Must share a dimension
+    /// with `to`.
     #[validate(length(min = 1))]
     pub from: String,
+    /// Target unit name or alias (e.g. "lb", "fahrenheit", "GB", "km"). Case
+    /// -insensitive. Required; must be a recognised unit. Must share a dimension
+    /// with `from`.
     #[validate(length(min = 1))]
     pub to: String,
 }
@@ -62,7 +69,10 @@ enum Dimension {
 /// (dimension, factor_to_base, offset_to_base)
 /// base units: meter, kg, liter, kelvin, second, byte
 fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
-    let u = unit.to_lowercase();
+    // Normalize the way the model naturally writes multi-word units: lowercase
+    // and collapse spaces/hyphens to underscores, so "fluid ounce", "Fluid-Ounce",
+    // and "fluid_ounce" all resolve identically.
+    let u = unit.to_lowercase().replace([' ', '-'], "_");
     Some(match u.as_str() {
         // Length (base: meter)
         "m" | "meter" | "meters" | "metre" | "metres" => (Dimension::Length, 1.0, 0.0),
@@ -109,7 +119,8 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
         "qt" | "quart" | "quarts" => (Dimension::Volume, 0.946353, 0.0),
         "pt" | "pint" | "pints" => (Dimension::Volume, 0.473176, 0.0),
         "cup" | "cups" => (Dimension::Volume, 0.236588, 0.0),
-        "fl_oz" | "fluid_ounce" | "fluid_ounces" => (Dimension::Volume, 0.0295735, 0.0),
+        "fl_oz" | "fluid_ounce" | "fluid_ounces" | "us_fl_oz" | "us_fluid_ounce"
+        | "us_fluid_ounces" => (Dimension::Volume, 0.0295735, 0.0),
         "tbsp" | "tablespoon" | "tablespoons" => (Dimension::Volume, 0.0147868, 0.0),
         "tsp" | "teaspoon" | "teaspoons" => (Dimension::Volume, 0.00492892, 0.0),
 

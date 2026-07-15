@@ -10,8 +10,10 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
+    /// VFS path to create or overwrite (session-relative, e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
+    /// Full file content to write, replacing any existing content. Required.
     pub content: String,
 }
 

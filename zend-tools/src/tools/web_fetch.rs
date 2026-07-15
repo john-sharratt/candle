@@ -9,8 +9,11 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// URL to fetch; must start with http:// or https://. Private/localhost URLs are blocked.
     #[validate(length(min = 1))]
     pub url: String,
+    /// Approximate max tokens of content to return (500-16000); content is truncated
+    /// at roughly 4 chars per token. Default: 4000.
     #[validate(range(min = 500, max = 16000))]
     pub max_tokens: Option<u32>,
 }

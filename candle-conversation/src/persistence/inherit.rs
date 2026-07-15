@@ -26,7 +26,7 @@ pub struct InheritedSubstrate {
     /// Canonical path of the inherited log file.
     path: PathBuf,
     /// The recovered manifest — carries only the singleton offsets
-    /// (`ModelSpec`, `Template`, `Tokenizer`, `ToolSummary`).
+    /// (`ModelSpec`, `Template`, `Tokenizer`).
     manifest: Manifest,
     /// In-RAM substrate populated by walking the inherited log during
     /// `load`.  Holds per-stream / per-timeline state (chunks, tokens,

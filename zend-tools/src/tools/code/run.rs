@@ -1,25 +1,34 @@
-//! code_run tool.
+//! code_run tool — one-shot JavaScript execution on the embedded boa VM.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::time::Instant;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::CodeError;
+use super::engine::run_js;
+use super::{is_javascript, CodeError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RunRequest {
+    /// Language to run. Only JavaScript is supported (aliases: javascript, js,
+    /// node). The field is kept explicit so the model states intent.
     #[validate(length(min = 1))]
     pub language: String,
+    /// JavaScript source to execute. `console.log`/`console.error` output is
+    /// captured; the value of the final expression is returned in `result`.
     #[validate(length(min = 1))]
     pub code: String,
+    /// Optional string exposed to the script as the global `stdin`. Omit for none.
     pub stdin: Option<String>,
+    /// Advisory wall-clock hint (1–300s). The VM cannot interrupt a synchronous
+    /// eval, so runaway scripts are bounded by loop/recursion limits instead.
     #[validate(range(min = 1, max = 300))]
     pub timeout_sec: Option<u32>,
+    /// Optional key/value map exposed to the script as the global object `env`.
+    /// Omit for none.
     pub env: Option<HashMap<String, String>>,
 }
 
@@ -29,6 +38,10 @@ pub struct RunResponse {
     pub stderr: String,
     pub exit_code: i32,
     pub duration_ms: u64,
+    /// The final expression's value, stringified. Absent when the script's last
+    /// statement produced `undefined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 pub struct CodeRun;
@@ -36,125 +49,60 @@ pub struct CodeRun;
 impl Tool for CodeRun {
     const NAME: &'static str = "code_run";
     const DESCRIPTION: &'static str =
-        "Execute code directly on the host system. Supports python, javascript (node), \
-         bash, sh. WARNING: runs without sandbox in current implementation. \
-         Returns stdout, stderr, exit code, and duration.";
+        "Execute a JavaScript snippet in an embedded, sandboxed engine (no filesystem, network, \
+         or process access). Runs in-process on a pure-Rust VM — no Node or external interpreter \
+         required. Use for arithmetic/logic the model would get wrong, data transformation, \
+         string processing, JSON manipulation, and quick algorithms. `console.log` output is \
+         returned in stdout; the final expression's value in result. Returns stdout, stderr, \
+         exit_code (0 on success, 1 if the script throws), duration, and result.";
 
     type Request = RunRequest;
     type Response = RunResponse;
     type Error = CodeError;
 
     fn run(_ctx: &ToolContext, req: RunRequest) -> Result<RunResponse, CodeError> {
-        let timeout = req.timeout_sec.unwrap_or(30);
-
-        let (mut cmd, temp_file) = match req.language.as_str() {
-            "python" | "python3" => {
-                let tmp =
-                    std::env::temp_dir().join(format!("zend_code_{}.py", uuid::Uuid::new_v4()));
-                std::fs::write(&tmp, &req.code)
-                    .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                let mut c = std::process::Command::new(if cfg!(windows) {
-                    "python.exe"
-                } else {
-                    "python3"
-                });
-                c.arg(&tmp);
-                (c, Some(tmp))
-            }
-            "javascript" | "js" | "node" => {
-                let tmp =
-                    std::env::temp_dir().join(format!("zend_code_{}.js", uuid::Uuid::new_v4()));
-                std::fs::write(&tmp, &req.code)
-                    .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                let mut c =
-                    std::process::Command::new(if cfg!(windows) { "node.exe" } else { "node" });
-                c.arg(&tmp);
-                (c, Some(tmp))
-            }
-            "bash" => {
-                let mut c = if cfg!(windows) {
-                    let mut c = std::process::Command::new("cmd");
-                    c.args(["/C", "bash", "-c"]);
-                    c
-                } else {
-                    let mut c = std::process::Command::new("bash");
-                    c.arg("-c");
-                    c
-                };
-                c.arg(&req.code);
-                (c, None)
-            }
-            "sh" => {
-                let mut c = if cfg!(windows) {
-                    let mut c = std::process::Command::new("cmd");
-                    c.args(["/C", "sh", "-c"]);
-                    c
-                } else {
-                    let mut c = std::process::Command::new("sh");
-                    c.arg("-c");
-                    c
-                };
-                c.arg(&req.code);
-                (c, None)
-            }
-            other => return Err(CodeError::InterpreterNotFound(other.to_string())),
-        };
-
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        if req.stdin.is_some() {
-            cmd.stdin(std::process::Stdio::piped());
+        if !is_javascript(&req.language) {
+            return Err(CodeError::InterpreterNotFound(req.language));
         }
 
+        // Expose stdin / env to the script as globals, injected as a silent
+        // prelude (JSON is valid JS literal syntax).
+        let mut prelude = String::new();
+        if let Some(stdin) = &req.stdin {
+            let lit = serde_json::to_string(stdin)
+                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
+            prelude.push_str(&format!("globalThis.stdin = {lit};\n"));
+        }
         if let Some(env) = &req.env {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+            let lit = serde_json::to_string(env)
+                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
+            prelude.push_str(&format!("globalThis.env = {lit};\n"));
         }
 
         let start = Instant::now();
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                CodeError::InterpreterNotFound(req.language.clone())
-            } else {
-                CodeError::ExecutionFailed(e.to_string())
-            }
-        })?;
+        let outcome = run_js(&prelude, &req.code);
+        let duration_ms = start.elapsed().as_millis() as u64;
 
-        if let (Some(stdin_data), Some(mut child_stdin)) = (&req.stdin, child.stdin.take()) {
-            let _ = child_stdin.write_all(stdin_data.as_bytes());
-        }
-
-        let output = loop {
-            if start.elapsed().as_secs() >= timeout as u64 {
-                let _ = child.kill();
-                if let Some(f) = temp_file {
-                    let _ = std::fs::remove_file(f);
+        // A thrown JS error is a script fault, not a tool error: report it via
+        // exit_code / stderr, the way a shell would surface a non-zero exit.
+        let (exit_code, stderr) = match outcome.error {
+            None => (0, outcome.stderr),
+            Some(err) => {
+                let mut s = outcome.stderr;
+                if !s.is_empty() && !s.ends_with('\n') {
+                    s.push('\n');
                 }
-                return Err(CodeError::Timeout);
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    break child
-                        .wait_with_output()
-                        .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => return Err(CodeError::ExecutionFailed(e.to_string())),
+                s.push_str(&err);
+                (1, s)
             }
         };
 
-        if let Some(f) = temp_file {
-            let _ = std::fs::remove_file(f);
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
         Ok(RunResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code().unwrap_or(-1),
+            stdout: outcome.stdout,
+            stderr,
+            exit_code,
             duration_ms,
+            result: outcome.result,
         })
     }
 }

@@ -561,6 +561,13 @@
     return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
   }
 
+  // Belief score badge for a selected projection member: compact, e.g. "1.3k"
+  // for 1325 or "436" for a sub-1k score.
+  function fmtScore(n) {
+    n = Math.round(n || 0);
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
   function logColors(level) {
     return ({
       TRACE: ['#9b8fdf', 'rgba(124,111,207,0.13)'], DEBUG: ['#5e9cd8', 'rgba(78,140,200,0.13)'],
@@ -620,6 +627,7 @@
       const vis = conversations.filter((c) => !c.archived && (c.turn_count > 0 || c.history.length));
       activeId = vis.length ? vis[0].id : null;
     }
+    writeHashConv(activeId);   // keep the URL in sync so a reload doesn't restore the just-archived chat
     setState({ conversations, activeId }, focusPrompt);
   }
   function unarchiveConv(id, e) {
@@ -632,6 +640,7 @@
     try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); } catch (_) {}
     let activeId = S.activeId;
     if (!showArchived) { const a = S.conversations.find((c) => c.id === activeId); if (a && a.archived) activeId = null; }
+    writeHashConv(activeId);
     setState({ showArchived, activeId }, focusPrompt);
   }
 
@@ -911,7 +920,7 @@
       hist = conv.history.slice(0, uk >= 0 ? uk : (i >= 0 ? i : 0));
     }
     savedSubstrateScroll = null;   // a fresh open starts at the top, not last session's offset
-    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {} });
+    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
     // Fallback: if a panel opens before any conversation hydrated (e.g. a brand
     // new chat), pull the workspace-wide glue + content via the main GET.
     if (S.substrateContent == null) {
@@ -1937,6 +1946,10 @@
         h('span', { style: 'width:6px; height:6px; border-radius:2px; flex-shrink:0; background:' + (s.selected ? '#6cb39a' : '#403b35') + ';' }),
         h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace;' }, s.name || '(unnamed)'),
         s.selected ? null : h('span', { style: 'font-size:9.5px; color:#5a5652; letter-spacing:0.04em; flex-shrink:0;' }, 'SKIPPED'),
+        // Belief score for a selected member — the provenance confidence that put
+        // it in scope (the same `z × margin` value the substrate stamps). Only
+        // shown when selected and non-zero; skipped/zero-belief rows stay clean.
+        (s.selected && s.score) ? h('span', { style: 'font-size:10px; color:#6cb39a; font-family:ui-monospace,monospace; flex-shrink:0;' }, fmtScore(s.score)) : null,
         h('span', { style: 'font-size:10.5px; color:#5a5652; font-family:ui-monospace,monospace; flex-shrink:0;' }, fmtTok(s.tokens) + ' tok'));
       const wrap = h('div', {}, row);
       if (open) {
@@ -2379,10 +2392,15 @@
     Promise.resolve(API.seedConversations(now)).then((list) => {
       S.conversations = list || [];
       const hashId = readHashConv();
-      const hashConv = hashId && S.conversations.find((c) => String(c.id) === String(hashId));
-      const hydrated = S.conversations.find((c) => c.history && c.history.length);
-      const first = S.conversations[0];
-      S.activeId = hashConv ? hashConv.id : (hydrated ? hydrated.id : (first ? first.id : null));
+      // Restore ONLY the conversation the user actually had open (carried in the
+      // URL hash) — never auto-select one otherwise. A reload with nothing open,
+      // or with everything archived, lands on the new-conversation home page
+      // instead of jumping into some chat. The hash still has to point at a
+      // *visible* conversation (respects the "show archived" toggle), which is also
+      // how a daemon-rebuild auto-reload returns you to the chat you were in.
+      const visible = (c) => !!c && (S.showArchived || !c.archived);
+      const hashConv = hashId && S.conversations.find((c) => String(c.id) === String(hashId) && visible(c));
+      S.activeId = hashConv ? hashConv.id : null;
       if (S.activeId) {
         const a = S.conversations.find((c) => c.id === S.activeId);
         S.loaded[S.activeId] = !!(a && a.history && a.history.length);

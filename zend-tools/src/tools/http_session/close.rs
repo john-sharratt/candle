@@ -9,6 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct CloseRequest {
+    /// ID of the session to close (from http_session_open). Must be non-empty. Idempotent.
     #[validate(length(min = 1))]
     pub session_id: String,
 }

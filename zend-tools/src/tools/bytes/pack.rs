@@ -9,9 +9,14 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PackRequest {
+    /// Values to pack, one per format field, in order. Required.
     pub values: Vec<serde_json::Value>,
+    /// Python struct-style format string: optional endianness prefix (`<` little-endian, `>` big-endian)
+    /// then type chars B/H/I/L/Q/b/h/i/l/q/f/d and `Ns` for an N-byte string. Required.
     #[validate(length(min = 1))]
     pub format: String,
+    /// Encoding for the returned packed bytes. One of: hex, base64, base64url, utf8. Defaults to hex.
+    #[schemars(with = "Option<super::BytesEncoding>")]
     pub output_encoding: Option<String>,
 }
 
@@ -28,7 +33,8 @@ impl Tool for BytesPack {
     const DESCRIPTION: &'static str =
         "Pack structured values into binary bytes using a format string (like Python struct). \
          Format: optional < (little-endian) or > (big-endian), then type chars: \
-         B(u8), H(u16), I/L(u32), Q(u64), b(i8), h(i16), i/l(i32), q(i64), f(f32), d(f64), Ns(N-byte string).";
+         B(u8), H(u16), I/L(u32), Q(u64), b(i8), h(i16), i/l(i32), q(i64), f(f32), d(f64), Ns(N-byte string). \
+         Always call this tool to pack the values; never assemble the bytes yourself.";
 
     type Request = PackRequest;
     type Response = PackResponse;

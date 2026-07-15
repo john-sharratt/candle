@@ -186,6 +186,18 @@ pub struct SamplingConfig {
     /// `.`, `!`, `?`, `\n`).  If empty, `graceful_segment_close_after` is a no-op.
     pub sentence_end_token_ids: Vec<i32>,
 
+    /// Closer phrase played when the HARD segment cap
+    /// (`force_segment_close_after`) fires mid-sentence: a canned
+    /// self-interruption (e.g. `" — actually, I've reasoned enough and know
+    /// what to do."`), emitted one token per decode step; the sampler then
+    /// emits the segment-close token itself.  Turns a mid-sentence amputation
+    /// into sensible prose and primes the answer with an explicit commitment
+    /// frame.  Never played at a completed sentence (graceful closes, or a
+    /// hard cap that happens to land on a sentence boundary — no rescue
+    /// needed) nor in a steering span that would continue reasoning after the
+    /// close. Empty = the hard cap emits the bare close token.
+    pub segment_close_script: Vec<u32>,
+
     /// After this many generated tokens, wait for the next sentence-ending
     /// token (`.`, `!`, `?`, or `\n` — resolved from the tokenizer at engine
     /// startup) and then emit EOS.  Mirrors the `graceful_segment_close_after` mechanism
@@ -245,6 +257,7 @@ impl Default for SamplingConfig {
             force_segment_close_after: 0,
             graceful_segment_close_after: 0,
             sentence_end_token_ids: Vec::new(),
+            segment_close_script: Vec::new(),
             graceful_eos_after: 0,
             forced_eos_after: 0,
             banned_tokens: Vec::new(),
@@ -1240,6 +1253,12 @@ pub struct EngineConfig {
     /// in the modern model lineup the engine supports); model
     /// builders override via `ret.dialect = ...`.
     pub dialect: Dialect,
+
+    /// When `true`, the engine does not spawn the async summariser thread and
+    /// new conversations are not registered for summarisation. The AVL summary
+    /// forest is left un-extended (provenance scans still work on raw turns).
+    /// Off by default; set via `ModelBuilder::disable_summariser`.
+    pub disable_summariser: bool,
 }
 
 impl EngineConfig {
@@ -1266,6 +1285,7 @@ impl EngineConfig {
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),
+            disable_summariser: false,
         }
     }
 }
@@ -1379,11 +1399,11 @@ pub struct SequenceConfig {
 
     /// Continuous re-projection cadence in decoded tokens.
     ///
-    /// When `> 0`, the scheduler fires a BDP scan + re-projection + view
+    /// When `> 0`, the scheduler fires a provenance scan + re-projection + view
     /// swap each time the decoded-token count for an active turn becomes a
     /// multiple of this value.  The view's borrowed-block ranges are
     /// recomputed from scratch using the live Q-vector signatures of the
-    /// turn-so-far as the BDP probe — letting attention "wander" through
+    /// turn-so-far as the provenance probe — letting attention "wander" through
     /// the substrate as the model's intent evolves mid-decode.
     ///
     /// Should be `>= CHUNK_SIZE` (32) so at least one freshly-sealed
@@ -1395,17 +1415,22 @@ pub struct SequenceConfig {
     /// continuous re-projection regardless of this setting.
     pub reproject_every_n_tokens: usize,
 
-    /// Maximum tokens to include in the BDP probe at each
+    /// Maximum tokens to include in the provenance probe at each
     /// reprojection event, looking backward from the current decode
     /// position.  Caps the "thought window" — beyond this many tokens
     /// the prior reprojection already accounted for the older intent.
     ///
     /// Should be a small multiple of `CHUNK_SIZE` (32) for tidy block
-    /// arithmetic; **default: `64`**.
+    /// arithmetic; **default: `256`** — a full tool-call turn's discriminative
+    /// span (the §80.2 sweep shows the true tool is always within Top-3 at this
+    /// width; a narrower 64-token tail needs a much larger budget for 100% recall).
     pub reproject_max_probe_tokens: usize,
 
-    /// Texts that, when sampled as a single token during decode, fire
-    /// an immediate reprojection in addition to the cadence trigger.
+    /// Texts that, when sampled as a single token during decode, fire a
+    /// reprojection in addition to the cadence trigger — but only once
+    /// **more than 16 non-trigger tokens** have been decoded since the last
+    /// projection.  That content gate stops short lines and runs of trigger
+    /// tokens (e.g. consecutive newlines) from each re-orienting attention.
     /// Encoded via the conversation's tokenizer at policy build time;
     /// any text that doesn't tokenize to exactly one ID is silently
     /// skipped.

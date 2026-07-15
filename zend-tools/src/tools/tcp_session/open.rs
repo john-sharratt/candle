@@ -16,9 +16,12 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Target hostname or IP address to connect to.
     #[validate(length(min = 1))]
     pub host: String,
+    /// Target TCP port (0–65535).
     pub port: u16,
+    /// Connection timeout in milliseconds. Default 5000.
     pub timeout_ms: Option<u64>,
 }
 

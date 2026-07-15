@@ -36,6 +36,7 @@ thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+half = { workspace = true }
 
 # Direct-I/O cold-load reader: positional ReadFile / OVERLAPPED on Windows,
 # pread64 + O_DIRECT on Linux. Windows needs windows-sys for the Win32
@@ -81,7 +82,12 @@ default = []
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,
 # gemm_*) so the gap-fill forward's internal breakdown can be dumped.
 profile = ["candle-transformers/profile"]
-sig-trace = []   # enables per-chunk BDP signature tracing (TRACE level, high volume)
+# Scans gathered R16 K/V for all-zero tokens at the decode reprojection gather,
+# the pre-finalize view, the seal-write to the substrate, and projection inject,
+# emitting a `tracing::error` (target `kv_zero`) per dead token. Off by default;
+# each hook does an extra provenance gather so it is debug-only. CUDA-only (the
+# gather is a CUDA path). See `scheduler::kv_zero_check`.
+kv-zero-check = []
 # Records the per-slot token stream (every injected section, every
 # projected turn, prefilled user text, decoded tokens, post-decode
 # tail) and emits a `=== KV cache token dump (turn complete) ===`
@@ -109,21 +115,7 @@ name = "ruler_stream"
 required-features = ["hub"]
 
 [[example]]
-name = "gen_tool_provenance_data"
-
-[[example]]
-name = "gen_real_provenance_data"
-required-features = ["hub"]
-
-[[example]]
-name = "dump_provenance_samples"
-
-[[example]]
 name = "substrate_inspect"
-
-[[test]]
-name = "projection_harness"
-path = "tests/projection_harness/main.rs"
 
 [[test]]
 name = "prefill_ab"

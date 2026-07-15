@@ -278,14 +278,6 @@ impl Scheduler {
             );
         }
 
-        // Extract provenance Q-sigs after advance_sequence so the offset is
-        // current.  The newly-completed block (if any) is guaranteed R16 —
-        // it finished this step and the bg_quantizer cannot have touched it
-        // yet.  Results accumulate in DecodeState::prov_sig_entries and are
-        // passed to perform_seal_and_write, making seal-time extraction cover
-        // only the final partial block (also always R16).
-        self.extract_prov_after_step(&seq_ids);
-
         // Clone sampling configs before taking mutable references
         let mut configs: Vec<SamplingConfig> = seq_ids
             .iter()
@@ -340,10 +332,24 @@ impl Scheduler {
         let mut removed_states: Vec<(SequenceId, SequenceSamplingState)> = seq_ids
             .iter()
             .map(|&id| {
-                let state = self
+                let mut state = self
                     .sampling_states
                     .remove(&id)
                     .expect("sampling state must exist for active sequence");
+                // Sync the steering span's close semantics into the sampler for
+                // THIS step (only consulted inside a segment): the hard-cap
+                // closer script may play only in a TERMINAL free-text span (or
+                // an unsteered block, where there is no stencil). Everywhere
+                // else — a continuation span whose close is dropped and
+                // re-steered into "But wait, " reasoning, a tool-call value,
+                // a static prefill — a forced close stays bare.
+                if state.in_segment {
+                    state.close_would_continue = self
+                        .active_decodes
+                        .get(&id)
+                        .and_then(|s| s.stencil.as_ref())
+                        .is_some_and(|d| !d.in_terminal_close_span());
+                }
                 (id, state)
             })
             .collect();
@@ -545,16 +551,25 @@ impl Scheduler {
         // before and after a tool call never shares a DRY window with the call —
         // and while the call runs DRY is off entirely (the grammar is steered).
         for &seq_id in seq_ids.iter() {
-            let in_tool = self
+            // `in_stencil` covers ANY steered span (think or tool call) and gates
+            // DRY, as before.  `in_tool_call` is the tool call specifically (by
+            // tree label) and gates the remaining repetition penalties — reasoning
+            // keeps full repetition control, only tool-call arguments are freed to
+            // reproduce the prompt's numbers/paths verbatim.
+            let label: Option<&str> = self
                 .active_decodes
                 .get(&seq_id)
-                .is_some_and(|s| s.stencil.is_some());
+                .and_then(|s| s.stencil.as_ref())
+                .map(|d| d.tree().label());
+            let in_stencil = label.is_some();
+            let in_tool_call = label == Some(super::TOOL_CALL_TREE_LABEL);
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
-                if in_tool && !ss.dry_suppressed {
+                if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();
-                } else if !in_tool && ss.dry_suppressed {
+                } else if !in_stencil && ss.dry_suppressed {
                     ss.exit_tool_call();
                 }
+                ss.in_tool_call = in_tool_call;
             }
         }
 
@@ -969,23 +984,55 @@ impl Scheduler {
                 //       intervals even on long uninterrupted spans.
                 //   (b) Punctuation: the just-sampled token is in the
                 //       policy's `trigger_token_ids` set (linefeed, period,
-                //       etc.).  Re-orients attention at semantic
-                //       transitions — paragraph/sentence boundaries — which
-                //       are usually the natural moments to reconsider what
-                //       context the model needs next.
+                //       etc.) AND more than 16 non-trigger tokens have been
+                //       decoded since the last projection.  Re-orients attention
+                //       at semantic transitions, but the content gate stops short
+                //       lines and runs of trigger tokens from each re-projecting.
                 // De-duped so a token that satisfies BOTH only queues once.
                 // Skipped when the sequence just finished — finalize fires
                 // via `cleanup_finished` instead.
                 if !state.finished {
-                    if let Some(p) = state.reprojection.as_ref() {
-                        let cadence_fire = p.every_n_tokens > 0
-                            && state.generated_tokens.len() % p.every_n_tokens == 0;
-                        let punctuation_fire = !p.trigger_token_ids.is_empty()
-                            && p.trigger_token_ids.contains(&next_token);
-                        if (cadence_fire || punctuation_fire)
-                            && !self.pending_reprojections.contains(&seq_id)
-                        {
-                            self.pending_reprojections.push(seq_id);
+                    // Compute the flags via a match so the immutable borrow of
+                    // `state.reprojection` ends before we mutate the counter below.
+                    let flags = match state.reprojection.as_ref() {
+                        Some(p) => Some((
+                            !p.trigger_token_ids.is_empty()
+                                && p.trigger_token_ids.contains(&next_token),
+                            p.every_n_tokens > 0
+                                && state.generated_tokens.len() % p.every_n_tokens == 0,
+                            p.tool_call_open_id == Some(next_token),
+                            p.tool_call_close_id == Some(next_token),
+                        )),
+                        None => None,
+                    };
+                    if let Some((is_trigger, cadence_fire, is_tool_open, is_tool_close)) = flags {
+                        if is_tool_open {
+                            // Entering the tool call: fire one lock-in reprojection so
+                            // the tool committed from the reasoning so far is what the
+                            // model sees, then freeze — the generic call body must not
+                            // re-orient the selection.
+                            Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
+                            state.non_punct_since_reproject = 0;
+                            state.in_tool_call = true;
+                        } else if is_tool_close {
+                            // Leaving the call: reprojection re-enables for whatever
+                            // follows (further calls, or the seal).
+                            state.in_tool_call = false;
+                            state.non_punct_since_reproject = 0;
+                        } else if state.in_tool_call {
+                            // Inside the call body — every cadence/punctuation trigger
+                            // is suppressed so the committed tool stays fixed.
+                        } else {
+                            let punctuation_fire =
+                                is_trigger && state.non_punct_since_reproject > 16;
+                            if cadence_fire || punctuation_fire {
+                                Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
+                                state.non_punct_since_reproject = 0;
+                            } else if !is_trigger {
+                                // A non-trigger token adds to the content accumulated
+                                // toward the next punctuation-driven reprojection.
+                                state.non_punct_since_reproject += 1;
+                            }
                         }
                     }
                 }
@@ -993,10 +1040,22 @@ impl Scheduler {
         }
     }
 
+    /// Queue a view for reprojection at the next drain, deduplicating against
+    /// entries already pending. Every reprojection trigger — cadence,
+    /// punctuation, tool-call lock-in, prefill promotion — enqueues through
+    /// here so the queue's invariants live in one place. An associated fn over
+    /// the queue field (not `&mut self`) so trigger sites that hold a
+    /// `DecodeState` borrow can still call it.
+    pub(super) fn queue_reprojection(pending: &mut Vec<SequenceId>, seq_id: SequenceId) {
+        if !pending.contains(&seq_id) {
+            pending.push(seq_id);
+        }
+    }
+
     /// Drain the queue of views whose decoded count crossed an
     /// `every_n_tokens` boundary in the last `batch_decode_step`.
     ///
-    /// Each entry triggers a BDP scan + projection + view swap; on
+    /// Each entry triggers a provenance scan + projection + view swap; on
     /// success the view's `SequenceId` changes (the new id is internal
     /// to the scheduler — never visible to the caller).  Failures mark
     /// the view as finished with an error event.
@@ -1007,7 +1066,7 @@ impl Scheduler {
         let _t_drain = super::PhaseTimer::new("drain_reprojections");
         let pending = std::mem::take(&mut self.pending_reprojections);
 
-        // Phase 1 — prepare each view: BDP scan + projection + tier elevate +
+        // Phase 1 — prepare each view: provenance scan + projection + tier elevate +
         // inject the sealed prefix + build the gap-fill descriptor. Removes the
         // view's `DecodeState` into the in-flight; does NOT fire the forward.
         let mut inflights: Vec<super::ReprojectInFlight> = Vec::new();

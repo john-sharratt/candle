@@ -204,3 +204,37 @@ fn hash_scan_no_match() {
     );
     harness::expect_error(&resp, "no_match");
 }
+
+// MD5 is supported; the empty string has the well-known digest d41d8cd9...e0.
+// The algorithm name is normalized, so "MD5" and "md5" are identical, and
+// display forms like "SHA-256"/"SHA3-256" also resolve.
+#[test]
+fn hash_compute_md5_known_answer() {
+    for algo in ["md5", "MD5"] {
+        let resp = harness::expect_success(harness::invoke(
+            "hash_compute",
+            json!({"algorithm": algo, "data": "", "data_encoding": "text"}),
+        ));
+        assert_eq!(resp["digest"], "d41d8cd98f00b204e9800998ecf8427e");
+    }
+}
+
+#[test]
+fn hash_compute_display_case_algorithms() {
+    let dashed = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({"algorithm": "SHA-256", "data": "hi", "data_encoding": "text"}),
+    ));
+    let canonical = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({"algorithm": "sha256", "data": "hi", "data_encoding": "text"}),
+    ));
+    assert_eq!(dashed["digest"], canonical["digest"]);
+
+    // "SHA3-256" must reach the sha3_256 arm.
+    let sha3 = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({"algorithm": "SHA3-256", "data": "hi", "data_encoding": "text"}),
+    ));
+    assert_eq!(sha3["digest"].as_str().unwrap().len(), 64);
+}

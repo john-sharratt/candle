@@ -9,7 +9,7 @@
 //!
 //! Keys are derived from the record header alone: `Chunk` is keyed by
 //! `(stream_id, chunk_index)`; the per-stream last-writer-wins types
-//! (`Tokens`, `Signatures`, `StreamDecl`, `Commit`, `ProjectionEvents`)
+//! (`Tokens`, `StreamDecl`, `Commit`, `ProjectionEvents`, `WideQSig`)
 //! by `stream_id`; the workspace singletons by type. The timeline-keyed
 //! metadata types (`Label`, `ConvState`, `TreeMetadata`, `DebugId`,
 //! `Tombstone`) carry their key inside the payload, which the header
@@ -48,23 +48,24 @@ impl RecordAccounting {
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
             RecordType::Tokens
-            | RecordType::Signatures
             | RecordType::StreamDecl
             | RecordType::Commit
-            | RecordType::ProjectionEvents => (header.record_type, header.stream_id, 0),
-            RecordType::ModelSpec
-            | RecordType::Template
-            | RecordType::Tokenizer
-            | RecordType::ToolSummary => (header.record_type, 0, 0),
+            | RecordType::ProjectionEvents
+            | RecordType::WideQSig => (header.record_type, header.stream_id, 0),
+            RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
+                (header.record_type, 0, 0)
+            }
             // Payload-keyed metadata records — excluded (see module doc).
             // `HeaderIndex` records are excluded too: they're derived
             // data with no supersession key, reclaimed wholesale at
-            // compaction.
+            // compaction. `Distilled` markers are payload-keyed and
+            // consumed by the next compaction pass.
             RecordType::Label
             | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::Distilled
             | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };

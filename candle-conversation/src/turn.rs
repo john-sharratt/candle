@@ -78,6 +78,11 @@ pub struct TurnOptions {
     /// it.  Empty = the schema's authored defaults.
     pub selection: SelectionState,
 
+    /// Gather-scope tags for this turn (e.g. `["tool"]` on calibration turns).
+    /// Persisted onto the turn so a projection policy's `tags:` filter can scope
+    /// its provenance gallery. Empty = an untagged live turn.
+    pub tags: Vec<String>,
+
     /// Tool-call stencils that may fire during this turn, keyed by trigger
     /// token.  The default is an empty registry — no constrained decoding.
     pub triggers: Arc<TriggerRegistry>,

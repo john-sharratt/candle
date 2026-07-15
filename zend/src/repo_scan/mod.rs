@@ -24,6 +24,18 @@ pub use cluster::{build_clusters, Cluster};
 pub use types::{FileEntry, Language, RepoMap};
 pub use walk::walk_workspace;
 
+/// Gather-scope tags for a cluster turn: `["repo_map", <root_dir>]`, with the
+/// workspace-root cluster's empty `root_dir` mapped to `"."` so the tag is a
+/// usable slot label for tag-scoped provenance galleries.
+fn cluster_tags(cluster: &Cluster) -> Vec<String> {
+    let root = if cluster.root_dir.is_empty() {
+        ".".to_string()
+    } else {
+        cluster.root_dir.clone()
+    };
+    vec!["repo_map".to_string(), root]
+}
+
 /// Strip auto-summarization from a [`SequenceConfig`] before using
 /// it to mint a utility-layer conversation (repo_map, code_reading).
 ///
@@ -168,7 +180,11 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
             );
             continue;
         }
-        sink.insert_prefill_turn(&cluster.user_prompt, &cluster.listing)?;
+        sink.insert_prefill_turn(
+            &cluster.user_prompt,
+            &cluster.listing,
+            cluster_tags(cluster),
+        )?;
         // Discrete, escaping-safe descriptive fields keyed by cluster root —
         // each value is stored verbatim by the substrate, so no JSON quoting
         // is involved. `rm:<root>` is the cache key the next run probes.
@@ -331,7 +347,11 @@ pub fn refresh_repo_map(
     {
         let mut sink = SequenceTurnSink::new(&mut new_sequence);
         for (i, cluster) in clusters.iter().enumerate() {
-            sink.insert_prefill_turn(&cluster.user_prompt, &cluster.listing)?;
+            sink.insert_prefill_turn(
+                &cluster.user_prompt,
+                &cluster.listing,
+                cluster_tags(cluster),
+            )?;
             progress.set_step_progress((i + 1) as u64, clusters.len() as u64);
         }
     }

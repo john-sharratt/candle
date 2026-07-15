@@ -1014,6 +1014,52 @@ fn test_fork_insert_then_send() {
     base.close().ok();
 }
 
+/// `insert_turn_staged` must leave the staged provenance linkage on each
+/// sealed turn: two projection events (user half at 0, assistant half at its
+/// grid boundary) whose selection references the turn itself and its
+/// predecessor by `(timeline, index)` — the chain a turn-level wide-Q scan
+/// follows to bring the turn in.
+#[test]
+#[ignore]
+fn test_insert_turn_staged_records_projection_events() {
+    let eng = engine();
+    let mut conv = eng
+        .new_conversation("You are absorbing source code.", chatml_config())
+        .expect("new_conversation failed");
+    let tags = vec!["code".to_string(), "src/a.rs".to_string()];
+    conv.insert_turn_staged(
+        "Source excerpt — `src/a.rs` lines 1-1:",
+        "<tool_response>fn alpha() {}</tool_response>",
+        tags.clone(),
+    )
+    .expect("first staged insert failed");
+    conv.insert_turn_staged(
+        "Source excerpt — `src/a.rs` lines 2-2:",
+        "<tool_response>fn beta() {}</tool_response>",
+        tags,
+    )
+    .expect("second staged insert failed");
+
+    let timeline = conv.timeline_id();
+    let per_turn = conv.recovered_projection_events(timeline);
+    assert_eq!(per_turn.len(), 2, "one event bucket per staged turn");
+    for (turn, events) in per_turn.iter().enumerate() {
+        assert_eq!(events.len(), 2, "user-half + assistant-half events");
+        assert_eq!(events[0].start_token, 0, "user half governs from 0");
+        assert!(
+            events[1].start_token > 0,
+            "assistant half starts past the user half"
+        );
+        let self_ref = events[0].selection.turns.last().expect("self reference");
+        assert_eq!(self_ref.index, turn as u32);
+        assert_eq!(self_ref.timeline, Some(timeline.raw()));
+    }
+    // The second turn's events reference the first as its predecessor.
+    assert_eq!(per_turn[1][0].selection.turns[0].index, 0);
+
+    conv.close().ok();
+}
+
 /// Multiple sequential forks from the same base, each with different
 /// injected context via `insert_turn`. Verifies the base KV cache is
 /// not mutated by forks.

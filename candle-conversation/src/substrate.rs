@@ -20,7 +20,6 @@
 //!  ┌──────────────────────────────────────────────────────────────────────┐
 //!  │ Substrate struct — concrete session-state owner                      │
 //!  │  • append_with_blocks(group, tokens, start, end) → TurnIndex         │
-//!  │  • set_scores(group, idx, PerDepthScores)                             │
 //!  │  • block_range_of(group, idx)                                         │
 //!  │  • reset()                                                            │
 //!  └──────────────────────────────────────────────────────────────────────┘
@@ -35,18 +34,13 @@
 //!
 //! # Scoring contract
 //!
-//! Per-turn relevance scores come from the Binary Directional Provenance
-//! scanner, which produces three [`TurnScores`] structs per turn (one per
-//! depth: syntactic, semantic, pragmatic).  The trait method
-//! [`ContentResolver::turn_score`] takes a [`ScoreFormula`] picking which
-//! statistic to use (max / sum / mean / top_k_mean / count) and a
-//! [`DepthWeights`] specifying how to combine the three depths.  Both are
-//! supplied by the projection engine from the layer schema; the resolver is
-//! agnostic to the choice.
-//!
-//! Scores default to all-zeroes until the first BDP scan refreshes them.
+//! Per-turn / per-section relevance scores are the wide-Q belief scores the
+//! scheduler records for a projection (see
+//! [`ContentResolver::turn_score`] / [`ContentResolver::section_score`], which
+//! return a plain `f32`). Scores default to zero until the reprojection's belief
+//! scan populates them.
 
-use std::sync::{OnceLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
 use candle_nn::kv_cache::{QuantFormat, SealedSequence};
@@ -59,23 +53,21 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, RecordType, TombstonePayload, ToolSummaryEntry, ToolSummaryPayload,
-    TreeMetadataPayload,
+    DebugIdPayload, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
-use crate::projection::{DepthWeights, ScoreFormula};
 use crate::projection::{
     GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex,
     TurnKey,
 };
+use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::summary_tree::{
-    select_budget_fit, Node, NodeId, SelectionDiagnostics, SelectionOrigin, SummaryTree, TurnKind,
-    MERGE_FANOUT,
+    select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
+    TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::TurnLayout;
-use crate::SigEntry;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -100,6 +92,15 @@ use crate::SigEntry;
 /// A residence appears on the hot list iff `hot.is_some()`, ditto
 /// warm. Position in the list **is** the recency information — no
 /// timestamps, no clock.
+/// Per-stream memoized decode of wide-Q signature blobs. The belief scan would
+/// otherwise `decode_wide_sigs` the whole (static) gallery on every reprojection
+/// — tens of ms of repeated work on a corpus that doesn't change between
+/// reprojections. Invalidation is **incremental**: a blob write evicts only that
+/// stream's entry (see [`Substrate::set_wide_q_sigs_blob`]), so one turn seal
+/// doesn't churn the whole gallery. `None` value = decoded to nothing (absent or
+/// empty window), cached so repeated misses don't re-parse.
+type SigCache = HashMap<StreamId, Option<Arc<Vec<WideQSig>>>>;
+
 #[derive(Debug, Default)]
 pub struct Substrate {
     /// Per-turn KV residence slab. Indexed by [`ResidenceIndex`];
@@ -152,13 +153,20 @@ pub struct Substrate {
     warm_lru: LinkedList<ResidenceIndex>,
 
     /// Per-stream in-RAM index of where each chunk / tokens record /
-    /// signatures record / committed-through watermark sits on disk.
+    /// committed-through watermark sits on disk.
     /// Built by replaying the redo log on startup (and updated on
     /// every fresh append).  Cold-load and seal-time persistence read
     /// this directly; the manifest holds only the workspace
     /// singletons.  The per-stream `BTreeMap` only ever sits in
     /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
+
+    /// Interior-mutable per-stream memo of decoded wide-Q windows for the belief
+    /// scan — filled lazily under a read lock, so a session's reprojections
+    /// decode the static gallery once instead of every scan, and invalidated
+    /// per-stream on a blob write so one turn seal doesn't churn the whole
+    /// gallery. See [`Self::decoded_wide_sig`].
+    sig_cache: Mutex<SigCache>,
 
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
@@ -187,10 +195,9 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
-    /// Latest cached tool-catalog summary (the `ToolSummary` singleton),
-    /// last-writer-wins. The startup hook reads `catalog_hash` to decide whether
-    /// the catalog changed and the summary must be regenerated.
-    tool_summary: Option<ToolSummaryPayload>,
+    /// Timelines marked for distillation — their turns keep sig + decl but shed
+    /// content at compaction. Same replay-order-independence as tombstones.
+    distilled_timelines: HashSet<TimelineId>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -488,78 +495,16 @@ pub struct PurgeReport {
 
 // ── Per-turn statistics ───────────────────────────────────────────────────────
 
-/// Five aggregations of per-token agreement values within a single turn at
-/// a single BDP depth.  All five are computed in one scan pass so the
-/// projection can pick whichever metric its layer schema asks for.
+/// Transient per-projection belief score cache.
 ///
-/// Values are typically in the range `[0, 128]` (the Hamming-agreement scale)
-/// scaled by however many `(probe, corpus)` pairs contributed.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct TurnScores {
-    /// Maximum agreement seen across all `(probe, corpus)` token pairs.
-    pub max: f32,
-    /// Sum of agreement across all pairs.
-    pub sum: f32,
-    /// Arithmetic mean: `sum / count_pairs`.
-    pub mean: f32,
-    /// Mean of the top-K agreements (K from `score_formula_k`, default 8).
-    pub top_k_mean: f32,
-    /// Number of pairs whose agreement crossed a "high-relevance" threshold.
-    pub count: f32,
-    /// Span score: Σ L^α over consecutive runs of probe token positions that
-    /// had at least one above-threshold corpus match.  α is configured on the
-    /// BdpScanner (default 2.0).  Isolated hits (L=1) score 1.0; a run of L
-    /// consecutive probe tokens scores L^α, rewarding sustained attention.
-    pub span: f32,
-    /// Per-token excess: Σ over probe tokens of `max(0, best_agreement − 64)`.
-    /// Recentered on the random baseline (noise → ~0) and reduced per probe
-    /// token (a single promiscuous token cannot inflate it), with no hit
-    /// threshold so weak sub-90 signal survives.  Calibrated as the strongest
-    /// prefill-phase section-scoring metric.
-    pub pertok_excess: f32,
-}
-
-impl TurnScores {
-    /// Read the statistic that matches `formula`.  `score_formula_k` for
-    /// `TopKMean` is encoded inside the variant; this method just picks a
-    /// pre-computed field.
-    #[inline]
-    pub fn pick(&self, formula: ScoreFormula) -> f32 {
-        match formula {
-            ScoreFormula::Max => self.max,
-            ScoreFormula::Sum => self.sum,
-            ScoreFormula::Mean => self.mean,
-            ScoreFormula::TopKMean { .. } => self.top_k_mean,
-            ScoreFormula::Count => self.count,
-            ScoreFormula::Span { .. } => self.span,
-            ScoreFormula::PerTokenExcess => self.pertok_excess,
-        }
-    }
-}
-
-/// Per-turn BDP scores at all three depths.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct PerDepthScores {
-    pub syn: TurnScores,
-    pub sem: TurnScores,
-    pub prag: TurnScores,
-}
-
-/// Transient per-projection BDP score cache.
-///
-/// **Not part of the persistent substrate state.** Built by the BDP
-/// scanner during one projection pass, consumed by the projection
-/// emitter during that same pass, then discarded. Conversation
-/// identity does not include this — reload from log starts with an
-/// empty `ProjectionScores`, and the next BDP scan repopulates it.
-///
-/// Lives separately from `TurnEntryData` / `SectionEntryData` so
-/// reads of those types don't surface stale-or-not-yet-scored
-/// projection scratch as if it were canonical conversation state.
+/// **Not part of the persistent substrate state.** Built by the scheduler's
+/// wide-Q belief scan during one reprojection, consumed by the projection
+/// emitter during that same pass, then discarded. Conversation identity does not
+/// include this — reload from log starts empty and the next scan repopulates it.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionScores {
-    turns: AHashMap<TurnKey, PerDepthScores>,
-    sections: AHashMap<SectionId, PerDepthScores>,
+    turns: AHashMap<TurnKey, f32>,
+    sections: AHashMap<SectionId, f32>,
 }
 
 impl ProjectionScores {
@@ -568,29 +513,27 @@ impl ProjectionScores {
         Self::default()
     }
 
-    /// Record the BDP scores for one turn.
-    pub fn set_turn(&mut self, timeline: TimelineId, index: TurnIndex, scores: PerDepthScores) {
-        self.turns.insert(TurnKey::new(timeline, index), scores);
+    /// Record the belief score for one turn.
+    pub fn set_turn(&mut self, timeline: TimelineId, index: TurnIndex, score: f32) {
+        self.turns.insert(TurnKey::new(timeline, index), score);
     }
 
-    /// Record the BDP scores for one system-prompt section.
-    pub fn set_section(&mut self, section: SectionId, scores: PerDepthScores) {
-        self.sections.insert(section, scores);
+    /// Record the belief score for one system-prompt section.
+    pub fn set_section(&mut self, section: SectionId, score: f32) {
+        self.sections.insert(section, score);
     }
 
-    /// Look up a turn's scores. Defaults to zero when the BDP scanner
-    /// did not score this turn in the current projection (e.g. the turn
-    /// was outside the recent window).
-    pub fn turn(&self, timeline: TimelineId, index: TurnIndex) -> PerDepthScores {
+    /// Look up a turn's belief score. Zero when not scored this projection.
+    pub fn turn(&self, timeline: TimelineId, index: TurnIndex) -> f32 {
         self.turns
             .get(&TurnKey::new(timeline, index))
             .copied()
-            .unwrap_or_default()
+            .unwrap_or(0.0)
     }
 
-    /// Look up a section's scores. Defaults to zero when not scored.
-    pub fn section(&self, section: SectionId) -> PerDepthScores {
-        self.sections.get(&section).copied().unwrap_or_default()
+    /// Look up a section's belief score. Zero when not scored.
+    pub fn section(&self, section: SectionId) -> f32 {
+        self.sections.get(&section).copied().unwrap_or(0.0)
     }
 
     /// Number of scored turns.
@@ -621,10 +564,10 @@ impl ProjectionScores {
         substrate: &Substrate,
         group: GroupId,
         index: TurnIndex,
-        scores: PerDepthScores,
+        score: f32,
     ) {
         if let Some(timeline) = substrate.timelines_for_group(group).next() {
-            self.set_turn(timeline, index, scores);
+            self.set_turn(timeline, index, score);
         }
     }
 }
@@ -633,13 +576,11 @@ impl ProjectionScores {
 
 /// Per-section state stored in the substrate.  Mirrors [`TurnEntryData`]
 /// for sections — sections are scoreable like turns when their content
-/// has been prefilled into a conversation's KV cache and their
-/// per-chunk sig_entries captured.
+/// has been prefilled into a conversation's KV cache.
 #[derive(Debug, Clone)]
 pub struct SectionEntryData {
     token_count: usize,
     block_range: (u64, u64),
-    sig_entries: Vec<SigEntry>,
     tokens: Arc<Vec<u32>>,
     /// Slot in [`Substrate::residence`] holding this section's
     /// hot/warm/cold KV state. Sealed bytes live there.
@@ -698,7 +639,6 @@ pub struct TurnPart {
     /// same bytes so cross-process replay (`recover_turn`)
     /// reconstructs the slot K/V exactly.
     pub token_ids: TokenBuffer,
-    pub sig_entries: Vec<SigEntry>,
     /// Slot in [`Substrate::residence`] holding this turn's
     /// hot/warm/cold KV state.
     pub residence: ResidenceIndex,
@@ -723,6 +663,10 @@ pub struct TurnPartWrite {
     pub block_start: u64,
     pub block_end: u64,
     pub sealed_gpu: Option<Arc<Vec<SealedSequence>>>,
+    /// Gather-scope tags for this turn (e.g. `"tool"` on calibration turns).
+    /// Persisted onto the turn's `TurnDecl`; the provenance gallery honours a
+    /// projection policy's `tags:` filter against them. Empty for live turns.
+    pub tags: Vec<String>,
 }
 
 impl TurnPartWrite {
@@ -760,19 +704,9 @@ pub trait ContentResolver {
     /// Token count for a turn.  Stable across projection calls.
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize;
 
-    /// Relevance score for a turn.
-    ///
-    /// Higher = more relevant.  Computed from per-depth BDP statistics:
-    /// the `formula` picks which of `(max, sum, mean, top_k_mean, count)`
-    /// to read for each depth, then `weights.combine` collapses the three
-    /// depths into a single `f32`.
-    fn turn_score(
-        &self,
-        group: GroupId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32;
+    /// Relevance score for a turn — the wide-Q belief score the scheduler
+    /// recorded for this projection. Zero when unscored.
+    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32;
 
     /// Layer that produced a given turn.  Used to denormalise
     /// `layer_id` onto the emitted `TurnId` without a back-lookup
@@ -782,6 +716,15 @@ pub trait ContentResolver {
     /// When `None`, projection emit falls back to the layer-walk's
     /// `layer_id` — which is correct for tests using mock resolvers.
     fn turn_origin(&self, _group: GroupId, _index: TurnIndex) -> Option<LayerId> {
+        None
+    }
+
+    /// The turn in `group` whose gather-scope decl tags contain `tag`, if any.
+    /// Used to resolve a group's declared `default` member (a workspace-root
+    /// cluster tagged `"."`, etc.) when normal selection is empty — so the
+    /// group never drops out of the projection. Off the hot path: only consulted
+    /// on an empty selection. Default `None` (mock resolvers carry no tags).
+    fn turn_with_tag(&self, _group: GroupId, _tag: &str) -> Option<TurnIndex> {
         None
     }
 
@@ -859,9 +802,6 @@ pub trait ContentResolver {
         &self,
         _timeline: TimelineId,
         _budget: u32,
-        _floor: usize,
-        _formula: ScoreFormula,
-        _weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
         None
     }
@@ -874,15 +814,9 @@ pub trait ContentResolver {
         0
     }
 
-    /// Relevance score for a system-prompt section.  Default returns
-    /// `0.0` — concrete resolvers (e.g. [`Substrate`]) override
-    /// this with BDP-derived scores.
-    fn section_score(
-        &self,
-        _section: SectionId,
-        _formula: ScoreFormula,
-        _weights: &DepthWeights,
-    ) -> f32 {
+    /// Relevance score for a system-prompt section — the wide-Q belief score
+    /// the scheduler recorded. Default `0.0`; concrete resolvers override.
+    fn section_score(&self, _section: SectionId) -> f32 {
         0.0
     }
 }
@@ -892,8 +826,8 @@ pub trait ContentResolver {
 /// Per-session turn state that implements [`ContentResolver`].
 ///
 /// Owns the append history for every group.  The caller stores turn *content*
-/// externally (keyed by `(GroupId, TurnIndex)`) and updates scores via
-/// [`Substrate::set_scores`] after each BDP retrieval pass.
+/// externally (keyed by `(GroupId, TurnIndex)`); relevance scores are supplied
+/// separately per projection via a [`ProjectionScores`] cache.
 ///
 /// # Storage
 ///
@@ -911,7 +845,7 @@ pub trait ContentResolver {
 ///   append_with_blocks(group, tokens, start, end) → TurnIndex
 ///        │
 ///        ▼
-///   set_scores(group, index, PerDepthScores)
+///   set_turn(timeline, index, belief_score: f32)
 ///        │
 ///        ▼
 ///   builder.project(target, &resolver)
@@ -1067,13 +1001,15 @@ pub struct StreamRuntime {
     pub chunks: BTreeMap<u64, ChunkLoc>,
     /// Latest `Tokens` record for the stream.
     pub tokens: Option<RecordLoc>,
-    /// Latest `Signatures` record for the stream.
-    pub signatures: Option<RecordLoc>,
     /// Latest `ProjectionEvents` record payload (opaque JSON bytes — the
     /// projection layer decodes). Eager bytes rather than a `RecordLoc`: the
     /// per-turn timeline is tiny, so we keep it resident and re-emit it on
     /// compaction like the other synthesised per-entity records.
     pub projection_events: Option<Vec<u8>>,
+    /// Opaque encoded wide-Q signature window (`provenance::wide_sig`) for this turn's most
+    /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
+    /// rebuilt from the redo log on replay. `None` until the first projection writes it.
+    pub wide_q_sigs: Option<Vec<u8>>,
     /// Highest chunk index the stream is durably committed through.
     pub committed_through: Option<u64>,
 }
@@ -1610,6 +1546,10 @@ impl Substrate {
         let threshold: u64 = std::cmp::max(2 * 1024 * 1024 * 1024, total_ram / 20);
         let mut freed_bytes: u64 = 0;
         let mut count: usize = 0;
+        // Residences popped off the LRU tail that we must NOT drop (their warm
+        // copy is the turn's only surviving copy). Restored to the LRU after the
+        // loop so a later pass reclaims them once a lower tier lands.
+        let mut skipped: Vec<ResidenceIndex> = Vec::new();
         loop {
             // available + freed - incoming >= threshold ?
             let projected = available_ram
@@ -1622,11 +1562,20 @@ impl Substrate {
             let Some(idx) = self.warm_lru.pop_back() else {
                 break;
             };
+            // Only drop warm when the data survives elsewhere — hot in VRAM or
+            // cold on disk. A warm-only residence (its cold write hasn't landed,
+            // or failed) is its turn's ONLY copy; dropping it would lose the K/V.
+            // Set it aside (restored below) rather than free it.
+            let slot = &self.residence[idx.0];
+            if slot.warm.is_some() && slot.cold.is_none() && slot.hot.is_none() {
+                skipped.push(idx);
+                continue;
+            }
             let slot = &mut self.residence[idx.0];
             if slot.warm.take().is_some() {
                 freed_bytes = freed_bytes.saturating_add(slot.byte_size);
                 count += 1;
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::persistence::tier",
                     residence = idx.0,
                     bytes = slot.byte_size,
@@ -1636,8 +1585,13 @@ impl Substrate {
             // If warm was None, the slot was stale in the LRU; just
             // discard the index and keep looking.
         }
+        // Restore the residences we couldn't safely drop; they remain valid warm
+        // entries and rejoin the LRU tail in their original relative order.
+        for idx in skipped {
+            self.warm_lru.push_back(idx);
+        }
         if count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "candle_conversation::persistence::tier",
                 count,
                 bytes = freed_bytes,
@@ -2254,10 +2208,56 @@ impl Substrate {
     // ── Per-stream runtime state (was Manifest.streams) ─────────────────
 
     /// Read the in-RAM runtime state for `stream_id` — chunk index +
-    /// latest tokens/signatures locations + committed-through
-    /// watermark + decl.
+    /// latest tokens location + committed-through watermark + decl.
     pub fn stream_of(&self, stream_id: StreamId) -> Option<&StreamRuntime> {
         self.streams.get(&stream_id)
+    }
+
+    /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
+    ///
+    /// The belief scan reads the same static gallery on every reprojection;
+    /// re-`decode_wide_sigs`-ing all of it each time is the single largest
+    /// repeated cost of the scan. This returns a shared [`Arc`] of the decoded
+    /// window, decoding on first touch and serving the memo thereafter. `None`
+    /// when the stream has no signature or an empty one. Interior-mutable: safe
+    /// to call under a read lock (a blob write evicts the stale entry under a
+    /// write lock, so a read never observes a stale window).
+    pub fn decoded_wide_sig(&self, stream_id: StreamId) -> Option<Arc<Vec<WideQSig>>> {
+        // Fast path — a cached decode. Scoped so the lock releases before the
+        // decode below. `unwrap_or_else(into_inner)` recovers a poisoned mutex:
+        // the memo holds only plain data, so a panic elsewhere can't corrupt it.
+        {
+            let cache = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(&stream_id) {
+                return hit.clone();
+            }
+        }
+        // Decode OUTSIDE the lock so a slow decode never blocks another reader's
+        // cache hit; a concurrent miss on the same stream just decodes twice
+        // (harmless — the value is identical, insert is last-writer-wins).
+        let decoded = self
+            .streams
+            .get(&stream_id)
+            .and_then(|e| e.wide_q_sigs.as_ref())
+            .and_then(|b| decode_wide_sigs(b))
+            .filter(|w| !w.is_empty())
+            .map(Arc::new);
+        self.sig_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(stream_id, decoded.clone());
+        decoded
+    }
+
+    /// Evict `stream_id`'s decoded-window memo — the **incremental** invalidation
+    /// used when its blob is (re)written, so one turn seal re-decodes only that
+    /// one window on the next scan instead of churning the whole gallery.
+    #[inline]
+    fn evict_decoded_wide_sig(&mut self, stream_id: StreamId) {
+        self.sig_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&stream_id);
     }
 
     /// True iff the substrate has any record of `stream_id`.
@@ -2388,11 +2388,6 @@ impl Substrate {
         self.streams.entry(stream_id).or_default().tokens = Some(loc);
     }
 
-    /// Record the latest `Signatures` record location for `stream_id`.
-    pub fn apply_signatures_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
-        self.streams.entry(stream_id).or_default().signatures = Some(loc);
-    }
-
     /// Record the highest chunk index the stream is durably committed
     /// through.  Last-writer-wins.
     pub fn apply_commit_through(&mut self, stream_id: StreamId, through_index: u64) {
@@ -2510,6 +2505,30 @@ impl Substrate {
         &self.tombstoned_timelines
     }
 
+    /// Apply a decoded [`DistillPayload`] — marks the timeline for distillation.
+    pub fn apply_distill(&mut self, payload: &DistillPayload) {
+        if let Some(timeline) = TimelineId::from_raw(payload.timeline_id) {
+            self.distilled_timelines.insert(timeline);
+        }
+    }
+
+    /// Mark `timeline` for distillation in-RAM (callers also write the matching
+    /// `Distilled` record so the marker survives reload).
+    pub fn distill_timeline(&mut self, timeline: TimelineId) {
+        self.distilled_timelines.insert(timeline);
+    }
+
+    /// Whether `timeline` is marked for distillation.
+    pub fn is_distilled(&self, timeline: TimelineId) -> bool {
+        self.distilled_timelines.contains(&timeline)
+    }
+
+    /// Direct read of the distilled-timeline set — the compactor uses it to shed
+    /// content (keep sig, drop tokens + KV) from these timelines' turns.
+    pub fn distilled_timelines(&self) -> &HashSet<TimelineId> {
+        &self.distilled_timelines
+    }
+
     /// On-disk bytes held by streams of tombstoned timelines — dead
     /// weight the header-keyed accounting can't see (a tombstone names
     /// its timeline in the payload, and the doomed records were live
@@ -2530,7 +2549,6 @@ impl Substrate {
             .map(|s| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
                     + s.tokens.map_or(0, |l| l.record_size)
-                    + s.signatures.map_or(0, |l| l.record_size)
             })
             .sum()
     }
@@ -2617,16 +2635,6 @@ impl Substrate {
                     },
                 );
             }
-            RecordType::Signatures => {
-                self.apply_signatures_loc(
-                    stream_id,
-                    RecordLoc {
-                        offset: entry.offset,
-                        payload_len: h.payload_len,
-                        record_size: entry.size,
-                    },
-                );
-            }
             RecordType::Commit => {
                 self.apply_commit_through(stream_id, h.chunk_index);
             }
@@ -2655,9 +2663,9 @@ impl Substrate {
                     self.apply_tombstone(&payload);
                 }
             }
-            RecordType::ToolSummary => {
-                if let Ok(payload) = ToolSummaryPayload::decode(&entry.record.payload) {
-                    self.apply_tool_summary(payload);
+            RecordType::Distilled => {
+                if let Ok(payload) = DistillPayload::decode(&entry.record.payload) {
+                    self.apply_distill(&payload);
                 }
             }
             RecordType::ProjectionEvents => {
@@ -2665,6 +2673,13 @@ impl Substrate {
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
+            }
+            RecordType::WideQSig => {
+                // Opaque wide-Q window bytes (provenance::wide_sig), last-writer-wins
+                // per turn stream id — each (re)projection overwrites the window.
+                self.streams.entry(stream_id).or_default().wide_q_sigs =
+                    Some(entry.record.payload.clone());
+                self.evict_decoded_wide_sig(stream_id);
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
@@ -2674,38 +2689,6 @@ impl Substrate {
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
-    }
-
-    /// Apply a decoded [`ToolSummaryPayload`], last-writer-wins: the walker
-    /// replays records in append order, so the final `ToolSummary` is the live
-    /// one and overwrites any earlier cached summary.
-    pub fn apply_tool_summary(&mut self, payload: ToolSummaryPayload) {
-        self.tool_summary = Some(payload);
-    }
-
-    /// The catalog hash of the currently-cached tool summary for the requested
-    /// mode (`restricted = true` for the safe-subset summary, `false` for the
-    /// full-catalog one), if any. The startup hook compares this to the
-    /// freshly-injected catalog's hash to decide whether to regenerate.
-    pub fn tool_summary_hash(&self, restricted: bool) -> Option<u128> {
-        self.tool_summary_entry(restricted).map(|e| e.catalog_hash)
-    }
-
-    /// The currently-cached tool-summary text for the requested mode, if any.
-    pub fn tool_summary_text(&self, restricted: bool) -> Option<&str> {
-        self.tool_summary_entry(restricted)
-            .map(|e| e.summary.as_str())
-    }
-
-    /// The cached summary entry for the requested mode.
-    fn tool_summary_entry(&self, restricted: bool) -> Option<&ToolSummaryEntry> {
-        self.tool_summary.as_ref().and_then(|p| {
-            if restricted {
-                p.restricted.as_ref()
-            } else {
-                p.comprehensive.as_ref()
-            }
-        })
     }
 
     /// Build an in-memory [`summary_tree::SummaryTree`] (forest) from the
@@ -2797,7 +2780,6 @@ impl Substrate {
                     layout: TurnLayout::default(),
                     token_count,
                     token_ids: TokenBuffer::default(),
-                    sig_entries: Vec::new(),
                     residence,
                 },
             },
@@ -2860,7 +2842,6 @@ impl Substrate {
                         layout: write.layout,
                         token_count,
                         token_ids: write.token_ids,
-                        sig_entries: Vec::new(),
                         residence,
                     },
                 },
@@ -2918,7 +2899,6 @@ impl Substrate {
                         layout,
                         token_count,
                         token_ids,
-                        sig_entries: Vec::new(),
                         residence,
                     },
                 },
@@ -3102,38 +3082,6 @@ impl Substrate {
         self.turn(timeline, index).map_or((0, 0), |e| e.block_range)
     }
 
-    /// Set the turn's BDP sig entries — one per chunk in the
-    /// content's residence, in slot block order.
-    pub fn set_sig_entries(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        entries: Vec<SigEntry>,
-    ) {
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.content.sig_entries = entries;
-        }
-    }
-
-    pub fn extend_sig_entries(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        entries: impl IntoIterator<Item = SigEntry>,
-    ) {
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.content.sig_entries.extend(entries);
-        }
-    }
-
-    /// Turn's BDP sig entries — one per chunk in the content's
-    /// residence, slot-block ordered.
-    pub fn sig_entries_of(&self, timeline: TimelineId, index: TurnIndex) -> Vec<SigEntry> {
-        self.turn(timeline, index)
-            .map(|e| e.content.sig_entries.clone())
-            .unwrap_or_default()
-    }
-
     /// Sealed K/V for the turn — Arc-cloned per-layer
     /// `SealedSequence` snapshot of the content residence's hot
     /// tier.  Used by the projection assembler when injecting a
@@ -3223,6 +3171,22 @@ impl Substrate {
         self.timelines
             .get(&timeline)
             .map_or(0, |t| t.turns.len() as u32)
+    }
+
+    /// The turn on `timeline` whose decl gather-scope tags contain `tag`, if any.
+    /// Backs [`ContentResolver::turn_with_tag`] — used to resolve a group's
+    /// declared `default` member (e.g. the repo_map workspace-root cluster,
+    /// tagged `"."`). Scans the stream decls (as `belief_gallery` does); scoped
+    /// to `timeline` because a group is shared across conversations. `tag` is
+    /// expected to identify a unique turn.
+    pub fn turn_with_tag(&self, timeline: TimelineId, tag: &str) -> Option<TurnIndex> {
+        self.all_streams().find_map(|(_sid, e)| {
+            let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
+                return None;
+            };
+            (d.timeline_id == timeline.raw() && d.tags.iter().any(|t| t == tag))
+                .then(|| TurnIndex(d.turn_index))
+        })
     }
 
     /// Corpus size for a conversation — `timeline`'s turn tokens plus the
@@ -3424,6 +3388,11 @@ impl Substrate {
         self.sections.clear();
         self.timeline_token_totals.clear();
         self.section_token_total = 0;
+        // Drop the whole decoded-signature memo — stream ids may be reused.
+        self.sig_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Store a turn's projection-event record payload (opaque JSON bytes) on its
@@ -3438,6 +3407,21 @@ impl Substrate {
         self.streams
             .get(&turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.projection_events.as_deref())
+    }
+
+    /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
+    pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
+        self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
+        // Incremental invalidation: evict only this stream's decoded window so a
+        // single seal doesn't force a full-gallery re-decode on the next scan.
+        self.evict_decoded_wide_sig(stream_id);
+    }
+
+    /// The stored wide-Q signature window payload for a turn, if any.
+    pub fn wide_q_sigs_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
+        self.streams
+            .get(&turn_stream_id(timeline.raw(), index.0))
+            .and_then(|s| s.wide_q_sigs.as_deref())
     }
 
     // ── Section accessors ────────────────────────────────────────────────────
@@ -3462,7 +3446,6 @@ impl Substrate {
         section: SectionId,
         stream_id: StreamId,
         token_count: usize,
-        sig_entries: Vec<SigEntry>,
         sealed_gpu: Arc<Vec<SealedSequence>>,
         migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
         tokens: Arc<Vec<u32>>,
@@ -3472,7 +3455,6 @@ impl Substrate {
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
-            sig_entries,
             tokens,
             residence,
         };
@@ -3497,13 +3479,11 @@ impl Substrate {
     /// installing it pre-emptively marks the section as already
     /// persisted so the persistence thread's section-persist pass
     /// skips it.
-    #[allow(clippy::too_many_arguments)]
     pub fn restore_section(
         &mut self,
         section: SectionId,
         stream_id: StreamId,
         token_count: usize,
-        sig_entries: Vec<SigEntry>,
         sealed_hot: Vec<SealedSequence>,
         cold: Vec<StoredSequence>,
         tokens: Arc<Vec<u32>>,
@@ -3513,7 +3493,6 @@ impl Substrate {
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
-            sig_entries,
             tokens,
             residence,
         };
@@ -3687,12 +3666,6 @@ impl Substrate {
             .map_or((0, 0), |e| e.block_range)
     }
 
-    pub fn section_sig_entries(&self, section: SectionId) -> &[SigEntry] {
-        self.sections
-            .get(&section)
-            .map_or(&[][..], |e| &e.sig_entries)
-    }
-
     pub fn all_sections(&self) -> impl Iterator<Item = SectionId> + '_ {
         self.sections.keys().copied()
     }
@@ -3727,13 +3700,7 @@ impl ContentResolver for Substrate {
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(
-        &self,
-        _group: GroupId,
-        _index: TurnIndex,
-        _formula: ScoreFormula,
-        _weights: &DepthWeights,
-    ) -> f32 {
+    fn turn_score(&self, _group: GroupId, _index: TurnIndex) -> f32 {
         // Bare substrate has no attached scores; pair via ScoredSubstrate
         // or read through Conversation::read_scored to see non-zero values.
         0.0
@@ -3749,12 +3716,7 @@ impl ContentResolver for Substrate {
         self.sections.get(&section).map_or(0, |e| e.token_count)
     }
 
-    fn section_score(
-        &self,
-        _section: SectionId,
-        _formula: ScoreFormula,
-        _weights: &DepthWeights,
-    ) -> f32 {
+    fn section_score(&self, _section: SectionId) -> f32 {
         0.0
     }
 }
@@ -3776,24 +3738,22 @@ impl<'a> ScoredSubstrate<'a> {
     }
 }
 
-/// Shared body of [`ContentResolver::summary_tree_select`] — the top-down
-/// refinement pick: build the timeline's summary forest and run
-/// [`select_budget_fit`], which keeps the newest turns raw while they fit the
-/// window and covers the older tail with summaries. Returns the picked turns
-/// with their selection origins, each carrying its BDP provenance score for the
-/// diagnostics panel. `None` when the timeline has no summary nodes, in which
-/// case the projection falls through to the rule-based selector (which excludes
-/// summary turns). Used by the production [`SubstrateRead`] resolver and the
-/// test-only [`ScoredSubstrate`].
+/// Shared body of [`ContentResolver::summary_tree_select`] — the score-density
+/// pick: build the timeline's summary forest, stamp each node with its
+/// provenance turn score, and run [`select_dense`], which selects the most
+/// relevant nodes (with recency anchoring/decay) that fit the window. Returns
+/// the picked turns with their selection origins, each carrying its effective
+/// provenance score for the diagnostics panel. `None` when the timeline has no
+/// summary nodes, in which case the projection falls through to the rule-based
+/// selector (which excludes summary turns). Used by the production
+/// [`SubstrateRead`] resolver and the test-only [`ScoredSubstrate`].
 fn select_summary_tree(
     substrate: &Substrate,
     scores: &ProjectionScores,
     timeline: TimelineId,
     budget: u32,
-    floor: usize,
-    formula: ScoreFormula,
-    weights: &DepthWeights,
 ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+    // No summary nodes yet → fall through to the rule-based path.
     if !substrate.has_summary_nodes(timeline) {
         return None;
     }
@@ -3801,17 +3761,30 @@ fn select_summary_tree(
     if tree.is_empty() {
         return None;
     }
-    let sel = select_budget_fit(&tree, budget, floor);
+    let mut node_scores: ahash::AHashMap<NodeId, f32> = ahash::AHashMap::default();
+    for id in tree.all_ids() {
+        let idx = TurnIndex(id.0);
+        // A tree node without a backing substrate turn is an orphan (redo-log
+        // TreeMetadata whose matching TurnDecl never landed). It can't be
+        // elevated, so exclude it from the selection that flows into the
+        // projection / elevate path.
+        if substrate.turn(timeline, idx).is_none() {
+            continue;
+        }
+        node_scores.insert(id, scores.turn(timeline, idx));
+    }
+    let cfg = RecencyConfig::default();
+    let sel = select_dense(&tree, &node_scores, cfg, budget);
+    // Convert (NodeId, SelectionOrigin) pairs back to TurnIndex, post-filtering
+    // orphan NodeIds `select_dense` may have walked in via the tree shape.
     let out: Vec<_> = sel
         .selected
         .iter()
         .zip(sel.origins.iter())
         .filter_map(|(id, origin)| {
             let idx = TurnIndex(id.0);
-            // Skip orphan tree nodes (metadata without a backing turn).
             substrate.turn(timeline, idx)?;
-            // Attach the node's BDP provenance score for the panel display.
-            let eff = combine_per_depth(scores.turn(timeline, idx), formula, weights);
+            let eff = sel.effective_scores.get(id).copied().unwrap_or(0.0);
             Some((idx, *origin, eff))
         })
         .collect();
@@ -3823,18 +3796,6 @@ impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
     fn deref(&self) -> &Substrate {
         self.substrate
     }
-}
-
-/// Combine the three per-depth statistics for a (formula, weights) pair.
-/// Shared between every scored ContentResolver impl so a substrate-side
-/// shape change can't drift the formula across them.
-#[inline]
-fn combine_per_depth(s: PerDepthScores, formula: ScoreFormula, weights: &DepthWeights) -> f32 {
-    weights.combine(
-        s.syn.pick(formula),
-        s.sem.pick(formula),
-        s.prag.pick(formula),
-    )
 }
 
 /// Group-keyed [`ContentResolver`] impl over a `(Substrate, ProjectionScores)`
@@ -3860,20 +3821,14 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(
-        &self,
-        group: GroupId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
         let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
             return 0.0;
         };
         if self.substrate.turn(timeline, index).is_none() {
             return 0.0;
         }
-        combine_per_depth(self.scores.turn(timeline, index), formula, weights)
+        self.scores.turn(timeline, index)
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
@@ -3889,35 +3844,19 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
             .map_or(0, |e| e.token_count)
     }
 
-    fn section_score(
-        &self,
-        section: SectionId,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    fn section_score(&self, section: SectionId) -> f32 {
         if !self.substrate.sections.contains_key(&section) {
             return 0.0;
         }
-        combine_per_depth(self.scores.section(section), formula, weights)
+        self.scores.section(section)
     }
 
     fn summary_tree_select(
         &self,
         timeline: TimelineId,
         budget: u32,
-        floor: usize,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
-        select_summary_tree(
-            self.substrate,
-            self.scores,
-            timeline,
-            budget,
-            floor,
-            formula,
-            weights,
-        )
+        select_summary_tree(self.substrate, self.scores, timeline, budget)
     }
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
@@ -3955,21 +3894,11 @@ impl<'a> SubstrateRead<'a> {
     /// by [`super::projection::resolver::TargetedRead`] which already
     /// knows the target-corrected `TimelineId` for the queried group.
     /// Returns `0.0` when the turn is unknown.
-    pub fn turn_score_for_timeline(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    pub fn turn_score_for_timeline(&self, timeline: TimelineId, index: TurnIndex) -> f32 {
         if self.guard.turn(timeline, index).is_none() {
             return 0.0;
         }
-        combine_per_depth(
-            self.scores_or_empty().turn(timeline, index),
-            formula,
-            weights,
-        )
+        self.scores_or_empty().turn(timeline, index)
     }
 }
 
@@ -3997,30 +3926,25 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(
-        &self,
-        group: GroupId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
         let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
             return 0.0;
         };
         if self.guard.turn(timeline, index).is_none() {
             return 0.0;
         }
-        combine_per_depth(
-            self.scores_or_empty().turn(timeline, index),
-            formula,
-            weights,
-        )
+        self.scores_or_empty().turn(timeline, index)
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
         let timeline = self.guard.active_timelines_for_group(group).next()?;
         let (layer, _) = self.guard.timeline_target(timeline)?;
         Some(layer)
+    }
+
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
+        let timeline = self.guard.active_timelines_for_group(group).next()?;
+        self.guard.turn_with_tag(timeline, tag)
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {
@@ -4030,35 +3954,19 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
             .map_or(0, |e| e.token_count)
     }
 
-    fn section_score(
-        &self,
-        section: SectionId,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    fn section_score(&self, section: SectionId) -> f32 {
         if !self.guard.sections.contains_key(&section) {
             return 0.0;
         }
-        combine_per_depth(self.scores_or_empty().section(section), formula, weights)
+        self.scores_or_empty().section(section)
     }
 
     fn summary_tree_select(
         &self,
         timeline: TimelineId,
         budget: u32,
-        floor: usize,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
-        select_summary_tree(
-            &self.guard,
-            self.scores_or_empty(),
-            timeline,
-            budget,
-            floor,
-            formula,
-            weights,
-        )
+        select_summary_tree(&self.guard, self.scores_or_empty(), timeline, budget)
     }
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
@@ -4090,10 +3998,7 @@ impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `PerDepthScores` aliased: `super::*` already brings in the
-    // projection-side type of the same name; `TurnDecl.scores` wants the
-    // wire-format one from `streams`.
-    use crate::persistence::streams::{PerDepthScores as DeclScores, TurnDecl};
+    use crate::persistence::streams::TurnDecl;
     use crate::projection::{
         GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
     };
@@ -4411,7 +4316,6 @@ mod tests {
             section,
             StreamId::default(),
             10,
-            vec![],
             sealed_gpu,
             identity_migrate,
             Arc::new(vec![1u32, 2, 3]),
@@ -4468,7 +4372,6 @@ mod tests {
             SectionId::new(7),
             StreamId::default(),
             10,
-            vec![],
             Arc::new(vec![minimal_sealed_layer()]),
             identity_migrate,
             Arc::new(vec![1u32, 2, 3]),
@@ -4496,7 +4399,6 @@ mod tests {
             SectionId::new(9),
             StreamId::default(),
             100,
-            vec![],
             Arc::new(vec![minimal_sealed_layer()]),
             identity_migrate,
             Arc::new(vec![1u32]),
@@ -4508,7 +4410,6 @@ mod tests {
             SectionId::new(9),
             StreamId::default(),
             60,
-            vec![],
             Arc::new(vec![minimal_sealed_layer()]),
             identity_migrate,
             Arc::new(vec![1u32]),
@@ -4555,11 +4456,20 @@ mod tests {
         assert_ne!(idx0, idx1);
     }
 
-    /// Helper: install a warm-only residence with a known byte_size.
-    /// Returns the residence index. Used by the purge tests below to
-    /// drive the warm LRU without going through the (CUDA-only)
-    /// migrate path.
-    fn install_warm_only(sub: &mut Substrate, timeline: TimelineId, bytes: u64) -> ResidenceIndex {
+    /// Helper: install a warm residence with a known byte_size. Returns the
+    /// residence index. Used by the purge tests below to drive the warm LRU
+    /// without going through the (CUDA-only) migrate path.
+    ///
+    /// `cold_backed` mirrors the realistic post-persist state: once a turn's
+    /// warm→cold write lands, its warm copy is purgeable (cold is the durable
+    /// backup). When `false`, the residence is warm-only with NO lower-tier
+    /// backup — the purge must refuse to drop it (its K/V would be lost).
+    fn install_warm_only(
+        sub: &mut Substrate,
+        timeline: TimelineId,
+        bytes: u64,
+        cold_backed: bool,
+    ) -> ResidenceIndex {
         let idx = sub
             .append_complete(
                 timeline,
@@ -4585,6 +4495,17 @@ mod tests {
             location: candle_nn::kv_cache::ArenaLocation::Cpu,
         }];
         sub.install_warm(residence, placeholder);
+        if cold_backed {
+            // A non-empty cold marker (its chunks are irrelevant to the purge —
+            // only `cold.is_some()` gates the drop).
+            sub.install_cold(
+                residence,
+                vec![StoredSequence {
+                    chunks: Vec::new(),
+                    token_count: 0,
+                }],
+            );
+        }
         residence
     }
 
@@ -4592,8 +4513,8 @@ mod tests {
     #[test]
     fn purge_with_ample_headroom_is_noop() {
         let (_, _, timeline, mut sub) = make_timeline();
-        install_warm_only(&mut sub, timeline, 1_000_000);
-        install_warm_only(&mut sub, timeline, 1_000_000);
+        install_warm_only(&mut sub, timeline, 1_000_000, true);
+        install_warm_only(&mut sub, timeline, 1_000_000, true);
 
         // 64 GB total, 32 GB available, incoming 1 MB. Threshold is
         // max(2 GiB, 5% * 64 GB) = 3.2 GB. 32 GB - 1 MB >> 3.2 GB.
@@ -4611,8 +4532,8 @@ mod tests {
         // Order matters: a is LRU (installed first → pushed to front,
         // then b → b is at front, a slides toward back). pop_back
         // returns a first.
-        let a = install_warm_only(&mut sub, timeline, 500_000_000);
-        let b = install_warm_only(&mut sub, timeline, 500_000_000);
+        let a = install_warm_only(&mut sub, timeline, 500_000_000, true);
+        let b = install_warm_only(&mut sub, timeline, 500_000_000, true);
 
         // 8 GB total, 2 GB available, incoming 1 GB. Threshold is
         // max(2 GiB = 2_147_483_648, 8 GB / 20 = 400 MB) = 2 GiB.
@@ -4631,6 +4552,31 @@ mod tests {
         assert_eq!(r.bytes, 1_000_000_000);
         assert!(sub.residence[a.0].warm.is_none(), "a (LRU) dropped first");
         assert!(sub.residence[b.0].warm.is_none(), "b also dropped");
+    }
+
+    /// A warm residence with NO lower-tier backup (its cold write hasn't landed,
+    /// or failed) is the turn's ONLY copy — the purge must refuse to drop it even
+    /// under pressure, or the K/V is lost. The cold-backed victim is still freed.
+    #[test]
+    fn purge_keeps_warm_without_backup() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // a installed first → slides to the LRU tail → `pop_back` sees it first.
+        // a has no cold backup; b does.
+        let a = install_warm_only(&mut sub, timeline, 500_000_000, false);
+        let b = install_warm_only(&mut sub, timeline, 500_000_000, true);
+
+        // Tight headroom that would otherwise purge both: 8 GB total, 1 GB
+        // available, incoming 0, threshold 2 GiB. projected = 1 GB < 2 GiB.
+        let r = sub.purge_warm_to_target(0, 1_000_000_000, 8 * 1000 * 1000 * 1000);
+        // Only the cold-backed residence (b) is dropped; the un-backed one (a)
+        // is preserved and stays warm-resident.
+        assert_eq!(r.count, 1, "only the cold-backed warm is purgeable");
+        assert_eq!(r.bytes, 500_000_000);
+        assert!(
+            sub.residence[a.0].warm.is_some(),
+            "un-backed warm must be kept (its K/V would otherwise be lost)"
+        );
+        assert!(sub.residence[b.0].warm.is_none(), "cold-backed warm dropped");
     }
 
     /// Empty warm LRU → purge exits gracefully without panicking even
@@ -4655,7 +4601,7 @@ mod tests {
     fn purge_threshold_is_max_of_2gib_and_5_percent() {
         let (_, _, timeline, mut sub) = make_timeline();
         // One LRU warm victim of 2 GB.
-        install_warm_only(&mut sub, timeline, 2_000_000_000);
+        install_warm_only(&mut sub, timeline, 2_000_000_000, true);
 
         // 256 GB total, 14 GB available, incoming 0. Threshold =
         // max(2 GiB, 256 GB * 0.05 = 12.8 GB) = 12.8 GB.
@@ -4819,7 +4765,6 @@ mod tests {
                 SectionId::new(id),
                 StreamId::default(),
                 32,
-                vec![],
                 sealed,
                 identity_migrate,
                 Arc::new(vec![]),
@@ -5107,8 +5052,8 @@ mod tests {
                 group_id: 1,
                 anchored_prefix: Vec::new(),
                 view: Vec::new(),
-                scores: DeclScores::default(),
                 segments: Vec::new(),
+                tags: Vec::new(),
             })
         };
         let dead_sid = turn_stream_id(7, 0);
@@ -5141,6 +5086,122 @@ mod tests {
             sub.tombstoned_stream_bytes(),
             8192 + 4096,
             "only the tombstoned timeline's chunk + tokens bytes count"
+        );
+    }
+
+    /// `turn_with_tag` resolves a declared default member to a real turn: it
+    /// matches a `TurnDecl.tags` entry, is scoped to the requested timeline (a
+    /// group is shared across conversations), and returns `None` for an unknown
+    /// tag.
+    #[test]
+    fn turn_with_tag_matches_scoped_to_timeline() {
+        let mut sub = Substrate::new();
+        let decl = |tl: u64, idx: u32, tags: &[&str]| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: idx,
+                turn_id_day: 0,
+                turn_id_seq: idx + 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        // Timeline 1: turn 0 is the repo-root cluster, turn 1 a code chunk.
+        sub.apply_stream_decl(turn_stream_id(1, 0), decl(1, 0, &["repo_map", "."]));
+        sub.apply_stream_decl(turn_stream_id(1, 1), decl(1, 1, &["code", "foo.rs"]));
+        // Timeline 2: its own repo-root cluster at turn 0.
+        sub.apply_stream_decl(turn_stream_id(2, 0), decl(2, 0, &["repo_map", "."]));
+
+        let tl1 = TimelineId::from_raw(1).unwrap();
+        let tl2 = TimelineId::from_raw(2).unwrap();
+
+        assert_eq!(sub.turn_with_tag(tl1, "."), Some(TurnIndex(0)));
+        assert_eq!(sub.turn_with_tag(tl1, "foo.rs"), Some(TurnIndex(1)));
+        // Absent tag ⇒ None.
+        assert_eq!(sub.turn_with_tag(tl1, "missing"), None);
+        // Timeline scoping: tl2 resolves its own root, not tl1's; and tl1's
+        // code tag does not leak into tl2.
+        assert_eq!(sub.turn_with_tag(tl2, "."), Some(TurnIndex(0)));
+        assert_eq!(sub.turn_with_tag(tl2, "foo.rs"), None);
+    }
+
+    /// The decoded-signature memo serves a stable `Arc` on repeat reads, and
+    /// invalidates when the underlying blob changes (gallery generation bump) so
+    /// a re-sealed turn never reads a stale decoded window.
+    #[test]
+    fn decoded_wide_sig_caches_and_invalidates_on_blob_change() {
+        use crate::provenance::encode_wide_sigs;
+        let mut sub = Substrate::new();
+        let sid = turn_stream_id(1, 0);
+        let sig_a = WideQSig {
+            n_heads: 12,
+            words: vec![0xAAAA_AAAA_AAAA_AAAA; 24],
+        };
+        sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig_a)));
+
+        let w1 = sub.decoded_wide_sig(sid).expect("decoded");
+        assert_eq!(w1.as_slice(), std::slice::from_ref(&sig_a));
+        // Second read is served from the memo — same allocation.
+        let w2 = sub.decoded_wide_sig(sid).expect("decoded");
+        assert!(Arc::ptr_eq(&w1, &w2), "repeat read must hit the cache");
+
+        // Overwriting the blob bumps the generation and invalidates the memo.
+        let sig_b = WideQSig {
+            n_heads: 12,
+            words: vec![0x5555_5555_5555_5555; 24],
+        };
+        sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig_b)));
+        let w3 = sub.decoded_wide_sig(sid).expect("decoded");
+        assert_eq!(
+            w3.as_slice(),
+            std::slice::from_ref(&sig_b),
+            "cache must re-decode after the blob changed"
+        );
+        assert!(!Arc::ptr_eq(&w1, &w3), "must not serve the stale window");
+
+        // An absent stream (and an empty window) resolve to None.
+        assert!(sub.decoded_wide_sig(turn_stream_id(1, 99)).is_none());
+    }
+
+    /// Invalidation is per-stream: rewriting one turn's sig evicts only that
+    /// turn's decoded window and leaves every other memo intact — so a single
+    /// seal never churns the whole gallery (the point of incremental eviction).
+    #[test]
+    fn decoded_wide_sig_eviction_is_per_stream() {
+        use crate::provenance::encode_wide_sigs;
+        let sig = |fill: u64| WideQSig {
+            n_heads: 12,
+            words: vec![fill; 24],
+        };
+        let mut sub = Substrate::new();
+        let sid_a = turn_stream_id(1, 0);
+        let sid_b = turn_stream_id(1, 1);
+        sub.set_wide_q_sigs_blob(sid_a, encode_wide_sigs(&[sig(0xAAAA_AAAA_AAAA_AAAA)]));
+        sub.set_wide_q_sigs_blob(sid_b, encode_wide_sigs(&[sig(0x5555_5555_5555_5555)]));
+
+        // Warm both windows.
+        let a1 = sub.decoded_wide_sig(sid_a).expect("a");
+        let b1 = sub.decoded_wide_sig(sid_b).expect("b");
+
+        // Rewrite A's blob — evicts A's memo only.
+        sub.set_wide_q_sigs_blob(sid_a, encode_wide_sigs(&[sig(0xFFFF_FFFF_FFFF_FFFF)]));
+        let a2 = sub.decoded_wide_sig(sid_a).expect("a");
+        let b2 = sub.decoded_wide_sig(sid_b).expect("b");
+
+        assert!(
+            !Arc::ptr_eq(&a1, &a2),
+            "A re-decoded after its own blob change"
+        );
+        assert!(
+            Arc::ptr_eq(&b1, &b2),
+            "B's memo must survive A's eviction — no whole-gallery churn"
         );
     }
 

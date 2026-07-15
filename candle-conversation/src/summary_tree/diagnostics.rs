@@ -36,7 +36,7 @@ pub enum SelectionOrigin {
     /// Provenance score was below the recency-decay floor, but the
     /// recency decay still made it competitive enough to win a slot.
     RecencyDecay,
-    /// Provenance score won the slot — i.e. the BDP scan ruled this
+    /// Provenance score won the slot — i.e. the provenance scan ruled this
     /// node relevant to the current probe Q.
     ProvenanceScore,
     /// Greedy fit left a coverage gap; the smallest covering node was
@@ -51,6 +51,14 @@ pub enum SelectionOrigin {
     /// Rule-based path (no summary tree): an older turn pulled back by
     /// relevance score (`conversation.historical_top_k`).
     Historical,
+    /// Belief-driven turn group (repo_map clusters, code scopes): the turn won
+    /// its slot from the RelLeak belief over its live wide-Q score, seeded from
+    /// the carried prior — the turn-axis analogue of a collection's tool pick.
+    Belief,
+    /// A group's declared `default` floor: belief/scores/rule selected nothing,
+    /// so the group's fallback member (by tag) was injected to keep the group —
+    /// and its layer — present. Not relevance, not recency: a guaranteed floor.
+    Fallback,
 }
 
 /// Per-turn selection diagnostics, attached to `TurnResponse`.

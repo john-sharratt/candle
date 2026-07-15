@@ -26,6 +26,7 @@ pub enum LoadStep {
     Substrate,
     Compacting,
     Sections,
+    CalibratingSections,
     RepoScan,
     CodeRead,
 }
@@ -38,6 +39,7 @@ impl LoadStep {
         LoadStep::Substrate,
         LoadStep::Compacting,
         LoadStep::Sections,
+        LoadStep::CalibratingSections,
         LoadStep::RepoScan,
         LoadStep::CodeRead,
     ];
@@ -48,7 +50,8 @@ impl LoadStep {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Loading substrate",
             LoadStep::Compacting => "Compacting substrate",
-            LoadStep::Sections => "Prefilling sections",
+            LoadStep::Sections => "Prefilling tool sections",
+            LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::RepoScan => "Scanning repository",
             LoadStep::CodeRead => "Reading code",
         }

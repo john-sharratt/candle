@@ -37,6 +37,29 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
         .ignore(true) // honour .ignore
         .require_git(false) // honour .gitignore even outside a git repo
         .follow_links(false)
+        // Prune nested git repositories / submodules. Any directory below the
+        // walk root that holds a `.git` entry (a submodule uses a `.git` FILE
+        // pointing into the superproject's modules dir; a nested clone a `.git`
+        // DIR) is a SEPARATE project — its contents are vendored third-party
+        // code and generated artifacts (e.g. the cutlass submodule's thousands
+        // of Doxygen `.html` files), not part of THIS workspace. The parent's
+        // `.gitignore` never lists a tracked submodule, so this is the only gate
+        // that stops the walk descending into it. Pruning at the directory skips
+        // the whole subtree in one stat, keeping the scan fast and the repo_map
+        // free of foreign trees.
+        .filter_entry(|entry| {
+            if entry.depth() > 0
+                && entry.file_type().is_some_and(|t| t.is_dir())
+                && entry.path().join(".git").exists()
+            {
+                tracing::debug!(
+                    dir = %entry.path().display(),
+                    "repo walk: skipping nested git repo / submodule"
+                );
+                return false;
+            }
+            true
+        })
         .build();
 
     for entry in walker.flatten() {
@@ -307,6 +330,41 @@ mod tests {
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.iter().any(|p| p.starts_with("target/")));
         assert!(!paths.contains(&"ignored.rs"));
+    }
+
+    #[test]
+    fn walk_prunes_nested_git_repos_and_submodules() {
+        let dir = fixture("submodule");
+        let root = dir.path().to_path_buf();
+        // The workspace root is itself a git repo (`.git` DIR) — the depth-0
+        // guard must NOT prune it, or nothing would scan.
+        write(&root, ".git/HEAD", b"ref: refs/heads/main\n");
+        // The workspace's own source is kept.
+        write(&root, "src/lib.rs", b"// keep\n");
+        // A submodule: a nested dir marked by a `.git` FILE (gitlink), holding
+        // vendored source and generated docs. None of it must be scanned.
+        write(
+            &root,
+            "vendor/cutlass/.git",
+            b"gitdir: ../.git/modules/cutlass\n",
+        );
+        write(&root, "vendor/cutlass/include/gemm.h", b"// vendored\n");
+        write(&root, "vendor/cutlass/docs/index.html", b"<html></html>\n");
+        // A nested clone: marked by a `.git` DIR. Also pruned.
+        write(&root, "nested/.git/HEAD", b"ref: refs/heads/main\n");
+        write(&root, "nested/main.rs", b"// separate project\n");
+
+        let map = walk_workspace(&root);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"src/lib.rs"));
+        assert!(
+            !paths.iter().any(|p| p.starts_with("vendor/cutlass/")),
+            "submodule subtree must be pruned: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("nested/")),
+            "nested git repo must be pruned: {paths:?}"
+        );
     }
 
     #[test]

@@ -68,8 +68,6 @@ pub struct Manifest {
     pub template: Option<RecordLoc>,
     /// Latest `Tokenizer` record.
     pub tokenizer: Option<RecordLoc>,
-    /// Latest `ToolSummary` record (workspace singleton).
-    pub tool_summary: Option<RecordLoc>,
 }
 
 /// Per-timeline conversation metadata persisted in `RecordType::Label`.
@@ -134,7 +132,7 @@ impl Manifest {
 
     /// Apply one walked record, last-writer-wins.  The manifest only
     /// tracks the singleton record types — every per-entity record
-    /// (`StreamDecl`, `Chunk`, `Tokens`, `Signatures`, `Commit`,
+    /// (`StreamDecl`, `Chunk`, `Tokens`, `Commit`,
     /// `Label`, `ConvState`, `TreeMetadata`, `DebugId`) is handled by
     /// the walker's per-record sink, which dispatches into the
     /// substrate via
@@ -150,21 +148,21 @@ impl Manifest {
             RecordType::ModelSpec => self.model_spec = Some(loc),
             RecordType::Template => self.template = Some(loc),
             RecordType::Tokenizer => self.tokenizer = Some(loc),
-            RecordType::ToolSummary => self.tool_summary = Some(loc),
             // Per-entity records flow to the substrate via the walker
             // sink — see `Substrate::apply_walker_entry`.  They never
             // enter the manifest.
             RecordType::StreamDecl
             | RecordType::Chunk
             | RecordType::Tokens
-            | RecordType::Signatures
             | RecordType::Commit
             | RecordType::Label
             | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::Distilled
             | RecordType::ProjectionEvents
+            | RecordType::WideQSig
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

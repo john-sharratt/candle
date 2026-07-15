@@ -23,7 +23,12 @@ fn detect_sqlite(path: &str) -> bool {
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
-    pub credential_name: String,
+    /// Optional name of a stored `sql_password` credential, used for its default
+    /// database. Omit to open a SQLite file or `:memory:` directly — SQLite needs
+    /// no credential.
+    pub credential_name: Option<String>,
+    /// SQLite database path, or `:memory:` for an in-memory database. Defaults to
+    /// the credential's default database if one is named, otherwise `:memory:`.
     pub database: Option<String>,
 }
 
@@ -39,8 +44,9 @@ pub struct SqlSessionOpen;
 impl Tool for SqlSessionOpen {
     const NAME: &'static str = "sql_session_open";
     const DESCRIPTION: &'static str =
-        "Open a SQL database session. SQLite is supported natively (credential's \
-         default_database or the database parameter — use ':memory:' for in-memory). \
+        "Open a SQL database session. SQLite is supported natively and needs no \
+         credential — pass the database path (or ':memory:' for in-memory). A \
+         credential_name is optional and only supplies a default database. \
          Use sql_session_query to run statements. Close with sql_session_close.";
 
     type Request = OpenRequest;
@@ -48,16 +54,22 @@ impl Tool for SqlSessionOpen {
     type Error = SqlError;
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, SqlError> {
-        let cred = ctx
-            .credentials
-            .get_by_name(&req.credential_name)
-            .ok_or_else(|| SqlError::CredentialNotFound(req.credential_name.clone()))?;
-        if cred.cred_type != "sql_password" {
-            return Err(SqlError::InvalidCredentialType);
-        }
+        let cred = match &req.credential_name {
+            Some(name) => {
+                let cred = ctx
+                    .credentials
+                    .get_by_name(name)
+                    .ok_or_else(|| SqlError::CredentialNotFound(name.clone()))?;
+                if cred.cred_type != "sql_password" {
+                    return Err(SqlError::InvalidCredentialType);
+                }
+                Some(cred)
+            }
+            None => None,
+        };
         let db_path = req
             .database
-            .or(cred.default_database.clone())
+            .or_else(|| cred.as_ref().and_then(|c| c.default_database.clone()))
             .unwrap_or_else(|| ":memory:".into());
 
         if !detect_sqlite(&db_path) {

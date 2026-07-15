@@ -6,18 +6,26 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{decode_data, encode_output, CryptoError};
+use super::{decode_data, encode_output, normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HmacRequest {
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
     #[validate(length(min = 1))]
     pub key: String,
+    /// How `key` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub key_encoding: Option<String>,
+    /// HMAC hash function. One of: sha256, sha512, sha1.
+    #[schemars(with = "super::HmacAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
+    /// Encoding for the returned MAC. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub output_encoding: Option<String>,
 }
 
@@ -48,7 +56,7 @@ impl Tool for HmacCompute {
         let data = decode_data(&req.data, data_enc).map_err(CryptoError::InvalidDataEncoding)?;
         let key = decode_data(&req.key, key_enc).map_err(CryptoError::InvalidDataEncoding)?;
 
-        let mac_bytes: Vec<u8> = match req.algorithm.as_str() {
+        let mac_bytes: Vec<u8> = match normalize_algorithm(&req.algorithm).as_str() {
             "sha256" => {
                 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
                 let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(&key)

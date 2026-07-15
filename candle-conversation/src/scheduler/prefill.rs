@@ -129,11 +129,13 @@ impl Scheduler {
 
     pub(super) fn promote_new_prefills(&mut self) {
         // Ragged prefill forward width — how many in-flight prefills coalesce into
-        // one forward. Matched to `code_read`'s worker count so a burst of small
-        // parallel scopes fills a wide, expert-load-amortising forward — but only
-        // up to the AIMD `admit_window`, which narrows the batch under VRAM
-        // pressure so the forward's transient peak (which scales with width) can't
-        // OOM a busy card. `MIN_PREFILL_WIDTH` keeps ≥1 in flight regardless.
+        // one forward: a burst of small parallel scopes (code_read's worker count),
+        // a bulk collection ingest's per-section prefills (`insert_section_collection`
+        // fires one prefill per section), or a batch of calibration cases. Capped by
+        // the AIMD `admit_window`, which narrows the batch under VRAM pressure so the
+        // forward's transient peak (which scales with width) can't OOM a busy card;
+        // `MIN_PREFILL_WIDTH` keeps ≥1 in flight regardless. (Decode-side waves are
+        // bounded separately, e.g. calibration's `CALIBRATION_BATCH`.)
         let cap = Self::MAX_PREFILL_WIDTH.min(self.admit_window.max(Self::MIN_PREFILL_WIDTH));
         while self.active_prefills.len() < cap {
             // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
@@ -174,6 +176,7 @@ impl Scheduler {
             self.active_prefills.push(ActivePrefill {
                 work,
                 offset: 0,
+                next_projection: 0,
                 final_logits: None,
                 error,
                 prefill_start: None,
@@ -287,15 +290,32 @@ impl Scheduler {
         // near-finished section no longer collapses the whole wave to the batch
         // minimum — the bug that dragged a 93-wide tool-catalog ingest down to
         // ~1 token/seq/forward. Mirrors `run_one_prefill_pass`.
+        //
+        // Bound the TOTAL tokens per forward to the same per-forward budget a
+        // normal prefill targets (`max_prefill_pass_tokens`). Without this the
+        // whole active set coalesces into one forward: the 93-section tool
+        // catalog (~21k tokens) packed into a single pass whose transient
+        // activation spiked VRAM to the card ceiling and paged (one forward took
+        // minutes on a 16 GB card). Sections beyond the budget ride the next
+        // `run_one_section_ingest_chunk` pass — the wave loop calls this until
+        // every section seals — so throughput is unchanged (each forward still
+        // fills to the expert-amortization target) while the peak stays bounded.
+        // At least one section is always admitted so the wave makes progress.
         let cap = self.max_prefill_pass_tokens;
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
         let mut advances: Vec<usize> = Vec::with_capacity(active.len());
+        let mut batch_tokens = 0usize;
         for &i in &active {
             let s = &mut self.active_section_ingests[i];
             let off = s.offset;
             let advance = (s.tokens.len() - off).min(cap);
+            // Stop packing once this forward has reached the per-forward budget
+            // (but never emit an empty forward).
+            if !seq_ids.is_empty() && batch_tokens + advance > cap {
+                break;
+            }
             let tokens = &s.tokens[off..off + advance];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
@@ -303,6 +323,7 @@ impl Scheduler {
                     inputs.push(t);
                     group_idxs.push(i);
                     advances.push(advance);
+                    batch_tokens += advance;
                 }
                 Err(e) => {
                     s.error = Some(ConversationError::Model(e));
@@ -436,7 +457,17 @@ impl Scheduler {
                 p.prefill_start = Some(Instant::now());
             }
             let off = p.offset;
-            let advance = (p.work.tokens.len() - off).min(cap);
+            let mut advance = (p.work.tokens.len() - off).min(cap);
+            // Staged calibration prefill: don't advance past the next projection
+            // point, so the wave stops exactly on it and the advance loop below can
+            // emit that segment's projection. Normal prefills carry no offsets and
+            // advance by the full cap, co-batching in this same ragged forward.
+            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
+                let seg_remaining = (next_off as usize).saturating_sub(off);
+                if seg_remaining > 0 {
+                    advance = advance.min(seg_remaining);
+                }
+            }
             let tokens = &p.work.tokens[off..off + advance];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
@@ -564,12 +595,37 @@ impl Scheduler {
             // log so the turn-complete dump can reconstruct the
             // exact context the kernel saw — `run_one_prefill_pass`
             // is the SubmitTurn prefill path, parallel to
-            // `run_prefill_with_shift`'s synchronous path.
+            // `run_prefill`'s synchronous path.
             let seq_id = p.work.sequence_id;
             let off = p.offset;
             let advance_tokens = p.work.tokens[off..off + advance].to_vec();
             super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &advance_tokens);
             p.offset += advance;
+            // Staged prefill: if this pass landed on the next projection point,
+            // emit that segment's projection (the pinned composition, spanned to
+            // this segment's generated tokens) and move to the next point. The
+            // client collects these `TurnEvent::Projection`s and persists them, so
+            // the sealed turn carries the same per-segment projection sequence a
+            // real decode produced.
+            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
+                if p.offset >= next_off as usize {
+                    if let Some(comp) = &p.work.staged_composition {
+                        let gen_start = p.work.assistant_content_start;
+                        let prev_off = if p.next_projection == 0 {
+                            gen_start
+                        } else {
+                            p.work.projection_offsets[p.next_projection - 1]
+                        };
+                        // A projection is a POINT: this segment's projection was
+                        // selected at `prev_off` and governs forward to `next_off`
+                        // (the next event's point). Emit it at its start position.
+                        let mut ev = comp.clone();
+                        ev.start_token = prev_off.saturating_sub(gen_start);
+                        let _ = p.work.event_tx.send(TurnEvent::Projection(ev));
+                    }
+                    p.next_projection += 1;
+                }
+            }
             let total = p.work.tokens.len();
             let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
                 tokens_done: p.offset,
@@ -632,6 +688,7 @@ impl Scheduler {
                     tokens: p.token_ids,
                     layout: p.layout,
                     token_count: p.token_count,
+                    tags: p.tags.clone(),
                 });
         }
         self.free_summary_slot(slot);
@@ -657,6 +714,7 @@ impl Scheduler {
             let ActivePrefill {
                 work,
                 offset: _,
+                next_projection: _,
                 final_logits,
                 error,
                 prefill_start,
@@ -891,8 +949,10 @@ impl Scheduler {
                         sampling_config: work.sampling,
                         seal_action: work.seal_action,
                         post_decode_tokens: work.post_decode_tokens,
+                        belief: work.belief,
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
+                        tags: work.tags,
                         user_content_start: work.user_content_start,
                         user_content_end: work.user_content_end,
                         assistant_content_start: work.assistant_content_start,
@@ -918,7 +978,9 @@ impl Scheduler {
                             hs
                         },
                         reprojection: work.reprojection,
-                        prov_sig_entries: Vec::new(),
+                        non_punct_since_reproject: 0,
+                        last_projection_end: 0,
+                        in_tool_call: false,
                         triggers: work.triggers,
                         stencil: None,
                         pending_mask: None,
@@ -955,6 +1017,25 @@ impl Scheduler {
                 "stencil steering started (trigger on the first decoded token)",
             );
         }
+        // A first-token `<tool_call>` trigger enters the call immediately, so the
+        // in-call state must be set HERE — the decode loop's `is_tool_open` scan
+        // (which normally sets it) only sees tokens sampled in `batch_decode_step`,
+        // never this one. Without it the in-call reprojection freeze never engages
+        // for these turns and cadence/punctuation triggers re-orient the selection
+        // mid-call. The early first-reprojection push below still fires once — it
+        // is this turn's lock-in reprojection, exactly like the one `is_tool_open`
+        // fires before freezing.
+        let first_token_opens_call = stencil
+            .as_ref()
+            .is_some_and(|d| d.tree().label() == super::TOOL_CALL_TREE_LABEL);
+        // Captured before `work.reprojection` moves into the DecodeState: the
+        // early first-reprojection below fires only for turns whose target
+        // layer runs belief-driven selection — a plain-prompt layer (the
+        // titler's single-section schema) gains nothing from the extra swap.
+        let wants_early_reprojection = work
+            .reprojection
+            .as_ref()
+            .is_some_and(|p| p.has_belief_collections());
 
         self.active_decodes.insert(
             work.sequence_id,
@@ -965,8 +1046,10 @@ impl Scheduler {
                 sampling_config: work.sampling,
                 seal_action: work.seal_action,
                 post_decode_tokens: work.post_decode_tokens,
+                belief: work.belief,
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
+                tags: work.tags,
                 user_content_start: work.user_content_start,
                 user_content_end: work.user_content_end,
                 assistant_content_start: work.assistant_content_start,
@@ -992,12 +1075,27 @@ impl Scheduler {
                     hs
                 },
                 reprojection: work.reprojection,
-                prov_sig_entries: Vec::new(),
+                non_punct_since_reproject: 0,
+                last_projection_end: 0,
+                in_tool_call: first_token_opens_call,
                 triggers: work.triggers,
                 stencil,
                 pending_mask: None,
             },
         );
+        // Fire the turn's FIRST reprojection immediately (drained right after
+        // the next decode step, ~token 1). The prefill just wrote the user
+        // query's wide-Q into R16, so the belief scan can score it and
+        // materialize the right sections BEFORE the model's plan forms in the
+        // early <think> tokens — waiting for the 64-token cadence lets a
+        // wrong-tool prefix anchor the reasoning first (the submit-time
+        // projection only carries the PREVIOUS turn's belief; it cannot see
+        // this turn's query). For a first-token tool call this is the turn's
+        // lock-in reprojection: `in_tool_call` is already set above, so the
+        // call body stays frozen afterwards.
+        if wants_early_reprojection {
+            Self::queue_reprojection(&mut self.pending_reprojections, work.sequence_id);
+        }
     }
 
     pub(super) fn run_prefill(
@@ -1007,7 +1105,7 @@ impl Scheduler {
     ) -> Result<Tensor, ConversationError> {
         // Chunked prefill: split large prompts into bounded chunks to keep
         // intermediate activation buffers from growing unboundedly.
-        if tokens.len() > self.max_prefill_pass_tokens {
+        let logits = if tokens.len() > self.max_prefill_pass_tokens {
             let mut last_logits: Option<Tensor> = None;
             for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
                 let input = Tensor::new(chunk, &self.device)
@@ -1023,32 +1121,45 @@ impl Scheduler {
                 super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, chunk);
                 last_logits = logits_vec.into_iter().next();
             }
-            return last_logits.ok_or_else(|| {
+            last_logits.ok_or_else(|| {
                 ConversationError::Channel("no logits returned from chunked prefill".into())
-            });
-        }
+            })?
+        } else {
+            let input = Tensor::new(tokens, &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(ConversationError::Model)?;
 
-        let input = Tensor::new(tokens, &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(ConversationError::Model)?;
+            let logits_vec = self
+                .model
+                .forward_batched(&mut self.session, &[sequence_id.0], &[input])
+                .map_err(ConversationError::Model)?;
 
-        let logits_vec = self
-            .model
-            .forward_batched(&mut self.session, &[sequence_id.0], &[input])
-            .map_err(ConversationError::Model)?;
+            self.session
+                .advance_sequence(sequence_id.0, tokens.len())
+                .map_err(ConversationError::Model)?;
 
+            // Mirror these tokens into the slot's diagnostic log so the
+            // turn-complete dump can reconstruct the exact context the
+            // kernel saw (compiled out without the `context-dump` feature).
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, tokens);
+
+            logits_vec.into_iter().next().ok_or_else(|| {
+                ConversationError::Channel("no logits returned from prefill".into())
+            })?
+        };
+
+        // Single exit for every prefill path: the forward wrote KV without the
+        // decode kernel's self-increment, so refresh the cached decode
+        // slot-state's writer slice with the advanced tail length. Without
+        // this, a mid-decode injection (a stencil static run, a think-steer
+        // continuation) is INVISIBLE to the following decode steps — the
+        // kernel attends the tail chunk at its stale pre-prefill length and
+        // the model decodes as if the injected tokens were never written.
+        // No-op for slots that haven't decoded yet.
         self.session
-            .advance_sequence(sequence_id.0, tokens.len())
+            .refresh_decode_slot_state(sequence_id.0)
             .map_err(ConversationError::Model)?;
 
-        // Mirror these tokens into the slot's diagnostic log so the
-        // turn-complete dump can reconstruct the exact context the
-        // kernel saw (compiled out without the `context-dump` feature).
-        super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, tokens);
-
-        logits_vec
-            .into_iter()
-            .next()
-            .ok_or_else(|| ConversationError::Channel("no logits returned from prefill".into()))
+        Ok(logits)
     }
 }

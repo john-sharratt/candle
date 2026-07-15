@@ -9,10 +9,17 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SendRequest {
+    /// The session id returned by udp_session_open.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Payload as UTF-8 text. Mutually exclusive with data_hex — provide exactly
+    /// one. If both are sent, data_hex wins.
     pub data: Option<String>,
+    /// Payload as hex-encoded bytes. Mutually exclusive with data — provide
+    /// exactly one. If both are sent, data_hex wins.
     pub data_hex: Option<String>,
+    /// Destination peer as "host:port", overriding the session default_peer.
+    /// Required if the session was opened without a default_peer.
     pub peer: Option<String>,
 }
 

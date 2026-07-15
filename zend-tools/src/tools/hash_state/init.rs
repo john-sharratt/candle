@@ -10,7 +10,10 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct InitRequest {
+    /// Optional state id to assign. Defaults to a generated `hs_<uuid>` value.
     pub id: Option<String>,
+    /// Hash algorithm. One of: sha256, sha512, sha1, md5, sha3_256, sha3_512, blake3. Required.
+    #[schemars(with = "super::super::hash::HashAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
 }

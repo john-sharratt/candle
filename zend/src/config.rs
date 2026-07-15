@@ -15,9 +15,14 @@ pub struct DaemonConfig {
     /// up to test conversations without waiting on (or perturbing the substrate
     /// with) the full repo scan.
     pub skip_repo_scan: bool,
-    /// Force a one-shot redo-log compaction at startup (after the substrate
-    /// reload, before serving). Reclaims dead records from superseded turns /
-    /// tombstoned timelines, shrinking the log and future startup walks.
-    /// Opt-in; compaction never runs otherwise.
+    /// Whether startup redo-log compaction is enabled (default: `true`, opt-out
+    /// via `--no-compact-substrate`). When enabled, compaction runs after the
+    /// substrate reload (before serving) **only if** the loaded substrate has
+    /// reclaimable markers — superseded turns, tombstoned timelines, distilled
+    /// calibration content — reclaiming them and shrinking the log.
     pub compact_substrate: bool,
+    /// Do not spawn the background summariser thread, and do not register new
+    /// conversations for summarisation. Brings the engine up without the AVL
+    /// summary forest running — useful for bulk corpus prefill. Opt-in.
+    pub disable_summariser: bool,
 }

@@ -13,7 +13,6 @@ use crate::projection::{
     from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
-use crate::provenance::ProvenanceFile;
 use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
 use crate::sequence_handle::{BlockCount, SequenceId};
@@ -230,20 +229,8 @@ pub struct Sequence {
     /// KV chunk size in tokens (mirrors `BatchedConfig::chunk_size`).
     chunk_size: usize,
 
-    /// Shared mmap-backed provenance file.
-    ///
-    /// The seal step writes chunk-group triplets (syntactic / semantic /
-    /// pragmatic) here inline and stashes the resulting `SigEntry`
-    /// values in the workspace substrate per `(group, turn)` key.
-    provenance: Arc<ProvenanceFile>,
-
     /// Static model properties captured at engine construction.
     model_core: ModelCoreProperties,
-
-    /// Number of 32-token KV blocks already indexed in `ProvenanceFile`.
-    /// Passed to the seal step so extraction starts from the first
-    /// unprocessed block rather than re-indexing the entire sequence.
-    sig_blocks_processed: usize,
 
     /// Projection schema for this conversation.
     ///
@@ -261,9 +248,6 @@ pub struct Sequence {
     /// `projection.project()`.  Different cognitive activities (dialogue,
     /// bug analysis, dream log, …) point at different targets.
     pub(crate) target: ProjectionTarget,
-    /// Persistent BDP scanner — its score map lives for the lifetime of
-    /// the conversation, refreshed each time `run_bdp_scan` is called.
-    pub(crate) bdp_scanner: crate::provenance::BdpScanner,
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -306,10 +290,19 @@ impl Sequence {
         target: ProjectionTarget,
         config: SequenceConfig,
         chunk_size: usize,
-        provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
         substrate: Conversation,
         section_progress: Option<&dyn Fn(u64, u64)>,
+        // When `false`, skip the [`SchedulerRequest::PrimingProjection`] slot
+        // pre-warm (a synchronous scheduler round-trip). Priming is a
+        // first-turn latency optimization — it pre-injects the empty-collection
+        // layout so the first `submit_turn` skips `apply_projection`. Callers
+        // that create MANY sequences in a pipelined burst (calibration) pass
+        // `false`: the per-sequence round-trip would serialise the burst back
+        // to one-create-per-wave-latency, defeating the batching, and the
+        // per-turn `apply_projection` at submit materialises the projection
+        // just the same (it must anyway, to select the pinned tool).
+        prime_slot: bool,
     ) -> crate::Result<Self> {
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
@@ -339,13 +332,10 @@ impl Sequence {
             freed: false,
             current_blocks: BlockCount(0),
             chunk_size,
-            provenance,
             model_core,
-            sig_blocks_processed: 0,
             projection: Arc::new(projection),
             substrate,
             target,
-            bdp_scanner: crate::provenance::BdpScanner::new(),
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -638,7 +628,7 @@ impl Sequence {
         // Any per-turn projection that selects ≥ 1 collection member
         // will materialise those (and the gated sections) via
         // `apply_projection` at submit_turn time.
-        if !fixed_prefix.is_empty() {
+        if prime_slot && !fixed_prefix.is_empty() {
             let (tx, rx) = crossbeam::channel::bounded(1);
             conv.scheduler_tx
                 .send(crate::scheduler::SchedulerRequest::PrimingProjection {
@@ -672,7 +662,7 @@ impl Sequence {
     /// Forks the conversation, prefills the section's content onto
     /// the fork (no decode), seals the fork to CPU, and pins the
     /// resulting `Arc<Vec<SealedSequence>>` in the substrate via
-    /// [`Substrate::set_section_sealed`].  The section's BDP
+    /// [`Substrate::set_section_sealed`].  The section's provenance
     /// sig entries and absolute block range are recorded by
     /// [`Substrate::set_section_data`].  The fork is freed.
     ///
@@ -692,7 +682,7 @@ impl Sequence {
     /// a `Sequence` — section ingestion is a substrate operation,
     /// not a sequence operation.  The current `&mut self` signature
     /// is retained because the section-fork pipeline pulls
-    /// scheduler_tx / tokenizer / provenance / chunk_size off the
+    /// scheduler_tx / tokenizer / chunk_size off the
     /// Sequence; lifting it to a workspace method requires threading
     /// those dependencies through and restructuring callers.
     pub fn insert_section(&mut self, section: SectionId, content: &str) -> crate::Result<()> {
@@ -891,7 +881,11 @@ impl Sequence {
             // `chunks_per_layer`, so we fall through to ingest.
             let stream_id = crate::persistence::content_hash::section_stream_id(address);
             if n_layers > 0 && self.substrate.section_stream_is_persisted(stream_id) {
-                if let Some((_, _, _)) = self.substrate.section_stream_layout(stream_id, n_layers) {
+                if self
+                    .substrate
+                    .section_stream_layout(stream_id, n_layers)
+                    .is_some()
+                {
                     to_restore.push(Pending {
                         section_id,
                         content,
@@ -932,7 +926,6 @@ impl Sequence {
             let chunks_per_layer = self
                 .substrate
                 .section_stream_layout(stream_id, n_layers)
-                .map(|(c, _, _)| c)
                 .unwrap_or(0);
             // Capture the content length for the progress callback
             // before `item.tokens` / `item.content` get consumed by
@@ -1255,6 +1248,10 @@ impl Sequence {
             user_content_end,
             assistant_content_start,
             no_think,
+            options.tags.clone(),
+            // Decode path: reprojection fires from the decode loop, not staged
+            // prefill offsets.
+            Vec::new(),
             // Decode path: the assistant half is produced by the model, so the
             // seal stores its decoded text — nothing to pre-supply here.
             String::new(),
@@ -1263,6 +1260,128 @@ impl Sequence {
             sampling,
             reprojection,
             options.triggers,
+        )?;
+        self.turn_in_flight = true;
+        Ok(handle)
+    }
+
+    /// Submit a calibration turn whose assistant trajectory is **supplied
+    /// verbatim** and prefilled in a single batched forward pass instead of
+    /// decoded — the fast path that reproduces a decode-built calibration turn's
+    /// KV (and thus its seal-captured wide-Q signature) without the per-token
+    /// decode cost.
+    ///
+    /// `assistant_trajectory` is the model's real reply body (`<think>…</think>`
+    /// + `<tool_call>…`) exactly as a decode produced it — NOT think-suppressed
+    /// like [`insert_turn_tagged`](Self::insert_turn_tagged). The grid is
+    /// `user_message + user_end + assistant_start + assistant_trajectory`, byte-
+    /// identical to the decode's persisted turn, so re-tokenizing it reproduces
+    /// the same tokens (modulo rare non-canonical BPE runs). `max_decode_tokens =
+    /// 0`, so the scheduler prefills then seals — `perform_seal_and_write`
+    /// captures the whole turn's wide-Q from KV exactly as for a decoded turn.
+    ///
+    /// `selection` pins the tool (via `CALIB_TOOL_SELECTOR`) so the projection
+    /// marks exactly that catalog member selected; `tags` scope the belief
+    /// gallery. Returns the streaming handle — drain it to `Done` and seal it
+    /// with [`finish_turn`](Self::finish_turn) exactly like a decoded turn.
+    pub fn submit_prefilled_turn(
+        &mut self,
+        user_message: &str,
+        assistant_trajectory: &str,
+        projection_marker: &str,
+        selection: SelectionState,
+        tags: Vec<String>,
+    ) -> crate::Result<TurnHandle> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+        self.selection = selection;
+
+        // Thinking turn: no forced `no_think_block` — the trajectory carries its
+        // own `<think>` in the body, matching the decode grid exactly.
+        let assistant_start_marker = self.config.dialect.assistant_start;
+        let assistant_head = format!(
+            "{}{}{}",
+            user_message, self.config.dialect.user_end, assistant_start_marker,
+        );
+        // The trajectory carries `projection_marker`s at the points a real decode
+        // reprojected. Strip them from the prefilled text (they are not model
+        // tokens), and record each one's token offset so the staged prefill wave
+        // fires a projection there — reproducing the decode's per-segment
+        // projection sequence. The markers are token-aligned by construction (the
+        // exporter verifies the split round-trips), so tokenizing the cumulative
+        // prefix up to each marker yields its exact grid offset.
+        let clean_trajectory = assistant_trajectory.replace(projection_marker, "");
+        let formatted = format!("{assistant_head}{clean_trajectory}");
+        let prefill_tokens = self.tokenize(&formatted)?;
+        // No post-decode tail — `assistant_end` is a live `Generated` segment,
+        // same as a decoded turn.
+        let post_decode_tokens = TokenBuffer::new();
+
+        // Record the pending user turn (text + raw tokens for the tree).
+        let user_tokens = self.tokenize(user_message)?;
+        self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
+
+        // Content boundaries: user body `[0, len(user_msg))`; the supplied
+        // assistant trajectory begins right after the head. Clamp/monotonise so a
+        // tokenizer that merges across a join can never invert the windows.
+        let total = prefill_tokens.len();
+        let user_content_start = 0u32;
+        let user_content_end = self.tokenize(user_message)?.len().min(total) as u32;
+        let assistant_content_start = self
+            .tokenize(&assistant_head)?
+            .len()
+            .min(total)
+            .max(user_content_end as usize) as u32;
+
+        // Grid-token offset of each projection marker: tokenize `head + trajectory
+        // up to the marker`. `split` yields one segment per marker plus a trailing
+        // remainder, so the boundaries between segments are exactly the marker
+        // positions. Two markers are dropped from the wave's emit list: the
+        // initial one at generation start (index 0 — the handler already applied
+        // that projection, and its span is carried by the next event) and the seal
+        // marker flush with the trajectory end (the final projection is appended at
+        // seal). The intermediate reprojections remain.
+        let segments: Vec<&str> = assistant_trajectory.split(projection_marker).collect();
+        let mut projection_offsets: Vec<u32> = Vec::new();
+        if segments.len() > 1 {
+            let end = prefill_tokens.len() as u32;
+            let mut prefix = assistant_head.clone();
+            for (i, seg) in segments[..segments.len() - 1].iter().enumerate() {
+                prefix.push_str(seg);
+                let off = self.tokenize(&prefix)?.len() as u32;
+                if i > 0 && off < end {
+                    projection_offsets.push(off);
+                }
+            }
+        }
+
+        let handle = self.submit_prefill_unit(
+            self.id,
+            Some(self.projection_inputs()),
+            formatted,
+            prefill_tokens,
+            user_message.to_string(),
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            // Thinking calibration turn: the trajectory carries its own `<think>`.
+            false,
+            tags,
+            projection_offsets,
+            // Prefill path: the assistant half is supplied — stored verbatim
+            // (markers stripped) as the turn's assistant_text.
+            clean_trajectory,
+            post_decode_tokens,
+            // No decode — prefill then seal.
+            0,
+            self.config.sampling.clone(),
+            // No reprojection policy: there is no decode loop to trigger it.
+            None,
+            // No tool stencils on a calibration prefill.
+            Arc::new(TriggerRegistry::new()),
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1300,6 +1419,8 @@ impl Sequence {
         user_content_end: u32,
         assistant_content_start: u32,
         no_think: bool,
+        tags: Vec<String>,
+        projection_offsets: Vec<u32>,
         prefill_assistant_text: String,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
@@ -1327,6 +1448,8 @@ impl Sequence {
                 user_content_end,
                 assistant_content_start,
                 no_think,
+                tags,
+                projection_offsets,
                 prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
@@ -1372,15 +1495,64 @@ impl Sequence {
     ///   the original decodes.
     ///
     /// Returns `Err(TurnInFlight)` if a turn is currently in progress.
-    /// Prefill a complete user/assistant exchange with no decode. Returns the
-    /// number of tokens prefilled (the full formatted grid: `/no_think`
-    /// prefix + user + markers + assistant text) — callers surface it as the
-    /// "tokens ingested" metric for prefill-only ingests (repo map, code read).
-    pub fn insert_turn(
+    pub fn insert_turn(&mut self, user_message: &str, assistant_text: &str) -> crate::Result<()> {
+        self.insert_turn_tagged(user_message, assistant_text, Vec::new())
+    }
+
+    /// [`insert_turn`](Self::insert_turn) with gather-scope tags — used to seed
+    /// tagged calibration turns (e.g. `["tool"]`) that a projection policy's
+    /// `tags:` filter scopes its provenance gallery to.
+    pub fn insert_turn_tagged(
         &mut self,
         user_message: &str,
         assistant_text: &str,
+        tags: Vec<String>,
+    ) -> crate::Result<()> {
+        self.insert_turn_inner(user_message, assistant_text, tags)?;
+        Ok(())
+    }
+
+    /// [`insert_turn_tagged`](Self::insert_turn_tagged) + staged provenance
+    /// linkage for ingest turns (repo_map clusters, code_read scopes): after
+    /// the turn seals, synthesizes two [`ProjectionEvent`]s — one for the
+    /// user half (`start_token: 0`), one for the assistant half — whose
+    /// `selection.turns` reference the turn itself and its immediate
+    /// predecessor by `(timeline, index)`, and persists them keyed to the
+    /// turn's stream id. Together with the turn's seal-time wide-Q signature
+    /// this gives a later provenance scan the resolvable chain
+    /// sig hit → event → turn.
+    ///
+    /// Returns the number of tokens prefilled (the full formatted grid), which
+    /// the prefill-only ingest paths (repo map, code read) surface as the "tokens
+    /// ingested" metric.
+    pub fn insert_turn_staged(
+        &mut self,
+        user_message: &str,
+        assistant_text: &str,
+        tags: Vec<String>,
     ) -> crate::Result<usize> {
+        let (assistant_content_start, turn_index, tokens) =
+            self.insert_turn_inner(user_message, assistant_text, tags)?;
+        let Some(idx) = turn_index else {
+            // No substrate seal (no registered target) — nothing to key
+            // events to; the turn itself was still prefilled.
+            return Ok(tokens);
+        };
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0)?;
+        Ok(tokens)
+    }
+
+    /// Shared body of [`insert_turn_tagged`] / [`insert_turn_staged`]: format,
+    /// tokenize, prefill through the shared projection path, drain to `Done`,
+    /// finalize. Returns the assistant half's grid-token start and the sealed
+    /// substrate `TurnIndex` (from the seal result — never derived by
+    /// counting, which races the async summariser).
+    fn insert_turn_inner(
+        &mut self,
+        user_message: &str,
+        assistant_text: &str,
+        tags: Vec<String>,
+    ) -> crate::Result<(u32, Option<u32>, usize)> {
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -1473,6 +1645,9 @@ impl Sequence {
             // Prefill content turns hard-apply `/no_think` (see the prefix above)
             // — record it so the re-render is consistent with the sealed grid.
             true,
+            tags,
+            // Structured ingest: one projection, no staged prefill segments.
+            Vec::new(),
             // Prefill path: the assistant half is supplied (not decoded), so
             // hand it through to be stored verbatim as the turn's assistant_text.
             assistant_text.to_string(),
@@ -1489,10 +1664,11 @@ impl Sequence {
         // observe Done so we know the parent's KV is fully populated
         // before we register the turn.
         let response = handle.wait()?;
+        let turn_index = response.seal.as_ref().and_then(|s| s.turn_index);
 
         // Run the same post-Done finalize as a regular turn.
         self.finalize_turn_post_done(user_tt, asst_tt, response.seal.as_ref())?;
-        Ok(total)
+        Ok((assistant_content_start, turn_index, total))
     }
 
     /// Ingest `scopes` into this conversation's timeline, prefilled **in parallel**
@@ -1511,9 +1687,13 @@ impl Sequence {
     /// Each scope's K/V is system-unconditioned (like a compression summary's
     /// re-prefill) — the async summary tree bridges the scopes with
     /// `SummaryOfTurns` nodes so the recombined file reads coherently.
+    /// `tags` (e.g. `["code", <path>]`) are applied to every scope turn's
+    /// `TurnDecl` and drive its staged provenance linkage, exactly as
+    /// [`insert_turn_staged`](Self::insert_turn_staged) does for the serial path.
     pub fn ingest_scopes_parallel(
         &mut self,
         scopes: &[ScopeTurn],
+        tags: Vec<String>,
         on_prefilled: ScopeProgressFn,
     ) -> crate::Result<Vec<usize>> {
         if self.turn_in_flight {
@@ -1528,9 +1708,11 @@ impl Sequence {
         let scope_total = scopes.len() as u32;
         let mut receivers = Vec::with_capacity(scopes.len());
         let mut per_scope_tokens = Vec::with_capacity(scopes.len());
+        let mut per_scope_asst_start = Vec::with_capacity(scopes.len());
         for (i, scope) in scopes.iter().enumerate() {
             let grid = self.prepare_scope_grid(&scope.user, &scope.assistant)?;
             per_scope_tokens.push(grid.token_count);
+            per_scope_asst_start.push(grid.assistant_content_start);
             let (tx, rx) = crossbeam::channel::unbounded();
             self.scheduler_tx
                 .send(SchedulerRequest::PrefillScope {
@@ -1544,6 +1726,7 @@ impl Sequence {
                     assistant_content_start: grid.assistant_content_start,
                     user_text: scope.user.clone(),
                     assistant_text: scope.assistant.clone(),
+                    tags: tags.clone(),
                     response_tx: tx,
                     on_prefilled: Arc::clone(&on_prefilled),
                 })
@@ -1552,12 +1735,14 @@ impl Sequence {
         }
         // The scheduler records the whole batch in scope order once every scope has
         // landed, then answers each channel — so these recvs unblock together, in
-        // submission order. Surface the first scope error (if any) after draining
-        // the rest so no channel is left dangling.
+        // submission order. Collect each recorded turn index (in scope order) for
+        // the staged-provenance pass. Surface the first scope error (if any) after
+        // draining the rest so no channel is left dangling.
+        let mut recorded: Vec<(usize, u32)> = Vec::with_capacity(scopes.len());
         let mut first_err = None;
-        for rx in receivers {
+        for (i, rx) in receivers.into_iter().enumerate() {
             match rx.recv() {
-                Ok(Ok(_idx)) => {}
+                Ok(Ok(idx)) => recorded.push((i, idx.0)),
                 Ok(Err(e)) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -1569,6 +1754,12 @@ impl Sequence {
                     }
                 }
             }
+        }
+        // Stage the sig→event→turn provenance chain for each recorded scope turn —
+        // the parallel analog of `insert_turn_staged`'s per-turn linkage, run once
+        // the whole batch is in the substrate.
+        for (scope_i, turn_index) in recorded {
+            self.persist_staged_ingest_events(turn_index, per_scope_asst_start[scope_i], 0.0)?;
         }
         match first_err {
             Some(e) => Err(e),
@@ -1676,25 +1867,190 @@ impl Sequence {
         self.finalize_turn_post_done(user_tt, assistant_tt, response.seal.as_ref())
     }
 
+    /// [`finish_turn`](Self::finish_turn) + staged provenance linkage for a
+    /// DECODED ingest turn (the code_read per-file summary): synthesizes and
+    /// persists the same two staged [`ProjectionEvent`]s as
+    /// [`insert_turn_staged`](Self::insert_turn_staged), with the decode's
+    /// wall-clock on the assistant-half event. The assistant half's grid
+    /// start comes from the sealed turn's own [`TurnLayout`] rather than
+    /// re-tokenizing.
+    pub fn finish_turn_staged(
+        &mut self,
+        handle: TurnHandle,
+        response: &TurnResponse,
+    ) -> crate::Result<String> {
+        let turn_index = response.seal.as_ref().and_then(|s| s.turn_index);
+        let seconds = response.stats.decode_ms / 1000.0;
+        let text = self.finish_turn(handle, response)?;
+        if let Some(idx) = turn_index {
+            let assistant_start = {
+                let read = self.substrate.read();
+                read.turn_layout(self.target.timeline, TurnIndex(idx))
+                    .map(|l| l.assistant_content_start())
+                    .unwrap_or(0)
+            };
+            self.persist_staged_ingest_events(idx, assistant_start, seconds)?;
+        }
+        Ok(text)
+    }
+
+    /// Synthesize + persist the two staged [`ProjectionEvent`]s for the
+    /// just-sealed ingest turn `turn_index`: one governing the user half
+    /// (`start_token: 0`), one governing the assistant half. `selection`
+    /// carries the layer's fixed system sections and — the mandatory
+    /// provenance linkage — the turn itself plus its immediate predecessor as
+    /// `(timeline, index)`-resolvable [`SelectedTurn`]s, keyed to the turn's
+    /// stream id (the same key its wide-Q signature persists under).
+    fn persist_staged_ingest_events(
+        &self,
+        turn_index: u32,
+        assistant_content_start: u32,
+        seconds: f64,
+    ) -> crate::Result<()> {
+        use crate::persistence::content_hash::turn_stream_id;
+        use crate::persistence::streams::StreamDecl;
+        use crate::projection::event::group_name_of;
+        use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
+        use crate::substrate::ContentResolver;
+        use crate::summary_tree::TurnKind;
+
+        let timeline = self.target.timeline;
+        let schema = self.projection.schema();
+        let layer = schema.layers.iter().find(|l| l.id == self.target.layer);
+        let layer_name = layer.map(|l| l.name.clone()).unwrap_or_default();
+        let group_name = group_name_of(schema, self.target.group)
+            .unwrap_or_default()
+            .to_string();
+
+        let (system, turns) = {
+            let read = self.substrate.read();
+            // The trunk's fixed system sections — utility-layer system
+            // prompts are fixed-only, so this is the complete composition.
+            let mut system: Vec<SystemItem> = Vec::new();
+            if let Some(layer) = layer {
+                for item in &layer.system_prompt.items {
+                    if let SystemPromptItem::Section(s) = item {
+                        let tokens = ContentResolver::section_token_count(&read, s.id) as u32;
+                        system.push(SystemItem::Section {
+                            name: s.name.clone(),
+                            tokens,
+                        });
+                    }
+                }
+            }
+            let count = crate::substrate::Substrate::turn_count(&read, timeline);
+            let selected = |idx: u32| -> Option<SelectedTurn> {
+                let t = TurnIndex(idx);
+                if idx >= count {
+                    return None;
+                }
+                let role = read
+                    .stream_of(turn_stream_id(timeline.raw(), idx))
+                    .and_then(|s| s.decl.as_ref())
+                    .and_then(|d| match d {
+                        StreamDecl::Turn(t) => Some(t.role),
+                        _ => None,
+                    })
+                    .map(|r| match r {
+                        0 => "system",
+                        2 => "assistant",
+                        _ => "user",
+                    })
+                    .unwrap_or("user")
+                    .to_string();
+                let kind = read
+                    .tree_meta_of(timeline, t)
+                    .map(|m| m.kind)
+                    .unwrap_or(TurnKind::Normal);
+                Some(SelectedTurn {
+                    layer: layer_name.clone(),
+                    group: group_name.clone(),
+                    index: idx,
+                    role,
+                    tokens: read.turn_token_count_of(timeline, t) as u32,
+                    kind,
+                    reason: None,
+                    timeline: Some(timeline.raw()),
+                    selected: true,
+                    score: 0.0,
+                })
+            };
+            let mut turns = Vec::with_capacity(2);
+            if let Some(prev) = turn_index.checked_sub(1).and_then(selected) {
+                turns.push(prev);
+            }
+            if let Some(own) = selected(turn_index) {
+                turns.push(own);
+            }
+            (system, turns)
+        };
+
+        let events = [
+            staged_ingest_event(0, 0.0, system.clone(), turns.clone()),
+            staged_ingest_event(assistant_content_start, seconds, system, turns),
+        ];
+        self.substrate
+            .persist_projection_events(
+                turn_stream_id(timeline.raw(), turn_index),
+                &encode_events(&events),
+            )
+            .map_err(ConversationError::Model)?;
+        Ok(())
+    }
+
+    /// Belief scores for the just-sealed turn, scored against each belief node
+    /// (the target layer's collections AND every layer's belief-driven turn
+    /// groups) using the turn's own persisted wide-Q signature as the probe. The
+    /// post-turn counterpart of the scheduler's live reproject scan — same
+    /// galleries + scorer, but the probe is the finished turn's stored signature
+    /// rather than a live gather. Empty when the turn has no signature (nothing
+    /// to score against).
+    fn last_turn_belief_scores(&self) -> crate::substrate::ProjectionScores {
+        use crate::provenance::decode_wide_sigs;
+        let empty = crate::substrate::ProjectionScores::new();
+        let timeline = self.target.timeline;
+        let probe = {
+            let read = self.substrate.read();
+            let count = read.turn_count(timeline);
+            if count == 0 {
+                return empty;
+            }
+            match read
+                .wide_q_sigs_blob(timeline, TurnIndex(count - 1))
+                .and_then(decode_wide_sigs)
+            {
+                Some(p) => p,
+                None => return empty,
+            }
+        };
+        let (scores, _) =
+            self.substrate
+                .score_beliefs(self.projection.schema(), self.target, &probe);
+        scores
+    }
+
     /// Recompute the materialized projection for this conversation and pair it
     /// with the just-finished decode's throughput into a [`ProjectionEvent`].
     ///
-    /// Call this immediately after [`finish_turn`](Self::finish_turn): the BDP
-    /// scan run there leaves fresh per-turn scores on the scanner, so the
-    /// scored reprojection here reflects what provenance selects for this
-    /// conversation at the decoding head. Returns `None` for layers that don't
-    /// reproject (`disable_reprojection` — utility/reference ingestion), where
-    /// a projection event carries no meaning.
+    /// Call this immediately after [`finish_turn`](Self::finish_turn): the turn
+    /// is sealed, so its wide-Q signature is persisted and serves as the belief
+    /// probe. Scoring that stored signature against each collection's tag-scoped
+    /// gallery gives the same per-section belief the live reproject scan
+    /// produces, so the persisted event reflects what provenance selects — not a
+    /// zero-score min-budget fill. Returns `None` for layers that don't reproject
+    /// (`disable_reprojection` — utility/reference ingestion), where a projection
+    /// event carries no meaning.
     ///
     /// The composition (system / section groups / turns), per-category token
     /// counts, substrate total, and decode throughput are all real; the only
     /// approximation is the probe — the recompute scores against the
-    /// just-finished turn rather than replaying each live decode-step Q vector.
+    /// just-finished turn's whole signature rather than replaying each live
+    /// decode-step Q vector.
     pub fn projection_event(&self, stats: &crate::stats::TurnStats) -> Option<ProjectionEvent> {
         if self.config.disable_reprojection {
             return None;
         }
-        let scores = self.bdp_scanner.to_projection_scores();
+        let scores = self.last_turn_belief_scores();
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let projection = self.projection.project_with_selection(
             self.target,
@@ -1713,6 +2069,7 @@ impl Sequence {
             &projection.selection_origins,
             self.projection.schema(),
             &resolver,
+            &projection.selection_scores,
             substrate_total,
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
@@ -1826,7 +2183,7 @@ impl Sequence {
     /// `insert_turn` need the same fold-down work:
     ///
     /// 1. Apply the scheduler's seal payload (cold store register +
-    ///    sig-blocks counter advance + BDP scan probe).  The
+    ///    sig-blocks counter advance + provenance scan probe).  The
     ///    substrate write itself happened scheduler-side before
     ///    `Done` arrived.
     /// 2. Persist the user/assistant entries to the cold store.
@@ -1848,7 +2205,6 @@ impl Sequence {
         // just register the bytes with the cold-store and advance
         // local counters.
         if let Some(seal) = seal {
-            self.sig_blocks_processed = seal.sig_blocks_processed;
             self.current_blocks = BlockCount(seal.block_count);
             // The scheduler already wrote the turn's sealed bytes,
             // per-block sig entries, role/text/token_ids, AND the
@@ -1857,27 +2213,6 @@ impl Sequence {
             // `Conversation::record_turn`.  Persistence is per-
             // workspace now, not per-Sequence; nothing for this
             // method to forward.
-            // Refresh BDP scores using the just-finished turn's chunk-group as
-            // probe — but ONLY for layers that actually reproject/retrieve.
-            //
-            // `run_bdp_scan` scans the just-finished turn against the WHOLE
-            // substrate corpus (`all_turns` + `all_sections`), so running it on
-            // every insert is O(n) per turn → O(n²) over an ingest. Utility /
-            // reference layers (repo_map, code_reading: `disable_reprojection`)
-            // are append-only and never queried during ingest, so that scan is
-            // pure waste there — it's what made code-reading slow to a crawl as
-            // the corpus grew. Cross-layer retrieval (the dialogue layer scoring
-            // these turns) still happens via the dialogue layer's own scans,
-            // which are not gated.
-            if !self.config.disable_reprojection {
-                let timeline_count = self.substrate.read().turn_count(self.target.timeline);
-                if timeline_count > 0 {
-                    let last_idx = TurnIndex(timeline_count - 1);
-                    if let Err(e) = self.run_bdp_scan(self.target.timeline, last_idx) {
-                        tracing::warn!("BDP scan failed: {e}");
-                    }
-                }
-            }
         }
 
         // Bump the local turn counter for diagnostics; the canonical
@@ -1981,21 +2316,14 @@ impl Sequence {
             freed: false,
             current_blocks: self.current_blocks,
             chunk_size: self.chunk_size,
-            provenance: self.provenance.clone(),
             model_core: self.model_core,
-            // The fork inherits all parent blocks already indexed.  Sig extraction
-            // during seal_and_detach_into uses this as the range start, so only the
-            // delta (blocks added after the fork) gets scanned — not the entire
-            // inherited parent history.
-            sig_blocks_processed: self.current_blocks.0,
             projection: self.projection.clone(),
             // Forks share the same substrate (Arc clone) so cross-fork
             // history aggregation continues to work.
             substrate: self.substrate.clone(),
             target: fork_target,
             // Forks start with a fresh scanner state — scoring will refresh
-            // on the next BDP scan.  No need to clone the parent's scores.
-            bdp_scanner: crate::provenance::BdpScanner::new(),
+            // on the next provenance scan.  No need to clone the parent's scores.
         };
         Ok(fork_conv)
     }
@@ -2032,8 +2360,7 @@ impl Sequence {
         self.pending_user = None;
         // The substrate is workspace-shared — don't reset its turn store
         // (other conversations would lose their history).  Only the local
-        // KV state and BDP score cache are cleared here.
-        self.bdp_scanner.clear();
+        // KV state and provenance score cache are cleared here.
         self.current_blocks = BlockCount(0);
 
         // Clear turn history (keeps system prompt, config, beliefs).
@@ -2065,7 +2392,6 @@ impl Sequence {
         // Clear local turn state unconditionally so the sequence is reusable.
         self.turn_in_flight = false;
         self.pending_user = None;
-        self.bdp_scanner.clear();
         self.current_blocks = BlockCount(0);
         self.tree.clear_turns();
     }
@@ -2470,122 +2796,29 @@ impl Sequence {
         if n == 0 && trigger_ids.is_empty() {
             return None;
         }
-        let probe_filter = Arc::new(self.build_reproject_probe_filter_token_ids());
         Some(ReprojectionPolicy {
             target: self.target,
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
             substrate: self.substrate.clone(),
-            provenance: Arc::clone(&self.provenance),
-            provenance_layer_indices: self.model_core.provenance_layer_indices,
             every_n_tokens: n,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
-            probe_filter_token_ids: probe_filter,
             trigger_token_ids: trigger_ids,
-            span_alpha: self.projection.span_alpha(),
+            tool_call_open_id: self.single_token_id("<tool_call>"),
+            tool_call_close_id: self.single_token_id("</tool_call>"),
         })
     }
 
-    /// Encode every token that's structural rather than content into a
-    /// deduplicated set to drop from the BDP probe.
-    ///
-    /// Three categories — anything in any of them appears in (almost)
-    /// every turn's KV, so keeping them in the probe inflates each
-    /// historical turn's score by roughly the same constant amount and
-    /// dilutes the actual content signal.
-    ///
-    /// 1. **Whitespace** — plain ASCII (`\n`, ` `, `\t`, `\n\n`) plus
-    ///    GPT-2 byte-level BPE encodings (`Ċ` = U+010A, `ċ` = U+0109,
-    ///    `Ġ` = U+0120, `ĊĊ` for double-newline).
-    /// 2. **Markdown punctuation** — `*` `-` `#` `` ` `` `|` `>` `\` `/`
-    ///    (bullets, list dashes, headings, code fences, table pipes,
-    ///    blockquotes, escapes, path separators).  Plus their
-    ///    space-prefixed BPE forms (`Ġ*`, `Ġ-`, …) which most
-    ///    tokenizers emit when these characters open a word.
-    /// 3. **Chat-template scaffolding** from the dialect — turn-boundary
-    ///    markers (`<|im_start|>`, `<|im_end|>`, role labels,
-    ///    think-block markers, etc.).
-    ///
-    /// Mirrors [`DecodeHealthConfig::resolve_structural_tokens`] for
-    /// categories 1 and 2 — kept as a parallel list rather than a
-    /// shared call because the conversation only has
-    /// [`SequenceConfig`], not [`EngineConfig`].
-    fn build_reproject_probe_filter_token_ids(&self) -> Vec<u32> {
-        let mut ids: Vec<u32> = Vec::new();
-        let add = |ids: &mut Vec<u32>, s: &str| {
-            if s.is_empty() {
-                return;
-            }
-            if let Ok(enc) = self.tokenizer.encode(s, false) {
-                for &id in enc.get_ids() {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            }
-        };
-
-        // Category 1: whitespace.
-        for s in ["\n", " ", "\t", "\n\n"] {
-            add(&mut ids, s);
+    /// The token id of `text` iff the tokenizer encodes it to exactly one token.
+    /// `<tool_call>` / `</tool_call>` are registered as single added tokens in the
+    /// Qwen3 tokenizer, so this pins the reprojection-suppression boundary; a
+    /// tokenizer without them yields `None` and the gate is simply inactive.
+    fn single_token_id(&self, text: &str) -> Option<u32> {
+        let enc = self.tokenizer.encode(text, false).ok()?;
+        match enc.get_ids() {
+            [id] => Some(*id),
+            _ => None,
         }
-        for s in [
-            "\u{010A}",         // Ċ — newline
-            "\u{0109}",         // ċ — tab
-            "\u{0120}",         // Ġ — space
-            "\u{010A}\u{010A}", // ĊĊ — double newline
-        ] {
-            add(&mut ids, s);
-        }
-
-        // Category 2: markdown / formatting punctuation, plus the
-        // space-prefixed BPE forms most tokenizers emit at word starts.
-        const MARKDOWN: &[char] = &['*', '-', '#', '`', '|', '>', '\\', '/'];
-        for &c in MARKDOWN {
-            let s = c.to_string();
-            add(&mut ids, &s);
-            let with_space = format!("\u{0120}{c}");
-            add(&mut ids, &with_space);
-        }
-
-        // Category 3: chat-template scaffolding from the dialect.
-        let d = &self.config.dialect;
-        for s in [
-            d.document_start,
-            d.document_end,
-            d.marker_start,
-            d.marker_end,
-            d.turn_start,
-            d.turn_begin,
-            d.turn_end,
-            d.system_start,
-            d.system_end,
-            d.user_start,
-            d.user_end,
-            d.assistant_start,
-            d.assistant_end,
-            d.recent_start,
-            d.recent_end,
-            d.no_think_block,
-            d.no_think,
-            d.think_block,
-        ] {
-            add(&mut ids, s);
-        }
-
-        // Category 4: JSON structural punctuation.  Tool-definition
-        // sections are prefilled as JSON blobs and tool calls are emitted
-        // as JSON; braces, brackets, quotes and separators carry no
-        // semantic signal and match across every section purely on shared
-        // JSON structure — pure BDP noise.  Both bare forms and the BPE
-        // merges a tokenizer emits inside compact JSON are added.
-        for s in [
-            "{", "}", "[", "]", ":", ",", "\"", "{\"", "\"}", "\"}}", "\":\"", "\",\"", "\":",
-            "\",", "[{", "}]",
-        ] {
-            add(&mut ids, s);
-        }
-        ids
     }
 
     /// Encode each `reproject_trigger_texts` entry via the tokenizer
@@ -2624,93 +2857,6 @@ impl Sequence {
                 Self::run_task_blocking_inner(&mut self.tree, task.as_mut(), inference);
             }
         }
-    }
-
-    /// Run a BDP scan using the sig entries of `(probe_group, probe_index)`
-    /// as the probe and every other tracked `(group, idx)` as the corpus.
-    /// Updates the session resolver's per-turn `PerDepthScores` in place.
-    ///
-    /// Pure no-op when the probe turn has no sig entries (e.g. the seal
-    /// produced zero new chunks).  Errors from the mmap path bubble up.
-    pub(crate) fn run_bdp_scan(
-        &mut self,
-        probe_timeline: crate::projection::TimelineId,
-        probe_index: TurnIndex,
-    ) -> crate::Result<()> {
-        // Snapshot probe + corpus under a single read lock, then drop the
-        // guard before doing the (CPU-heavy) BDP scan and the write phase.
-        //
-        // BdpScanner is keyed by `TurnKey` natively — no group/timeline
-        // translation needed.
-        let probe_key = crate::projection::TurnKey::new(probe_timeline, probe_index);
-        let (probe_entries, turn_corpus, section_corpus): (
-            Vec<crate::provenance::SigEntry>,
-            Vec<(crate::projection::TurnKey, Vec<crate::provenance::SigEntry>)>,
-            Vec<(SectionId, Vec<crate::provenance::SigEntry>)>,
-        ) = {
-            let view = self.substrate.read();
-            let probe = view.sig_entries_of(probe_timeline, probe_index).to_vec();
-            if probe.is_empty() {
-                return Ok(()); // nothing to probe with
-            }
-            let turn_corpus: Vec<_> = view
-                .all_turns()
-                .filter_map(|key| {
-                    if key == probe_key {
-                        return None;
-                    }
-                    let entries = view.sig_entries_of(key.timeline, key.index).to_vec();
-                    if entries.is_empty() {
-                        None
-                    } else {
-                        Some((key, entries))
-                    }
-                })
-                .collect();
-            let section_corpus: Vec<_> = view
-                .all_sections()
-                .map(|sid| (sid, view.section_sig_entries(sid).to_vec()))
-                .filter(|(_, e)| !e.is_empty())
-                .collect();
-            (probe, turn_corpus, section_corpus)
-        };
-
-        // Read probe TokenSignatures back from the ProvenanceFile, concatenated
-        // across all of the probe turn's chunks so each probe-token contributes.
-        let mut probe_syn = Vec::new();
-        let mut probe_sem = Vec::new();
-        let mut probe_prag = Vec::new();
-        for entry in &probe_entries {
-            let (syn, sem, prag) = self.provenance.read_entry(*entry)?;
-            probe_syn.extend(syn);
-            probe_sem.extend(sem);
-            probe_prag.extend(prag);
-        }
-
-        self.bdp_scanner.scan(
-            &self.provenance,
-            &probe_syn,
-            &probe_sem,
-            &probe_prag,
-            &turn_corpus,
-        )?;
-        self.bdp_scanner.scan_sections(
-            &self.provenance,
-            &probe_syn,
-            &probe_sem,
-            &probe_prag,
-            &section_corpus,
-        )?;
-
-        // Scanner output stays on `self.bdp_scanner` — it is **not**
-        // pushed into the substrate. Scores are transient, per-projection
-        // state: a downstream consumer wanting scored projection on this
-        // Sequence's substrate view builds a [`ProjectionScores`] from
-        // `self.bdp_scanner.scores()` / `.section_scores()` at the call
-        // site (see `BdpScanner::to_projection_scores`) and reads with
-        // [`Conversation::read_scored`]. The substrate's persistent
-        // identity does not include scoring state.
-        Ok(())
     }
 }
 

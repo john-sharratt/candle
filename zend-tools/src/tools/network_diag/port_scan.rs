@@ -12,10 +12,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PortScanRequest {
+    /// Hostname or IP address to scan.
     #[validate(length(min = 1))]
     pub host: String,
+    /// TCP ports to check (1-100 ports per call).
     #[validate(length(min = 1, max = 100))]
     pub ports: Vec<u16>,
+    /// Per-port TCP connect timeout in milliseconds. Default: 500.
     pub timeout_ms: Option<u64>,
 }
 

@@ -11,10 +11,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct MkdirRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Remote directory path to create.
     #[validate(length(min = 1))]
     pub path: String,
+    /// Unix permission bits for the new directory. Defaults to 0o755.
     pub mode: Option<u32>,
 }
 

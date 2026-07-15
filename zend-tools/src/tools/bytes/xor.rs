@@ -9,12 +9,20 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct XorRequest {
+    /// First operand, interpreted according to `a_encoding`. Required.
     #[validate(length(min = 1))]
     pub a: String,
+    /// How `a` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.
+    #[schemars(with = "Option<super::BytesEncoding>")]
     pub a_encoding: Option<String>,
+    /// Second operand, interpreted according to `b_encoding`. Required.
     #[validate(length(min = 1))]
     pub b: String,
+    /// How `b` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.
+    #[schemars(with = "Option<super::BytesEncoding>")]
     pub b_encoding: Option<String>,
+    /// Encoding for the returned XOR result. One of: hex, base64, base64url, utf8. Defaults to hex.
+    #[schemars(with = "Option<super::BytesEncoding>")]
     pub output_encoding: Option<String>,
 }
 
@@ -31,7 +39,8 @@ impl Tool for BytesXor {
     const DESCRIPTION: &'static str =
         "Combine two byte sequences with a bitwise XOR, zero-padding the \
          shorter one. Use for one-time-pad analysis, keystream masking, and \
-         computing bitwise differences between binary blobs.";
+         computing bitwise differences between binary blobs. Always call this \
+         tool to perform the XOR; never compute the result yourself.";
 
     type Request = XorRequest;
     type Response = XorResponse;

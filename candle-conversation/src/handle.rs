@@ -109,8 +109,8 @@ pub enum TurnEvent {
 /// summarisation).  When `Some`, the substrate already holds the new
 /// turn or section by the time the conversation receives `Done`; the
 /// payload exists so the conversation can run its post-seal
-/// follow-ups (cold-store persistence, BDP probe scan) without a
-/// second round-trip to the scheduler.
+/// follow-ups (cold-store persistence) without a second round-trip to
+/// the scheduler.
 pub struct SealResult {
     /// Total sealed-block count for the parent slot **after** the seal
     /// advance.
@@ -123,14 +123,14 @@ pub struct SealResult {
     /// Total tokens in this turn or section
     /// (`parent.chunks[block_from..block_to].iter().map(.token_count).sum()`).
     pub turn_token_count: usize,
-    /// Sig entries appended to the workspace's `ProvenanceFile` for
-    /// the new blocks.  One entry per 32-token block.
-    pub new_sig_entries: Vec<crate::provenance::SigEntry>,
     /// Chunk size in tokens (mirrors the scheduler's chunk_size).
     pub chunk_size: usize,
-    /// Updated `sig_blocks_processed` counter.  The conversation's
-    /// next seal starts indexing from here.
-    pub sig_blocks_processed: usize,
+    /// The substrate `TurnIndex` this seal recorded (`SealAction::Turn`
+    /// only; `None` for section seals).  Callers keying per-turn persists
+    /// (staged projection events) MUST use this rather than
+    /// `turn_count - 1`: the async summariser appends its node turns to
+    /// the same timeline, so counting races.
+    pub turn_index: Option<u32>,
 }
 
 /// Complete response from a turn.

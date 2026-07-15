@@ -109,7 +109,6 @@ fn main() -> Result<()> {
         offset: seq1_offset,
         input_ids: &seq1_input,
         input_len: seq1_prompt.len(),
-        write_offset_shift: 0,
     }];
     let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
     let seq_len = contexts[0].input_len;
@@ -128,7 +127,6 @@ fn main() -> Result<()> {
         offset: seq2_offset,
         input_ids: &seq2_input,
         input_len: seq2_prompt.len(),
-        write_offset_shift: 0,
     }];
     let offsets2: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
     let seq_len2 = contexts[0].input_len;
@@ -184,7 +182,6 @@ fn main() -> Result<()> {
             offset: seq2_offset_val,
             input_ids: &seq2_offset_input,
             input_len: 1,
-            write_offset_shift: 0,
         }];
         let generation = stager.begin_generation();
         let _ = model.forward_batch(
@@ -223,14 +220,12 @@ fn main() -> Result<()> {
                 offset: seq1_offset,
                 input_ids: &seq1_input,
                 input_len: 1,
-                write_offset_shift: 0,
             },
             SequenceContext {
                 kv_caches: &mut seq2_caches,
                 offset: seq2_offset,
                 input_ids: &seq2_input,
                 input_len: 1,
-                write_offset_shift: 0,
             },
         ];
 
@@ -348,7 +343,6 @@ fn main() -> Result<()> {
             offset: seq2_offset_val,
             input_ids: &seq2_offset_for_par,
             input_len: 1,
-            write_offset_shift: 0,
         }];
         let generation = stager.begin_generation();
         let _ = model.forward_batch(
@@ -378,14 +372,12 @@ fn main() -> Result<()> {
                 offset: seq1_offset,
                 input_ids: &seq1_input,
                 input_len: 1,
-                write_offset_shift: 0,
             },
             SequenceContext {
                 kv_caches: &mut seq2_caches_par,
                 offset: seq2_offset,
                 input_ids: &seq2_input,
                 input_len: 1,
-                write_offset_shift: 0,
             },
         ];
 

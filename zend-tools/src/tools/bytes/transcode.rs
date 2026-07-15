@@ -9,10 +9,15 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TranscodeRequest {
+    /// The input, interpreted according to `from`.
     #[validate(length(min = 1))]
     pub data: String,
+    /// Encoding `data` is currently in. One of: hex, base64, base64url, utf8.
+    #[schemars(with = "super::BytesEncoding")]
     #[validate(length(min = 1))]
     pub from: String,
+    /// Encoding to convert to. One of: hex, base64, base64url, utf8.
+    #[schemars(with = "super::BytesEncoding")]
     #[validate(length(min = 1))]
     pub to: String,
 }
@@ -31,7 +36,8 @@ impl Tool for BytesTranscode {
     const NAME: &'static str = "bytes_transcode";
     const DESCRIPTION: &'static str = "Re-encode data between byte representations — hex, base64, \
          base64url, and raw utf8 — without changing the underlying bytes. \
-         Use to normalize how a payload is written, not what it contains.";
+         Use to normalize how a payload is written, not what it contains. \
+         Always call this tool to re-encode; never convert the data yourself.";
 
     type Request = TranscodeRequest;
     type Response = TranscodeResponse;

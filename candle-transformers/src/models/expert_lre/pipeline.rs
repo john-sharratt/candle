@@ -618,7 +618,10 @@ impl PipelineState {
         // panic here and take down the whole expert-pipeline thread — after
         // which every forward fails forever. Drop such ids and log instead:
         // that token loses one expert (negligible) rather than bricking decode.
+        #[cfg(feature = "cuda")]
         let n_experts = self.expert_locations[moe_idx].len();
+        #[cfg(not(feature = "cuda"))]
+        let n_experts = self.host_refs[moe_idx].len();
 
         for &expert_idx in expert_ids {
             if expert_idx >= n_experts {

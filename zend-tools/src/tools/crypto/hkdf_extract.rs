@@ -4,16 +4,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{decode_data, CryptoError};
+use super::{decode_data, normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HkdfExtractRequest {
     #[validate(length(min = 1))]
     pub ikm: String,
+    /// How `ikm` (input keying material) is encoded. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub ikm_encoding: Option<String>,
     pub salt: Option<String>,
+    /// How `salt` is encoded. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub salt_encoding: Option<String>,
+    /// HKDF hash function. One of: sha256, sha512.
+    #[schemars(with = "super::HkdfHash")]
     #[validate(length(min = 1))]
     pub algorithm: String,
 }
@@ -51,7 +57,7 @@ impl Tool for HkdfExtract {
             None
         };
 
-        let prk_hex = match req.algorithm.as_str() {
+        let prk_hex = match normalize_algorithm(&req.algorithm).as_str() {
             "sha256" => {
                 let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(salt_opt.as_deref(), &ikm);
                 hex::encode(prk)

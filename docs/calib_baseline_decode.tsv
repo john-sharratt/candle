@@ -1,0 +1,746 @@
+# calib-baseline  tag=tool  turns=744  (0 without wide-Q)
+# key	n_tok	tok_hash	n_sig	wq_hash	mean_pop
+aead_decrypt|can you decrypt ChaCha20-Poly1305 blob feedface90ab using key ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100 and nonce 0b0a090807060504030201ff with no AAD	1601	08282b534120d95b	1601	1e0e00f2ffc2b60f	760.7
+aead_decrypt|decrypt the AES-128-GCM ciphertext 3a7f9c2e1b8d with key 000102030405060708090a0b0c0d0e0f, nonce 0102030405060708090a0b0c, and no AAD	674	148f7916a87d1a37	674	af74087fde11d675	762.8
+aead_decrypt|decrypt the AES-128-GCM ciphertext c0ffee11 with key aabbccddeeff00112233445566778899, nonce 00112233445566778899aabb, no AAD	462	24f67cbcb24e1ee6	462	ea94287896d3f037	761.8
+aead_decrypt|decrypt the AES-256-GCM ciphertext 5e1a3f9c with key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 0102030405060708090a0b0c, and no AAD	1170	72c0442dd161203f	1170	e110da5a83404967	760.5
+aead_decrypt|decrypt the AES-256-GCM ciphertext 9a8b7c6d5e4f302112034455667788990a1b2c3d4e5f60718293a4b5c6d7e8f90 with key cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677, nonce 00112233445566778899aabb, no AAD	714	195a29139bfbe7ef	714	a73b26ada0c87bd8	761.2
+aead_decrypt|decrypt the ChaCha20-Poly1305 ciphertext 9f3c7a2e with key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 000102030405060708090a0b, no AAD	744	dabb58cfce15ecd8	744	4cb3e95f8ad70699	762.7
+aead_decrypt|open the AES-256-GCM ciphertext 7b2d4e6f8a0c with key 1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100, nonce a1b2c3d4e5f60718293a4b5c, no AAD	1186	023ca5d79c1dab81	1186	7e4e9004fb79ce7b	760.3
+aead_decrypt|recover the plaintext from AES-128-GCM ciphertext 1234abcd5678 with key 112233445566778899aabbccddeeff00, nonce ffeeddccbbaa99887766554433, and no AAD	1680	58f324bebbf20a43	1680	ed509821b3e97f1e	759.2
+aead_encrypt|can you AES-128-GCM encrypt 'ping ok' with the key 112233445566778899aabbccddeeff00 and nonce ffeeddccbbaa99887766554433	1262	0e9fea3f298b334d	1262	099a3172610dadd4	758.9
+aead_encrypt|encrypt 'session token grant' with ChaCha20-Poly1305, key ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100, nonce 0b0a090807060504030201ff	623	c0256c13502baa89	623	a4595e2dd3353ff0	762.1
+aead_encrypt|encrypt the text 'confidential memo' with AES-128-GCM, key aabbccddeeff00112233445566778899, nonce 00112233445566778899aabb	645	8de9028d55516cff	645	ca2bc125d963e0a7	760.0
+aead_encrypt|encrypt the text 'launch code 7' with AES-128-GCM, key 000102030405060708090a0b0c0d0e0f, nonce 0102030405060708090a0b0c	535	a0a5da13cd50835d	535	a9b814aa9600bbf8	761.5
+aead_encrypt|encrypt the text 'meet at noon' with AES-256-GCM, key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 0102030405060708090a0b0c	479	9fd76c652aa59f6f	479	8a78a23f3e8dbc72	762.6
+aead_encrypt|encrypt the text 'top secret' with ChaCha20-Poly1305, key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 000102030405060708090a0b	490	610c4035d40a7aaf	490	7cb44c1deb69f141	763.7
+aead_encrypt|run AES-256-GCM over the message 'rotate the master key' with key 1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100 and nonce 00112233445566778899aabb	797	4143772a63dc0344	797	574754bb14ceeb28	759.9
+aead_encrypt|seal 'wire the funds' using AES-256-GCM with key cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677 and nonce a1b2c3d4e5f60718293a4b5c	588	71ddb21674957480	588	ea88a1d5297cd08f	761.1
+bytes_pack|encode the signed bytes -47, 112, and -9 with the format '>bbb'	393	87fa4c72cc96bdba	393	2bf2fd331e1b90b9	758.3
+bytes_pack|pack the double 2.71828 with the format '<d'	277	92f7b3f26ef7e689	277	2a48e703ef32bd48	764.0
+bytes_pack|pack the float 3.14 and the shorts 7 and 9 into bytes with format '>fHH'	556	781759168608af6b	556	dfadc695952e20fe	760.3
+bytes_pack|pack the integers 3149642683, 1094795585, and 2882395258 as big-endian unsigned 32-bit ints	339	86e9fecc709be89d	339	1a087a0856dc8bdd	764.2
+bytes_pack|pack the value 65535 and the float 1.5 as little-endian with format '<Hf'	461	01a9b029e18cb877	461	573536a8090a3f54	762.6
+bytes_pack|pack the values 3405691582 and 48350 into a binary buffer with the format '>IH'	329	bfba712e36782506	329	efe5535af28789a1	762.8
+bytes_pack|pack the values 46021 and 12873 as little-endian u16s	256	a8f36cf8227d184c	256	c02764f507781fc5	762.4
+bytes_pack|serialize the u64 4294967296 and the u8 200 using format '>QB'	353	2180c9b95698a78d	353	ca1a4b5102df9427	761.6
+bytes_transcode|convert the base64url string SGVsbG8gd29ybGQ to base64	210	7ab2d9621bbbda36	210	881a427b91e2db90	761.6
+bytes_transcode|convert the base64url string aGVsbG8td29ybGQ to hex	308	f38a4597adce6f0b	308	281b060acbf3da1c	764.7
+bytes_transcode|convert the hex string 89504e470d0a1a0a0000000d49484452 to base64	574	7d791e0b4433f80f	574	0f3fff870bfd043d	761.9
+bytes_transcode|decode the base64 value VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyBhbmQga2VlcHMgb24gcnVubmluZw== to a utf8 string	467	d1997ac24c3680c8	467	b1b3ec71b6d0231e	762.6
+bytes_transcode|re-encode the utf8 string 'the quick brown fox' to base64url	1122	c0531537c5742acd	1122	f5279fb7e36e2ec5	757.6
+bytes_transcode|re-encode the utf8 text 'café menu' as hex	1402	89ef7a9606550770	1402	3dcdafd7cd22e2bc	759.6
+bytes_transcode|transcode the base64 value SGVsbG8sIFdvcmxkIQ== to hex	201	54a5a27848c558d7	201	b11d48794bcae211	766.2
+bytes_transcode|turn the hex ffd8ffe000104a464946 into base64url	296	8880683ed58e3437	296	282c6597ea28c803	762.6
+bytes_unpack|decode the hex-encoded bytes b3f10a4c as a big-endian u32, format '>I'	290	1879e1ca70951ac8	290	93cb9d83f405e3bb	765.5
+bytes_unpack|read the hex 9c2f04e7 as four unsigned bytes, format '>BBBB'	584	4af5c10de4ae6331	584	011e5a9802d5af1b	763.1
+bytes_unpack|unpack the hex 7b19c4a891e3f5a2c47d1b60 into a u32 and an i64, format '<Iq'	346	c3f14033302c61b9	346	1305540fc4138dc8	766.5
+bytes_unpack|unpack the hex bytes 401921fb54442d18 as a big-endian double, format '>d'	310	3e055e3264214f9a	310	a191d85473bc0c84	763.7
+bytes_unpack|unpack the hex-encoded bytes 39d4a10800000000 as a signed 64-bit integer, format '<q'	404	057d2d656b2e86ee	404	e5c66f80f467aa8c	763.8
+bytes_unpack|unpack the hex-encoded bytes 3ac91f7e5b2048d1 as two little-endian u32s, format '<II'	362	6336e2c9cd2d3cb8	362	4e7d0fca42086e37	764.2
+bytes_unpack|unpack the hex-encoded bytes 6f12833e as a little-endian float, format '<f'	253	03804747e4f2c7a5	253	c457a404e0b03f05	767.8
+bytes_unpack|unpack the hex-encoded bytes a83f5c19 as two big-endian u16s, format '>HH'	301	f283e9ead01c64fe	301	780a083c6cf84b4f	764.1
+bytes_xor|mask the hex 5e6f7a8b9c0d1e2f with the one-time pad a5b4c3d2e1f00918	510	7469865b10e2fb2e	510	297305c4818b8a96	761.9
+bytes_xor|what do you get when you XOR 1234567890abcdef and c73e91a45db8206f	299	784f1c3f59204966	299	33c72def83531bc0	763.3
+bytes_xor|xor 7d3f9a02c815be64f0a19d3c5e82740b against 2b6ef1c40953a7d8e14c60ba39f5127e	360	2ef585c6933fe3fb	360	f30e0a3ca714b7ab	760.8
+bytes_xor|xor the 32-byte hex 00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f and ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0	769	26cb32388ab6b811	769	a68e4ddfeb6f02e6	759.9
+bytes_xor|xor the hex a1b2c3d4e5f60718293a4b5c6d7e8f90 and 0f1e2d3c4b5a69788796a5b4c3d2e1f0	387	f2f341f40a679a33	387	28bd31a632623850	761.8
+bytes_xor|xor the hex blocks 3c8f1ad57e29b0c46f81d2a3905e7bc191e4072db8a6f53c1d4e8b09a7f26d3e and 5f4e3d2c1b0a998877665544332211009988776655443322110ffeeddccbbaa9	362	011f836b5643cf0b	362	ffa187a1ec9cfc08	761.1
+bytes_xor|xor the hex cafebabedeadbeef0123456789abcdef and fedcba9876543210ffeeddccbbaa9988	355	020b2705bc0dbd53	355	1ca6233ddf46f403	758.7
+bytes_xor|xor the keystream 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d with the ciphertext deadbeefcafebabe0011223344556677	652	4d1bd896abb7486d	652	fe8f95629c37e942	761.1
+calculator|compute the square root of 74183	137	36df7be786a02e08	137	d780959f9d6b7400	761.5
+calculator|evaluate (128 + 47) * 2^7 - 913	1281	d0c92cb09e6cf858	1281	1d737e2e39886e31	763.4
+calculator|how much is 918273 divided by 4657, to four decimal places	395	fd4ba02185a2bbd8	395	46f99ce5377954e7	765.3
+calculator|log base 2 of 95443	312	f3e65bef207a3dae	312	4c8154052fb18bb5	764.3
+calculator|what is 1234 multiplied by 5678	174	eb2c072f85f30867	174	9c5ef58d3d773d6c	767.3
+calculator|what is 37% of 84193	233	1ecca011c06351e8	233	6841ae0715b657f8	764.4
+calculator|what is 76234 multiplied by 88911	182	a9317a0b38da13da	182	c74e2013511002a2	766.6
+calculator|what's the square root of 2750000	155	9b773e13d9de2c64	155	993f4aaafcdc2861	764.9
+code_run|evaluate JavaScript that counts the vowels in 'sandbox engine'	737	0e651089d49483c6	737	dcd4f45868cfca96	762.9
+code_run|evaluate this JavaScript expression that sums an array of numbers	630	30ccc2ae66b021c0	630	e25c4e089bf56710	760.6
+code_run|execute a JavaScript snippet that reverses the string 'hello world'	687	1ec991b5322f31dc	687	5cb866e843c14a0b	761.4
+code_run|run JS to compute the factorial of 12	449	d0264d573b3fda82	449	8db05b6273712821	763.1
+code_run|run a quick JavaScript to format a Unix timestamp as an ISO date string	763	7be2cc01a9226088	763	ef67dee449433831	763.9
+code_run|run some JavaScript that prints the first 10 Fibonacci numbers	1039	0a17ec74ebae81b4	1039	87434bd62d579268	764.6
+code_run|use JavaScript to filter the array [3, 8, 11, 14, 5, 20, 7] down to just the even numbers	475	bb2f7c44650b8525	475	26b9c4a636103ba5	762.1
+code_run|write and run JS that parses the JSON {"name":"Ada","age":36,"admin":true} and prints its keys	414	331d42ea126de42a	414	a6ad47c2ed9bf029	762.6
+code_session_close|close code session sess_3f9a2c	135	dacb2ac3e9390553	135	1929355f34210306	763.2
+code_session_close|discard the state and end code session js-2	366	773be07dd2d81e83	366	f495b2c57c9d9c72	763.5
+code_session_close|drop code session js-4, I'm done with it	173	96a8edf69921cd82	173	0505f6134b55d960	762.7
+code_session_close|end code execution session build-7	143	22b592de10b3952b	143	97ff1084e45a322c	767.9
+code_session_close|kill the code session with id run-42	125	5b37fdd9b30c0eb5	125	a0c81453d82590ac	763.7
+code_session_close|please close out code session sess_9d2e1a	127	9809e76e86ca22e5	127	9abc6f118cd356c6	763.6
+code_session_close|shut down the code sandbox, session id abc123	153	5dfe509f1f074218	153	139cea06d6ffef9b	763.6
+code_session_close|terminate the JavaScript session js-1	116	04509cd10831e38c	116	fa7fa622794995d0	767.7
+code_session_exec|evaluate `JSON.stringify({ x, total })` in code session js-1	331	5e539f10672324e1	331	d7e47eb479a70c0d	763.0
+code_session_exec|execute `const arr = [1, 2, 3, 4]` in code session js-1	335	1c322ddd0f8442dc	335	fa0e3e6bae635c3d	765.8
+code_session_exec|execute `const total = arr.reduce((a, b) => a + b, 0)` in code session js-1	434	6b0407866341128b	434	f9205e14689cffac	762.2
+code_session_exec|in code session js-3, run `arr.map(n => n * n)`	264	dc25d21f368e35df	264	0a62e01d6f658bdb	764.8
+code_session_exec|run `add(x, 8)` in code session js-2	382	f617b98ac95c493d	382	dc1a32bd43223e38	761.7
+code_session_exec|run `console.log(x + 1)` in code session js-1	258	fee5c9ac4a6cdb2b	258	85c36546f1f08075	765.9
+code_session_exec|run `function add(a, b) { return a + b; }` in code session js-2	215	b3e2ae210eae290c	215	df467e11571b87f5	766.4
+code_session_exec|run `let x = 42` in code session js-1	297	90866f1430dd4192	297	612671c5c66a7318	765.7
+code_session_list|are there any code sessions still open?	142	a402a1da5e53b239	142	ed46c69265bd6a8f	764.1
+code_session_list|enumerate my open JavaScript sessions	292	224dff67b199202a	292	736128bfdeb2521d	767.5
+code_session_list|give me a rundown of every running code sandbox	131	3200b6e7bfff6b54	131	a5d9d1a35bd319ce	767.7
+code_session_list|how many code sessions do I have open	281	2d260bf1de636de8	281	fcba3079a285e451	768.6
+code_session_list|list my open code sessions	228	f63367d3fa2b644d	228	7890450505a1c873	768.5
+code_session_list|show the active code sandboxes	134	eec2d18cbdb63093	134	06b2d3ff8ba2e57b	767.1
+code_session_list|what code session ids are currently alive?	185	831c003d2a76dc8c	185	139d219accfe70a1	767.2
+code_session_list|which code execution sessions are running	248	ab2007bd173d056e	248	369f0be883c45fdd	768.2
+code_session_open|create a JavaScript sandbox session I can keep reusing	157	e8d93c6331b3bac2	157	fdb17b96b18dc61b	764.6
+code_session_open|give me a persistent JS REPL so I can build up state across steps	309	e1c87f6879b1b21e	309	4c8ca767165ca294	765.5
+code_session_open|open a JS session so variables are kept between calls	209	65c694537246e43a	209	0d9e400c647546b6	764.3
+code_session_open|open a code session for javascript	114	3b17141ba14fc329	114	c9b8911fa73a8de3	768.5
+code_session_open|open a long-lived js session	140	5ca8cdeea9e3f937	140	5b63ec1c1b1c09c1	766.7
+code_session_open|spin up a stateful JavaScript code session	146	7400eb1e18c9f582	146	8d8f593f284f2508	767.0
+code_session_open|start a code session (javascript) that remembers my definitions	205	481902b08d716210	205	e4f9f4ea8b1cf6df	767.7
+code_session_open|start a persistent JavaScript session	123	eec5ecc486e20047	123	46b4984b1837113b	769.8
+cred_list|before I connect, remind me what login credentials are on file	165	6bed5e1a670d8151	165	1cd1fd796109ff1b	766.4
+cred_list|do I already have a credential saved for the staging database?	537	54b32efe703aa242	537	7a8130428a4a95e0	767.3
+cred_list|enumerate the credential entries I've set up so far	117	b5b8c03101cc796a	117	d99af0f7eac2bc3e	764.1
+cred_list|give me a rundown of every secret name in the credential store	161	224bbfbd14f62bb8	161	e2122b1a94473431	767.0
+cred_list|list all my saved credentials	226	92923dc2ef66a8d2	226	b0e9b20525c04c46	767.8
+cred_list|show me the names of my saved API keys	249	dc8839e72711119a	249	230763dc22f79d22	766.3
+cred_list|what credentials do I have stored	283	6cb6968ae32c4d04	283	bf8e399db06e41c9	769.5
+cred_list|which credentials are available for this session	208	39bf0a653f668d66	208	e463e1a2b34de584	768.5
+credential_delete|can you wipe the stored value for jenkins-token?	218	79ee5ab491fd04df	218	7e87d7d8aa3ee137	767.0
+credential_delete|delete the saved credential named old-api-key	136	f6cb5a603e134ae9	136	7507013052a03a7e	769.1
+credential_delete|drop the credential named legacy-smtp-password, we don't use it anymore	152	a88a0e94fed43a8d	152	8a73b173bdffae28	770.4
+credential_delete|forget the credential called expired-token	128	e291e649931a1c0e	128	2da2c315b6110ff4	767.5
+credential_delete|get rid of the saved secret called demo-webhook-secret	139	68309b6d16b8f8c9	139	3aa684688aab93b2	764.1
+credential_delete|purge the credential entry named test-account-key from the store	120	a63a098f39ff42ce	120	6fb47925d16457a7	764.1
+credential_delete|remove the database password credential named dev-db-password	136	44cc6c5d30eeac5d	136	913292bb76d9f7b9	766.3
+credential_delete|revoke the SSH key credential named staging-ssh-key	132	ef205fe20063312d	132	ea886b7f76551116	766.6
+credential_save|I want to store the SMTP app password mailgun-smtp — it's key-3ax6xnjp29jd6fds4gc373sgvjxteol0	615	37fca9328d492168	615	e84a44c3f1b0f8d5	764.5
+credential_save|add a new credential called cloudflare-token set to v1.0-9zQwErTyUiOpAsDfGhJkL	424	dc17cd93da41d278	424	7a5d89a23ce53faf	765.1
+credential_save|can you stash my AWS secret access key as aws-prod, the value is wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY	619	e77a23da051f8c17	619	6f7a2d2ce9a92f1f	763.7
+credential_save|keep the vault-unseal-key credential around with value hvs-EXAMPLE-not-a-real-token	971	fad94304c6d1f83d	971	a2983381acadef99	762.9
+credential_save|remember the credential named stripe-secret with value sk_live_51HxYzAbCdEfG	367	bac5cdf241ddba64	367	198042eb0b5b0541	766.0
+credential_save|save the credential named github-pat with value ghp_aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z	554	6b5cd55291596cf1	554	7a153d687b712c8d	763.0
+credential_save|save the password for the analytics DB under the name analytics-db, value Hunter2!swordfish	385	1aded689835a4395	385	1e47e211714af367	763.9
+credential_save|store an API token under the name openai-key with value sk-proj-abc123def456	309	5a5e37adde64d915	309	36e0cbcb2c2a44e5	765.5
+datetime|give me the current UTC date and time	212	d8331d66e3a3a379	212	9384c2831149622b	762.0
+datetime|if it's 3pm here in Berlin, what time is it in Sydney	544	837c4b19bd5a85b4	544	1fc33acf4a4ae46f	762.0
+datetime|tell me the current Unix timestamp	219	fcd3d4f38936a9d1	219	54807a722aca4c87	766.1
+datetime|what day of the week is it today	468	313fd4b35a938dcb	468	995e459218fc9cc0	765.4
+datetime|what time is it in Tokyo right now	156	f33e7281cdd90813	156	6e7e76531ee48626	765.0
+datetime|what's the current local time in Asia/Dubai	152	87c18da237b0eca7	152	68f0f09569c88cb3	763.6
+datetime|what's the current time in America/New_York	120	1e9f5f4cf3a3da94	120	366c6c58e5c916e5	762.6
+datetime|what's today's date	172	426b55ea19205a26	172	bd501f34f2f34063	762.7
+dns_lookup|do a reverse DNS lookup on 8.8.4.4	347	1de97b0925371e7f	347	847d800371b73507	763.4
+dns_lookup|look up the A records for example.com	130	4560d3b055f0f433	130	3de89fb67eaa7f4a	762.1
+dns_lookup|look up the IP address of cloudflare.com	144	b27044bc44b942b6	144	aa4fecc2d10de80c	762.2
+dns_lookup|resolve the DNS for github.com	132	49f2dfbdc0d62060	132	7a1634f1a813b81f	762.6
+dns_lookup|resolve the IPv4 address for api.stripe.com	139	bbe22cc9735d42aa	139	2c724a103be1681d	764.7
+dns_lookup|reverse-resolve the IP 208.67.222.222 to a hostname	206	7f351ee0bb89c084	206	9d77e24f0698b699	764.4
+dns_lookup|what does the AAAA record for ipv6.google.com resolve to?	169	3541cbb8cad7ceee	169	c84305cb0d9ea40b	766.0
+dns_lookup|what's the IP address of rust-lang.org	149	9d24507fa2111cd2	149	f4ee0b4b9d4f8cb6	766.6
+file_delete|I don't need /workspace/old/legacy.py anymore, delete it	120	69a99ec3b083c551	120	bf7b1d9913b04de8	767.7
+file_delete|can you clean up /workspace/target/debug/incremental.tmp	196	dc1a557f2af88744	196	b3cc6cd6d5d5f851	763.2
+file_delete|delete /workspace/build/output.log	163	c901181e6ce3d035	163	ec1562c7c7a09d6a	765.1
+file_delete|delete the file /workspace/tmp/scratch.txt	160	6d6f92544151415c	160	dab06c6df9f22c4f	765.8
+file_delete|get rid of the file /workspace/notes/draft.md	184	dec93e79e0d77563	184	5701c05b9645576a	765.3
+file_delete|remove /workspace/config.bak	137	919740eb0d8142f6	137	d64c6d725ebf8321	767.2
+file_delete|trash the file at /workspace/downloads/duplicate(1).zip	142	27ebc9ca27689d8a	142	e7ceba6a1229fafc	766.2
+file_delete|wipe /workspace/cache/session.dat	147	621af47b9b45a324	147	1c0381aa84b9a4ed	764.6
+file_edit|change the log level from "info" to "debug" in /workspace/logging.yaml	288	cb59eaf183b6eb7b	288	1355c5615dfcb346	764.0
+file_edit|fix the typo `recieve` to `receive` in /workspace/src/handlers/mod.rs	195	d19f2a8b77ae3241	195	588517f72483b1cc	767.6
+file_edit|in /workspace/.env swap DEBUG=true for DEBUG=false	169	0a5ef08f4f6830f2	169	698ff907fcf0a67f	766.6
+file_edit|in /workspace/Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`	258	582184378c6cf14b	258	47890df822bbc0d1	763.3
+file_edit|in /workspace/docker-compose.yml bump the image tag from :1.2 to :1.3	369	a3d2ccd5ee0484e9	369	5011dc4ac367759a	765.0
+file_edit|in /workspace/src/config.rs replace the string `localhost` with `0.0.0.0`	249	f1885d2c17c00d83	249	7e8e1501529d36bc	765.7
+file_edit|rename the function foo to bar in /workspace/src/utils.rs	243	29cf11139ebc0056	243	1146a8c9d2c21dcc	765.3
+file_edit|update the port from 8080 to 9090 in /workspace/config.toml	267	dcd19722a88ddea0	267	d09c4b38baa7afd5	762.1
+file_list|enumerate the contents of /workspace/scripts	138	d32b58cbaaa0fbfe	138	e0867dd997ec8f1d	767.9
+file_list|give me a directory listing of /workspace/assets/images	145	144dd275b0284c48	145	5bac9a1304b88143	769.0
+file_list|list the files in /workspace/src	171	723fd0989f4b4eab	171	ee4268f786a9337f	767.0
+file_list|list the files under /workspace/benches	149	eb3ca90d498a4773	149	dff7df05ff021867	769.6
+file_list|show me everything under /workspace/tests	117	8f9514e268423bc9	117	facd47498d36daa7	765.7
+file_list|what files are in /workspace	317	1a43a21a66168f46	317	5d2740da9ae1942f	767.0
+file_list|what's in the /workspace/migrations directory	206	80dbf8ee37edead5	206	d396297bced136d3	771.4
+file_list|which files live under /workspace/config	165	0ee3d26a80a8fe68	165	5bffd768db210603	769.8
+file_present|attach /workspace/reports/coverage.html to the chat so I can view it	584	416fad97436346e4	584	7d1c3c5eb1174cc0	765.4
+file_present|can you bring up /workspace/src/lib.rs and /workspace/src/error.rs side by side	227	44279d0331d96635	227	c077500e74234c74	763.9
+file_present|display /workspace/src/main.rs in the chat	180	5a70f65309c0c2ca	180	767b51d43306b2e3	765.1
+file_present|pop /workspace/docs/api-reference.md into the conversation	259	f08061f195a49ed4	259	e12b5eba77b1a1bf	763.7
+file_present|present the file /workspace/README.md to the user	616	1bbfca920b7c9735	616	306112a4d58a65dd	763.3
+file_present|put /workspace/CHANGELOG.md in front of me	315	124c481adc368a7d	315	b61611c684208a2a	764.0
+file_present|show me the file /workspace/Cargo.lock	176	87112d12b9a50fb9	176	00d5d83663d816bd	766.2
+file_present|surface /workspace/config/prod.yaml and /workspace/.env for me to look at	274	db5c48e24166e29c	274	8b269f8310752543	765.0
+file_read|I need to see what's inside /workspace/scripts/build.sh	150	a08fc43654019218	150	d81809ae69cdc290	765.3
+file_read|cat /workspace/docs/architecture.md for me	372	6ff43262d1e58381	372	44b8daa478df9a93	766.9
+file_read|grab the text of /workspace/LICENSE and print it	192	36d73668907054da	192	11721f1227033f10	767.0
+file_read|open /workspace/config/settings.yaml and show it	328	71b45afe53934dd0	328	77d61cc96f92a853	765.4
+file_read|pull up the contents of /workspace/tests/fixtures/sample.json	189	9cbf8adda2b0a3d8	189	88c95f6501a41800	767.2
+file_read|read the file /workspace/src/main.rs	114	ed5beb3a10a4900c	114	e408591736dc65ac	764.1
+file_read|show me the contents of /workspace/Cargo.toml	169	51013c3e23486f2f	169	eab3bb36d6e5270d	760.6
+file_read|what's in /workspace/.gitignore	178	b65ef2cf338c8e41	178	edd9b186e50e4d95	765.5
+hash_compute|compute a SHA-1 checksum for the string 'v3.1.4-rc2'	282	7e6d2c1617a43da6	282	627baf8df424cae1	761.9
+hash_compute|compute the MD5 hash of the string 'correct horse battery staple'	248	c2421d4746a99642	248	176ceb0e9bc8efaf	764.7
+hash_compute|compute the SHA-1 digest of the string 'commit message v1'	257	b4116707a2ecf4c9	257	d4b2217560b68af2	763.7
+hash_compute|compute the SHA-256 of the string hello world	355	5b3363c8f5136664	355	ce88e57553d74953	760.0
+hash_compute|give me the SHA-256 digest of 'the quick brown fox jumps over the lazy dog'	226	13bf80d9d6aa7864	226	38a0bd2bebb7d69f	761.1
+hash_compute|hash 'user:alice|role:admin' with SHA-512	222	828b1356fc3a2806	222	1a6a08cae92633fe	762.1
+hash_compute|hash the string 'foo' with SHA-512	195	9f3bfa452a089cc6	195	6ffad1fe00d8cba8	760.7
+hash_compute|what's the MD5 of 'release-2026.07'?	361	9ebbb0e56435b96b	361	696f20243f5d31d8	763.7
+hash_scan|figure out which algorithm maps 'letmein' to 0d107d09f5bbe40cade3de5c71e9e9b7	400	5124012cf6d233f4	400	53f67f998c6b8c38	761.1
+hash_scan|identify the algorithm that hashes 'admin' to 21232f297a57a5a743894a0e4a801fc3	493	78f67a33c999f527	493	62b50929609d8999	760.0
+hash_scan|identify the hash that turns 'root' into 4813494d137e1631bba301d5acab6e7bb7aa74ce1185d456565ef51d737677b2	620	e87d23f537d5d9c7	620	fc150fe9f4b8cec0	762.4
+hash_scan|the string 'test' hashes to a94a8fe5ccb19ba61c4c0873d391e987982fbbd3 — what algorithm is that?	888	1a8681811153132e	888	9f6ad8fba54462d8	757.8
+hash_scan|what algorithm hashes the string 'password' to 5f4dcc3b5aa765d61d8327deb882cf99	590	f5ae901c7f762736	590	8c2daf7a1f152a84	761.8
+hash_scan|what hash produces e10adc3949ba59abbe56e057f20f883e from the input '123456'	678	27d1835e59116e7e	678	bc7d34d53e05e721	760.5
+hash_scan|which digest function produces 098f6bcd4621d373cade4e832627b4f6 from 'test'	426	56136b2c92888b84	426	deaf18eb7832dbc1	761.9
+hash_scan|which hash function turns 'hello' into 5d41402abc4b2a76b9719d911017c592	757	1230ad2a80fb8f9a	757	6fb5b6840e19817d	758.8
+hash_state_finalize|I'm done streaming — finalize hash state hs-2	227	962194a9b4b7adcb	227	4c3658decc08dc9b	760.7
+hash_state_finalize|close out hash state hs-4 and return the hash	165	cc385ca932c4c522	165	494a5efd03d77c7c	765.7
+hash_state_finalize|conclude hash state hs-2 and emit the result	186	a28a7f3c313b91da	186	fc414b76d86fe78d	761.2
+hash_state_finalize|finalize hash state hs-1 and give me the digest	237	c999a3ff0779cdd8	237	afc0f6d98e5f0409	764.3
+hash_state_finalize|finish hash state hs-1	160	904071990ef9b2e3	160	f1a773a72734ba41	759.9
+hash_state_finalize|give me the final digest of hash state hs-3	192	a96fc36ed3926893	192	a167172214152357	763.7
+hash_state_finalize|seal hash state hs-6 and hand me the checksum	151	90097ce3d32d1483	151	49677802c85bc1a7	764.2
+hash_state_finalize|wrap up hash state hs-5 and show me the hex digest	177	c5f23463a34b4444	177	ab9dab1eb51cbfc8	759.3
+hash_state_init|I want to hash a big file piece by piece with SHA-512 — set up the state	200	e61e4746cf958994	200	a7e7bb42b4a6d58e	766.8
+hash_state_init|begin an incremental SHA-512 computation	146	014e8b53446801dc	146	0a675dc824ca7514	768.6
+hash_state_init|create a new incremental SHA-1 hashing session	177	aa2b4d1ee6d4b1a7	177	c2c6e1c61a6fbe28	766.5
+hash_state_init|initialize an incremental SHA-256 hash for feeding data in chunks	169	c2006d4f3e44f2e2	169	e60dba37a9f98604	767.8
+hash_state_init|open a new streaming hash with SHA-1	216	96ba44658dde7bec	216	1f251b5b2194b5ab	765.2
+hash_state_init|open a streaming SHA-256 context so I can push data as it arrives	245	5ae0b6eefd1f475e	245	53e752c97f0c165e	764.3
+hash_state_init|spin up a fresh streaming MD5 hash	396	22a375e60ea032ef	396	32fc44f4cb54072b	766.4
+hash_state_init|start a streaming SHA-256 hash	123	396a3b8b3da4ec83	123	019c32381907df72	763.4
+hash_state_update|absorb the bytes deadbeef into hash state hs-2	185	a49c58653920680a	185	969bd3b44e037c89	762.2
+hash_state_update|add the chunk 'final part' to hash state hs-1	200	34d33ed35b29b3e9	200	0f38b0407686282d	762.3
+hash_state_update|append the string 'row 2048 of the export' to hash state hs-3	305	d6158e06fba507d5	305	70421fbfe7a0c194	762.7
+hash_state_update|feed the hex 48656c6c6f into hash state hs-1	344	aad0cf10d463b662	344	3c0c07153b6f1a62	763.4
+hash_state_update|feed the next block 9988776655443322 into hash state hs-5	382	7c6ffc194dbb416c	382	2cb32079a5e187bc	761.8
+hash_state_update|keep hashing — add 'appended log line' to hash state hs-2	245	7ce911e1c7dfbc40	245	1e81ac18dd8f67bf	763.6
+hash_state_update|push the hex cafebabe0011 into hash state hs-4	270	3118e0145f17343c	270	8a1f31d20773e19b	763.1
+hash_state_update|update hash state hs-1 with the string 'more data'	434	f1eebcda1bf8ed15	434	a74a78a894df7da6	761.9
+hkdf_expand_label|HKDF-Expand-Label with SHA-256 from the hex secret 112233445566778899aabbccddeeff00 with label 's hs traffic' to 32 bytes	1425	62b2425eec015560	1425	a75ed72e424beaed	760.5
+hkdf_expand_label|HKDF-Expand-Label with SHA-256 the hex secret 33ad0a1c607ec03b09e6cd9893680ce2 with label 'c hs traffic' to 32 bytes	450	aee7220a1874d558	450	3599a1739a2353d8	763.8
+hkdf_expand_label|derive a 16-byte TLS 1.3 key with SHA-256 from the hex PRK aabbccddeeff00112233445566778899 with label 'key'	467	1351962f59bff5b5	467	f63a6f0c57fcc270	764.4
+hkdf_expand_label|expand the hex secret 0011223344556677 into a 16-byte 'quic key' using HKDF-Expand-Label with SHA-256	475	093e135f7c50f574	475	6d13e2b522865a33	765.4
+hkdf_expand_label|expand the hex secret deadbeefcafebabe into a 12-byte 'iv' with HKDF-Expand-Label using SHA-256	873	08586b0435423877	873	209626aac9be8f33	765.1
+hkdf_expand_label|give me a 32-byte 'c ap traffic' secret via HKDF-Expand-Label SHA-256 from the hex PRK 5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d	638	5cae103ff59fdd44	638	ac51cb22cf516bf0	762.7
+hkdf_expand_label|run HKDF-Expand-Label SHA-256 on hex secret cafef00dbaadf00dcafef00dbaadf00d with label 'res master' for 32 bytes	811	416b053f9dcab944	811	c96795a17ece48a7	764.7
+hkdf_expand_label|run HKDF-Expand-Label with SHA-256 on the hex secret 0102030405060708 with label 'finished' for 32 bytes	683	a3375b9fccff23b1	683	af356cf64cfd3fb7	764.9
+hkdf_extract|HKDF-extract SHA-256: take the hex IKM 00ff00ff00ff00ff and salt it with hex 1234567890	440	26ea10cae6a119bd	440	8cbd24c25ca775c3	760.5
+hkdf_extract|HKDF-extract with SHA-256 from the hex Diffie-Hellman output 1122334455667788 using hex salt 99aabbccdd	578	b935815e40982c15	578	d38cdaeff69baaa5	761.7
+hkdf_extract|HKDF-extract with SHA-256 from the hex IKM 0b0b0b0b0b0b0b0b0b0b0b and hex salt 000102030405060708090a0b0c	627	c3467d062a4dea72	627	c6307a4aa5f15949	759.9
+hkdf_extract|HKDF-extract with SHA-256 from the hex IKM aabbccddeeff00112233445566778899 and an empty salt	427	5b775117f366734b	427	e1749bf53e5b21ad	761.3
+hkdf_extract|HKDF-extract with SHA-256: condense the hex shared secret deadbeefcafebabedeadbeefcafebabe into a PRK using hex salt 0102030405	645	e668b83cafb583d6	645	60f87183fe8c4bb4	762.6
+hkdf_extract|condense the hex key material 9988776655443322110000112233445566 into a PRK via HKDF-extract SHA-256 with an empty salt	635	3024bfff72747bb2	635	1f32826832ed1ec2	761.9
+hkdf_extract|extract a PRK with SHA-256 from the hex ECDH secret 5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d and hex salt a0b1c2d3	608	d94b786168d4a83b	608	0ec3a790e4fad54d	762.4
+hkdf_extract|run HKDF-extract with SHA-256 over the hex IKM ccddeeff00112233445566778899aabb with hex salt fedcba9876543210	823	84c1599c6556f938	823	3dcfdd1ad32bc2e3	759.4
+hmac_compute|HMAC-SHA512 the message 'nonce=8823;amount=1000' using the key hunter2-rotated	376	8f99d9d7ced3f08b	376	12fde1b0b09e02f9	763.6
+hmac_compute|authenticate 'invoice-2026-0714' with HMAC-SHA256 under the key billing-hmac-key	379	2e3e0edcde8aebb8	379	9d6c57832090a15d	762.2
+hmac_compute|compute the HMAC-SHA256 of the message 'transfer 500 to alice' with key s3cr3t-key	360	5c4546c7f011d814	360	1462e1038fa4f050	762.2
+hmac_compute|compute the HMAC-SHA512 of the message 'hello' with key abc123def456	388	f326d2b8dff39652	388	01df14fd7c0c0dd9	763.9
+hmac_compute|generate an HMAC-SHA256 tag for the data 'order#42' with key my-signing-key	316	1d4877d510f9f4ac	316	e4106def426f1592	761.3
+hmac_compute|give me the HMAC-SHA256 of 'GET /api/v2/balance' keyed with webhook-secret-9f	320	fe5aeb4e2ade3ea6	320	8b4852e12ea92f0f	761.0
+hmac_compute|what HMAC-SHA1 tag does 'cookie=session42' produce with key legacy-mac-key	355	e770110cdb5f6280	355	6d86bf758f88fbff	761.8
+hmac_compute|what's the HMAC-SHA1 of the string 'payload' with key topsecret	237	738e832be83a6722	237	e920c3d4bf234b5a	764.4
+host_info|build an identification profile for the host at 208.67.220.220	243	127649a19db92c4b	243	894103b69bf032f4	765.7
+host_info|gather host info for rust-lang.org	131	67a06239254cd7d4	131	3741d9f4aedb0a3b	768.4
+host_info|give me a full profile of example.com	173	156634edeb700df9	173	ed5a519cb9fea16b	766.6
+host_info|profile the server at 10.0.0.5	197	793714a4302cacc7	197	8a902f9727faf83b	767.7
+host_info|pull together everything you can find on 1.1.1.1	128	e3ca68833223c8f2	128	60e0509e54e65435	766.2
+host_info|tell me about the machine behind cloudflare.com	430	868e9d12422a8b55	430	8b7e1ee8428bacd1	764.2
+host_info|what can you tell me about the host github.com	219	d339f5fc9cbfda68	219	9903d392a662acc5	766.3
+host_info|what's the full rundown on mail.protonmail.com?	317	1216caf493ea972b	317	ada3d7026ce45bee	766.3
+http_request|POST the JSON body {"item":"widget","qty":3} to /orders on HTTP session http-1	339	4e8673cc7f4f6e9d	339	92862388d2398b7b	762.3
+http_request|do a PUT to /profile/7 with body {"name":"Ada"} on HTTP session http-3	450	1555edc87167e8bb	450	7902c579f8db2577	763.7
+http_request|fire off a GET to /health on HTTP session http-2	276	6bf462ca668b1300	276	058250af1a20ed78	765.3
+http_request|hit /search?q=candle with a GET on HTTP session http-1	545	461dd028c88f03fc	545	ef6ee68a07408a35	763.4
+http_request|make a DELETE request to /items/42 on HTTP session http-2	165	a9ecb744392c8049	165	70ae9554de422f34	763.6
+http_request|on HTTP session http-4, POST {"email":"a@b.com"} to /subscribe	386	493ec6094a33f077	386	7718a671ce8e75a6	763.3
+http_request|send a GET request to /users on HTTP session http-1	273	86edbe77e92aff1f	273	12c6cb8cbc99bfd7	766.7
+http_request|send a PATCH to /config with body {"debug":true} on HTTP session http-1	334	f01ed428b85197c1	334	424040db0c22c038	763.9
+http_session_close|I'm finished with HTTP session http-5, close it out	289	e059160d99eec5d7	289	43846e9d2d65188d	767.3
+http_session_close|close HTTP session http-1	141	cd51b89310a206ff	141	716adc5a52697703	764.3
+http_session_close|dispose of HTTP session http-6	148	8523e25f753a30e5	148	5c04ce2e9a4409f1	768.1
+http_session_close|drop the HTTP session http-2	128	f3827776b321c85b	128	1ca4b8588e63d076	768.0
+http_session_close|end HTTP session http-1	217	464fdffb9b5d80f4	217	b7915d22929cb5f3	767.5
+http_session_close|release HTTP session http-2	159	3c05fb23b77fa0c7	159	f9899e47b5413935	765.5
+http_session_close|shut down HTTP session http-4 please	139	2c5bae9999d9c9f4	139	426772e5b43ba5b7	769.0
+http_session_close|tear down HTTP session http-3	127	cd260722cefe42aa	127	9061345c00f944fc	764.7
+http_session_list|are there any HTTP client sessions still around?	125	9e8f336803c4ea6e	125	30178d9d3269d918	764.6
+http_session_list|enumerate every open HTTP session id	121	c61ce41388aaf09e	121	08ff254cc1bf34ff	766.8
+http_session_list|give me the list of live HTTP sessions	122	ca0b6bce50ad27f2	122	24496a6ec2db2394	767.0
+http_session_list|how many HTTP sessions am I holding open?	125	fa439e20d7670f6c	125	675c58b0c77039b3	768.4
+http_session_list|list my open HTTP sessions	98	f86e8e8fc87941d2	98	057589ce27e9a84c	765.3
+http_session_list|show the active HTTP client sessions	123	6b688949c3d8098e	123	29faf20552e8409d	765.5
+http_session_list|what HTTP sessions are open right now	187	5c57ec83be00c451	187	f9c8a5ae77b05c03	766.9
+http_session_list|which HTTP sessions do I have	269	e7604b6a8d9d5a09	269	1beb1de0e2d9fa7e	768.7
+http_session_open|can you open an HTTP client session to https://gitlab.com/api/v4 with header `PRIVATE-TOKEN: glpat-xyz789`?	286	407fb2ac06c6172a	286	d0a0a7d9eac299f2	764.9
+http_session_open|create an HTTP session for https://api.stripe.com with a default JSON content-type header	226	e33abdd3b6759cf8	226	ddeaab59ae1ec775	766.8
+http_session_open|open an HTTP session for https://api.github.com with an Authorization header of `Bearer ghp_abc123`	300	d0fab2e5b2f17ad6	300	7273ee0730d4b527	764.1
+http_session_open|open an HTTP session with base URL https://api.example.com	161	7eb9f6358486daf7	161	e21e91a377d3c4d8	767.3
+http_session_open|open an HTTP session with base URL https://httpbin.org	146	e0d69cbbb5322920	146	c58b645c97b0f3c3	766.5
+http_session_open|set up an HTTP session for https://jsonplaceholder.typicode.com	180	06d38260a600947c	180	4da2b7cf04059228	766.6
+http_session_open|spin up an HTTP session against https://api.twilio.com with an `Accept: application/json` default header	222	a6fc8521d0c970fb	222	283b4c14e476cdd9	764.9
+http_session_open|start an HTTP session pointed at https://api.openweathermap.org for me	191	ca4b53876547b3b7	191	a44b02b8573c5fd8	767.1
+ip_scan|discover live hosts on 192.168.0.0/24	274	a4aab20d740eba08	274	58001802f984337b	763.3
+ip_scan|do a host sweep of 192.168.100.0/24 and list everything alive	230	cb68101bec548be0	230	43c6840521bdb45c	762.2
+ip_scan|find which hosts are up on 10.0.0.0/24	290	0c403c78d0d1e7a3	290	2078ef2d8ed8aac1	765.5
+ip_scan|map out active machines across the 10.0.42.0/24 subnet	244	b69b30511ada82ce	244	9def2b825ee282d4	762.9
+ip_scan|scan the subnet 172.20.5.0/24 for reachable hosts	319	18ed0dda900d1731	319	18da4d5790cab0a9	766.1
+ip_scan|scan the subnet 192.168.1.0/24 for live hosts	268	6e9ab1c911dadc57	268	115ab2ad67905ce6	766.4
+ip_scan|sweep the 172.16.0.0/24 network for active machines	204	fa42a10951f95d94	204	60e60b4f1eabb592	766.4
+ip_scan|which addresses respond in the 10.10.5.0/25 range?	328	0944074e961107b0	328	3bda62d49c259365	767.0
+kdf_derive|derive a 32-byte key from the passphrase 'correct horse battery' with scrypt, hex salt a1b2c3d4e5f60718	435	3cf10d26f439dfef	435	bb4ca459b8d1d595	762.0
+kdf_derive|derive a 32-byte key from the password 'hunter2' with PBKDF2-HMAC-SHA256, hex salt 00112233445566778899aabbccddeeff	546	fb65ba95adf81a4f	546	d6f046135c7c4044	764.6
+kdf_derive|derive a 32-byte key from the password 's3cr3t' with Argon2id, hex salt deadbeefcafebabe	607	cf649897571fd306	607	ee63feec3aa219de	763.4
+kdf_derive|derive a 48-byte key with PBKDF2-HMAC-SHA256 from the password 'letmein-2026' and hex salt cafef00dbaadf00d	552	468e6b3d2d120119	552	fee3993a20d48a5f	765.9
+kdf_derive|derive a 64-byte key from the password 'p@ssw0rd' with PBKDF2-HMAC-SHA256, hex salt 0f1e2d3c4b5a6978	440	e42b475595aa923b	440	2d98075114a4a8cb	765.7
+kdf_derive|give me a 32-byte Argon2id key from the password 'Tr0ub4dour&3' with hex salt 99887766554433221100ffee	951	63a39990970093c1	951	7953d6b479b9e01f	762.3
+kdf_derive|stretch the passphrase 'summer sky lantern' into a 16-byte key using scrypt with hex salt 5a5a5a5a12345678	727	014ae28fa26b5063	727	3dd2e74948748fca	762.3
+kdf_derive|turn the passphrase 'north star river' into a 64-byte scrypt key using hex salt 0123456789abcdeffedcba98	680	3f6453c67207820d	680	35c6cee91c51d8cd	761.5
+notes_list|catalog my notes so I can see what exists before opening one	171	ef01d5f45752934f	171	4d48a3913e565bfe	767.4
+notes_list|give me an index of my notes	214	e1033bf7d17d8b61	214	30bf3967f513b312	765.6
+notes_list|how many notes have I stored and what are their keys	357	2bded60ea0162f63	357	50c8915c012c9a49	767.6
+notes_list|list all my notes	365	4ea358e9767f440c	365	29a0a18bfea57eaa	765.5
+notes_list|show me every note I've saved	254	abcdb58847928ce4	254	fa4875af2f757271	767.4
+notes_list|show me the notes tagged 'work' along with their timestamps	171	c8fc03f1e7478bc2	171	958a3d28dd82f931	766.8
+notes_list|what notes do I have	289	4ed8c74bff5ac6d7	289	3fe47b0d07a2a3e2	769.0
+notes_list|which notes start with the prefix 'meeting-'	185	ee8643438095ef2f	185	4d06282ae2eec492	771.5
+notes_read|fetch the contents of the note keyed vacation-plans	155	41227105905b5273	155	8e757a7ff47c9ea9	765.5
+notes_read|let me see the note titled 'ssl-cert-renewal'	94	bb8be549cc1623a3	94	4765e0c4660ffec0	769.3
+notes_read|open the note titled database-schema	133	ef82b73f718274d8	133	da649020dcf294f9	762.6
+notes_read|pull up my note called onboarding-checklist	124	26055d7de9e214c8	124	c70def9e8823ad60	768.3
+notes_read|read the note titled deployment-runbook	131	49644505b08f7f32	131	f217f2ed73ae23a8	766.9
+notes_read|read the note titled standup-2026-06-15	179	ef90759b404d2901	179	c7c53f4c2d69f0c6	769.5
+notes_read|show me the note titled todo	135	5318edc4c82e70da	135	11fa02bc00422a5f	767.1
+notes_read|what did I write in the note titled retro-notes	299	7af28395a4471813	299	b97bcf452da33cad	771.2
+notes_search|do I have any notes tagged 'urgent'	236	d55a1b40de9b08e2	236	96f0876f49271ffb	768.1
+notes_search|find notes mentioning the payment gateway	147	137f5be027d50085	147	bae78d52f92a8571	767.1
+notes_search|find the note where I wrote down the office door code	426	8c49679b813085a7	426	d8e2828b0b7770ae	764.6
+notes_search|hunt through my notes for anything referencing Postgres	165	c5c458568cf234a7	165	addb667c402304a2	768.8
+notes_search|look through my notes for the wifi setup	257	2678c399010fe35b	257	6d616bd9d6f81cfc	768.8
+notes_search|search my notes for anything about kubernetes	263	6879dff3ff7e2fd6	263	967c687e2866452e	771.4
+notes_search|search notes for 'release checklist'	236	4c1b2fdf7b3e5eaa	236	a5e9d096a757e242	768.4
+notes_search|which of my notes talk about the database migration	147	c33a1d47c2763542	147	d985d331e1f045a1	769.2
+notes_write|jot down a note called 'gift-ideas' saying 'headphones for Sam, cookbook for Alex'	191	27ce89eba5eae382	191	c9d0fd913b128f29	765.9
+notes_write|make a note 'grocery-list' with the body 'eggs, oat milk, spinach, coffee beans'	175	83e38a8d1abc2fc9	175	46bbfebe5bcb1224	766.5
+notes_write|note titled 'interview-feedback': candidate was strong on systems, weak on frontend	274	97f62c04753f168b	274	19365e052d8763e3	765.3
+notes_write|remember this: under the title 'server-ip' store '10.0.0.42 is the new prod box'	182	b7c519e34e5d64a9	182	00f7ed2669765f92	763.4
+notes_write|save a note titled 'api-key-rotation' with content 'revoke old key, generate new, update configs, redeploy'	194	c0295c7bdd00ec5a	194	32e66d857e479213	764.0
+notes_write|save a note titled 'auth-refactor' with content 'refactor the auth module to use the new token store'	241	ede96dbcc8ac8c9a	241	1da506289cf7427d	766.3
+notes_write|save a note titled 'meeting' with content 'team sync at 3pm Thursday in room 4'	225	475d44a3358c8812	225	a10cd7e2d6d53f7a	763.3
+notes_write|save a note titled 'parser-bug' with content 'the tokenizer drops trailing commas in nested arrays'	227	a77d451484d2a135	227	6b1a6013f498e072	766.6
+ping_icmp|can you tell if my NAS at 192.168.1.50 is alive?	273	e7cbf3a3a6694d50	273	8d70027cb4c2188d	764.8
+ping_icmp|check if example.com is reachable	163	69448dc762c18f92	163	c020509965995b88	762.0
+ping_icmp|is 10.0.0.1 responding to pings?	165	8854e7ec122c9718	165	e85f7bba11e7e5da	762.3
+ping_icmp|measure the round-trip time to cloudflare.com	159	0869d431f7b6fb8e	159	17055a8352411228	763.0
+ping_icmp|ping 8.8.8.8	162	fd8dc231e7c95ea2	162	3a3f6705f22a5bd8	764.7
+ping_icmp|ping the gateway at 192.168.1.1	229	df94843c89031b2d	229	68bb1f0ab8ecd27a	764.4
+ping_icmp|send 10 ICMP echoes to 1.1.1.1 and report packet loss	176	00b19b4a97f32bd8	176	e79a4effa0177075	764.4
+ping_icmp|what's the latency to dns.quad9.net	196	1ab48cfdc9c74277	196	932c637884991282	763.6
+port_scan|check if port 22 is open on 10.0.0.5	175	7f75f48e9578d38e	175	39ebd9aaf5c9dbc2	765.7
+port_scan|check whether 3389 is reachable on 192.168.1.100	249	81c8fffd48cb76a8	249	934de77f637b87c9	762.5
+port_scan|is the Postgres port 5432 listening on db.internal?	276	038be26037a1e8b1	276	579c8d40fb870dcb	761.3
+port_scan|is the SSH port open on 192.168.1.20	344	4859fae9cb6b61c5	344	d7485eb3d8390531	764.6
+port_scan|probe ports 25, 465, and 587 on mail.example.org	280	fad71e19174c2408	280	c693abe35287efa6	762.1
+port_scan|scan ports 21, 25, 110, and 143 on 172.16.0.9	298	e846d714c0acb152	298	b8902511612b4ea0	762.6
+port_scan|scan ports 22, 80, and 443 on 10.0.0.8	231	d39f4bdd54ed3c66	231	1ffeaf45e832ccf4	764.5
+port_scan|scan ports 80, 443, and 8080 on example.com	239	94c4e74afb7328dc	239	0f42f4482c5f95a5	763.0
+random|choose randomly between pizza, sushi, and tacos	162	5277005e5aadff15	162	710a47193199fd18	764.9
+random|flip a coin for me	206	76a7fbbe41a98a63	206	35188a60c6413973	765.6
+random|generate a random hex color	975	9a72b6c81cb2c197	975	a64a1128e99db3f1	763.4
+random|give me a random integer from 1000 to 9999 for a PIN	167	9cd7c8d12513ca95	167	54b6a9c60a93340c	759.2
+random|pick a random number between 1 and 100	158	85e29be9e707ed0c	158	f987b0c7cbadcc40	761.5
+random|pick one winner at random from these five names	731	3ceba82325f41ad0	731	437c03eae2de4c3a	766.2
+random|roll two six-sided dice	205	26c817d49984abe8	205	095b6adb521db6ec	762.7
+random|shuffle the list Alice, Bob, Carol, Dave and give me the order	246	e44fa96637206966	246	a5cdbc097cf8ff15	765.2
+remote_fs_session_close|can you shut down remote-fs session rfs-4?	134	9ae7166fd6d84f1c	134	4a8352d05339a679	762.8
+remote_fs_session_close|close remote-fs session rfs-1	127	5d7560c73160ace9	127	a3abd7359ff5e9ab	763.4
+remote_fs_session_close|disconnect remote-fs session rfs-2	121	e4234b20e6723ea6	121	e20a22f8d77d61ea	766.2
+remote_fs_session_close|drop remote-fs session rfs-1, I'm done with it	143	0f9077253289700c	143	b775677c09af8351	761.0
+remote_fs_session_close|end remote-fs session rfs-1	128	9081216b2575a031	128	d4e513674576be0b	764.2
+remote_fs_session_close|hang up the connection for remote-fs session rfs-2	168	4a24495bb2d84259	168	b69a8ff54f4bfe3d	768.3
+remote_fs_session_close|please close out remote-fs session rfs-5 now	138	258c49469f81b53e	138	c6e67e00756c7ea0	765.5
+remote_fs_session_close|tear down remote-fs session rfs-3	140	af6d3acaae5eac13	140	6c17aeda530aed61	767.4
+remote_fs_session_delete|can you delete /home/ci/artifacts/build-01.tar.gz on remote-fs session rfs-4?	305	f9ff7b3f40402002	305	5b5a636a05b1c927	769.0
+remote_fs_session_delete|delete /backups/2019.sql on remote-fs session rfs-2	263	05277c0982212de1	263	9f3268eadd489a63	763.4
+remote_fs_session_delete|delete /tmp/old.log on remote-fs session rfs-1	169	39c86a63c024d6e9	169	c79f9c3f7f6b28c1	768.3
+remote_fs_session_delete|erase /var/log/nginx/access.log.1 on remote-fs session rfs-2	182	396828a675c07b9a	182	911fe28920b707bf	763.7
+remote_fs_session_delete|get rid of /srv/cache/session-tmp.dat on remote-fs session rfs-3	221	5ea13a73ea38f620	221	7384d98117eb52d3	766.3
+remote_fs_session_delete|remove /opt/app/debug.log on remote-fs session rfs-1	188	0e4eb7c5f6e98dda	188	26a0cea68dbd95f6	766.5
+remote_fs_session_delete|remove /var/www/stale.html on remote-fs session rfs-1	210	696a6e11d9d426f0	210	4118fb94440e3c8d	768.4
+remote_fs_session_delete|rm /etc/cron.d/stale-job on remote-fs session rfs-1	182	90f60ed713d65572	182	1a325afc62b80c8c	764.6
+remote_fs_session_get|can you retrieve /srv/certs/fullchain.pem from remote-fs session rfs-2?	253	8f0f448d948652b4	253	4757be57710086d3	766.3
+remote_fs_session_get|copy /etc/systemd/system/zend.service down from remote-fs session rfs-1	305	ade2f81738d35619	305	5c0bcbe66b3733da	765.3
+remote_fs_session_get|download /home/ci/artifacts/build-42.tar.gz from remote-fs session rfs-4	346	36e0da76c0413f26	346	ca6880dd51c50a90	763.5
+remote_fs_session_get|download /var/log/app.log from remote-fs session rfs-1	286	dee530fa3094a72a	286	8aa3c3c18419aafe	766.0
+remote_fs_session_get|fetch /etc/hosts from remote-fs session rfs-1	274	b88c5ad93a7b70a4	274	2018223673b0ea34	766.0
+remote_fs_session_get|get /backups/latest.sql from remote-fs session rfs-1	217	078f92395b5efa9a	217	d7610b362a368130	767.8
+remote_fs_session_get|grab /var/log/nginx/error.log off remote-fs session rfs-3 for me	221	3a18624e4308ca6f	221	343e29a2d99d8237	764.8
+remote_fs_session_get|pull /opt/app/config.yaml from remote-fs session rfs-2	349	602a427c8561411d	349	03c79baa8c0f258e	764.3
+remote_fs_session_list_dir|can you show me everything under /var/lib/postgresql on remote-fs session rfs-2?	181	13ad7e6e0217486e	181	f58361f74a9c504f	768.1
+remote_fs_session_list_dir|enumerate the entries in /home/ci/artifacts on remote-fs session rfs-4	253	3b03ba00078c9860	253	e26f15c913d952f7	768.8
+remote_fs_session_list_dir|list the directory /opt/app/logs on remote-fs session rfs-1	203	2bc41f3cab9ded2c	203	a300aaa5b993fec6	764.4
+remote_fs_session_list_dir|list the files in /var/www on remote-fs session rfs-1	209	fcf1ad71c25bf171	209	95b602b5cc17b56b	766.4
+remote_fs_session_list_dir|ls /srv/data/incoming on remote-fs session rfs-3	202	1116cc70d1e60b2c	202	f4a596316cde6797	767.2
+remote_fs_session_list_dir|show the contents of /home/deploy on remote-fs session rfs-1	404	a7282acd7bd8ba7c	404	4b703c63559f9fcb	766.4
+remote_fs_session_list_dir|what files are sitting in /mnt/backup/nightly on remote-fs session rfs-1	267	63ecb0c5dc19c49a	267	83e1fb7e9b132320	768.3
+remote_fs_session_list_dir|what's in /etc on remote-fs session rfs-2	250	c1d8f811e27ebd7a	250	fbb994d3f7431ac0	764.8
+remote_fs_session_list|are there any remote filesystem sessions still open right now	126	49ee6a45f1fca3d4	126	e8dbc58c397c56a6	764.2
+remote_fs_session_list|enumerate my active remote FS session ids	108	10fffe5bd8a5eb6d	108	32c22b9241593150	762.0
+remote_fs_session_list|give me a rundown of every open SFTP session and its host	238	017c7f318cf7df8d	238	071215de925cf502	767.2
+remote_fs_session_list|how many remote filesystem sessions do I have	409	0e615ed410ff16c8	409	711b169fa4fb238d	766.8
+remote_fs_session_list|list my open remote filesystem sessions	122	521e71bf6180be93	122	b0bc0da50d9ede28	767.2
+remote_fs_session_list|show the open remote FS connections	204	188a0b08a82960bd	204	b5a7c5ed3038aca4	765.5
+remote_fs_session_list|what remote-fs sessions are currently connected?	121	26c157202cd22a90	121	ca21ef15a365a97b	768.6
+remote_fs_session_list|which SFTP sessions are active	126	6c0cf9885d9ee5c0	126	3e9dd84954bd2920	769.9
+remote_fs_session_mkdir|can you make a /srv/backups/weekly directory on remote-fs session rfs-3?	234	41b7c4c864956380	234	c24b51471c3ff05d	765.5
+remote_fs_session_mkdir|create /data/2026 on remote-fs session rfs-1	223	474567ab42029839	223	e6ac876ed808655a	766.5
+remote_fs_session_mkdir|create /home/ci/artifacts/2026-07 on remote-fs session rfs-1	257	9d4ffd2fa0cbfa7d	257	e81f9295a5d1c1e1	766.7
+remote_fs_session_mkdir|create the directory /opt/app/releases on remote-fs session rfs-1	266	89da202cda8c3554	266	f4629538a76ef33d	767.0
+remote_fs_session_mkdir|make the folder /var/www/uploads on remote-fs session rfs-1	213	90bce4baaeec41ff	213	a42685077943efd7	766.2
+remote_fs_session_mkdir|mkdir /home/deploy/tmp on remote-fs session rfs-2	428	573e2e8b6c5bd146	428	52de2ffa58658419	767.3
+remote_fs_session_mkdir|new directory /var/lib/zend/snapshots on remote-fs session rfs-2	297	2d04fe418db3b36f	297	a39703fe61eff54c	764.5
+remote_fs_session_mkdir|set up the folder /opt/app/staging/incoming on remote-fs session rfs-4	252	eaa836555d93fe6c	252	4c534055aefdd188	766.0
+remote_fs_session_open|I need a remote filesystem connection to sftp://ops@db-primary.corp using credential vault-ssh	1435	9c8d56b07ff0dd8f	1435	be50013e17c87a45	763.1
+remote_fs_session_open|can you spin up an SFTP session to 172.16.4.10 using the staging-key credential?	353	2f4f44eed906834f	353	8938a58b12fb3cab	766.2
+remote_fs_session_open|connect a new remote-fs session to sftp://ci@build-01.internal:2222 with credential ci-runner	495	5e2eb280aea70afb	495	0e8d8c96587196b2	764.1
+remote_fs_session_open|open a remote FS session to sftp://backup@nas.local using credential nas-key	687	9ed4b0e9d8177644	687	362dc3424e588be8	762.3
+remote_fs_session_open|open a remote filesystem session to sftp://deploy@example.com using credential deploy-key	1044	4ed6069460835cb0	1044	b9e69bd8cb74ae58	763.5
+remote_fs_session_open|open an SFTP session to 10.0.0.5 using credential prod-key	325	7c44472dc191ff9b	325	a7d2b458bd659aaa	765.5
+remote_fs_session_open|open an SFTP session to prod.example.com using credential prod-key	548	9e64009e46d7c7ab	548	5b73faa292026ad3	763.0
+remote_fs_session_open|start a remote FS session against archive.example.org on port 22 with credential archive-ro	516	ac5e0a5f322ea7f2	516	f37949d0fd6d0dc6	763.1
+remote_fs_session_put|can you upload nginx.conf to /etc/nginx/nginx.conf on remote-fs session rfs-2?	281	8f81d6293305cb8f	281	9d90a91ec77e63d6	766.5
+remote_fs_session_put|copy notes.txt to /home/deploy/notes.txt on remote-fs session rfs-1	466	5f34dab41a753eb8	466	4faffdf97acb70b3	764.0
+remote_fs_session_put|push deploy.sh to /usr/local/bin/deploy.sh on remote-fs session rfs-1	249	9e0f80e7ce1c0a71	249	78ab441748e84b7d	766.4
+remote_fs_session_put|put local patch.diff at /tmp/patch.diff on remote-fs session rfs-3	320	0be1e166f9422d25	320	251ea8c5c0aed3a5	768.6
+remote_fs_session_put|send build.tar.gz to /var/www/releases/build.tar.gz on remote-fs session rfs-2	676	09ce4ef04c795cf3	676	82ecc5e5767de2f3	763.2
+remote_fs_session_put|transfer secrets.env up to /opt/app/.env on remote-fs session rfs-4	895	8335cea22ea18e96	895	91eb3cce18604398	763.3
+remote_fs_session_put|upload config.toml to /opt/app/config.toml on remote-fs session rfs-1	583	e6afe60b5134533d	583	1cebeb0da232e2f9	764.7
+remote_fs_session_put|write ca-bundle.crt to /usr/local/share/ca-certificates/ca-bundle.crt on remote-fs session rfs-1	392	cf6ef61055b5a782	392	ebe88e2657dfadfc	766.1
+remote_fs_session_rename|can you rename /srv/data/dump.sql.tmp to /srv/data/dump.sql on remote-fs session rfs-3?	416	2d8bb258d4192f1d	416	ad5590591da42d00	765.5
+remote_fs_session_rename|move /home/ci/artifacts/staging to /home/ci/artifacts/archived on remote-fs session rfs-1	269	f5c392bd7107b0b8	269	1a388f17788a6bdb	767.0
+remote_fs_session_rename|move /home/deploy/draft.md to /home/deploy/final.md on remote-fs session rfs-1	292	88fcb5203332fc72	292	e47cf26a84a7721e	765.7
+remote_fs_session_rename|move /tmp/upload.bin to /data/final.bin on remote-fs session rfs-1	267	4552e9ede00b9918	267	27bfd98ce4fe8d3a	766.1
+remote_fs_session_rename|relocate /tmp/build.tar.gz to /var/www/releases/build.tar.gz on remote-fs session rfs-4	359	597af52c16c1fe3e	359	1524669509b3b9e2	766.1
+remote_fs_session_rename|rename /opt/app/current to /opt/app/previous on remote-fs session rfs-1	325	12526b6b262401c5	325	54f2308d518df405	767.7
+remote_fs_session_rename|rename /var/www/index.html.new to /var/www/index.html on remote-fs session rfs-2	296	70cf9a416a0d7284	296	85fd1c9f15bc44ea	765.3
+remote_fs_session_rename|swap /etc/nginx/nginx.conf over to /etc/nginx/nginx.conf.bak on remote-fs session rfs-2	282	379859a0169fe89d	282	73ac84e3196e2604	767.2
+remote_fs_session_stat|check the metadata of /opt/app/config.yaml on remote-fs session rfs-2	292	58784f31c323aebe	292	41370176f2903b3e	762.4
+remote_fs_session_stat|does /home/deploy/.ssh/authorized_keys exist on remote-fs session rfs-1	227	83adbaa17d67cf47	227	545dd864db9ddce3	765.3
+remote_fs_session_stat|get the size and permissions of /var/log/syslog on remote-fs session rfs-1	240	5b75cccd5e42dfed	240	8cf5877ae6d462e8	767.8
+remote_fs_session_stat|how big is /var/lib/mysql/ibdata1 on remote-fs session rfs-4	315	1400342449be90b1	315	627b9b2aa347d65b	766.9
+remote_fs_session_stat|is /tmp/lock a directory on remote-fs session rfs-1	229	eb039bdd1be22c60	229	ae0992abfdcd6dbc	767.5
+remote_fs_session_stat|show the ownership and mode of /usr/local/bin/deploy.sh on remote-fs session rfs-2	359	060f8d66c9d2e221	359	3392206d68d69a95	765.8
+remote_fs_session_stat|stat /etc/nginx/nginx.conf on remote-fs session rfs-1	201	2de2a71e1ff8ce6e	201	6acf44465471540c	765.2
+remote_fs_session_stat|when was /srv/data/dump.sql last modified on remote-fs session rfs-3?	352	450ecd944b679977	352	52e77379ff890afb	765.9
+signature_sign|can you ed25519-sign the message 'ceasefire at dawn' using credential ops-key	325	e5b57285e848f80b	325	26123c0564b71db4	763.8
+signature_sign|create an ed25519 signature for the message 'audit entry 7' using credential audit-key	247	8eb8f4cbebaa34ea	247	46ec2140fe86bc3c	763.0
+signature_sign|generate a p256_sha256 signature over 'ledger close 2026-07' with credential 'ledger-key'	302	6008a01adae9de1c	302	2d2e03088780561d	763.7
+signature_sign|produce an ed25519 signature over 'deploy approved' using credential deploy-key	254	f3d5098bc34e54cf	254	187e567ee4635062	761.5
+signature_sign|sign 'firmware image v9 checksum ok' with the p256_sha256 credential firmware-key	498	559606dba433cd51	498	1e539332aabcaf37	760.3
+signature_sign|sign the data 'order#42 confirmed' using the p256_sha256 algorithm with credential 'signing-key'	304	28ac77e7149ba4f9	304	a34f50af3f57d121	764.2
+signature_sign|sign the message 'release v1.2.0' with the ed25519 credential release-signing-key	256	f6549123c8a36121	256	d0c4e87e2c05b5f7	764.5
+signature_sign|sign the string 'grant admin token' using the ed25519 credential admin-issuer-key	307	b17da7b4d4d2c0d3	307	2d97d5e55dddbed7	763.7
+signature_verify|check whether the ed25519 signature 9f8e7d6c5b4a392817063a4b5c6d7e8f0091a2b3c4d5e6f708192a3b4c5d6e7f over 'deploy approved' is valid with public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	1198	b5f8c7ef45b6f77f	1198	a146ca9bbc6505f1	759.4
+signature_verify|confirm the ed25519 signature feedface8badf00dcafebabe0123456789abcdef112233445566778899aabbcc over 'audit log' with public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	668	75c23d04fd3db874	668	539ecf5cd21b61fd	762.0
+signature_verify|is the ed25519 signature 0011223344556677889900aabbccddeeff112233445566778899aabbccddeeff0 over 'firmware image v9' authentic given public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	542	59b1282adebf0e35	542	07a7bae3023dc2ad	762.3
+signature_verify|tell me if the ed25519 signature 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809 matches 'ledger close 2026-07' under public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	798	91fde7a187dfa685	798	a4463c577171d4aa	761.3
+signature_verify|validate the ed25519 signature a5b4c3d2e1f00918273645546372819aabbccddee0011223344556677889900ab on the message 'grant admin token' using public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	564	5f7ad500ba893219	564	63d4019ba4d88be9	759.5
+signature_verify|verify signature 7788990011223344556677889900aabbccddeeff00112233445566778899aabb over 'ceasefire at dawn' with the ed25519 public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	549	d875925dd889c1ec	549	52c3378628ce0cd2	762.0
+signature_verify|verify the ed25519 signature 3a7f9c2e1b8d4f60a5e8c1d2b3f4a69708172635445566778899aabbccddeeff over the message 'release v1.2' with public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	548	52c7e6ebd147424d	548	355d4ee9f1ff58cb	762.1
+signature_verify|verify the ed25519 signature c0ffee11d00dfeedbaadf00d1234567890abcdef00112233445566778899aabb over 'contract terms' with public key -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= -----END PUBLIC KEY-----	522	53dc8357c964bbb2	522	76a5283f8b7fac3f	759.8
+sql_session_close|can you shut down SQL session sql-6 and release its handle?	300	488e85e4b9d51e32	300	e5a0deeb657a502e	763.9
+sql_session_close|close SQL session sql-1	133	6031f0c18f9a32f8	133	825764b780dd59ce	764.7
+sql_session_close|drop the database session sql-5	134	1874ac46143b108c	134	a2485fd2570ecea8	767.8
+sql_session_close|end SQL session sql-1	136	6f29937dabe76a7d	136	c779c915ed58b160	766.0
+sql_session_close|free the SQLite connection on SQL session sql-4	167	1c11bda32aff99d6	167	fc3dcb89c97eadbe	766.4
+sql_session_close|release SQL session sql-2	121	ae6b2c4d0a62392c	121	60dc3a41a30b4ac8	765.4
+sql_session_close|tear down SQL session sql-3	144	f6cb5a62f5ea6832	144	74611a89df06d84d	762.1
+sql_session_close|we're done querying, please close SQL session sql-2	249	22abbfc580633e8c	249	bb031ea59d27dd0b	762.2
+sql_session_list|do I still have any SQL sessions open	100	24f8c59d1470f408	100	96dc7c9249759fa7	765.9
+sql_session_list|enumerate the active SQL connections in this conversation	172	7a33ea90afb2e8a0	172	809f1611fd7ecbc2	767.0
+sql_session_list|how many SQL sessions do I have	240	b059bd8cc4d70fc9	240	40a6cf32fb08d548	765.3
+sql_session_list|list my open SQL sessions	129	2e740738f26378f9	129	fe80c917a4e667a5	765.6
+sql_session_list|show me every SQL session with its database path and connection state	147	e194c970097cd773	147	2b842486b7574d3c	768.4
+sql_session_list|show the open SQL connections	199	65815a80143671ba	199	04d1e4f933c7da5b	767.7
+sql_session_list|what database sessions are currently open	107	cb97294bb84f6d1a	107	098e96ced4045fd1	759.8
+sql_session_list|which database sessions are active	124	d52f7765b9c72fa5	124	9a53cbdff610adaa	767.9
+sql_session_open|can you connect to the SQLite database at /var/lib/metrics/telemetry.db?	234	49f8076620745376	234	f85064563a1c9273	763.2
+sql_session_open|connect to the SQLite database analytics.db	175	dc9f38bd2fff250b	175	7344985ada066e6a	765.0
+sql_session_open|open a SQL session against the database at ./data/app.db	206	bea451ca663896c6	206	896ad3239db86b47	767.5
+sql_session_open|open a database session for reporting.db	172	45a4a58bba661a76	172	d40a3645a95dd9c8	764.2
+sql_session_open|open an in-memory SQL session using :memory:	171	38f42d74a38f9f12	171	829b1454663b6543	766.4
+sql_session_open|open the SQLite file inventory.db as a session	223	573c68f27d534c11	223	4d20b6f51ee95ae4	768.8
+sql_session_open|start a SQL session for the local users database	999	7448052f61dff231	999	5741c6bd34c47b8f	763.4
+sql_session_open|start a SQL session on the orders database at ./db/orders.sqlite	185	89b0c53356ec5054	185	d928fdef79018c83	766.1
+sql_session_query|delete stale rows with `DELETE FROM sessions WHERE expires_at < date('now')` on SQL session sql-2	433	09e365cfeb7557a8	433	ff569c6a11e9a4f3	763.0
+sql_session_query|execute `INSERT INTO logs (level, msg) VALUES ('warn', 'disk low')` on SQL session sql-3	392	f9e23f0c778bcae5	392	efd2e463eac629c6	763.4
+sql_session_query|execute `UPDATE settings SET value = 'on' WHERE key = 'feature'` on SQL session sql-2	278	619d4acc05ed4b15	278	e7fdd2a50fbebbae	763.9
+sql_session_query|run `SELECT * FROM orders WHERE date = date('now')` on SQL session sql-1	246	fcd91ef3757c7609	246	bb2c927fa23908fc	762.8
+sql_session_query|run `SELECT * FROM users LIMIT 10` on SQL session sql-1	267	2538761c1d3c3c81	267	1b5cede8827607d5	765.4
+sql_session_query|run `SELECT COUNT(*) FROM events` on SQL session sql-1	203	2e67a1a85e3f3bc2	203	deaff98594776d85	767.5
+sql_session_query|run `SELECT name FROM sqlite_master WHERE type = 'table'` on SQL session sql-1	260	c48b825bf324a37a	260	e5a9a21308511321	766.3
+sql_session_query|run `SELECT user_id, SUM(amount) FROM payments GROUP BY user_id` on SQL session sql-4	211	732c535ed70eadcf	211	fd2b5327c10e6f9f	766.1
+ssh_open|SSH to backup@nas.lan using the credential nas-admin	200	660b452eb2cab562	200	411837334f3eb100	763.9
+ssh_open|can you SSH into db01.internal.net on port 2222 with the dba-key credential?	329	669f7c3b4ac25897	329	97efafa16678bde4	764.1
+ssh_open|connect over SSH to deploy@example.com using credential deploy-key	262	ee3f5e7aa4fe3f43	262	c3aee5930bee9977	762.9
+ssh_open|establish an SSH connection to ubuntu@172.31.4.18 using credential ec2-pem	300	1aceae46116e6a7e	300	be914b68cee7f5a7	763.5
+ssh_open|log into the build box at 10.10.5.7 over SSH with the ci-runner credential	372	4ef2a06f3aa888bd	372	74aa37f77d16da4a	762.9
+ssh_open|open an SSH session to 10.0.0.5 using the prod-server credential	348	97995df659f0942e	348	c475e572d830887d	763.3
+ssh_open|open an SSH session to 192.168.1.20 as root using credential root-key	238	28371cec338fb7eb	238	8f129fa8232d9831	762.9
+ssh_open|start an SSH session to staging.example.com port 22 with credential staging-key	276	9c40ad19cac310ab	276	61e9516aa851bdbe	763.0
+ssh_session_close|close SSH session ssh-7f3a	157	16a3047c075b6038	157	80f072899da42389	767.1
+ssh_session_close|disconnect SSH session ssh-2b1c	146	6a33c7f6d1dc8af7	146	ed57a35768651569	767.3
+ssh_session_close|drop the SSH connection ssh-0d2e	146	0211739113735b42	146	3694504c95d6e674	763.3
+ssh_session_close|end SSH session ssh-7f3a	156	cbc3ec72f7d5d250	156	bbd745d77a41fe25	764.7
+ssh_session_close|hang up the SSH session ssh-5f1a, I'm done with it	166	ede4a7db951e5972	166	bf27e2b1c38c07cf	764.3
+ssh_session_close|please shut down SSH session ssh-b3c8	119	57145459cee3689b	119	0add7bc50cfae5eb	763.0
+ssh_session_close|tear down SSH session ssh-9d4e	141	0d34fd107d1815c9	141	0b94579b5ba4c068	764.7
+ssh_session_close|terminate SSH session ssh-e7a4	140	291c3838446d0eaf	140	40ca919a6f74e46b	766.3
+ssh_session_exec_async|fire off `apt-get -y dist-upgrade` on SSH session ssh-0e1d and don't wait for it	370	147f617b074e08c2	370	ad800296299a628d	766.1
+ssh_session_exec_async|kick off `rsync -avz /data/ remote:/data/` on SSH session ssh-5b3c in the background	329	67ac587abcb3c58d	329	bff8dff21da42f2e	765.3
+ssh_session_exec_async|launch `ffmpeg -i in.mov out.mp4` on SSH session ssh-c4d7 without blocking	342	c4c303125d27019e	342	f83e84f7b0c65f35	766.6
+ssh_session_exec_async|run `./migrate.sh --all` asynchronously on SSH session ssh-9d4e	292	417d26ed2647176a	292	687a880d554997de	766.3
+ssh_session_exec_async|run `make -j8 release` on SSH session ssh-2b1c without waiting	370	7adfd9fc743d8ed2	370	dd86aba5371fdda9	764.3
+ssh_session_exec_async|run `pg_dump mydb > /backups/db.sql` on SSH session ssh-7f3a in the background	498	3fbfc5dfbbecb688	498	45ffa0c28281344d	766.1
+ssh_session_exec_async|run `stress-ng --cpu 4 --timeout 60s` on SSH session ssh-7f3a and don't block	756	01b32f34c45534d8	756	c71fe9f86a4c220e	765.3
+ssh_session_exec_async|start `find / -name '*.core' -delete` async on SSH session ssh-8f2a	251	9e93aa103848fa95	251	62e25720d4a31bcb	766.5
+ssh_session_exec|check the uptime on SSH session ssh-2b1c	305	e34519239b146d92	305	e5508fa7d54e1eaa	765.1
+ssh_session_exec|execute `systemctl status nginx` on SSH session ssh-7f3a	198	c1f9c37a381bcc94	198	026dad45cf954479	765.6
+ssh_session_exec|execute `whoami && hostname` on SSH session ssh-6e0f	258	283c3047f37964ee	258	12de07a6b8174f17	768.7
+ssh_session_exec|grab the free memory by running `free -m` over SSH session ssh-1a2b	277	cd34bb7da35c0d67	277	f14f1482ea257159	763.5
+ssh_session_exec|list the running docker containers on SSH session ssh-9d4e	257	b4764861549d4be1	257	59a1c652d2a5e009	765.6
+ssh_session_exec|on SSH session ssh-4c8d, run `tail -n 50 /var/log/auth.log`	302	3a4fd0cadafc2a56	302	b475dd3b005ccf97	767.5
+ssh_session_exec|run `cat /etc/os-release` on the SSH session ssh-3d5a and show me the output	275	6132f60e56fe31cd	275	db4cdecb505deef2	765.7
+ssh_session_exec|run `df -h` on SSH session ssh-7f3a	308	8f409bc21f3b47b3	308	d398ac6ee5356271	769.1
+ssh_session_list|are there any SSH sessions still connected right now?	289	60f89de2b6317eed	289	09d530247134d178	768.0
+ssh_session_list|enumerate my current SSH remote sessions	114	89c79fbccf809ad1	114	b9448b6fd9a015f3	766.6
+ssh_session_list|give me the ids of every SSH session I've opened	152	f7b91da36f064208	152	36926639c56df7a0	764.8
+ssh_session_list|how many SSH sessions are running	228	0ba07b9dd8c7e326	228	b78fd314ea08e1ec	766.7
+ssh_session_list|list my open SSH sessions	96	9d355e187995eb60	96	852143f7deb832ff	765.7
+ssh_session_list|show me the active SSH sessions	144	7149ace93967bdcb	144	4ae2038c13c90466	768.7
+ssh_session_list|what SSH sessions are on the books at the moment	104	e1dfec2e768424d2	104	f464a9a96dcceff9	763.6
+ssh_session_list|which SSH connections do I currently have open	282	f6b63d8be557c0fa	282	2658dd589658554f	765.9
+ssh_session_poll|check whether async process proc_8a3f2c1d4e5b has finished	264	44d32e68b15005ca	264	20748ee2e895e86b	766.9
+ssh_session_poll|get the latest stdout from async process proc_9c8b7a6e5d4f	278	de9414500bced857	278	55822150a792fc0c	762.5
+ssh_session_poll|has the async task proc_2d6f8b0a3c7e exited, and what was its status?	352	7f20eced207b7c9e	352	642ef2ae3530aae2	764.0
+ssh_session_poll|is the background job proc_1f2e3d4c5a6b done yet	338	ef3b10525cdd927b	338	3bbd8c2e4c044a73	764.6
+ssh_session_poll|poll async process proc_4b7e9a02c1f3 for its output so far	372	ed43a28e97a0d8f2	372	e9b2a86fac2922e1	763.0
+ssh_session_poll|poll proc_6f4e2d0c8b7a and tell me if it's still running	235	768b4cf26e4b8663	235	eb47e7227fd8938e	765.3
+ssh_session_poll|show me any new output from background process proc_7e5c1a9b2d0f	247	773e93322ad53775	247	6222178730048fb6	766.3
+ssh_session_poll|what's the current state of the async SSH job proc_0a1b2c3d4e5f	290	d3441c639839adf6	290	2b82cc708a374eeb	766.4
+sub_run|delegate the task of finding every TODO comment under the src directory to a subagent	454	12713ab0221e31f1	454	8cc0d716dac233b6	767.0
+sub_run|delegate writing the unit tests for the parser module to a subagent	231	d8ea4a2fa8edc355	231	6decdc66776f7727	765.6
+sub_run|have a subagent investigate why the build is failing	161	577b81eaccbab775	161	05509c8f4c089545	767.7
+sub_run|have a subagent research the top three Rust web frameworks and recommend one for a REST API	381	251a58f385dc46f9	381	233abded04adeab5	767.1
+sub_run|kick off a subagent to audit the codebase for unwrap() calls and list them	317	483b2df2699d3976	317	84193f83b7f76fbf	767.9
+sub_run|launch a nested agent to draft the migration plan	340	09c78f0ee8489815	340	e26330e24cff206c	769.7
+sub_run|spawn a subagent to research the best Rust logging crate and report back	325	bc10603a6c40b8be	325	ecee071fdf165d63	765.6
+sub_run|spawn an agent to trace where this config value is read across the repo	452	b432c50a2ce2ffc9	452	634dc891f07daaf3	766.5
+tcp_session_close|I'm done with TCP session tcp-5, close it	212	a9f60ca92a18788b	212	52ecde0ccb08000d	758.4
+tcp_session_close|close TCP session tcp-1	135	7f717c07341c6a89	135	c41a1515040eb9d4	764.9
+tcp_session_close|close the TCP session whose id is tcp-6	152	f2b3ebad03c2dd14	152	a0d6944dbaec9877	766.0
+tcp_session_close|drop the TCP socket tcp-4	114	c9b3ca1d6b0db943	114	623f043110610550	760.0
+tcp_session_close|end TCP session tcp-1	170	3002c3029f1b25a8	170	a9b4a4962d6c585b	766.3
+tcp_session_close|kill TCP session tcp-2 now	133	641044ab4d540fce	133	858969ffae4d89c9	766.7
+tcp_session_close|shut down TCP session tcp-2	138	c4f52a6fb27245e7	138	d1b2cc1b99d9878d	767.8
+tcp_session_close|tear down TCP session tcp-3	161	971a20f9f1f17b40	161	ebf76269b1aca631	761.2
+tcp_session_list|are any raw TCP sockets still connected?	213	59565a0ed95a0e36	213	8ea68e5143afe679	766.7
+tcp_session_list|enumerate the live TCP session ids	97	fa341264b25414ec	97	9c9d0e535e11d21e	766.0
+tcp_session_list|give me a list of every open TCP session	120	093a1a37554395d4	120	d32b3a1e6199c63a	767.2
+tcp_session_list|how many TCP connections do I have	243	3b737b1be891be77	243	8bb5fabbcd923146	766.9
+tcp_session_list|list my open TCP connections	113	37d44c62c4580f64	113	18940b9de28b191a	766.1
+tcp_session_list|show the active TCP sessions	136	ff54afd975885fe2	136	bf48913c63a8b8a0	766.6
+tcp_session_list|what TCP connections am I currently holding?	197	622053d466b40890	197	9651c9f2fac35cc6	769.0
+tcp_session_list|which TCP sockets are open	166	c1360cbdcfb5a803	166	b5367f51aab99a7e	770.6
+tcp_session_open|can you open a TCP connection to db.internal:27017?	272	a3a9cb52d8401b36	272	c6e6d6c1a404ae23	761.9
+tcp_session_open|connect over TCP to example.com:8080	180	4cec99ccf43cafcb	180	ed8458a158c7eb93	762.9
+tcp_session_open|dial a TCP socket out to smtp.mailgun.org port 587	154	fe608fb82bac873f	154	3c82ff55a63ad58d	763.4
+tcp_session_open|establish a raw TCP session to 172.16.9.4 on port 11211	208	5e5cd4ec44c2397e	208	59401b1625f7c97f	763.3
+tcp_session_open|open a TCP connection to 10.4.4.4 port 4444	193	777d293d60d9c3d2	193	45fa6c3db98683d1	762.0
+tcp_session_open|open a TCP socket to 192.168.1.50 port 9000	217	e4a1cc18a87acf42	217	bc9ba65a17b8476e	761.4
+tcp_session_open|open a raw TCP connection to 10.0.0.8 on port 6379	195	e00deedf456ef0b2	195	4874ac8fda914de3	766.6
+tcp_session_open|start a TCP session to 10.0.0.20 on port 5432	207	0c68c711ca4bacdc	207	3195cb1930e8d947	763.7
+tcp_session_recv|block up to 10 seconds reading from TCP session tcp-1	680	cbef7938369a1ad3	680	72856d318346be7d	759.8
+tcp_session_recv|drain TCP session tcp-2 for 2 seconds	390	31c75f646c6d748e	390	d3c43955dc721edd	762.0
+tcp_session_recv|grab 256 bytes off TCP session tcp-3	368	80ebbe8767676c58	368	7523a98a36afbe1c	761.0
+tcp_session_recv|pull whatever's waiting on TCP session tcp-2 for the next 3 seconds	409	004559416b965907	409	3cd405b3440ed787	761.2
+tcp_session_recv|read 4096 bytes from TCP session tcp-4	270	7b06fb4891e1bfde	270	8939c3ba16d17e73	760.4
+tcp_session_recv|read for up to 5 seconds from TCP session tcp-1	233	85118e04b6cf1e14	233	0b8157b025e2fbfd	759.1
+tcp_session_recv|receive 1024 bytes from TCP session tcp-1	207	c70ec6a813a9d61c	207	646dd1ddc55ad3d2	762.1
+tcp_session_recv|receive 512 bytes from TCP session tcp-1	224	7217c08e57ecdef6	224	c6c79a8706bb738d	761.0
+tcp_session_send|can you send `EHLO zen\r\n` over TCP session tcp-4?	342	4e1dce0c646a92c4	342	1fe0e9ced6fbf496	766.4
+tcp_session_send|push `QUIT\r\n` down TCP session tcp-2	190	d121b2858a15ce9f	190	fde7136f0037cf22	764.2
+tcp_session_send|send `GET / HTTP/1.0\r\n\r\n` to TCP session tcp-2	269	8b3a3f94bd34d8a6	269	4b488709f16f79b9	766.4
+tcp_session_send|send `PING\r\n` to TCP session tcp-1	274	e6966e8288a9b078	274	4a796795d3b69107	764.6
+tcp_session_send|send the raw bytes cafebabe00ff to TCP session tcp-1	273	863ce56fdae87a71	273	206babf3c31f819b	766.2
+tcp_session_send|transmit `INFO\r\n` to TCP session tcp-1	242	8dc0c5134b020329	242	4ac919bbcdd8b6a1	764.4
+tcp_session_send|write the hex bytes 0badf00d to TCP session tcp-3	300	4f61d441be46d207	300	d4e0fe4a635a4408	762.3
+tcp_session_send|write the raw bytes deadbeef to TCP session tcp-1	362	5ebc3defd5a07593	362	af104f3d5c785480	763.6
+telnet_send|could you send `write memory` over telnet session telnet-2?	189	8ce758d61520a6c3	189	306464ed941557f2	766.1
+telnet_send|issue `show version` on telnet session telnet-1	252	cb9ee4d571f65eb6	252	430315af20885b21	766.4
+telnet_send|on telnet session telnet-3, type `configure terminal` and wait for the prompt	279	98c0def258a22d7e	279	71f252a5f46df24a	762.6
+telnet_send|push the command `show ip interface brief` to telnet session telnet-4	290	ef5d006a803b601d	290	157d7cb0d8d665e4	766.1
+telnet_send|run `logout` on telnet session telnet-1	293	4e09fefb32110733	293	da7e3925f74b9a75	765.3
+telnet_send|send `enable` on telnet session telnet-1	278	2a379eb3c1477a7b	278	58488f73f5f98482	763.7
+telnet_send|send `reload` to telnet session telnet-2	243	a1cf23879f9ce7cc	243	aafe07b80c5cd615	766.4
+telnet_send|send `show running-config` to telnet session telnet-1 and wait for the prompt	380	16d029d4e1bda931	380	c00ff9f1ae1bcd5d	766.6
+telnet_session_close|I'm done with telnet session telnet-5, drop it	189	f73b9a626a465648	189	bb8b563cbc7a0fb5	764.2
+telnet_session_close|close telnet session telnet-1	157	111419a0d3f90898	157	51cf9dbe217d1e9a	765.2
+telnet_session_close|disconnect telnet session telnet-2	127	f02661739541c1da	127	2bb540d4e558e0c6	766.4
+telnet_session_close|end telnet session telnet-1	130	8f34de1a0b8f6772	130	033ca10a4ddbdb38	764.3
+telnet_session_close|kill the telnet session telnet-2 now	322	96ef4508c7663194	322	e0fe737e42f4b89a	763.6
+telnet_session_close|please hang up telnet session telnet-4	132	e7fc97696ce846a5	132	764bca8708e6599c	768.1
+telnet_session_close|tear down telnet session telnet-3	213	61c8614df373255e	213	70ed757ecb5f376d	763.8
+telnet_session_close|terminate telnet session telnet-6	135	45e8528e0c02b70f	135	3db7fa5faee2de2c	765.5
+telnet_session_list|do I still have any telnet sessions going?	100	ea00858622df5cfc	100	249c6a8e78e6dd7e	765.0
+telnet_session_list|enumerate the telnet connections still alive	161	6ccfa4b9481d297f	161	d145f7713e95d3f8	767.5
+telnet_session_list|give me a rundown of every active telnet session	142	6920e11f8c6118ab	142	e31e230cd16301a9	770.9
+telnet_session_list|how many telnet sessions are running	154	b3fb0182324b0067	154	57ff8f824b3e0e92	766.5
+telnet_session_list|list my open telnet sessions	120	3fe09470c70cf8cd	120	db91ccca91d9903a	770.2
+telnet_session_list|show the telnet sessions I have open	166	12404894f9bb3357	166	f498c397dcec0da9	767.8
+telnet_session_list|what telnet session ids are currently open?	136	6b5de617b0f0467b	136	b7c5f5769bbfc97c	768.3
+telnet_session_list|which telnet connections are active	163	ba54cd4da3af6e1f	163	b095d6d7395939f0	768.0
+telnet_session_open|I need a telnet session opened to bbs.example.net port 23	177	7749529e779a14d6	177	67f17d964d5a6134	762.0
+telnet_session_open|connect via telnet to the switch console at 10.0.0.30 port 23	233	31c8933d2e2ea172	233	59874f27ef4e7592	763.8
+telnet_session_open|establish a telnet link to the mainframe host at 10.20.30.40 port 992	289	1c85204dda080399	289	dd6befe176948c7b	764.7
+telnet_session_open|open a telnet connection to the router at 192.168.0.1 port 23	248	027f358efb3753c7	248	9c034f00c9334a4c	762.7
+telnet_session_open|open a telnet session to the firewall at 10.10.10.1 on port 23	274	7055f3f190fb406b	274	47d92e9d798ca375	760.2
+telnet_session_open|spin up a telnet connection to the PDU at 172.16.4.9 port 23	244	2aeab9446b5e5bb1	244	e0cb3b1d32af941e	764.5
+telnet_session_open|start a telnet session to the device at 172.16.0.5 port 23	333	48149b4737e2a3da	333	da4bb9bd86133aee	762.8
+telnet_session_open|telnet to the serial console at 192.168.1.100 port 2000	224	dfae9f96d9ce013a	224	95ea1bae6325b63f	763.8
+tls_session_close|can you close out TLS session tls-6?	121	b52a513d99b6d0c4	121	f1934742050c6818	766.0
+tls_session_close|close TLS session tls-1	122	345372832e72b811	122	ae0a2e86f8abcf89	765.7
+tls_session_close|drop the encrypted TLS channel tls-5	144	bdad9bccce814c71	144	60bcaa545c2d4e9d	765.9
+tls_session_close|end TLS session tls-2	138	75375f1542baacfc	138	40a9fd59fd03dd68	766.0
+tls_session_close|send close-notify and shut TLS session tls-4	245	fb24d1a1161efba4	245	52b3dd313ae5bf3e	767.4
+tls_session_close|shut down TLS session tls-3	136	9c1112713bad41e3	136	deed179722393ff9	762.0
+tls_session_close|tear down TLS session tls-1	167	b59ae8b80ec89ab6	167	2672397d16d24979	764.8
+tls_session_close|we're finished with TLS session tls-2, please close it	164	1ebc3384a03ff389	164	5aec6410cb83905a	766.4
+tls_session_list|are any TLS sessions still connected	123	fd7be6b46ce1290f	123	6614845e4e443574	766.8
+tls_session_list|enumerate the active TLS connections and their hosts	178	c78d38e6d13c3e2b	178	d98105dbbe82aba5	770.2
+tls_session_list|how many TLS sessions do I have	344	c00773b9b4568d64	344	6321b158375b9368	765.9
+tls_session_list|list my open TLS sessions	115	08aa2e612f0cf8e1	115	c758835adc24b4ea	766.7
+tls_session_list|show me every TLS channel and its peer certificate identity	161	3efc19eb50fc53ff	161	57aad4cc1dab9698	770.7
+tls_session_list|show the open TLS sockets	266	b46654cd5d0da17f	266	34f3f0b9cfb7d7c4	766.4
+tls_session_list|what encrypted TLS sessions are open at the moment	146	6f26518bc4eb1b5b	146	aecf1d9e67f6519e	765.8
+tls_session_list|which TLS connections are active	121	097baf51f53c68e9	121	2375b74b86e3f9e3	768.5
+tls_session_open|can you open TLS to the FTPS control channel at ftps://files.example.net:990?	408	bfa4ae7821b60db3	408	5f503f94f3395880	761.2
+tls_session_open|connect over TLS to smtps://smtp.example.com:465	260	bd7b20459f20d44f	260	6ee106ecb3f51d5e	763.4
+tls_session_open|establish a TLS session to pop3s://pop.example.org:995	193	9ec987a905385e23	193	64fcfac1e824a2a5	763.3
+tls_session_open|open a TLS connection to imaps://mail.example.com:993	284	afee7dc1dfedca02	284	797d66492373fe18	761.1
+tls_session_open|open a TLS connection to mqtts://broker.example.com:8883	222	4542773277360508	222	dacb427b4e45b874	765.1
+tls_session_open|open a TLS session to the syslog-tls endpoint at logs.example.com:6514	241	2d62d46548303797	241	3a118aa74d058329	762.9
+tls_session_open|start a TLS session to ldaps://ldap.example.com:636	263	bd607313816609c0	263	f5640008a1d07d41	761.2
+tls_session_open|start an encrypted TLS connection to the NNTPS server nntps://news.example.com:563	489	ada4cc1688facd5f	489	26632c2ac2ad7ddf	762.5
+tls_session_recv|can you read the TLS response on session tls-2 for up to 1 second?	251	78ce45cf99eae4b5	251	6f7ef3420c8a8b20	761.4
+tls_session_recv|drain TLS session tls-1 for 2 seconds	164	3c7f7fec61f5d018	164	508dd0fb69435580	761.8
+tls_session_recv|grab the next 256 bytes off TLS session tls-4	306	eb21994b6ffb8c5b	306	01a9bd1ee8192f28	762.3
+tls_session_recv|read for up to 3 seconds from TLS session tls-1	242	b27a7db338db4860	242	c1882beb4fa14cad	759.7
+tls_session_recv|read up to 4096 bytes of decrypted data from TLS session tls-3	275	b14a6889e4b95e0c	275	ddb6027bb143f451	760.3
+tls_session_recv|receive 1024 bytes from TLS session tls-2	236	e7c86fa00fe4f1a8	236	e2440a3c8c374ea0	761.0
+tls_session_recv|receive 512 bytes from TLS session tls-1	277	9f1bc93f3f4b6e9f	277	2fa2a7e50a7f451c	765.4
+tls_session_recv|wait 5 seconds for the TLS server greeting on session tls-1	358	4d61e6c43e0e42ef	358	a04926fab49e9e25	764.4
+tls_session_send|can you send the LDAP unbind hex 30050201034200 to TLS session tls-2?	367	0693b3633ce4fde1	367	e0467180b916622c	765.3
+tls_session_send|over TLS session tls-3, send the POP3 command `USER alice\r\n`	267	385c864df394eee3	267	b41a35fafe518851	762.1
+tls_session_send|push `CAPABILITY\r\n` down TLS session tls-1	328	8a194f989225c597	328	fc21bdbb7e35b935	764.8
+tls_session_send|send `EHLO example.com` to TLS session tls-2	275	4e636470c175f567	275	fe19a58681271694	764.8
+tls_session_send|send the IMAP `a1 LOGIN user pass` command to TLS session tls-1	290	813796c1c33244d5	290	b82cd7ad62b5b147	766.4
+tls_session_send|send the hex bytes 101000044d51545404020000 to TLS session tls-1	353	82d5572bf1598803	353	1d7e73d115e320b2	764.3
+tls_session_send|send the hex bytes 300c020101600702010304008000 to TLS session tls-1	396	9174ca514bca160c	396	1afb7bc88dfd4d02	766.0
+tls_session_send|write the hex bytes 820100 to TLS session tls-4	266	daa3520551982823	266	09d85a3b0443faac	763.2
+totp|I need the current authenticator code for the credential named cloudflare	182	5cf3e6b89d9c9e8d	182	fafcaa30964fc029	768.9
+totp|compute the TOTP for the credential named okta	205	46f7206b76271c1e	205	f518b74eb071dddc	762.6
+totp|generate the current TOTP code for the credential named github	189	96ffcf92f992fbfb	189	6f67f50188270fca	768.4
+totp|give me the current one-time password for the credential named gitlab	187	af62c5809a001586	187	29c9d38da6367549	766.6
+totp|grab the current TOTP for the credential named npm-registry	182	aed6f032d2e2998b	182	634a15177c987d0d	766.3
+totp|read off the live 2FA digits for the credential named vault-admin	201	cc1d27ce2ef09e15	201	190456f5fe2933b7	767.1
+totp|what one-time passcode does the credential named bitwarden show right now?	192	58ba939fefebb3d9	192	90d9e76957948fa9	766.2
+totp|what's the current 6-digit 2FA code for the credential named aws-root	181	5abdce9f44873567	181	bd4cf70eae095f6d	765.3
+trace_route|map the hops to github.com	161	e8a2231bf4159f3b	161	c082a381206aeb4b	762.8
+trace_route|run a traceroute to cdn.jsdelivr.net and list every hop	167	c70ca01d79b3b987	167	e6b6639b873bd6dd	763.6
+trace_route|show me the network path to 1.1.1.1	338	e23591daca7c5e4c	338	2db48df8938aeaa1	764.4
+trace_route|trace the path to 203.0.113.42	182	2676d36930e22477	182	4352bcfbf83cc830	762.4
+trace_route|trace the route to google.com	132	3f61554d1f99e559	132	ed3255e51243dae5	763.5
+trace_route|traceroute to example.com	140	d7c7ebbf09158575	140	50fa478954de9fb8	764.8
+trace_route|where does traffic to 8.8.8.8 get slow?	302	32ba31fb25dd3033	302	053424e1855f6539	765.4
+trace_route|which routers sit between me and aws.amazon.com?	176	32b2e2b534fad830	176	c74a5cb8cc70f46d	768.1
+udp_session_close|can you close out UDP session udp-6 and free its port?	218	27fdd8710accd6ab	218	2d19ddd54891b053	767.1
+udp_session_close|close UDP session udp-1	142	b60ce26e05139cdd	142	c8d9a770f21a5fd2	766.2
+udp_session_close|drop the UDP datagram socket udp-5	186	5cd93c7dad46285f	186	bf15c5a83582c2ab	763.6
+udp_session_close|end UDP session udp-2	144	df6722a20b1e7ed9	144	5b9f806019f30808	768.1
+udp_session_close|free up the UDP socket on session udp-4	142	e43851d3f19debef	142	a416f08e720062bb	765.9
+udp_session_close|shut down UDP session udp-3	176	d6337342199a3d3b	176	a12a62e1e55df04f	764.0
+udp_session_close|tear down UDP session udp-1	173	35aceb4a160aa605	173	6b991b6ce2cf2cf2	768.9
+udp_session_close|we're done with UDP session udp-2, please release it	148	28b8f7a1de02d243	148	f813573a3684ea5f	764.0
+udp_session_list|are there any UDP sessions still open	128	93028b9000075541	128	dea4bcad8070f728	769.7
+udp_session_list|enumerate the active UDP sockets in this conversation	194	96bf0ceaa0826254	194	4d8e564d2f6fd20c	769.9
+udp_session_list|give me a rundown of every bound UDP datagram socket and its default peer	205	4eb22b48401805f6	205	cb73747e9ca4689d	769.5
+udp_session_list|how many UDP sockets do I have	297	e644779ef695f784	297	65585fac67827837	765.2
+udp_session_list|list my open UDP sockets	143	1e5e311b90d8c915	143	676001dd5933e22e	764.6
+udp_session_list|show the open UDP connections	245	e4b57075fd897881	245	aa748fd8b0883020	767.6
+udp_session_list|what UDP sessions are currently open right now	161	7450a8883996e79f	161	43e715455a874b60	767.2
+udp_session_list|which UDP sessions are active	115	eadef90e350ad447	115	8ebedacd7e17a633	768.9
+udp_session_open|I need a UDP session to the game server at game.example.com:27015	209	4f5750d4cf9956de	209	5a607e02e294a18c	763.7
+udp_session_open|can you open a UDP socket bound to the DHCP server 172.16.0.1 on port 67?	491	15e10c1ac32ccfca	491	0c8d4ea2924eae4f	764.8
+udp_session_open|open UDP to the StatsD collector at 10.10.5.5 port 8125	285	eed428c77058274a	285	b48008ebb9ee1264	764.7
+udp_session_open|open a UDP session to the NTP server at 192.168.1.1 port 123	269	c7c0393901123489	269	d7c4bb4e9766116d	762.6
+udp_session_open|open a UDP session to the syslog server at 10.0.0.50 port 514	262	8e7368c1fe374274	262	a1304bc9461e106c	764.4
+udp_session_open|open a UDP socket to 8.8.8.8 port 53	200	3d787c6ed82eb478	200	c414296aebadb6ef	760.3
+udp_session_open|open a UDP socket to send datagrams to 10.0.0.9 port 5000	283	a79e6564d3fc6f33	283	ab4522d74a17117d	768.6
+udp_session_open|spin up a UDP datagram socket pointed at 203.0.113.7 port 1194 for the VPN	457	83574e9f123d3fee	457	1218ec856c4193d7	760.8
+udp_session_recv|get the incoming datagram and sender address from UDP session udp-2	304	20a00ea3cae7403f	304	32c8a2e6ee226e00	761.5
+udp_session_recv|grab the next UDP datagram off session udp-3 and tell me who sent it	278	b2b9d92c0ed2265e	278	5bced646679f5a30	763.9
+udp_session_recv|pull one datagram from UDP session udp-4 along with the source address	254	bc2c823c9563f891	254	d371a715a383b423	765.6
+udp_session_recv|read one packet from UDP session udp-1	252	1f6f655ac82adb2c	252	e68ce9f51c65b81c	764.9
+udp_session_recv|read the next datagram from UDP session udp-1	437	1c673c8dec2744c2	437	9eaa71c283d5c4d0	765.2
+udp_session_recv|receive the next inbound datagram on UDP session udp-2	234	5ba3b2787a7fbeb8	234	af03ee160534c5dd	765.6
+udp_session_recv|receive the response packet on UDP session udp-1	198	e2de5da0eb72ea01	198	d368409a4cefb7fa	763.9
+udp_session_recv|wait for the next UDP reply on session udp-1	224	0996abbfeeea9880	224	1de9201c1ee21383	764.5
+udp_session_send|blast the string `STATUS?` to UDP session udp-4	203	2454c0ea6122e61d	203	09aea8cf4a830025	763.3
+udp_session_send|can you push the text `DISCOVER` out on UDP session udp-2?	220	6e82a913f184e5b6	220	064809ba5321b3ff	764.5
+udp_session_send|fire the hex datagram deadbeef00ff over UDP session udp-3	360	d57e15b74c6c607a	360	0561b2c4be5543cc	764.0
+udp_session_send|send the bytes 0102030405 to UDP session udp-2	265	e41f56018e3aab34	265	5c18143f2770730c	765.7
+udp_session_send|send the bytes cafebabe to UDP session udp-1	639	24773a15485c3f97	639	9c69dde80504b7d7	759.7
+udp_session_send|send the heartbeat string `hb` to UDP session udp-1	277	a21c396bf3b3089e	277	036528c65a08cebd	762.2
+udp_session_send|send the text `ping` to UDP session udp-1	230	efbfda8980c7d076	230	803f141453b8b54b	763.3
+udp_session_send|transmit the bytes 1b0000000000000000 as a UDP datagram on udp-1	518	a8e1de8b814eb98f	518	1f92b0429d64b341	761.1
+unit_convert|convert 100 kilometers to miles	211	712208fe64fcce45	211	cb818218a4de1764	764.5
+unit_convert|convert 72 fahrenheit to celsius	202	79b4e53da497036b	202	1fa0d2479d87a59d	763.7
+unit_convert|convert 90 miles per hour to meters per second	785	7cb6106fcf0c3e41	785	57d1ad3333c7f799	761.7
+unit_convert|how many feet are in 3 meters	284	44e41e77338f35e5	284	ff24ffac0ed792e5	765.0
+unit_convert|how many gigabytes is 4500 megabytes	469	72323f4109148fbe	469	8f543ec77bd6173d	758.8
+unit_convert|how many ounces are in 2.5 liters	521	f9f868513a35e052	521	54ced7390d2e9c34	761.6
+unit_convert|how many seconds are in 6.25 hours	338	054a630f51155df7	338	f70776ba1dedff49	762.7
+unit_convert|turn 5 pounds into kilograms	233	c34ccb467cde9476	233	75f81cadfc183dd6	764.7
+weather|do I need a jacket in Paris this evening	509	2c0c14b47002013c	509	b56883a630f9e713	762.2
+weather|give me the 5-day forecast for Denver	145	e4eefa4c41045097	145	187e1a058940d82d	766.4
+weather|how hot is it in Phoenix right now	178	596208d6b3de9cd8	178	f3d614d0b8846b74	766.8
+weather|is it snowing in Reykjavik	218	dc6b756566c7d81e	218	5837b43cbccd1a83	765.2
+weather|what's the humidity like in Singapore	139	5004c170a158c312	139	2d561b856454a919	766.4
+weather|what's the weather in London today	144	4014f390af36c3b8	144	c4dc11f4aeda84e3	763.5
+weather|what's the wind speed at the coast in Cape Town	198	7321736fd8fd59ee	198	7d6dba578323cd2e	764.9
+weather|will it rain in Seattle tomorrow	243	e5a2d5fad3085c7e	243	50864c609d333264	766.5
+web_fetch|download the page at https://news.ycombinator.com	161	882b7e1c06dd33ab	161	8bec9fb2fd3bb561	768.6
+web_fetch|fetch the contents of https://example.com	145	dba8c99de7cd6d08	145	90d4aec209939088	768.1
+web_fetch|get the text from https://www.rust-lang.org/learn	205	01e6ff0e8e4e5f9a	205	4567973dba795021	766.0
+web_fetch|grab the JSON from https://httpbin.org/json	185	48de10dec6a95510	185	851c1795ce586272	764.6
+web_fetch|pull the raw README from https://raw.githubusercontent.com/tokio-rs/tokio/master/README.md	309	7ee05aa9dae5e214	309	8229244e282e3f37	765.0
+web_fetch|read what's on https://en.wikipedia.org/wiki/Ferris_wheel	194	915014e6f8ac6660	194	eb244ed329e411a4	765.1
+web_fetch|retrieve https://api.github.com/repos/rust-lang/rust	185	33d09971255f35bc	185	0a9aa3dd0afc5f8c	769.8
+web_fetch|summarize the article at https://blog.rust-lang.org/2024/01/01/announcement.html	253	9a0887d1d2ea87fa	253	5ef8840a4ed845b6	765.6
+web_search|find recent news about the James Webb telescope	219	e35ef35f5331b1bd	219	5b25e4421e9695af	767.8
+web_search|find the official documentation for the tokio crate	354	5f6b02338266f4a9	354	d1a4a8e40d3f856c	764.7
+web_search|look up the current population of Canada	729	626d4a3179290fd6	729	7de8858f2813fef1	764.8
+web_search|search for how to configure nginx as a reverse proxy	380	90f37288e4804fce	380	c76cce7211a6b1ff	765.7
+web_search|search for vegetarian ramen recipes	129	a5de86c2618c90f7	129	292d84097e23bd1f	766.8
+web_search|search the web for the latest Rust async runtime benchmarks	289	2d968ff14742fe80	289	cff326ac118aa671	765.7
+web_search|what are the reviews saying about the new Framework laptop	337	da28e7137883ee18	337	794953aea4d75d16	766.8
+web_search|who won the Formula 1 race last weekend	254	f0ec296d83c86c11	254	bfe60e7d00465c4b	764.4
+write|can you save a shell script to /workspace/scripts/deploy.sh that just echoes "deploying"	1030	d06eb7c3a19aa14b	1030	f52b1b4bcd4e09ac	761.9
+write|create /workspace/README.md with the title '# Acme API'	201	bfa4273534370de1	201	5f71d5d6c032220d	766.9
+write|create /workspace/data/users.json containing exactly an empty JSON object: {}	231	0139ba2380814ca2	231	da90f61d98b27656	765.4
+write|create the file /workspace/config.toml with a basic logging section	361	bbdab2b54c2ec159	361	e73809dcfdfb8c59	765.2
+write|drop a .gitignore at /workspace/.gitignore that ignores target/ and *.log	312	489812089c389e51	312	dccea4981a79a33d	767.7
+write|overwrite /workspace/VERSION so it contains only the text 2.4.1	167	13e6ae4130764dc1	167	49d6b571fcb893f6	766.4
+write|put a Dockerfile in /workspace/Dockerfile starting FROM rust:1.79 as the base image	707	0c961c4bd659d611	707	c31e0d05bfaf7b28	761.3
+write|write 'hello world' to /workspace/notes/greeting.txt	184	fc33548f2365f1af	184	42a691f58de7989b	765.6

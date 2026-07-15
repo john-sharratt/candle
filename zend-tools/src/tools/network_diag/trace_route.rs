@@ -9,9 +9,12 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TraceRequest {
+    /// Hostname or IP address to trace the route to.
     #[validate(length(min = 1))]
     pub host: String,
+    /// Maximum number of hops to probe. Defaults to 30.
     pub max_hops: Option<u32>,
+    /// Per-hop probe timeout in seconds. Uses the OS default if omitted.
     pub timeout_sec: Option<u32>,
 }
 
@@ -46,15 +49,27 @@ impl Tool for TraceRoute {
     fn run(_ctx: &ToolContext, req: TraceRequest) -> Result<TraceResponse, DiagError> {
         let max_hops = req.max_hops.unwrap_or(30);
 
+        // tracert takes the per-hop wait in milliseconds (-w); traceroute takes it
+        // in seconds (-w). Only pass it when the caller specified one.
         #[cfg(target_os = "windows")]
-        let output = std::process::Command::new("tracert")
-            .args(["-h", &max_hops.to_string(), &req.host])
-            .output();
+        let output = {
+            let mut cmd = std::process::Command::new("tracert");
+            cmd.args(["-h", &max_hops.to_string()]);
+            if let Some(t) = req.timeout_sec {
+                cmd.args(["-w", &(t * 1000).to_string()]);
+            }
+            cmd.arg(&req.host).output()
+        };
 
         #[cfg(not(target_os = "windows"))]
-        let output = std::process::Command::new("traceroute")
-            .args(["-m", &max_hops.to_string(), &req.host])
-            .output();
+        let output = {
+            let mut cmd = std::process::Command::new("traceroute");
+            cmd.args(["-m", &max_hops.to_string()]);
+            if let Some(t) = req.timeout_sec {
+                cmd.args(["-w", &t.to_string()]);
+            }
+            cmd.arg(&req.host).output()
+        };
 
         let output = output.map_err(|e| DiagError::Failed(e.to_string()))?;
         let raw = String::from_utf8_lossy(&output.stdout).into_owned();
