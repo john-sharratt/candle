@@ -31,10 +31,10 @@ pub mod selection;
 pub mod wide_sig;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
-pub use gather::{belief_step, score_slots, SlotBelief};
+pub use gather::{belief_step, score_slots, score_slots_weighted, SlotBelief};
 pub use gpu::{score_batched_gpu, BatchedGpuGallery};
 pub use packed::{score_packed, PackedGallery};
 pub use raw_store::extract_q_vector_r16;
-pub use scan::score_provenance_late_fusion;
+pub use scan::{score_provenance_late_fusion, score_provenance_late_fusion_weighted};
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
 pub use wide_sig::{decode_wide_sigs, encode_wide_sigs, fold_provenance, WideQSig};

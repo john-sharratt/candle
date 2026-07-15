@@ -829,8 +829,8 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
                 .map(|r| format!("{r:?}"))
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "          {}/{} #{} {} {:<12} ({} tok)  why={}",
-                t.layer, t.group, t.index, t.role, src, t.tokens, why
+                "          {}/{} #{} {} {:<12} ({} tok)  score={:>8.2}  why={}",
+                t.layer, t.group, t.index, t.role, src, t.tokens, t.score, why
             );
         }
     }

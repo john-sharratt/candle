@@ -2252,10 +2252,11 @@ pub struct ConvEntry {
     /// sidebar hides archived entries by default; the "show archived"
     /// checkbox toggles them back in via `?include_archived=true`.
     pub archived: bool,
-    /// Last-activity timestamp (ms since epoch) used by the sidebar to sort
-    /// newest-first. Derived from the `conv_id`, which encodes its creation
-    /// time (the client mints `Date.now()`-style ids); `0` when the id is not
-    /// numeric.
+    /// Creation-order rank used by the sidebar to sort newest-first. This is a
+    /// monotonic counter (`TimelineEntry::order`), NOT a millisecond clock — the
+    /// `conv_id` is a random u64 with no time information, so the substrate
+    /// stamps each conversation an increasing rank in redo-log (creation) order.
+    /// The wire name is kept for the frontend's existing sort key.
     pub updated_ms: u64,
 }
 
@@ -2421,20 +2422,25 @@ impl ZendSession {
         let mut entries: Vec<ConvEntry> = engine
             .known_conversations()
             .into_iter()
-            .filter(|(tl, _, _, _)| *tl != titler_timeline)
-            .filter(|(_, _, _, archived)| include_archived || !*archived)
-            .map(|(tl, conv_id, label, archived)| {
-                let updated_ms = conv_id.parse::<u64>().unwrap_or(0);
+            .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
+            .filter(|(_, _, _, archived, _)| include_archived || !*archived)
+            .map(|(tl, conv_id, label, archived, order)| {
+                // `order` is creation rank (see `TimelineEntry::order`) — the
+                // conv_id itself is a random u64 and carries no time. The field
+                // is named `updated_ms` for the wire, but it is a monotonic
+                // rank, not a millisecond clock; the sidebar only ever sorts on
+                // it, never displays it as a time.
                 ConvEntry {
                     id: conv_id,
                     label,
                     turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
                     archived,
-                    updated_ms,
+                    updated_ms: order,
                 }
             })
             .collect();
-        entries.sort_by(|a, b| b.id.cmp(&a.id));
+        // Newest-created first.
+        entries.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
         entries
     }
 
@@ -3369,7 +3375,7 @@ mod projection_schema_tests {
     use std::path::Path;
 
     /// The shipped `projection.yaml` parses, and the reconstructed repo map is
-    /// capped and floored: `structure` is a `top_k(2)` group with a `"."`
+    /// capped and floored: `structure` is a `top_k(3)` group with a `"."`
     /// default so the workspace-root cluster always survives selection.
     #[test]
     fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
@@ -3380,8 +3386,8 @@ mod projection_schema_tests {
         let group = builder.group(structure).expect("group schema present");
 
         match &group.selection {
-            SelectionRule::TopK { k } => assert_eq!(*k, 2, "repo map capped at 2 clusters"),
-            other => panic!("structure should be top_k(2), got {other:?}"),
+            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 clusters"),
+            other => panic!("structure should be top_k(3), got {other:?}"),
         }
         assert_eq!(
             group.default.as_ref().map(|d| d.tag.as_str()),

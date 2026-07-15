@@ -15,7 +15,7 @@
 //! See `docs/tool_selection_provenance_results.md` §24.
 
 use super::selection::{GroupBudget, SectionPolicy, SectionSelector};
-use super::{score_provenance_late_fusion, WideQSig};
+use super::{score_provenance_late_fusion_weighted, WideQSig};
 
 /// One slot's belief after a step: its confidence and whether it is selected.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,6 +37,18 @@ pub fn score_slots(
     gallery_slot: &[usize],
     n_slots: usize,
 ) -> Vec<f32> {
+    score_slots_weighted(query, gallery_windows, gallery_slot, n_slots, &[])
+}
+
+/// [`score_slots`] with a per-layer-group weight on the vote (see
+/// [`score_provenance_late_fusion_weighted`]). `group_weights` empty ⇒ uniform.
+pub fn score_slots_weighted(
+    query: &[WideQSig],
+    gallery_windows: &[&[WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    group_weights: &[f32],
+) -> Vec<f32> {
     let total: usize = gallery_windows.iter().map(|w| w.len()).sum();
     let mut gtoks: Vec<&WideQSig> = Vec::with_capacity(total);
     let mut gcase: Vec<u32> = Vec::with_capacity(total);
@@ -50,7 +62,7 @@ pub fn score_slots(
             gcase.push(slot as u32);
         }
     }
-    score_provenance_late_fusion(query, &gtoks, &gcase, n_slots)
+    score_provenance_late_fusion_weighted(query, &gtoks, &gcase, n_slots, group_weights)
 }
 
 /// One online belief update: reseed from the prior projection (`prior_scores` +

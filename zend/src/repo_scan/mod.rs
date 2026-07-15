@@ -36,6 +36,48 @@ fn cluster_tags(cluster: &Cluster) -> Vec<String> {
     vec!["repo_map".to_string(), root]
 }
 
+/// Text marker inserted at each sub-window seam of a cluster listing. Stripped
+/// before prefill (pure text op in `insert_turn_staged_windowed`), so its exact
+/// value only needs to never occur naturally in a file listing.
+const SEAM_MARKER: &str = "<|repo-seam|>";
+
+/// Files per flat-run sub-window before forcing a seam. ~8 file lines ≈ 100–150
+/// tokens — small enough that a distinctive filename isn't diluted, large enough
+/// not to explode the candidate count on the reproject scan.
+const FILES_PER_WINDOW: usize = 8;
+
+/// Insert `marker` into a cluster listing at structural seams: before every
+/// directory-header line (a line that is not a `  - file` item), and every
+/// `files_per_window` file lines within a flat run. The first line never gets a
+/// leading seam. Removing every `marker` reproduces the input **line-for-line**
+/// (line endings normalized to `\n`, one trailing `\n`); the marker-stripped text
+/// is what gets prefilled and what the wide-Q sig is captured over, so the seam
+/// offsets and the sig share one consistent tokenization — only the recorded
+/// sub-window offsets are added on top of the plain listing.
+fn insert_seams(listing: &str, marker: &str, files_per_window: usize) -> String {
+    let mut out = String::with_capacity(listing.len() + marker.len() * 8);
+    let mut files_since_seam = 0usize;
+    for (li, line) in listing.lines().enumerate() {
+        let is_file = line.trim_start().starts_with("- ");
+        let is_dir_header = !is_file && !line.trim().is_empty();
+        if li > 0 {
+            if is_dir_header {
+                out.push_str(marker);
+                files_since_seam = 0;
+            } else if is_file && files_since_seam >= files_per_window {
+                out.push_str(marker);
+                files_since_seam = 0;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        if is_file {
+            files_since_seam += 1;
+        }
+    }
+    out
+}
+
 /// Strip auto-summarization from a [`SequenceConfig`] before using
 /// it to mint a utility-layer conversation (repo_map, code_reading).
 ///
@@ -180,9 +222,17 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
             );
             continue;
         }
-        sink.insert_prefill_turn(
+        // Seam the listing at structural boundaries (directory headers, and every
+        // FILES_PER_WINDOW files within a flat run) so each region becomes a
+        // self-referencing retrieval sub-window that resolves back to this cluster.
+        // A query naming a file/subdir then matches a focused ~100-token window
+        // instead of drowning in the whole listing. The markers are stripped before
+        // prefill — the sealed content is byte-identical to `cluster.listing`.
+        let seamed = insert_seams(&cluster.listing, SEAM_MARKER, FILES_PER_WINDOW);
+        sink.insert_prefill_turn_windowed(
             &cluster.user_prompt,
-            &cluster.listing,
+            &seamed,
+            SEAM_MARKER,
             cluster_tags(cluster),
         )?;
         // Discrete, escaping-safe descriptive fields keyed by cluster root —

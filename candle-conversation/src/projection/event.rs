@@ -265,6 +265,18 @@ pub struct ProjectionEvent {
     /// builder (the panel then falls back to reconstructing the framing).
     #[serde(default)]
     pub materialized: Vec<MaterializedPiece>,
+    /// When `true`, this event marks a **self-referencing retrieval sub-window**:
+    /// the belief scan bounds the interval `[start_token, next_start_token)` as one
+    /// focused window, but tags every window of a turn with the SAME slot, so the
+    /// scorer aggregates them into ONE case (best-token agreement across the whole
+    /// turn) rather than letting the regions compete as separate cases and split
+    /// the turn's vote. So a query matching one structural region of a prefilled
+    /// listing (a subdirectory of a repo_map cluster) surfaces the whole cluster
+    /// without diluting against the rest of the listing. Ordinary reprojection /
+    /// staged-ingest events leave it `false` — their target is their `selection`,
+    /// and the turn is scored as one window.
+    #[serde(default)]
+    pub self_reference: bool,
 }
 
 /// One classified segment before aggregation — `(kind, label, tokens)`.
@@ -314,6 +326,7 @@ pub fn aggregate(
         buckets,
         selection: ProjectionSelection::default(),
         materialized: Vec::new(),
+        self_reference: false,
     }
 }
 
@@ -365,6 +378,7 @@ pub fn staged_ingest_event(
         buckets,
         selection: ProjectionSelection { system, turns },
         materialized: Vec::new(),
+        self_reference: false,
     }
 }
 
@@ -426,6 +440,7 @@ pub fn summary_node_event(
             turns,
         },
         materialized: Vec::new(),
+        self_reference: false,
     }
 }
 

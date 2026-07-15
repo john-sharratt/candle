@@ -193,23 +193,33 @@ impl PolicyConfig {
 pub struct SelectionPolicy {
     pub config: PolicyConfig,
     pub tags: Vec<String>,
+    /// Per-layer-group weights on the belief scorer's `z × margin` vote
+    /// (`layer_weights[g]` scales fold-group `g`; missing / empty ⇒ uniform 1.0).
+    /// The fold is `[46, 1, 1]` (§ `wide_sig`): group 0 = L0–45, group 1 = L46,
+    /// group 2 = L47. Tools keep uniform weighting (their identity is spread across
+    /// the upper groups); repo_map peaks on group 1 (L46), where cluster identity
+    /// concentrates — see `docs/tool_selection_provenance_results.md` §83. Set via
+    /// the node's `policy.layer_weights` in the YAML.
+    pub layer_weights: Vec<f32>,
 }
 
 impl SelectionPolicy {
     /// The schema-wide default when no node up the inheritance chain declares a
-    /// policy: the committed tool scope, unrestricted tag scope.
+    /// policy: the committed tool scope, unrestricted tag scope, uniform layers.
     pub fn default_policy() -> SelectionPolicy {
         SelectionPolicy {
             config: PolicyPreset::CommittedToolScope.config(),
             tags: Vec::new(),
+            layer_weights: Vec::new(),
         }
     }
 
-    /// A policy from a preset with unrestricted scope.
+    /// A policy from a preset with unrestricted scope and uniform layer weights.
     pub fn from_preset(preset: PolicyPreset) -> SelectionPolicy {
         SelectionPolicy {
             config: preset.config(),
             tags: Vec::new(),
+            layer_weights: Vec::new(),
         }
     }
 }

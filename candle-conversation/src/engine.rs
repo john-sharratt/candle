@@ -603,9 +603,10 @@ impl ConversationEngine {
     }
 
     /// Every conversation the workspace substrate knows about —
-    /// `(timeline, conv_id, label, archived)` quads. Drives the
-    /// daemon's `GET /v1/conversations` sidebar listing directly.
-    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
+    /// `(timeline, conv_id, label, archived, order)` tuples, where `order`
+    /// is the creation-order rank ([`crate::substrate::TimelineEntry::order`]).
+    /// Drives the daemon's `GET /v1/conversations` sidebar listing directly.
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.conversation.known_conversations()
     }
 

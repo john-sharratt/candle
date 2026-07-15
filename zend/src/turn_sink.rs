@@ -32,6 +32,24 @@ pub trait InsertTurnSink {
         tags: Vec<String>,
     ) -> anyhow::Result<usize>;
 
+    /// Like [`Self::insert_prefill_turn`], but `assistant` carries `seam_marker`s
+    /// at structural boundaries (e.g. subdirectory headers). Each becomes a
+    /// self-referencing projection event so the listing's regions are
+    /// independently retrievable (see
+    /// `Conversation::insert_turn_staged_windowed`). Default: strip the markers and
+    /// fall back to a plain prefill — a sink without projection-event storage keeps
+    /// the turn, just not the sub-window seams.
+    fn insert_prefill_turn_windowed(
+        &mut self,
+        user: &str,
+        assistant_with_seams: &str,
+        seam_marker: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()> {
+        self.insert_prefill_turn(user, &assistant_with_seams.replace(seam_marker, ""), tags)?;
+        Ok(())
+    }
+
     /// Prefill every `(user, assistant)` scope of one file **in parallel** — each
     /// on its own scratch slot so the file's scopes (and scopes across
     /// concurrently-ingesting files) batch into large amortising forwards instead
@@ -90,6 +108,18 @@ impl<'a> SequenceTurnSink<'a> {
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
+    fn insert_prefill_turn_windowed(
+        &mut self,
+        user: &str,
+        assistant_with_seams: &str,
+        seam_marker: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .insert_turn_staged_windowed(user, assistant_with_seams, seam_marker, tags)
+            .map_err(|e| anyhow::anyhow!("insert_turn_staged_windowed: {e}"))
+    }
+
     fn insert_prefill_turn(
         &mut self,
         user: &str,

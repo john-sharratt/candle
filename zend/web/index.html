@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Zend</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
@@ -84,6 +84,14 @@
   .zmd .think-body { margin: .45rem 0 .2rem .15rem; padding-left: .9rem; border-left: 2px solid #2e2b27; color: #8a8074; font-size: .9em; line-height: 1.65; }
   .zmd .think-body p { margin-bottom: .5rem; } .zmd .think-body p:last-child { margin-bottom: 0; }
   .zmd .think-body code { font-size: .8em; }
+  /* Streaming think: a non-collapsible header (no chevron/pointer — expansion is
+     only offered once the block is complete) plus a word ticker that rolls the
+     most recent thoughts through a bright centre band, showing progress + speed. */
+  .zmd .think-streaming { margin: .1rem 0 .9rem; }
+  .zmd .think-head { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; }
+  .zmd .think-ticker { width: 20rem; max-width: 55vw; overflow: hidden; white-space: nowrap; font-size: .8rem; line-height: 1.5; color: #8a8074; opacity: .6;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent);
+            mask-image: linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent); }
   .zmd .zdots { display: inline-flex; gap: 5px; align-items: center; margin-left: 6px; }
   .zmd .zdots i { width: 7px; height: 7px; border-radius: 50%; background: #5a5652; display: inline-block; animation: zdot 1.3s ease-in-out infinite; }
   .zmd .zdots i:nth-child(2) { animation-delay: .22s; } .zmd .zdots i:nth-child(3) { animation-delay: .44s; }
@@ -119,7 +127,10 @@
   .z-load-list li::before { content: '✓'; color: #34d399; font-weight: 700; }
   .z-load-detail { font-size: .82rem; color: #5e554c; margin-top: .6rem; min-height: 1.2em; font-variant-numeric: tabular-nums; }
   @media (max-width: 1024px) { .z-logs { width: 280px !important; } }
-  @media (max-width: 720px) {
+  /* Mobile overrides fire at the same 820px the JS uses for its narrow layout
+     (NARROW_W) so there's no dead-band where the layout is narrow but modals/logs
+     still render desktop-style. */
+  @media (max-width: 820px) {
     .z-sb { position: fixed !important; left: 0; top: 0; bottom: 0; width: 82vw !important; max-width: 320px; z-index: 130 !important; box-shadow: 6px 0 34px rgba(0,0,0,0.55); }
     .z-rsz-l, .z-rsz-r { display: none !important; }
     .z-logs { position: fixed !important; inset: 0 !important; width: auto !important; z-index: 140 !important; }
@@ -219,6 +230,7 @@
     loaded: {},
     showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
     sidebarCollapsed: false,
+    sidebarDrawer: false,   // narrow only: the conversation list open as an overlay drawer
     narrow: (typeof window !== 'undefined' && window.innerWidth < NARROW_W),
     wide: (typeof window !== 'undefined' && window.innerWidth >= WIDE_W),
     sidebarW: 220,
@@ -321,6 +333,9 @@
     const open = !!S.thinkOpen[conv.id + ':' + idx];
     zmd.innerHTML = nodeHtml(m, open);
     if (!S.narrow) applyProjSegments(zmd, m);
+    // Keep any live thinking ticker scrolled to its tail so the newest words sit at
+    // the right and roll leftward through the fade as more stream in.
+    zmd.querySelectorAll('.think-ticker').forEach((t) => { t.scrollLeft = t.scrollWidth; });
     // Follow the bottom only while the user hasn't scrolled away; keep
     // lastScrollTop in sync so this programmatic move isn't read as a scroll-up.
     if (stick) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; }
@@ -480,21 +495,34 @@
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
   }
+  const THINK_BRAIN = '<svg class="think-brain" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M12.4 18.4C12.5 19.8 12.2 21 12.6 22L13.8 22C14 21 13.8 19.6 14 18.4 15.1 18.8 16.4 18.6 17 17.6 18.4 17.6 19.4 16.3 19.2 14.9 20.3 14.4 20.6 13 19.8 12.1 20.5 11.2 20.4 9.8 19.3 9.4 19.3 7.9 18 6.8 16.5 7 16 5.9 14.6 5.4 13.4 5.9 12.7 5 11.3 5 10.5 5.7 9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 11 18.5 11.8 18.4 12.4 18.4Z" fill="#f3d2bd" stroke="#3f2c25" stroke-width="0.9"/>' +
+    '<path d="M10.5 5.7C9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 10.7 14.5 10.6 9.4 10.5 5.7Z" fill="#e8917f" stroke="#3f2c25" stroke-width="0.9"/>' +
+    '</svg>';
   function renderThink(seg, open) {
+    // Still thinking: a NON-collapsible header (no chevron, no click toggle — the
+    // expand affordance is withheld until the block finishes, since it can't expand
+    // mid-stream anyway) plus a ticker of the most recent words, right-pinned so
+    // new words roll leftward through the mask's bright centre band.
+    if (!seg.complete) {
+      const w = (seg.body || '').trim().split(/\s+/).filter(Boolean);
+      const tick = esc(w.slice(-24).join(' '));
+      return '<div class="think-block think-streaming"><div class="think-head">' +
+        THINK_BRAIN +
+        '<span class="think-label think-pulse">Thinking…</span>' +
+        '<div class="think-ticker">' + tick + '</div>' +
+        '</div></div>';
+    }
+    // Finished: the collapsible block, expandable/collapsible as before.
     const words = (seg.body || '').trim().split(/\s+/).filter(Boolean).length;
-    const label = (seg.complete ? 'Thought process' : 'Thinking…') + ' · ' + words + (words === 1 ? ' word' : ' words');
-    const labelCls = seg.complete ? '' : ' think-pulse';
+    const label = 'Thought process · ' + words + (words === 1 ? ' word' : ' words');
     const body = renderMd((seg.body || '').trim());
     // Carry the think's raw char range so applyProjSegments can split its bar
-    // proportionally when several projections fired inside it (completed only).
-    const range = (seg.complete && seg.c0 != null) ? ' data-c0="' + seg.c0 + '" data-c1="' + seg.c1 + '"' : '';
+    // proportionally when several projections fired inside it.
+    const range = (seg.c0 != null) ? ' data-c0="' + seg.c0 + '" data-c1="' + seg.c1 + '"' : '';
     return '<details class="think-block"' + range + (open ? ' open' : '') + '>' +
-      '<summary class="think-summary">' +
-      '<svg class="think-brain" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M12.4 18.4C12.5 19.8 12.2 21 12.6 22L13.8 22C14 21 13.8 19.6 14 18.4 15.1 18.8 16.4 18.6 17 17.6 18.4 17.6 19.4 16.3 19.2 14.9 20.3 14.4 20.6 13 19.8 12.1 20.5 11.2 20.4 9.8 19.3 9.4 19.3 7.9 18 6.8 16.5 7 16 5.9 14.6 5.4 13.4 5.9 12.7 5 11.3 5 10.5 5.7 9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 11 18.5 11.8 18.4 12.4 18.4Z" fill="#f3d2bd" stroke="#3f2c25" stroke-width="0.9"/>' +
-      '<path d="M10.5 5.7C9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 10.7 14.5 10.6 9.4 10.5 5.7Z" fill="#e8917f" stroke="#3f2c25" stroke-width="0.9"/>' +
-      '</svg>' +
-      '<span class="think-label' + labelCls + '">' + label + '</span>' +
+      '<summary class="think-summary">' + THINK_BRAIN +
+      '<span class="think-label">' + label + '</span>' +
       '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
       '</summary><div class="think-body">' + body + '</div></details>';
   }
@@ -586,7 +614,7 @@
   function addLog(line) { if (!line) return; logs = logs.concat([line]).slice(-600); renderLogsOnly(); }
 
   // ── actions ──────────────────────────────────────────────────────────────
-  function selectConv(id) { writeHashConv(id); setState({ activeId: id }, () => { hydrateIfNeeded(id); scrollChat(); focusPrompt(); }); }
+  function selectConv(id) { writeHashConv(id); setState({ activeId: id, sidebarDrawer: false }, () => { hydrateIfNeeded(id); scrollChat(); if (!S.narrow) focusPrompt(); }); }
   function hydrateIfNeeded(id) {
     const conv = S.conversations.find((c) => c.id === id);
     if (!conv || S.loaded[id]) return;
@@ -617,7 +645,7 @@
       if (S.activeId === id) scrollChat();
     });
   }
-  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '' }, focusPrompt); }
+  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false }, focusPrompt); }
   function archiveConv(id, e) {
     if (e) e.stopPropagation();
     API.archiveConversation(id);
@@ -660,7 +688,11 @@
     target = activeId !== null ? conversations.find((c) => c.id === activeId) : null;
     if (!target) {
       const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
-      target = { id, title: titleOf(text), archived: false, updated_ms: Date.now(), turn_count: 0, history: [], files: [] };
+      // updated_ms is a creation-order rank (see the daemon's TimelineEntry::order),
+      // not a clock. Seat a brand-new conversation just above the current top so it
+      // leads the list; the server's rank (also the new max) keeps it there after hydrate.
+      const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
+      target = { id, title: titleOf(text), archived: false, updated_ms: topRank + 1, turn_count: 0, history: [], files: [] };
       conversations = [target].concat(conversations);
       activeId = id;
       S.loaded[id] = true;
@@ -884,6 +916,13 @@
     setState({ upload: { convId: conv.id, items, handle, phases, stats }, dragActive: false });
   }
   function cancelUpload() { if (S.upload && S.upload.handle) S.upload.handle.cancel(); setState({ upload: null }); }
+  // Attach-button (mobile) path: the hidden file input's picked files feed the same
+  // uploader as drag-and-drop. Reset value so re-picking the same file still fires.
+  function onPickFiles(e) {
+    const list = (e.target && e.target.files) ? [].slice.call(e.target.files) : [];
+    if (list.length) startUpload(list);
+    if (e.target) e.target.value = '';
+  }
 
   function openFile(file) {
     setState({ fileView: Object.assign({}, file) });
@@ -980,7 +1019,11 @@
     promptEl = chatEl = logEl = filesListEl = substrateEl = null;
 
     const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
-    const layout = h('div', { style: 'display:flex; height:100vh; width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
+    // 100dvh (dynamic viewport) not 100vh: on mobile 100vh is the tall viewport
+    // with the address bar hidden, which pushes the composer under the browser's
+    // bottom bar and lets the top pills drift as the bar shows/hides. dvh tracks
+    // the actually-visible height; the vh line is a fallback for old browsers.
+    const layout = h('div', { style: 'display:flex; height:100vh; height:100dvh; width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
 
     if (!S.sidebarCollapsed && !S.narrow) { layout.appendChild(buildSidebarExpanded()); layout.appendChild(buildResizer('l')); }
     else layout.appendChild(buildSidebarRail());
@@ -990,6 +1033,12 @@
     if (S.logsOpen) { layout.appendChild(buildResizer('r')); layout.appendChild(buildLogs()); }
 
     const overlays = [];
+    // Narrow: the conversation list opens as a fixed drawer over the chat (there's
+    // no room to dock it), dismissed by tapping the backdrop.
+    if (S.narrow && S.sidebarDrawer) {
+      overlays.push(h('div', { onClick: () => setState({ sidebarDrawer: false }), style: 'position:fixed; inset:0; z-index:40; background:rgba(0,0,0,0.5);' }));
+      overlays.push(buildSidebarExpanded(true));
+    }
     if (S.fileView) overlays.push(buildFileViewer());
     if (S.substrateOpen) overlays.push(buildSubstrate());
     if (S.upload) overlays.push(buildUploadModal());
@@ -1015,8 +1064,13 @@
   }
 
   // ── sidebar (expanded) ──────────────────────────────────────────────────
-  function buildSidebarExpanded() {
+  function buildSidebarExpanded(drawer) {
     const convs = visibleConvs();
+    // Drawer mode (narrow): a fixed overlay sized to the phone rather than a docked
+    // column, closed via the collapse button or the backdrop.
+    const w = drawer ? Math.min(300, Math.round((typeof window !== 'undefined' ? window.innerWidth : 360) * 0.82)) : S.sidebarW;
+    const pos = drawer ? 'position:fixed; top:0; left:0; bottom:0; z-index:41; box-shadow:0 6px 44px rgba(0,0,0,0.65);' : 'height:100%;';
+    const closeSidebar = drawer ? () => setState({ sidebarDrawer: false }) : () => setState({ sidebarCollapsed: true });
     const rows = convs.map((c) => {
       const active = c.id === S.activeId;
       return h('button', {
@@ -1030,12 +1084,12 @@
           : h('span', { 'data-act': 'archive', title: 'Archive conversation', onClick: (e) => archiveConv(c.id, e), style: 'flex-shrink:0; width:20px; height:20px; border-radius:4px; color:#8197ad; font-size:14px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; margin-left:3px; opacity:0.85;' }, '×')
       );
     });
-    return h('div', { class: 'zscroll-blue z-sb', style: 'width:' + S.sidebarW + 'px; flex-shrink:0; height:100%; display:flex; flex-direction:column; background:#1e2a3a; color:#c0ccd8;' },
+    return h('div', { class: 'zscroll-blue z-sb', style: 'width:' + w + 'px; flex-shrink:0; ' + pos + ' display:flex; flex-direction:column; background:#1e2a3a; color:#c0ccd8;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:0.9rem 0.8rem 0.75rem; border-bottom:1px solid #2a3848; background:#19222f;' },
         h('div', { style: 'display:flex; align-items:center; gap:0.5rem; font-size:0.82rem; font-weight:650; color:#d0dae4;', html: starLogo(22, '#1a1714') + '<span>&nbsp;Zend</span>' }),
         h('div', { style: 'display:flex; align-items:center; gap:5px;' },
           iconBtn('M7 2v10M2 7h10', 'New conversation', newConv, 27),
-          iconBtn('M9 2L4 7l5 5', 'Collapse sidebar', () => setState({ sidebarCollapsed: true }), 27))),
+          iconBtn('M9 2L4 7l5 5', drawer ? 'Close' : 'Collapse sidebar', closeSidebar, 27))),
       h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; overflow-y:auto; padding:0 0.4rem 0.5rem;' },
         convs.length ? rows : [h('div', { style: 'padding:1rem 0.9rem; font-size:0.775rem; color:#4a6278;' }, 'No conversations yet.')]),
       h('div', { style: 'flex-shrink:0; padding:0.55rem 0.85rem 0.65rem; border-top:1px solid #2a3848; background:#19222f;' },
@@ -1046,7 +1100,7 @@
   function buildSidebarRail() {
     const convs = visibleConvs();
     return h('div', { class: 'z-rail', style: 'width:56px; flex-shrink:0; height:100%; display:flex; flex-direction:column; align-items:center; gap:7px; padding:0.7rem 0; background:#1e2a3a; color:#c0ccd8; border-right:1px solid #2a3848;' },
-      iconBtn('M2 4h12M2 8h12M2 12h12', 'Expand sidebar', () => setState({ sidebarCollapsed: false }), 34),
+      iconBtn('M2 4h12M2 8h12M2 12h12', 'Expand sidebar', () => setState(S.narrow ? { sidebarDrawer: true } : { sidebarCollapsed: false }), 34),
       iconBtn('M7 2v10M2 7h10', 'New conversation', newConv, 34),
       h('div', { style: 'width:24px; height:1px; background:#2a3848; flex-shrink:0; margin:1px 0 2px;' }),
       h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; width:100%; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:6px;' },
@@ -1415,7 +1469,7 @@
   function buildComposer() {
     const conv = activeConv();
     const inputArchived = !!(conv && conv.archived);
-    const wrap = h('div', { style: 'flex-shrink:0; position:relative; padding:0 2rem 1.5rem; background:#1c1917;' },
+    const wrap = h('div', { style: 'flex-shrink:0; position:relative; padding:0 ' + (S.narrow ? '0.85rem' : '2rem') + ' calc(1.5rem + env(safe-area-inset-bottom)); background:#1c1917;' },
       h('div', { style: 'position:absolute; top:-2rem; left:0; right:0; height:2rem; background:linear-gradient(to bottom, transparent, #1c1917); pointer-events:none;' }));
     if (inputArchived) {
       wrap.appendChild(h('div', { style: 'text-align:center; color:#5a5652; font-size:0.85rem; font-style:italic; padding:0.9rem 1rem; border:1px dashed #38342f; border-radius:14px; background:rgba(35,33,32,0.6);' }, 'This conversation is archived.'));
@@ -1439,6 +1493,11 @@
       ? h('button', { 'aria-label': 'Stop', title: 'Stop generating', onClick: stopStream, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:#3a352f; color:#e2d9cd; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>' })
       : h('button', { 'aria-label': 'Send', onClick: () => send(S.promptValue), disabled: !ready, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:' + ACCENT + '; color:#fff; cursor:' + (ready ? 'pointer' : 'default') + '; display:flex; align-items:center; justify-content:center; opacity:' + (ready ? 1 : 0.3) + '; padding:0;', html: '<svg viewBox="0 0 16 16" fill="none" style="width:14px;height:14px;"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
 
+    // Touch devices can't drag-and-drop, so an attach button drives a hidden file
+    // input (the desktop drop zone stays). The button closes over its own input.
+    const fileInput = h('input', { type: 'file', multiple: true, onChange: onPickFiles, style: 'display:none;' });
+    const attachBtn = h('button', { 'aria-label': 'Attach files', title: 'Attach files', onClick: () => fileInput.click(), style: 'flex-shrink:0; width:32px; height:32px; border-radius:9px; border:1px solid #38342f; background:#232120; color:#8a8074; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>' });
+
     const box = h('div', { style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
       ta,
       h('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:0.5rem; margin-top:0.3rem;' },
@@ -1449,9 +1508,11 @@
           buildDial('verbosity'),
           h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'tools'),
           buildDial('tools')),
-        h('div', { style: 'display:flex; align-items:center; gap:0.65rem;' },
+        h('div', { style: 'display:flex; align-items:center; gap:0.55rem;' },
           h('span', { class: 'z-sendhint', style: 'font-size:0.72rem; color:#5a5652; white-space:nowrap;' }, sendHint),
-          sendBtn)));
+          attachBtn,
+          sendBtn,
+          fileInput)));
     wrap.appendChild(box);
     return wrap;
   }
@@ -1460,31 +1521,42 @@
     '<path d="m15 12-8.5 8.5a2.12 2.12 0 1 1-3-3L12 9"/>' +
     '<path d="M17.64 15 22 10.64"/>' +
     '<path d="m20.91 11.7-1.25-1.25c-.6-.6-.93-1.4-.93-2.25v-.86L16.01 4.6a5.56 5.56 0 0 0-3.94-1.64H9l.92.82A6.18 6.18 0 0 1 12 8.4v1.56l2 2h.86c.85 0 1.65.33 2.25.93l1.25 1.25"/></svg>';
+  // Compact glyphs for the narrow (mobile) dials — icon-only, tap to open the menu.
+  const GLYPH_BRAIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>';
+  const GLYPH_LINES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M4 6h16M4 12h16M4 18h10"/></svg>';
   const DIALS = {
-    effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', pref: 'zend.effort', ticksGrow: true },
-    verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false },
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'safe tools only', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, zeroable: true },
+    effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', pref: 'zend.effort', ticksGrow: true, glyph: GLYPH_BRAIN },
+    verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'safe tools only', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true },
   };
   function buildDial(which) {
     const d = DIALS[which];
     const lvl = S[d.key];
     const open = S.openMenu === which;
-    const ticks = [];
-    // `zeroable` dials (e.g. Tools) show one fewer bar than levels and light
-    // `lvl` of them, so level 0 lights none; ordinary dials show one bar per
-    // level and light through the current one (level 0 still lights the first).
-    const nBars = d.zeroable ? d.names.length - 1 : d.names.length;
-    for (let i = 0; i < nBars; i++) {
-      const lit = d.zeroable ? i < lvl : i <= lvl;
-      const ht = d.ticksGrow ? (4 + i * 1.8) : 10;
-      ticks.push(h('span', { style: 'width:2.5px; height:' + ht + 'px; border-radius:1px; background:' + (lit ? ACCENT : '#3a352f') + ';' }));
+    const onToggle = () => setState({ openMenu: open ? null : which });
+    let btn;
+    if (S.narrow) {
+      // Icon-only on mobile — tap to open the picker. Accent when the mode is on
+      // (any non-Off level), dim when off; the level name lives in the tooltip.
+      btn = h('button', { onClick: onToggle, title: d.label + ': ' + d.names[lvl], style: 'display:inline-flex; align-items:center; justify-content:center; width:34px; height:30px; border-radius:8px; border:1px solid ' + (open ? '#6a6258' : '#38342f') + '; background:' + (open ? '#2a2622' : '#1c1a18') + '; color:' + (lvl > 0 ? '#c9a26a' : '#6a625a') + '; cursor:pointer; padding:0;', html: d.glyph });
+    } else {
+      const ticks = [];
+      // `zeroable` dials (e.g. Tools) show one fewer bar than levels and light
+      // `lvl` of them, so level 0 lights none; ordinary dials show one bar per
+      // level and light through the current one (level 0 still lights the first).
+      const nBars = d.zeroable ? d.names.length - 1 : d.names.length;
+      for (let i = 0; i < nBars; i++) {
+        const lit = d.zeroable ? i < lvl : i <= lvl;
+        const ht = d.ticksGrow ? (4 + i * 1.8) : 10;
+        ticks.push(h('span', { style: 'width:2.5px; height:' + ht + 'px; border-radius:1px; background:' + (lit ? ACCENT : '#3a352f') + ';' }));
+      }
+      const kids = [];
+      if (d.icon) kids.push(h('span', { html: d.icon, style: 'display:inline-flex; align-items:center; color:#a89a86;' }));
+      kids.push(h('span', { style: 'display:inline-flex; align-items:' + (d.ticksGrow ? 'flex-end' : 'center') + '; gap:1.5px; height:11px;' }, ticks));
+      kids.push(d.names[lvl]);
+      btn = h('button', { onClick: onToggle, title: d.label, style: 'display:inline-flex; align-items:center; gap:0.42rem; height:27px; padding:0 0.62rem; border-radius:8px; border:1px solid #38342f; background:#1c1a18; color:#cfc8c0; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:500;' },
+        ...kids);
     }
-    const kids = [];
-    if (d.icon) kids.push(h('span', { html: d.icon, style: 'display:inline-flex; align-items:center; color:#a89a86;' }));
-    kids.push(h('span', { style: 'display:inline-flex; align-items:' + (d.ticksGrow ? 'flex-end' : 'center') + '; gap:1.5px; height:11px;' }, ticks));
-    kids.push(d.names[lvl]);
-    const btn = h('button', { onClick: () => setState({ openMenu: open ? null : which }), title: d.label, style: 'display:inline-flex; align-items:center; gap:0.42rem; height:27px; padding:0 0.62rem; border-radius:8px; border:1px solid #38342f; background:#1c1a18; color:#cfc8c0; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:500;' },
-      ...kids);
     const wrap = h('span', { style: 'position:relative; z-index:50;' }, btn);
     if (open) {
       wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },
