@@ -482,7 +482,7 @@ fn build_glue_meta(
     let n = write_slice.len();
     // Confirms the gap-fill forward took the paged-glue route (HD128) — one line
     // per reproject, under the scheduler's reproject log target.
-    tracing::info!(
+    tracing::trace!(
         target: "candle_conversation::scheduler::reproject",
         slots = pending.len(),
         total_glue = total,

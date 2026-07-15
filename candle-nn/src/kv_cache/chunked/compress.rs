@@ -43,6 +43,8 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
+use super::alloc::EvictionScope;
+#[cfg(feature = "cuda")]
 use super::arena::ArenaKey;
 #[cfg(feature = "cuda")]
 use super::backing::ChunkedKvBacking;
@@ -164,6 +166,13 @@ pub fn quantize_sealed_in_place(
     if sequences.is_empty() {
         return Ok(Vec::new());
     }
+
+    // This is a compress-to-free op: it allocates small transient quantized
+    // arenas, then frees the much larger float source. Enter the eviction scope
+    // so those arenas may draw from the dedicated eviction reserve even when the
+    // normal KV budget is exhausted — otherwise, under extreme pressure, the
+    // allocation fails and the cache can never reclaim VRAM (freeing needs VRAM).
+    let _evict = EvictionScope::enter();
 
     let cuda_dev = match device {
         Device::Cuda(d) => d,

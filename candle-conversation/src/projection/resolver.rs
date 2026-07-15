@@ -244,6 +244,39 @@ impl Conversation {
         TargetedRead::new(self.read_scored(scores), target)
     }
 
+    /// Bounded rolling-window view ranges for an append-only ingest — the
+    /// system-prompt blocks plus the most recent `window_turns` sealed turns of
+    /// `timeline` (design `docs/unified_wave_inference_engine.md` §4.7). Returned
+    /// as raw `(start_block, end_block)` pairs for the scheduler's view borrow.
+    ///
+    /// `window_turns == 0` (unbounded) or fewer sealed turns than the window
+    /// returns `[(0, total_blocks)]` — the whole parent, byte-for-byte the
+    /// unwindowed behaviour. Used only on the disable-reprojection ingest path
+    /// and only when `CANDLE_CODEREAD_WINDOW_TURNS > 0`; the KV-windowing effect
+    /// itself requires golden-token validation on a live model.
+    pub fn windowed_ingest_ranges(
+        &self,
+        timeline: TimelineId,
+        window_turns: usize,
+        total_blocks: usize,
+    ) -> Vec<(usize, usize)> {
+        let sub = self.inner.read().unwrap();
+        let turn_count = sub.turn_count(timeline);
+        // Per-turn start block in the sealed block grid the view borrow indexes.
+        // `block_range_of` is `(start, end)`; the system prompt is the blocks
+        // before turn 0's start.
+        let turn_starts: Vec<usize> = (0..turn_count)
+            .map(|i| sub.block_range_of(timeline, TurnIndex(i)).0 as usize)
+            .collect();
+        let sys_end = turn_starts.first().copied().unwrap_or(0);
+        crate::conversation::windowed_ingest_ranges_impl(
+            sys_end,
+            &turn_starts,
+            total_blocks,
+            window_turns,
+        )
+    }
+
     /// Acquire a write guard for mutating operations (append, set_*).
     pub fn write(&self) -> SubstrateWrite<'_> {
         SubstrateWrite {
@@ -1759,6 +1792,26 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .tree_meta_of(timeline, index)
             .map(|m| m.kind)
             .unwrap_or(TurnKind::Normal)
+    }
+
+    fn node_covers(&self, group: GroupId, index: TurnIndex) -> Vec<TurnIndex> {
+        let Some(timeline) = self.timeline_for(group) else {
+            return Vec::new();
+        };
+        // Walk the immutable forest downward from `index`, collecting every
+        // transitive child. `tree_meta_of` gives a node's direct children;
+        // Normal leaves have none, so a raw turn yields an empty cover set.
+        let mut out = Vec::new();
+        let mut stack = vec![index];
+        while let Some(node) = stack.pop() {
+            if let Some(meta) = self.read.tree_meta_of(timeline, node) {
+                for &child in &meta.children {
+                    out.push(child);
+                    stack.push(child);
+                }
+            }
+        }
+        out
     }
 
     fn turn_no_think(&self, timeline: TimelineId, index: TurnIndex) -> bool {

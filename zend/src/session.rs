@@ -372,16 +372,16 @@ fn seal_calibration_turn(
     }
 }
 
-/// In-flight calibration cases held in the sliding window. Kept well above the
-/// `MAX_ACTIVE_PREFILLS` prefill gate (16) on purpose: with only ~16 in flight,
-/// the scheduler reaches an equilibrium where a few cases are prefilling and a
-/// few decoding, and since prefill and decode are different forward-pass shapes,
-/// each pass batches only the handful in the *same* phase — so waves hover low
-/// (~5). A deeper window keeps dozens of cases decoding while the 16-wide prefill
-/// gate refills underneath them, so decode waves stay large. Bounded by decode-KV
-/// VRAM, which the prefill backpressure defends (it throttles admission under
-/// memory pressure rather than the window).
-const CALIBRATION_BATCH: usize = 64;
+/// In-flight calibration cases held in the sliding window. Cases are
+/// prefill-only (the exported trajectory is prefilled, not decoded — see
+/// `submit_prefilled_turn`), so the whole window co-batches into one prefill
+/// forward shape; a wider window just packs more sequences per forward, up to
+/// the `max_prefill_pass_tokens` budget. 16 keeps the peak VRAM footprint of the
+/// concurrently-resident lossless case K/V within a tight (16 GB) card while
+/// still filling every forward — the window is now populated in one pipelined
+/// batch (`new_conversations_with_projection_batch`), so it actually reaches
+/// this width instead of trickling in one case per wave-latency.
+const CALIBRATION_BATCH: usize = 16;
 /// Conversation-metadata key tagging each calibration conversation with its
 /// `"{tool}|{example}"` case **at creation**, so it is findable by case on a
 /// later load — finished or half-finished. *Done* is signalled separately by
@@ -819,7 +819,8 @@ impl InferenceState {
                 Vec::new();
             let retire_completed =
                 |inflight: &mut Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)>,
-                 done: &mut usize|
+                 done: &mut usize,
+                 reclaim: &mut Vec<TimelineId>|
                  -> bool {
                     let mut retired = false;
                     let mut i = 0;
@@ -858,6 +859,11 @@ impl InferenceState {
                                         // mark for distillation so compaction sheds
                                         // the trajectory content.
                                         mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                        // Retired: its sealed K/V is never attended
+                                        // again (only the persisted wide-Q sig is),
+                                        // so queue its timeline for hot→warm demotion
+                                        // to keep calibration's VRAM footprint flat.
+                                        reclaim.push(conv.timeline_id());
                                     }
                                     Some(_) => tracing::warn!(
                                     tool = name,
@@ -880,21 +886,45 @@ impl InferenceState {
             let assistant_start = conv_config.dialect.assistant_start;
             let mut to_run_iter = to_run.into_iter();
             let mut warmed = false;
+            // Timelines of archived (retired) calibration cases, awaiting hot→warm
+            // demotion. Their sealed K/V is never attended again — only the
+            // persisted wide-Q sig is — so dropping the hot copy as they retire
+            // keeps the phase's VRAM footprint flat instead of letting 700+ cases'
+            // lossless K/V pile up hot and OOM the next phase's first prefill.
+            let mut calib_timelines: Vec<TimelineId> = Vec::new();
+            // Index into `calib_timelines` up to which we've already demoted, so
+            // each incremental sweep only re-demotes the fresh tail.
+            let mut reclaimed_up_to = 0usize;
             loop {
-                // Refill the window: create the next case's conversation lazily
-                // (only when there's window room) and submit it, so at most
-                // `CALIBRATION_BATCH` empty slots are ever live at once.
-                while inflight.len() < CALIBRATION_BATCH {
-                    let Some((name, example, idx)) = to_run_iter.next() else {
-                        break;
-                    };
-                    let mut conv = match engine.new_conversation_with_projection(
+                // Refill the window in ONE pipelined round-trip:
+                // `new_conversations_with_projection_batch` fires every slot
+                // allocation before awaiting any, so the whole window's cases
+                // prefill together in a wide forward instead of trickling in one
+                // per wave-latency (which starved the batch to 2–4 wide). The
+                // warm-up case is created alone first so the shared tool sections
+                // pin once before the concurrent window opens.
+                let want = if warmed {
+                    CALIBRATION_BATCH.saturating_sub(inflight.len())
+                } else {
+                    1
+                };
+                let batch: Vec<(&str, &str, usize)> =
+                    (0..want).map_while(|_| to_run_iter.next()).collect();
+                let created_any = !batch.is_empty();
+                let convs = if created_any {
+                    engine.new_conversations_with_projection_batch(
+                        batch.len(),
                         &calib_prelude,
-                        calib_builder.clone(),
+                        &calib_builder,
                         calib_layer,
                         calib_group,
-                        calib_config.clone(),
-                    ) {
+                        &calib_config,
+                    )
+                } else {
+                    Vec::new()
+                };
+                for ((name, example, idx), conv_res) in batch.into_iter().zip(convs) {
+                    let mut conv = match conv_res {
                         Ok(conv) => conv,
                         Err(e) => {
                             tracing::warn!(tool = name, "calibration create failed: {e}");
@@ -990,6 +1020,10 @@ impl InferenceState {
                                         // Sig captured — mark for distillation so
                                         // compaction sheds the trajectory content.
                                         mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                        // Queue for hot→warm demotion (see the retire
+                                        // path) so the warm-up case's K/V is reclaimed
+                                        // like every other case's.
+                                        calib_timelines.push(conv.timeline_id());
                                     }
                                     Some(_) => tracing::warn!(
                                         tool = name,
@@ -1010,17 +1044,49 @@ impl InferenceState {
                         }
                     }
                 }
-                if inflight.is_empty() {
+                // Terminate only when nothing is in flight AND nothing remained
+                // to submit this pass (`created_any` false ⇒ `to_run` is drained).
+                // After the warm-up case (which leaves `inflight` empty but
+                // `created_any` true) this correctly continues to the concurrent
+                // window instead of breaking early.
+                if inflight.is_empty() && !created_any {
                     break;
                 }
                 // Retire finished cases; if none finished this pass, yield briefly
                 // (the unbounded channels buffer, so this never starves the wave).
-                if !retire_completed(&mut inflight, &mut done) {
+                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines) {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
+                // Incremental hot→warm demotion: once a full window's worth of
+                // cases has retired since the last sweep, drop the hot K/V of just
+                // the fresh tail (`[reclaimed_up_to..]`). No flush — the
+                // persistence thread has already migrated the older cases to warm,
+                // so they qualify; any not-yet-warm straggler is caught by the
+                // flushing boundary sweep below (which re-demotes the whole list).
+                // The call is fire-and-forget, so case submission never stalls.
+                if calib_timelines.len() - reclaimed_up_to >= CALIBRATION_BATCH {
+                    if let Err(e) =
+                        engine.demote_timelines_hot(&calib_timelines[reclaimed_up_to..], false)
+                    {
+                        tracing::warn!("calibration hot→warm demote failed: {e}");
+                    }
+                    reclaimed_up_to = calib_timelines.len();
+                }
+            }
+            // Boundary sweep: flush the pending hot→warm migration so the final
+            // window's just-sealed cases are warm-backed, then demote every
+            // calibration timeline. This reclaims the tail before the repo-scan
+            // phase's first prefill, which would otherwise hit a card still full
+            // of the calibration corpus's hot K/V.
+            if let Err(e) = engine.demote_timelines_hot(&calib_timelines, true) {
+                tracing::warn!("calibration boundary hot→warm demote failed: {e}");
             }
             progress.set_step_progress(total as u64, total as u64);
-            tracing::info!(cases = total, "calibrating sections complete");
+            tracing::info!(
+                cases = total,
+                demoted_timelines = calib_timelines.len(),
+                "calibrating sections complete"
+            );
         }
 
         // Walk the workspace, cluster the directory tree under a
@@ -1177,7 +1243,53 @@ impl InferenceState {
     /// When `map` is `Some`, the refresh reuses that workspace walk
     /// instead of doing its own.
     pub(crate) fn refresh_code_reading(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
-        let progress = LoadProgress::new();
+        self.refresh_code_reading_with_progress(map, &Arc::new(LoadProgress::new()))
+    }
+
+    /// Ingest **only** the given workspace-relative files into the
+    /// `code_reading` layer — the upload's read_file phase. Bounded to those
+    /// files (never a whole-workspace re-ingest, never a tombstone sweep), so
+    /// it's safe under `--skip-code-read` and can't overload the model with the
+    /// entire repo. Merges the ingested files' content hashes into the running
+    /// `CodeReadState` so the resume cache and future watcher refreshes skip
+    /// them. Reports per-scope progress into `progress`. Returns
+    /// `(ingested, failed)`: whether anything was newly ingested, and whether
+    /// at least one file's ingest tolerated-failed (e.g. the GPU ran out of KV
+    /// VRAM) — so the upload can report a real failure instead of a silent
+    /// no-op.
+    pub(crate) fn ingest_uploaded_files(
+        &self,
+        rel_paths: &[String],
+        progress: &Arc<LoadProgress>,
+    ) -> anyhow::Result<(bool, bool)> {
+        let ctx = self.refresh_ctx();
+        let (state, n_failed) = crate::code_read::ingest_files(
+            &self.engine,
+            &ctx.proj_builder,
+            &self.workspace,
+            rel_paths,
+            ctx.config,
+            progress,
+        )?;
+        let failed = n_failed > 0;
+        if state.file_hashes.is_empty() {
+            return Ok((false, failed));
+        }
+        let mut guard = self.code_read_conv.lock().unwrap();
+        for (path, hash) in state.file_hashes {
+            guard.state.file_hashes.insert(path, hash);
+        }
+        Ok((true, failed))
+    }
+
+    /// As [`Self::refresh_code_reading`], but reports per-scope ingest
+    /// progress into the caller's `progress` handle — the upload's read_file
+    /// phase shares one and polls it to stream a progress bar to the GUI.
+    pub(crate) fn refresh_code_reading_with_progress(
+        &self,
+        map: Option<RepoMap>,
+        progress: &Arc<LoadProgress>,
+    ) -> anyhow::Result<bool> {
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
         let prior_state = self.code_read_conv.lock().unwrap().state.clone();
         let ctx = self.refresh_ctx();
@@ -1186,7 +1298,7 @@ impl InferenceState {
             &self.workspace,
             &map,
             &prior_state,
-            &progress,
+            progress,
         )?;
         match outcome {
             crate::code_read::RefreshOutcome::NoOp => Ok(false),
@@ -1195,6 +1307,62 @@ impl InferenceState {
                 *guard = CodeReadConv { state };
                 Ok(true)
             }
+        }
+    }
+
+    /// Tombstone the per-file `code_read` conversation of every uploaded file
+    /// that has since been deleted from the `uploads/` folder.
+    ///
+    /// Uploads are endpoint-managed and deliberately excluded from the workspace
+    /// walk (so `refresh_code_reading`'s `reconcile_deleted` never retires them —
+    /// that would delete freshly-uploaded content on the next refresh). But a
+    /// genuine deletion of an uploaded file — whether from the filesystem or via
+    /// the GUI — must still retire its conversation; otherwise deleted uploads
+    /// accumulate live turns forever, growing the redo log and the projection
+    /// candidate set without bound.
+    ///
+    /// Cheap and self-limiting: a metadata scan plus one `Path::exists` probe per
+    /// upload conversation, no workspace walk and no re-ingest. Tombstoning only
+    /// *absent* files makes it a no-op for still-present uploads, so the watcher
+    /// can fire it on any `uploads/` event (create / modify / delete) — an
+    /// in-flight upload's own create events simply match nothing.
+    ///
+    /// Runs at startup (to retire uploads deleted while the daemon was down) and
+    /// on every `uploads/` watcher burst.
+    pub(crate) fn reconcile_uploaded_files(&self) {
+        let engine = self.engine.lock().unwrap();
+        let mut tombstoned = 0usize;
+        for (tl, path) in engine.conversations_with_metadata_key("path") {
+            if !crate::code_read::is_upload_path(&path) {
+                continue;
+            }
+            // `path` is workspace-relative with `/` separators; `Path::join`
+            // accepts them on win32, and `exists()` is case-insensitive there.
+            if self.workspace.join(&path).exists() {
+                continue;
+            }
+            match engine.tombstone_timeline(tl) {
+                Ok(()) => {
+                    tombstoned += 1;
+                    tracing::info!(
+                        target: "zend::session",
+                        path = %path,
+                        "reconcile_uploaded_files: tombstoned deleted upload's conversation",
+                    );
+                }
+                Err(err) => tracing::warn!(
+                    target: "zend::session",
+                    path = %path,
+                    "reconcile_uploaded_files: tombstone failed: {err:#}",
+                ),
+            }
+        }
+        if tombstoned > 0 {
+            tracing::info!(
+                target: "zend::session",
+                count = tombstoned,
+                "reconcile_uploaded_files: retired deleted uploads",
+            );
         }
     }
 }
@@ -2020,6 +2188,53 @@ pub struct StatusSnapshot {
     pub started_at_ms: u64,
 }
 
+/// Measured throughput of an upload, filled in once its pipeline finishes and
+/// persisted alongside the [`UploadInfo`] (optional — absent on older events or
+/// when the model wasn't loaded to ingest). Batch-level: every file dropped
+/// together shares one measurement. Drives the inline "in Xs (X t/s, X MB/s)"
+/// stat and the upload-time line in the file viewer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadStats {
+    /// Total bytes received across the batch.
+    pub bytes: u64,
+    /// Wall-clock to receive the batch over the wire (phase 1).
+    pub upload_ms: u64,
+    /// Tokens prefilled reading the batch into the substrate (phase 2).
+    pub ingest_tokens: u64,
+    /// Wall-clock of the read_file ingest (phase 2).
+    pub ingest_ms: u64,
+}
+
+/// One uploaded file recorded against a conversation — the substrate
+/// event that survives resume and drives the inline history tile. Stored
+/// (JSON-serialized, as an array under the `uploads` custom-metadata key)
+/// in the conversation's Label record, so it recovers with the conversation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadInfo {
+    /// Conv-file-store id — the handle the GUI opens the file's content by.
+    pub id: u64,
+    pub name: String,
+    /// Workspace-relative path of the file (e.g. `uploads/notes (1).txt`),
+    /// with `/` separators — portable, not an absolute host path.
+    pub path: String,
+    pub ext: String,
+    pub kind: String,
+    /// Display size (e.g. `18.4 KB`).
+    pub size: String,
+    /// Display timestamp (e.g. `just now`).
+    pub added: String,
+    /// Number of turns present when the file was uploaded — positions the
+    /// tile in the history stream (the tile renders after this many turns).
+    #[serde(default)]
+    pub turn_index: u32,
+    /// Measured upload/ingest/summarize throughput, filled in once the
+    /// pipeline finishes (`record_upload_stats`). `None` until then, or when
+    /// the model wasn't loaded to run the ingest phases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<UploadStats>,
+}
+
 /// Sidebar entry surfaced by `GET /v1/conversations`. Built directly from
 /// the substrate — `RecordType::Label` records carry the `conv_id`
 /// string and the human label; `RecordType::ConvState` carries the
@@ -2076,6 +2291,80 @@ impl ZendSession {
     /// The conversation-files store (uploads). Available before the model loads.
     pub fn files(&self) -> &ConvFileStore {
         &self.file_store
+    }
+
+    /// The `uploads/` directory in the daemon's workspace — raw uploaded
+    /// files are written here so the workspace watcher and `code_read`
+    /// pick them up like any other source file. Created on demand.
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.config.workspace.join("uploads")
+    }
+
+    /// **Phase 1 of the upload pipeline** — write `bytes` to
+    /// `<workspace>/uploads/<safe, non-colliding name>` and return the actual
+    /// path used. The name is sanitized to its final path component and a
+    /// conservative charset (a malicious `name` can never escape the uploads
+    /// directory — no `..`, no separators, no absolute paths), then de-duped
+    /// against existing files so a second `notes.txt` becomes `notes (1).txt`
+    /// rather than overwriting the first. The caller reads the final file name
+    /// back off the returned path.
+    pub fn write_upload_to_disk(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let dir = self.uploads_dir();
+        std::fs::create_dir_all(&dir)?;
+        let safe = sanitize_upload_name(name);
+        let path = dir.join(dedup_in_dir(&dir, &safe));
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// The path of a file under the workspace expressed relative to the
+    /// workspace root, with `/` separators (matching `repo_scan`'s
+    /// normalization). Falls back to the file name alone if `path` is
+    /// somehow not under the workspace. This is the form persisted in the
+    /// upload event — a portable, workspace-relative reference, not an
+    /// absolute host path.
+    pub fn workspace_relative(&self, path: &std::path::Path) -> String {
+        path.strip_prefix(&self.config.workspace)
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(|s| s.replace('\\', "/"))
+            .unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("upload")
+                    .to_string()
+            })
+    }
+
+    /// **Phase 2 of the upload pipeline** — read the just-uploaded files into
+    /// the substrate via the normal `code_read` ingest, scoped to **only those
+    /// files** (`rel_paths`, workspace-relative). Bounded to the uploaded
+    /// files' work — never a whole-workspace re-ingest — so it can't overload
+    /// the model and is safe under `--skip-code-read`. Returns `Ok(true)` when
+    /// something was ingested, `Ok(false)` for a no-op (non-code files, or the
+    /// model not loaded). Per-scope progress streams into `progress`.
+    /// Returns `(ingested, failed)` — see `ingest_uploaded_files`.
+    pub fn read_file_phase(
+        &self,
+        rel_paths: &[String],
+        progress: &Arc<crate::loading::LoadProgress>,
+    ) -> anyhow::Result<(bool, bool)> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return Ok((false, false));
+        };
+        state.ingest_uploaded_files(rel_paths, progress)
+    }
+
+    /// Kick the async summariser so the just-ingested turns start folding into
+    /// their summary trees promptly instead of waiting for the next periodic
+    /// tick. **Fire-and-forget**: summarisation is a fully background task,
+    /// invisible to the upload — the pipeline never waits on it, shows no
+    /// progress for it, and records nothing about it. A no-op when the model
+    /// isn't loaded (the periodic tick picks the work up once it is).
+    pub fn kick_summariser(&self) {
+        if let Some(state) = self.inference.read().unwrap().as_ref() {
+            state.engine.lock().unwrap().trigger_summariser();
+        }
     }
 
     /// Snapshot for `GET /v1/status`. `loading=None` once every startup
@@ -2230,6 +2519,122 @@ impl ZendSession {
             })
             .collect();
         Some(decoded)
+    }
+
+    /// Record a batch of just-uploaded files as an event in the substrate,
+    /// so they recover with the conversation and can be replayed inline in
+    /// its history. Each file is stamped with `turn_index` — the number of
+    /// turns present at upload time — which positions it in the history
+    /// stream. Persisted (last-writer-wins) in the conversation's Label
+    /// record `custom` bag under the `uploads` key, a JSON array appended to
+    /// on every upload. No-op when the model isn't loaded.
+    pub fn record_uploads(&self, conv_id: &str, files: &[UploadInfo]) {
+        if files.is_empty() {
+            return;
+        }
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return;
+        };
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        // Register the conv_id so an upload-only conversation (one started by
+        // dropping a file on the home page, which may never submit a chat turn)
+        // is a *listed* conversation: `known_conversations` — and thus the
+        // sidebar + the client's server-authoritative sync — only surface
+        // timelines that carry a conv_id. Normally the chat submit sets this;
+        // without it here the conversation exists only client-side and gets
+        // dropped on the next sync (vanishes from the list, and a send bounces
+        // back to home). Idempotent for a conversation that already has one.
+        if let Err(e) = engine.set_conversation_conv_id(timeline, conv_id) {
+            tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
+        }
+        // Give it a provisional label from the file(s) if it has none yet, so it
+        // shows a sensible name in the sidebar before any chat turn — the titler
+        // refines it once the user actually talks. Never overwrite an existing
+        // label (an upload into a conversation that already has turns).
+        if engine
+            .conversation_label_of(timeline)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            let label = match files.first() {
+                Some(f) if files.len() == 1 => f.name.clone(),
+                _ => format!("{} files", files.len()),
+            };
+            if let Err(e) = engine.set_conversation_label(timeline, &label) {
+                tracing::warn!(conv_id = %conv_id, "record_uploads: set label failed: {e}");
+            }
+        }
+        // Position: the number of already-present turns. `record_uploads`
+        // runs between turns (the user drops a file, then sends), so every
+        // prior turn is sealed and visible in `recovered_history`.
+        let turn_index = {
+            let base = state.base_conv.lock().unwrap();
+            base.recovered_history(timeline, false).len() as u32
+        };
+        // Read the current uploads array, append the new files, write it back.
+        let mut arr: Vec<UploadInfo> = engine
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get("uploads").cloned())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        for f in files {
+            let mut f = f.clone();
+            f.turn_index = turn_index;
+            arr.push(f);
+        }
+        if let Ok(json) = serde_json::to_string(&arr) {
+            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
+                tracing::warn!(conv_id = %conv_id, "record_uploads write failed: {e}");
+            }
+        }
+    }
+
+    /// Attach measured throughput to an already-recorded upload batch. `ids`
+    /// are the conv-file-store ids from the batch's [`UploadInfo`]s; every
+    /// matching entry gets `stats` (batch-level, so they share one
+    /// measurement). A no-op when the model isn't loaded. Called once the
+    /// upload pipeline finishes, after `record_uploads` positioned the batch.
+    pub fn record_upload_stats(&self, conv_id: &str, ids: &[u64], stats: &UploadStats) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return;
+        };
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        let mut arr: Vec<UploadInfo> = engine
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get("uploads").cloned())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        for entry in &mut arr {
+            if ids.contains(&entry.id) {
+                entry.stats = Some(stats.clone());
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&arr) {
+            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
+                tracing::warn!(conv_id = %conv_id, "record_upload_stats write failed: {e}");
+            }
+        }
+    }
+
+    /// The upload events recorded against a conversation, in upload order —
+    /// backs both the files pane and the inline history tiles on resume.
+    /// Empty when the model isn't loaded or nothing was uploaded.
+    pub fn conversation_uploads(&self, conv_id: &str) -> Vec<UploadInfo> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        engine
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get("uploads").cloned())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     /// Projection-event buckets banked for a conversation this daemon session,
@@ -2522,7 +2927,30 @@ impl ZendSession {
                                 }
                             }
                         });
-                        match crate::watcher::spawn(&state.workspace, on_refresh) {
+                        // Uploads are endpoint-managed, so upload churn never
+                        // drives the source refresh above — but a deletion of an
+                        // uploaded file still has to retire its substrate
+                        // conversation. Fire the cheap tombstone-if-absent
+                        // reconcile once at startup (uploads deleted while the
+                        // daemon was down) and on every `uploads/` watcher burst.
+                        state.reconcile_uploaded_files();
+                        let inference_for_uploads = Arc::clone(&slot);
+                        let on_uploads_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                            let Some(state) = inference_for_uploads
+                                .read()
+                                .unwrap()
+                                .as_ref()
+                                .map(Arc::clone)
+                            else {
+                                return;
+                            };
+                            state.reconcile_uploaded_files();
+                        });
+                        match crate::watcher::spawn(
+                            &state.workspace,
+                            on_refresh,
+                            on_uploads_changed,
+                        ) {
                             Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
                             Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
                         }
@@ -2718,6 +3146,69 @@ fn timeline_for(conv_id: &str) -> projection::TimelineId {
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }
 
+/// Reduce an uploaded file name to a safe basename that stays inside the
+/// uploads directory: take the final path component (defeating `../` and
+/// absolute paths), keep only `[A-Za-z0-9._-]`, collapse the rest to `_`,
+/// and fall back to `upload` if nothing survives. A leading `.` is
+/// prefixed with `_` so uploads are never hidden dotfiles.
+fn sanitize_upload_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let mut out: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Windows strips trailing dots/spaces on create; drop them here so the
+    // recorded name matches what actually lands on disk (and a `foo.exe.` can't
+    // dodge the extension gate by re-materialising as `foo.exe`). Spaces have
+    // already become `_`, so only trailing dots remain to trim.
+    while out.ends_with('.') {
+        out.pop();
+    }
+    // Reject the pure-dot names that name a directory, and hidden dotfiles.
+    if out.is_empty() {
+        return "upload".to_string();
+    }
+    if out.starts_with('.') {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// Return `safe` if it doesn't already exist in `dir`, otherwise the first
+/// free `stem-NNN.ext` variant (`NNN` = 001, 002, …, zero-padded to three
+/// digits so directory listings sort correctly). `safe` is assumed already
+/// sanitized. The scan is bounded; in the (pathological) event every
+/// candidate up to the cap is taken, it falls back to the millisecond
+/// timestamp so the write still succeeds rather than clobbering.
+fn dedup_in_dir(dir: &std::path::Path, safe: &str) -> String {
+    if !dir.join(safe).exists() {
+        return safe.to_string();
+    }
+    // Split into stem + extension (the extension is the final `.` segment,
+    // if any) so the counter lands before the extension: `notes-001.txt`.
+    let (stem, ext) = match safe.rfind('.') {
+        Some(i) if i > 0 => (&safe[..i], &safe[i..]), // ext includes the dot
+        _ => (safe, ""),
+    };
+    for n in 1..=9999u32 {
+        let cand = format!("{stem}-{n:03}{ext}");
+        if !dir.join(&cand).exists() {
+            return cand;
+        }
+    }
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{stem}-{stamp}{ext}")
+}
+
 /// Cap the titler's prefill at `head + tail` tokens. For short messages
 /// (≤ head+tail) the text is returned verbatim; for long ones the head and
 /// tail token windows are decoded back to text and joined with `" … "`.
@@ -2823,6 +3314,61 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_upload_name;
+
+    #[test]
+    fn keeps_safe_basenames() {
+        assert_eq!(sanitize_upload_name("notes.txt"), "notes.txt");
+        assert_eq!(sanitize_upload_name("my-file_v2.rs"), "my-file_v2.rs");
+    }
+
+    #[test]
+    fn strips_path_traversal_and_separators() {
+        // Only the final component survives — no directory escape possible.
+        assert_eq!(sanitize_upload_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_upload_name("/abs/path/x.md"), "x.md");
+        assert_eq!(sanitize_upload_name("a\\b\\c.json"), "c.json");
+        assert_eq!(sanitize_upload_name(".."), "upload");
+        assert_eq!(sanitize_upload_name("."), "upload");
+    }
+
+    #[test]
+    fn collapses_unsafe_chars_and_unhides_dotfiles() {
+        assert_eq!(
+            sanitize_upload_name("weird name!@#.txt"),
+            "weird_name___.txt"
+        );
+        assert_eq!(sanitize_upload_name(".env"), "_.env"); // never a hidden dotfile
+        assert_eq!(sanitize_upload_name(""), "upload");
+    }
+
+    #[test]
+    fn dedup_appends_a_counter_before_the_extension() {
+        use super::dedup_in_dir;
+        let dir = std::env::temp_dir().join(format!(
+            "zend_dedup_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A free name is returned verbatim.
+        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes.txt");
+        std::fs::write(dir.join("notes.txt"), b"a").unwrap();
+        // Collision -> "notes-001.txt"; zero-padded, counter before the ext.
+        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes-001.txt");
+        std::fs::write(dir.join("notes-001.txt"), b"b").unwrap();
+        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes-002.txt");
+        // Extensionless names get the counter at the end.
+        std::fs::write(dir.join("README"), b"c").unwrap();
+        assert_eq!(dedup_in_dir(&dir, "README"), "README-001");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

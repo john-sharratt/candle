@@ -11,6 +11,7 @@ use crate::projection::{
     Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
+use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
@@ -492,6 +493,12 @@ impl ConversationEngine {
         self.conversation.pending_summary_len(timeline)
     }
 
+    /// Wake the summariser thread now instead of waiting for its next
+    /// tick — used to kick off summarisation of freshly-ingested turns promptly.
+    pub fn trigger_summariser(&self) {
+        self.summariser_thread.trigger();
+    }
+
     /// Test-harness diagnostic — the most recent score-density
     /// [`SelectionDiagnostics`] for `timeline`, or `None` if no
     /// projection has run yet (or projection used the rule-based
@@ -646,6 +653,61 @@ impl ConversationEngine {
     /// Whether `timeline` is already marked for distillation.
     pub fn is_timeline_distilled(&self, timeline: TimelineId) -> bool {
         self.conversation.is_timeline_distilled(timeline)
+    }
+
+    /// Demote the hot K/V of `timelines` to the warm (RAM) tier, keeping the
+    /// warm copy — the VRAM the hot copies held returns to the pool. The demote
+    /// itself runs on the scheduler thread (single-owner GPU-pool mutation).
+    /// Used by the loader's calibration phase to keep VRAM flat: reclaim each
+    /// throwaway case's K/V as it retires rather than letting it accumulate hot.
+    /// Idempotent — a turn already demoted (or not yet warm) is skipped.
+    ///
+    /// `flush` selects the mode:
+    /// - `true` (boundary sweep): first drain the hot→warm migration **on this
+    ///   thread** so the whole tail is warm-backed (hence demotable), then issue
+    ///   the demote and **block** until it completes — the caller needs the VRAM
+    ///   reclaimed before the next phase prefills. The flush is done here rather
+    ///   than inside the scheduler handler so its (≤30 s) wait can't stall the
+    ///   scheduler's decode/prefill loop. Returns the number of residences
+    ///   demoted.
+    /// - `false` (incremental sweep): **fire-and-forget** — issue the demote and
+    ///   return immediately without blocking the caller (case submission must not
+    ///   stall). Only already-warm-backed turns are dropped; any not-yet-warm
+    ///   tail is caught by the next sweep or the boundary flush. Returns `0`.
+    pub fn demote_timelines_hot(
+        &self,
+        timelines: &[TimelineId],
+        flush: bool,
+    ) -> crate::Result<usize> {
+        if flush {
+            self.persist_thread
+                .trigger_handle()
+                .flush_blocking(std::time::Duration::from_secs(30));
+        }
+        if timelines.is_empty() {
+            return Ok(0);
+        }
+        let (response_tx, response_rx) = channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::DemoteTimelinesHot {
+                conversation: self.conversation.clone(),
+                timelines: timelines.to_vec(),
+                response_tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        if flush {
+            // Boundary: wait for the demote to complete (VRAM must be reclaimed
+            // before the next phase).
+            let demoted = response_rx
+                .recv()
+                .map_err(|_| ConversationError::SchedulerGone)??;
+            Ok(demoted)
+        } else {
+            // Incremental: fire-and-forget. Dropping `response_rx` makes the
+            // handler's reply a silent no-op; the demote still runs.
+            drop(response_rx);
+            Ok(0)
+        }
     }
 
     /// Whether the loaded substrate holds tombstoned or distilled timelines —
@@ -925,9 +987,129 @@ impl ConversationEngine {
             self.model_core,
             self.conversation.clone(),
             section_progress,
+            // Single-create path keeps the first-turn priming optimization.
+            true,
         )?;
 
         Ok(conv)
+    }
+
+    /// Batch-create `n` conversations that share one projection (system prompt,
+    /// builder, layer/group, config), **pipelining** the `NewSequence` slot
+    /// allocations: every request is fired before any response is awaited, so
+    /// the scheduler drains the whole batch in a single cycle and it costs ~one
+    /// round-trip instead of `n` serial ones.
+    ///
+    /// [`Self::new_conversation_with_projection`] blocks on its slot-alloc reply,
+    /// and the scheduler interleaves those replies between forward waves — so
+    /// creating a window of cases one at a time pays ~one wave-latency per case.
+    /// During calibration that starved the wave-batched prefill to 2–4 sequences
+    /// wide (poor MoE expert amortization). Firing the window's allocations up
+    /// front lets the cases prefill together in one wide forward instead.
+    ///
+    /// Each conversation gets a fresh timeline; per-conversation compression and
+    /// summariser settings mirror the single-create path. Returns one `Result`
+    /// per requested conversation, in submission order.
+    pub fn new_conversations_with_projection_batch(
+        &self,
+        n: usize,
+        system_prompt: &str,
+        builder: &Builder,
+        layer: LayerId,
+        group: GroupId,
+        config: &SequenceConfig,
+    ) -> Vec<crate::Result<Sequence>> {
+        if n == 0 {
+            return Vec::new();
+        }
+        if let Some(yaml) = builder.source_yaml() {
+            if let Err(e) = self.conversation.set_template(yaml.as_bytes()) {
+                tracing::warn!("persist projection template failed: {e}");
+            }
+        }
+        let compression = if config.kv_compression_level.is_some()
+            || config.kv_force_k_format.is_some()
+            || config.kv_force_v_format.is_some()
+            || config.kv_lossless
+        {
+            Some(ConvCompression {
+                lossless: config.kv_lossless,
+                level: config.kv_compression_level,
+                disable_k_override: config.kv_disable_k_override,
+                force_k: config.kv_force_k_format,
+                force_v: config.kv_force_v_format,
+            })
+        } else {
+            None
+        };
+
+        // Phase 1 — mint a timeline and fire `NewSequence` for every case
+        // WITHOUT awaiting, so all `n` requests sit in the scheduler queue
+        // together and one drain cycle allocates every slot.
+        struct Fired {
+            target: ProjectionTarget,
+            rx: channel::Receiver<crate::Result<SequenceId>>,
+        }
+        let mut fired: Vec<crate::Result<Fired>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let timeline = self.conversation.mint_timeline(layer, group);
+            let target = ProjectionTarget {
+                layer,
+                group,
+                timeline,
+            };
+            let (response_tx, rx) = channel::bounded(1);
+            match self.scheduler_tx.send(SchedulerRequest::NewSequence {
+                conversation: self.conversation.clone(),
+                target: Some(target),
+                response_tx,
+            }) {
+                Ok(()) => {
+                    // Only register per-timeline metadata for a conversation that
+                    // actually exists — set it after the send succeeds (still
+                    // before the scheduler drains the request or any turn seals,
+                    // so residence compression inheritance is unaffected). A
+                    // failed send leaves only the bare timeline mint, no metadata.
+                    self.conversation
+                        .set_timeline_compression(timeline, compression);
+                    self.conversation
+                        .set_timeline_summarize(timeline, !self.config.disable_summariser);
+                    fired.push(Ok(Fired { target, rx }));
+                }
+                Err(_) => fired.push(Err(ConversationError::SchedulerGone)),
+            }
+        }
+
+        // Phase 2 — collect each slot id (already queued, so no extra wave wait)
+        // and build its Sequence. After the warm-up case has pinned the shared
+        // sections, `new_with_projection` only re-references already-hot sections
+        // here, so it issues no further scheduler round-trip.
+        fired
+            .into_iter()
+            .map(|f| {
+                let f = f?;
+                let sequence_id =
+                    f.rx.recv()
+                        .map_err(|_| ConversationError::SchedulerGone)??;
+                Sequence::new_with_projection(
+                    self.scheduler_tx.clone(),
+                    sequence_id,
+                    Arc::clone(&self.tokenizer),
+                    system_prompt,
+                    builder.clone(),
+                    f.target,
+                    config.clone(),
+                    CHUNK_SIZE,
+                    self.model_core,
+                    self.conversation.clone(),
+                    None,
+                    // Pipelined batch: skip the per-sequence priming round-trip
+                    // that would otherwise serialise the burst — `apply_projection`
+                    // at first submit materialises the projection instead.
+                    false,
+                )
+            })
+            .collect()
     }
 
     /// Get the shared tokenizer.

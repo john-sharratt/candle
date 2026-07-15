@@ -286,8 +286,19 @@ __device__ void moe_route_impl(
         uint32_t* oi = out_idx + (size_t)token * (size_t)k;
         float*    ow = out_weights + (size_t)token * (size_t)k;
         for (int p = 0; p < k; ++p) {
-            oi[p] = (uint32_t)sel_i[p];
-            ow[p] = sel_w[p] * inv;
+            // `bi` seeds at `n_experts` as a "not found" sentinel. It survives to
+            // `sel_i[p]` only when this slot had no finite candidate — a
+            // degenerate token whose remaining logits are all -inf/NaN (NaN loses
+            // every `>` compare), or fewer finite experts than k. Emit a valid
+            // index with zero weight so the downstream gather/scatter and the
+            // expert-paging pipeline never index out of bounds on the sentinel.
+            if (sel_i[p] >= n_experts) {
+                oi[p] = 0u;
+                ow[p] = 0.f;
+            } else {
+                oi[p] = (uint32_t)sel_i[p];
+                ow[p] = sel_w[p] * inv;
+            }
         }
     }
 }

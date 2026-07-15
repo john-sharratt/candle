@@ -161,6 +161,16 @@
           '   2: zend::http::completions::stream',
           '   3: tokio::runtime::task::harness::poll',
         ]) },
+        { id: 5, name: 'bench.csv', ext: 'CSV', kind: 'text', size: '0.4 KB', added: '30m ago', content: J([
+          'shape,best_ms,mean_ms,tok_per_s',
+          'q64_prefix8k,1.169,1.179,54752',
+          'q256_prefix2k,1.488,1.499,172078',
+          '"q512_f16, prefix4k",4.561,4.602,112244',
+        ]) },
+        { id: 6, name: 'model-config.json', ext: 'JSON', kind: 'code', size: '0.3 KB', added: '22m ago', content: J([
+          '{"arch":"Qwen3Moe","vocab":151936,"max_seq":40960,',
+          '"sampling":{"temp":0.8,"top_k":40,"top_p":0.95},"experts":128,"active":8}',
+        ]) },
       ];
       for (const f of files) this._fileContent[f.id] = f.content;
       return files;
@@ -215,7 +225,7 @@
             if (handlers.onFileDone) handlers.onFileDone(meta.id, meta);
             results.push(meta);
             remaining -= 1;
-            if (remaining <= 0 && handlers.onAllDone) handlers.onAllDone(results);
+            if (remaining <= 0) runPhases();
             return;
           }
           if (handlers.onPart) handlers.onPart(meta.id, part, totalParts);
@@ -223,7 +233,54 @@
         }, 110);
         timers.push(timer);
       });
-      return { cancel: () => { cancelled = true; timers.forEach(clearInterval); } };
+      // After every file lands, walk the single engine-bound phase (read_file)
+      // the live daemon reports, then finish. Summarisation runs in the
+      // background and is never surfaced, so the mock emits no phase for it.
+      function runPhases() {
+        if (cancelled) return;
+        // Synthetic stats the real daemon measures: prefill accrues over the
+        // read_file bar. Sized off the dropped bytes so the modal's stat lines
+        // look realistic.
+        const bytes = descriptors.reduce((a, d) => a + (d.size || 4096), 0);
+        const totalPrefill = Math.max(128, Math.round(bytes / 4));
+        // read_file streams a determinate per-scope bar (like the real ingest),
+        // carrying the running prefill token counter.
+        const readStats = (i, steps) => ({
+          prefillTokens: Math.round(totalPrefill * (i / steps)),
+        });
+        const withBar = (key, steps, statsFor) => new Promise((res) => {
+          if (handlers.onPhase) handlers.onPhase(key, 'start');
+          let i = 0;
+          const tick = () => {
+            if (cancelled) return;
+            i += 1;
+            const extra = Object.assign({ current: i, total: steps }, statsFor ? statsFor(i, steps) : {});
+            if (handlers.onPhase) handlers.onPhase(key, 'progress', extra);
+            if (i >= steps) {
+              if (handlers.onPhase) handlers.onPhase(key, 'done', statsFor ? statsFor(steps, steps) : {});
+              res();
+              return;
+            }
+            const t = setTimeout(tick, 120);
+            timers.push(t);
+          };
+          tick();
+        });
+        withBar('read_file', 6, readStats).then(() => {
+          if (cancelled) return;
+          // Final measured throughput — mirrors the daemon's `stats` SSE event
+          // (camelCase, matching UploadStats) so the inline tile + file viewer
+          // render the same shape they'd get live.
+          if (handlers.onStats) handlers.onStats({
+            bytes: bytes,
+            uploadMs: Math.max(30, Math.round(bytes / 50000)),
+            ingestTokens: totalPrefill,
+            ingestMs: 6 * 120,
+          });
+          if (handlers.onAllDone) handlers.onAllDone(results);
+        });
+      }
+      return { cancel: () => { cancelled = true; timers.forEach((t) => { clearInterval(t); clearTimeout(t); }); } };
     },
 
     // GET /v1/conversations/{id}/files/{fileId} — reconstructed content.

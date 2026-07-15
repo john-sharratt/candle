@@ -65,6 +65,10 @@ candle-kernels/build_tool/
 # Substrate persistence redo log — created at runtime under any workspace root
 .substrate/
 
+# Endpoint-managed upload staging dir — the zend daemon writes user-uploaded
+# files here at runtime; they are workspace content, never repo content.
+uploads/
+
 # Stray full prefill-capture dumps: ZEND_PREFILL_CAPTURE writes the untrimmed
 # capture here by default. The committed test fixture is the trimmed copy under
 # candle-transformers/tests/fixtures/ (LFS-tracked via .gitattributes).

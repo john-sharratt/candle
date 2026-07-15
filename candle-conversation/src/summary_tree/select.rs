@@ -487,7 +487,7 @@ fn leftmost_normal_pos(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tree::Node;
+    use super::super::tree::{Node, MERGE_FANOUT};
     use super::*;
 
     /// Build a tree where every Normal turn is `tokens_per_normal`
@@ -591,38 +591,39 @@ mod tests {
 
     #[test]
     fn redundancy_eliminates_ancestor_when_all_children_selected() {
-        // Three SoT leaves carry into one ternary SoS internal; selecting all
-        // three children makes the ancestor redundant.
-        let (tree, _) = build_uniform_tree(3, 1, 10, 20);
+        // MERGE_FANOUT SoT leaves carry into one SoS internal; selecting all
+        // its children makes the ancestor redundant.
+        let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 1, 10, 20);
         let mut sel: AHashSet<NodeId> = AHashSet::default();
-        sel.insert(NodeId(1));
-        sel.insert(NodeId(2));
-        sel.insert(NodeId(3));
+        for i in 1..=MERGE_FANOUT as u32 {
+            sel.insert(NodeId(i));
+        }
         // The auto-generated SoS internal has id 2^31.
         let internal = NodeId(1u32 << 31);
         sel.insert(internal);
-        // 3 × 20 (leaves) + 20 (internal, DEFAULT_INTERNAL_TOKENS).
-        let mut used = 80;
+        // MERGE_FANOUT × 20 (leaves) + 20 (internal, DEFAULT_INTERNAL_TOKENS).
+        let mut used = 20 * (MERGE_FANOUT as u32 + 1);
         eliminate_redundant(&tree, &mut sel, &mut used);
         assert!(!sel.contains(&internal));
-        assert!(sel.contains(&NodeId(1)));
-        assert!(sel.contains(&NodeId(2)));
-        assert!(sel.contains(&NodeId(3)));
+        for i in 1..=MERGE_FANOUT as u32 {
+            assert!(sel.contains(&NodeId(i)));
+        }
         // The dropped internal returns its 20 tokens to the budget.
-        assert_eq!(used, 60);
+        assert_eq!(used, 20 * MERGE_FANOUT as u32);
     }
 
     #[test]
     fn redundancy_keeps_ancestor_when_one_child_uncovered() {
-        // Ternary SoS over three SoT leaves; only two selected. The ancestor
-        // must stay — it's the only way to cover the third leaf.
-        let (tree, _) = build_uniform_tree(3, 1, 10, 20);
+        // SoS over MERGE_FANOUT SoT leaves; all but the last selected. The
+        // ancestor must stay — it's the only way to cover the last leaf.
+        let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 1, 10, 20);
         let mut sel: AHashSet<NodeId> = AHashSet::default();
-        sel.insert(NodeId(1));
-        sel.insert(NodeId(2));
+        for i in 1..MERGE_FANOUT as u32 {
+            sel.insert(NodeId(i));
+        }
         let internal = NodeId(1u32 << 31);
         sel.insert(internal);
-        let mut used = 60;
+        let mut used = 20 * MERGE_FANOUT as u32;
         eliminate_redundant(&tree, &mut sel, &mut used);
         assert!(
             sel.contains(&internal),
@@ -636,7 +637,7 @@ mod tests {
         // `covered(node, sel)` from §8.4 means: every leaf descendant
         // of `node` is in `sel` (or `node` itself is).  It does NOT
         // walk upward.  This is the redundancy-elimination semantics.
-        let (tree, _) = build_uniform_tree(3, 2, 10, 20);
+        let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 2, 10, 20);
         let internal = NodeId(1u32 << 31);
 
         // SoS in sel → trivially covered.
@@ -649,12 +650,12 @@ mod tests {
         // asks).
         assert!(!covered(&tree, NodeId(1), &sel_internal));
 
-        // All three SoT leaves in sel → SoS is covered (its ternary children
+        // All MERGE_FANOUT SoT leaves in sel → SoS is covered (its children
         // are all in sel).
         let mut sel_leaves = AHashSet::default();
-        sel_leaves.insert(NodeId(1));
-        sel_leaves.insert(NodeId(2));
-        sel_leaves.insert(NodeId(3));
+        for i in 1..=MERGE_FANOUT as u32 {
+            sel_leaves.insert(NodeId(i));
+        }
         assert!(covered(&tree, internal, &sel_leaves));
         // ...and each leaf is covered (in sel).
         assert!(covered(&tree, NodeId(1), &sel_leaves));
@@ -712,12 +713,17 @@ mod tests {
 
     #[test]
     fn lca_of_normals_across_leaves_finds_common_ancestor() {
-        let (tree, normals) = build_uniform_tree(3, 1, 10, 20);
+        let (tree, normals) = build_uniform_tree(MERGE_FANOUT as u32, 1, 10, 20);
         let parents = build_parent_map(&tree);
         let map = build_normal_to_leaf_map(&tree);
-        // Three leaves carry into a single ternary SoS peak; normals 0 and 2
-        // span all three leaves → LCA = that sole peak.
-        let lca = lca_of_normals(&tree, &[normals[0], normals[2]], &parents, &map);
+        // MERGE_FANOUT leaves carry into a single SoS peak; the first and last
+        // normals span all leaves → LCA = that sole peak.
+        let lca = lca_of_normals(
+            &tree,
+            &[normals[0], normals[MERGE_FANOUT - 1]],
+            &parents,
+            &map,
+        );
         let peaks = tree.peaks();
         assert_eq!(peaks.len(), 1);
         assert_eq!(lca, Some(peaks[0]));

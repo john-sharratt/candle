@@ -46,6 +46,7 @@ use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
 use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
 use std::collections::HashMap;
+use sysinfo::System;
 
 /// How often the loop wakes up on its own when no triggers arrive.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
@@ -714,6 +715,39 @@ fn run_pass(
                 view.install_cold(idx, stored);
             }
         }
+    }
+
+    // ── Phase 2.6: warm-tier RAM purge ─────────────────────────────────
+    //
+    // The warm (RAM) copies produced by Phase 1 are durable the moment
+    // their cold copy lands (Phase 2 / 2.5 above), but nothing else drops
+    // them: `install_cold` frees hot, never warm, and the only other
+    // `purge_warm_to_target` call site is the cold→hot recall path in
+    // `elevate_to_hot`. During a bulk ingest (calibration, repo scan)
+    // there are almost no recalls — just hot→warm→cold migration — so the
+    // warm tier would otherwise grow unbounded and exhaust host RAM (the
+    // OOM that killed a full load). Run the same LRU purge here, where warm
+    // is actually produced, dropping the least-recently-used warm copies
+    // until the OS holds at least `max(2 GiB, 5% × total)` free. Every warm
+    // residence reachable here is already cold-backed (Phase 2 persisted
+    // this pass's whole warm-without-cold set), so no un-persisted bytes
+    // are dropped. `incoming = 0`: we bound the existing footprint, not
+    // reserve for an upcoming allocation.
+    //
+    // Gated on this pass having actually moved KV into warm — warm only
+    // grows via the hot→warm migration above, and a pass that produced
+    // none can't have pushed RAM up, so an idle tick skips the sysinfo
+    // query entirely.
+    if hot_to_warm_count > 0 || warm_to_cold_count > 0 {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let total_ram = sys.total_memory();
+        let available_ram = sys.available_memory();
+        // `purge_warm_to_target` logs its own batch summary (see substrate.rs);
+        // no extra log here.
+        let _ = conversation
+            .write()
+            .purge_warm_to_target(0, available_ram, total_ram);
     }
 
     // ── Phase 3: fsync ─────────────────────────────────────────────────

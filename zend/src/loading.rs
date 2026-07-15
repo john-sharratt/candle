@@ -80,11 +80,23 @@ enum Inner {
         /// progress reported yet for this step" → bar reads 0%.
         progressed: u64,
         total: u64,
+        /// Cumulative tokens prefilled during this step (ingest stat).
+        prefill_tokens: u64,
         /// Wall-clock instant the current step was entered — used for
         /// per-step elapsed-time logging at transitions.
         started: Instant,
     },
     Ready,
+}
+
+/// Live token counters for an in-flight ingest step, polled to drive the
+/// upload modal's per-stage stats (ingested tokens & t/s). The whole-file
+/// summary is no longer decoded inline — it's the async summary tree's root,
+/// tracked separately by the upload's analysis phase — so there are no
+/// summary token counters here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngestStats {
+    pub prefill_tokens: u64,
 }
 
 impl LoadProgress {
@@ -96,6 +108,7 @@ impl LoadProgress {
                 current: LoadStep::Model,
                 progressed: 0,
                 total: 0,
+                prefill_tokens: 0,
                 started: Instant::now(),
             }),
         }
@@ -167,6 +180,7 @@ impl LoadProgress {
             current: step,
             progressed: 0,
             total: 0,
+            prefill_tokens: 0,
             started: Instant::now(),
         };
     }
@@ -188,6 +202,42 @@ impl LoadProgress {
         {
             *progressed = current.min(total);
             *t = total;
+        }
+    }
+
+    /// Read the raw `(current, total)` step counters — the inverse of
+    /// [`Self::set_step_progress`]. `total == 0` means indeterminate.
+    /// Cheap; used to poll an in-flight step's progress (e.g. streaming the
+    /// code-read ingest bar during an upload).
+    pub fn step_progress(&self) -> (u64, u64) {
+        let guard = self.inner.lock().unwrap();
+        if let Inner::Loading {
+            progressed, total, ..
+        } = &*guard
+        {
+            (*progressed, *total)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Add `n` to the running prefilled-token count for the current step.
+    /// Cheap; called once per carved scope as the ingest reads a file.
+    pub fn add_prefill_tokens(&self, n: u64) {
+        if let Inner::Loading { prefill_tokens, .. } = &mut *self.inner.lock().unwrap() {
+            *prefill_tokens += n;
+        }
+    }
+
+    /// Snapshot the current step's ingest token counters — polled by the upload
+    /// SSE loop to stream the per-stage "ingested tokens & t/s" stat to the GUI.
+    pub fn ingest_stats(&self) -> IngestStats {
+        if let Inner::Loading { prefill_tokens, .. } = &*self.inner.lock().unwrap() {
+            IngestStats {
+                prefill_tokens: *prefill_tokens,
+            }
+        } else {
+            IngestStats::default()
         }
     }
 

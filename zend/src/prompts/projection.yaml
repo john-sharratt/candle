@@ -262,15 +262,19 @@ layers:
             group) being read above. Nothing else.
         assistant:
           system_prompt: |
-            You compress absorbed source code into a faithful digest. Keep the key
-            definitions — functions, structs, traits, impls — by their exact name and
-            signature, and what each is for; drop the line-by-line body. Never rename,
-            never invent a definition, parameter, or type that is not in the code.
-            Stop the moment the definitions are captured; do not pad.
+            You compress absorbed source code into a faithful digest. Open by naming
+            the file path and the specific scope (function, struct, impl block, or
+            import group) being read — this digest stands alone, so it must say what
+            it is about. Then keep the key definitions — functions, structs, traits,
+            impls — by their exact name and signature, and what each is for; drop the
+            line-by-line body. Never rename, never invent a file, definition,
+            parameter, or type that is not in the code. Stop the moment the
+            definitions are captured; do not pad.
           user_prompt: |
-            Digest the code above: the key definitions by their exact name and
-            signature and what each does, dropping bodies. Add nothing not in the
-            code; stop when captured.
+            Digest the code above. Start with the file path and the specific scope
+            being read, then the key definitions by their exact name and signature and
+            what each does, dropping bodies. Add nothing not in the code; stop when
+            captured.
       summaries:
         max_tokens: 512
         user:

@@ -1291,14 +1291,19 @@ impl EngineConfig {
 }
 
 /// Scheduler-specific configuration.
-///
-/// Phase 1 uses single-mode prefill; these thresholds are reserved for Phase 2.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Small-prefill threshold (Phase 2+). Prefills below this go to the fast queue.
+    /// Small-prefill threshold. Reserved for the unified-wave small/large batch
+    /// flip (design `docs/unified_wave_inference_engine.md`); not yet read.
     pub small_prefill_threshold: usize,
 
-    /// Maximum aggregate tokens in one large-prefill step (Phase 2+).
+    /// **Per-forward prefill token target** (`max_prefill_pass_tokens`): the
+    /// tokens one prefill forward carries. The primary knob for the expert-load
+    /// amortization curve (design §1.2/§6) — a larger target streams the same
+    /// all-expert weight load over more tokens. Bounded above by the model-side
+    /// per-forward ceiling ([`crate::models::batched_inference`]'s
+    /// `MAX_PREFILL_TOKENS`); set at the point where enough parallel work is
+    /// reliably queued to fill every forward, so no forward runs starved.
     pub large_prefill_max_tokens: usize,
 }
 
@@ -1306,7 +1311,13 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             small_prefill_threshold: 128,
-            large_prefill_max_tokens: 512,
+            // 2048 tokens/forward: with the parallel scope-ingest keeping ~24
+            // scopes queued at once (`CODE_READ_PARALLELISM`), every forward
+            // fills to this target — saturating ~all experts by the
+            // coupon-collector bound — instead of stalling on a 4096-token
+            // target that the reduced-scope scope KV rarely reaches. ≤ the
+            // model's `MAX_PREFILL_TOKENS` ceiling.
+            large_prefill_max_tokens: 2048,
         }
     }
 }
@@ -1468,6 +1479,22 @@ pub struct SequenceConfig {
     /// to capture full-resolution tool-call exemplars for the provenance work.
     /// Overrides the level/force fields above. **Default: `false`.**
     pub kv_lossless: bool,
+}
+
+#[cfg(test)]
+mod scheduler_config_tests {
+    use super::SchedulerConfig;
+
+    #[test]
+    fn prefill_target_is_reliably_fillable() {
+        // The scheduler per-forward target sits at the point the parallel
+        // scope-ingest reliably fills every forward (amortization, design §6),
+        // not chunked at 512 nor stalled waiting for a 4096-token forward the
+        // reduced-scope scope KV rarely reaches. Must stay ≤ the model-side
+        // `MAX_PREFILL_TOKENS` ceiling (4096).
+        assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 2048);
+        assert!(SchedulerConfig::default().large_prefill_max_tokens <= 4096);
+    }
 }
 
 #[cfg(test)]

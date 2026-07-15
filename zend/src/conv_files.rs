@@ -62,6 +62,47 @@ pub fn kind_for(name: &str) -> FileKind {
     }
 }
 
+/// Executable / installer / auto-run file extensions that are never admitted
+/// as uploads. The daemon writes uploads to disk, so hosting a native
+/// executable, installer, or OS auto-run dropper is a needless malware
+/// vector — and none of them carry any text value for the model to read.
+/// Plain-text source scripts (`.sh`, `.ps1`, `.py`, `.js`, …) are **not**
+/// blocked: they are read as text, never run.
+///
+/// Kept in sync with the GUI's `BLOCKED_UPLOAD_EXTS` (both sides enforce it).
+pub const BLOCKED_UPLOAD_EXTS: &[&str] = &[
+    // Native executables, libraries, object code.
+    "exe", "dll", "so", "dylib", "com", "scr", "pif", "cpl", "sys", "drv", "ocx", "o", "a", "lib",
+    "bin", "elf", "out", "ko", // Installers / OS packages / disk images.
+    "msi", "msp", "msc", "cab", "dmg", "pkg", "app", "deb", "rpm", "apk", "ipa", "appx",
+    "appimage", "gadget", // Windows shell / registry / shortcut auto-run vectors.
+    "bat", "cmd", "vbs", "vbe", "wsf", "wsh", "hta", "jse", "wsc", "reg", "lnk", "scf", "inf",
+    // Java / .NET intermediate executables.
+    "jar", "class",
+];
+
+/// If `name` names a blocked upload type (see [`BLOCKED_UPLOAD_EXTS`]),
+/// return a short human-readable reason; otherwise `None`.
+pub fn blocked_upload_reason(name: &str) -> Option<&'static str> {
+    // Windows' CreateFileW silently strips trailing dots and spaces, so
+    // `payload.exe.` (or `payload.exe `) lands on disk as `payload.exe`. Trim
+    // them before reading the extension or the gate is trivially bypassed.
+    let cleaned = name.trim_end_matches([' ', '.', '\t']);
+    let ext = cleaned
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == cleaned {
+        return None; // no extension at all
+    }
+    if BLOCKED_UPLOAD_EXTS.contains(&ext.as_str()) {
+        Some("executable, installer, and auto-run file types are not allowed")
+    } else {
+        None
+    }
+}
+
 /// The 2–4 char uppercase extension badge the GUI shows (e.g. `RS`, `LOG`).
 pub fn ext_badge(name: &str) -> String {
     let ext = name.rsplit('.').next().unwrap_or("");
@@ -151,6 +192,42 @@ mod tests {
         assert_eq!(kind_for("notes.txt"), FileKind::Text);
         assert_eq!(kind_for("diagram.png"), FileKind::Img);
         assert_eq!(kind_for("noext"), FileKind::Text);
+    }
+
+    #[test]
+    fn blocks_executables_allows_text_and_source() {
+        // Blocked: executables, installers, OS auto-run droppers.
+        for n in [
+            "malware.exe",
+            "payload.DLL",
+            "setup.msi",
+            "trojan.scr",
+            "dropper.bat",
+            "run.cmd",
+            "x.vbs",
+            "a.jar",
+            "lib.so",
+            "kernel.dylib",
+            "shortcut.lnk",
+            "keys.reg",
+        ] {
+            assert!(blocked_upload_reason(n).is_some(), "{n} must be blocked");
+        }
+        // Allowed: text, source, docs, data, images — read, never executed.
+        for n in [
+            "notes.txt",
+            "redo.rs",
+            "app.js",
+            "script.sh",
+            "deploy.ps1",
+            "schema.md",
+            "data.csv",
+            "config.json",
+            "diagram.png",
+            "noext",
+        ] {
+            assert!(blocked_upload_reason(n).is_none(), "{n} must be allowed");
+        }
     }
 
     #[test]

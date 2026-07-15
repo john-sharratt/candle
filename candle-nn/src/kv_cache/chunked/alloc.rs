@@ -63,6 +63,66 @@ fn vram_reserve_bytes(_total: usize) -> usize {
     384 * 1024 * 1024
 }
 
+/// Extra VRAM headroom kept free ON TOP of [`vram_reserve_bytes`] that ONLY a
+/// compress-to-free operation may allocate from — the scheduler's ordinary KV
+/// growth can never touch it (see [`vram_budget_available`]).
+///
+/// It exists to break a deadlock: under extreme KV pressure the hot→warm
+/// migration (and in-session seal) couldn't allocate the small *transient*
+/// quantized scratch it needs to compress and free the much larger float
+/// source — so `quantize_sealed_in_place` failed, VRAM stayed pinned, and
+/// nothing could ever drain (can't free VRAM because freeing needs VRAM).
+/// Reserving a dedicated slice that normal allocation must always leave free
+/// guarantees the compress path — wrapped in an [`EvictionScope`] — always has
+/// physical room to run and reclaim far more than it borrows.
+///
+/// Default 128 MiB (one compress arena is ~16 MiB; this covers several in
+/// flight across the persistence + scheduler threads); override with
+/// `CANDLE_KV_EVICTION_RESERVE_MB`.
+#[cfg(feature = "cuda")]
+fn eviction_reserve_bytes() -> usize {
+    if let Ok(v) = std::env::var("CANDLE_KV_EVICTION_RESERVE_MB") {
+        if let Ok(mb) = v.trim().parse::<usize>() {
+            return mb.saturating_mul(1024 * 1024);
+        }
+    }
+    128 * 1024 * 1024
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    /// Whether the current thread is inside a compress-to-free operation and
+    /// may therefore allocate from the [`eviction_reserve_bytes`] slice.
+    static EVICTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII scope: while alive, arena allocations *on this thread* may dip into the
+/// dedicated [`eviction_reserve_bytes`] headroom. Wrap a compress-to-free
+/// operation (`quantize_sealed_in_place`) in it so the transient quantized
+/// scratch it needs can always be allocated, even when the normal KV budget is
+/// exhausted. Nestable — restores the previous state on drop.
+#[cfg(feature = "cuda")]
+pub(crate) struct EvictionScope(bool);
+
+#[cfg(feature = "cuda")]
+impl EvictionScope {
+    pub(crate) fn enter() -> Self {
+        EvictionScope(EVICTING.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for EvictionScope {
+    fn drop(&mut self) {
+        EVICTING.with(|c| c.set(self.0));
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn evicting() -> bool {
+    EVICTING.with(|c| c.get())
+}
+
 /// Whether `want` bytes can be allocated on `device` without pushing *our own*
 /// live GPU footprint past the memory actually available to us. Returns `true`
 /// (permit) on non-CUDA devices, or when the pool/total queries are unavailable
@@ -93,7 +153,16 @@ fn vram_has_room(device: &Device, want: usize) -> bool {
         Ok(ft) => ft,
         Err(_) => return true,
     };
-    let reserve = vram_reserve_bytes(total);
+    // Normal allocations must leave both the base reserve AND the dedicated
+    // eviction slice free; a compress-to-free op (inside an `EvictionScope`) may
+    // dip into the eviction slice — that's the whole point, so it can always
+    // allocate its transient scratch and reclaim VRAM under extreme pressure.
+    let reserve = vram_reserve_bytes(total)
+        + if evicting() {
+            0
+        } else {
+            eviction_reserve_bytes()
+        };
     // Stable budget: our own pool usage (model + KV + activations), against the
     // VRAM that was ours to spend — `init_free` = total minus the CUDA context,
     // captured at device creation with the pageable desktop excluded. This is
@@ -148,7 +217,10 @@ pub fn vram_budget_available(device: &Device) -> Option<usize> {
     };
     let used = d.pool_used_bytes().ok()?;
     let (_free, total) = d.mem_get_info().ok()?;
-    let reserve = vram_reserve_bytes(total);
+    // The scheduler's KV growth is ordinary allocation, so it must treat BOTH
+    // the base reserve and the dedicated eviction slice as unavailable — keeping
+    // the eviction headroom genuinely reserved for the compress-to-free path.
+    let reserve = vram_reserve_bytes(total) + eviction_reserve_bytes();
     let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
     Some(ceiling.saturating_sub(used).saturating_sub(reserve))
 }

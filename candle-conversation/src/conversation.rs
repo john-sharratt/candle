@@ -14,7 +14,7 @@ use crate::projection::{
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
-use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
+use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
@@ -138,6 +138,27 @@ pub(crate) fn window_sealed_tokens(
 use crate::stencil::TriggerRegistry;
 use crossbeam::channel::Sender;
 use std::sync::Arc;
+
+/// One code scope to ingest in parallel — the `(user, assistant)` pair a single
+/// [`Sequence::insert_turn`] takes, but many are prefilled concurrently on
+/// scratch slots and recombined into the conversation's timeline in scope order.
+/// The user half is the tool-call request ("Read X lines A–B"), the assistant
+/// half the file-content echo. See [`Sequence::ingest_scopes_parallel`].
+pub struct ScopeTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// A scope tokenised into its cold-prefill grid + the content offsets the sealed
+/// turn's layout needs — the client-side product handed to the scheduler's
+/// `PrefillScope` request.
+struct PreparedScopeGrid {
+    tokens: TokenBuffer,
+    token_count: usize,
+    user_content_start: u32,
+    user_content_end: u32,
+    assistant_content_start: u32,
+}
 
 /// A client-side conversation handle.
 ///
@@ -272,6 +293,16 @@ impl Sequence {
         model_core: ModelCoreProperties,
         substrate: Conversation,
         section_progress: Option<&dyn Fn(u64, u64)>,
+        // When `false`, skip the [`SchedulerRequest::PrimingProjection`] slot
+        // pre-warm (a synchronous scheduler round-trip). Priming is a
+        // first-turn latency optimization — it pre-injects the empty-collection
+        // layout so the first `submit_turn` skips `apply_projection`. Callers
+        // that create MANY sequences in a pipelined burst (calibration) pass
+        // `false`: the per-sequence round-trip would serialise the burst back
+        // to one-create-per-wave-latency, defeating the batching, and the
+        // per-turn `apply_projection` at submit materialises the projection
+        // just the same (it must anyway, to select the pinned tool).
+        prime_slot: bool,
     ) -> crate::Result<Self> {
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
@@ -597,7 +628,7 @@ impl Sequence {
         // Any per-turn projection that selects ≥ 1 collection member
         // will materialise those (and the gated sections) via
         // `apply_projection` at submit_turn time.
-        if !fixed_prefix.is_empty() {
+        if prime_slot && !fixed_prefix.is_empty() {
             let (tx, rx) = crossbeam::channel::bounded(1);
             conv.scheduler_tx
                 .send(crate::scheduler::SchedulerRequest::PrimingProjection {
@@ -1490,20 +1521,25 @@ impl Sequence {
     /// turn's stream id. Together with the turn's seal-time wide-Q signature
     /// this gives a later provenance scan the resolvable chain
     /// sig hit → event → turn.
+    ///
+    /// Returns the number of tokens prefilled (the full formatted grid), which
+    /// the prefill-only ingest paths (repo map, code read) surface as the "tokens
+    /// ingested" metric.
     pub fn insert_turn_staged(
         &mut self,
         user_message: &str,
         assistant_text: &str,
         tags: Vec<String>,
-    ) -> crate::Result<()> {
-        let (assistant_content_start, turn_index) =
+    ) -> crate::Result<usize> {
+        let (assistant_content_start, turn_index, tokens) =
             self.insert_turn_inner(user_message, assistant_text, tags)?;
         let Some(idx) = turn_index else {
             // No substrate seal (no registered target) — nothing to key
             // events to; the turn itself was still prefilled.
-            return Ok(());
+            return Ok(tokens);
         };
-        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &[])
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &[])?;
+        Ok(tokens)
     }
 
     /// Like [`Self::insert_turn_staged`], but `assistant_with_seams` carries
@@ -1524,7 +1560,7 @@ impl Sequence {
     ) -> crate::Result<()> {
         let segments: Vec<&str> = assistant_with_seams.split(seam_marker).collect();
         let clean_assistant = segments.concat();
-        let (assistant_content_start, turn_index) =
+        let (assistant_content_start, turn_index, _tokens) =
             self.insert_turn_inner(user_message, &clean_assistant, tags)?;
         let Some(idx) = turn_index else {
             return Ok(());
@@ -1558,7 +1594,7 @@ impl Sequence {
         user_message: &str,
         assistant_text: &str,
         tags: Vec<String>,
-    ) -> crate::Result<(u32, Option<u32>)> {
+    ) -> crate::Result<(u32, Option<u32>, usize)> {
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -1674,7 +1710,152 @@ impl Sequence {
 
         // Run the same post-Done finalize as a regular turn.
         self.finalize_turn_post_done(user_tt, asst_tt, response.seal.as_ref())?;
-        Ok((assistant_content_start, turn_index))
+        Ok((assistant_content_start, turn_index, total))
+    }
+
+    /// Ingest `scopes` into this conversation's timeline, prefilled **in parallel**
+    /// and recorded in scope order. Returns the per-scope prefilled token counts
+    /// (in scope order — sum for the "tokens ingested" metric). Blocks until every
+    /// scope is recorded.
+    ///
+    /// Unlike a run of [`insert_turn`](Self::insert_turn) calls — each prefilling
+    /// one-at-a-time on this conversation's single slot — every scope here cold-
+    /// prefills on its own scratch slot, so a file's N scopes (and scopes across
+    /// concurrently-ingesting files) batch into large forwards that amortise the
+    /// MoE expert-weight load (design §6). The scheduler owns cross-file fairness
+    /// and the scratch-slot bound, so this fires all scopes up-front without
+    /// managing backpressure; it then waits for the batch to record.
+    ///
+    /// Each scope's K/V is system-unconditioned (like a compression summary's
+    /// re-prefill) — the async summary tree bridges the scopes with
+    /// `SummaryOfTurns` nodes so the recombined file reads coherently.
+    /// `tags` (e.g. `["code", <path>]`) are applied to every scope turn's
+    /// `TurnDecl` and drive its staged provenance linkage, exactly as
+    /// [`insert_turn_staged`](Self::insert_turn_staged) does for the serial path.
+    pub fn ingest_scopes_parallel(
+        &mut self,
+        scopes: &[ScopeTurn],
+        tags: Vec<String>,
+        on_prefilled: ScopeProgressFn,
+    ) -> crate::Result<Vec<usize>> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timeline = self.target.timeline;
+        let scope_total = scopes.len() as u32;
+        let mut receivers = Vec::with_capacity(scopes.len());
+        let mut per_scope_tokens = Vec::with_capacity(scopes.len());
+        let mut per_scope_asst_start = Vec::with_capacity(scopes.len());
+        for (i, scope) in scopes.iter().enumerate() {
+            let grid = self.prepare_scope_grid(&scope.user, &scope.assistant)?;
+            per_scope_tokens.push(grid.token_count);
+            per_scope_asst_start.push(grid.assistant_content_start);
+            let (tx, rx) = crossbeam::channel::unbounded();
+            self.scheduler_tx
+                .send(SchedulerRequest::PrefillScope {
+                    timeline,
+                    projection: Arc::clone(&self.projection),
+                    scope_index: i as u32,
+                    scope_total,
+                    tokens: grid.tokens,
+                    user_content_start: grid.user_content_start,
+                    user_content_end: grid.user_content_end,
+                    assistant_content_start: grid.assistant_content_start,
+                    user_text: scope.user.clone(),
+                    assistant_text: scope.assistant.clone(),
+                    tags: tags.clone(),
+                    response_tx: tx,
+                    on_prefilled: Arc::clone(&on_prefilled),
+                })
+                .map_err(|_| ConversationError::SchedulerGone)?;
+            receivers.push(rx);
+        }
+        // The scheduler records the whole batch in scope order once every scope has
+        // landed, then answers each channel — so these recvs unblock together, in
+        // submission order. Collect each recorded turn index (in scope order) for
+        // the staged-provenance pass. Surface the first scope error (if any) after
+        // draining the rest so no channel is left dangling.
+        let mut recorded: Vec<(usize, u32)> = Vec::with_capacity(scopes.len());
+        let mut first_err = None;
+        for (i, rx) in receivers.into_iter().enumerate() {
+            match rx.recv() {
+                Ok(Ok(idx)) => recorded.push((i, idx.0)),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(ConversationError::SchedulerGone);
+                    }
+                }
+            }
+        }
+        // Stage the sig→event→turn provenance chain for each recorded scope turn —
+        // the parallel analog of `insert_turn_staged`'s per-turn linkage, run once
+        // the whole batch is in the substrate.
+        for (scope_i, turn_index) in recorded {
+            self.persist_staged_ingest_events(turn_index, per_scope_asst_start[scope_i], 0.0, &[])?;
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(per_scope_tokens),
+        }
+    }
+
+    /// Tokenise one scope into its cold-prefill grid + content offsets, matching
+    /// [`insert_turn`](Self::insert_turn)'s layout byte-for-byte:
+    /// `[/no_think][user][user_end][assistant_start][assistant]`. The `/no_think`
+    /// prefix keeps the model out of a reasoning frame over the supplied content.
+    fn prepare_scope_grid(
+        &self,
+        user_message: &str,
+        assistant_text: &str,
+    ) -> crate::Result<PreparedScopeGrid> {
+        let no_think_prefix = self.config.dialect.no_think;
+        let assistant_start_marker = self.config.dialect.assistant_start;
+        let formatted = format!(
+            "{}{}{}{}{}",
+            no_think_prefix,
+            user_message,
+            self.config.dialect.user_end,
+            assistant_start_marker,
+            assistant_text,
+        );
+        let tokens = self.tokenize(&formatted)?;
+        // Tokenise each prefix against the SAME strings the grid is built from so
+        // the offsets land on the real token grid; clamp + monotonise so a
+        // tokenizer that merges across a join can never invert the windows.
+        let user_content_start = self.tokenize(no_think_prefix)?.len();
+        let user_content_end = self
+            .tokenize(&format!("{no_think_prefix}{user_message}"))?
+            .len();
+        let assistant_content_start = self
+            .tokenize(&format!(
+                "{}{}{}{}",
+                no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
+            ))?
+            .len();
+        let total = tokens.len();
+        let user_content_start = user_content_start.min(total) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
+        Ok(PreparedScopeGrid {
+            token_count: total,
+            tokens,
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+        })
     }
 
     /// Blocking convenience: submit + wait.
@@ -2746,6 +2927,75 @@ impl Drop for Sequence {
                 sequence_id: self.id,
             });
         }
+    }
+}
+
+/// Pure block-range windowing for a bounded rolling-window ingest (design
+/// `docs/unified_wave_inference_engine.md` §4.7): given the system-prompt end
+/// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
+/// sealed turn), the current `total` block count, and `window_turns`, return the
+/// parent block ranges the next prefill should attend — the system prompt plus
+/// the most recent `window_turns` sealed turns.
+///
+/// `window_turns == 0` (unbounded) or fewer sealed turns than the window returns
+/// the whole parent `[(0, total)]` — a no-op, byte-for-byte the unwindowed
+/// behaviour. Split out from [`Conversation::windowed_ingest_ranges`] so it is
+/// unit-testable without a live substrate.
+pub(crate) fn windowed_ingest_ranges_impl(
+    sys_end: usize,
+    turn_starts: &[usize],
+    total: usize,
+    window_turns: usize,
+) -> Vec<(usize, usize)> {
+    let whole = || {
+        if total == 0 {
+            Vec::new()
+        } else {
+            vec![(0, total)]
+        }
+    };
+    if window_turns == 0 || turn_starts.len() <= window_turns {
+        return whole();
+    }
+    let keep_from = turn_starts[turn_starts.len() - window_turns];
+    // If the window already reaches back into (or to) the system prompt, the two
+    // pieces are contiguous — borrow the whole parent.
+    if keep_from <= sys_end {
+        return whole();
+    }
+    let mut ranges = Vec::with_capacity(2);
+    if sys_end > 0 {
+        ranges.push((0, sys_end));
+    }
+    ranges.push((keep_from, total));
+    ranges
+}
+
+#[cfg(test)]
+mod windowed_ingest_tests {
+    use super::windowed_ingest_ranges_impl as w;
+
+    #[test]
+    fn window_bounds_to_system_prompt_plus_last_n_turns() {
+        // system prompt occupies [0,2); five sealed turns start at 2,5,9,12,16;
+        // current total is 20 blocks.
+        let sys = 2;
+        let starts = [2usize, 5, 9, 12, 16];
+        // Unbounded (0) or window >= turn count → whole parent (no-op).
+        assert_eq!(w(sys, &starts, 20, 0), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 5), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 9), vec![(0, 20)]);
+        // Keep last 2 turns → system [0,2) + [starts[3]=12, 20).
+        assert_eq!(w(sys, &starts, 20, 2), vec![(0, 2), (12, 20)]);
+        // Keep last 1 → [0,2) + [16, 20).
+        assert_eq!(w(sys, &starts, 20, 1), vec![(0, 2), (16, 20)]);
+        // No system prompt → single tail range.
+        assert_eq!(w(0, &starts, 20, 2), vec![(12, 20)]);
+        // Empty parent → no ranges.
+        assert_eq!(w(0, &[], 0, 3), Vec::<(usize, usize)>::new());
+        // Window reaches into the system-prompt region (keep_from <= sys_end) →
+        // contiguous → whole parent.
+        assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
     }
 }
 
