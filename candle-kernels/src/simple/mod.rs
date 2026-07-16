@@ -46,5 +46,8 @@ pub mod moe_scatter;
 // R16 KV gather: single-kernel replacement for per-chunk memcpy_dtov
 pub mod gather_r16_kv;
 
+// Provenance sign(Q) bit-pack: GPU read+sign+pack, one launch for all layers
+pub mod prov_sign_pack;
+
 // KV tier-migration scatter/gather (kv_pack / kv_unpack primitive)
 pub mod kv_migrate;

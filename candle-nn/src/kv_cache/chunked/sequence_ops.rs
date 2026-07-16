@@ -1683,11 +1683,29 @@ impl ChunkedKvBacking {
             }
         };
 
-        // Pre-compute per-arena byte strides once for the whole record call.
-        // `chunk_byte_stride` is the byte size of one physical chunk slot in that
-        // arena; summing over unique arena indices gives the total bytes for a
-        // SealedChunk's GID set.
-        let arena_infos = self.resolve_arena_info().unwrap_or_default();
+        // Pre-compute per-arena byte strides once for the whole record call — but
+        // only for the arenas this sequence's chunks actually reference (a
+        // couple), not the whole arena table. The full `to_arena_entry` walk per
+        // layer dominated the snapshot's per-scope cost.
+        let n_kv_head = self.inner.n_kv_head;
+        let needed: std::collections::HashSet<usize> = slot
+            .chunks_slice()
+            .iter()
+            .flat_map(|cw| {
+                (0..n_kv_head).flat_map(move |h| {
+                    (0..N_PALETTE).flat_map(move |p| {
+                        [
+                            cw.gids.k_gid_pal(h, p).arena_idx(),
+                            cw.gids.v_gid_pal(h, p).arena_idx(),
+                        ]
+                    })
+                })
+            })
+            .collect();
+        let arena_infos = self
+            .inner
+            .resolve_arena_info_for(&needed)
+            .unwrap_or_default();
 
         // Build SealedChunks from every block in the slot's block
         // table, including the trailing partial.  No positional state

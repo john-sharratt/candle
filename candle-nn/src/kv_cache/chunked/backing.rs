@@ -1396,6 +1396,25 @@ impl BackingInner {
     /// Returns one [`ResolvedArenaInfo`] per arena index (dense, 0..num_arenas).
     /// The `num_arenas` count is determined by scanning all active GIDs.
     pub fn resolve_arena_info(&self) -> Result<Vec<ResolvedArenaInfo>> {
+        self.resolve_arena_info_filtered(None)
+    }
+
+    /// Like [`Self::resolve_arena_info`] but only builds entries for the arena
+    /// indices in `needed` (others stay at the zero default). The provenance
+    /// pointer-resolve touches only a couple of arenas per scope, so skipping
+    /// `to_arena_entry` for every other arena is the bulk of that path's cost.
+    /// `None` resolves all arenas (the original behaviour).
+    pub fn resolve_arena_info_for(
+        &self,
+        needed: &std::collections::HashSet<usize>,
+    ) -> Result<Vec<ResolvedArenaInfo>> {
+        self.resolve_arena_info_filtered(Some(needed))
+    }
+
+    fn resolve_arena_info_filtered(
+        &self,
+        needed: Option<&std::collections::HashSet<usize>>,
+    ) -> Result<Vec<ResolvedArenaInfo>> {
         use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
 
         let chunk_size = CHUNK_SIZE;
@@ -1418,6 +1437,11 @@ impl BackingInner {
             ];
 
             for (&arena_idx, arena) in arenas.iter() {
+                if let Some(needed) = needed {
+                    if !needed.contains(&arena_idx) {
+                        continue;
+                    }
+                }
                 let ae = arena.to_arena_entry();
                 let base_ptr = ae.k_ptr;
                 let k_tag = ae.k_format_tag;
@@ -2093,6 +2117,148 @@ impl ChunkedKvBacking {
         }
 
         Ok(result)
+    }
+
+    /// Resolve the R16 K-chunk base pointers (Q is co-located in the K chunk at
+    /// +64 per dim-group) for a sequence's blocks — the addresses the provenance
+    /// sign-pack kernel reads Q from. Returns `(q_ptrs, block_indices)` where
+    /// `q_ptrs` is `[block][head][palette]` device i64 addresses (length
+    /// `block_indices.len() × n_kv_head × N_PALETTE`) and `block_indices` are the
+    /// absolute chunk indices kept — only fully-R16, GPU-backed blocks are
+    /// included, exactly as [`Self::gather_r16_kv_probe`] filters them, so all
+    /// layers of a scope resolve to the same block set. Empty on non-CUDA / no
+    /// R16 blocks.
+    pub fn provenance_q_ptrs(
+        &self,
+        batch_idx: usize,
+        block_range: Option<(usize, usize)>,
+    ) -> Result<(Vec<i64>, Vec<usize>)> {
+        use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+
+        let n_kv_head = self.inner.n_kv_head;
+        let Device::Cuda(_) = &self.inner.device else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        // (absolute_block_idx, [(k_ai, k_ci)]) — Q side only (co-located with K).
+        let block_gids: Vec<(usize, Vec<(usize, usize)>)> = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            let slot = match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
+                Some(s) => s,
+                None => return Ok((Vec::new(), Vec::new())),
+            };
+            let chunks = slot.chunks_slice();
+            let (lo, hi) = match block_range {
+                Some((l, h)) => (l.min(chunks.len()), h.min(chunks.len())),
+                None => (0, chunks.len()),
+            };
+            if hi <= lo {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            chunks[lo..hi]
+                .iter()
+                .enumerate()
+                .map(|(i, cw)| {
+                    let absolute_idx = lo + i;
+                    let gids: Vec<(usize, usize)> = (0..n_kv_head)
+                        .flat_map(|h| {
+                            (0..N_PALETTE).map(move |p| {
+                                let kg = cw.gids.k_gid_pal(h, p);
+                                (kg.arena_idx(), kg.chunk_idx())
+                            })
+                        })
+                        .collect();
+                    (absolute_idx, gids)
+                })
+                .collect()
+        };
+        if block_gids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Resolve only the arenas this scope's gids actually reference (a couple),
+        // not the whole arena table — the bulk of this path's per-scope cost.
+        let needed: std::collections::HashSet<usize> = block_gids
+            .iter()
+            .flat_map(|(_, gids)| gids.iter().map(|&(k_ai, _)| k_ai))
+            .collect();
+        let arena_info = self.inner.resolve_arena_info_for(&needed)?;
+        let mut q_ptrs: Vec<i64> = Vec::new();
+        let mut block_indices: Vec<usize> = Vec::new();
+        for (block_idx, head_gids) in &block_gids {
+            // Keep a block only when every (h,p) K side is R16 and GPU-backed —
+            // same filter as `gather_r16_kv_probe`, so layers stay aligned.
+            let ok = head_gids.iter().all(|&(k_ai, _)| {
+                arena_info
+                    .get(k_ai)
+                    .is_some_and(|a| a.k_format_tag == ArenaFormatTag::R16 && a.base_ptr != 0)
+            });
+            if !ok {
+                continue;
+            }
+            block_indices.push(*block_idx);
+            for &(k_ai, k_ci) in head_gids.iter() {
+                let k_arena = &arena_info[k_ai];
+                q_ptrs.push(k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride);
+            }
+        }
+        Ok((q_ptrs, block_indices))
+    }
+
+    /// Launch the provenance sign-pack kernel over R16 Q-chunk pointers spanning
+    /// ALL layers of a scope, returning the packed sign bits (`n_warps ×
+    /// CHUNK_SIZE` u32, warp-major: `out[warp*CHUNK_SIZE + token]` has bit `d`
+    /// set iff Q dim `d` of that sub-band is `>= 0`). `all_q_ptrs` is the
+    /// concatenation of every layer's [`Self::provenance_q_ptrs`] output; all
+    /// layers share this backing's device, so any backing can launch for the
+    /// whole set. One HtoD (pointers) + one launch + one DtoH (packed bits) —
+    /// replaces the per-layer f16 K/Q/V round-trips. CUDA only.
+    #[cfg(feature = "cuda")]
+    pub fn run_prov_sign_pack(&self, all_q_ptrs: &[i64], sub_head_dim: usize) -> Result<Vec<u32>> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::kernels;
+
+        let Device::Cuda(cuda_dev) = &self.inner.device else {
+            return Ok(Vec::new());
+        };
+        if all_q_ptrs.is_empty() || sub_head_dim == 0 || sub_head_dim > 32 {
+            return Ok(Vec::new());
+        }
+        let n_warps = all_q_ptrs.len();
+        let out_len = n_warps * CHUNK_SIZE;
+
+        let ptrs_gpu = cuda_dev.memcpy_stod(all_q_ptrs)?;
+        let out_gpu = unsafe { cuda_dev.alloc::<u32>(out_len)? };
+        let stream = cuda_dev.cuda_stream();
+        {
+            let (pp, _pg) = ptrs_gpu.device_ptr(&stream);
+            let (op, _og) = out_gpu.device_ptr(&stream);
+            candle::set_kernel_breadcrumb("run_prov_sign_pack", file!(), line!());
+            unsafe {
+                kernels::simple::prov_sign_pack::run_prov_sign_pack(
+                    pp as *const i64,
+                    op as *mut std::ffi::c_void,
+                    n_warps as i32,
+                    sub_head_dim as i32,
+                    stream.cu_stream() as *mut _,
+                );
+            }
+        }
+        let out: Vec<u32> = cuda_dev.memcpy_dtov(&out_gpu)?;
+        Ok(out)
+    }
+
+    /// Non-CUDA stub — no GPU kernel, so the provenance capture uses its CPU path.
+    #[cfg(not(feature = "cuda"))]
+    pub fn run_prov_sign_pack(
+        &self,
+        _all_q_ptrs: &[i64],
+        _sub_head_dim: usize,
+    ) -> Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 
     /// Get K arenas as float tensors.

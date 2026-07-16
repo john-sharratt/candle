@@ -537,6 +537,24 @@ pub struct PendingGlue {
     pub fwd_ahead: Vec<u32>,
 }
 
+/// GPU-packed wide-Q provenance sign bits for a scope, produced by
+/// [`BatchedInferenceSession::gather_provenance_sign_packed`] and consumed by the
+/// scheduler's `gather_wide_sigs` (assemble raw `WideQSig` → fold).
+pub struct ProvSignPacked {
+    /// Warp-major packed sign bits — `packed[warp * CHUNK_SIZE + token]`, bit `d`
+    /// set iff Q dim `d` of that sub-band is `>= 0` (`d` in `0..sub_head_dim`).
+    /// Warp index = `((layer*n_blocks + block_pos)*n_kv_head + head)*n_palette + palette`,
+    /// where `block_pos` indexes [`Self::block_indices`].
+    pub packed: Vec<u32>,
+    /// Absolute chunk indices captured (identical across all layers).
+    pub block_indices: Vec<usize>,
+    pub n_layers: usize,
+    pub n_kv_head: usize,
+    pub n_palette: usize,
+    /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 32`).
+    pub sub_head_dim: usize,
+}
+
 impl BatchedInferenceSession {
     /// Create a new batched inference session.
     pub fn new(
@@ -1642,6 +1660,104 @@ impl BatchedInferenceSession {
                 None => Ok(vec![]),
             })
             .collect()
+    }
+
+    /// GPU-side wide-Q provenance capture: one kernel launch across ALL layers
+    /// reads the R16 Q, signs it, and bit-packs it — only the packed bits come
+    /// back to the host. Replaces the per-layer f16 K/Q/V D2H + CPU sign pass
+    /// (~48 blocking round-trips per scope) with one HtoD (pointers) + one launch
+    /// + one DtoH (a few KB). The caller (`gather_wide_sigs`) assembles the raw
+    /// per-token `WideQSig` from `packed` and folds it — bit-identical to the CPU
+    /// path. Returns `None` (caller falls back to the CPU gather) when not CUDA,
+    /// when any layer has no R16 blocks, when the layers' block sets disagree, or
+    /// when `sub_head_dim > 32` (can't pack into a u32).
+    pub fn gather_provenance_sign_packed(
+        &self,
+        seq_idx: usize,
+        block_range: Option<(usize, usize)>,
+    ) -> candle::Result<Option<ProvSignPacked>> {
+        let Some((all_ptrs, block_indices)) =
+            self.resolve_provenance_q_ptrs(seq_idx, block_range)?
+        else {
+            return Ok(None);
+        };
+        let sub_head_dim = self.prov_sub_head_dim();
+        let packed = self.run_prov_sign_pack(&all_ptrs, sub_head_dim)?;
+        if packed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ProvSignPacked {
+            packed,
+            block_indices,
+            n_layers: self.backings.len(),
+            n_kv_head: self.n_kv_head(),
+            n_palette: candle_nn::kv_cache::N_PALETTE,
+            sub_head_dim,
+        }))
+    }
+
+    /// The provenance sign-pack sub-band width (`head_dim / N_PALETTE`), or 0 when
+    /// the geometry can't be packed into a u32 (`> 32`) — callers treat 0 as "use
+    /// the CPU path".
+    pub fn prov_sub_head_dim(&self) -> usize {
+        let head_dim = self.head_dim();
+        if head_dim == 0 {
+            return 0;
+        }
+        let sub = head_dim / candle_nn::kv_cache::N_PALETTE;
+        if sub == 0 || sub > 32 {
+            0
+        } else {
+            sub
+        }
+    }
+
+    /// Resolve the concatenated R16 Q-chunk pointers across ALL layers for a
+    /// sequence's blocks — the input to the sign-pack kernel — plus the block
+    /// index set (identical across layers). Split from the launch so a caller can
+    /// resolve many scopes while their slots are alive, then batch ONE kernel
+    /// launch over all of them (the arena chunks stay valid via the sealed K/V's
+    /// RAII refs). `None` (→ CPU path) when not CUDA, when any layer has no R16
+    /// blocks, when the layers' block sets disagree, or when `sub_head_dim > 32`.
+    pub fn resolve_provenance_q_ptrs(
+        &self,
+        seq_idx: usize,
+        block_range: Option<(usize, usize)>,
+    ) -> candle::Result<Option<(Vec<i64>, Vec<usize>)>> {
+        if self.backings.is_empty() || self.n_kv_head() == 0 || self.prov_sub_head_dim() == 0 {
+            return Ok(None);
+        }
+        let mut all_ptrs: Vec<i64> = Vec::new();
+        let mut block_indices: Option<Vec<usize>> = None;
+        for backing in &self.backings {
+            let (ptrs, blocks) = backing.provenance_q_ptrs(seq_idx, block_range)?;
+            if ptrs.is_empty() {
+                return Ok(None);
+            }
+            match &block_indices {
+                None => block_indices = Some(blocks),
+                Some(prev) if *prev != blocks => return Ok(None),
+                _ => {}
+            }
+            all_ptrs.extend(ptrs);
+        }
+        match block_indices {
+            Some(b) if !b.is_empty() => Ok(Some((all_ptrs, b))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Launch the sign-pack kernel over already-resolved (concatenated) Q-chunk
+    /// pointers — one kernel + one D2H for the whole batch. Empty on non-CUDA.
+    pub fn run_prov_sign_pack(
+        &self,
+        all_ptrs: &[i64],
+        sub_head_dim: usize,
+    ) -> candle::Result<Vec<u32>> {
+        match self.backings.first() {
+            Some(b) => b.run_prov_sign_pack(all_ptrs, sub_head_dim),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the

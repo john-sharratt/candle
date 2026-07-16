@@ -48,7 +48,7 @@ use candle::{Device, IndexOp, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel,
+    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
 };
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
@@ -527,6 +527,14 @@ impl Drop for PhaseTimer {
     }
 }
 
+/// Per-wave accumulators (µs) splitting the scope-ingest provenance sig cost into
+/// its three stages, logged in the wave phase breakdown: `resolve` (host-side
+/// per-layer Q-pointer resolution), `kernel` (HtoD + sign-pack launch + D2H), and
+/// `assemble` (host XOR-fold of the packed bits). Reset each wave in `flush`.
+static PROV_RESOLVE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROV_KERNEL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROV_ASSEMBLE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn record_phase(start: Instant, phase: &'static str) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -536,6 +544,79 @@ fn record_phase(start: Instant, phase: &'static str) {
         ms,
         "phase",
     );
+}
+
+/// Assemble per-token raw wide `sign(Q)` from the GPU-packed sub-band bits
+/// ([`ProvSignPacked`]) and fold each to the compact provenance signature. This
+/// is the on-CPU tail of the GPU fast path in [`Scheduler::gather_wide_sigs`] and
+/// is **bit-identical** to `fold_provenance(WideQSig::from_band(..))`: a head's
+/// `head_dim` sign bits are its `n_palette` sub-band u32s laid down at global
+/// dims `[p*sub_head_dim, (p+1)*sub_head_dim)` — exactly how `from_band` packs
+/// them (bit `i` → word `i/64`, bit `i%64`). Only real tokens (per the chunk
+/// `layout`) are emitted, skipping partial-chunk padding.
+fn assemble_folded_prov_sigs(
+    packed: &ProvSignPacked,
+    layout: &[(u16, u16, usize)],
+    head_dim: usize,
+) -> Vec<WideQSig> {
+    let chunk = candle_nn::CHUNK_SIZE;
+    let wph = head_dim.div_ceil(64);
+    let n_layers = packed.n_layers;
+    let n_kv_head = packed.n_kv_head;
+    let n_palette = packed.n_palette;
+    let sub = packed.sub_head_dim;
+    let n_blocks = packed.block_indices.len();
+    let n_raw_heads = n_layers * n_kv_head;
+    if wph == 0 || n_raw_heads == 0 || sub == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (block_pos, &block_idx) in packed.block_indices.iter().enumerate() {
+        let Some(&(offset, len, _cum)) = layout.get(block_idx) else {
+            continue; // no metadata — can't place this block's tokens
+        };
+        let offset = offset as usize;
+        for j in 0..len as usize {
+            let t = offset + j; // physical token slot within the chunk
+            if t >= chunk {
+                break;
+            }
+            let mut words = vec![0u64; n_raw_heads * wph];
+            for layer in 0..n_layers {
+                for head in 0..n_kv_head {
+                    let hidx = layer * n_kv_head + head;
+                    for p in 0..n_palette {
+                        let warp =
+                            ((layer * n_blocks + block_pos) * n_kv_head + head) * n_palette + p;
+                        let Some(&bits_u32) = packed.packed.get(warp * chunk + t) else {
+                            continue;
+                        };
+                        let bits = bits_u32 as u64;
+                        // Palette p → global head-dims [p*sub, (p+1)*sub); place its
+                        // `sub` bits at that offset within the head's `wph` words,
+                        // splitting across the word boundary if it straddles one.
+                        let bit_off = p * sub;
+                        let w = bit_off / 64;
+                        let sh = bit_off % 64;
+                        if let Some(word) = words.get_mut(hidx * wph + w) {
+                            *word |= bits << sh;
+                        }
+                        if sh + sub > 64 {
+                            if let Some(word) = words.get_mut(hidx * wph + w + 1) {
+                                *word |= bits >> (64 - sh);
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(fold_provenance(&WideQSig {
+                n_heads: n_raw_heads as u16,
+                words,
+            }));
+        }
+    }
+    out
 }
 
 /// Chunks of the turn's head (the user query) that stay in every reprojection
@@ -1310,6 +1391,16 @@ struct WaveStats {
     prefill_ms: u64,
     section_ms: u64,
     reproj_ms: u64,
+    /// Per-scope code-read seal sub-slices of the Prefill phase (microseconds,
+    /// summed over the window). These are NOT separate phases — they live inside
+    /// `prefill_ms` — but split the non-forward seal cost so we can see whether
+    /// the wave-dominating overhead is the GPU snapshot, the wide-Q provenance
+    /// sig gather, or the record/compress/persist flush. `seal_count` is scopes
+    /// sealed this window.
+    seal_snapshot_us: u64,
+    seal_sig_us: u64,
+    seal_flush_us: u64,
+    seal_count: u64,
 }
 
 impl WaveStats {
@@ -1325,7 +1416,19 @@ impl WaveStats {
             prefill_ms: 0,
             section_ms: 0,
             reproj_ms: 0,
+            seal_snapshot_us: 0,
+            seal_sig_us: 0,
+            seal_flush_us: 0,
+            seal_count: 0,
         }
+    }
+
+    /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
+    fn add_seal(&mut self, snapshot_us: u64, sig_us: u64, flush_us: u64) {
+        self.seal_snapshot_us += snapshot_us;
+        self.seal_sig_us += sig_us;
+        self.seal_flush_us += flush_us;
+        self.seal_count += 1;
     }
 
     /// Record one forward. `n_tokens` is the total tokens in the batch
@@ -1480,6 +1583,18 @@ impl WaveStats {
             section_ms = self.section_ms,
             reproj_ms = self.reproj_ms,
             unaccounted_ms = unaccounted,
+            // Sub-slices INSIDE prefill_ms (not additive to the phases above):
+            // where the non-forward per-scope seal cost goes during code-read.
+            seal_count = self.seal_count,
+            seal_snapshot_ms = self.seal_snapshot_us / 1000,
+            seal_sig_ms = self.seal_sig_us / 1000,
+            seal_flush_ms = self.seal_flush_us / 1000,
+            // seal_sig split: host pointer-resolve / GPU kernel(HtoD+launch+D2H) / host fold.
+            prov_resolve_ms =
+                PROV_RESOLVE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
+            prov_kernel_ms = PROV_KERNEL_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
+            prov_assemble_ms =
+                PROV_ASSEMBLE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
             "wave phase breakdown (scheduler-thread wall-clock; watch which grows)"
         );
         self.window_start = std::time::Instant::now();
@@ -1492,6 +1607,10 @@ impl WaveStats {
         self.prefill_ms = 0;
         self.section_ms = 0;
         self.reproj_ms = 0;
+        self.seal_snapshot_us = 0;
+        self.seal_sig_us = 0;
+        self.seal_flush_us = 0;
+        self.seal_count = 0;
     }
 }
 
@@ -4379,6 +4498,7 @@ impl Scheduler {
             return;
         };
         let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
+        let t_snap = Instant::now();
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
             Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
             Err(e) => {
@@ -4392,9 +4512,15 @@ impl Scheduler {
                 return;
             }
         };
+        let snap_us = t_snap.elapsed().as_micros() as u64;
         // Wide-Q sigs over the fresh (still-R16) blocks BEFORE the free — the
-        // sealed slice holds RAII `ChunkGid` clones, so the K/V survives too.
+        // sealed slice holds RAII `ChunkGid` clones, so the K/V survives too. Done
+        // per scope (not batched): the scope must be recorded immediately below so
+        // its K/V enters the eviction pipeline — deferring the record pins the
+        // unrecorded snapshots invisibly to eviction and exhausts VRAM.
+        let t_sig = Instant::now();
         let sigs = self.gather_wide_sigs(slot, (0, block_count));
+        let sig_us = t_sig.elapsed().as_micros() as u64;
         self.free_summary_slot(slot);
         let block_end = sealed_gpu.first().map(|s| s.chunks.len()).unwrap_or(0);
         let PendingScopePrefill {
@@ -4422,7 +4548,12 @@ impl Scheduler {
         }
         // Record the contiguous run of landed scopes now — its VRAM K/V flows into
         // the persist/eviction pipeline instead of piling up until the file ends.
+        let t_flush = Instant::now();
         self.advance_scope_flush(timeline);
+        let flush_us = t_flush.elapsed().as_micros() as u64;
+        // Split this scope's non-forward seal cost into the wave breakdown so we
+        // can see whether snapshot / provenance-sig / record-flush dominates.
+        self.wave_stats.add_seal(snap_us, sig_us, flush_us);
         self.pump_scope_prefills();
     }
 
@@ -6084,6 +6215,47 @@ impl Scheduler {
         }
         let seq_off = self.session.sequence_offset(seq_id.0).unwrap_or(0);
         let layout = self.session.provenance_chunk_layout(seq_id.0, seq_off);
+
+        // GPU fast path: read R16 Q + sign + bit-pack on device in ONE launch
+        // across all layers, then D2H only the packed bits (a few KB) and XOR-fold
+        // them here — bit-identical to the CPU path below. Falls through to the CPU
+        // gather on non-CUDA / unsupported geometry / no R16 blocks. Split into
+        // resolve / kernel / assemble so the wave breakdown shows where the
+        // per-scope cost lives (see the `PROV_*_US` accumulators).
+        use std::sync::atomic::Ordering::Relaxed;
+        let sub = self.session.prov_sub_head_dim();
+        if sub > 0 {
+            let t_res = Instant::now();
+            let resolved = self
+                .session
+                .resolve_provenance_q_ptrs(seq_id.0, Some(range))
+                .ok()
+                .flatten();
+            PROV_RESOLVE_US.fetch_add(t_res.elapsed().as_micros() as u64, Relaxed);
+            if let Some((all_ptrs, block_indices)) = resolved {
+                let t_run = Instant::now();
+                let packed = self
+                    .session
+                    .run_prov_sign_pack(&all_ptrs, sub)
+                    .unwrap_or_default();
+                PROV_KERNEL_US.fetch_add(t_run.elapsed().as_micros() as u64, Relaxed);
+                if !packed.is_empty() {
+                    let t_asm = Instant::now();
+                    let ps = ProvSignPacked {
+                        packed,
+                        block_indices,
+                        n_layers,
+                        n_kv_head,
+                        n_palette: candle_nn::kv_cache::N_PALETTE,
+                        sub_head_dim: sub,
+                    };
+                    let sigs = assemble_folded_prov_sigs(&ps, &layout, head_dim);
+                    PROV_ASSEMBLE_US.fetch_add(t_asm.elapsed().as_micros() as u64, Relaxed);
+                    return sigs;
+                }
+            }
+        }
+
         let layers: Vec<usize> = (0..n_layers).collect();
         let dump =
             match self
@@ -7119,6 +7291,84 @@ impl Scheduler {
 mod tests {
     use super::*;
     use candle::{DType, Tensor};
+
+    /// The GPU provenance path's on-CPU tail (`assemble_folded_prov_sigs`) must be
+    /// bit-identical to the CPU path (`fold_provenance(WideQSig::from_band(..))`).
+    /// This drives both from the same synthetic signs — the kernel just produces
+    /// the packed `u32`s this test hand-packs — so it validates the whole host
+    /// mapping (palette→word, warp indexing, layout) without a GPU.
+    #[test]
+    fn gpu_assembled_prov_sigs_match_cpu_fold() {
+        use crate::provenance::WideQSig;
+        const N_LAYERS: usize = 48;
+        const N_KV_HEAD: usize = 4; // == PROV_HEADS_PER_LAYER
+        const N_PALETTE: usize = 4;
+        const SUB: usize = 32; // sub_head_dim
+        const HEAD_DIM: usize = N_PALETTE * SUB; // 128
+        let chunk = candle_nn::CHUNK_SIZE;
+        let n_real = 5usize; // real tokens in the single block
+
+        // Deterministic sign for (layer, head, token, global-dim): true = bit set.
+        let sgn = |l: usize, h: usize, t: usize, d: usize| -> bool {
+            let x = ((((l * 131 + h) * 131 + t) * 131 + d) as u64).wrapping_mul(2654435761);
+            (x >> 13) & 1 == 0
+        };
+
+        // CPU reference: build the f32 band, from_band, fold — per token.
+        let mut cpu: Vec<WideQSig> = Vec::new();
+        for t in 0..n_real {
+            let mut band = Vec::with_capacity(N_LAYERS * N_KV_HEAD * HEAD_DIM);
+            for l in 0..N_LAYERS {
+                for h in 0..N_KV_HEAD {
+                    for d in 0..HEAD_DIM {
+                        band.push(if sgn(l, h, t, d) { 1.0f32 } else { -1.0f32 });
+                    }
+                }
+            }
+            cpu.push(fold_provenance(&WideQSig::from_band(&band, HEAD_DIM)));
+        }
+
+        // Hand-pack the kernel's warp-major u32 output for the same signs.
+        let n_blocks = 1usize;
+        let n_warps = N_LAYERS * n_blocks * N_KV_HEAD * N_PALETTE;
+        let mut packed = vec![0u32; n_warps * chunk];
+        for l in 0..N_LAYERS {
+            for h in 0..N_KV_HEAD {
+                for p in 0..N_PALETTE {
+                    let warp = ((l * n_blocks) * N_KV_HEAD + h) * N_PALETTE + p;
+                    for t in 0..n_real {
+                        let mut bits = 0u32;
+                        for d in 0..SUB {
+                            if sgn(l, h, t, p * SUB + d) {
+                                bits |= 1u32 << d;
+                            }
+                        }
+                        packed[warp * chunk + t] = bits;
+                    }
+                }
+            }
+        }
+        let ps = ProvSignPacked {
+            packed,
+            block_indices: vec![0],
+            n_layers: N_LAYERS,
+            n_kv_head: N_KV_HEAD,
+            n_palette: N_PALETTE,
+            sub_head_dim: SUB,
+        };
+        // Block 0: real tokens at physical slots 0..n_real.
+        let layout = vec![(0u16, n_real as u16, 0usize)];
+        let gpu = assemble_folded_prov_sigs(&ps, &layout, HEAD_DIM);
+
+        assert_eq!(gpu.len(), cpu.len(), "token count");
+        for (t, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert_eq!(g.n_heads, c.n_heads, "token {t}: n_heads");
+            assert_eq!(
+                g.words, c.words,
+                "token {t}: assembled words != from_band+fold"
+            );
+        }
+    }
 
     #[test]
     fn pending_prefill_backlog_sums_remaining_tokens() {
