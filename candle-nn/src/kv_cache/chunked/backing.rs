@@ -113,6 +113,33 @@ pub(crate) struct BackingInner {
     /// cold-load, and warm→hot elevate; read by the attention kernels via each
     /// slice's `kvheads_ptr`. Shared across all layers of this group.
     pub(crate) meta_pool: super::meta_pool::MetaPool,
+
+    /// Reused device scratch for the provenance sign-pack kernel — grows to the
+    /// largest batch seen and is reused thereafter, so the per-scope seal pays no
+    /// device `alloc`/pointer-`memcpy_stod` (the WDDM-expensive part). Held in a
+    /// `Mutex` for interior mutability behind the shared `Arc<BackingInner>`; the
+    /// seal runs single-threaded so it's uncontended. Mirrors `KvSamplerGpu`.
+    #[cfg(feature = "cuda")]
+    pub(crate) prov_sign_scratch: Mutex<Option<ProvSignScratch>>,
+}
+
+/// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
+#[cfg(feature = "cuda")]
+pub(crate) struct ProvSignScratch {
+    /// Concatenated Q-chunk pointers (capacity ≥ the batch's `n_warps`).
+    ptrs: candle::cuda_backend::cudarc::driver::CudaSlice<i64>,
+    /// Packed sign bits (capacity ≥ `n_warps × CHUNK_SIZE`).
+    out: candle::cuda_backend::cudarc::driver::CudaSlice<u32>,
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for ProvSignScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvSignScratch")
+            .field("ptrs_cap", &self.ptrs.len())
+            .field("out_cap", &self.out.len())
+            .finish()
+    }
 }
 
 impl BackingInner {
@@ -702,6 +729,8 @@ impl ChunkedKvBacking {
                 super::meta_pool::chunk_record_bytes(n_kv_head, head_dim),
                 device.clone(),
             ),
+            #[cfg(feature = "cuda")]
+            prov_sign_scratch: Mutex::new(None),
         });
 
         // Register for cooperative compaction
@@ -2230,12 +2259,37 @@ impl ChunkedKvBacking {
         let n_warps = all_q_ptrs.len();
         let out_len = n_warps * CHUNK_SIZE;
 
-        let ptrs_gpu = cuda_dev.memcpy_stod(all_q_ptrs)?;
-        let out_gpu = unsafe { cuda_dev.alloc::<u32>(out_len)? };
+        // Reuse the grow-only device scratch: realloc only when this batch is
+        // bigger than any prior one, so the steady-state seal pays no device
+        // alloc / pointer memcpy_stod — only one HtoD into the existing buffer.
+        let mut guard = self
+            .inner
+            .prov_sign_scratch
+            .lock()
+            .map_err(|_| candle::Error::Msg("prov_sign_scratch mutex poisoned".into()))?;
+        let grow = guard
+            .as_ref()
+            .map_or(true, |s| s.ptrs.len() < n_warps || s.out.len() < out_len);
+        if grow {
+            let ptrs_cap = guard
+                .as_ref()
+                .map_or(n_warps, |s| s.ptrs.len().max(n_warps));
+            let out_cap = guard.as_ref().map_or(out_len, |s| s.out.len().max(out_len));
+            let ptrs = unsafe { cuda_dev.alloc::<i64>(ptrs_cap)? };
+            let out = unsafe { cuda_dev.alloc::<u32>(out_cap)? };
+            *guard = Some(ProvSignScratch { ptrs, out });
+        }
+        let scratch = guard.as_mut().unwrap();
         let stream = cuda_dev.cuda_stream();
+
+        // One HtoD of the pointers into the reused buffer.
+        cuda_dev.memcpy_htod(all_q_ptrs, &mut scratch.ptrs.slice_mut(..n_warps))?;
+
+        let ptrs_view = scratch.ptrs.slice(..n_warps);
+        let out_view = scratch.out.slice(..out_len);
         {
-            let (pp, _pg) = ptrs_gpu.device_ptr(&stream);
-            let (op, _og) = out_gpu.device_ptr(&stream);
+            let (pp, _pg) = ptrs_view.device_ptr(&stream);
+            let (op, _og) = out_view.device_ptr(&stream);
             candle::set_kernel_breadcrumb("run_prov_sign_pack", file!(), line!());
             unsafe {
                 kernels::simple::prov_sign_pack::run_prov_sign_pack(
@@ -2247,7 +2301,14 @@ impl ChunkedKvBacking {
                 );
             }
         }
-        let out: Vec<u32> = cuda_dev.memcpy_dtov(&out_gpu)?;
+
+        // DtoH only the packed bits into a fresh host Vec — host allocation is
+        // cheap; the reused device buffers are what mattered.
+        let mut out = vec![0u32; out_len];
+        stream
+            .memcpy_dtoh(&out_view, &mut out)
+            .map_err(candle::Error::wrap)?;
+        stream.synchronize().map_err(candle::Error::wrap)?;
         Ok(out)
     }
 
