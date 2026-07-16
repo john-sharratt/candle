@@ -22,7 +22,9 @@ use std::path::Path;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::log_file::{read_record_at, LogFile, LogSource};
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest};
-use super::record::{encode_record, DebugIdPayload, Record, RecordHeader, RecordType};
+use super::record::{
+    encode_record, DebugIdPayload, DistillMode, DistillPayload, Record, RecordHeader, RecordType,
+};
 use super::walker::WalkEntry;
 use super::Result;
 use crate::substrate::Substrate;
@@ -62,28 +64,33 @@ pub fn collect_live_records(
         .iter()
         .map(|t| t.raw())
         .collect();
-    let distilled: std::collections::HashSet<u64> = substrate
+    let distilled: std::collections::HashMap<u64, DistillMode> = substrate
         .distilled_timelines()
         .iter()
-        .map(|t| t.raw())
+        .map(|(t, m)| (t.raw(), *m))
         .collect();
 
     // Per-stream live records — sourced from the substrate's in-RAM
     // stream index, the authoritative source.
     for (stream_id, entry) in substrate.all_streams() {
-        // A turn on a distilled timeline (e.g. the calibration corpus) sheds its
-        // content at compaction: keep its `StreamDecl` + `WideQSig` — the belief
-        // gallery reads only the sig — and reclaim the KV chunks + tokens.
-        // Tombstoned timelines drop entirely, as before.
-        let provenance_only =
+        // Distillation degree for this turn's timeline (None = not distilled).
+        // Both modes drop the KV chunks (the bulk of the on-disk cost);
+        // ProvenanceOnly also drops tokens (keep sig + projections — the belief
+        // gallery reads only the sig), TextOnly also drops sig + projections
+        // (keep tokens — a plain read-only text record). Tombstoned timelines
+        // drop entirely, as before.
+        let distill: Option<DistillMode> =
             if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
                 if tombstoned.contains(&t.timeline_id) {
                     continue;
                 }
-                distilled.contains(&t.timeline_id)
+                distilled.get(&t.timeline_id).copied()
             } else {
-                false
+                None
             };
+        let keep_chunks = distill.is_none();
+        let keep_tokens = distill != Some(DistillMode::ProvenanceOnly);
+        let keep_sig = distill != Some(DistillMode::TextOnly);
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
             out.push((
@@ -99,11 +106,13 @@ pub fn collect_live_records(
                 payload,
             ));
         }
-        if !provenance_only {
+        if keep_chunks {
             for loc in entry.chunks.values() {
                 let r = read_record_at(log, loc.offset, loc.record_size)?;
                 out.push((r.header, r.payload));
             }
+        }
+        if keep_tokens {
             if let Some(loc) = entry.tokens {
                 let r = read_record_at(log, loc.offset, loc.record_size)?;
                 out.push((r.header, r.payload));
@@ -111,36 +120,41 @@ pub fn collect_live_records(
         }
         // Per-turn projection-event timeline — re-emitted from the resident
         // bytes rather than read back from disk, so the GUI dots survive a
-        // compaction pass.
-        if let Some(payload) = &entry.projection_events {
-            out.push((
-                RecordHeader {
-                    record_type: RecordType::ProjectionEvents,
-                    format: 0,
-                    payload_len: payload.len() as u64,
-                    crc: 0,
-                    stream_id: stream_id.0,
-                    chunk_index: 0,
-                    token_count: 0,
-                },
-                payload.clone(),
-            ));
+        // compaction pass. Dropped for TextOnly (`keep_sig` false).
+        if keep_sig {
+            if let Some(payload) = &entry.projection_events {
+                out.push((
+                    RecordHeader {
+                        record_type: RecordType::ProjectionEvents,
+                        format: 0,
+                        payload_len: payload.len() as u64,
+                        crc: 0,
+                        stream_id: stream_id.0,
+                        chunk_index: 0,
+                        token_count: 0,
+                    },
+                    payload.clone(),
+                ));
+            }
         }
         // Per-turn wide-Q signature window — same resident-bytes re-emit so the
-        // decode→decode consensus substrate survives a compaction pass.
-        if let Some(payload) = &entry.wide_q_sigs {
-            out.push((
-                RecordHeader {
-                    record_type: RecordType::WideQSig,
-                    format: 0,
-                    payload_len: payload.len() as u64,
-                    crc: 0,
-                    stream_id: stream_id.0,
-                    chunk_index: 0,
-                    token_count: 0,
-                },
-                payload.clone(),
-            ));
+        // decode→decode consensus substrate survives a compaction pass. Dropped
+        // for TextOnly (`keep_sig` false).
+        if keep_sig {
+            if let Some(payload) = &entry.wide_q_sigs {
+                out.push((
+                    RecordHeader {
+                        record_type: RecordType::WideQSig,
+                        format: 0,
+                        payload_len: payload.len() as u64,
+                        crc: 0,
+                        stream_id: stream_id.0,
+                        chunk_index: 0,
+                        token_count: 0,
+                    },
+                    payload.clone(),
+                ));
+            }
         }
         if let Some(through) = entry.committed_through {
             out.push((
@@ -235,6 +249,29 @@ pub fn collect_live_records(
                 token_count: 0,
             },
             bytes,
+        ));
+    }
+    // Per-distilled-timeline marker — re-emitted (with mode) so a distilled
+    // timeline stays distilled across the compaction it just shed through.
+    // Without this the marker is lost and, e.g., a text-only archived
+    // conversation would read back as un-distilled. Tombstoned timelines are
+    // gone, so skip them.
+    for (&timeline_id, &mode) in &distilled {
+        if tombstoned.contains(&timeline_id) {
+            continue;
+        }
+        let payload = DistillPayload { timeline_id, mode }.encode();
+        out.push((
+            RecordHeader {
+                record_type: RecordType::Distilled,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
         ));
     }
     Ok(out)
@@ -592,7 +629,7 @@ mod tests {
 
     #[test]
     fn distilled_turn_keeps_sig_drops_content() {
-        use crate::persistence::record::DistillPayload;
+        use crate::persistence::record::{DistillMode, DistillPayload};
         use crate::persistence::streams::{StreamDecl, TurnDecl};
 
         let tl = 77u64;
@@ -624,12 +661,16 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::Chunk, sid, 0, b"kv-chunk-content"));
         blob.extend_from_slice(&record(RecordType::Tokens, sid, 0, b"token-content"));
         blob.extend_from_slice(&record(RecordType::WideQSig, sid, 0, &wide_payload));
-        // The distillation marker for the timeline.
+        // The distillation marker for the timeline (provenance-only).
         blob.extend_from_slice(&record(
             RecordType::Distilled,
             0,
             0,
-            &DistillPayload { timeline_id: tl }.encode(),
+            &DistillPayload {
+                timeline_id: tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
         ));
 
         let mut mem = MemLog::with_records(&blob);
@@ -658,6 +699,97 @@ mod tests {
                 .iter()
                 .any(|(h, _)| h.record_type == RecordType::Tokens),
             "provenance-only turn drops its tokens",
+        );
+        // The marker survives the compaction it just shed through, at its mode.
+        assert!(
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::Distilled
+                    && DistillPayload::decode(p).ok().map(|d| d.mode)
+                        == Some(DistillMode::ProvenanceOnly)),
+            "distilled marker re-emitted with its mode",
+        );
+    }
+
+    /// The text-only degree (archived conversations): keep the StreamDecl +
+    /// tokens as a plain read-only record; drop the KV chunks, the WideQSig, and
+    /// the projection events.
+    #[test]
+    fn text_only_distill_keeps_tokens_drops_sig_and_kv() {
+        use crate::persistence::record::{DistillMode, DistillPayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let tl = 91u64;
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: tl,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = 9191u64;
+        let wide_payload =
+            crate::provenance::encode_wide_sigs(&[crate::provenance::WideQSig::from_band(
+                &vec![1.0f32; 4 * 128],
+                128,
+            )]);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, sid, 0, b"kv-chunk-content"));
+        blob.extend_from_slice(&record(RecordType::Tokens, sid, 0, b"token-content"));
+        blob.extend_from_slice(&record(RecordType::WideQSig, sid, 0, &wide_payload));
+        blob.extend_from_slice(&record(
+            RecordType::ProjectionEvents,
+            sid,
+            0,
+            b"proj-events",
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: tl,
+                mode: DistillMode::TextOnly,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+
+        let has = |rt: RecordType| live.iter().any(|(h, _)| h.record_type == rt);
+        assert!(
+            has(RecordType::StreamDecl),
+            "text-only keeps its StreamDecl"
+        );
+        assert!(
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::Tokens && p == b"token-content"),
+            "text-only keeps its tokens (the readable record)",
+        );
+        assert!(!has(RecordType::Chunk), "text-only drops its KV chunks");
+        assert!(!has(RecordType::WideQSig), "text-only drops its signature");
+        assert!(
+            !has(RecordType::ProjectionEvents),
+            "text-only drops its projection events",
+        );
+        assert!(
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::Distilled
+                    && DistillPayload::decode(p).ok().map(|d| d.mode)
+                        == Some(DistillMode::TextOnly)),
+            "text-only marker re-emitted with its mode",
         );
     }
 }

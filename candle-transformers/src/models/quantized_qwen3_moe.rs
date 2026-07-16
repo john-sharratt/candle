@@ -257,6 +257,10 @@ impl SparseMoeBlock {
             .gate
             .forward_dynamic(acts.as_dynamic(), out_dtype)?
             .reshape((num_tokens, ()))?;
+        // Logits width = the real expert count; the router kernel writes this
+        // value as a "no expert" sentinel into empty top-k slots, so downstream
+        // must know it to filter them (see `forward_with_indices`).
+        let num_experts = router_logits.dim(1)?;
         let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
         let input = match acts {
             DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
@@ -271,6 +275,7 @@ impl SparseMoeBlock {
             seq_len,
             hidden_dim,
             k,
+            num_experts,
             t,
         )
     }
@@ -443,6 +448,7 @@ impl SparseMoeBlock {
         seq_len: usize,
         hidden_dim: usize,
         k: usize,
+        num_experts: usize,
         _routing_start: ProfileMark,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert via a counting sort ──
@@ -454,19 +460,20 @@ impl SparseMoeBlock {
         // scaled badly with the batch size we want for expert-stream amortization).
         let t = profile_now();
         let k_u = k as u32;
-        // Bucket count = highest routed expert id + 1.
-        let n_experts = idx_cpu
-            .iter()
-            .flat_map(|idxs| idxs.iter())
-            .copied()
-            .max()
-            .map_or(0, |m| m as usize + 1);
+        // Bucket count = the router's expert count. The router kernel writes
+        // `num_experts` itself as a sentinel into any top-k slot that found no
+        // valid expert (a token whose logits were all -inf/NaN), so ids `>=
+        // num_experts` are skipped in both passes — they aren't real experts and
+        // would index past `num_experts` here and the pipeline's expert arrays.
+        let n_experts = num_experts;
 
-        // Pass 1: count assignments per expert.
+        // Pass 1: count assignments per expert (skipping sentinels).
         let mut counts = vec![0u32; n_experts];
         for idxs in &idx_cpu {
             for &eid in idxs {
-                counts[eid as usize] += 1;
+                if (eid as usize) < n_experts {
+                    counts[eid as usize] += 1;
+                }
             }
         }
         // Prefix-sum into per-expert bucket starts; collect the ascending active
@@ -483,12 +490,17 @@ impl SparseMoeBlock {
         }
         // Pass 2: scatter each assignment into its expert's bucket (stable in
         // token order) → assignments grouped by ascending expert id, exactly as
-        // a sort-by-expert would produce.
+        // a sort-by-expert would produce. `slot_k` stays the original top-k
+        // position so the flat weight index remains aligned even when a
+        // sentinel slot is skipped.
         let num_assignments = running as usize;
         let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); num_assignments];
         for (tok, idxs) in idx_cpu.iter().enumerate() {
             let tok_u = tok as u32;
             for (slot_k, &eid) in idxs.iter().enumerate() {
+                if (eid as usize) >= n_experts {
+                    continue;
+                }
                 let pos = cursor[eid as usize] as usize;
                 assignments[pos] = (eid, tok_u, tok_u * k_u + slot_k as u32);
                 cursor[eid as usize] += 1;

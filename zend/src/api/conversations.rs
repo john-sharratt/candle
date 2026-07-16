@@ -1,14 +1,14 @@
 //! `GET /v1/conversations` — sidebar population.
 //! `GET /v1/conversations/{id}` — recovered turn history.
-//! `POST /v1/conversations/{id}/archive` — set archived = true.
-//! `POST /v1/conversations/{id}/unarchive` — set archived = false.
+//! `POST /v1/conversations/{id}/archive` — archive (one-way): set archived = true
+//!   and mark the timeline for TextOnly distillation. There is no unarchive —
+//!   distillation drops the KV, so an archived conversation can't be resumed.
 //! `DELETE /v1/conversations/{id}` — tombstone (permanent; reclaimed at compaction).
 //!
-//! Archive/unarchive append a `RecordType::ConvState` record
-//! (last-writer-wins) and update the in-RAM substrate. The sidebar
-//! filters archived entries out unless `?include_archived=true` is
-//! set on the list call — that's the "show archived" checkbox at
-//! the bottom of the sidebar.
+//! Archive appends a `RecordType::ConvState` record (last-writer-wins) plus a
+//! `RecordType::Distilled` marker, and updates the in-RAM substrate. The sidebar
+//! filters archived entries out unless `?include_archived=true` is set on the
+//! list call — that's the "show archived" checkbox at the bottom of the sidebar.
 
 use std::sync::Arc;
 
@@ -44,14 +44,15 @@ pub async fn archive(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    set_archived(&session, &id, true)
-}
-
-pub async fn unarchive(
-    State(session): State<Arc<ZendSession>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    set_archived(&session, &id, false)
+    match session.archive_conversation(&id) {
+        Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
+        Some(Err(e)) => {
+            tracing::warn!(conv_id = %id, "archive failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        // Model not loaded yet — same shape as `get` returns.
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 pub async fn delete(
@@ -65,18 +66,6 @@ pub async fn delete(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         // Model not loaded yet — same shape as `get`/`archive` return.
-        None => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
-}
-
-fn set_archived(session: &ZendSession, id: &str, archived: bool) -> Result<StatusCode, StatusCode> {
-    match session.set_conversation_archived(id, archived) {
-        Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
-        Some(Err(e)) => {
-            tracing::warn!(conv_id = %id, "archive write failed: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-        // Model not loaded yet — same shape as `get` returns.
         None => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }

@@ -487,10 +487,11 @@ impl SubstratePersistence {
     }
 
     /// Append a [`RecordType::Distilled`] record marking `timeline_id` for
-    /// distillation — its turns shed content (keep sig, drop tokens + KV) on the
-    /// next compaction pass. Idempotent — duplicate markers replay identically.
-    pub fn write_distill(&mut self, timeline_id: u64) -> Result<()> {
-        let payload = record::DistillPayload { timeline_id };
+    /// distillation at `mode` — its turns shed content on the next compaction
+    /// pass. Idempotent for a fixed mode; a later record upgrades the mode
+    /// (last-writer-wins on replay).
+    pub fn write_distill(&mut self, timeline_id: u64, mode: record::DistillMode) -> Result<()> {
+        let payload = record::DistillPayload { timeline_id, mode };
         let bytes = payload.encode();
         self.append_record(RecordType::Distilled, 0, 0, 0, 0, &bytes)?;
         Ok(())

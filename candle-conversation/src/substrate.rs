@@ -53,7 +53,7 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -202,9 +202,10 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
-    /// Timelines marked for distillation — their turns keep sig + decl but shed
-    /// content at compaction. Same replay-order-independence as tombstones.
-    distilled_timelines: HashSet<TimelineId>,
+    /// Timelines marked for distillation, each with the [`DistillMode`] degree
+    /// its turns shed to at compaction. Same replay-order-independence as
+    /// tombstones.
+    distilled_timelines: HashMap<TimelineId, DistillMode>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -2538,27 +2539,35 @@ impl Substrate {
         &self.tombstoned_timelines
     }
 
-    /// Apply a decoded [`DistillPayload`] — marks the timeline for distillation.
+    /// Apply a decoded [`DistillPayload`] — marks the timeline for distillation
+    /// at its recorded [`DistillMode`]. A later record upgrades the mode
+    /// (last-writer-wins), so a conversation distilled provenance-only and then
+    /// archived ends up `TextOnly`.
     pub fn apply_distill(&mut self, payload: &DistillPayload) {
         if let Some(timeline) = TimelineId::from_raw(payload.timeline_id) {
-            self.distilled_timelines.insert(timeline);
+            self.distilled_timelines.insert(timeline, payload.mode);
         }
     }
 
-    /// Mark `timeline` for distillation in-RAM (callers also write the matching
-    /// `Distilled` record so the marker survives reload).
-    pub fn distill_timeline(&mut self, timeline: TimelineId) {
-        self.distilled_timelines.insert(timeline);
+    /// Mark `timeline` for distillation in-RAM at `mode` (callers also write the
+    /// matching `Distilled` record so the marker survives reload).
+    pub fn distill_timeline(&mut self, timeline: TimelineId, mode: DistillMode) {
+        self.distilled_timelines.insert(timeline, mode);
     }
 
-    /// Whether `timeline` is marked for distillation.
+    /// Whether `timeline` is marked for distillation (any mode).
     pub fn is_distilled(&self, timeline: TimelineId) -> bool {
-        self.distilled_timelines.contains(&timeline)
+        self.distilled_timelines.contains_key(&timeline)
     }
 
-    /// Direct read of the distilled-timeline set — the compactor uses it to shed
-    /// content (keep sig, drop tokens + KV) from these timelines' turns.
-    pub fn distilled_timelines(&self) -> &HashSet<TimelineId> {
+    /// The distillation mode `timeline` is marked at, if any.
+    pub fn distill_mode(&self, timeline: TimelineId) -> Option<DistillMode> {
+        self.distilled_timelines.get(&timeline).copied()
+    }
+
+    /// Direct read of the distilled-timeline map — the compactor uses it to shed
+    /// each timeline's turns to its [`DistillMode`].
+    pub fn distilled_timelines(&self) -> &HashMap<TimelineId, DistillMode> {
         &self.distilled_timelines
     }
 

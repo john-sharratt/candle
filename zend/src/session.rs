@@ -11,6 +11,7 @@ use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
+use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
@@ -334,7 +335,8 @@ fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
 
 fn mark_calibration_distill(engine: &ConversationEngine, timeline: TimelineId, tool: &str) {
     if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
-        if let Err(e) = engine.distill_timeline(timeline) {
+        // Calibration exemplars stay retrievable by signature — provenance-only.
+        if let Err(e) = engine.distill_timeline(timeline, DistillMode::ProvenanceOnly) {
             tracing::warn!(tool = tool, "calibration distill mark failed: {e}");
         }
     }
@@ -2445,20 +2447,20 @@ impl ZendSession {
         entries
     }
 
-    /// Set the archived lifecycle flag for `conv_id`. Persists to the
-    /// redo log (last-writer-wins on `RecordType::ConvState`) and
-    /// updates the in-RAM substrate. Backs `POST /v1/conversations/
-    /// {id}/archive` and `/unarchive`. Returns `None` when the model
-    /// isn't loaded yet (no engine to drive the write through).
-    pub fn set_conversation_archived(
-        &self,
-        conv_id: &str,
-        archived: bool,
-    ) -> Option<candle_conversation::Result<()>> {
+    /// Archive a conversation — one-way. Sets the archived lifecycle flag and
+    /// marks the timeline for `TextOnly` distillation, so the next compaction
+    /// sheds its KV chunks + signatures + projections and leaves a read-only
+    /// text record. There is no unarchive: distillation is lossy (the KV is
+    /// gone), so an archived conversation can't be resumed. Returns `None` when
+    /// the model isn't loaded yet.
+    pub fn archive_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = timeline_for(conv_id);
         let engine = state.engine.lock().unwrap();
-        Some(engine.set_conversation_archived(timeline, archived))
+        let result = engine
+            .set_conversation_archived(timeline, true)
+            .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly));
+        Some(result)
     }
 
     /// Permanently tombstone a conversation — the delete path behind
