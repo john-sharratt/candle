@@ -4618,7 +4618,10 @@ mod tests {
             sub.residence[a.0].warm.is_some(),
             "un-backed warm must be kept (its K/V would otherwise be lost)"
         );
-        assert!(sub.residence[b.0].warm.is_none(), "cold-backed warm dropped");
+        assert!(
+            sub.residence[b.0].warm.is_none(),
+            "cold-backed warm dropped"
+        );
     }
 
     /// Empty warm LRU → purge exits gracefully without panicking even

@@ -1915,6 +1915,14 @@ use candle_conversation::persistence::resume::ChunkImage;
 /// 32 layers matches the Qwen3-8B / Llama-3.2-3B-class architectures.
 const N_LAYERS_METADATA: usize = 32;
 
+/// Layer count for the fast per-cycle `*_mini` guards. Small enough to run in
+/// ~1s (the full `N_LAYERS_METADATA` variant is `#[ignore]`d), but ≥2 so the
+/// cross-layer ordering of the per-(h, p) metadata carriers is still exercised
+/// alongside the wide `N_KV_HEAD_METADATA × N_PALETTE` sub-band index space —
+/// the same bug classes the full-depth version catches, at a fraction of the
+/// GPU+disk cost.
+const N_LAYERS_METADATA_MINI: usize = 2;
+
 /// KV head count for the metadata round-trip tests. Larger than the
 /// module-level `N_KV_HEAD = 2` so the (h * N_PALETTE + p) index space
 /// is wider — surfaces head-index reorder bugs that would alias on the
@@ -1925,8 +1933,12 @@ const N_KV_HEAD_METADATA: usize = 4;
 /// round-trip tests. Uses `head_dim = QUANT_HEAD_DIM` (= 128) so the
 /// palette-4 selection kernel's `head_dim = 128` shape constraint is
 /// satisfied.
-fn make_backings_metadata(device: &Device, policy: &CompressionPolicy) -> Vec<ChunkedKvBacking> {
-    (0..N_LAYERS_METADATA)
+fn make_backings_metadata(
+    device: &Device,
+    policy: &CompressionPolicy,
+    n_layers: usize,
+) -> Vec<ChunkedKvBacking> {
+    (0..n_layers)
         .map(|_| {
             ChunkedKvBacking::new_with_format_adaptive(
                 4,
@@ -1945,8 +1957,8 @@ fn make_backings_metadata(device: &Device, policy: &CompressionPolicy) -> Vec<Ch
 
 /// Same as `make_backings_metadata` but for the BF16-default
 /// no-policy round-trip — exercises the format-preserving migration.
-fn make_backings_metadata_no_policy(device: &Device) -> Vec<ChunkedKvBacking> {
-    (0..N_LAYERS_METADATA)
+fn make_backings_metadata_no_policy(device: &Device, n_layers: usize) -> Vec<ChunkedKvBacking> {
+    (0..n_layers)
         .map(|_| {
             ChunkedKvBacking::new(
                 4,
@@ -2297,11 +2309,35 @@ fn seed_turn_varied_per_sub_band(
 /// Catches: per-(h, p) format reordering, palette-map drift, scale
 /// re-derivation from a stale arena state, kv_bytes/format misalignment,
 /// any silent fallback to a uniform format on the cold-load path.
+///
+/// Heavy (~20s): a full 32-layer tri-tier round-trip over real GPU
+/// quantization + on-disk persistence. Kept out of the default `cargo test`
+/// cycle via `#[ignore]` — run it (and its no-policy sibling) explicitly, e.g.
+/// `cargo test -p candle-conversation --test cold_warm_hot_path -- --ignored`,
+/// before landing changes to the tier/quantize/persistence metadata paths.
 #[test]
+#[ignore = "heavy 32-layer GPU+disk tier round-trip (~20s); run with --ignored"]
 fn quantize_on_evict_metadata_round_trip() {
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
+    run_quantize_on_evict_metadata_round_trip(&device, N_LAYERS_METADATA, false);
+}
+
+/// Fast per-cycle guard: the same policy-driven metadata round-trip at the small
+/// `N_LAYERS_METADATA_MINI` depth. Runs by default so the tier/quantize/persist
+/// metadata contract stays covered every cycle; the full-depth sibling above is
+/// `#[ignore]`d.
+#[test]
+fn quantize_on_evict_metadata_round_trip_mini() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    run_quantize_on_evict_metadata_round_trip(&device, N_LAYERS_METADATA_MINI, true);
+}
+
+fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, mini: bool) {
+    let device = device.clone();
     let tmpdir = tempfile::tempdir().unwrap();
     let dir = tmpdir.path().to_path_buf();
 
@@ -2325,7 +2361,7 @@ fn quantize_on_evict_metadata_round_trip() {
     // ── Phase 1: seed F16 with varied pattern, run policy-driven persist ──
     let key = {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata(&device, &policy);
+        let backings = make_backings_metadata(&device, &policy, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
 
         let idx = seed_turn_varied_per_sub_band(
@@ -2357,6 +2393,60 @@ fn quantize_on_evict_metadata_round_trip() {
         key
     };
 
+    // ── Mini path: one verify session covering both reload legs ────────
+    //
+    // The `#[ignore]`d full version below re-opens the substrate from disk for
+    // each leg (cold→hot determinism + a separate warm→hot) to mirror distinct
+    // restarts. The per-cycle guard folds it into a SINGLE reopen: cold→hot
+    // (reference + varied-format sanity), then evict + warm→hot in the same
+    // session (cold→hot pre-populated warm), asserting the two legs produce
+    // byte-identical metadata. Same per-(h, p) reorder/drift/fallback coverage,
+    // ~half the GPU+disk work.
+    if mini {
+        let conv = open_conversation(&dir);
+        let backings = make_backings_metadata(&device, &policy, n_layers);
+        conv.register_timeline(timeline, layer_id, group_id);
+        conv.reconstruct_from_log(n_layers, None).unwrap();
+
+        let main_stream = cuda_stream(&device);
+        let mut pinned: Option<PinnedBuf> = None;
+        let mut stager = ColdLoadStager::new();
+        elevate_to_hot(
+            &conv,
+            &backings,
+            &device,
+            &main_stream,
+            &mut pinned,
+            &mut stager,
+            &[],
+            &[key],
+        )
+        .unwrap();
+        let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_varied_formats(&reference, "mini cold→hot");
+
+        let purged = evict_from_hot(&conv, &[], &[]);
+        assert_eq!(
+            purged.count, 1,
+            "hot must be evictable to exercise warm→hot"
+        );
+        let report = elevate_to_hot(
+            &conv,
+            &backings,
+            &device,
+            &main_stream,
+            &mut pinned,
+            &mut stager,
+            &[],
+            &[key],
+        )
+        .unwrap();
+        assert_eq!(report.warm_to_hot, 1, "mini must exercise warm→hot");
+        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_chunk_images_eq(&reference, &snap, "mini warm→hot");
+        return;
+    }
+
     // ── Phase 2: open a fresh process state, elevate warm→hot, ─────────
     //            capture full ChunkImage reference                       ─
     //
@@ -2367,9 +2457,9 @@ fn quantize_on_evict_metadata_round_trip() {
     // every subsequent transition must preserve.
     let reference = {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata(&device, &policy);
+        let backings = make_backings_metadata(&device, &policy, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2403,9 +2493,9 @@ fn quantize_on_evict_metadata_round_trip() {
     // byte / scale / format tag we'd see drift here.
     {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata(&device, &policy);
+        let backings = make_backings_metadata(&device, &policy, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2432,9 +2522,9 @@ fn quantize_on_evict_metadata_round_trip() {
     //            elevated without restart.                                ─
     {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata(&device, &policy);
+        let backings = make_backings_metadata(&device, &policy, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2494,11 +2584,31 @@ fn quantize_on_evict_metadata_round_trip() {
 /// preserving migration. Catches any drift in the trivial-format
 /// branches of `k_formats` / `v_formats` / `k_pal` / `v_pal` /
 /// `k_scale` / `v_scale` populating.
+///
+/// Heavy (~10s): 32-layer GPU+disk round-trip. Ignored by default like its
+/// policy-driven sibling — run with `--ignored` when touching the tier paths.
 #[test]
+#[ignore = "heavy 32-layer GPU+disk tier round-trip (~10s); run with --ignored"]
 fn no_policy_metadata_round_trip() {
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
+    run_no_policy_metadata_round_trip(&device, N_LAYERS_METADATA, false);
+}
+
+/// Fast per-cycle guard: the same format-preserving metadata round-trip at the
+/// small `N_LAYERS_METADATA_MINI` depth. Runs by default; the full-depth sibling
+/// above is `#[ignore]`d.
+#[test]
+fn no_policy_metadata_round_trip_mini() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    run_no_policy_metadata_round_trip(&device, N_LAYERS_METADATA_MINI, true);
+}
+
+fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: bool) {
+    let device = device.clone();
     let tmpdir = tempfile::tempdir().unwrap();
     let dir = tmpdir.path().to_path_buf();
 
@@ -2508,7 +2618,7 @@ fn no_policy_metadata_round_trip() {
 
     let key = {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata_no_policy(&device);
+        let backings = make_backings_metadata_no_policy(&device, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
         let idx = seed_turn_varied_per_sub_band(
             &conv,
@@ -2532,12 +2642,59 @@ fn no_policy_metadata_round_trip() {
         key
     };
 
+    // Mini path: one verify session covering both reload legs (see the
+    // policy-driven sibling for the rationale). No `assert_varied_formats` here —
+    // the no-policy path deliberately preserves the uniform seed format.
+    if mini {
+        let conv = open_conversation(&dir);
+        let backings = make_backings_metadata_no_policy(&device, n_layers);
+        conv.register_timeline(timeline, layer_id, group_id);
+        conv.reconstruct_from_log(n_layers, None).unwrap();
+
+        let main_stream = cuda_stream(&device);
+        let mut pinned: Option<PinnedBuf> = None;
+        let mut stager = ColdLoadStager::new();
+        elevate_to_hot(
+            &conv,
+            &backings,
+            &device,
+            &main_stream,
+            &mut pinned,
+            &mut stager,
+            &[],
+            &[key],
+        )
+        .unwrap();
+        let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+
+        let purged = evict_from_hot(&conv, &[], &[]);
+        assert_eq!(
+            purged.count, 1,
+            "hot must be evictable to exercise warm→hot"
+        );
+        let report = elevate_to_hot(
+            &conv,
+            &backings,
+            &device,
+            &main_stream,
+            &mut pinned,
+            &mut stager,
+            &[],
+            &[key],
+        )
+        .unwrap();
+        assert_eq!(report.warm_to_hot, 1, "mini must exercise warm→hot");
+        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_chunk_images_eq(&reference, &snap, "no-policy mini warm→hot");
+        return;
+    }
+
     // Reference: post-restart, post warm→hot elevation.
     let reference = {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata_no_policy(&device);
+        let backings = make_backings_metadata_no_policy(&device, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2559,9 +2716,9 @@ fn no_policy_metadata_round_trip() {
     // Warm→hot leg after evict.
     {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata_no_policy(&device);
+        let backings = make_backings_metadata_no_policy(&device, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2598,9 +2755,9 @@ fn no_policy_metadata_round_trip() {
     // Second cold→hot reload from the same log.
     {
         let conv = open_conversation(&dir);
-        let backings = make_backings_metadata_no_policy(&device);
+        let backings = make_backings_metadata_no_policy(&device, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
+        conv.reconstruct_from_log(n_layers, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;

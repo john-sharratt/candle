@@ -305,7 +305,12 @@ fn data_path(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+// Measurement/tooling, not a regression guard: writes CSV + binary stat files
+// and prints tables (run manually with `--nocapture`). ~10s of GPU + I/O, so
+// keep it out of the default `cargo test` cycle — run with
+// `--ignored`/by name when analysing KV distributions.
 #[test]
+#[ignore = "kv-stats generator: heavy measurement tool, run manually with --nocapture"]
 fn test_generate_kv_stats() {
     let dump_path = data_path(DUMP_REL_PATH);
     if !dump_path.exists() {
@@ -571,7 +576,11 @@ fn print_amax_histogram(label: &str, values: &[f32], num_buckets: usize, bar_wid
     }
 }
 
+// Measurement/tooling, not a regression guard: prints per-(layer, head)
+// channel-amax percentiles + histograms (run manually with `--nocapture`).
+// ~5s, kept out of the default `cargo test` cycle.
 #[test]
+#[ignore = "kv-amax distribution: measurement tool, run manually with --nocapture"]
 fn test_kv_amax_channel_distribution() {
     let dump_path = data_path(DUMP_REL_PATH);
     if !dump_path.exists() {

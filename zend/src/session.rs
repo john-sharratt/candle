@@ -1063,7 +1063,8 @@ impl InferenceState {
                 // flushing boundary sweep below (which re-demotes the whole list).
                 // The call is fire-and-forget, so case submission never stalls.
                 if calib_timelines.len() - reclaimed_up_to >= CALIBRATION_BATCH {
-                    if let Err(e) = engine.demote_timelines_hot(&calib_timelines[reclaimed_up_to..], false)
+                    if let Err(e) =
+                        engine.demote_timelines_hot(&calib_timelines[reclaimed_up_to..], false)
                     {
                         tracing::warn!("calibration hot→warm demote failed: {e}");
                     }
