@@ -249,7 +249,7 @@ pub fn persist_turn_chunks_capture(
             let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             let encoded = image.payload.encode();
             let payload_len = encoded.len() as u64;
-            let (log_offset, record_len) = p.append_record(
+            let (segment, log_offset, record_len) = p.append_record(
                 RecordType::Chunk,
                 header_fmt,
                 stream_id.0,
@@ -265,6 +265,10 @@ pub fn persist_turn_chunks_capture(
             locs.push((
                 flat,
                 ChunkLoc {
+                    // The active segment this chunk's record landed in — a
+                    // rotation mid-turn can land later chunks in a newer
+                    // segment, so each chunk carries its own id.
+                    segment,
                     offset: log_offset,
                     payload_len,
                     record_size: record_len,

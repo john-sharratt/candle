@@ -1,18 +1,23 @@
-//! Log compaction — the whole-file dead-record rewrite (§5.8 of
-//! `docs/kv_tier_migration.md`).
+//! Store compaction — reclaim dead weight by rewriting only the **live**
+//! records into a fresh segment (`docs/segmented_substrate_log.md`).
 //!
-//! An append-only log only grows: every superseded partial-tail snapshot,
+//! An append-only store only grows: every superseded partial-tail snapshot,
 //! every stale `ModelSpec` / `Template`, every chunk of a deleted stream is
-//! dead weight the skip-load walk still steps over. Compaction rebuilds the
-//! log keeping only the **live** records — the winners under last-writer-wins
-//! that the manifest already resolved.
+//! dead weight the skip-load walk still steps over. Compaction keeps only the
+//! live records — the winners under last-writer-wins that the manifest and the
+//! substrate index already resolve.
 //!
-//! The live set is streamed into a fresh file in dependency order
-//! (`ModelSpec`, `Template`, then per stream its `StreamDecl`, `Chunk`s,
-//! `Tokens`, `Commit`). The orchestration that swaps the new
-//! file in is [`SubstratePersistence::compact`], and the automatic trigger
-//! is the O(1) dead-byte accounting behind
-//! [`SubstratePersistence::should_compact`] (see [`super::accounting`]).
+//! [`collect_live_records`] plans the live set in dependency order (`ModelSpec`,
+//! `Template`, then per stream its `StreamDecl`, `Chunk`s, `Tokens`, `Commit`)
+//! **without any disk reads** — read-back records (`Chunk` / `Tokens` /
+//! singletons) carry their source location, resident metadata carries its
+//! freshly-encoded bytes. [`write_compacted_log`] then reads the read-back
+//! records off their source segments in **coalesced stripes** and stages them
+//! **verbatim** (no decode / CRC re-verify / re-encode — the same fast path the
+//! incremental maintenance relocation uses), interleaving a fresh `HeaderIndex`
+//! chain. The orchestration that adopts the result as the sole segment and drops
+//! the rest is [`SubstratePersistence::compact`] (via
+//! [`super::segmented_log::SegmentedLog::adopt_compacted`]).
 //!
 //! [`SubstratePersistence::compact`]: super::SubstratePersistence::compact
 //! [`SubstratePersistence::should_compact`]: super::SubstratePersistence::should_compact
@@ -20,40 +25,123 @@
 use std::path::Path;
 
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
-use super::log_file::{read_record_at, LogFile, LogSource};
-use super::manifest::{encode_conv_state_payload, ConvState, Manifest};
+use super::log_file::LogFile;
+use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
 use super::record::{
-    encode_record, DebugIdPayload, DistillMode, DistillPayload, Record, RecordHeader, RecordType,
+    encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
 };
-use super::walker::WalkEntry;
+use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::Result;
 use crate::substrate::Substrate;
 
-/// Collect every **live** record from `log`, in dependency order, as
-/// `(header, payload)` pairs ready to re-encode.
-///
-/// `ModelSpec` / `Template` / `Chunk` / `Tokens` are read
-/// back from the log at their manifest offsets; `StreamDecl` and `Commit`
-/// are synthesised from the manifest (the manifest holds the decoded
-/// declaration and the durable-through index directly).
-pub fn collect_live_records(
-    log: &mut dyn LogSource,
-    manifest: &Manifest,
-    substrate: &Substrate,
-) -> Result<Vec<(RecordHeader, Vec<u8>)>> {
-    let mut out: Vec<(RecordHeader, Vec<u8>)> = Vec::new();
+/// Bytes staged into the compacted log before an incremental flush to disk —
+/// bounds the write buffer so a whole-store rewrite never holds the entire new
+/// log in RAM at once.
+const COMPACT_FLUSH_BYTES: usize = 256 * 1024 * 1024;
 
-    if let Some(loc) = manifest.model_spec {
-        let r = read_record_at(log, loc.offset, loc.record_size)?;
-        out.push((r.header, r.payload));
+/// One record destined for the compacted log. `Raw` records (`Chunk` / `Tokens`
+/// / the singletons) are staged **verbatim** from their source segment — no
+/// decode, no CRC re-verify, no re-encode — via coalesced stripe reads; their
+/// header is synthesized from the substrate/manifest index (never read from
+/// disk) for the header-index digest + singleton manifest. `Synth` records are
+/// the small resident metadata, encoded fresh from in-RAM state.
+pub enum CompactItem {
+    Raw {
+        header: RecordHeader,
+        segment: SegmentId,
+        offset: u64,
+        record_size: u64,
+    },
+    Synth {
+        header: RecordHeader,
+        payload: Vec<u8>,
+    },
+}
+
+impl CompactItem {
+    fn raw(header: RecordHeader, segment: SegmentId, offset: u64, record_size: u64) -> CompactItem {
+        CompactItem::Raw {
+            header,
+            segment,
+            offset,
+            record_size,
+        }
     }
-    if let Some(loc) = manifest.template {
-        let r = read_record_at(log, loc.offset, loc.record_size)?;
-        out.push((r.header, r.payload));
+
+    fn synth(header: RecordHeader, payload: Vec<u8>) -> CompactItem {
+        CompactItem::Synth { header, payload }
     }
-    if let Some(loc) = manifest.tokenizer {
-        let r = read_record_at(log, loc.offset, loc.record_size)?;
-        out.push((r.header, r.payload));
+
+    /// The record's header — synthesized for `Raw`, authored for `Synth`.
+    pub fn header(&self) -> &RecordHeader {
+        match self {
+            CompactItem::Raw { header, .. } | CompactItem::Synth { header, .. } => header,
+        }
+    }
+
+    /// A `Synth` item's payload, or `None` for a `Raw` (read-back) item.
+    #[cfg(test)]
+    pub fn synth_payload(&self) -> Option<&[u8]> {
+        match self {
+            CompactItem::Synth { payload, .. } => Some(payload),
+            CompactItem::Raw { .. } => None,
+        }
+    }
+}
+
+/// Header for a singleton (`ModelSpec` / `Template` / `Tokenizer`) staged
+/// verbatim — `payload_len` from its manifest location, every other field zero.
+fn singleton_header(rt: RecordType, payload_len: u64) -> RecordHeader {
+    RecordHeader {
+        record_type: rt,
+        format: 0,
+        payload_len,
+        crc: 0,
+        stream_id: 0,
+        chunk_index: 0,
+        token_count: 0,
+    }
+}
+
+/// `(offset, record_size)` of a `Raw` item — used by tests to read a chosen
+/// source location back and confirm which record was selected.
+#[cfg(test)]
+fn raw_loc(it: &CompactItem) -> (u64, u64) {
+    match it {
+        CompactItem::Raw {
+            offset,
+            record_size,
+            ..
+        } => (*offset, *record_size),
+        CompactItem::Synth { .. } => unreachable!("raw_loc on a Synth item"),
+    }
+}
+
+/// Collect every **live** record, in dependency order, as [`CompactItem`]s —
+/// planning only, **no disk reads**. `ModelSpec` / `Template` / `Tokenizer` /
+/// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
+/// offset, record_size)` and a header synthesized from the substrate/manifest
+/// index; every resident record (`StreamDecl`, `Commit`, `Label`, `ConvState`,
+/// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `DebugId`, `Distilled`) is a
+/// `Synth` item carrying its freshly-encoded payload. [`write_compacted_log`]
+/// reads the `Raw` bytes back coalesced and stages them verbatim.
+pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<CompactItem> {
+    let mut out: Vec<CompactItem> = Vec::new();
+
+    // Singletons — staged verbatim from wherever they physically live.
+    for (rt, loc) in [
+        (RecordType::ModelSpec, manifest.model_spec),
+        (RecordType::Template, manifest.template),
+        (RecordType::Tokenizer, manifest.tokenizer),
+    ] {
+        if let Some(loc) = loc {
+            out.push(CompactItem::raw(
+                singleton_header(rt, loc.payload_len),
+                loc.segment,
+                loc.offset,
+                loc.record_size,
+            ));
+        }
     }
     // Tombstoned timelines drop out of the compacted log entirely
     // — their records are physically gone, not merely hidden.  This
@@ -93,7 +181,7 @@ pub fn collect_live_records(
         let keep_sig = distill != Some(DistillMode::TextOnly);
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
-            out.push((
+            out.push(CompactItem::synth(
                 RecordHeader {
                     record_type: RecordType::StreamDecl,
                     format: 0,
@@ -107,15 +195,39 @@ pub fn collect_live_records(
             ));
         }
         if keep_chunks {
-            for loc in entry.chunks.values() {
-                let r = read_record_at(log, loc.offset, loc.record_size)?;
-                out.push((r.header, r.payload));
+            for (&idx, loc) in &entry.chunks {
+                out.push(CompactItem::raw(
+                    RecordHeader {
+                        record_type: RecordType::Chunk,
+                        format: loc.format,
+                        payload_len: loc.payload_len,
+                        crc: 0,
+                        stream_id: stream_id.0,
+                        chunk_index: idx,
+                        token_count: loc.token_count,
+                    },
+                    loc.segment,
+                    loc.offset,
+                    loc.record_size,
+                ));
             }
         }
         if keep_tokens {
             if let Some(loc) = entry.tokens {
-                let r = read_record_at(log, loc.offset, loc.record_size)?;
-                out.push((r.header, r.payload));
+                out.push(CompactItem::raw(
+                    RecordHeader {
+                        record_type: RecordType::Tokens,
+                        format: 0,
+                        payload_len: loc.payload_len,
+                        crc: 0,
+                        stream_id: stream_id.0,
+                        chunk_index: 0,
+                        token_count: 0,
+                    },
+                    loc.segment,
+                    loc.offset,
+                    loc.record_size,
+                ));
             }
         }
         // Per-turn projection-event timeline — re-emitted from the resident
@@ -123,7 +235,7 @@ pub fn collect_live_records(
         // compaction pass. Dropped for TextOnly (`keep_sig` false).
         if keep_sig {
             if let Some(payload) = &entry.projection_events {
-                out.push((
+                out.push(CompactItem::synth(
                     RecordHeader {
                         record_type: RecordType::ProjectionEvents,
                         format: 0,
@@ -142,7 +254,7 @@ pub fn collect_live_records(
         // for TextOnly (`keep_sig` false).
         if keep_sig {
             if let Some(payload) = &entry.wide_q_sigs {
-                out.push((
+                out.push(CompactItem::synth(
                     RecordHeader {
                         record_type: RecordType::WideQSig,
                         format: 0,
@@ -157,7 +269,7 @@ pub fn collect_live_records(
             }
         }
         if let Some(through) = entry.committed_through {
-            out.push((
+            out.push(CompactItem::synth(
                 RecordHeader {
                     record_type: RecordType::Commit,
                     format: 0,
@@ -180,7 +292,7 @@ pub fn collect_live_records(
             continue;
         }
         let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label, &custom);
-        out.push((
+        out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Label,
                 format: 0,
@@ -194,7 +306,7 @@ pub fn collect_live_records(
         ));
         if archived {
             let cs_payload = encode_conv_state_payload(timeline_id, ConvState { archived: true });
-            out.push((
+            out.push(CompactItem::synth(
                 RecordHeader {
                     record_type: RecordType::ConvState,
                     format: 0,
@@ -215,7 +327,7 @@ pub fn collect_live_records(
             continue;
         }
         let bytes = payload.encode();
-        out.push((
+        out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::TreeMetadata,
                 format: 0,
@@ -238,7 +350,7 @@ pub fn collect_live_records(
             debug_id: id,
         };
         let bytes = payload.encode();
-        out.push((
+        out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::DebugId,
                 format: 0,
@@ -261,7 +373,7 @@ pub fn collect_live_records(
             continue;
         }
         let payload = DistillPayload { timeline_id, mode }.encode();
-        out.push((
+        out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Distilled,
                 format: 0,
@@ -274,17 +386,24 @@ pub fn collect_live_records(
             payload,
         ));
     }
-    Ok(out)
+    out
 }
 
-/// Write the live records to a fresh log at `path`, interleaving a
-/// fresh `HeaderIndex` chain and publishing its head in the superblock
-/// — a just-compacted log recovers through the chain like any other.
-/// Returns the open [`LogFile`] and its manifest. `path` is removed
-/// first if it already exists.
+/// Write the live set to a fresh log at `path`, interleaving a fresh
+/// `HeaderIndex` chain and publishing its head in the superblock — a
+/// just-compacted log recovers through the chain like any other.
+///
+/// `Raw` items are read back from their source segment through `read_into` in
+/// **coalesced stripes** (a contiguous run of records → one sequential read)
+/// and staged **byte-for-byte** — no decode, no CRC re-verify, no re-encode.
+/// `Synth` items are encoded from their in-RAM payload. The write buffer is
+/// flushed incrementally so the whole new log is never resident at once.
+/// Returns the open [`LogFile`] and its (singleton-only) manifest. `path` is
+/// removed first if it already exists.
 pub fn write_compacted_log(
     path: &Path,
-    live: &[(RecordHeader, Vec<u8>)],
+    items: &[CompactItem],
+    read_into: &mut dyn FnMut(SegmentId, u64, &mut [u8]) -> Result<()>,
 ) -> Result<(LogFile, Manifest)> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -312,22 +431,95 @@ pub fn write_compacted_log(
             pending.clear();
         };
 
-    for (header, payload) in live {
-        let mut h = *header;
-        h.payload_len = payload.len() as u64;
-        let bytes = encode_record(&h, payload);
-        let offset = log.stage(&bytes);
-        manifest.ingest(&WalkEntry {
-            offset,
-            record: Record {
-                header: h,
-                payload: payload.clone(),
-            },
-            size: bytes.len() as u64,
-        })?;
-        pending.push(IndexEntry::from_header(&h, offset, bytes.len() as u64));
+    // Single streaming pass in dependency order. `Synth` items encode from their
+    // in-RAM payload; a `Raw` item begins a **run** — the maximal span of
+    // consecutive `Raw` items that is also physically contiguous in one source
+    // segment (a stream's chunk/token run: adjacent on disk and adjacent in the
+    // list). The whole run is read in **one coalesced stripe** and each record
+    // staged straight from the read buffer: one copy per record, no per-record
+    // allocation, no whole-store intermediate buffer.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            CompactItem::Synth { header, payload } => {
+                let mut h = *header;
+                h.payload_len = payload.len() as u64;
+                let bytes = encode_record(&h, payload);
+                let offset = log.stage(&bytes);
+                pending.push(IndexEntry::from_header(&h, offset, bytes.len() as u64));
+                i += 1;
+            }
+            CompactItem::Raw {
+                segment,
+                offset,
+                record_size,
+                ..
+            } => {
+                let seg = *segment;
+                let start = *offset;
+                let mut end = start + record_size;
+                let mut j = i + 1;
+                while let Some(CompactItem::Raw {
+                    segment: s2,
+                    offset: o2,
+                    record_size: rs2,
+                    ..
+                }) = items.get(j)
+                {
+                    if *s2 != seg || *o2 != end {
+                        break;
+                    }
+                    end += rs2;
+                    j += 1;
+                }
+                let len = (end - start) as usize;
+                if buf.len() < len {
+                    buf.resize(len, 0);
+                }
+                read_into(seg, start, &mut buf[..len])?;
+                let mut within = 0usize;
+                for it in &items[i..j] {
+                    let CompactItem::Raw {
+                        header,
+                        record_size,
+                        ..
+                    } = it
+                    else {
+                        unreachable!("a Raw run holds only Raw items");
+                    };
+                    let sz = *record_size as usize;
+                    let staged = log.stage(&buf[within..within + sz]);
+                    within += sz;
+                    // Singletons resolve from the manifest (the substrate replay
+                    // never rebuilds them); `Chunk` / `Tokens` are substrate-
+                    // indexed and never enter the manifest.
+                    let loc = RecordLoc {
+                        segment: FIRST_SEGMENT,
+                        offset: staged,
+                        payload_len: header.payload_len,
+                        record_size: sz as u64,
+                    };
+                    match header.record_type {
+                        RecordType::ModelSpec => manifest.model_spec = Some(loc),
+                        RecordType::Template => manifest.template = Some(loc),
+                        RecordType::Tokenizer => manifest.tokenizer = Some(loc),
+                        _ => {}
+                    }
+                    pending.push(IndexEntry::from_header(header, staged, sz as u64));
+                    if pending.len() >= INDEX_FLUSH_ENTRIES {
+                        flush_index(&mut log, &mut pending, &mut last_index);
+                    }
+                }
+                i = j;
+            }
+        }
         if pending.len() >= INDEX_FLUSH_ENTRIES {
             flush_index(&mut log, &mut pending, &mut last_index);
+        }
+        // Bound the in-RAM write buffer for a whole-store rewrite.
+        if log.pending_len() >= COMPACT_FLUSH_BYTES {
+            log.flush()?;
         }
     }
     if !pending.is_empty() {
@@ -344,8 +536,20 @@ pub fn write_compacted_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::log_file::{MemLog, SUPERBLOCK_SIZE};
+    use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::record::encode_record;
+
+    /// True iff any record of type `rt` carries `payload` (only `Synth` items
+    /// hold a payload; `Raw` read-back records don't).
+    fn has_synth(live: &[CompactItem], rt: RecordType, payload: &[u8]) -> bool {
+        live.iter()
+            .any(|it| it.header().record_type == rt && it.synth_payload() == Some(payload))
+    }
+
+    /// True iff any record of type `rt` is present (by header, `Raw` or `Synth`).
+    fn has_type(live: &[CompactItem], rt: RecordType) -> bool {
+        live.iter().any(|it| it.header().record_type == rt)
+    }
 
     fn record(rt: RecordType, stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
         encode_record(
@@ -375,20 +579,31 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
         // Exactly: 1 ModelSpec + 1 Chunk = 2 (no StreamDecl/Commit/Tokens here).
         assert_eq!(live.len(), 2);
+        // Each read-back item points at the live winner's on-disk location — the
+        // manifest / substrate index already resolved last-writer-wins — so the
+        // stale ModelSpec and the dead partial chunk are never staged. Read the
+        // chosen source bytes back to prove which record was selected.
         let model = live
             .iter()
-            .find(|(h, _)| h.record_type == RecordType::ModelSpec)
+            .find(|it| it.header().record_type == RecordType::ModelSpec)
             .unwrap();
-        assert_eq!(model.1, b"model-v2-live", "the stale ModelSpec is dropped");
+        let (off, size) = raw_loc(model);
+        assert_eq!(
+            read_record_at(&mut mem, off, size).unwrap().payload,
+            b"model-v2-live",
+            "the stale ModelSpec is dropped"
+        );
         let chunk = live
             .iter()
-            .find(|(h, _)| h.record_type == RecordType::Chunk)
+            .find(|it| it.header().record_type == RecordType::Chunk)
             .unwrap();
+        let (off, size) = raw_loc(chunk);
         assert_eq!(
-            chunk.1, b"sealed-final-live",
+            read_record_at(&mut mem, off, size).unwrap().payload,
+            b"sealed-final-live",
             "the dead partial chunk is dropped"
         );
     }
@@ -406,7 +621,7 @@ mod tests {
         let (before, before_sub, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&mut mem, &before, &before_sub).unwrap();
+        let live = collect_live_records(&before, &before_sub);
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
             std::time::SystemTime::now()
@@ -414,16 +629,21 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let (mut new_log, _after_manifest) = write_compacted_log(&path, &live).unwrap();
+        let (mut new_log, _after_manifest) =
+            write_compacted_log(&path, &live, &mut |_s, off, dest| mem.read_into(off, dest))
+                .unwrap();
 
         // The compacted log re-walked into a substrate has the same
         // live streams + chunks as the source.
         let hint = new_log.superblock().last_index;
         assert_ne!(hint, (0, 0), "compacted log must carry an index chain");
         let mut after_sub = Substrate::new();
-        let recovered = super::super::recovery::recover_with_sink(&mut new_log, hint, |e| {
-            after_sub.apply_walker_entry(e)
-        })
+        let recovered = super::super::recovery::recover_with_sink(
+            &mut new_log,
+            super::super::segment::FIRST_SEGMENT,
+            hint,
+            |e| after_sub.apply_walker_entry(e),
+        )
         .unwrap();
         assert_eq!(
             recovered.last_index,
@@ -516,33 +736,40 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
 
-        // The dead timeline's records are physically gone from the
-        // live set.
+        // The dead timeline's records are physically gone from the live set.
+        // Chunks are read-back (`Raw`) items keyed by stream id; the dead
+        // stream (100) must contribute none.
         assert!(
-            !live.iter().any(|(_, p)| p == b"dead-chunk-payload"),
+            !live
+                .iter()
+                .any(|it| it.header().record_type == RecordType::Chunk
+                    && it.header().stream_id == 100),
             "tombstoned timeline's chunk must be dropped during compaction",
         );
         assert!(
-            !live.iter().any(|(_, p)| {
-                std::str::from_utf8(p)
-                    .map(|s| s.contains("dead-conv"))
-                    .unwrap_or(false)
-            }),
+            !live.iter().any(|it| it
+                .synth_payload()
+                .and_then(|p| std::str::from_utf8(p).ok())
+                .map(|s| s.contains("dead-conv"))
+                .unwrap_or(false)),
             "tombstoned timeline's Label must be dropped during compaction",
         );
-        // The alive timeline's records survive intact.
+        // The alive timeline's records survive: its chunk (stream 200) present,
+        // its Label carrying "alive-conv" present.
         assert!(
-            live.iter().any(|(_, p)| p == b"alive-chunk-payload"),
+            live.iter()
+                .any(|it| it.header().record_type == RecordType::Chunk
+                    && it.header().stream_id == 200),
             "alive timeline's chunk must survive compaction",
         );
         assert!(
-            live.iter().any(|(_, p)| {
-                std::str::from_utf8(p)
-                    .map(|s| s.contains("alive-conv"))
-                    .unwrap_or(false)
-            }),
+            live.iter().any(|it| it
+                .synth_payload()
+                .and_then(|p| std::str::from_utf8(p).ok())
+                .map(|s| s.contains("alive-conv"))
+                .unwrap_or(false)),
             "alive timeline's Label must survive compaction",
         );
     }
@@ -576,11 +803,10 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
 
         assert!(
-            live.iter()
-                .any(|(h, p)| h.record_type == RecordType::ProjectionEvents && p == &proj_payload),
+            has_synth(&live, RecordType::ProjectionEvents, &proj_payload),
             "ProjectionEvents record must survive compaction with its payload intact",
         );
     }
@@ -618,11 +844,10 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
 
         assert!(
-            live.iter()
-                .any(|(h, p)| h.record_type == RecordType::WideQSig && p == &wide_payload),
+            has_synth(&live, RecordType::WideQSig, &wide_payload),
             "WideQSig record must survive compaction with its payload intact",
         );
     }
@@ -676,35 +901,34 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
 
         // The declaration and the sig survive — the belief gallery still finds it.
         assert!(
-            live.iter()
-                .any(|(h, _)| h.record_type == RecordType::StreamDecl),
+            has_type(&live, RecordType::StreamDecl),
             "provenance-only turn keeps its StreamDecl (tags + gallery scope)",
         );
         assert!(
-            live.iter()
-                .any(|(h, p)| h.record_type == RecordType::WideQSig && p == &wide_payload),
+            has_synth(&live, RecordType::WideQSig, &wide_payload),
             "provenance-only turn keeps its WideQSig",
         );
         // The content is reclaimed.
         assert!(
-            !live.iter().any(|(h, _)| h.record_type == RecordType::Chunk),
+            !has_type(&live, RecordType::Chunk),
             "provenance-only turn drops its KV chunks",
         );
         assert!(
-            !live
-                .iter()
-                .any(|(h, _)| h.record_type == RecordType::Tokens),
+            !has_type(&live, RecordType::Tokens),
             "provenance-only turn drops its tokens",
         );
         // The marker survives the compaction it just shed through, at its mode.
         assert!(
             live.iter()
-                .any(|(h, p)| h.record_type == RecordType::Distilled
-                    && DistillPayload::decode(p).ok().map(|d| d.mode)
+                .any(|it| it.header().record_type == RecordType::Distilled
+                    && it
+                        .synth_payload()
+                        .and_then(|p| DistillPayload::decode(p).ok())
+                        .map(|d| d.mode)
                         == Some(DistillMode::ProvenanceOnly)),
             "distilled marker re-emitted with its mode",
         );
@@ -766,28 +990,43 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
 
-        let has = |rt: RecordType| live.iter().any(|(h, _)| h.record_type == rt);
         assert!(
-            has(RecordType::StreamDecl),
+            has_type(&live, RecordType::StreamDecl),
             "text-only keeps its StreamDecl"
         );
-        assert!(
-            live.iter()
-                .any(|(h, p)| h.record_type == RecordType::Tokens && p == b"token-content"),
+        // Tokens are kept as a read-back item; read its source bytes to confirm
+        // the readable record survives.
+        let tokens = live
+            .iter()
+            .find(|it| it.header().record_type == RecordType::Tokens)
+            .expect("text-only keeps its tokens (the readable record)");
+        let (off, size) = raw_loc(tokens);
+        assert_eq!(
+            read_record_at(&mut mem, off, size).unwrap().payload,
+            b"token-content",
             "text-only keeps its tokens (the readable record)",
         );
-        assert!(!has(RecordType::Chunk), "text-only drops its KV chunks");
-        assert!(!has(RecordType::WideQSig), "text-only drops its signature");
         assert!(
-            !has(RecordType::ProjectionEvents),
+            !has_type(&live, RecordType::Chunk),
+            "text-only drops its KV chunks"
+        );
+        assert!(
+            !has_type(&live, RecordType::WideQSig),
+            "text-only drops its signature"
+        );
+        assert!(
+            !has_type(&live, RecordType::ProjectionEvents),
             "text-only drops its projection events",
         );
         assert!(
             live.iter()
-                .any(|(h, p)| h.record_type == RecordType::Distilled
-                    && DistillPayload::decode(p).ok().map(|d| d.mode)
+                .any(|it| it.header().record_type == RecordType::Distilled
+                    && it
+                        .synth_payload()
+                        .and_then(|p| DistillPayload::decode(p).ok())
+                        .map(|d| d.mode)
                         == Some(DistillMode::TextOnly)),
             "text-only marker re-emitted with its mode",
         );

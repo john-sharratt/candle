@@ -37,10 +37,15 @@ use std::collections::BTreeMap;
 use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
-use candle_conversation::persistence::manifest::Manifest;
-use candle_conversation::persistence::record::{ChunkPayload, Record, RecordType};
+use candle_conversation::persistence::manifest::{
+    decode_conv_state_payload, decode_label_payload, Manifest,
+};
+use candle_conversation::persistence::record::{
+    ChunkPayload, DistillMode, DistillPayload, Record, RecordType,
+};
 use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
+use candle_conversation::persistence::segment::FIRST_SEGMENT;
 use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::walker;
 use candle_conversation::projection::{
@@ -57,19 +62,198 @@ use tokenizers::Tokenizer;
     about = "Read-only inspector for a substrate redo log"
 )]
 struct Cli {
-    /// Path to the substrate log. Defaults to `.substrate/substrate.log`
-    /// under the current directory (the workspace's redo log).
+    /// Path to inspect: the `.substrate` **directory** (the segmented redo
+    /// log) or a single `seg-*.log` / `seg-*.active` segment file. Defaults to
+    /// `.substrate` under the current directory. For a directory, `summary`
+    /// aggregates every segment; the other views open the active segment (pass
+    /// a segment file to inspect a specific sealed segment).
     #[arg(short, long, global = true)]
     log: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-/// The default log location — `<cwd>/.substrate/substrate.log`, where the
-/// daemon writes the workspace redo log.
+/// The default inspect target — `<cwd>/.substrate`, the segmented redo-log
+/// directory the daemon writes.
 fn default_log_path() -> PathBuf {
-    use candle_conversation::persistence::{ACTIVE_LOG_NAME, SUBSTRATE_DIR};
-    PathBuf::from(SUBSTRATE_DIR).join(ACTIVE_LOG_NAME)
+    use candle_conversation::persistence::SUBSTRATE_DIR;
+    PathBuf::from(SUBSTRATE_DIR)
+}
+
+/// Parse the segment id from a `seg-<id>.log` / `.active` file path, for the
+/// single-`--log` conversations view. A non-segment name falls back to id 0
+/// (the view only uses the id for display).
+fn segment_id_of(path: &std::path::Path) -> u64 {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("seg-"))
+        .and_then(|rest| rest.rsplit_once('.'))
+        .and_then(|(num, _)| num.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// `(id, path, is_active)` for every segment file in `dir`, ascending by id.
+/// The active segment is the **highest-id** file — the daemon appends to the
+/// last segment in the sequence (single `.log` namespace). A legacy `.active`
+/// file (present only until the one-time adopt renames it) is recognized too;
+/// being highest-id, it resolves to active by the same rule.
+fn enumerate_segments(dir: &std::path::Path) -> Result<Vec<(u64, PathBuf, bool)>> {
+    let mut segs = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("seg-") else {
+            continue;
+        };
+        let Some((num, ext)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if ext != "log" && ext != "active" {
+            continue;
+        }
+        let Ok(id) = num.parse::<u64>() else { continue };
+        segs.push((id, entry.path(), false));
+    }
+    segs.sort_by_key(|(id, _, _)| *id);
+    if let Some(last) = segs.last_mut() {
+        last.2 = true;
+    }
+    Ok(segs)
+}
+
+/// Segment-aware `summary`: one line per segment (id, role, size) plus a total.
+fn segment_summary(segs: &[(u64, PathBuf, bool)]) -> Result<()> {
+    println!("segments: {}", segs.len());
+    let mut total = 0u64;
+    for (id, path, is_active) in segs {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        total += len;
+        println!(
+            "  seg {id:>10}  {:<7}  {:>12} bytes  {}",
+            if *is_active { "active" } else { "sealed" },
+            len,
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        );
+    }
+    println!("  total: {total} bytes across {} segment(s)", segs.len());
+    println!("\nper-segment detail:");
+    for (id, path, _) in segs {
+        println!("\n── segment {id} ──");
+        let mut log = LogFile::open_read_only(path)?;
+        summary(path, &mut log)?;
+    }
+    Ok(())
+}
+
+/// Reconstructed lifecycle state for one conversation timeline, folded from
+/// its `Label` / `ConvState` / `Distilled` records across every segment.
+#[derive(Default)]
+struct ConvRow {
+    conv_id: String,
+    label: String,
+    /// `(segment_id, offset)` of the most recent `Label` seen.
+    label_loc: Option<(u64, u64)>,
+    /// Winning `archived` flag — the last `ConvState` in ascending
+    /// (segment, offset) order, exactly as the substrate reconstruct resolves it.
+    archived: bool,
+    /// `(segment_id, offset)` of the `ConvState` that set the winning flag.
+    state_loc: Option<(u64, u64)>,
+    /// Total `ConvState` records seen for this timeline (across all segments).
+    state_count: usize,
+    /// Distill mode + `(segment_id, offset)` of the most recent `Distilled` marker.
+    distilled: Option<(DistillMode, u64, u64)>,
+    distill_count: usize,
+}
+
+/// Walk one segment read-only and fold its `Label`/`ConvState`/`Distilled`
+/// records into `rows`. Call in ascending segment-id order so `ConvState` /
+/// `Distilled` last-writer-wins matches the reconstruct's recency rule.
+fn fold_conversations(
+    seg_id: u64,
+    log: &mut LogFile,
+    rows: &mut BTreeMap<u64, ConvRow>,
+) -> Result<()> {
+    let (entries, _outcome) = walker::collect(log, FIRST_SEGMENT, SUPERBLOCK_SIZE)?;
+    for e in &entries {
+        match e.record.header.record_type {
+            RecordType::Label => {
+                let (tl, meta) = decode_label_payload(&e.record.payload)?;
+                let row = rows.entry(tl).or_default();
+                row.conv_id = meta.conv_id;
+                row.label = meta.label;
+                row.label_loc = Some((seg_id, e.offset));
+            }
+            RecordType::ConvState => {
+                let (tl, st) = decode_conv_state_payload(&e.record.payload)?;
+                let row = rows.entry(tl).or_default();
+                row.archived = st.archived;
+                row.state_loc = Some((seg_id, e.offset));
+                row.state_count += 1;
+            }
+            RecordType::Distilled => {
+                let p: DistillPayload = serde_json::from_slice(&e.record.payload)
+                    .with_context(|| "decoding Distilled payload")?;
+                let row = rows.entry(p.timeline_id).or_default();
+                row.distilled = Some((p.mode, seg_id, e.offset));
+                row.distill_count += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filter: Option<&str>) {
+    let mut shown = 0usize;
+    for (tl, row) in rows {
+        if let Some(f) = filter {
+            let hit = row.conv_id.contains(f)
+                || row.label.contains(f)
+                || format!("{tl}").contains(f)
+                || format!("{tl:#x}").contains(f);
+            if !hit {
+                continue;
+            }
+        }
+        // A timeline with neither a conv_id nor any ConvState/Distilled is an
+        // internal (base / section) timeline — not a user conversation.
+        if row.conv_id.is_empty() && row.state_count == 0 && row.distill_count == 0 {
+            continue;
+        }
+        let arch = if row.archived { "ARCHIVED" } else { "active  " };
+        let state = match row.state_loc {
+            Some((s, o)) => format!("seg{s}@{o}×{}", row.state_count),
+            None => "none".to_string(),
+        };
+        let distill = match &row.distilled {
+            Some((m, s, o)) => format!("{m:?}@seg{s}:{o}×{}", row.distill_count),
+            None => "-".to_string(),
+        };
+        let label = if row.label.is_empty() {
+            "(untitled)"
+        } else {
+            &row.label
+        };
+        println!(
+            "tl={tl:<18} {arch}  conv={:<38}  convstate={state:<22}  distill={distill:<26}  {label}",
+            if row.conv_id.is_empty() { "-" } else { &row.conv_id },
+        );
+        shown += 1;
+    }
+    println!("\n{shown} conversation timeline(s)");
+}
+
+/// Directory-mode `conversations`: fold every segment in ascending id order so
+/// cross-segment last-writer-wins holds, then print.
+fn segment_conversations(segs: &[(u64, PathBuf, bool)], filter: Option<&str>) -> Result<()> {
+    let mut rows: BTreeMap<u64, ConvRow> = BTreeMap::new();
+    for (id, path, _) in segs {
+        let mut log = LogFile::open_read_only(path)?;
+        fold_conversations(*id, &mut log, &mut rows)?;
+    }
+    print_conversations(&rows, filter);
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -80,6 +264,19 @@ enum Cmd {
     Headers,
     /// Per-stream manifest view (turns and prompt sections).
     Streams,
+    /// Per-conversation lifecycle, reconstructed the way the substrate does it:
+    /// for every timeline carrying a `Label` / `ConvState` / `Distilled` record,
+    /// show conv_id, label, the winning `archived` flag with the exact
+    /// `(segment,offset)` of the ConvState that set it (and how many ConvState
+    /// records exist), and the distill mode if any. Last-writer-wins across
+    /// segments in ascending id order — so this answers "why does the reload
+    /// think this conversation is archived, and where does that record live".
+    Conversations {
+        /// Only show timelines whose conv_id, label, or timeline id contains this
+        /// substring (timeline id matched as decimal and `0x`-hex).
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Prompt sections grouped by name, each variant with its content address
     /// (prefix + section hash) and a KV fingerprint. A section-tree's branch
     /// variants share a name and `section_hash` but differ in `prefix_hash` and
@@ -312,10 +509,46 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let log_path = cli.log.clone().unwrap_or_else(default_log_path);
-    let mut log = LogFile::open(&log_path).with_context(|| {
+    let target = cli.log.clone().unwrap_or_else(default_log_path);
+
+    // A directory is the segmented store: `summary` aggregates every segment;
+    // the single-segment views open the active segment.
+    let log_path = if target.is_dir() {
+        let segs = enumerate_segments(&target)
+            .with_context(|| format!("enumerating segments in {}", target.display()))?;
+        if segs.is_empty() {
+            anyhow::bail!("no seg-*.log/.active files in {}", target.display());
+        }
+        if matches!(cli.cmd, Cmd::Summary) {
+            return segment_summary(&segs);
+        }
+        if let Cmd::Conversations { filter } = &cli.cmd {
+            return segment_conversations(&segs, filter.as_deref());
+        }
+        // Single-segment views: use the active segment (highest-id `.active`,
+        // else the highest-id segment present).
+        let (_, path, _) = segs
+            .iter()
+            .rev()
+            .find(|(_, _, active)| *active)
+            .or_else(|| segs.last())
+            .expect("segs is non-empty");
+        eprintln!(
+            "note: inspecting the active segment {} (read-only; safe against a live daemon); \
+             pass --log <seg-file> for a specific sealed segment",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        );
+        path.clone()
+    } else {
+        target
+    };
+
+    // Always open read-only: the inspector never writes, and this makes it safe
+    // to point at the running daemon's active segment without racing its writes
+    // or healing/truncating the file underneath it.
+    let mut log = LogFile::open_read_only(&log_path).with_context(|| {
         format!(
-            "opening log {} (pass --log to point elsewhere)",
+            "opening log {} read-only (pass --log to point elsewhere)",
             log_path.display()
         )
     })?;
@@ -324,6 +557,12 @@ fn main() -> Result<()> {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::Headers => headers(&mut log)?,
         Cmd::Streams => streams(&mut log)?,
+        Cmd::Conversations { filter } => {
+            let seg_id = segment_id_of(&log_path);
+            let mut rows = BTreeMap::new();
+            fold_conversations(seg_id, &mut log, &mut rows)?;
+            print_conversations(&rows, filter.as_deref());
+        }
         Cmd::Sections => sections(&mut log)?,
         Cmd::Chunks { stream_id, preview } => {
             chunks(&mut log, parse_stream_id(&stream_id)?, preview)?
@@ -3106,7 +3345,7 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     let sb = log.superblock();
     // Header-only walk — the histogram and the dead-byte accounting need
     // no payload bytes.
-    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |_| false)?;
+    let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |_| false)?;
 
     // Record-type histogram. `type_index` maps each discriminant to
     // `rt as usize - 1`, so `Unknown` (the highest discriminant) maps to the
@@ -3184,7 +3423,7 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
 }
 
 fn headers(log: &mut LogFile) -> Result<()> {
-    let (entries, outcome) = walker::collect(log, SUPERBLOCK_SIZE)?;
+    let (entries, outcome) = walker::collect(log, FIRST_SEGMENT, SUPERBLOCK_SIZE)?;
     println!(
         "{:>5}  {:>10}  {:<11}  {:>18}  {:>7}  {:>4}  {:>7}  {:>9}",
         "#", "offset", "type", "stream_id", "chunk", "fmt", "tokens", "payload"
@@ -3274,7 +3513,7 @@ fn streams(log: &mut LogFile) -> Result<()> {
 fn first_seen_offsets(log: &mut LogFile) -> Result<std::collections::HashMap<StreamId, u64>> {
     // Headers only — first_seen needs each record's `(stream_id, offset)`, never
     // its payload, so skip every payload read.
-    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |_| false)?;
+    let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |_| false)?;
     let mut first = std::collections::HashMap::new();
     for e in &entries {
         let sid = e.record.header.stream_id;
@@ -3662,7 +3901,9 @@ fn recover_view(log: &mut LogFile) -> Result<()> {
     // filtered forward walk otherwise.
     let hint = log.superblock().last_index;
     let mut substrate = Substrate::new();
-    let recovered = recovery::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
+    let recovered = recovery::recover_with_sink(log, FIRST_SEGMENT, hint, |e| {
+        substrate.apply_walker_entry(e)
+    })?;
     let (turns, sections) = stream_kind_counts(&substrate);
     println!(
         "recovers to: {} streams ({turns} turn, {sections} section), tail offset {}, torn-tail={}",
@@ -3725,7 +3966,7 @@ fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     // biggest cost in every command. `WideQSig` / `ProjectionEvents` are NOT
     // skipped — `apply_walker_entry` mirrors their payload into the stream blob the
     // belief gallery reads.
-    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |rt| {
+    let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
         !matches!(
             rt,
             RecordType::Chunk | RecordType::Tokens | RecordType::HeaderIndex

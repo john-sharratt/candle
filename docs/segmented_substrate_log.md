@@ -1,6 +1,26 @@
 # Segmented Substrate Log — Design
 
-Status: **finalized — ready to implement (rev 3)**
+Status: **implemented (rev 5). All phases landed on branch `unified-wave-engine`,
+CPU-tested (162 persistence + 44 substrate tests green); GPU cold-load segment
+routing is daemon-validated.**
+
+Implementation notes vs. this design:
+- **Incremental drop/compact/combine (§6) is implemented** in
+  `persistence/maintenance.rs` (`run_maintenance` → `pick_maintenance_op` →
+  `apply_maintenance_op`). Safety rests on re-emitting the full **resident**
+  record set (incl. `Tombstone` markers) before any drop, so a dropped segment
+  never takes the only copy of live metadata and a tombstoned timeline can't
+  resurrect (see the module doc). Per-segment dead accounting is derived from the
+  substrate index (`segment_liveness`), not a sharded `RecordAccounting` — the
+  resident set is re-emitted wholesale each op, so a segment's `dead = total −
+  live_readback` slightly over-counts, which only over-eagerly compacts (safe).
+- The **whole-store** compactor (`compact`) is **kept** (segment-aware:
+  `collect_live_records` routes reads per segment, `SegmentedLog::adopt_compacted`
+  swaps in a single fresh segment) as a manual/emergency op; `write_compacted_log`
+  is **not** deleted (repurposed). It is no longer on any automatic path.
+- Load-path compaction is **removed** (§9): the `--no-compact-substrate` flag,
+  the `substrate_has_reclaimable` gate, and the `Compacting` load step are gone;
+  reclaim is fully background.
 Scope: the on-disk redo log under `candle-conversation/src/persistence/` (`.substrate/`)
 
 ---
@@ -89,13 +109,17 @@ Segments live in `.substrate/` with an id encoded in the name:
 .substrate/
   seg-0000000001.log      ← sealed (immutable, complete)
   seg-0000000002.log      ← sealed
-  seg-0000000003.active   ← active: the ONE append target
+  seg-0000000003.log      ← active: the highest-id file, the ONE append target
 ```
 
-- **Active**: exactly one `*.active` file — the current append target, always the
-  highest id. All writes (fresh appends *and* relocated records from
-  compact/combine — §6) go here.
-- **Sealed**: `*.log` files, lower ids, immutable.
+- **Single namespace.** Every segment is a `seg-<id>.log` file. There is **no
+  `.active` extension**: the active is simply the **highest-id** file, and a
+  segment is sealed by a higher-id one existing. (Sealing needs no rename —
+  which removes the two-active crash window; a legacy `seg-<id>.active` from
+  before this simplification is adopted → renamed to `.log` → on open.)
+- **Active**: the highest-id segment — the current append target. All writes
+  (fresh appends *and* relocated records from compact/combine — §6) go here.
+- **Sealed**: every lower-id segment, immutable.
 - **Next id**: `max(existing ids) + 1`, derived from the directory.
 - Each segment file is exactly today's `LogFile` layout (superblock + 4 KB
   records + `HeaderIndex` chain). No new on-disk record types.
@@ -103,8 +127,8 @@ Segments live in `.substrate/` with an id encoded in the name:
 ### 4.1 Why no manifest — deriving everything
 
 The segment set, order, and active/sealed split are all derivable:
-- **Set + order** = the directory listing, sorted by id.
-- **Active** = the sole `*.active` file (highest id).
+- **Set + order** = the `seg-<id>.log` directory listing, sorted by id.
+- **Active** = the highest-id file.
 - **Recency** = **append order = id order**, *because relocation always appends
   to the active (highest id)* (§6). So a key's live version is always its
   highest-id occurrence.
@@ -132,6 +156,25 @@ struct RecordLoc { segment: SegmentId, offset: u64, record_size: u64 }
 recovery. Reads route to the segment's `LogFile`/`DirectFile` via the LRU pool.
 This is the widest-touching change; **§9 is the full audit checklist** to do it
 without regressions.
+
+### 5.1 How the segment id reaches the in-RAM index during recovery
+
+The manifest holds only three singleton `RecordLoc`s; every per-stream `ChunkLoc`
+lives on the `Substrate`, stamped by `Substrate::apply_walker_entry`. Both consume
+a `WalkEntry`. So the single threading mechanism is a **`segment: SegmentId` field
+on `WalkEntry`**: the walker/recovery functions take the segment they are walking
+and stamp every entry they emit; `manifest.ingest` and `apply_walker_entry` read
+`entry.segment` instead of the `FIRST_SEGMENT` placeholder. This keeps the sink
+signature (`FnMut(&WalkEntry)`) unchanged — only the entry-construction sites in
+`walker.rs` / `recovery.rs` / `header_index.rs` gain the field.
+
+Multi-segment recovery (`SegmentedLog::open`) walks the segments in **ascending
+id** (each sealed segment via its own `HeaderIndex` chain / full-walk fallback,
+active last with torn-tail truncation), feeding all entries into **one** shared
+`Substrate` + manifest through the same sink. Because a later (higher-id) segment's
+`apply_walker_entry` overwrites an earlier one for the same key, the in-RAM index
+lands on the highest-id (newest) record per key — the id-order-wins recency model
+of §4.1. The three manifest singletons resolve the same way.
 
 ## 6. Background maintenance — drop / compact / combine
 
@@ -163,11 +206,12 @@ over its source by id-order, so a crash mid-relocation self-heals (§7).
 
 Ordering rules and their crash windows:
 
-- **Append/seal**: seal = fsync active → rename `*.active`→`*.log` → create
-  `seg-(max+1).active`. Rename is atomic. Crash after rename, before create →
-  no `*.active` exists → recovery mints a fresh empty active. Crash before
-  rename → old `*.active` is still the active; its tail is re-derived
-  (`set_write_offset`). Either way consistent.
+- **Append/seal**: seal = fsync active's index chain → create
+  `seg-(max+1).log` → close the old segment's write handle. **No rename.** A
+  crash at any point leaves the old (durable) segment plus possibly an empty new
+  one; the highest id is unambiguously the active on the next open, so there is
+  **no two-active state to heal**. The active's tail is re-derived
+  (`set_write_offset`) on recovery. Consistent.
 - **Relocate (compact/combine)**: write live copies to active → **fsync active**
   → unlink source(s). Crash before fsync → copies not durable, source intact →
   op re-runs. Crash after fsync, before unlink → copies live in the active
@@ -177,7 +221,7 @@ Ordering rules and their crash windows:
 - **Drop**: `unlink` (last step). Crash before → segment still present but fully
   dead → re-dropped. Crash after → gone.
 
-**Invariant:** every `*.log`/`*.active` file on disk is authoritative; recency is
+**Invariant:** every `seg-<id>.log` file on disk is authoritative; recency is
 id-order; a fully-dead segment is reclaimable; a crashed relocation leaves the
 winning copy in the higher-id active. No manifest, no orphan list needed —
 orphans are simply dead segments that the next background pass drops. (A stray
@@ -217,8 +261,19 @@ converted. Concrete list to audit (from this pass's tracing):
 - `persistence/direct_io.rs` — the 16-handle `DirectFile` becomes a per-segment
   resource behind the LRU pool; `read_stripes_concurrent` unchanged per segment.
 - `persistence/cold_load.rs` — stripe reads keyed by `(segment, offset)`.
+- `persistence/chunk_plan.rs` — `SourceLog` gains a **`Sealed(SegmentId)`** variant
+  (alongside `Active` / `Inherited(i)`); `plan_chunked_read` partitions a stream's
+  chunks **by segment** (grouping on `ChunkLoc.segment`) before stripe coalescing,
+  because a live timeline's chunks now span the sealed segments **and** the active.
+  Each source's stripes stay within one file — the coalescing invariant is
+  preserved per segment.
+- `persistence/pipeline.rs` — the reader pool's `match work.source` resolves
+  `SourceLog::Sealed(id)` to that segment's pooled `DirectFile` (`n_handles()` must
+  match the segment actually being read). This is the **GPU cold-load** path
+  (`kv_migrate` scatter); validated on the live daemon, not CPU tests.
 - `persistence/recovery.rs` / `header_index.rs` — per-segment `HeaderIndex` chain;
-  multi-segment replay ordering (ascending id, active last).
+  multi-segment replay ordering (ascending id, active last); `WalkEntry.segment`
+  stamped per walk (§5.1).
 - `persistence/inherit.rs` — inherited-log reads (fork parents) become
   segment-addressed.
 - `persistence/compaction.rs` — delete `write_compacted_log`/whole-file rewrite;
@@ -270,22 +325,56 @@ const SEGMENT_COMPACT_MIN_AGE_S: u64 = 60;                     // settle/rate-li
 const OPEN_SEALED_SEGMENTS: usize    = 8;                      // LRU of DirectFiles
 ```
 
-## 13. Migration
+## 13. Migration — auto-split on open
 
-Per repo policy (no backward compatibility, pre-publication): **clean break** —
-bump `FILE_FORMAT_VERSION`; the existing single-file open already rejects
-mismatched versions → a fresh `.substrate` rebuild. No migration code. (If
-preserving current `.substrate` ever matters: on first open, rename a bare
-`substrate.log` → `seg-0000000001.log` and mint an empty active — one-time, no
-rewrite. Recommend against unless needed.)
+On open, the segment layer **auto-migrates** a legacy monolithic
+`.substrate/substrate.log` into the segmented layout. This is O(1) (two renames /
+one create — never a byte rewrite) and preserves the existing store, so a running
+deployment upgrades in place with no rebuild.
+
+**Algorithm** (`SegmentedLog::open`, before the recovery walk):
+
+1. Scan `.substrate/` for `seg-*.log` (and legacy `seg-*.active`). If **any**
+   segment file already exists, the store is already segmented → skip migration.
+2. Otherwise, if a bare `substrate.log` exists, migrate it:
+   - **Rename `substrate.log` → `seg-0000000001.log`** (it becomes the oldest
+     **sealed** segment) and **create a fresh empty `seg-0000000002.log`** (the
+     active, since it is now the highest id). All new writes land in the small
+     active; the big legacy blob is read-only sealed state.
+3. If neither exists, this is a fresh store → create `seg-0000000001.log`.
+
+Separately, on **every** open a leftover legacy `seg-<id>.active` (from before
+the `.active` extension was retired) is **adopted** — renamed to `seg-<id>.log`
+— so the single-namespace scan picks it up as the highest-id active.
+
+The migrated `seg-0000000001.log` may carry a **torn tail** (the legacy file
+crashed mid-append). Sealed-segment recovery (§7, the ascending-id walk) already
+detects a torn tail via the walker and **truncates that segment file once**, in
+place — so no dedicated pre-pass or rewrite is needed. A legacy file with no
+`HeaderIndex` chain simply takes the full-walk recovery path for that one
+segment, exactly as the monolithic open does today.
+
+The 29 GB / calibration bloat is **not** rewritten at migration time: it becomes
+one sealed segment whose dead records are reclaimed by the ordinary background
+**compact/combine/drop** passes (§6) over the following minutes — relocating its
+live records into the active and then `unlink`-ing it. Migration cost is two
+directory operations regardless of legacy file size.
+
+`FILE_FORMAT_VERSION` is **not** bumped for segmentation: the per-segment
+on-disk record/superblock format is byte-identical to the monolithic format
+(segmentation is a file-set/addressing change, not a wire-format change), so a
+sealed `seg-*.log` is exactly a legacy `substrate.log` under a new name.
 
 ## 14. Phased rollout
 
-1. **Addressing** — `SegmentId` + `RecordLoc` threaded through reads/index/
-   recovery, still one segment. Pure plumbing; verify reads + recovery identical.
-2. **Seal/rotate + handle pool** — active-segment sealing at
-   `SEGMENT_TARGET_BYTES`, `.active`→`.log` rename, the LRU `DirectFile` pool,
-   multi-segment ascending-id recovery.
+1. **Addressing** *(done)* — `SegmentId` + `RecordLoc`/`ChunkLoc` threaded through
+   the stream index, still one segment (`FIRST_SEGMENT`). Pure plumbing; reads +
+   recovery identical.
+2. **Seal/rotate + handle pool + migration** — the `SegmentedLog` abstraction:
+   directory scan (single `seg-<id>.log` namespace — active = highest id, no
+   `.active` extension or rename-on-seal), auto-split migration (§13), sealing at
+   `SEGMENT_TARGET_BYTES` (create-next), the LRU `DirectFile` pool,
+   `WalkEntry.segment` threading (§5.1), and multi-segment ascending-id recovery.
 3. **Per-segment accounting** — shard `RecordAccounting`; cross-segment
    supersession + distill/tombstone debits.
 4. **Background drop/compact/combine** — the persistence-thread pass + trigger
@@ -294,9 +383,12 @@ rewrite. Recommend against unless needed.)
 6. **Tooling + GUI** — `substrate_inspect --dir`, the `CompactionStatus` API +
    GUI indicator.
 
-Phases 1–4 are mostly CPU-testable: segment sizing, id-order recovery,
-per-segment accounting, and **crash-point simulations** (truncate/kill between
-each fsync in §7) to prove the manifest-free model.
+Phases 1–4 are mostly CPU-testable: auto-split migration, segment sizing,
+id-order recovery, per-segment accounting, and **crash-point simulations**
+(truncate/kill between each fsync in §7) to prove the manifest-free model. The
+per-segment cold-load routing (`chunk_plan` `SourceLog::Sealed(id)` + `pipeline`
+handle selection) is exercised on the live GPU daemon, since it drives the
+`kv_migrate` scatter.
 
 ## 15. Resolved decisions
 

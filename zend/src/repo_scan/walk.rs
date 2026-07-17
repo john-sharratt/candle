@@ -52,7 +52,7 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
                 && entry.file_type().is_some_and(|t| t.is_dir())
                 && entry.path().join(".git").exists()
             {
-                tracing::debug!(
+                tracing::trace!(
                     dir = %entry.path().display(),
                     "repo walk: skipping nested git repo / submodule"
                 );

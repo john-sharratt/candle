@@ -710,18 +710,18 @@ impl ConversationEngine {
         }
     }
 
-    /// Whether the loaded substrate holds tombstoned or distilled timelines —
-    /// i.e. compaction would reclaim something. The loader runs compaction only
-    /// when this is true.
-    pub fn substrate_has_reclaimable(&self) -> bool {
-        self.conversation.has_reclaimable_records()
-    }
-
     /// Whether `timeline` still has KV content (not yet reclaimed by a distill
     /// compaction). Gate distill-marking on this to keep it idempotent and avoid
     /// looping compaction.
     pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
         self.conversation.timeline_has_kv(timeline)
+    }
+
+    /// The segmented redo log's maintenance state — `(segment_count, last_op)`,
+    /// where `last_op` is `(label, unix_secs)` — for the daemon status / GUI
+    /// compaction indicator.
+    pub fn substrate_maintenance_status(&self) -> (usize, Option<(String, u64)>, bool) {
+        self.conversation.maintenance_status()
     }
 
     /// Build an **engine-internal** conversation that lives on the reserved

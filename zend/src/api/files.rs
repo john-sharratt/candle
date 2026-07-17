@@ -189,7 +189,9 @@ pub async fn upload(
                 "phase",
                 serde_json::json!({ "phase": "read_file", "state": "start" }),
             ));
-            let progress = Arc::new(crate::loading::LoadProgress::new());
+            // Throwaway progress sink for the upload's read_file bar — silent so
+            // it doesn't log "load step started Loading model".
+            let progress = Arc::new(crate::loading::LoadProgress::silent());
             let sess = Arc::clone(&session);
             let prog = Arc::clone(&progress);
             // Read ONLY the files this upload wrote — bounded work, never a

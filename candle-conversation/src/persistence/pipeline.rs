@@ -48,7 +48,9 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
 use super::cold_load::ColdLoadStager;
+use super::direct_io::DirectFile;
 use super::record::{decode_record, verify_record_crc, ChunkPayload};
+use super::segment::SegmentId;
 use super::SubstratePersistence;
 
 /// Cross-thread raw pointer to the pinned scratch's base. Bundled into
@@ -212,6 +214,7 @@ pub struct PipelineStats {
 /// by the next batch).
 pub fn run_pipeline(
     persistence: &SubstratePersistence,
+    sealed: &std::collections::HashMap<SegmentId, DirectFile>,
     backings: &[ChunkedKvBacking],
     device: &Device,
     chunk_batch: &ChunkBatch,
@@ -295,6 +298,22 @@ pub fn run_pipeline(
                     while let Ok(work) = work_rx.recv() {
                         let direct = match work.source {
                             SourceLog::Active => persistence.active_direct_file(),
+                            SourceLog::Sealed(id) => match sealed.get(&id) {
+                                Some(d) => d,
+                                // Every `Sealed(id)` in the plan gets a handle
+                                // opened up front by `load_stream_into_hot`; a
+                                // miss is a bug, but propagate it as a read
+                                // error rather than panicking the reader thread.
+                                None => {
+                                    let _ = done_tx.send(UnitDone {
+                                        unit_idx: work.unit_idx,
+                                        error: Some(candle::Error::Msg(format!(
+                                            "pipeline: no open handle for sealed segment {id}"
+                                        ))),
+                                    });
+                                    continue;
+                                }
+                            },
                             SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
                         };
                         // SAFETY: per-unit dest regions are disjoint

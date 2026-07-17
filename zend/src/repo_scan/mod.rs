@@ -356,7 +356,7 @@ pub fn refresh_repo_map(
 ) -> anyhow::Result<RefreshOutcome> {
     let clusters = build_clusters(map);
     if prior.equivalent_to(&clusters) {
-        tracing::debug!("repo map refresh: no cluster hash changed, skipping refresh");
+        tracing::trace!("repo map refresh: no cluster hash changed, skipping refresh");
         return Ok(RefreshOutcome::NoOp);
     }
 

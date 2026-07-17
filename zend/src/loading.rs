@@ -24,6 +24,8 @@ use std::time::Instant;
 pub enum LoadStep {
     Model,
     Substrate,
+    /// Forced whole-store redo-log compaction (`--compact-substrate`). Skipped
+    /// unless the flag is set — reclaim is normally incremental/background.
     Compacting,
     Sections,
     CalibratingSections,
@@ -100,9 +102,21 @@ pub struct IngestStats {
 }
 
 impl LoadProgress {
-    /// Begin at the first step (`Model`).
+    /// Begin at the first step (`Model`) and announce it — the daemon's real
+    /// model-load lifecycle. Use [`Self::silent`] for throwaway progress sinks
+    /// that report sub-progress but are not that lifecycle.
     pub fn new() -> Self {
         tracing::info!(step = LoadStep::Model.label(), "load step started");
+        Self::silent()
+    }
+
+    /// Like [`Self::new`] but **does not** emit the "load step started" log.
+    /// For throwaway progress handles — the workspace watcher's repo-map /
+    /// code-reading refreshes and upload ingests create one per call just to
+    /// satisfy the progress parameter, and are not the model-load lifecycle.
+    /// Without this, every filesystem-event burst would spuriously log
+    /// "load step started Loading model".
+    pub fn silent() -> Self {
         Self {
             inner: Mutex::new(Inner::Loading {
                 current: LoadStep::Model,
@@ -274,6 +288,18 @@ mod tests {
     #[test]
     fn new_starts_at_model_step_with_zero_progress() {
         let p = LoadProgress::new();
+        let snap = p.snapshot().unwrap();
+        assert_eq!(snap.current, LoadStep::Model);
+        assert_eq!(snap.progress, 0.0);
+        assert!(snap.completed.is_empty());
+    }
+
+    /// `silent()` has the same initial state as `new()` (it only differs by not
+    /// emitting the "load step started" log — the property that keeps a
+    /// watcher-refresh burst from spuriously logging "Loading model").
+    #[test]
+    fn silent_starts_at_model_step_like_new() {
+        let p = LoadProgress::silent();
         let snap = p.snapshot().unwrap();
         assert_eq!(snap.current, LoadStep::Model);
         assert_eq!(snap.progress, 0.0);

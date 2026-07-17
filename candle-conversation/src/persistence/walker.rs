@@ -15,12 +15,18 @@
 
 use super::log_file::LogSource;
 use super::record::{decode_header, decode_record, padded_record_len, Record, RecordType, ALIGN};
+use super::segment::SegmentId;
 use super::Result;
 
 /// One record encountered by a walk.
 #[derive(Clone, Debug)]
 pub struct WalkEntry {
-    /// File offset of the record.
+    /// Segment the record was walked from — stamped by the walk so the
+    /// in-RAM index (`RecordLoc`/`ChunkLoc`) records which file physically
+    /// holds the bytes. Multi-segment recovery walks each segment with its
+    /// own id (see `SegmentedLog::open`).
+    pub segment: SegmentId,
+    /// File offset of the record within its segment.
     pub offset: u64,
     /// The decoded, checksum-verified record.
     pub record: Record,
@@ -54,10 +60,11 @@ fn all_zero(bytes: &[u8]) -> bool {
 /// counted but skipped silently.
 pub fn walk(
     src: &mut dyn LogSource,
+    segment: SegmentId,
     start: u64,
     visit: impl FnMut(&WalkEntry),
 ) -> Result<WalkOutcome> {
-    walk_filtered(src, start, |_| true, visit)
+    walk_filtered(src, segment, start, |_| true, visit)
 }
 
 /// Like [`walk`], but `read_payload(record_type)` decides whether a record's
@@ -71,6 +78,7 @@ pub fn walk(
 /// into an essentially header-only scan.
 pub fn walk_filtered(
     src: &mut dyn LogSource,
+    segment: SegmentId,
     start: u64,
     mut read_payload: impl FnMut(RecordType) -> bool,
     mut visit: impl FnMut(&WalkEntry),
@@ -149,6 +157,7 @@ pub fn walk_filtered(
             || !read_payload(header.record_type)
         {
             let entry = WalkEntry {
+                segment,
                 offset,
                 record: Record {
                     header,
@@ -175,6 +184,7 @@ pub fn walk_filtered(
         };
         debug_assert_eq!(consumed as u64, total);
         let entry = WalkEntry {
+            segment,
             offset,
             record: Record {
                 header,
@@ -190,9 +200,13 @@ pub fn walk_filtered(
 
 /// Walk and collect every entry into a `Vec` — convenience for tests and
 /// small logs.
-pub fn collect(src: &mut dyn LogSource, start: u64) -> Result<(Vec<WalkEntry>, WalkOutcome)> {
+pub fn collect(
+    src: &mut dyn LogSource,
+    segment: SegmentId,
+    start: u64,
+) -> Result<(Vec<WalkEntry>, WalkOutcome)> {
     let mut entries = Vec::new();
-    let outcome = walk(src, start, |e| entries.push(e.clone()))?;
+    let outcome = walk(src, segment, start, |e| entries.push(e.clone()))?;
     Ok((entries, outcome))
 }
 
@@ -201,11 +215,14 @@ pub fn collect(src: &mut dyn LogSource, start: u64) -> Result<(Vec<WalkEntry>, W
 /// scan that avoids reading large reference-stored payloads.
 pub fn collect_filtered(
     src: &mut dyn LogSource,
+    segment: SegmentId,
     start: u64,
     read_payload: impl FnMut(RecordType) -> bool,
 ) -> Result<(Vec<WalkEntry>, WalkOutcome)> {
     let mut entries = Vec::new();
-    let outcome = walk_filtered(src, start, read_payload, |e| entries.push(e.clone()))?;
+    let outcome = walk_filtered(src, segment, start, read_payload, |e| {
+        entries.push(e.clone())
+    })?;
     Ok((entries, outcome))
 }
 
@@ -214,6 +231,7 @@ mod tests {
     use super::*;
     use crate::persistence::log_file::{MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::record::{encode_record, RecordHeader, RecordType};
+    use crate::persistence::segment::FIRST_SEGMENT;
 
     fn chunk(stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
         encode_record(
@@ -238,7 +256,7 @@ mod tests {
         blob.extend_from_slice(&chunk(2, 0, b"c"));
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(outcome.records, 3);
         assert_eq!(outcome.unknown_records, 0);
         assert!(!outcome.torn);
@@ -275,7 +293,7 @@ mod tests {
         blob.extend_from_slice(&small_record(RecordType::Commit, b"commit-payload"));
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(outcome.records, 2);
         // Location-only record: payload skipped, header (incl. len) intact.
         assert!(entries[0].record.payload.is_empty());
@@ -290,7 +308,7 @@ mod tests {
     #[test]
     fn empty_log_walk_is_clean() {
         let mut mem = MemLog::with_records(&[]);
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert!(entries.is_empty());
         assert_eq!(outcome.records, 0);
         assert!(!outcome.torn);
@@ -304,7 +322,7 @@ mod tests {
         blob.extend_from_slice(&[0u8; 8192]); // simulate pre-grown region
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(!outcome.torn);
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + real_len as u64);
@@ -327,7 +345,7 @@ mod tests {
         blob.extend_from_slice(&bad);
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(outcome.torn);
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + good_len as u64);
@@ -346,7 +364,7 @@ mod tests {
         blob.extend_from_slice(&bad);
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(entries.len(), 2, "walker accepts both records");
         assert!(
             !outcome.torn,
@@ -365,7 +383,7 @@ mod tests {
         blob.extend_from_slice(&second[..2048]);
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(outcome.torn);
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + good_len as u64);
@@ -398,7 +416,7 @@ mod tests {
         blob.extend_from_slice(&chunk(2, 0, b"third"));
         let mut mem = MemLog::with_records(&blob);
 
-        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (entries, outcome) = collect(&mut mem, FIRST_SEGMENT, SUPERBLOCK_SIZE).unwrap();
         assert!(!outcome.torn, "unknown type is not a torn record");
         assert_eq!(outcome.records, 2, "the two known records are visited");
         assert_eq!(outcome.unknown_records, 1, "the unknown record is counted");

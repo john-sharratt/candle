@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
 use crate::session::ZendSession;
@@ -21,6 +21,14 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         progress: s.progress,
         completed: s.completed.iter().map(|step| step.label()).collect(),
     });
+    let maintenance = session
+        .substrate_maintenance()
+        .map(|(segments, last, running)| MaintenanceBody {
+            segments,
+            last_op: last.as_ref().map(|(label, _)| label.clone()),
+            last_op_unix: last.map(|(_, unix)| unix),
+            running,
+        });
     Json(StatusBody {
         state: if loading.is_some() {
             "loading"
@@ -30,6 +38,7 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         started_at_ms: snap.started_at_ms,
         detail: snap.detail,
         loading,
+        maintenance,
         build: super::build_id(),
     })
 }
@@ -53,9 +62,58 @@ pub struct StatusBody {
     pub started_at_ms: u64,
     pub detail: String,
     pub loading: Option<LoadingBody>,
+    /// Segmented redo-log maintenance state — segment count and the last
+    /// drop/compact/combine op. `null` until the engine is loaded.
+    pub maintenance: Option<MaintenanceBody>,
     /// Hash of the embedded web build. The frontend captures this on load and
     /// force-reloads when it changes (daemon rebuilt with new UI assets).
     pub build: &'static str,
+}
+
+/// Segmented redo-log maintenance view sent inside `StatusBody.maintenance` —
+/// drives the GUI's compaction indicator (§11).
+#[derive(Serialize)]
+pub struct MaintenanceBody {
+    /// Total segment files in `.substrate/` (sealed + the one active).
+    pub segments: usize,
+    /// Human label of the last maintenance op (e.g. `"dropped segment 3"`),
+    /// or `null` if none has run this session.
+    pub last_op: Option<String>,
+    /// Unix-seconds timestamp of the last op, or `null`.
+    pub last_op_unix: Option<u64>,
+    /// `true` while a maintenance op's I/O is in flight — drives the GUI's live
+    /// spinner (vs. the settled ✓ shown for the last completed op).
+    pub running: bool,
+}
+
+/// `POST /v1/debug/maintenance` — force one background-maintenance op now
+/// (seal the active + compact a dead-carrying sealed segment, waiving the
+/// age/ratio gates), for exercising the in-flight compaction path while chat is
+/// live. Runs under the same phased locking as background maintenance, so it
+/// doesn't stall inference. `503` until the model is loaded.
+pub async fn force_maintenance(
+    State(session): State<Arc<ZendSession>>,
+) -> Result<Json<ForceMaintenanceBody>, StatusCode> {
+    match session.force_maintenance() {
+        Some((ran, segments, last_op)) => Ok(Json(ForceMaintenanceBody {
+            ran,
+            segments,
+            last_op: last_op.map(|(label, _)| label),
+        })),
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Response body for `POST /v1/debug/maintenance`.
+#[derive(Serialize)]
+pub struct ForceMaintenanceBody {
+    /// Whether a drop/compact/combine op actually ran (`false` = nothing was
+    /// eligible even under the forced gates — e.g. the sealed segment is 100% live).
+    pub ran: bool,
+    /// Total segment files after the pass.
+    pub segments: usize,
+    /// Label of the op that ran (e.g. `"compacted segment 12"`), or `null`.
+    pub last_op: Option<String>,
 }
 
 /// Structured loading-state view sent inside `StatusBody.loading`.

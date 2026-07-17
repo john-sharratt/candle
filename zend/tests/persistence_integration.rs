@@ -17,7 +17,7 @@ mod persistence {
 
     use futures::StreamExt;
 
-    use candle_conversation::persistence::{SubstratePersistence, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
+    use candle_conversation::persistence::{SubstratePersistence, SUBSTRATE_DIR};
     use candle_conversation::substrate::Substrate;
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
@@ -91,7 +91,7 @@ mod persistence {
         result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS} s"));
 
         // ── Simulated restart: reopen the substrate straight from disk ──────
-        let log_path = workspace.join(SUBSTRATE_DIR).join(ACTIVE_LOG_NAME);
+        let log_path = workspace.join(SUBSTRATE_DIR).join("seg-0000000001.log");
         assert!(
             log_path.exists(),
             "the daemon must leave a substrate log at {}",

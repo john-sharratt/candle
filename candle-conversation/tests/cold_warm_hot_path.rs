@@ -1777,7 +1777,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
     let policy = CompressionPolicy::new(5);
     let log_path = dir
         .join(candle_conversation::persistence::SUBSTRATE_DIR)
-        .join(candle_conversation::persistence::ACTIVE_LOG_NAME);
+        .join("seg-0000000001.log");
 
     // ── Phase 1: seed + persist (quantize on evict) ─────────────────
     {
@@ -2356,7 +2356,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
     let policy = CompressionPolicy::new(6);
     let log_path = dir
         .join(candle_conversation::persistence::SUBSTRATE_DIR)
-        .join(candle_conversation::persistence::ACTIVE_LOG_NAME);
+        .join("seg-0000000001.log");
 
     // ── Phase 1: seed F16 with varied pattern, run policy-driven persist ──
     let key = {

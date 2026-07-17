@@ -12,7 +12,7 @@ use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
-use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
+use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
 };
@@ -400,8 +400,8 @@ impl InferenceState {
         workspace: PathBuf,
         skip_code_read: bool,
         skip_repo_scan: bool,
-        compact_substrate: bool,
         disable_summariser: bool,
+        compact_substrate: bool,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Arc<Self>> {
         // Step 1: model. Engine ctor also reloads the substrate
@@ -547,13 +547,14 @@ impl InferenceState {
             }
         }
 
-        // Redo-log compaction (after the reload so the live set is known; before
-        // serving). On by default (opt out with `--no-compact-substrate`); runs
-        // only when the loaded substrate holds reclaimable markers (tombstoned or
-        // distilled timelines) — otherwise skipped, so a clean reload pays
-        // nothing. Since compaction consumes those markers, the next reload finds
-        // none and skips (no loop).
-        if compact_substrate && engine.substrate_has_reclaimable() {
+        // Reclaim is normally fully background: the segmented log's
+        // persistence-thread maintenance pass drops / compacts / combines
+        // segments incrementally (`docs/segmented_substrate_log.md` §6), so a
+        // startup pays no whole-store rewrite. `--compact-substrate` forces the
+        // eager path instead — a whole-store rewrite here, after the reload (so
+        // the live set is known) and before serving. It always runs when the
+        // flag is set (no reclaimable-marker gate): the operator asked for it.
+        if compact_substrate {
             progress.set_step(LoadStep::Compacting);
             let cprog = Arc::clone(&progress);
             let cb = move |done: usize, total: usize| {
@@ -1211,7 +1212,9 @@ impl InferenceState {
     /// per filesystem-event burst and shares the result with both
     /// refresh paths.
     pub(crate) fn refresh_repo_map(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
-        let progress = LoadProgress::new();
+        // Throwaway progress sink (a refresh, not the model-load lifecycle) —
+        // silent so a watcher burst doesn't log "load step started Loading model".
+        let progress = LoadProgress::silent();
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
         let (old_timeline, prior_state) = {
             let guard = self.repo_map_conv.lock().unwrap();
@@ -1243,7 +1246,9 @@ impl InferenceState {
     /// When `map` is `Some`, the refresh reuses that workspace walk
     /// instead of doing its own.
     pub(crate) fn refresh_code_reading(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
-        self.refresh_code_reading_with_progress(map, &Arc::new(LoadProgress::new()))
+        // Throwaway progress sink (a refresh, not the model-load lifecycle) —
+        // silent so a watcher burst doesn't log "load step started Loading model".
+        self.refresh_code_reading_with_progress(map, &Arc::new(LoadProgress::silent()))
     }
 
     /// Ingest **only** the given workspace-relative files into the
@@ -2400,16 +2405,54 @@ impl ZendSession {
     /// conversations are filtered out unless `include_archived` is
     /// set — that's the "show archived" checkbox at the bottom of
     /// the sidebar.
+    /// The segmented redo log's maintenance state — `(segment_count, last_op)`
+    /// — for the `/v1/status` compaction indicator. `None` until the engine is
+    /// loaded.
+    pub fn substrate_maintenance(&self) -> Option<(usize, Option<(String, u64)>, bool)> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let engine = state.engine.lock().unwrap();
+        Some(engine.substrate_maintenance_status())
+    }
+
+    /// Force one background-maintenance op now — the `POST /v1/debug/maintenance`
+    /// test trigger. Seals the active segment (so a conversation archived this
+    /// session, whose now-dead records sit in the active, becomes eligible) and
+    /// compacts a dead-carrying sealed segment, waiving the age/ratio gates. Runs
+    /// under phased locking (never holds the substrate write lock across the
+    /// relocation I/O) and — crucially — is invoked on a cloned `Conversation`
+    /// handle **without** holding the engine lock, so the user's in-flight chat
+    /// (per-turn group-commits) isn't blocked. Returns `(ran, segments, last_op)`,
+    /// or `None` if the model isn't loaded.
+    pub fn force_maintenance(&self) -> Option<(bool, usize, Option<(String, u64)>)> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let conv = { state.engine.lock().unwrap().conversation() };
+        let ran = match conv.force_compact_persistence() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("force maintenance failed: {e:#}");
+                false
+            }
+        };
+        let (segments, last_op, _running) = conv.maintenance_status();
+        Some((ran, segments, last_op))
+    }
+
     pub fn list_conversations(&self, include_archived: bool) -> Vec<ConvEntry> {
-        // On-disk gate: if the workspace's redo log is gone, return
-        // empty regardless of the in-RAM cache. The daemon will keep
-        // running and any new turn will rebuild the log file.
-        let log_path = self
-            .config
-            .workspace
-            .join(SUBSTRATE_DIR)
-            .join(ACTIVE_LOG_NAME);
-        if !log_path.exists() {
+        // On-disk gate: if the workspace's redo log is gone (no segment files
+        // in `.substrate/`), return empty regardless of the in-RAM cache. The
+        // daemon keeps running and any new turn re-mints the segment set.
+        let sub_dir = self.config.workspace.join(SUBSTRATE_DIR);
+        let has_segments = std::fs::read_dir(&sub_dir)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("seg-"))
+                })
+            })
+            .unwrap_or(false);
+        if !has_segments {
             return Vec::new();
         }
 
@@ -2770,8 +2813,8 @@ impl ZendSession {
         let workspace = self.config.workspace.clone();
         let skip_code_read = self.config.skip_code_read;
         let skip_repo_scan = self.config.skip_repo_scan;
-        let compact_substrate = self.config.compact_substrate;
         let disable_summariser = self.config.disable_summariser;
+        let compact_substrate = self.config.compact_substrate;
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
         // model load, so the workspace watcher's `tokio::spawn` would otherwise
@@ -2845,8 +2888,8 @@ impl ZendSession {
                     workspace,
                     skip_code_read,
                     skip_repo_scan,
-                    compact_substrate,
                     disable_summariser,
+                    compact_substrate,
                     load_progress_for_blocking,
                 ) {
                     Ok(state) => {
@@ -2890,7 +2933,7 @@ impl ZendSession {
                             // twice per burst is wasted work.
                             let map = crate::repo_scan::walk_workspace(&state.workspace);
                             if skip_repo_scan {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "--skip-repo-scan: watcher repo-map refresh suppressed"
                                 );
                             } else {
@@ -2898,7 +2941,7 @@ impl ZendSession {
                                     Ok(true) => {
                                         tracing::info!("repo map refreshed after fs event burst")
                                     }
-                                    Ok(false) => tracing::debug!(
+                                    Ok(false) => tracing::trace!(
                                         "fs event burst saw no cluster hash change — repo map skipped"
                                     ),
                                     Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
@@ -2910,7 +2953,7 @@ impl ZendSession {
                             // re-ingest the whole repo (flooding the scheduler and
                             // starving interactive chat).
                             if skip_code_read {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "--skip-code-read: watcher code-reading refresh suppressed"
                                 );
                             } else {
@@ -2920,7 +2963,7 @@ impl ZendSession {
                                             "code reading refreshed after fs event burst"
                                         )
                                     }
-                                    Ok(false) => tracing::debug!(
+                                    Ok(false) => tracing::trace!(
                                     "fs event burst saw no file content change — code read skipped"
                                 ),
                                     Err(e) => tracing::warn!("code read refresh failed: {e:#}"),
