@@ -1121,7 +1121,37 @@
       h('div', { style: 'flex-shrink:0; padding:0.55rem 0.85rem 0.65rem; border-top:1px solid #2a3848; background:#19222f;' },
         h('label', { onClick: toggleArchived, style: 'display:flex; align-items:center; gap:0.45rem; font-size:0.72rem; color:#6a8098; cursor:pointer; user-select:none;' },
           h('span', { style: 'width:13px; height:13px; border-radius:3px; border:1px solid #445870; background:' + (S.showArchived ? ACCENT : 'transparent') + '; display:flex; align-items:center; justify-content:center; color:#fff; font-size:9px;' }, S.showArchived ? '✓' : ''),
-          'Show archived')));
+          'Show archived'),
+        maintenanceIndicator()));
+  }
+
+  // Segmented redo-log maintenance indicator for the sidebar footer (§11): the
+  // segment count, plus a live pulse + the op label for a few seconds after a
+  // drop/compact/combine. `null` (skipped by `h`) until the daemon reports it.
+  function maintenanceIndicator() {
+    const m = S.maintenance;
+    if (!m) return null;
+    const running = !!m.running;
+    // "Recently completed" highlight for a few seconds after an op — but not
+    // while another is running (the spinner takes precedence).
+    const recent = !running && m.last_op_unix && (Date.now() / 1000 - m.last_op_unix) < 8;
+    const active = running || recent;
+    const segs = m.segments + ' segment' + (m.segments === 1 ? '' : 's');
+    // While running, the spinner conveys the activity; once done, the label
+    // carries the past-tense op name next to a ✓.
+    const label = running ? segs : segs + (recent && m.last_op ? ' · ' + m.last_op : '');
+    // Icon: a real spinning ⟳ during the op, ✓ just after, ▦ idle.
+    const icon = running
+      ? h('span', { style: 'display:inline-block; animation: zspin .8s linear infinite;' }, '⟳')
+      : h('span', {}, recent ? '✓' : '▦');
+    return h('div', {
+      title: running
+        ? 'Redo-log maintenance running…'
+        : (m.last_op ? ('Last maintenance: ' + m.last_op) : 'Redo-log maintenance idle'),
+      style: 'display:flex; align-items:center; gap:0.4rem; font-size:0.7rem; margin-top:0.5rem; user-select:none; color:' + (active ? ACCENT : '#5a7088') + ';',
+    },
+      icon,
+      h('span', { style: 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, label));
   }
   function buildSidebarRail() {
     const convs = visibleConvs();
@@ -2660,6 +2690,10 @@
         pollStatus();
         return;
       }
+      // Segmented redo-log maintenance indicator (sidebar footer).
+      const m = st.maintenance || null;
+      const prevM = JSON.stringify(S.maintenance || null);
+      if (JSON.stringify(m) !== prevM) S.maintenance = m;
       if (lastStartedAt !== null && st.started_at_ms && st.started_at_ms !== lastStartedAt) {
         lastStartedAt = st.started_at_ms;
         S.loaded = {};
@@ -2667,6 +2701,7 @@
       } else {
         if (st.started_at_ms) lastStartedAt = st.started_at_ms;
         refreshConversationList();
+        if (JSON.stringify(m) !== prevM) render();
       }
     }).catch(() => {
       // Unreachable — daemon almost certainly restarting. Show the loading

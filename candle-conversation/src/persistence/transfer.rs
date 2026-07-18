@@ -375,9 +375,30 @@ mod cuda_impl {
         let mut register_us_total: u64 = 0;
         let mut gpu_push_us_total: u64 = 0;
 
+        // Open a direct-I/O handle set for every sealed segment this turn's
+        // chunks span (a turn that straddles a seal reads part of its records
+        // from a sealed segment). The active and inherited handles come from
+        // `persistence`; the sealed ones are owned here for the cold-load's
+        // duration so the pipeline's reader threads can borrow them by id.
+        let mut sealed_handles: std::collections::HashMap<
+            crate::persistence::segment::SegmentId,
+            crate::persistence::direct_io::DirectFile,
+        > = std::collections::HashMap::new();
+        for batch in &plan.chunks {
+            if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {
+                if !sealed_handles.contains_key(&id) {
+                    let handle = persistence.open_sealed_direct(id).map_err(|e| {
+                        candle::Error::Msg(format!("cold-load: open sealed segment {id}: {e}"))
+                    })?;
+                    sealed_handles.insert(id, handle);
+                }
+            }
+        }
+
         for batch in &plan.chunks {
             let stats = crate::persistence::pipeline::run_pipeline(
                 persistence,
+                &sealed_handles,
                 backings,
                 device,
                 batch,

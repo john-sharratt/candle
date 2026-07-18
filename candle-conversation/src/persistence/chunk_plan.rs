@@ -31,14 +31,18 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::manifest::ChunkLoc;
+use super::segment::SegmentId;
 
-/// Identifies which log a record's bytes live in. The orchestrator
+/// Identifies which log file a record's bytes live in. The orchestrator
 /// uses this to pick the correct [`super::direct_io::DirectFile`]
 /// handle when reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceLog {
-    /// The substrate's own active redo log.
+    /// The active segment of the substrate's own redo log.
     Active,
+    /// A sealed segment of the substrate's own redo log — a turn whose
+    /// chunks span a seal reads part of its records from here.
+    Sealed(SegmentId),
     /// The `i`-th inherited log (index into
     /// [`SubstratePersistence::inherited`]).
     Inherited(usize),
@@ -114,6 +118,7 @@ pub struct ChunkedReadPlan {
 /// `<= buffer_size` bytes. Empty sources contribute no chunks; an
 /// empty turn yields an empty plan.
 pub fn plan_chunked_read(
+    active_id: SegmentId,
     active_chunks: Option<&BTreeMap<u64, ChunkLoc>>,
     inherited_chunks: &[Option<&BTreeMap<u64, ChunkLoc>>],
     buffer_size: usize,
@@ -121,9 +126,34 @@ pub fn plan_chunked_read(
     let mut seen: HashSet<u64> = HashSet::new();
     let mut plan = ChunkedReadPlan::default();
 
-    {
-        let active_recs = collect_records(active_chunks, SourceLog::Active, &mut seen);
-        partition_and_append(active_recs, buffer_size, &mut plan);
+    // Active-substrate chunks may live across several segments (sealed ones
+    // plus the active) once a turn spans a seal. Group by segment — each
+    // segment reads from its own file, so stripe coalescing stays per file —
+    // and emit `Active` for the append segment, `Sealed(id)` otherwise.
+    if let Some(chunks) = active_chunks {
+        let mut by_seg: BTreeMap<SegmentId, Vec<RawRecord>> = BTreeMap::new();
+        for (&chunk_idx, loc) in chunks {
+            if !seen.insert(chunk_idx) {
+                continue;
+            }
+            let source = if loc.segment == active_id {
+                SourceLog::Active
+            } else {
+                SourceLog::Sealed(loc.segment)
+            };
+            by_seg.entry(loc.segment).or_default().push(RawRecord {
+                source,
+                chunk_idx,
+                file_offset: loc.offset,
+                record_size: loc.record_size,
+                payload_len: loc.payload_len,
+                token_count: loc.token_count,
+            });
+        }
+        for (_seg, mut recs) in by_seg {
+            recs.sort_unstable_by_key(|r| r.file_offset);
+            partition_and_append(recs, buffer_size, &mut plan);
+        }
     }
 
     for (i, chunks) in inherited_chunks.iter().enumerate() {

@@ -93,6 +93,16 @@ pub struct Conversation {
     /// blocking any concurrent first callers until it completes (so nothing scores
     /// against a half-warmed cache).
     normalization_warm: Arc<Once>,
+    /// Cached `(segment_count, last_op)` for the `/v1/status` maintenance
+    /// indicator — refreshed by the persistence thread after each maintenance
+    /// pass. Read through this **separate** lock so the status endpoint never
+    /// blocks on `persistence` (which a compaction holds across its I/O).
+    /// GUI compaction-indicator cache: `(segment_count, last_op, running)`.
+    /// `running` is `true` only while a maintenance op's relocation I/O is in
+    /// flight, so the sidebar can show a live spinner (vs. a settled ✓ for the
+    /// last completed op). Refreshed by the persistence thread each pass; read
+    /// by `/v1/status` off this separate lock so it never blocks on compaction.
+    maintenance: Arc<Mutex<(usize, Option<(String, u64)>, bool)>>,
 }
 
 impl Default for Conversation {
@@ -125,6 +135,7 @@ impl Conversation {
         Self {
             inner: Arc::new(RwLock::new(substrate)),
             allocator: Arc::new(TimelineAllocator::new()),
+            maintenance: Arc::new(Mutex::new((persistence.segment_count(), None, false))),
             persistence: Arc::new(Mutex::new(persistence)),
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
@@ -140,6 +151,7 @@ impl Conversation {
         Self {
             inner: Arc::new(RwLock::new(substrate)),
             allocator: Arc::new(TimelineAllocator::new()),
+            maintenance: Arc::new(Mutex::new((persistence.segment_count(), None, false))),
             persistence: Arc::new(Mutex::new(persistence)),
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
@@ -1311,14 +1323,6 @@ impl Conversation {
         self.read().is_distilled(timeline)
     }
 
-    /// Whether the substrate holds any reclaimable markers — tombstoned or
-    /// distilled timelines — so a compaction pass would do real work. The loader
-    /// uses this to run compaction only when there's something to reclaim.
-    pub fn has_reclaimable_records(&self) -> bool {
-        let s = self.read();
-        !s.tombstoned_timelines().is_empty() || !s.distilled_timelines().is_empty()
-    }
-
     /// Whether `timeline` still has KV chunks on any of its turns — i.e. content
     /// not yet reclaimed. Callers gate distill-marking on this so a
     /// content-reclaimed timeline is never re-marked (which would keep triggering
@@ -1665,29 +1669,103 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))
     }
 
-    /// Compact the redo log when its dead-weight ratio crosses the
-    /// threshold — the automatic reclaim the persistence thread polls
-    /// every pass. The check is pure in-RAM arithmetic (O(1) dead-byte
-    /// counter + tombstoned-stream sum), so the common no-op path costs
-    /// nothing. When compaction runs it holds the persistence lock and
-    /// the substrate write lock for the duration of the rewrite —
-    /// cold-loads and persists queue behind it.
+    /// Run one **background maintenance** op on the segmented redo log — drop a
+    /// fully-dead segment, compact a mostly-dead one, or combine two small
+    /// adjacent ones (`docs/segmented_substrate_log.md` §6). At most one op per
+    /// call; the persistence thread polls this every pass. The common no-op
+    /// path is a cheap per-segment liveness scan. Holds the persistence lock
+    /// and the substrate write lock for the op's duration — cold-loads and
+    /// persists queue behind it.
     ///
-    /// Returns `true` when a compaction actually ran.
+    /// Returns `true` when an op actually ran.
     pub fn compact_persistence_if_needed(&self) -> candle::Result<bool> {
-        let mut p = self.persistence.lock().unwrap();
+        self.run_maintenance_pass(false)
+    }
+
+    /// Force one maintenance op **now**, waiving the age/ratio gates — the manual
+    /// `POST /v1/debug/maintenance` trigger. Seals the active segment first, so a
+    /// conversation just archived/distilled this session (whose now-dead records
+    /// sit in the active, which maintenance never touches) moves into a sealed
+    /// segment and gets compacted away. Uses the same phased locking, so it never
+    /// holds the substrate write lock across the relocation I/O — background
+    /// decode keeps running. Returns whether an op ran.
+    pub fn force_compact_persistence(&self) -> candle::Result<bool> {
         {
-            let substrate = self.read();
-            if !p.should_compact(&substrate) {
-                return Ok(false);
-            }
+            let mut p = self.persistence.lock().unwrap();
+            p.commit()
+                .map_err(|e| candle::Error::Msg(format!("substrate maintenance commit: {e}")))?;
+            p.seal_active()
+                .map_err(|e| candle::Error::Msg(format!("substrate maintenance seal: {e}")))?;
         }
-        p.commit()
-            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        let mut substrate = self.write();
-        p.compact(&mut substrate, None)
-            .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
-        Ok(true)
+        self.run_maintenance_pass(true)
+    }
+
+    /// One maintenance pass under phased locking so the slow relocation I/O never
+    /// holds the substrate write lock (which would stall every decode `read()`),
+    /// mirroring the persistence thread's hot→warm / warm→cold discipline. When
+    /// `force` is set the age/ratio gates are waived (`pick_maintenance_op`).
+    fn run_maintenance_pass(&self, force: bool) -> candle::Result<bool> {
+        // 1. Plan under a brief read + persistence lock (snapshot only).
+        let plan = {
+            let p = self.persistence.lock().unwrap();
+            let substrate = self.read();
+            p.plan_maintenance(&substrate, force)
+                .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
+        };
+        let outcome = if let Some(plan) = plan {
+            // Signal "in progress" so the GUI shows a live spinner across the I/O.
+            self.maintenance.lock().unwrap().2 = true;
+            // Run the I/O in a closure so its result is captured rather than
+            // early-returned: `running` MUST be cleared below on both success and
+            // failure — an `?` straight out of here would leave the spinner (and
+            // `/v1/status.running`) stuck true until the next successful pass.
+            (|| -> candle::Result<bool> {
+                // 2. Relocation I/O under the persistence lock ONLY — the
+                //    substrate lock is released, so decode's in-RAM projection
+                //    proceeds during the read + re-append + fsync.
+                let result = {
+                    let mut p = self.persistence.lock().unwrap();
+                    p.execute_maintenance(&plan).map_err(|e| {
+                        candle::Error::Msg(format!("substrate maintenance exec: {e}"))
+                    })?
+                };
+                // 3. Repoint the index at the relocated records under a brief write lock.
+                {
+                    let mut substrate = self.write();
+                    result.apply_to_substrate(&mut substrate);
+                }
+                // 4. Unlink the drained source segments under the persistence lock.
+                {
+                    let mut p = self.persistence.lock().unwrap();
+                    p.finish_maintenance(&plan).map_err(|e| {
+                        candle::Error::Msg(format!("substrate maintenance drop: {e}"))
+                    })?;
+                }
+                Ok(true)
+            })()
+        } else {
+            Ok(false)
+        };
+        // Always refresh the status cache — this also clears `running`, even if
+        // the op above errored. The persistence lock here is held only for two
+        // O(1) reads (never across I/O); the status endpoint reads the separate
+        // `maintenance` lock, so it never blocks on a compaction.
+        let view = {
+            let p = self.persistence.lock().unwrap();
+            (p.segment_count(), p.last_maintenance(), false)
+        };
+        *self.maintenance.lock().unwrap() = view;
+        outcome
+    }
+
+    /// The segmented redo log's maintenance state for the daemon status / GUI
+    /// compaction indicator: `(segment_count, last_op, running)` where `last_op`
+    /// is `(label, unix_secs)` of the most recent drop/compact/combine this
+    /// session (or `None`) and `running` is `true` while an op's I/O is in
+    /// flight. Read from the **cache** — never takes the persistence lock — so
+    /// `/v1/status` stays responsive while a compaction runs.
+    pub fn maintenance_status(&self) -> (usize, Option<(String, u64)>, bool) {
+        self.maintenance.lock().unwrap().clone()
     }
 
     /// Run `f` against the persistence layer's current manifest snapshot.

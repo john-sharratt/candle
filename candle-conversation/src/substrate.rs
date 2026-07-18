@@ -1621,7 +1621,7 @@ impl Substrate {
             self.warm_lru.push_back(idx);
         }
         if count > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 count,
                 bytes = freed_bytes,
@@ -2736,6 +2736,10 @@ impl Substrate {
                     stream_id,
                     h.chunk_index,
                     ChunkLoc {
+                        // The segment the walk stamped on this entry — the
+                        // physical file that holds these KV bytes (§5.1). The
+                        // cold-load read routes there.
+                        segment: entry.segment,
                         offset: entry.offset,
                         payload_len: h.payload_len,
                         record_size: entry.size,
@@ -2748,6 +2752,7 @@ impl Substrate {
                 self.apply_tokens_loc(
                     stream_id,
                     RecordLoc {
+                        segment: entry.segment,
                         offset: entry.offset,
                         payload_len: h.payload_len,
                         record_size: entry.size,
@@ -4126,6 +4131,7 @@ impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::segment::FIRST_SEGMENT;
     use crate::persistence::streams::TurnDecl;
     use crate::projection::{
         GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
@@ -5134,6 +5140,7 @@ mod tests {
 
         // Pre-compaction stream index + matching cold refs.
         let old_loc = |flat: u64| ChunkLoc {
+            segment: FIRST_SEGMENT,
             offset: 4096 + flat * 4096,
             payload_len: 100,
             record_size: 4096,
@@ -5193,6 +5200,7 @@ mod tests {
         // "Compaction": every chunk record lands at a new offset with a
         // new padded size.
         let new_loc = |flat: u64| ChunkLoc {
+            segment: FIRST_SEGMENT,
             offset: 100_000 + flat * 8192,
             payload_len: 100,
             record_size: 8192,
@@ -5253,6 +5261,7 @@ mod tests {
                 sid,
                 0,
                 ChunkLoc {
+                    segment: FIRST_SEGMENT,
                     offset: 4096,
                     payload_len: 100,
                     record_size: 8192,
@@ -5263,6 +5272,7 @@ mod tests {
             sub.apply_tokens_loc(
                 sid,
                 RecordLoc {
+                    segment: FIRST_SEGMENT,
                     offset: 20_480,
                     payload_len: 64,
                     record_size: 4096,

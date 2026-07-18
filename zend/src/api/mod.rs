@@ -55,6 +55,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
         .route("/v1/telemetry", get(telemetry::telemetry))
+        .route("/v1/debug/maintenance", post(status::force_maintenance))
         .route("/v1/conversations", get(conversations::list))
         .route(
             "/v1/conversations/:id",

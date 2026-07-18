@@ -77,18 +77,19 @@ struct Cli {
     #[arg(long)]
     skip_repo_scan: bool,
 
-    /// Disable the automatic redo-log compaction. Compaction is ON by default
-    /// and runs at startup whenever the loaded substrate has reclaimable markers
-    /// (superseded turns, tombstoned timelines, distilled calibration content);
-    /// pass this to skip it entirely.
-    #[arg(long)]
-    no_compact_substrate: bool,
-
     /// Do not run the background summariser thread (no AVL summary-forest
     /// extension, no per-conversation summarisation registration). Brings the
     /// engine up without the summariser — useful for bulk corpus prefill.
     #[arg(long)]
     disable_summariser: bool,
+
+    /// Force a whole-store redo-log compaction once during load (after the
+    /// substrate reload, before serving) instead of leaving reclaim to the
+    /// incremental background maintenance pass. Physically rewrites the log,
+    /// shedding tombstoned/distilled records and dead chunks, then
+    /// re-reconstructs the substrate. Opt-in; the startup pays the rewrite cost.
+    #[arg(long)]
+    compact_substrate: bool,
 
     /// Address to bind the HTTP server to. Defaults to loopback only
     /// (`127.0.0.1`) — reachable from this machine alone. Pass `0.0.0.0` to
@@ -171,8 +172,8 @@ async fn main() -> anyhow::Result<()> {
         port: cli.port,
         skip_code_read: cli.skip_code_read,
         skip_repo_scan: cli.skip_repo_scan,
-        compact_substrate: !cli.no_compact_substrate,
         disable_summariser: cli.disable_summariser,
+        compact_substrate: cli.compact_substrate,
     };
 
     if cli.skip_code_read {
@@ -181,11 +182,11 @@ async fn main() -> anyhow::Result<()> {
     if cli.skip_repo_scan {
         tracing::info!("--skip-repo-scan: startup repository scan is disabled");
     }
-    if cli.no_compact_substrate {
-        tracing::info!("--no-compact-substrate: automatic redo-log compaction is disabled");
-    }
     if cli.disable_summariser {
         tracing::info!("--disable-summariser: background summariser thread is disabled");
+    }
+    if cli.compact_substrate {
+        tracing::info!("--compact-substrate: forcing a whole-store redo-log compaction on load");
     }
 
     tracing::info!(workspace = %workspace.display(), port = cli.port, "starting zend");

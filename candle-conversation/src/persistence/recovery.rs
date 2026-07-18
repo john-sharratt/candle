@@ -28,6 +28,7 @@ use super::header_index::{decode_index_payload, IndexEntry};
 use super::log_file::{read_record_at, LogSource, SUPERBLOCK_SIZE};
 use super::manifest::Manifest;
 use super::record::{decode_record, verify_record_crc, Record, RecordType};
+use super::segment::SegmentId;
 use super::walker::{self, WalkEntry};
 use super::{PersistenceError, Result};
 
@@ -74,8 +75,12 @@ fn payload_needed(rt: RecordType) -> bool {
 
 /// Recover a log into a manifest and its true tail. `index_hint` is the
 /// superblock's `last_index` — pass `(0, 0)` to force the full walk.
-pub fn recover(src: &mut dyn LogSource, index_hint: (u64, u64)) -> Result<Recovered> {
-    recover_with_sink(src, index_hint, |_| {})
+pub fn recover(
+    src: &mut dyn LogSource,
+    segment: SegmentId,
+    index_hint: (u64, u64),
+) -> Result<Recovered> {
+    recover_with_sink(src, segment, index_hint, |_| {})
 }
 
 /// Recovery + per-record sink. Identical to [`recover`] except every
@@ -90,6 +95,7 @@ pub fn recover(src: &mut dyn LogSource, index_hint: (u64, u64)) -> Result<Recove
 /// (digest-synthesized headers carry `crc = 0`, which nothing consumes).
 pub fn recover_with_sink<F>(
     src: &mut dyn LogSource,
+    segment: SegmentId,
     index_hint: (u64, u64),
     mut sink: F,
 ) -> Result<Recovered>
@@ -124,7 +130,7 @@ where
             .collect();
         match fetch_records_coalesced(src, &fetch) {
             Ok(payloads) => {
-                return recover_from_chain(src, index_hint, digests, payloads, sink);
+                return recover_from_chain(src, segment, index_hint, digests, payloads, sink);
             }
             Err(e) => {
                 tracing::warn!(
@@ -133,7 +139,7 @@ where
             }
         }
     }
-    recover_full_walk(src, &mut sink)
+    recover_full_walk(src, segment, &mut sink)
 }
 
 /// Follow the backward `HeaderIndex` chain from `hint`, returning the
@@ -184,6 +190,7 @@ fn load_index_chain(src: &mut dyn LogSource, hint: (u64, u64)) -> Result<Option<
 /// payloads), then forward-walk the tail after the hinted index record.
 fn recover_from_chain<F>(
     src: &mut dyn LogSource,
+    segment: SegmentId,
     hint: (u64, u64),
     digests: Vec<IndexEntry>,
     mut payloads: HashMap<u64, Record>,
@@ -203,12 +210,13 @@ where
                 .remove(&d.offset)
                 .expect("fetch covered every payload_needed digest");
             WalkEntry {
+                segment,
                 offset: d.offset,
                 record,
                 size: d.record_size as u64,
             }
         } else {
-            d.to_walk_entry()
+            d.to_walk_entry(segment)
         };
         if ingest_err.is_none() {
             if let Err(e) = manifest.ingest(&entry) {
@@ -228,7 +236,7 @@ where
     let tail_start = hint.0 + hint.1;
     let mut tail_digests: Vec<IndexEntry> = Vec::new();
     let mut walk_err: Option<PersistenceError> = None;
-    let outcome = walker::walk_filtered(src, tail_start, payload_needed, |entry| {
+    let outcome = walker::walk_filtered(src, segment, tail_start, payload_needed, |entry| {
         if entry.record.header.record_type != RecordType::HeaderIndex {
             tail_digests.push(IndexEntry::from_header(
                 &entry.record.header,
@@ -259,14 +267,18 @@ where
 /// The universal fallback: one filtered forward walk from the first
 /// record. Correct on any log — including logs with no index chain at
 /// all — at O(records) serial header probes.
-fn recover_full_walk<F>(src: &mut dyn LogSource, sink: &mut F) -> Result<Recovered>
+fn recover_full_walk<F>(
+    src: &mut dyn LogSource,
+    segment: SegmentId,
+    sink: &mut F,
+) -> Result<Recovered>
 where
     F: FnMut(&WalkEntry),
 {
     let mut manifest = Manifest::new();
     let mut tail_digests: Vec<IndexEntry> = Vec::new();
     let mut ingest_err: Option<PersistenceError> = None;
-    let outcome = walker::walk_filtered(src, SUPERBLOCK_SIZE, payload_needed, |entry| {
+    let outcome = walker::walk_filtered(src, segment, SUPERBLOCK_SIZE, payload_needed, |entry| {
         if entry.record.header.record_type != RecordType::HeaderIndex {
             tail_digests.push(IndexEntry::from_header(
                 &entry.record.header,
@@ -354,6 +366,7 @@ mod tests {
     use crate::persistence::header_index::encode_index_payload;
     use crate::persistence::log_file::{LogFile, MemLog};
     use crate::persistence::record::{encode_record, RecordHeader, RecordType};
+    use crate::persistence::segment::FIRST_SEGMENT;
     use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl};
     use crate::substrate::Substrate;
 
@@ -434,7 +447,7 @@ mod tests {
         let mut mem_a = MemLog::with_records(&blob);
         let mut sub_a = Substrate::new();
         let mut seen_a: Vec<(RecordType, u64, usize)> = Vec::new();
-        let rec_a = recover_with_sink(&mut mem_a, hint, |e| {
+        let rec_a = recover_with_sink(&mut mem_a, FIRST_SEGMENT, hint, |e| {
             seen_a.push((
                 e.record.header.record_type,
                 e.offset,
@@ -448,7 +461,7 @@ mod tests {
         let mut mem_b = MemLog::with_records(&blob);
         let mut sub_b = Substrate::new();
         let mut seen_b: Vec<(RecordType, u64, usize)> = Vec::new();
-        let rec_b = recover_with_sink(&mut mem_b, (0, 0), |e| {
+        let rec_b = recover_with_sink(&mut mem_b, FIRST_SEGMENT, (0, 0), |e| {
             seen_b.push((
                 e.record.header.record_type,
                 e.offset,
@@ -498,7 +511,8 @@ mod tests {
 
         let mut mem = MemLog::with_records(&blob);
         let mut sub = Substrate::new();
-        let rec = recover_with_sink(&mut mem, hint, |e| sub.apply_walker_entry(e)).unwrap();
+        let rec = recover_with_sink(&mut mem, FIRST_SEGMENT, hint, |e| sub.apply_walker_entry(e))
+            .unwrap();
         assert_eq!(rec.last_index, Some(hint));
         // sample_records leaves 1 record un-indexed (7 % 2) + 3 tail.
         assert_eq!(rec.tail_digests.len(), 4);
@@ -522,7 +536,9 @@ mod tests {
         for bad in [wrong_type, dangling, legacy] {
             let mut mem = MemLog::with_records(&blob);
             let mut sub = Substrate::new();
-            let rec = recover_with_sink(&mut mem, bad, |e| sub.apply_walker_entry(e)).unwrap();
+            let rec =
+                recover_with_sink(&mut mem, FIRST_SEGMENT, bad, |e| sub.apply_walker_entry(e))
+                    .unwrap();
             assert_eq!(
                 rec.last_index, None,
                 "hint {bad:?} must fall back to the walk"
@@ -564,8 +580,10 @@ mod tests {
 
         let mut mem = MemLog::with_records(&blob);
         let mut sub = Substrate::new();
-        let rec = recover_with_sink(&mut mem, (idx_off, idx_size), |e| sub.apply_walker_entry(e))
-            .unwrap();
+        let rec = recover_with_sink(&mut mem, FIRST_SEGMENT, (idx_off, idx_size), |e| {
+            sub.apply_walker_entry(e)
+        })
+        .unwrap();
         assert_eq!(rec.last_index, None, "looped chain must fall back");
         assert_eq!(sub.live_chunk_count(), 1);
     }
@@ -582,7 +600,7 @@ mod tests {
         blob.extend_from_slice(&bad);
 
         let mut mem = MemLog::with_records(&blob);
-        let rec = recover(&mut mem, hint).unwrap();
+        let rec = recover(&mut mem, FIRST_SEGMENT, hint).unwrap();
         assert_eq!(rec.last_index, Some(hint));
         assert!(rec.torn);
         assert_eq!(rec.tail_offset, SUPERBLOCK_SIZE + good_len as u64);
@@ -615,8 +633,10 @@ mod tests {
             let mut log = LogFile::open(&path).unwrap();
             let hint = log.superblock().last_index;
             let mut substrate = Substrate::new();
-            let rec =
-                recover_with_sink(&mut log, hint, |e| substrate.apply_walker_entry(e)).unwrap();
+            let rec = recover_with_sink(&mut log, FIRST_SEGMENT, hint, |e| {
+                substrate.apply_walker_entry(e)
+            })
+            .unwrap();
             assert!(rec.torn, "the truncated third record must be detected");
             assert_eq!(rec.tail_offset, good_records);
             assert_eq!(substrate.live_chunk_count(), 2);
@@ -638,7 +658,7 @@ mod tests {
 
         let mut seen: Vec<(RecordType, usize, u64)> = Vec::new();
         let mut mem = MemLog::with_records(&blob);
-        recover_with_sink(&mut mem, hint, |e| {
+        recover_with_sink(&mut mem, FIRST_SEGMENT, hint, |e| {
             seen.push((
                 e.record.header.record_type,
                 e.record.payload.len(),

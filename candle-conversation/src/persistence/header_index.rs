@@ -36,6 +36,7 @@
 //! ```
 
 use super::record::{Record, RecordHeader, RecordType};
+use super::segment::SegmentId;
 use super::walker::WalkEntry;
 use super::{PersistenceError, Result};
 
@@ -90,8 +91,9 @@ impl IndexEntry {
     /// have visited for the same record (the header's `crc` is not
     /// carried by the digest; entries synthesized here never have
     /// their payload consumed, so nothing reads it).
-    pub fn to_walk_entry(self) -> WalkEntry {
+    pub fn to_walk_entry(self, segment: SegmentId) -> WalkEntry {
         WalkEntry {
+            segment,
             offset: self.offset,
             record: Record {
                 header: RecordHeader {
@@ -278,7 +280,7 @@ mod tests {
             token_count: 0,
         };
         let e = IndexEntry::from_header(&header, 20_480, 4096);
-        let w = e.to_walk_entry();
+        let w = e.to_walk_entry(crate::persistence::segment::FIRST_SEGMENT);
         assert_eq!(w.offset, 20_480);
         assert_eq!(w.size, 4096);
         assert_eq!(w.record.header, header);

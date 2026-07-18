@@ -17,6 +17,7 @@ use super::log_file::{read_record_at, LogFile};
 use super::manifest::Manifest;
 use super::record::Record;
 use super::recovery;
+use super::segment::FIRST_SEGMENT;
 use super::streams::StreamId;
 use super::Result;
 use crate::substrate::Substrate;
@@ -116,7 +117,10 @@ impl InheritedSubstrate {
         let mut file = LogFile::open(&canonical)?;
         let hint = file.superblock().last_index;
         let mut substrate = Substrate::new();
-        let recovered = recovery::recover_with_sink(&mut file, hint, |entry| {
+        // An inherited log is a single frozen file — its own one segment.
+        // Inherited reads route via the `Inherited(i)` source, not via the
+        // stamped `ChunkLoc.segment`, so `FIRST_SEGMENT` is the correct id.
+        let recovered = recovery::recover_with_sink(&mut file, FIRST_SEGMENT, hint, |entry| {
             substrate.apply_walker_entry(entry)
         })?;
         let direct = DirectFile::open(&canonical)?;

@@ -190,7 +190,11 @@ fn main() -> Result<()> {
     // Replay the redo log into an in-RAM substrate so every stream's `Tokens`
     // record and projection-event blob is known.
     let mut substrate = Substrate::new();
-    let (entries, _) = walker::collect(&mut log, SUPERBLOCK_SIZE)?;
+    let (entries, _) = walker::collect(
+        &mut log,
+        candle_conversation::persistence::segment::FIRST_SEGMENT,
+        SUPERBLOCK_SIZE,
+    )?;
     for e in &entries {
         substrate.apply_walker_entry(e);
     }

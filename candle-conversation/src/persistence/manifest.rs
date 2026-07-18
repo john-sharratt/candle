@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::log_file::LogSource;
 use super::record::RecordType;
+use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::{self, WalkEntry, WalkOutcome};
 use super::{PersistenceError, Result};
 #[cfg(test)]
@@ -27,6 +28,8 @@ use crate::substrate::Substrate;
 /// Location of a whole record in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordLoc {
+    /// Which segment file physically holds this record. Reads route to it.
+    pub segment: SegmentId,
     pub offset: u64,
     pub payload_len: u64,
     /// Padded on-disk size of the record (header + payload + sector
@@ -41,6 +44,8 @@ pub struct RecordLoc {
 /// Location and shape of one chunk record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkLoc {
+    /// Which segment file physically holds this record. Reads route to it.
+    pub segment: SegmentId,
     pub offset: u64,
     pub payload_len: u64,
     /// Padded on-disk size of the record — see [`RecordLoc::record_size`].
@@ -140,6 +145,10 @@ impl Manifest {
     pub fn ingest(&mut self, entry: &WalkEntry) -> Result<()> {
         let h = &entry.record.header;
         let loc = RecordLoc {
+            // The segment the walk stamped on this entry — which physical
+            // file holds the record (§5.1). A read of this singleton routes
+            // there.
+            segment: entry.segment,
             offset: entry.offset,
             payload_len: h.payload_len,
             record_size: entry.size,
@@ -182,7 +191,7 @@ impl Manifest {
         let mut manifest = Manifest::new();
         let mut substrate = Substrate::new();
         let mut err: Option<PersistenceError> = None;
-        let outcome = walker::walk(src, start, |entry| {
+        let outcome = walker::walk(src, FIRST_SEGMENT, start, |entry| {
             if err.is_none() {
                 if let Err(e) = manifest.ingest(entry) {
                     err = Some(e);
@@ -200,7 +209,7 @@ impl Manifest {
     pub fn build_from_walk(src: &mut dyn LogSource, start: u64) -> Result<(Manifest, WalkOutcome)> {
         let mut manifest = Manifest::new();
         let mut err: Option<PersistenceError> = None;
-        let outcome = walker::walk(src, start, |entry| {
+        let outcome = walker::walk(src, FIRST_SEGMENT, start, |entry| {
             if err.is_none() {
                 if let Err(e) = manifest.ingest(entry) {
                     err = Some(e);

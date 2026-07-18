@@ -128,6 +128,12 @@ pub struct LogFile {
     allocated: u64,
     /// Group-commit staging buffer — appended records not yet flushed.
     pending: Vec<u8>,
+    /// When true this handle was opened read-only ([`LogFile::open_read_only`]):
+    /// the OS file has no write access and the superblock is never healed on
+    /// open, so it is safe to point at a segment another process holds open for
+    /// append (e.g. the running daemon's active segment). Every write path
+    /// asserts on it.
+    read_only: bool,
 }
 
 impl LogFile {
@@ -151,6 +157,7 @@ impl LogFile {
             write_offset: SUPERBLOCK_SIZE,
             allocated: 0,
             pending: Vec::new(),
+            read_only: false,
         };
         log.grow_to(SUPERBLOCK_SIZE)?;
         log.write_superblock()?;
@@ -183,6 +190,7 @@ impl LogFile {
             write_offset: SUPERBLOCK_SIZE,
             allocated,
             pending: Vec::new(),
+            read_only: false,
         };
         let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
         match Superblock::decode(&head) {
@@ -195,6 +203,44 @@ impl LogFile {
                 log.write_superblock()?;
                 log.file.sync_data()?;
             }
+            Err(e) => return Err(e),
+        }
+        Ok(log)
+    }
+
+    /// Open an existing log for inspection **without any write access**. The OS
+    /// handle is read-only and the superblock is never healed on open, so this
+    /// is safe to point at a live segment another process holds open for append
+    /// (e.g. the running daemon's active segment) — it cannot race the writer's
+    /// superblock or truncate a tail out from under it.
+    ///
+    /// A torn superblock (valid magic, bad CRC) is **not** rewritten: its hint
+    /// is treated as absent, exactly as the healed hint would be, so reads that
+    /// need the tail take the full-walk path. A wrong magic, or a valid-CRC
+    /// superblock with an unsupported version, is still a hard error — same as
+    /// [`LogFile::open`]. Every write path on the returned handle asserts.
+    pub fn open_read_only(path: &Path) -> Result<LogFile> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let allocated = file.metadata()?.len();
+        let direct = DirectFile::open(path)?;
+        let mut log = LogFile {
+            file,
+            direct,
+            superblock: Superblock {
+                format_version: FILE_FORMAT_VERSION,
+                last_index: (0, 0),
+            },
+            write_offset: SUPERBLOCK_SIZE,
+            allocated,
+            pending: Vec::new(),
+            read_only: true,
+        };
+        let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
+        match Superblock::decode(&head) {
+            Ok(sb) => log.superblock = sb,
+            // Torn superblock: leave the zero-hint default. We cannot — and must
+            // not — rewrite it under the live writer; recovery takes the full walk.
+            Err(PersistenceError::BadChecksum { .. }) => {}
             Err(e) => return Err(e),
         }
         Ok(log)
@@ -254,6 +300,7 @@ impl LogFile {
     /// Stage one already-encoded, 4 KB-aligned record into the group-commit
     /// buffer. Returns the file offset the record will occupy once flushed.
     pub fn stage(&mut self, record_bytes: &[u8]) -> u64 {
+        assert!(!self.read_only, "stage on a read-only LogFile");
         assert!(
             record_bytes.len() % ALIGN == 0,
             "record bytes must be 4 KB-aligned"
@@ -271,6 +318,7 @@ impl LogFile {
     /// Flush the group-commit buffer to the file as one sequential write.
     /// Does not `fsync` — see [`LogFile::commit`].
     pub fn flush(&mut self) -> Result<()> {
+        assert!(!self.read_only, "flush on a read-only LogFile");
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -305,6 +353,7 @@ impl LogFile {
     /// Physically truncate the file to `len` (used by recovery after a torn
     /// tail, and by compaction).
     pub fn truncate_to(&mut self, len: u64) -> Result<()> {
+        assert!(!self.read_only, "truncate_to on a read-only LogFile");
         self.file.set_len(len)?;
         self.allocated = len;
         if self.write_offset > len {
@@ -314,6 +363,7 @@ impl LogFile {
     }
 
     fn write_superblock(&mut self) -> Result<()> {
+        assert!(!self.read_only, "write_superblock on a read-only LogFile");
         let bytes = self.superblock.encode();
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&bytes)?;
@@ -323,6 +373,7 @@ impl LogFile {
     /// Grow the physical file so it holds at least `end` bytes, rounding up
     /// to the next [`GROW_EXTENT`].
     fn grow_to(&mut self, end: u64) -> Result<()> {
+        assert!(!self.read_only, "grow_to on a read-only LogFile");
         if end <= self.allocated {
             return Ok(());
         }
@@ -608,6 +659,113 @@ mod tests {
             );
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// `open_read_only` on a clean log reads back the superblock hint and every
+    /// committed record verbatim, and leaves the file byte-for-byte unchanged.
+    #[test]
+    fn open_read_only_reads_records_and_hint() {
+        let path = tmp_path("ro_clean");
+        let r0 = rec(8, 0, b"alpha");
+        let r1 = rec(8, 1, b"beta-payload");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            log.stage(&r0);
+            log.stage(&r1);
+            log.commit().unwrap();
+            log.set_last_index((SUPERBLOCK_SIZE, r0.len() as u64))
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        {
+            let mut log = LogFile::open_read_only(&path).unwrap();
+            assert_eq!(log.superblock().format_version, FILE_FORMAT_VERSION);
+            assert_eq!(
+                log.superblock().last_index,
+                (SUPERBLOCK_SIZE, r0.len() as u64)
+            );
+            let back0 = log.read_at(SUPERBLOCK_SIZE, r0.len()).unwrap();
+            assert_eq!(back0, r0);
+            let back1 = log
+                .read_at(SUPERBLOCK_SIZE + r0.len() as u64, r1.len())
+                .unwrap();
+            assert_eq!(back1, r1);
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "open_read_only + reads must not modify the file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The safety property that makes it live-daemon-safe: opening a **torn**
+    /// superblock read-only does not heal it — the file is byte-for-byte
+    /// identical afterward (whereas [`LogFile::open`] rewrites it in place),
+    /// and the records still read back.
+    #[test]
+    fn open_read_only_never_mutates_torn_superblock() {
+        let path = tmp_path("ro_torn");
+        let r = rec(7, 0, b"read-only-survives");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            log.stage(&r);
+            log.commit().unwrap();
+            log.set_last_index((SUPERBLOCK_SIZE, r.len() as u64))
+                .unwrap();
+        }
+        // Tear the superblock: flip a CRC-covered byte, magic + version intact.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        {
+            let mut log = LogFile::open_read_only(&path).unwrap();
+            // Torn hint treated as absent, not healed.
+            assert_eq!(log.superblock().last_index, (0, 0));
+            // Records read back verbatim regardless.
+            let back = log.read_at(SUPERBLOCK_SIZE, r.len()).unwrap();
+            assert_eq!(back, r);
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "open_read_only must not heal (write) a torn superblock"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A wrong magic is a hard error under read-only open too, same as `open`.
+    #[test]
+    fn open_read_only_rejects_wrong_magic() {
+        let path = tmp_path("ro_bad_magic");
+        {
+            LogFile::create(&path).unwrap();
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        }
+        assert!(LogFile::open_read_only(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Any write path on a read-only handle asserts rather than touching a file
+    /// another process may hold open for append.
+    #[test]
+    #[should_panic(expected = "read-only")]
+    fn open_read_only_write_asserts() {
+        let path = tmp_path("ro_write_assert");
+        {
+            LogFile::create(&path).unwrap();
+        }
+        let mut log = LogFile::open_read_only(&path).unwrap();
+        let _ = log.set_last_index((SUPERBLOCK_SIZE, 4096));
     }
 
     #[test]

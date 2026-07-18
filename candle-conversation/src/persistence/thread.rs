@@ -33,7 +33,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -51,6 +51,13 @@ use sysinfo::System;
 
 /// How often the loop wakes up on its own when no triggers arrive.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
+
+/// Minimum wall-clock between background **segment-maintenance** scans. The
+/// tiering phases run every pass (one per trigger / tick), but the maintenance
+/// candidate scan is O(live segments' records), so it's decoupled from the
+/// trigger rate and run at most this often — reclaim is a slow background job,
+/// not something that needs to react to every turn-seal.
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Clone-able trigger for the persistence thread. Held by anything that
 /// wants to wake the loop early (e.g. the scheduler signalling "turn just
@@ -270,6 +277,11 @@ fn run_loop(
         candle_nn::kv_cache::MIGRATION_STAGING_CAP_BYTES,
         "persistence::pinned_scratch",
     );
+    // Rate-limit the maintenance scan (see `MAINTENANCE_INTERVAL`). Start it a
+    // full interval in the past so the first pass is eligible.
+    let mut last_maintenance = Instant::now()
+        .checked_sub(MAINTENANCE_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         // Wait for trigger, shutdown, or the periodic tick — whichever
         // fires first. The `default` arm fires after `DEFAULT_TICK` if
@@ -293,6 +305,10 @@ fn run_loop(
             Ordering::Relaxed,
         );
 
+        let run_maintenance = last_maintenance.elapsed() >= MAINTENANCE_INTERVAL;
+        if run_maintenance {
+            last_maintenance = Instant::now();
+        }
         run_pass(
             &conversation,
             &backings,
@@ -300,6 +316,7 @@ fn run_loop(
             &copy_stream,
             compression_policy.as_ref(),
             &mut pinned_scratch,
+            run_maintenance,
         );
 
         // Re-stamp the residual backlog (post-drain) so the signal decays as
@@ -579,6 +596,7 @@ fn run_pass(
     copy_stream: &Arc<CudaStream>,
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
+    run_maintenance: bool,
 ) {
     // Cross-thread write→read barrier. This persist pass runs on the background
     // persistence thread and reads each freshly-sealed turn's K/V for the
@@ -941,23 +959,28 @@ fn run_pass(
         tracing::warn!("persist: fsync failed: {e}");
     }
 
-    // ── Phase 4: compaction ────────────────────────────────────────────
+    // ── Phase 4: segment maintenance ───────────────────────────────────
     //
-    // Reclaim the log's dead weight once it crosses the threshold. The
-    // check is pure in-RAM arithmetic (the O(1) dead-byte counter plus
-    // the tombstoned-stream sum), so polling it every pass is free; the
-    // rewrite itself holds the persistence + substrate locks for its
-    // duration, which is why it lives here on the background thread
-    // rather than anywhere near the decode path.
-    match conversation.compact_persistence_if_needed() {
+    // Reclaim dead weight incrementally — one segment drop / compact / combine
+    // per invocation (`persistence/maintenance.rs`). Rate-limited to
+    // `MAINTENANCE_INTERVAL` (the candidate scan is O(live records), so it's
+    // decoupled from the trigger rate). The relocation I/O runs under the
+    // persistence lock only (phased locking), never the substrate write lock,
+    // so it can't stall decode. The specific op is logged at DEBUG by
+    // `finish_maintenance`.
+    match if run_maintenance {
+        conversation.compact_persistence_if_needed()
+    } else {
+        Ok(false)
+    } {
         Ok(true) => {
             tracing::info!(
                 target: "candle_conversation::persistence::tier",
-                "persist: redo log compacted (dead-byte threshold crossed)"
+                "persist: substrate maintenance op applied (segment reclaim)"
             );
         }
         Ok(false) => {}
-        Err(e) => tracing::warn!("persist: auto-compaction failed: {e}"),
+        Err(e) => tracing::warn!("persist: substrate maintenance failed: {e}"),
     }
 
     // Per-pass aggregate. Only logged when something actually moved.
