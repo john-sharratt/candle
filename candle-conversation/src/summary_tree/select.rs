@@ -1,7 +1,8 @@
-//! Score-density selection (§8.4) — the projection step-9 algorithm
-//! that fills the layer's token budget with the highest-scoring subset
-//! of the summary tree's nodes, then eliminates redundant ancestors and
-//! fills coverage gaps until convergence.
+//! Score-density selection — the projection algorithm that fills the
+//! layer's token budget with the highest-scoring subset of the summary
+//! **forest**'s nodes, then eliminates redundant ancestors and fills
+//! coverage gaps until convergence (`docs/immutable_summary_forest.md` —
+//! *Window of attention*).
 //!
 //! # The five steps
 //!
@@ -12,11 +13,18 @@
 //! 3. **Eliminate redundant ancestors** — bottom-up, drop any node
 //!    whose entire subtree is already covered by selected descendants.
 //! 4. **Fill coverage gaps largest first** — for each maximal run of
-//!    uncovered Normal sub-leaves, add the smallest tree node whose
-//!    subtree covers that run.
+//!    uncovered Normal sub-leaves, add the smallest node whose subtree
+//!    covers that run.
 //! 5. **Multi-pass refill until convergence** — add the highest-score
-//!    non-selected nodes that fit, then re-eliminate; stop when a full
-//!    pass adds nothing.
+//!    non-selected nodes that fit, skipping any whose subtree is already
+//!    covered (step 3 would drop those straight back out and the pass
+//!    would never converge), then re-eliminate; stop when a full pass
+//!    adds nothing.
+//!
+//! The recency anchor is what keeps the newest turns **verbatim**: the
+//! anchored `Normal`s win step 2, and step 3 then drops the `SummaryOfTurns`
+//! leaves that summarise them — so the window reads as "recent turns raw,
+//! older history as coarse peak summaries".
 //!
 //! The output is a [`Selection`] holding the chronologically-ordered
 //! selected nodes plus per-node origin tags (consumed by
@@ -46,7 +54,7 @@ impl Selection {
     }
 }
 
-/// Score-density selection over the entire summary tree.
+/// Score-density selection over the entire summary forest.
 ///
 /// `provenance_scores` is the per-node Q-agreement score produced by
 /// the provenance scan; missing nodes default to `0.0`.  `recency_cfg`
@@ -63,11 +71,22 @@ pub fn select_dense(
         return sel;
     }
 
+    // The recent-raw tail's boundary, in whole exchanges — derived once and read
+    // O(1) per node below (see `recency::anchor_start`).
+    let anchor_start =
+        super::recency::anchor_start(tree.couplings(), tree.chrono_normals().len(), recency_cfg);
+
     // Step 1 — effective score per node.
     let mut effective: AHashMap<NodeId, f32> = AHashMap::default();
     for id in tree.all_ids() {
         let prov = provenance_scores.get(&id).copied().unwrap_or(0.0);
-        let rec = recency_score(id, tree.chrono_leaves(), recency_cfg);
+        let rec = recency_score(
+            id,
+            tree.chrono_normals(),
+            tree.chrono_leaves(),
+            anchor_start,
+            recency_cfg,
+        );
         let eff = if prov >= rec { prov } else { rec };
         effective.insert(id, eff);
     }
@@ -91,32 +110,55 @@ pub fn select_dense(
         prov_map.get(&id).copied().unwrap_or(0.0)
     };
     for (id, eff_score) in &ranked {
-        if !eff_score.is_finite() || *eff_score > 0.0 {
-            // Skip; finite check below.  (Both INFINITY and positive
-            // finite scores qualify; only 0.0 / NaN / negative don't.)
-        }
+        // Both `+∞` and positive-finite scores qualify; 0.0 / NaN / negative
+        // don't.
         if !(eff_score.is_finite() && *eff_score > 0.0 || eff_score.is_infinite()) {
             continue;
         }
-        let node = match tree.get(*id) {
-            Some(n) => n,
-            None => continue,
-        };
-        if used.saturating_add(node.tokens) > budget {
+        if tree.get(*id).is_none() {
             continue;
         }
-        used = used.saturating_add(node.tokens);
-        selected_set.insert(*id);
-        let rec = recency_score(*id, tree.chrono_leaves(), recency_cfg);
-        let prov = prov_threshold(*id, provenance_scores);
-        let origin = if rec.is_infinite() {
-            SelectionOrigin::HardAnchor
-        } else if rec > prov {
-            SelectionOrigin::RecencyDecay
-        } else {
-            SelectionOrigin::ProvenanceScore
-        };
-        origin_map.insert(*id, origin);
+        // An exchange is atomic. A tool response without the call that requested
+        // it reads as output from nowhere, and a call whose result never arrives
+        // is a request the model may simply re-issue — so a hit on either half
+        // takes both. Charged and admitted all-or-nothing: a half that would
+        // overflow the budget must not be taken alone, and the exchange's summary
+        // covers it instead via the gap-fill.
+        let unit = tree.exchange_unit(*id);
+        let cost: u32 = unit
+            .iter()
+            .filter(|n| !selected_set.contains(*n))
+            .filter_map(|n| tree.get(*n))
+            .map(|n| n.tokens)
+            .fold(0u32, |a, t| a.saturating_add(t));
+        if used.saturating_add(cost) > budget {
+            continue;
+        }
+        used = used.saturating_add(cost);
+        for member in unit {
+            if !selected_set.insert(member) {
+                continue;
+            }
+            // Each member is attributed by its own score, so an exchange pulled
+            // in by one relevant half doesn't misreport the rest as provenance
+            // hits.
+            let rec = recency_score(
+                member,
+                tree.chrono_normals(),
+                tree.chrono_leaves(),
+                anchor_start,
+                recency_cfg,
+            );
+            let prov = prov_threshold(member, provenance_scores);
+            let origin = if rec.is_infinite() {
+                SelectionOrigin::HardAnchor
+            } else if rec > prov {
+                SelectionOrigin::RecencyDecay
+            } else {
+                SelectionOrigin::ProvenanceScore
+            };
+            origin_map.insert(member, origin);
+        }
     }
 
     // Build the parent map once — used by `covered` and the coverage
@@ -144,7 +186,8 @@ pub fn select_dense(
         }
         let cover_tokens = tree.get(covering).map(|n| n.tokens).unwrap_or(0);
         if used.saturating_add(cover_tokens) > budget {
-            // Per §8.4: covering-node size grows monotonically with gap
+            // Per `docs/archived/infinite_conversations.md` §8.4:
+            // covering-node size grows monotonically with gap
             // depth, so once one gap's cover is unaffordable, every
             // larger gap's cover is also unaffordable.  Break out.
             //
@@ -173,12 +216,41 @@ pub fn select_dense(
                 Some(n) => n,
                 None => continue,
             };
-            if used.saturating_add(node.tokens) > budget {
+            // Never re-add a node whose subtree is already fully covered by the
+            // selected set: `eliminate_redundant` below would drop it straight
+            // back out, `added_any` would stay true, and the pass would spin
+            // forever. This matters as soon as a high-scoring node can also be
+            // redundant — e.g. an anchored Normal turn covers its SoT parent,
+            // and that parent is itself anchored.
+            if node.has_children()
+                && node
+                    .children
+                    .iter()
+                    .all(|c| covered(tree, *c, &selected_set))
+            {
                 continue;
             }
-            used = used.saturating_add(node.tokens);
-            selected_set.insert(*id);
-            origin_map.insert(*id, SelectionOrigin::Refill);
+            // Exchanges are atomic here too, not only in the greedy fit: this
+            // pass admits nodes by its own budget test, so without the unit it
+            // would happily refill a tool response whose call the fit had already
+            // rejected as too large — reintroducing the dangling half by the back
+            // door.
+            let unit = tree.exchange_unit(*id);
+            let cost: u32 = unit
+                .iter()
+                .filter(|n| !selected_set.contains(*n))
+                .filter_map(|n| tree.get(*n))
+                .map(|n| n.tokens)
+                .fold(0u32, |a, t| a.saturating_add(t));
+            if used.saturating_add(cost) > budget {
+                continue;
+            }
+            used = used.saturating_add(cost);
+            for member in unit {
+                if selected_set.insert(member) {
+                    origin_map.insert(member, SelectionOrigin::Refill);
+                }
+            }
             added_any = true;
         }
         eliminate_redundant(tree, &mut selected_set, &mut used);
@@ -312,7 +384,7 @@ fn lca_of_normals(
         return None;
     }
     // Start each walker at the Normal's containing SoT leaf — Normals
-    // themselves aren't in the binary AVL spine.
+    // themselves aren't part of the forest spine.
     let mut leaves: Vec<NodeId> = normals
         .iter()
         .filter_map(|n| normal_to_leaf.get(n).copied())
@@ -523,6 +595,90 @@ mod tests {
         (tree, all_normals)
     }
 
+    /// Recency disabled, so these tests measure the exchange mechanism alone.
+    /// With the default `hard_anchor: 3` a two-turn tree has every Normal pinned
+    /// at `+∞`, and an atomicity assertion would pass whether or not the code
+    /// works.
+    fn no_recency() -> RecencyConfig {
+        RecencyConfig {
+            hard_anchor: 0,
+            decay: 0.8,
+        }
+    }
+
+    /// A tool round-trip: two Normal turns, coupled. Provenance hits ONLY the
+    /// response half — the exact shape observed in production, where turn #4's
+    /// `<tool_response>` was selected while the call turn #2 that requested it
+    /// was not, leaving the model reading output from nowhere.
+    #[test]
+    fn provenance_hitting_one_half_pulls_in_the_whole_exchange() {
+        let (mut tree, normals) = build_uniform_tree(1, 2, 10, 20);
+        // Normal position 0 runs on into position 1 (call → response).
+        tree.set_couplings([0u32].into_iter().collect());
+        let mut scores: AHashMap<NodeId, f32> = AHashMap::default();
+        scores.insert(normals[1], 0.9);
+
+        let sel = select_dense(&tree, &scores, no_recency(), 1000);
+        assert!(
+            sel.selected.contains(&normals[1]),
+            "the scored half must be selected"
+        );
+        assert!(
+            sel.selected.contains(&normals[0]),
+            "its call turn must come too — a tool response without its              invocation is context from nowhere"
+        );
+    }
+
+    /// …and symmetrically, a hit on the call turn brings its result.
+    #[test]
+    fn provenance_hitting_the_call_pulls_in_its_response() {
+        let (mut tree, normals) = build_uniform_tree(1, 2, 10, 20);
+        tree.set_couplings([0u32].into_iter().collect());
+        let mut scores: AHashMap<NodeId, f32> = AHashMap::default();
+        scores.insert(normals[0], 0.9);
+
+        let sel = select_dense(&tree, &scores, no_recency(), 1000);
+        assert!(sel.selected.contains(&normals[0]));
+        assert!(
+            sel.selected.contains(&normals[1]),
+            "a call whose result never arrives is a request the model re-issues"
+        );
+    }
+
+    /// All-or-nothing: an exchange that cannot fit must not be taken HALF. Half
+    /// an exchange is worse than none — the gap-fill covers it with its summary
+    /// instead.
+    #[test]
+    fn an_exchange_that_does_not_fit_is_not_taken_in_half() {
+        let (mut tree, normals) = build_uniform_tree(1, 2, 10, 20);
+        tree.set_couplings([0u32].into_iter().collect());
+        let mut scores: AHashMap<NodeId, f32> = AHashMap::default();
+        scores.insert(normals[1], 0.9);
+
+        // Budget fits exactly one 10-token half, never both.
+        let sel = select_dense(&tree, &scores, no_recency(), 15);
+        assert!(
+            !sel.selected.contains(&normals[1]) || sel.selected.contains(&normals[0]),
+            "took the response half without its call under a tight budget"
+        );
+    }
+
+    /// Uncoupled turns are unaffected — no coupling means every turn is its own
+    /// exchange, so selection behaves exactly as before.
+    #[test]
+    fn uncoupled_turns_are_selected_alone() {
+        let (tree, normals) = build_uniform_tree(1, 2, 10, 20);
+        let mut scores: AHashMap<NodeId, f32> = AHashMap::default();
+        scores.insert(normals[1], 0.9);
+
+        let sel = select_dense(&tree, &scores, no_recency(), 1000);
+        assert!(sel.selected.contains(&normals[1]));
+        assert!(
+            !sel.selected.contains(&normals[0]),
+            "an uncoupled neighbour must not be dragged in"
+        );
+    }
+
     #[test]
     fn empty_tree_returns_empty_selection() {
         let tree = SummaryTree::new();
@@ -534,25 +690,45 @@ mod tests {
 
     #[test]
     fn small_tree_anchor_only() {
-        // 1 leaf, 1 normal, tiny budget — only the hard-anchored leaf
-        // fits.
-        let (tree, _) = build_uniform_tree(1, 1, 10, 20);
+        // 1 leaf, 1 normal, tiny budget — the anchored Normal turn goes in
+        // verbatim and its SoT parent falls out as redundant.
+        let (tree, normals) = build_uniform_tree(1, 1, 10, 20);
         let scores = AHashMap::default();
         let sel = select_dense(&tree, &scores, RecencyConfig::default(), 50);
-        // Hard anchor includes the rightmost (only) leaf.
-        assert!(sel.contains(NodeId(1)));
+        // The recent-raw tail is the turn itself, not its summary.
+        assert!(sel.contains(normals[0]));
+        assert!(
+            !sel.contains(NodeId(1)),
+            "the SoT leaf is redundant once its only Normal child is selected"
+        );
         assert!(sel.origins.contains(&SelectionOrigin::HardAnchor));
     }
 
+    /// The recent-raw tail: the newest `hard_anchor` **Normal turns** are
+    /// selected verbatim and the SoT leaves summarising them drop out as
+    /// redundant, while older history stays covered by its summaries. This is
+    /// the regression guard for "the window had no recent conversation in it at
+    /// all — it was replaced entirely by summaries".
     #[test]
-    fn hard_anchor_three_leaves_always_included() {
-        // 5 leaves, no provenance.  Last 3 are hard-anchored.
-        let (tree, _) = build_uniform_tree(5, 1, 10, 20);
+    fn hard_anchor_keeps_recent_turns_verbatim() {
+        // 5 leaves, no provenance, generous budget.
+        let (tree, normals) = build_uniform_tree(5, 1, 10, 20);
         let scores = AHashMap::default();
         let sel = select_dense(&tree, &scores, RecencyConfig::default(), 10_000);
-        assert!(sel.contains(NodeId(3)));
-        assert!(sel.contains(NodeId(4)));
-        assert!(sel.contains(NodeId(5)));
+        // The three newest turns are in, verbatim.
+        for n in normals.iter().rev().take(3) {
+            assert!(sel.contains(*n), "recent turn {n:?} must be verbatim");
+        }
+        // Their summaries are redundant and dropped.
+        for leaf in [NodeId(3), NodeId(4), NodeId(5)] {
+            assert!(
+                !sel.contains(leaf),
+                "SoT {leaf:?} is redundant once its Normal child is selected"
+            );
+        }
+        // Older history is still covered — by its summaries.
+        assert!(sel.contains(NodeId(1)));
+        assert!(sel.contains(NodeId(2)));
     }
 
     #[test]
@@ -576,17 +752,16 @@ mod tests {
     fn budget_starves_low_score_nodes() {
         // 10 leaves, budget for ~3 summary turns + some buffer.  Only
         // hard-anchor 3 + maybe 1 more fit.
-        let (tree, _) = build_uniform_tree(10, 1, 10, 20);
+        let (tree, normals) = build_uniform_tree(10, 1, 10, 20);
         let scores = AHashMap::default();
-        // Budget: tight — fit 3 SoT leaves (60 tokens) + 3 Normals
-        // (30 tokens) + maybe an SoS or two.
+        // Budget: tight — the anchored tail plus a couple of older summaries.
         let sel = select_dense(&tree, &scores, RecencyConfig::default(), 100);
         assert!(sel.used_tokens <= 100);
-        // The hard anchor 3 are nonnegotiable; they must all fit at
-        // budget = 100 (3 leaves * 20 tokens = 60).
-        assert!(sel.contains(NodeId(8)));
-        assert!(sel.contains(NodeId(9)));
-        assert!(sel.contains(NodeId(10)));
+        // The hard-anchored recent turns are nonnegotiable; they must all fit
+        // at budget = 100 (3 Normals * 10 tokens = 30).
+        for n in normals.iter().rev().take(3) {
+            assert!(sel.contains(*n), "anchored turn {n:?} must fit");
+        }
     }
 
     #[test]
@@ -634,7 +809,8 @@ mod tests {
 
     #[test]
     fn covered_is_subtree_semantics_not_ancestor_walk() {
-        // `covered(node, sel)` from §8.4 means: every leaf descendant
+        // `covered(node, sel)` (`docs/archived/infinite_conversations.md`
+        // §8.4) means: every leaf descendant
         // of `node` is in `sel` (or `node` itself is).  It does NOT
         // walk upward.  This is the redundancy-elimination semantics.
         let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 2, 10, 20);
@@ -767,7 +943,7 @@ mod tests {
         // 16 leaves, budget tight enough that the algorithm has to
         // make 2+ passes.  Verify it terminates and produces a valid
         // result.
-        let (tree, _) = build_uniform_tree(16, 2, 8, 20);
+        let (tree, normals) = build_uniform_tree(16, 2, 8, 20);
         let mut scores = AHashMap::default();
         // Plant a few high-score middle nodes.
         scores.insert(NodeId(5), 5.0);
@@ -778,10 +954,10 @@ mod tests {
         // enough).
         assert!(sel.contains(NodeId(5)));
         assert!(sel.contains(NodeId(8)));
-        // Hard anchors must always be in.
-        assert!(sel.contains(NodeId(14)));
-        assert!(sel.contains(NodeId(15)));
-        assert!(sel.contains(NodeId(16)));
+        // The hard-anchored recent turns must always be in, verbatim.
+        for n in normals.iter().rev().take(3) {
+            assert!(sel.contains(*n), "anchored turn {n:?} must be selected");
+        }
     }
 
     #[test]

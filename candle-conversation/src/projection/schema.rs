@@ -53,6 +53,7 @@
 
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, SelectionPolicy};
+use crate::summary_tree::scope::Scope;
 
 /// Schema for one layer's system-prompt content.
 ///
@@ -591,53 +592,61 @@ impl CompressionPrompt {
     }
 }
 
-/// How a compression level runs.
+/// How a compression level produces a summary's **assistant half** (its
+/// content — the answer body).
 ///
-/// The leaf level (a layer's `turns`) is always [`SinglePass`](SummaryMode::SinglePass).
-/// A `summaries` (summary-of-summaries) level may instead be
-/// [`Structural`](SummaryMode::Structural) — a pipeline for structural content
-/// (repo_map, code_reading): the prompts run as a stage-1 abstraction, then a
-/// deterministic stage validates every emitted name against the child summaries
-/// and drops anything invented (see `zend/examples/pipeline_sos.rs`).
+/// Orthogonal to [`Scope`], which derives the *user* half. Any level may pair
+/// any `Content` with any `Scope`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SummaryMode {
-    /// One compression pass per half. The only mode for leaf turns; the default
-    /// for `summaries` too.
+pub enum Content {
+    /// The model decodes the content from the children under this level's
+    /// [`CompressionPrompt`]. The default, and right for prose: an assistant
+    /// half is exactly what a model decode is good at producing.
     #[default]
-    SinglePass,
-    /// Stage-1 model abstraction + deterministic stage-2 name-validation against
-    /// the child summaries. For structural roll-ups, where the names are known
-    /// from the children and the model only decides the grouping/abstraction.
+    Decode,
+    /// The content is built deterministically from the children, with no model
+    /// decode at all (`summary_tree::structural`). For content whose structure
+    /// is fully determined by its input — directory trees — where a decode is
+    /// pure cost and invites fabrication, and a faithful *merge* just unions the
+    /// children so the result grows toward the root instead of compressing.
     Structural,
 }
 
 /// How one tree-level of a layer's turns is compressed.
 ///
-/// A turn has two bodies — the user-message half (`Role::User`,
-/// `[user_start, user_end)`) and the assistant-response half (`Role::Assistant`,
-/// `[asst_start, total)`) — and they compress differently, so each gets its own
-/// [`CompressionPrompt`]. The decode cap is shared across both halves of this
-/// level. `mode` selects single-pass vs the validated structural pipeline.
+/// A summary turn is a compressed *exchange* and keeps both bodies of a real
+/// turn — the user-message half (`Role::User`, `[user_start, user_end)`) and the
+/// assistant-response half (`Role::Assistant`, `[asst_start, total)`) — so it
+/// stays role-coherent when re-injected, and carries a scope for retrieval to
+/// match against. The two halves are produced by different means:
+///
+/// - the **user half** is always *derived* from the children's scopes
+///   ([`Scope`]) — never decoded, because a decode always speaks as the
+///   assistant and would be inventing a question that was never asked;
+/// - the **assistant half** is produced per [`Content`]: decoded under
+///   [`Self::assistant`], or built deterministically.
+///
+/// There is deliberately no user-half prompt: nothing would ever run it.
 #[derive(Debug, Clone)]
 pub struct TurnSummary {
-    /// Compresses the user-message half of a turn (`Role::User`).
-    pub user: CompressionPrompt,
+    /// Derives the user-message half (the scope) from the children's scopes.
+    pub scope: Scope,
     /// Compresses the assistant-response half of a turn (`Role::Assistant`).
+    /// Unused when `content` is [`Content::Structural`].
     pub assistant: CompressionPrompt,
-    /// Hard decode-token ceiling for each compressed half.
+    /// Hard decode-token ceiling for the compressed assistant half.
     pub max_tokens: usize,
-    /// Single-pass (default) or the validated structural pipeline. Always
-    /// `SinglePass` for leaf turns; a `summaries` level may set `Structural`.
-    pub mode: SummaryMode,
+    /// How the assistant half is produced: decoded (default) or structural.
+    pub content: Content,
 }
 
 impl Default for TurnSummary {
     fn default() -> Self {
         Self {
-            user: CompressionPrompt::placeholder("__summary_user__"),
+            scope: Scope::default(),
             assistant: CompressionPrompt::placeholder("__summary_assistant__"),
             max_tokens: 0,
-            mode: SummaryMode::SinglePass,
+            content: Content::Decode,
         }
     }
 }
@@ -676,7 +685,6 @@ impl LayerSummary {
 
 impl TurnSummary {
     fn push_section_ids(&self, out: &mut Vec<u32>) {
-        out.push(self.user.system_prompt.id.raw());
         out.push(self.assistant.system_prompt.id.raw());
     }
 }

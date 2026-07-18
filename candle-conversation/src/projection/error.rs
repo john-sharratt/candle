@@ -96,11 +96,26 @@ pub enum ConstructionError {
     )]
     InvalidSummary { owner: String },
 
-    /// A summary level's `mode:` was not `single_pass` or `structural`.
+    /// A summary level's `content:` was not `decode` or `structural`.
     #[error(
-        "summary for {owner:?} has unknown mode {mode:?} (expected `single_pass` or `structural`)"
+        "summary for {owner:?} has unknown content {content:?} (expected `decode` or `structural`)"
     )]
-    InvalidSummaryMode { owner: String, mode: String },
+    InvalidSummaryContent { owner: String, content: String },
+
+    /// A summary level's `scope:` was not `union` or `line_spans`.
+    #[error(
+        "summary for {owner:?} has unknown scope {scope:?} (expected `union` or `line_spans`)"
+    )]
+    InvalidSummaryScope { owner: String, scope: String },
+
+    /// A `content: structural` summary level also set `scope:`, which it would
+    /// ignore — a structural level derives both halves from its children's
+    /// skeletons.
+    #[error(
+        "summary for {owner:?} sets `scope:` alongside `content: structural`, which ignores it \
+         (a structural level derives both halves from its children's skeletons)"
+    )]
+    ScopeOnStructuralSummary { owner: String },
 
     /// A `{name}` placeholder remained in the YAML template after
     /// substitution — either the caller forgot to supply that variable, or

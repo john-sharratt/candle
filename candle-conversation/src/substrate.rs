@@ -54,6 +54,7 @@ use crate::persistence::manifest::{
 };
 use crate::persistence::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
+    TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -62,6 +63,7 @@ use crate::projection::{
     TurnKey,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
+use crate::summary_tree::exchange::Couplings;
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
@@ -178,7 +180,7 @@ pub struct Substrate {
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
     /// Provides O(1) lookup for the test-harness `find_or_create`
-    /// pattern (§10.4 of `docs/infinite_conversations.md`).
+    /// pattern (§10.4 of `docs/archived/infinite_conversations.md`).
     timeline_by_debug_id: HashMap<String, TimelineId>,
 
     /// Walker scratch: `Label` / `ConvState` payloads decoded for a
@@ -793,8 +795,9 @@ pub trait ContentResolver {
         0
     }
 
-    /// Score-density selection over a timeline's summary tree
-    /// (`docs/infinite_conversations.md` §8).  Returns the chrono-
+    /// Score-density selection over a timeline's summary forest
+    /// (`docs/immutable_summary_forest.md` — *Window of attention*).
+    /// Returns the chrono-
     /// logically ordered `(turn_index, effective_score)` list for the
     /// given timeline, fitted into `budget` tokens, or `None` when no
     /// summary tree exists yet for that timeline.
@@ -817,7 +820,7 @@ pub trait ContentResolver {
     /// Number of turns currently awaiting the async summariser for
     /// `timeline`.  Used by the projection to populate the
     /// score-density backpressure metric inside its diagnostic sink
-    /// (§9 of `docs/infinite_conversations.md`).  Default returns 0.
+    /// (§9 of `docs/archived/infinite_conversations.md`).  Default returns 0.
     fn pending_summary_len(&self, _timeline: TimelineId) -> usize {
         0
     }
@@ -907,6 +910,13 @@ pub struct TimelineEntry {
     /// after the §6 probe runs.  The peak set (window entry points) is derived
     /// from this map — see [`Substrate::peaks_of`].
     pub tree_meta: BTreeMap<TurnIndex, TreeNodeMeta>,
+    /// Turns coupled to the tool response that follows them — the two halves of
+    /// one tool round-trip (`RecordType::TurnCoupling`). `from ∈ set` reads as
+    /// "turn `from + 1` is the tool response to turn `from`". Replayed as a set
+    /// because the records are idempotent and order-independent; consumed by
+    /// [`summary_tree::exchange`](crate::summary_tree::exchange) to group turns
+    /// into exchanges.
+    pub couplings: Couplings,
     /// Optional substrate-side resume key.  Set via
     /// [`Substrate::set_debug_id`] and reverse-indexed by
     /// [`Substrate::timeline_by_debug_id`].  Used by the
@@ -1031,6 +1041,7 @@ impl TimelineEntry {
         Self {
             layer,
             group,
+            couplings: Couplings::default(),
             label: None,
             conv_id: None,
             order: 0,
@@ -1937,6 +1948,38 @@ impl Substrate {
             })
     }
 
+    // ── tool-round-trip couplings ───────────────────────────────────────────
+
+    /// Couple `from_turn` to the tool response that follows it.
+    ///
+    /// Idempotent — replaying the same record, or coupling twice in a live
+    /// session, is a no-op. A coupling naming an unregistered timeline is
+    /// dropped: with no turns to group it could only describe a round-trip that
+    /// does not exist.
+    pub fn couple_turn(&mut self, timeline: TimelineId, from_turn: u32) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.couplings.insert(from_turn);
+        }
+    }
+
+    /// Replay a persisted [`TurnCouplingPayload`].
+    pub fn apply_turn_coupling(&mut self, payload: &TurnCouplingPayload) {
+        let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
+            return;
+        };
+        self.couple_turn(timeline, payload.from_turn);
+    }
+
+    /// The turns on `timeline` coupled to the tool response that follows them.
+    /// Empty for a timeline that has never made a tool call — every turn is then
+    /// its own exchange.
+    pub fn couplings_of(&self, timeline: TimelineId) -> Couplings {
+        self.timelines
+            .get(&timeline)
+            .map(|t| t.couplings.clone())
+            .unwrap_or_default()
+    }
+
     // ── debug_id resume keys ────────────────────────────────────────────────
 
     /// Set the substrate-side resume key for a timeline.  Replaces any
@@ -2654,6 +2697,11 @@ impl Substrate {
                     self.apply_stream_decl(stream_id, decl);
                 }
             }
+            RecordType::TurnCoupling => {
+                if let Ok(payload) = TurnCouplingPayload::decode(&entry.record.payload) {
+                    self.apply_turn_coupling(&payload);
+                }
+            }
             RecordType::Chunk => {
                 self.apply_chunk_loc(
                     stream_id,
@@ -2772,6 +2820,18 @@ impl Substrate {
                 TurnKind::SummaryOfSummaries => {}
             }
         }
+        // Install the exchange couplings, projected onto the chrono-normal
+        // positions the tree just collected, so selection can expand a hit on
+        // either half of a tool round-trip into the whole exchange.
+        let normals: Vec<TurnIndex> = tree
+            .chrono_normals()
+            .iter()
+            .map(|n| TurnIndex(n.0))
+            .collect();
+        tree.set_couplings(crate::summary_tree::exchange::over_normals(
+            &self.couplings_of(timeline),
+            &normals,
+        ));
         // The peak set (forest roots) is derived from the node parentage — no
         // single root to install.
         tree
@@ -5093,6 +5153,52 @@ mod tests {
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
         );
+    }
+
+    /// Replaying a coupling record makes the round-trip visible to the
+    /// summariser and selector. Idempotent: the records carry no ordering, and a
+    /// recovery walk may present the same one twice.
+    #[test]
+    fn turn_coupling_replays_into_the_timeline_set() {
+        use crate::projection::{GroupId, LayerId, TimelineAllocator};
+        let mut sub = Substrate::new();
+        let alloc = TimelineAllocator::new();
+        let timeline = alloc.next();
+        sub.register_timeline(timeline, LayerId::for_test(1), GroupId::for_test(1));
+
+        let payload = TurnCouplingPayload {
+            timeline_id: timeline.raw(),
+            from_turn: 4,
+        };
+        sub.apply_turn_coupling(&payload);
+        sub.apply_turn_coupling(&payload); // duplicate — must not change the set
+        assert_eq!(sub.couplings_of(timeline), [4u32].into_iter().collect());
+    }
+
+    /// A coupling naming a timeline that was never registered describes a
+    /// round-trip that cannot exist — it must be dropped, not conjure an entry.
+    #[test]
+    fn turn_coupling_for_an_unknown_timeline_is_dropped() {
+        let mut sub = Substrate::new();
+        let alloc = crate::projection::TimelineAllocator::new();
+        let timeline = alloc.next();
+        sub.apply_turn_coupling(&TurnCouplingPayload {
+            timeline_id: timeline.raw(),
+            from_turn: 1,
+        });
+        assert!(sub.couplings_of(timeline).is_empty());
+    }
+
+    /// A timeline that never called a tool has no couplings, so every turn is its
+    /// own exchange — the pre-coupling behaviour, unchanged.
+    #[test]
+    fn a_timeline_without_couplings_reports_an_empty_set() {
+        use crate::projection::{GroupId, LayerId, TimelineAllocator};
+        let mut sub = Substrate::new();
+        let alloc = TimelineAllocator::new();
+        let timeline = alloc.next();
+        sub.register_timeline(timeline, LayerId::for_test(1), GroupId::for_test(1));
+        assert!(sub.couplings_of(timeline).is_empty());
     }
 
     /// `tombstoned_stream_bytes` sums the on-disk record bytes of every

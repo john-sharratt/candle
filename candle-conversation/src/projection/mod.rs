@@ -235,8 +235,8 @@ pub use project::{
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
 pub use schema::{
-    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
+    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection, SectionSchema, SectionTree,
-    SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
-    TreeOption, TreeVariant, TurnSummary,
+    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode, TreeOption,
+    TreeVariant, TurnSummary,
 };

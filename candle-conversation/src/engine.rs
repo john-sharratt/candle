@@ -327,9 +327,10 @@ impl ConversationEngine {
         );
         let persist_trigger = persist_thread.trigger_handle();
 
-        // Spawn the async summariser thread (`docs/infinite_conversations.md`
-        // §3.3 / §7).  Drains the per-timeline pending queue every
-        // 250 ms (or on trigger), runs §6 probes via the
+        // Spawn the async summariser thread (`docs/immutable_summary_forest.md`
+        // — *Two queues*).  Drains the per-timeline pending queue every
+        // 250 ms (or on trigger), runs probes
+        // (`docs/archived/infinite_conversations.md` §6) via the
         // scheduler-backed [`ChannelProbeRunner`], extends the
         // per-timeline summary tree, and persists the resulting
         // [`TreeMetadata`] records to the redo log.  Spawned after the
@@ -464,7 +465,7 @@ impl ConversationEngine {
     /// * `config` — Per-conversation configuration (role markers, sampling, etc.).
     /// Persist a substrate-side resume key (`debug_id`) for
     /// `timeline`.  Used by the debug-id-resumable grow-conversation
-    /// harness (`docs/infinite_conversations.md` §10.4): a test can
+    /// harness (`docs/archived/infinite_conversations.md` §10.4): a test can
     /// re-open the workspace, call [`Self::lookup_by_debug_id`] to
     /// find a previously-built timeline, and continue growing.
     ///

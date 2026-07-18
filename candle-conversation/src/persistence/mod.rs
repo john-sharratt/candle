@@ -552,6 +552,22 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a [`RecordType::TurnCoupling`] record joining `from_turn` to the
+    /// tool response that follows it.
+    ///
+    /// Written before the response turn is submitted — the one window where the
+    /// round-trip is certain — so replay can never observe the response turn
+    /// without its coupling. Idempotent: duplicates replay into the same set.
+    pub fn write_turn_coupling(&mut self, timeline_id: u64, from_turn: u32) -> Result<()> {
+        let payload = record::TurnCouplingPayload {
+            timeline_id,
+            from_turn,
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
     /// Append a [`RecordType::Distilled`] record marking `timeline_id` for
     /// distillation at `mode` — its turns shed content on the next compaction
     /// pass. Idempotent for a fixed mode; a later record upgrades the mode

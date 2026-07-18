@@ -1297,6 +1297,22 @@ impl Conversation {
         Ok(())
     }
 
+    /// Couple `from_turn` to the tool response that follows it — in-RAM (so this
+    /// session's summariser groups the exchange immediately) and on disk (a
+    /// [`crate::persistence::record::RecordType::TurnCoupling`] record, so the
+    /// grouping survives reload).
+    ///
+    /// Must be called before the response turn is submitted: that ordering is
+    /// what stops the summariser observing half an exchange and freezing a leaf
+    /// over it.
+    pub fn couple_turn(&self, timeline: TimelineId, from_turn: u32) -> candle::Result<()> {
+        self.write().couple_turn(timeline, from_turn);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_turn_coupling(timeline.raw(), from_turn)
+            .map_err(|e| candle::Error::Msg(format!("write_turn_coupling: {e}")))?;
+        Ok(())
+    }
+
     /// Whether `timeline` has been tombstoned.
     pub fn is_timeline_tombstoned(&self, timeline: TimelineId) -> bool {
         self.read().is_tombstoned(timeline)

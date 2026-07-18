@@ -2650,6 +2650,29 @@ impl Sequence {
         read.turn_layout(timeline, TurnIndex(index))
     }
 
+    /// Couple `from_turn` — the sealed **call turn** — to the tool response about
+    /// to be submitted as the next turn, the two halves of one tool round-trip.
+    ///
+    /// Call this **after** the tools have returned real output and **before**
+    /// submitting the response turn. In that window the round-trip is certain:
+    /// the call turn is sealed (so its index is final) and the response turn is
+    /// guaranteed to follow. Writing it here — rather than at either turn's seal
+    /// — is what makes the record authoritative (a call that is never executed,
+    /// or yields nothing, simply never couples).
+    ///
+    /// `from_turn` must be the call turn's **own** index, captured from its seal
+    /// (`TurnResponse::seal`). Do not infer it from the current turn count: the
+    /// async summariser can seal a `SummaryOfTurns`/`SummaryOfSummaries` turn
+    /// into the same index space between the call turn's seal and this call, so
+    /// "the last turn" may be a summary node, not the call — and coupling that
+    /// index is silently dropped when the forest is derived (it maps to no
+    /// `Normal`), leaving the exchange unformed.
+    pub fn couple_turn(&self, from_turn: u32) -> crate::Result<()> {
+        self.substrate
+            .couple_turn(self.target.timeline, from_turn)
+            .map_err(ConversationError::Model)
+    }
+
     /// Persist this conversation's projection-event timeline for the most
     /// recently sealed turn. Called by the caller after `finish_turn` with the
     /// events streamed during (and at the end of) that turn's decode; survives
