@@ -21,7 +21,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use candle_conversation::turn_layout::TurnLayout;
 
@@ -60,6 +60,19 @@ pub async fn layer(
         .substrate_layer(&name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+pub async fn project(
+    State(session): State<Arc<ZendSession>>,
+    Json(req): Json<ProjectReq>,
+) -> Result<Json<ProjectView>, StatusCode> {
+    // The probe is a real GPU prefill + belief scan — keep it off the async
+    // runtime's worker threads so an in-flight projection never stalls other
+    // requests. `substrate_project` is synchronous and internally blocking.
+    let out = tokio::task::spawn_blocking(move || session.substrate_project(&req.text))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    out.map(Json).ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 pub async fn timeline(
@@ -136,6 +149,8 @@ pub struct LayerView {
     pub system_prompt: Vec<String>,
     /// Number of conversations targeting this layer.
     pub conv_count: usize,
+    /// Total sealed tokens across every conversation in this layer.
+    pub tokens: usize,
 }
 
 #[derive(Serialize)]
@@ -249,4 +264,42 @@ pub struct TurnView {
     /// present for normal turns, letting the viewer colorize the exact segments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<TurnLayout>,
+}
+
+/// `POST /v1/substrate/project` request — the typed query to project.
+#[derive(Deserialize)]
+pub struct ProjectReq {
+    pub text: String,
+}
+
+/// `POST /v1/substrate/project` body — what the query would retrieve, as tiles.
+#[derive(Serialize)]
+pub struct ProjectView {
+    /// Query token count (the probe's wide-Q window length).
+    pub query_tokens: usize,
+    /// Selected turns + scored section members, sorted by belief score descending.
+    pub tiles: Vec<ProjectTile>,
+}
+
+/// One retrieved item — a conversation turn/summary or a scored system-prompt
+/// section (collection member) the query would pull in.
+#[derive(Serialize)]
+pub struct ProjectTile {
+    /// `"normal"` | `"sot"` | `"sos"` | `"section"`.
+    pub kind: &'static str,
+    pub score: f32,
+    pub selected: bool,
+    pub layer: String,
+    pub group: String,
+    /// Turn: its conversation title (label / conv_id / file path) or `#index`.
+    /// Section: the section/tool name.
+    pub label: String,
+    pub tokens: u32,
+    /// Turn identity (raw timeline id as a string) — absent for sections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// The full body (turn text, or the tool description) — clipped by the client.
+    pub text: String,
 }

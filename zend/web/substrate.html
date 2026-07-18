@@ -143,6 +143,13 @@
   .seglegend{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;color:var(--ink-dim);font-family:var(--mono);font-size:11px}
   .seglegend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}
 
+  /* ── Project button (links to /project) ─────────────────────────── */
+  .projbtn{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:12.5px;
+    color:var(--bg);background:var(--accent);border:1px solid var(--accent);border-radius:9px;
+    padding:7px 13px;cursor:pointer;font-weight:600;text-decoration:none}
+  .projbtn:hover{filter:brightness(1.08)}
+  .projbtn svg{color:var(--bg)}
+
   @media (max-width:640px){
     .wrap{padding:16px 13px 60px}
     .kpi .v{font-size:19px}
@@ -166,6 +173,10 @@
     </div>
     <button class="pill" id="live"><span class="dot"></span><span id="livetxt">connecting…</span></button>
     <div class="spacer"></div>
+    <a class="projbtn" href="/project" title="Project a query against the substrate">
+      <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 10h9M9 6l4 4-4 4M15 4v12"/></svg>
+      Project
+    </a>
     <a class="back" href="/" onclick="if(history.length>1){history.back();return false;}">&larr; back</a>
   </header>
 
@@ -382,6 +393,7 @@ function layerCard(l, d){
     h('span',{class:'title mono'},[document.createTextNode(l.name)]),
     h('div',{class:'meta'},[
       l.conv_count?badge('on', l.conv_count+' conv'):badge('off','empty'),
+      l.tokens?badge('', fmtTok(l.tokens)+' tok'):null,
       isTarget?badge('peak','target'):null,
       badge('', 'win '+fmtTok(l.window)),
       badge('', 'pri '+l.priority),
@@ -473,27 +485,39 @@ function buildTurnBody(host, t){
       h('span',{class:'chip',html:'compresses turns <b>'+t.children.join(', ')+'</b>'})
     ]));
   }
+  // Readable content, primary. The user/assistant halves and the K/V segment
+  // layout describe the SAME tokens, so the segments go in a collapsed sub-panel
+  // below rather than duplicating the text inline.
   const userLbl = t.kind==='normal' ? 'user' : 'scope';
   const asstLbl = t.kind==='normal' ? 'assistant' : 'summary';
+  let anyText=false;
   if(t.user && t.user.trim()){
     host.appendChild(h('div',{class:'seg'},[h('div',{class:'lbl',text:userLbl}), h('pre',{class:'body user',text:t.user})]));
+    anyText=true;
   }
   if(t.assistant && t.assistant.trim()){
     host.appendChild(h('div',{class:'seg'},[h('div',{class:'lbl',text:asstLbl}), h('pre',{class:'body asst',text:t.assistant})]));
+    anyText=true;
   }
-  if((!t.user||!t.user.trim()) && (!t.assistant||!t.assistant.trim())){
+  const segs = (t.layout && t.layout.segments) || [];
+  if(!anyText && !segs.length){
     host.appendChild(h('div',{class:'empty',text:'(no decoded body)'}));
   }
-  if(t.layout && t.layout.segments && t.layout.segments.length){
-    host.appendChild(renderSegments(t.layout.segments));
+  if(segs.length){
+    const head=[
+      h('span',{class:'title',text:'K/V layout'}),
+      h('div',{class:'meta'},[badge('', segs.length+' segments')]),
+    ];
+    const kv=group(head,(b)=>{ b.appendChild(renderSegments(segs)); });
+    kv.style.borderLeftColor='var(--c-glue)'; kv.style.marginTop='9px';
+    host.appendChild(kv);
   }
 }
 
-// Colorized K/V segment layout (real vs ethereal glue, user, thinking, assistant).
+// Colorized K/V segment layout as a <pre> (real vs ethereal glue, user, thinking,
+// assistant) — shown inside the collapsed "K/V layout" panel.
 function renderSegments(segs){
   const kindColor={user:'var(--c-user)',assistant:'var(--c-asst)',thinking:'var(--c-think)',glue:'var(--c-glue)'};
-  const wrap=h('div',{class:'seg'});
-  wrap.appendChild(h('div',{class:'lbl',text:'K/V segments'}));
   const pre=h('pre',{class:'body'});
   segs.forEach(s=>{
     const kind=(s.kind||'glue').toLowerCase();
@@ -505,8 +529,7 @@ function renderSegments(segs){
     line.textContent = txt + '\n';
     pre.appendChild(line);
   });
-  wrap.appendChild(pre);
-  return wrap;
+  return pre;
 }
 
 function escapeHtml(s){ return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -588,13 +611,13 @@ function mockOverview(){
     target_layer:'dialogue',
     layers:[
       {name:'repo_map',description:'Structural shape of the repository: directory tree, file types, line counts.',
-        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],system_prompt:['frame'],conv_count:1},
+        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],system_prompt:['frame'],conv_count:1,tokens:14880},
       {name:'code_reading',description:'Raw scope-aware code chunks. One turn per (file × scope) chunk.',
-        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],system_prompt:['frame'],conv_count:1},
+        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],system_prompt:['frame'],conv_count:2,tokens:10430},
       {name:'dialogue',description:'The active developer conversation served to the VS Code extension or web chat.',
         window:16000,priority:100,groups:[{name:'primary_conversation',selection:'recent 16 + top 8'}],
         system_prompt:['system open · template','section tree','history_stance','grounding','tools_overview',
-          'tools · collection','system close · template'],conv_count:3},
+          'tools · collection','system close · template'],conv_count:3,tokens:35630},
     ],
   };
 }
@@ -625,7 +648,10 @@ function mockTools(){
 function mockLayer(name){
   const m={
     repo_map:[{timeline:'3300220011009988776',conv_id:'',label:'(untitled)',archived:false,group:'structure',turns:22,tokens:14880,summary_nodes:4}],
-    code_reading:[{timeline:'2200110099887766554',conv_id:'',label:'(untitled)',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0}],
+    code_reading:[
+      {timeline:'2200110099887766554',conv_id:'',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0},
+      {timeline:'2200110099887766555',conv_id:'',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0},
+    ],
     dialogue:[
       {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turns:18,tokens:24310,summary_nodes:3},
       {timeline:'7311882299441100223',conv_id:'99aa88bb77cc',label:'Segmented log compaction design',archived:false,group:'primary_conversation',turns:7,tokens:9120,summary_nodes:0},

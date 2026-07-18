@@ -14,8 +14,8 @@ use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemPromptItem,
-    SystemPromptSchema, TimelineId,
+    self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
+    SystemPromptSchema, TimelineId, TurnIndex,
 };
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
@@ -27,8 +27,9 @@ use candle_conversation::{
 use serde_json::Value;
 
 use crate::api::substrate::{
-    ConvView, Counts, GroupView, LayerConversations, LayerView, SectionView, SegmentView, Storage,
-    SubstrateOverview, SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
+    ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
+    SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
+    ToolView, ToolsView, TurnView,
 };
 use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
@@ -2513,21 +2514,25 @@ impl ZendSession {
         let layers: Vec<LayerView> = schema
             .layers
             .iter()
-            .map(|l| LayerView {
-                name: l.name.clone(),
-                description: l.description.trim().to_string(),
-                window: l.window,
-                priority: l.budget.priority,
-                groups: l
-                    .groups
-                    .iter()
-                    .map(|g| GroupView {
-                        name: g.name.clone(),
-                        selection: fmt_selection(&g.selection),
-                    })
-                    .collect(),
-                system_prompt: system_prompt_labels(&l.system_prompt),
-                conv_count: layer_conv_count(s, &l.groups, titler),
+            .map(|l| {
+                let (conv_count, tokens) = layer_totals(s, &l.groups, titler);
+                LayerView {
+                    name: l.name.clone(),
+                    description: l.description.trim().to_string(),
+                    window: l.window,
+                    priority: l.budget.priority,
+                    groups: l
+                        .groups
+                        .iter()
+                        .map(|g| GroupView {
+                            name: g.name.clone(),
+                            selection: fmt_selection(&g.selection),
+                        })
+                        .collect(),
+                    system_prompt: system_prompt_labels(&l.system_prompt),
+                    conv_count,
+                    tokens,
+                }
             })
             .collect();
 
@@ -2710,6 +2715,147 @@ impl ZendSession {
             },
             couplings: coupling_list,
             turns,
+        })
+    }
+
+    /// `POST /v1/substrate/project` — project a typed query against the substrate.
+    /// Prefills `text` under the base conversation's system prompt (no seal, no
+    /// belief mutation), then resolves the selected turns + scored section members
+    /// into score-sorted tiles. `None` until the model is loaded.
+    pub fn substrate_project(&self, text: &str) -> Option<ProjectView> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        if text.trim().is_empty() {
+            return Some(ProjectView {
+                query_tokens: 0,
+                tiles: Vec::new(),
+            });
+        }
+
+        // Project the query against the substrate as a warm ephemeral turn: the
+        // probe materializes the full system prompt, captures the query's wide-Q,
+        // and scores it — writing NOTHING to the substrate. Snapshot the handles
+        // under a brief `base_conv` lock, then run the GPU-bound probe UNLOCKED so
+        // the fork source isn't held across a full turn round-trip.
+        let ctx = { state.base_conv.lock().unwrap().probe_ctx() };
+        let (event, query_tokens) = match ctx.probe(text) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("substrate_project probe failed: {e:#}");
+                return Some(ProjectView {
+                    query_tokens: 0,
+                    tiles: Vec::new(),
+                });
+            }
+        };
+
+        // Resolve tile labels + bodies from the substrate (read lock only).
+        let conv = { state.engine.lock().unwrap().conversation() };
+        let read = conv.read();
+        let s = &*read;
+
+        let mut tiles: Vec<ProjectTile> = Vec::new();
+
+        // Selected conversation turns / summary nodes.
+        for t in &event.selection.turns {
+            let Some(tl_raw) = t.timeline else {
+                continue; // the live user message has no source timeline
+            };
+            let kind = match t.kind {
+                TurnKind::Normal => "normal",
+                TurnKind::SummaryOfTurns => "sot",
+                TurnKind::SummaryOfSummaries => "sos",
+            };
+            let (label, body) = match projection::TimelineId::from_raw(tl_raw) {
+                Some(tl) => {
+                    let title = s
+                        .label_of(tl)
+                        .filter(|l| !l.is_empty())
+                        .or_else(|| s.conv_id_of(tl).filter(|c| !c.is_empty()))
+                        .map(|x| x.to_string())
+                        .or_else(|| {
+                            s.custom_of(tl)
+                                .and_then(|m| m.get("path"))
+                                .filter(|p| !p.is_empty())
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| format!("turn #{}", t.index));
+                    let idx = TurnIndex(t.index);
+                    let u = s.user_text_of(tl, idx);
+                    let a = s.assistant_text_of(tl, idx);
+                    let body = if u.trim().is_empty() {
+                        a
+                    } else if a.trim().is_empty() {
+                        u
+                    } else {
+                        format!("{u}\n\n{a}")
+                    };
+                    (title, body)
+                }
+                None => (format!("turn #{}", t.index), String::new()),
+            };
+            tiles.push(ProjectTile {
+                kind,
+                score: t.score,
+                selected: t.selected,
+                layer: t.layer.clone(),
+                group: t.group.clone(),
+                label,
+                tokens: t.tokens,
+                timeline: Some(tl_raw.to_string()),
+                index: Some(t.index),
+                text: body,
+            });
+        }
+
+        // Scored section members (the collection tools). Text comes from the live
+        // registry (the schema declares the collection empty). Cut the noise floor:
+        // keep only members the query selected or gave a positive belief score.
+        let tool_desc: HashMap<&str, &str> = zend_tools::registry::all_tools()
+            .iter()
+            .map(|t| (t.name, t.description))
+            .collect();
+        for item in &event.selection.system {
+            if let SystemItem::Collection { name, sections } = item {
+                for sec in sections {
+                    if !sec.selected && sec.score <= 0.0 {
+                        continue;
+                    }
+                    tiles.push(ProjectTile {
+                        kind: "section",
+                        score: sec.score,
+                        selected: sec.selected,
+                        layer: String::new(),
+                        group: name.clone(),
+                        label: sec.name.clone(),
+                        tokens: sec.tokens,
+                        timeline: None,
+                        index: None,
+                        text: tool_desc
+                            .get(sec.name.as_str())
+                            .map(|d| d.to_string())
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
+        tiles.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+        // Diagnostic: if `scored` is 0 while `query_tokens` > 0, the probe Q was
+        // captured but didn't discriminate against the gallery (cold/partial-warm
+        // context) — selection fell back to the default fill.
+        let max_score = tiles.iter().map(|t| t.score).fold(0.0f32, f32::max);
+        tracing::info!(
+            query_tokens,
+            tiles = tiles.len(),
+            scored = tiles.iter().filter(|t| t.score.abs() > f32::EPSILON).count(),
+            max_score,
+            "substrate_project"
+        );
+
+        Some(ProjectView {
+            query_tokens,
+            tiles,
         })
     }
 
@@ -3613,15 +3759,15 @@ fn clean_title(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// Count the conversations (non-empty, non-tombstoned, non-titler timelines)
-/// targeting a layer's groups — the cheap number the overview shows without
-/// materializing the list.
-fn layer_conv_count(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> usize {
+/// `(conversation count, total tokens)` across the non-empty, non-tombstoned,
+/// non-titler timelines targeting a layer's groups — the cheap headline numbers
+/// the overview shows without materializing the conversation list.
+fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (usize, usize) {
     groups
         .iter()
         .flat_map(|g| s.timelines_for_group(g.id))
         .filter(|tl| *tl != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
-        .count()
+        .fold((0, 0), |(n, tok), tl| (n + 1, tok + s.total_token_count(tl)))
 }
 
 /// The conversations targeting a layer's groups, largest first. Enumerates
@@ -3636,14 +3782,23 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
             if tl == titler || s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
                 continue;
             }
-            // Internal timelines carry no conv_id/label; fall back to the
-            // conv_id, then to an empty string (the viewer shows "(untitled)").
+            // Title precedence: the sidebar label, then the conv_id, then the
+            // conversation's `path` metadata — code_reading (and any file-scoped
+            // ingest) records the file path there at creation, so those otherwise
+            // conv_id-less timelines read as the file they cover instead of
+            // "(untitled)".
             let label = s
                 .label_of(tl)
                 .filter(|l| !l.is_empty())
                 .or_else(|| s.conv_id_of(tl).filter(|c| !c.is_empty()))
-                .unwrap_or_default()
-                .to_string();
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    s.custom_of(tl)
+                        .and_then(|m| m.get("path"))
+                        .filter(|p| !p.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_default();
             let summary_nodes = s
                 .turn_indices(tl)
                 .filter(|idx| s.tree_meta_of(tl, *idx).is_some_and(|m| m.kind.is_summary()))

@@ -37,6 +37,7 @@ pub fn build_id() -> &'static str {
             "index.html",
             "perf.html",
             "substrate.html",
+            "project.html",
             "zend-api.js",
             "zend-api.mock.js",
             "zend-api.live.js",
@@ -61,6 +62,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/substrate/tools", get(substrate::tools))
         .route("/v1/substrate/layer/:name", get(substrate::layer))
         .route("/v1/substrate/timeline/:tl", get(substrate::timeline))
+        .route("/v1/substrate/project", post(substrate::project))
         .route("/v1/debug/maintenance", post(status::force_maintenance))
         .route("/v1/conversations", get(conversations::list))
         .route(

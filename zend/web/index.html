@@ -1511,6 +1511,7 @@
     files: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:12px;"><path d="M3 1.2h4.4l3 3v8.6H3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M7.2 1.4v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>',
     perf: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.5 1.5v11h11M4 9l2.5-3 2 2L12 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     substrate: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M7 1.2 12.5 4 7 6.8 1.5 4 7 1.2ZM1.5 7 7 9.8 12.5 7M1.5 10 7 12.8 12.5 10" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>',
+    project: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.8 7h6.4M6.2 4.2 9 7l-2.8 2.8M10.5 2.5v9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     menu: '<svg viewBox="0 0 16 16" fill="none" style="width:15px;height:15px;"><circle cx="8" cy="3" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="13" r="1.4" fill="currentColor"/></svg>',
   };
 
@@ -1524,6 +1525,7 @@
       { key: 'files', label: 'Files', icon: ICON.files, active: S.filesOpen, badge: filesCount || null, title: 'Conversation files', onClick: () => setState({ filesOpen: !S.filesOpen, topMenuOpen: false }) },
       { key: 'perf', label: 'Perf', icon: ICON.perf, href: '/perf', title: 'Wave & pressure telemetry' },
       { key: 'substrate', label: 'Substrate', icon: ICON.substrate, href: '/substrate', title: 'Substrate inspector' },
+      { key: 'project', label: 'Project', icon: ICON.project, href: '/project', title: 'Project a query against the substrate' },
     ].filter(Boolean);
   }
 

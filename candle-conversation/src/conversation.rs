@@ -14,9 +14,11 @@ use crate::projection::{
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
+use crate::provenance::WideQSig;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
+use crate::TurnEvent;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
@@ -2154,6 +2156,22 @@ impl Sequence {
         Some(ev)
     }
 
+    /// Snapshot the handles the interactive projection probe needs into a
+    /// lock-free [`ProbeCtx`]. Cheap (Arc/handle clones), so the caller drops the
+    /// `base_conv` mutex immediately and runs the GPU-bound [`ProbeCtx::probe`]
+    /// unlocked — the probe (a full turn round-trip) must not hold the fork source
+    /// every new conversation and several status reads contend on.
+    pub fn probe_ctx(&self) -> ProbeCtx {
+        ProbeCtx {
+            scheduler_tx: self.scheduler_tx.clone(),
+            substrate: self.substrate.clone(),
+            projection: Arc::clone(&self.projection),
+            target: self.target,
+            tokenizer: Arc::clone(&self.tokenizer),
+            selection: self.selection.clone(),
+        }
+    }
+
     /// `(section name, authored content)` for every system-prompt section in the
     /// schema (bare sections + every collection member). Backs the projection
     /// panel's expandable section text — fetched on demand, never stored in the
@@ -2992,6 +3010,176 @@ pub(crate) fn windowed_ingest_ranges_impl(
     }
     ranges.push((keep_from, total));
     ranges
+}
+
+/// A lock-free snapshot of the handles the interactive projection probe needs
+/// ([`Sequence::probe_ctx`]), so the probe — a full GPU turn round-trip — runs
+/// WITHOUT holding the `base_conv` mutex, which is the fork source every new
+/// conversation and several status reads contend on.
+pub struct ProbeCtx {
+    scheduler_tx: Sender<SchedulerRequest>,
+    substrate: Conversation,
+    projection: Arc<Builder>,
+    target: ProjectionTarget,
+    tokenizer: Arc<tokenizers::Tokenizer>,
+    selection: SelectionState,
+}
+
+impl ProbeCtx {
+    /// Project a typed `text` against the current substrate as if it were a new
+    /// turn under this conversation's system prompt — the interactive
+    /// "what would this query retrieve" probe. Warms the query under the full
+    /// system prompt, scores its wide-Q read-only (`observe = false`), and returns
+    /// the resulting [`ProjectionEvent`] (selected turns + sections with belief
+    /// scores) plus the query token count. Persists NOTHING to the substrate.
+    pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, usize)> {
+        let probe = self.probe_wide_q(text)?;
+        let query_tokens = probe.len();
+        let (scores, _) =
+            self.substrate
+                .score_beliefs(self.projection.schema(), self.target, &probe, false);
+        let resolver = self.substrate.read_for_scored(self.target, &scores);
+        let projection = self.projection.project_with_selection(
+            self.target,
+            &resolver,
+            ProjectionMode::Prefill,
+            &self.selection,
+        );
+        let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
+        let ev = from_projection_with_origins(
+            &projection.segments,
+            &projection.selection_origins,
+            self.projection.schema(),
+            &resolver,
+            &projection.selection_scores,
+            substrate_total,
+            0,
+            0.0,
+        );
+        Ok((ev, query_tokens))
+    }
+
+    /// Capture the WARM folded wide-Q signature of `text` as if it were a new turn
+    /// under the system prompt, WITHOUT writing anything to the substrate. An
+    /// ephemeral projection slot materializes the full system prompt (warming the
+    /// query's Q exactly like a real turn) and decodes one throwaway token so the
+    /// completion path finalizes the KV and gathers the query wide-Q; the slot
+    /// resolves to `SealAction::None`, so no turn is sealed and no belief learned.
+    fn probe_wide_q(&self, text: &str) -> crate::Result<Vec<WideQSig>> {
+        let query_tokens = match self.tokenizer.encode(text, false) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(_) => return Ok(Vec::new()),
+        };
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Ephemeral slot bound to this conversation's target: it projects (warm)
+        // but never seals.
+        let slot = {
+            let (tx, rx) = crossbeam::channel::bounded(1);
+            self.scheduler_tx
+                .send(SchedulerRequest::NewEphemeralSequence {
+                    conversation: self.substrate.clone(),
+                    target: self.target,
+                    response_tx: tx,
+                })
+                .map_err(|_| ConversationError::SchedulerGone)?;
+            rx.recv().map_err(|_| ConversationError::SchedulerGone)??
+        };
+        let free = |tx: &Sender<SchedulerRequest>| {
+            let _ = tx.send(SchedulerRequest::FreeSequence { sequence_id: slot });
+        };
+
+        // Submit the query as a projected turn (full warm system prompt via
+        // `apply_projection`), decoding one token so the completion path finalizes
+        // the KV onto the slot and gathers the query's warm wide-Q.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::SubmitTurn {
+                sequence_id: slot,
+                projection_inputs: Some(ProjectionInputs {
+                    projection: Arc::clone(&self.projection),
+                    selection: self.selection.clone(),
+                }),
+                prefill_tokens: TokenBuffer::from(query_tokens),
+                prefill_text: String::new(),
+                user_text: String::new(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
+                tags: Vec::new(),
+                projection_offsets: Vec::new(),
+                prefill_assistant_text: String::new(),
+                post_decode_tokens: TokenBuffer::new(),
+                max_decode_tokens: 1,
+                sampling: SamplingConfig::argmax(),
+                event_tx,
+                reprojection: None,
+                disable_reprojection: false,
+                triggers: Arc::new(TriggerRegistry::new()),
+            })
+            .is_err()
+        {
+            free(&self.scheduler_tx);
+            return Err(ConversationError::SchedulerGone);
+        }
+
+        // Drain to Done/Error. A channel closed before `Done` (the turn was aborted
+        // without a terminal event) is a failure — surface it rather than returning
+        // an empty window that reads as "query retrieved nothing".
+        let mut err: Option<ConversationError> = None;
+        let mut done = false;
+        while let Ok(ev) = event_rx.recv() {
+            match ev {
+                TurnEvent::Done(_) => {
+                    done = true;
+                    break;
+                }
+                TurnEvent::Error(e) => {
+                    err = Some(e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = err {
+            free(&self.scheduler_tx);
+            return Err(e);
+        }
+        if !done {
+            free(&self.scheduler_tx);
+            return Err(ConversationError::SchedulerGone);
+        }
+
+        // Drain the warm wide-Q the ephemeral turn stashed, then free.
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let sigs = if self
+            .scheduler_tx
+            .send(SchedulerRequest::ProbeWideSigs {
+                sequence_id: slot,
+                response_tx: tx,
+            })
+            .is_ok()
+        {
+            rx.recv()
+                .map_err(|_| ConversationError::SchedulerGone)
+                .and_then(|r| r)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        free(&self.scheduler_tx);
+
+        // Keep the WHOLE turn window `[query .. decoded]`, not just the query — the
+        // discriminating belief signal for a tool lives in the DECODE-Q (the token
+        // where the model commits to the call), not the query's prefill-Q, which
+        // sits near the noise floor (the call↔definition domain gap). Dropping the
+        // decoded tail collapsed scores ~10× (600 → 60).
+        Ok(sigs)
+    }
 }
 
 #[cfg(test)]
