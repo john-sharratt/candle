@@ -170,6 +170,7 @@ impl Manifest {
             | RecordType::DebugId
             | RecordType::Tombstone
             | RecordType::Distilled
+            | RecordType::TurnCoupling
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
             | RecordType::HeaderIndex

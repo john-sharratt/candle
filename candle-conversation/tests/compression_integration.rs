@@ -347,12 +347,10 @@ fn compression_over_zend_schema() -> candle_conversation::Result<()> {
             .iter()
             .find(|l| l.id == dialogue_layer)
             .expect("dialogue layer in schema");
-        let mut comp_ids = vec![
-            dl.summary.turns.user.system_prompt.id.raw(),
-            dl.summary.turns.assistant.system_prompt.id.raw(),
-        ];
+        // Only the assistant half has a prompt — a summary's user half (its
+        // scope) is derived from its children's, never decoded.
+        let mut comp_ids = vec![dl.summary.turns.assistant.system_prompt.id.raw()];
         if let Some(s) = &dl.summary.summaries {
-            comp_ids.push(s.user.system_prompt.id.raw());
             comp_ids.push(s.assistant.system_prompt.id.raw());
         }
         eprintln!("compression-prompt section ids: {comp_ids:?}");

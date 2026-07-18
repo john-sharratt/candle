@@ -118,20 +118,13 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        # Structural mode: the leaf is built DETERMINISTICALLY from the scan turn —
+        # Structural content: the leaf is built DETERMINISTICALLY from the scan turn —
         # strip the `(N lines, …)` size annotations, keep the full directory
         # skeleton — with NO model decode (`summary_tree::structural::leaf_skeleton`).
-        # The user/assistant prompts below are therefore unused; the schema still
-        # mandates a summary block, so they remain as a faithful fallback.
-        mode: structural
-        user:
-          system_prompt: |
-            You name which repository or scope is being mapped — the root path or
-            directory being absorbed. Output only that reference; never name a path
-            that does not appear in the message above, and add nothing else.
-          user_prompt: |
-            Name which repository or directory scope is being mapped above. Nothing
-            else.
+        # Both halves are derived from the skeleton, which for a directory tree is the
+        # authoritative statement of what the node covers, so no `scope:` is set (the
+        # schema rejects one here) and the `assistant:` prompt below never runs.
+        content: structural
         assistant:
           system_prompt: |
             You compress a repository structure map into a faithful structural
@@ -145,22 +138,12 @@ layers:
             dropping sizes and counts and adding nothing.
       summaries:
         max_tokens: 384
-        # Structural mode: the summary-of-summaries is built DETERMINISTICALLY from
+        # Structural content: the summary-of-summaries is built DETERMINISTICALLY from
         # the children's directory paths (truncated by tree height so it coarsens
         # toward the root), with NO model decode — see `summary_tree::structural`.
-        # The user/assistant prompts below are therefore unused for SoS under this
-        # mode (only the leaf `turns` prompts above run); the schema still mandates
-        # a summary block, so they remain as a faithful single-pass fallback.
-        mode: structural
-        user:
-          system_prompt: |
-            Each section below names a repository directory that was mapped. Name the
-            directories mapped across them, using ONLY paths that literally appear in
-            the sections above — never invent, alter, or guess a path. Add nothing and
-            describe nothing.
-          user_prompt: |
-            Name the directories mapped across the sections above, using only paths
-            that appear there, adding nothing.
+        # As with the leaf above, both halves are derived and the `assistant:` prompt
+        # below never runs.
+        content: structural
         assistant:
           system_prompt: |
             The sections below are already-compressed structural skeletons —
@@ -251,15 +234,11 @@ layers:
     summary:
       turns:
         max_tokens: 512
-        user:
-          system_prompt: |
-            You name which code chunk is being read: the file path and the specific
-            scope within it — a function, struct, impl block, or import group. Output
-            only that reference; never name a file or scope that does not appear in
-            the message above, and add nothing else.
-          user_prompt: |
-            Name the file and the specific scope (function, struct, impl, import
-            group) being read above. Nothing else.
+        # The user half of a code_reading turn is an excerpt header naming a file
+        # and a line range (`Source excerpt — `path` lines 47-93:`), so the scope
+        # of a roll-up is those ranges coalesced per file: reads of 1-40 and 41-93
+        # are one read of 1-93. Derived, never decoded.
+        scope: line_spans
         assistant:
           system_prompt: |
             You compress absorbed source code into a faithful digest. Open by naming
@@ -277,16 +256,7 @@ layers:
             captured.
       summaries:
         max_tokens: 512
-        user:
-          system_prompt: |
-            The scope sections below are already compressed. Name which files and
-            scopes were read across them, using only file and scope names that appear
-            in those sections — never invent or alter a path. Add nothing and describe
-            nothing. This is a tree node: near the root it names the whole region of
-            code that was read.
-          user_prompt: |
-            Name the files and scopes read across the sections above, using only names
-            that appear there, adding nothing.
+        scope: line_spans
         assistant:
           system_prompt: |
             The code digests below are already compressed. Merge them into one digest:
@@ -333,14 +303,6 @@ layers:
     summary:
       turns:
         max_tokens: 512
-        user:
-          system_prompt: |
-            You name which file is being enumerated: its path (and scope, if one is
-            named). Output only that reference; never name a file that does not appear
-            in the message above, and add nothing else.
-          user_prompt: |
-            Name the file (and scope) whose artifacts are enumerated above. Nothing
-            else.
         assistant:
           system_prompt: |
             You compress an enumeration of a file's code artifacts into a faithful
@@ -353,15 +315,6 @@ layers:
             purpose. Omit none, invent none.
       summaries:
         max_tokens: 512
-        user:
-          system_prompt: |
-            The file-reference sections below are already compressed. Name which files
-            were analysed across them, using only file names that appear in those
-            sections — never invent or alter a path. Add nothing and describe nothing.
-            This is a tree node: near the root it names all the analysed files.
-          user_prompt: |
-            Name the files analysed across the sections above, using only names that
-            appear there, adding nothing.
         assistant:
           system_prompt: |
             The artifact indexes below are already compressed. Merge them into one
@@ -410,14 +363,6 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        user:
-          system_prompt: |
-            You name which file's dependencies are being mapped: its path (and the
-            artifact, if one is named). Output only that reference; never name a file
-            that does not appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the file (and artifact) whose dependency graph is mapped above.
-            Nothing else.
         assistant:
           system_prompt: |
             You compress a file's dependency analysis into a faithful edge list. Keep
@@ -430,16 +375,6 @@ layers:
             captured.
       summaries:
         max_tokens: 384
-        user:
-          system_prompt: |
-            The reference sections below are already compressed. Name which files had
-            their dependencies mapped across them, using only file names that appear in
-            those sections — never invent or alter a path. Add nothing and describe
-            nothing. This is a tree node: near the root it names the whole region whose
-            dependencies were mapped.
-          user_prompt: |
-            Name the files whose dependencies were mapped across the sections above,
-            using only names that appear there, adding nothing.
         assistant:
           system_prompt: |
             The dependency edge lists below are already compressed. Merge them into one
@@ -485,14 +420,6 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        user:
-          system_prompt: |
-            You name which file's architecture is under analysis: its path (and the
-            artifact, if one is named). Output only that reference; never name a file
-            that does not appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the file (and artifact) whose architecture is analysed above. Nothing
-            else.
         assistant:
           system_prompt: |
             You compress an architectural analysis into a shorter, faithful version.
@@ -507,16 +434,6 @@ layers:
             adding nothing and stopping when captured.
       summaries:
         max_tokens: 384
-        user:
-          system_prompt: |
-            The reference sections below are already compressed. Name which files were
-            analysed architecturally across them, using only file names that appear in
-            those sections; add nothing not already there. Output only that line: never
-            output these directions or describe the task. This is a tree node: near the
-            root it names the whole region whose architecture was reasoned about.
-          user_prompt: |
-            Name the files analysed architecturally across the sections above, using
-            only names that appear there, as one short line.
         assistant:
           system_prompt: |
             The architectural sections below are already compressed. Merge them into
@@ -566,13 +483,6 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        user:
-          system_prompt: |
-            You name which file is being critically evaluated: its path (and scope, if
-            one is named). Output only that reference; never name a file that does not
-            appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the file (and scope) being critically evaluated above. Nothing else.
         assistant:
           system_prompt: |
             You compress a critical evaluation into a shorter, faithful version. Keep
@@ -587,16 +497,6 @@ layers:
             stopping when captured.
       summaries:
         max_tokens: 384
-        user:
-          system_prompt: |
-            The reference sections below are already compressed. Name which files were
-            critiqued across them, using only file names that appear in those sections;
-            add nothing not already there. Output only that line: never output these
-            directions or describe the task. This is a tree node: near the root it
-            names the whole region that was critiqued.
-          user_prompt: |
-            Name the files critiqued across the sections above, using only names that
-            appear there, as one short line.
         assistant:
           system_prompt: |
             The critique sections below are already compressed. Merge them into one
@@ -656,13 +556,6 @@ layers:
     summary:
       turns:
         max_tokens: 512
-        user:
-          system_prompt: |
-            You name which file is being hunted for bugs: its path (and scope, if one
-            is named). Output only that reference; never name a file that does not
-            appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the file (and scope) being hunted for bugs above. Nothing else.
         assistant:
           system_prompt: |
             You compress a bug analysis into a shorter, faithful version. Keep every
@@ -677,16 +570,6 @@ layers:
             stopping when captured.
       summaries:
         max_tokens: 512
-        user:
-          system_prompt: |
-            The reference sections below are already compressed. Name which files were
-            hunted for bugs across them, using only file names that appear in those
-            sections; add nothing not already there. Output only that line: never
-            output these directions or describe the task. This is a tree node: near the
-            root it names the whole region that was checked.
-          user_prompt: |
-            Name the files hunted for bugs across the sections above, using only names
-            that appear there, as one short line.
         assistant:
           system_prompt: |
             The bug sections below are already compressed. Merge them into one faithful,
@@ -734,14 +617,6 @@ layers:
     summary:
       turns:
         max_tokens: 512
-        user:
-          system_prompt: |
-            You name which day's record this is and the convergence question that
-            framed it, as prose. Keep only that; never name a day or question that does
-            not appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the day and the convergence question asked of it above, as prose.
-            Nothing else.
         assistant:
           system_prompt: |
             You compress a day's developer conversations into a shorter, faithful
@@ -756,16 +631,6 @@ layers:
             adding nothing, stopping when captured.
       summaries:
         max_tokens: 512
-        user:
-          system_prompt: |
-            The question sections below are already compressed. Name which days and
-            what was asked across them, as one prose passage, using only what appears in
-            those sections and adding nothing. Output only that passage: never output
-            these directions or describe the task. This is a tree node: near the root it
-            describes what the whole period was converging on.
-          user_prompt: |
-            Name the days and what was asked across the sections above, as one short
-            prose passage, using only what appears there.
         assistant:
           system_prompt: |
             The daily sections below are already compressed. Merge them into one
@@ -815,13 +680,6 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        user:
-          system_prompt: |
-            You name the what-if scenario that framed a dream — the "If I was to…"
-            change being explored. Keep only that assignment; never name a change that
-            does not appear in the message above, and add nothing else.
-          user_prompt: |
-            Name the what-if change being explored above. Nothing else.
         assistant:
           system_prompt: |
             You compress a speculative architectural exploration into a shorter,
@@ -835,16 +693,6 @@ layers:
             implications, dropping hedging, adding nothing, stopping when captured.
       summaries:
         max_tokens: 384
-        user:
-          system_prompt: |
-            The scenario sections below are already compressed. Name what kinds of
-            changes were explored across them, using only what appears in those
-            sections and adding nothing. Output only that line: never output these
-            directions or describe the task. This is a tree node: near the root it
-            covers the whole space of speculation.
-          user_prompt: |
-            Name the kinds of changes explored across the sections above, using only
-            what appears there, as one short line.
         assistant:
           system_prompt: |
             The speculative sections below are already compressed. Merge them into one
@@ -1136,22 +984,6 @@ layers:
     summary:
       turns:
         max_tokens: 192
-        user:
-          system_prompt: |
-            /no_think
-            You restate a developer's message AS the request itself — a direct
-            question or instruction in their own first/second-person voice, exactly
-            as they would type it, only shorter. Keep the specific ask plus any
-            names, numbers, and constraints. A question stays a question ("How does
-            X work?"); an instruction stays an instruction ("Refactor Y to Z"). If
-            it is already short, output it almost verbatim. Output ONLY the
-            request, phrased as a request — never describe it from the outside,
-            never write "the developer asks…" or "they want…", never switch to
-            third person, never answer it, and never add or invent anything that is
-            not in the message.
-          user_prompt: |
-            The developer's request above, restated as briefly as possible in
-            their own words:
         assistant:
           system_prompt: |
             You compress an assistant's reply into a faithful, shorter version.
@@ -1173,19 +1005,6 @@ layers:
             nothing, invent nothing, and stop as soon as it is captured.
       summaries:
         max_tokens: 192
-        user:
-          system_prompt: |
-            /no_think
-            The question sections below are already compressed — several separate
-            asks. Output one shorter line that states what was asked across them AS
-            a direct question or instruction in the developer's own
-            first/second-person voice — not a description of it. Represent every
-            section; do not just repeat one. Add nothing that is not already there;
-            invent nothing; drop only what repeats. Never write "the developer
-            asked…" or switch to third person, never answer it.
-          user_prompt: |
-            What was asked across the question sections above, as one short direct
-            question or instruction in the original voice, covering every section:
         assistant:
           system_prompt: |
             /no_think

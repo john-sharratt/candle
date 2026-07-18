@@ -141,6 +141,17 @@ pub enum RecordType {
     /// compactor drops every copy and the writer regenerates the chain
     /// in the new file.
     HeaderIndex = 18,
+    /// Couples a turn to the tool response that follows it — the two halves of
+    /// one tool round-trip. JSON payload [`TurnCouplingPayload`]. Idempotent;
+    /// replay collects them into a per-timeline set.
+    ///
+    /// Written by the caller (not the seal) in the one window where the fact is
+    /// certain: after the tools have actually returned output, and *before* the
+    /// response turn is submitted. So a coupling exists iff the round-trip really
+    /// happened — capture mode and malformed calls emit none — and it is always
+    /// durable before the turn it points at exists, which is what lets the
+    /// summariser group an exchange without ever racing its own record.
+    TurnCoupling = 19,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -177,6 +188,7 @@ impl RecordType {
             16 => RecordType::Distilled,
             17 => RecordType::WideQSig,
             18 => RecordType::HeaderIndex,
+            19 => RecordType::TurnCoupling,
             _ => RecordType::Unknown,
         }
     }
@@ -812,6 +824,30 @@ pub enum DistillMode {
     TextOnly,
 }
 
+/// JSON payload for a [`RecordType::TurnCoupling`] record — joins turn
+/// `from_turn` to the tool response that follows it.
+///
+/// Only `from_turn` is needed: a tool response is always the immediately
+/// following turn, so the record can be written before that turn exists (and
+/// therefore before the summariser can observe it). `from_turn ∈ set` reads as
+/// "turn `from_turn + 1` is the tool response to turn `from_turn`".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCouplingPayload {
+    pub timeline_id: u64,
+    pub from_turn: u32,
+}
+
+impl TurnCouplingPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("TurnCouplingPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("TurnCoupling JSON parse: {e}")))
+    }
+}
+
 /// JSON payload for a [`RecordType::Distilled`] record — names the timeline whose
 /// turns should shed content at compaction, and the [`DistillMode`] degree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -830,6 +866,48 @@ impl DistillPayload {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_json::from_slice(buf)
             .map_err(|e| PersistenceError::Corrupt(format!("Distill JSON parse: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod turn_coupling_tests {
+    use super::*;
+
+    /// Exact wire bytes — a coupling is durable state that must decode
+    /// identically in every future build, so this asserts the encoding itself,
+    /// not merely that it round-trips.
+    #[test]
+    fn payload_encodes_to_exact_bytes() {
+        let p = TurnCouplingPayload {
+            timeline_id: 42,
+            from_turn: 7,
+        };
+        assert_eq!(p.encode(), br#"{"timeline_id":42,"from_turn":7}"#.to_vec());
+    }
+
+    #[test]
+    fn payload_round_trips() {
+        let p = TurnCouplingPayload {
+            timeline_id: u64::MAX,
+            from_turn: u32::MAX,
+        };
+        assert_eq!(TurnCouplingPayload::decode(&p.encode()).unwrap(), p);
+    }
+
+    /// The wire tag is durable: changing it silently reinterprets every existing
+    /// coupling record as some other type.
+    #[test]
+    fn wire_tag_is_nineteen() {
+        assert_eq!(RecordType::TurnCoupling.tag(), 19);
+        assert_eq!(RecordType::from_tag(19), RecordType::TurnCoupling);
+    }
+
+    /// A log written before couplings existed has none of these records, and an
+    /// unknown tag must stay skippable rather than abort the walk.
+    #[test]
+    fn corrupt_payload_is_an_error_not_a_panic() {
+        assert!(TurnCouplingPayload::decode(b"not json").is_err());
+        assert!(TurnCouplingPayload::decode(b"").is_err());
     }
 }
 

@@ -66,6 +66,7 @@ impl RecordAccounting {
             | RecordType::DebugId
             | RecordType::Tombstone
             | RecordType::Distilled
+            | RecordType::TurnCoupling
             | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };

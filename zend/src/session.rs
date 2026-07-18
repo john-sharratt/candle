@@ -2013,6 +2013,25 @@ fn run_inference_stream(
                 );
                 break;
             }
+
+            // The round-trip is now certain — the tools returned real output and
+            // the follow-up turn is guaranteed to be submitted below — so couple
+            // the just-sealed call turn to it. This is the only window where that
+            // is knowable: at the call turn's seal the tools had not run, and by
+            // the response turn's seal the call turn's record is already durable.
+            // Couple the call turn by its OWN sealed index (`resp.seal.turn_index`),
+            // never by "the last turn": the async summariser can append a summary
+            // turn in this window, so the newest index may not be the call turn.
+            if let Some(call_idx) = resp.seal.as_ref().and_then(|s| s.turn_index) {
+                if let Err(e) = cs.conv.couple_turn(call_idx) {
+                    tracing::warn!(conv_id = %conv_id, "couple_turn: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    "tool call turn sealed without an index — cannot couple its response"
+                );
+            }
         }
 
         // Title generation has already been fired in parallel from

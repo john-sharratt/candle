@@ -24,6 +24,7 @@
 //! no rotation, and no `dirty` state: the structure is a pure function of the
 //! leaf sequence.
 
+use super::exchange::{self, Couplings};
 use ahash::{AHashMap, AHashSet};
 
 /// Fan-out of an internal `SummaryOfSummaries` node: a merge combines exactly
@@ -180,12 +181,38 @@ pub struct SummaryTree {
     chrono_normals: Vec<NodeId>,
     /// All `SummaryOfTurns` leaves in chronological order.
     chrono_leaves: Vec<NodeId>,
+    /// Which `chrono_normals` positions run on into the next — the tool
+    /// round-trips (`summary_tree::exchange`). Empty for a timeline that never
+    /// called a tool, which makes every turn its own exchange.
+    couplings: Couplings,
 }
 
 impl SummaryTree {
     /// Empty forest.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the exchange couplings, as positions over [`Self::chrono_normals`]
+    /// (build them with `exchange::over_normals`). Call after the chrono normals
+    /// are pushed.
+    pub fn set_couplings(&mut self, couplings: Couplings) {
+        self.couplings = couplings;
+    }
+
+    /// The nodes that must be selected together with `id`.
+    ///
+    /// For a `Normal` turn this is its whole **exchange**: a tool response
+    /// without the call that requested it — or a call whose result never arrives
+    /// — is incoherent context, so provenance hitting either half must pull in
+    /// both. For every other node (summary leaves and internals) it is just `id`;
+    /// a summary already covers its exchange whole.
+    pub fn exchange_unit(&self, id: NodeId) -> Vec<NodeId> {
+        let Some(pos) = self.chrono_normals.iter().position(|n| *n == id) else {
+            return vec![id];
+        };
+        let group = exchange::exchange_of(&self.couplings, self.chrono_normals.len(), pos);
+        self.chrono_normals[group].to_vec()
     }
 
     /// Number of nodes (all kinds).
@@ -215,6 +242,11 @@ impl SummaryTree {
     /// All Normal-turn sub-leaves in chronological order.
     pub fn chrono_normals(&self) -> &[NodeId] {
         &self.chrono_normals
+    }
+
+    /// The exchange couplings, as positions over [`Self::chrono_normals`].
+    pub fn couplings(&self) -> &Couplings {
+        &self.couplings
     }
 
     /// The peak set — orphan summary nodes (no parent) in chronological order

@@ -45,12 +45,13 @@ use super::project::{
     run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
 };
 use super::schema::{
-    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
-    Schema, SectionCollection, SectionSchema, SelectionRule, SummaryMode, SystemPromptItem,
+    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, LayerSchema,
+    LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
+use crate::summary_tree::scope::Scope;
 use crate::summary_tree::SelectionDiagnostics;
 
 /// Run all construction-time validation checks against a parsed schema.
@@ -1138,17 +1139,15 @@ impl Builder {
         group_id: GroupId,
         section_id: SectionId,
     ) -> Self {
-        // Distinct ids for the question/answer summary framing sections (never
-        // emitted; sealed lazily only if this conversation is summarised). Offset
-        // from the frame, special-cased so a reserved frame (top of the u32
-        // range) keeps both ids in the reserved band.
-        let (summary_q_id, summary_a_id) = if section_id.raw() == u32::MAX {
-            (SectionId::new(u32::MAX - 1), SectionId::new(u32::MAX - 2))
+        // Id for the summary's answer framing section (never emitted; sealed
+        // lazily only if this conversation is summarised). Offset from the frame,
+        // special-cased so a reserved frame (top of the u32 range) keeps the id in
+        // the reserved band. There is no question-half section: a summary's user
+        // half is derived, never decoded, so it has no prompt to frame.
+        let summary_a_id = if section_id.raw() == u32::MAX {
+            SectionId::new(u32::MAX - 1)
         } else {
-            (
-                SectionId::new(section_id.raw() + 1),
-                SectionId::new(section_id.raw() + 2),
-            )
+            SectionId::new(section_id.raw() + 1)
         };
         let schema = Schema {
             layers: vec![LayerSchema {
@@ -1181,27 +1180,7 @@ impl Builder {
                 // SummaryOfSummaries nodes reuse it.
                 summary: LayerSummary {
                     turns: TurnSummary {
-                        user: CompressionPrompt {
-                            system_prompt: SectionSchema {
-                                id: summary_q_id,
-                                name: "__summary_turns_user__".to_string(),
-                                content: "You are a faithful compressor. Compress the user's \
-                                          message below into a much shorter version that preserves \
-                                          what was asked — the specific request, names, numbers, \
-                                          and constraints — in the original voice. No commentary, \
-                                          headings, or lists."
-                                    .to_string(),
-                                priority: 50.0,
-                                depends_on: None,
-                                depends_on_absent: None,
-                                is_template: false,
-                                template_tokens: None,
-                            },
-                            user_prompt: "Compress the user message above into a faithful, much \
-                                          shorter version that preserves the specific request, \
-                                          names, numbers, and constraints, in the original voice."
-                                .to_string(),
-                        },
+                        scope: Scope::Union,
                         assistant: CompressionPrompt {
                             system_prompt: SectionSchema {
                                 id: summary_a_id,
@@ -1224,7 +1203,7 @@ impl Builder {
                                     .to_string(),
                         },
                         max_tokens: 384,
-                        mode: SummaryMode::SinglePass,
+                        content: Content::Decode,
                     },
                     summaries: None,
                 },

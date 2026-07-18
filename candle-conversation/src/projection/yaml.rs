@@ -66,11 +66,12 @@ use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
+    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
-    SelectionDefault, SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema,
-    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
+    SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
+    TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
+use crate::summary_tree::scope::Scope;
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
 /// schema even though names are per-layer scoped.
@@ -217,16 +218,19 @@ struct YamlCompressionPrompt {
 /// a shared decode cap. All fields mandatory (no serde default).
 #[derive(Deserialize)]
 struct YamlTurnSummary {
-    /// Hard decode-token ceiling for each compressed half.
+    /// Hard decode-token ceiling for the compressed assistant half.
     max_tokens: usize,
-    /// Compresses the user-message half of a turn (`Role::User`).
-    user: YamlCompressionPrompt,
     /// Compresses the assistant-response half of a turn (`Role::Assistant`).
+    /// Unused when `content: structural`.
     assistant: YamlCompressionPrompt,
-    /// `single_pass` (default) or `structural` — the validated structural
-    /// pipeline. Only meaningful on a `summaries` level.
+    /// How the user-message half (the scope) is derived from the children's:
+    /// `union` (default), `line_spans`, or `directory`. Never decoded — see
+    /// [`Scope`].
     #[serde(default)]
-    mode: String,
+    scope: String,
+    /// How the assistant half is produced: `decode` (default) or `structural`.
+    #[serde(default)]
+    content: String,
 }
 
 /// A layer's `summary:` block — required on every layer. `turns` (SummaryOfTurns)
@@ -1060,12 +1064,12 @@ fn build_compression_prompt(
     })
 }
 
-/// Build one tree-level [`TurnSummary`] (question + answer halves + decode cap).
-/// Validates `max_tokens >= 1`; each half allocates its own framing section.
+/// Build one tree-level [`TurnSummary`] (scope derivation + answer half + decode
+/// cap). Validates `max_tokens >= 1`; the assistant half allocates its framing
+/// section. The user half carries no prompt — it is derived, never decoded.
 fn build_turn_summary(
     owner_label: &str,
     yt: &YamlTurnSummary,
-    q_name: String,
     a_name: String,
     section_alloc: &mut SectionIdAlloc,
 ) -> Result<TurnSummary, ConstructionError> {
@@ -1074,21 +1078,39 @@ fn build_turn_summary(
             owner: owner_label.to_string(),
         });
     }
-    let mode = match yt.mode.as_str() {
-        "" | "single_pass" => SummaryMode::SinglePass,
-        "structural" => SummaryMode::Structural,
+    let scope = match yt.scope.as_str() {
+        "" | "union" => Scope::Union,
+        "line_spans" => Scope::LineSpans,
         other => {
-            return Err(ConstructionError::InvalidSummaryMode {
+            return Err(ConstructionError::InvalidSummaryScope {
                 owner: owner_label.to_string(),
-                mode: other.to_string(),
+                scope: other.to_string(),
             })
         }
     };
+    let content = match yt.content.as_str() {
+        "" | "decode" => Content::Decode,
+        "structural" => Content::Structural,
+        other => {
+            return Err(ConstructionError::InvalidSummaryContent {
+                owner: owner_label.to_string(),
+                content: other.to_string(),
+            })
+        }
+    };
+    // A structural level derives both halves from its children's skeletons, so a
+    // `scope:` here would be silently ignored. Reject it rather than let the
+    // config claim a derivation that never runs.
+    if content == Content::Structural && !yt.scope.is_empty() {
+        return Err(ConstructionError::ScopeOnStructuralSummary {
+            owner: owner_label.to_string(),
+        });
+    }
     Ok(TurnSummary {
-        user: build_compression_prompt(owner_label, &yt.user, q_name, section_alloc)?,
+        scope,
         assistant: build_compression_prompt(owner_label, &yt.assistant, a_name, section_alloc)?,
         max_tokens: yt.max_tokens,
-        mode,
+        content,
     })
 }
 
@@ -1102,7 +1124,6 @@ fn build_layer_summary(
     let turns = build_turn_summary(
         owner_label,
         &yl.turns,
-        "__summary_turns_user__".to_string(),
         "__summary_turns_assistant__".to_string(),
         section_alloc,
     )?;
@@ -1110,7 +1131,6 @@ fn build_layer_summary(
         Some(ys) => Some(build_turn_summary(
             &format!("{owner_label} (summaries)"),
             ys,
-            "__summary_sums_user__".to_string(),
             "__summary_sums_assistant__".to_string(),
             section_alloc,
         )?),

@@ -34,6 +34,7 @@ use crate::persistence::record::TreeMetadataPayload;
 use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::scheduler::SchedulerRequest;
 use crate::substrate::TreeNodeMeta;
+use crate::summary_tree::exchange;
 use crate::summary_tree::probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
 use crate::summary_tree::tree::carry_run;
 use crate::summary_tree::TurnKind;
@@ -239,7 +240,7 @@ pub fn run_pass(
     }
     for timeline in timeline_ids {
         // Per-timeline isolation: a soft failure on one timeline (e.g. a
-        // corrupt summary tree from an older run hitting an AVL invariant)
+        // corrupt summary forest from an older run failing to reconcile)
         // must not abort the whole pass — it would starve every other
         // timeline, including freshly-started conversations. Log it and move
         // on; only a hard error propagates and stops the thread.
@@ -293,16 +294,18 @@ pub fn run_pass(
 }
 
 /// Drain every pending Normal turn for `timeline` into the summary
-/// tree.  For each pending Normal:
+/// forest.  For each pending Normal:
 ///
-/// 1. Run a §6 probe over `[normal_idx]` to seal a fresh
+/// 1. Run a probe over `[normal_idx]` to seal a fresh
 ///    `SummaryOfTurns` leaf turn.
 /// 2. Write the leaf's `TreeNodeMeta` (kind, children = [normal_idx],
-///    height = 1, dirty = false).
-/// 3. AVL-insert the new leaf, allocating any synthesised
-///    `SummaryOfSummaries` internals via additional probes.
-/// 4. Update `tree_root`, mark rotated ancestors dirty, persist all
-///    changes as `TreeMetadata` redo-log records.
+///    height = 1).
+/// 3. Append the leaf as the rightmost peak, then carry-merge: while the
+///    last `MERGE_FANOUT` peaks share a level, allocate one
+///    `SummaryOfSummaries` over them via additional probes.
+/// 4. Persist every change as `TreeMetadata` redo-log records.  Nodes are
+///    immutable once written — no root pointer, no rotations, no dirty bit
+///    (`docs/immutable_summary_forest.md`).
 fn absorb_pending_turns(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,
@@ -313,7 +316,22 @@ fn absorb_pending_turns(
         // Collect up to `max_concurrent` eligible pending Normal turns, so
         // their SoT probes can be submitted together and their decodes batch
         // in the scheduler's wave loop instead of running one at a time.
-        let mut batch: Vec<TurnIndex> = Vec::with_capacity(max_concurrent);
+        // The exchange view: a leaf covers one complete exchange, not one turn.
+        // A tool round-trip spans several Normal turns, and summarising the call
+        // turn alone leaves the compressor with no answer among its children — so
+        // it invents one. Rebuilt each pass: both inputs grow as turns land.
+        let (normals, couplings, finalize) = {
+            let read = conversation.read();
+            let normals = read.normal_turns_chrono(timeline);
+            let couplings = exchange::over_normals(&read.couplings_of(timeline), &normals);
+            // Once archived, the conversation is terminal — the frontier exchange
+            // will never gain a successor, so seal it now rather than leave a hole
+            // in the peak cover.
+            let finalize = read.is_archived(timeline);
+            (normals, couplings, finalize)
+        };
+        let mut batch: Vec<Vec<TurnIndex>> = Vec::with_capacity(max_concurrent);
+        let mut deferred: Vec<TurnIndex> = Vec::new();
         while batch.len() < max_concurrent {
             let normal_idx = match conversation.write().pop_pending_summary(timeline) {
                 Some(idx) => idx,
@@ -335,7 +353,55 @@ fn absorb_pending_turns(
                 );
                 continue;
             }
-            batch.push(normal_idx);
+            let Some(pos) = normals.iter().position(|n| *n == normal_idx) else {
+                // A pending index that is not in the timeline's Normal set. It was
+                // enqueued as pending, so this drop loses a turn silently — log it
+                // rather than swallow it. (Expected only if the turn was already
+                // promoted out of Normal between pop and this read; anything else
+                // is a real bug.)
+                tracing::warn!(
+                    target: "candle_conversation::summariser",
+                    timeline = %timeline,
+                    normal = %normal_idx,
+                    n_normals = normals.len(),
+                    "absorb: pending turn is not in the Normal set — dropping (should be rare)",
+                );
+                continue;
+            };
+            let group = exchange::exchange_of(&couplings, normals.len(), pos);
+            // Only the head drives its exchange. The other members are pending
+            // too, and pop later in index order; skipping them here is what stops
+            // one exchange being summarised once per member.
+            if group.start != pos {
+                continue;
+            }
+            if !exchange::is_settled(&group, normals.len(), finalize) {
+                // This is the frontier exchange — the live tail of the
+                // conversation. A tool round-trip here may still be waiting on its
+                // response, and its coupling may not be in the log yet, so sealing
+                // now risks freezing a leaf over half an exchange. Leaf children
+                // are frozen at creation, so we wait until a later turn exists
+                // (which guarantees the exchange is complete and fully coupled —
+                // see `exchange::is_settled`). Nothing is lost: the frontier is
+                // anchored verbatim by recency until then.
+                tracing::trace!(
+                    target: "candle_conversation::summariser",
+                    timeline = %timeline,
+                    normal = %normal_idx,
+                    "absorb: frontier exchange, deferring until a later turn settles it",
+                );
+                deferred.push(normal_idx);
+                continue;
+            }
+            batch.push(normals[group].to_vec());
+        }
+        // Re-enqueue deferred heads AFTER draining, so this pass can't pop the
+        // same open exchange again and spin.
+        if !deferred.is_empty() {
+            let mut write = conversation.write();
+            for idx in deferred {
+                write.push_pending_summary(timeline, idx);
+            }
         }
         if batch.is_empty() {
             return Ok(());
@@ -349,18 +415,18 @@ fn absorb_pending_turns(
 
         let requests: Vec<ProbeRequest> = batch
             .iter()
-            .map(|&normal_idx| ProbeRequest {
+            .map(|group| ProbeRequest {
                 timeline,
                 kind: TurnKind::SummaryOfTurns,
-                children: vec![normal_idx],
+                children: group.clone(),
                 height: 1,
             })
             .collect();
         let results = runner.run_batch(requests);
 
-        // Insert the sealed leaves into the AVL tree.  The probe decodes ran
-        // concurrently; the tree mutation (which may emit serial SoS-allocation
-        // probes) is applied one leaf at a time, in batch order — ascending
+        // Append the sealed leaves into the forest.  The probe decodes ran
+        // concurrently; the append + carry-merge (which may emit serial
+        // SoS-allocation probes) is applied one leaf at a time, in batch order — ascending
         // chronological order among the turns that succeeded.
         //
         // A soft-failed probe re-enqueues only that turn, to the *back* of the
@@ -373,10 +439,13 @@ fn absorb_pending_turns(
         // can place its leaf after a younger sibling; that bounded local disorder
         // is the accepted cost of liveness + no orphans.
         let mut soft_failed = false;
-        for (&normal_idx, result) in batch.iter().zip(results) {
+        for (group, result) in batch.iter().zip(results) {
+            // The exchange's head — the turn the pending queue handed us, and the
+            // one re-enqueued if its probe soft-fails.
+            let normal_idx = group[0];
             match result {
                 Ok(sealed) => {
-                    seal_leaf(conversation, timeline, sealed, vec![normal_idx])?;
+                    seal_leaf(conversation, timeline, sealed, group.clone())?;
                     carry_merge(conversation, runner, timeline)?;
                 }
                 Err(ProbeError::Soft(msg)) => {
@@ -745,7 +814,9 @@ mod tests {
         let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
         let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
         let n2 = conv.write().append_with_blocks(timeline, 10, 2, 3);
-        assert_eq!(conv.pending_summary_len(timeline), 3);
+        // A trailing turn so n2 is settled (not the deferred frontier exchange).
+        let _sentinel = conv.write().append_with_blocks(timeline, 10, 3, 4);
+        assert_eq!(conv.pending_summary_len(timeline), 4);
 
         let runner = FailOnChildRunner {
             inner: MockProbeRunner::new(conv.clone()),
@@ -815,30 +886,183 @@ mod tests {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
         let _normal0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        // pending_summary_queue now has 1 entry.
-        assert_eq!(conv.pending_summary_len(timeline), 1);
+        // A trailing turn settles #0's exchange (making it sealable); the trailing
+        // turn itself stays the deferred frontier.
+        let _normal1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        assert_eq!(conv.pending_summary_len(timeline), 2);
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
-        // The pending queue is drained.
-        assert_eq!(conv.pending_summary_len(timeline), 0);
-        // A SummaryOfTurns leaf now exists at index 1.
+        // #0 sealed; the frontier #1 stays pending.
+        assert_eq!(conv.pending_summary_len(timeline), 1);
+        // The SoT leaf over #0 is recorded - its index follows the two Normals.
         let leaf_meta = conv
             .read()
-            .tree_meta_of(timeline, TurnIndex(1))
+            .tree_meta_of(timeline, TurnIndex(2))
             .cloned()
             .expect("leaf meta exists");
         assert_eq!(leaf_meta.kind, TurnKind::SummaryOfTurns);
         assert_eq!(leaf_meta.children, vec![TurnIndex(0)]);
         assert_eq!(leaf_meta.tree_height, 1);
-        // The lone leaf is the single peak.
-        assert_eq!(conv.read().peaks_of(timeline), vec![(TurnIndex(1), 1)]);
+        // The lone sealed leaf is the single peak.
+        assert_eq!(conv.read().peaks_of(timeline), vec![(TurnIndex(2), 1)]);
+    }
+
+    /// Every `SummaryOfTurns` leaf's children, in turn order.
+    fn leaf_children(conv: &Conversation, timeline: TimelineId) -> Vec<Vec<TurnIndex>> {
+        let read = conv.read();
+        (0..read.turn_count(timeline))
+            .filter_map(|i| {
+                read.tree_meta_of(timeline, TurnIndex(i))
+                    .filter(|m| m.kind == TurnKind::SummaryOfTurns)
+                    .map(|m| m.children.clone())
+            })
+            .collect()
+    }
+
+    /// The fabrication fix. Two turns coupled into one tool round-trip must seal
+    /// ONE leaf covering BOTH — not two half-leaves. A leaf over the call turn
+    /// alone has no answer among its children, which is what made the compressor
+    /// invent "15:30 UTC" for a tool that returned 12:21.
+    #[test]
+    fn a_coupled_round_trip_seals_one_leaf_over_both_turns() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        conv.write().couple_turn(timeline, call.0);
+        let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        // A trailing turn settles the [call, response] exchange (otherwise it is
+        // the deferred frontier).
+        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        assert_eq!(conv.pending_summary_len(timeline), 3);
+
+        let runner = MockProbeRunner::new(conv.clone());
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        // Only the frontier sentinel remains; the round-trip is drained.
+        assert_eq!(
+            conv.pending_summary_len(timeline),
+            1,
+            "only the frontier remains"
+        );
+
+        // Exactly ONE leaf, covering the whole exchange in order.
+        let leaves = leaf_children(&conv, timeline);
+        assert_eq!(
+            leaves.len(),
+            1,
+            "one exchange must seal one leaf, got {leaves:?}"
+        );
+        assert_eq!(
+            leaves[0],
+            vec![call, response],
+            "the leaf must cover the call AND its tool response"
+        );
+    }
+
+    /// The live frontier: a coupling is durable but its tool response has not
+    /// landed. Sealing now would freeze a leaf that has to invent its answer, so
+    /// the exchange must defer — and stay queued for a later pass.
+    #[test]
+    fn an_open_exchange_defers_instead_of_sealing_half() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        conv.write().couple_turn(timeline, call.0);
+        // The response turn does not exist yet — the tools are still running.
+        assert_eq!(conv.pending_summary_len(timeline), 1);
+
+        let runner = MockProbeRunner::new(conv.clone());
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+
+        assert!(
+            leaf_children(&conv, timeline).is_empty(),
+            "must not seal a leaf over half an exchange"
+        );
+        assert_eq!(
+            conv.pending_summary_len(timeline),
+            1,
+            "the deferred head must stay queued for the next pass"
+        );
+
+        // The response lands, but [call, response] is now the frontier, so it
+        // still defers - the fabrication guard holds until a later turn settles it.
+        let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        assert!(
+            leaf_children(&conv, timeline).is_empty(),
+            "the round-trip is still the frontier - not yet sealed"
+        );
+        // A later turn settles it -> seals as ONE leaf over both halves.
+        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        assert_eq!(
+            leaf_children(&conv, timeline),
+            vec![vec![call, response]],
+            "seals once a later turn settles the exchange"
+        );
+    }
+
+    /// Uncoupled turns are untouched — no coupling means every turn is its own
+    /// exchange, so the forest is shaped exactly as it was before exchanges.
+    #[test]
+    fn uncoupled_turns_still_seal_one_leaf_each() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        // A trailing turn so both n0 and n1 are settled (non-frontier).
+        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+
+        let runner = MockProbeRunner::new(conv.clone());
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        let leaves = leaf_children(&conv, timeline);
+        assert_eq!(leaves.len(), 2, "two settled exchanges, two leaves");
+        assert!(leaves.contains(&vec![n0]));
+        assert!(leaves.contains(&vec![n1]));
+    }
+
+    /// A live conversation defers its last exchange (frontier); once archived,
+    /// a summariser pass seals it too, so an archived conversation has no hole in
+    /// its peak cover.
+    #[test]
+    fn archiving_seals_the_deferred_frontier_exchange() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let runner = MockProbeRunner::new(conv.clone());
+
+        // Live: n0 settles (n1 is its successor); n1 is the frontier and defers.
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        assert_eq!(leaf_children(&conv, timeline), vec![vec![n0]]);
+        assert_eq!(
+            conv.pending_summary_len(timeline),
+            1,
+            "frontier n1 deferred"
+        );
+
+        // Archive → a finalising pass seals the frontier n1 too.
+        conv.write().set_archived(timeline, true);
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        let leaves = leaf_children(&conv, timeline);
+        assert_eq!(leaves.len(), 2, "archived: frontier sealed");
+        assert!(
+            leaves.contains(&vec![n1]),
+            "the deferred frontier n1 is now sealed"
+        );
+        assert_eq!(
+            conv.pending_summary_len(timeline),
+            0,
+            "nothing left pending"
+        );
     }
 
     #[test]
     fn absorb_a_full_run_carries_into_one_sos() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        for i in 0..MERGE_FANOUT as u64 {
+        // MERGE_FANOUT turns to carry, plus a trailing turn so the last of them is
+        // settled rather than the deferred frontier.
+        for i in 0..MERGE_FANOUT as u64 + 1 {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
@@ -866,12 +1090,15 @@ mod tests {
         let (conv, timeline) = fresh_conversation(tmp.path());
         // F + 1 turns → base-F "11" → one full SoS (level 2) + one leftover leaf
         // (level 1). Peak levels {1, 2}.
-        let n = MERGE_FANOUT as u64 + 1;
-        for i in 0..n {
+        // F + 1 exchanges must SEAL to give base-F 11 (levels {1,2}); append one
+        // extra so the (F+1)-th is settled rather than the deferred frontier.
+        let sealed = MERGE_FANOUT as u64 + 1;
+        for i in 0..sealed + 1 {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, (n as usize) * 2).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, (sealed as usize + 1) * 2)
+            .expect("absorb ok");
         let mut levels: Vec<u8> = conv
             .read()
             .peaks_of(timeline)

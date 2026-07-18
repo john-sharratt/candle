@@ -22,7 +22,7 @@
 //! let fixture = SubstrateFixture::load("tests/fixtures/coherent-50")?;
 //! let engine  = ConversationEngine::open(fixture.workspace_path())?;
 //! let tree    = engine.conversation().read().build_summary_tree_in_memory(timeline);
-//! assert!(tree.is_balanced());
+//! assert_eq!(tree.peaks().len(), expected_peak_count);
 //! ```
 //!
 //! This module owns the manifest schema + a loader that validates
@@ -47,8 +47,8 @@ pub struct FixtureManifest {
     /// the same timeline).
     pub debug_id: String,
     /// Manifest format version — bumped when this struct changes.
-    /// `1` is the v1 layout described in `docs/infinite_conversations.md`
-    /// §10.3.
+    /// `1` is the v1 layout described in
+    /// `docs/archived/infinite_conversations.md` §10.3.
     pub schema_version: u32,
     /// Git SHA of the workspace at fixture creation time.  Used to
     /// detect "fixture was built before a relevant algorithm change"
@@ -99,18 +99,18 @@ pub struct ProbeSpec {
     pub expected_top: Vec<String>,
 }
 
-/// Algorithm-level invariants the fixture must satisfy at load time.
+/// Algorithm-level invariants the fixture must satisfy at load time
+/// (`docs/immutable_summary_forest.md` — *Invariants*).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExpectedInvariants {
-    /// AVL balance invariant must hold.
+    /// The persisted forest matches the canonical shape for its leaf count:
+    /// the peak levels are the base-`MERGE_FANOUT` digits of `N`, and every
+    /// `SummaryOfSummaries` has exactly `MERGE_FANOUT` children of equal level.
     #[serde(default = "default_true")]
-    pub avl_balanced: bool,
-    /// Every dirty-set entry must have been swept (`dirty_summary_set`
-    /// is empty).
-    #[serde(default)]
-    pub no_dirty_nodes: bool,
+    pub canonical_shape: bool,
     /// Every Normal sub-leaf is referenced by exactly one
-    /// `SummaryOfTurns` parent.
+    /// `SummaryOfTurns` parent, and the peak set is a contiguous,
+    /// non-overlapping cover of `0..N`.
     #[serde(default = "default_true")]
     pub coverage_complete: bool,
 }
@@ -217,8 +217,7 @@ mod tests {
                 m
             },
             expected: ExpectedInvariants {
-                avl_balanced: true,
-                no_dirty_nodes: true,
+                canonical_shape: true,
                 coverage_complete: true,
             },
         };
@@ -235,7 +234,7 @@ mod tests {
         assert_eq!(fixture.manifest().n_turns_normal, 50);
         assert_eq!(fixture.manifest().plants.len(), 1);
         assert_eq!(fixture.manifest().plants[0].fact, "The password is rosebud");
-        assert!(fixture.manifest().expected.avl_balanced);
+        assert!(fixture.manifest().expected.canonical_shape);
     }
 
     #[test]

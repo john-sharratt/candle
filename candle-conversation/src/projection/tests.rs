@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{GatherScope, SummaryMode};
+use super::schema::{Content, GatherScope};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
@@ -3134,8 +3134,8 @@ fn zend_projection_yaml_parses() {
 
     assert!(b.id_for_group("primary_conversation").is_some());
 
-    // The structural layers declare the validated structural-pipeline mode for
-    // their summary-of-summaries level; dialogue stays single-pass.
+    // repo_map (directory trees) declares deterministic structural content;
+    // every other layer's content is a model decode.
     let mode_of = |layer: &str| {
         let id = b.id_for_layer(layer).unwrap();
         b.schema()
@@ -3147,11 +3147,11 @@ fn zend_projection_yaml_parses() {
             .summaries
             .as_ref()
             .expect("layer has a summaries level")
-            .mode
+            .content
     };
     // Only repo_map (directory trees) uses the deterministic structural roll-up;
     // the other layers' summaries are code definitions/artifacts, not paths.
-    assert_eq!(mode_of("repo_map"), SummaryMode::Structural);
+    assert_eq!(mode_of("repo_map"), Content::Structural);
     for single in [
         "code_reading",
         "static_analysis",
@@ -3163,8 +3163,8 @@ fn zend_projection_yaml_parses() {
     ] {
         assert_eq!(
             mode_of(single),
-            SummaryMode::SinglePass,
-            "{single} should stay single-pass"
+            Content::Decode,
+            "{single} should stay a model decode"
         );
     }
 }
