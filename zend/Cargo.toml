@@ -33,6 +33,7 @@ candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 zend-tools          = { path = "../zend-tools" }
 regex               = "1"
+sysinfo             = { version = "0.31", default-features = false, features = ["system"] }
 tokenizers          = { workspace = true }
 
 # Workspace scanning + scope-aware carving (Phase 1 & 2 ingestion).

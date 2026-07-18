@@ -1311,6 +1311,23 @@ impl Substrate {
             .collect()
     }
 
+    /// Total VRAM byte footprint of hot residences that lack a warm copy — the
+    /// hot→warm drain **backlog**. Cheap companion to [`Self::snapshot_pending_warm`]
+    /// (which clones every hot `SealedSequence` for the migration): this only
+    /// sums each slot's cached `byte_size`, so the persistence thread can stamp
+    /// it every pass and the scheduler can poll it to drive ingest admission
+    /// backpressure off a *leading* signal (drain deficit) rather than the
+    /// lagging VRAM-pressure trip.
+    pub fn pending_warm_bytes(&self) -> u64 {
+        self.hot_lru
+            .iter()
+            .filter_map(|&idx| {
+                let slot = &self.residence[idx.0];
+                (slot.hot.is_some() && slot.warm.is_none()).then_some(slot.byte_size)
+            })
+            .sum()
+    }
+
     /// Snapshot indices of warm-resident slots that lack a cold (on-
     /// disk) record — the work list for the persistence thread's
     /// warm→cold phase. Pairs each index with the slot's [`StreamId`]
@@ -1805,6 +1822,66 @@ impl Substrate {
             }
         }
         demoted
+    }
+
+    /// Gentle-early demotion for append-only **ingest** timelines: drop the hot
+    /// copy of every sealed, warm-backed turn on an ingest timeline except the
+    /// newest `keep_recent` per timeline, keeping warm. Ingest turns are never
+    /// re-attended until query time — scopes are independent (each is its own
+    /// `[0..scope]`) and `apply_projection` never runs for these — so a sealed
+    /// ingest turn's hot copy is pure zero-reload-cost footprint the instant it
+    /// seals; it re-elevates warm→hot on demand at query time. Firing this at a
+    /// **low** capacity watermark (~50%) sheds that footprint long before the
+    /// near-cap eviction ladder, so a bulk repo ingest holds only a small rolling
+    /// hot window instead of the whole corpus. The active (unsealed,
+    /// warm-absent) writer turn is protected by the hot+warm guard. Returns the
+    /// turns demoted + VRAM bytes freed.
+    pub fn demote_cold_ingest(
+        &mut self,
+        ingest_timelines: &std::collections::HashSet<TimelineId>,
+        keep_recent: usize,
+    ) -> EvictionReport {
+        let mut victims: Vec<ResidenceIndex> = Vec::new();
+        let mut freed: u64 = 0;
+        for (tl, entry) in self.timelines.iter() {
+            if !ingest_timelines.contains(tl) {
+                continue;
+            }
+            let n = entry.turns.len();
+            if n <= keep_recent {
+                continue;
+            }
+            // `turns` is a `BTreeMap` — iterate ascending by `TurnIndex` and stop
+            // before the newest `keep_recent`, which stay hot as the rolling
+            // window.
+            let cutoff = n - keep_recent;
+            for turn_data in entry.turns.values().take(cutoff) {
+                let residence = turn_data.content.residence;
+                let slot = &self.residence[residence.0];
+                if slot.hot.is_some() && slot.warm.is_some() {
+                    freed += slot.byte_size;
+                    victims.push(residence);
+                }
+            }
+        }
+        let count = victims.len();
+        for idx in &victims {
+            self.residence[idx.0].hot = None;
+            Self::remove_from_lru(&mut self.hot_lru, *idx);
+        }
+        if count > 0 {
+            tracing::info!(
+                target: "candle_conversation::persistence::tier",
+                count,
+                bytes = freed,
+                keep_recent,
+                "demote_cold_ingest (gentle-early) complete"
+            );
+        }
+        EvictionReport {
+            count,
+            bytes: freed,
+        }
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -4805,6 +4882,64 @@ mod tests {
             sub.residence[c.0].hot.is_some(),
             "c hot-without-warm untouched"
         );
+    }
+
+    /// Gentle-early ingest demotion drops the hot copy of an ingest timeline's
+    /// sealed, warm-backed turns EXCEPT the newest `keep_recent` (the rolling
+    /// window), keeping warm; a hot-without-warm turn (the active writer) is left
+    /// hot.
+    #[test]
+    fn demote_cold_ingest_keeps_window_and_warm() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // Five sealed, hot+warm turns, oldest→newest.
+        let (_, t0) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t1) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t2) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t3) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t4) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        // The newest turn is the active writer: hot-only (no warm copy yet).
+        sub.residence[t4.0].warm = None;
+
+        let mut ingest = std::collections::HashSet::new();
+        ingest.insert(timeline);
+
+        // keep_recent = 2 → protect t3, t4; demote t0, t1, t2 (all warm-backed).
+        let report = sub.demote_cold_ingest(&ingest, 2);
+        assert_eq!(report.count, 3, "t0,t1,t2 demoted; t3,t4 window kept");
+        assert_eq!(report.bytes, 300_000_000);
+        for r in [t0, t1, t2] {
+            assert!(sub.residence[r.0].hot.is_none(), "older ingest turn demoted");
+            assert!(sub.residence[r.0].warm.is_some(), "warm KEPT (cheap reload)");
+        }
+        assert!(sub.residence[t3.0].hot.is_some(), "window turn stays hot");
+        assert!(
+            sub.residence[t4.0].hot.is_some(),
+            "hot-without-warm writer stays hot"
+        );
+
+        // Idempotent: the demoted turns are now warm-only, so a second pass frees
+        // nothing.
+        assert_eq!(sub.demote_cold_ingest(&ingest, 2).count, 0, "already demoted");
+    }
+
+    /// A timeline NOT in the ingest set is never touched — the demotion is scoped
+    /// to append-only ingest timelines, so chat working sets are safe.
+    #[test]
+    fn demote_cold_ingest_ignores_non_ingest_timeline() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, c) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        // Empty ingest set → this timeline is not an ingest timeline.
+        let report = sub.demote_cold_ingest(&std::collections::HashSet::new(), 0);
+        assert_eq!(report.count, 0);
+        for r in [a, b, c] {
+            assert!(
+                sub.residence[r.0].hot.is_some(),
+                "non-ingest timeline untouched"
+            );
+        }
     }
 
     /// `install_cold` frees a section's hot VRAM only when its residence is

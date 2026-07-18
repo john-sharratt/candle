@@ -37,7 +37,7 @@ use crate::error::ConversationError;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
     ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
-    Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex,
+    Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
 use crate::scheduler::profile;
 use crate::sequence_handle::SequenceId;
@@ -52,6 +52,12 @@ use crate::summary_tree::SelectionOrigin;
 #[derive(Debug, Default)]
 pub(super) struct SlotState {
     pub(super) pending_user_part: Option<Arc<Vec<SealedSequence>>>,
+    /// The sealed sections + turns this slot's current projection attends over.
+    /// Refreshed on every `apply_projection`; consumed by the relief-eviction
+    /// path as an explicit protect-list so it never drops the hot copy of a turn
+    /// an in-flight prefill/decode is attending. Lives on `SlotState` so it
+    /// inherits the slot's lifecycle (removal + fork re-keying) for free.
+    pub(super) working_set: SlotWorkingSet,
 }
 
 impl SlotState {
@@ -59,6 +65,34 @@ impl SlotState {
     pub(super) fn trim_post_turn(&mut self) {
         self.pending_user_part = None;
     }
+}
+
+/// The sealed working set (sections + turns) a slot's projection attends over.
+/// See [`SlotState::working_set`] and [`working_set_from_segments`].
+#[derive(Debug, Default, Clone)]
+pub(super) struct SlotWorkingSet {
+    pub(super) sections: Vec<SectionId>,
+    pub(super) turns: Vec<TurnKey>,
+}
+
+/// Extract the sealed working set from a projection's segments. Only `Sealed`
+/// entries reference persisted KV; `Generated`/`NewUserMessage` segments carry
+/// live-prefilled tokens with no substrate residence, so they never contribute.
+pub(super) fn working_set_from_segments(segments: &[ProjectionSegment]) -> SlotWorkingSet {
+    let mut ws = SlotWorkingSet::default();
+    for seg in segments {
+        if let ProjectionSegment::Sealed(kind) = seg {
+            match kind {
+                SealedKind::Section(rs) => ws.sections.push(rs.id),
+                SealedKind::Turn(rt, _) | SealedKind::TurnHalf(rt) => {
+                    if let Some(key) = rt.key() {
+                        ws.turns.push(key);
+                    }
+                }
+            }
+        }
+    }
+    ws
 }
 
 /// Pre-tokenised dialect role markers the assembler wraps around
@@ -91,6 +125,14 @@ pub(crate) struct BoundaryMarkers {
     /// switch sits in the user turn (where Qwen3 honours it) without being baked
     /// into any sealed turn.
     pub(crate) no_think: Arc<Vec<u32>>,
+    /// The role-marker strings, kept beside their tokenised forms so the seal
+    /// path can locate role boundaries baked into a turn's assistant text (the
+    /// code_read tool exchange `<tool_call>…<tool_response>…confirmation`) by a
+    /// plain string match, and slice the sub-segment display text at them.
+    pub(crate) user_start_str: String,
+    pub(crate) assistant_end_str: String,
+    pub(crate) user_end_str: String,
+    pub(crate) assistant_start_str: String,
 }
 
 impl BoundaryMarkers {
@@ -116,6 +158,10 @@ impl BoundaryMarkers {
             user_end,
             assistant_start,
             no_think,
+            user_start_str: dialect.user_start.to_string(),
+            assistant_end_str: dialect.assistant_end.to_string(),
+            user_end_str: dialect.user_end.to_string(),
+            assistant_start_str: dialect.assistant_start.to_string(),
         })
     }
 }
@@ -1211,6 +1257,32 @@ mod tests {
     fn slot_state_default_is_empty() {
         let s = SlotState::default();
         assert!(s.pending_user_part.is_none());
+        assert!(s.working_set.sections.is_empty() && s.working_set.turns.is_empty());
+    }
+
+    #[test]
+    fn working_set_extracts_sealed_sections_and_turns() {
+        // Sealed sections/turns contribute their ids; Generated glue does not.
+        let segments = vec![
+            section_seg(1),
+            turn_seg(0, 5, 2),
+            generated_seg("glue", 0, &[9, 9]),
+            section_seg(3),
+            turn_seg(0, 5, 7),
+        ];
+        let ws = working_set_from_segments(&segments);
+        assert_eq!(ws.sections, vec![SectionId::new(1), SectionId::new(3)]);
+        assert_eq!(
+            ws.turns,
+            vec![
+                TurnKey::new(TimelineId::for_test(5), TurnIndex(2)),
+                TurnKey::new(TimelineId::for_test(5), TurnIndex(7)),
+            ]
+        );
+
+        // A projection of only live-prefilled glue attends no sealed KV.
+        let none = working_set_from_segments(&[generated_seg("g", 0, &[1])]);
+        assert!(none.sections.is_empty() && none.turns.is_empty());
     }
 
     fn test_markers() -> BoundaryMarkers {
@@ -1220,6 +1292,10 @@ mod tests {
             user_end: Arc::new(vec![101]),
             assistant_start: Arc::new(vec![201]),
             no_think: Arc::new(vec![]),
+            user_start_str: "<|im_start|>user\n".into(),
+            assistant_end_str: "<|im_end|>\n".into(),
+            user_end_str: "<|im_end|>\n".into(),
+            assistant_start_str: "<|im_start|>assistant\n".into(),
         }
     }
 

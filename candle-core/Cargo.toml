@@ -30,6 +30,7 @@ rand_distr = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 yoke = { workspace = true }
 zip = { workspace = true }
 strum = { workspace = true }
@@ -40,6 +41,18 @@ ug = { workspace = true }
 ug-cuda = { workspace = true, optional = true }
 ug-metal = { workspace = true, optional = true }
 
+# Windows-only VRAM measurement backend (DXGI) for the VRAM Governor's DXGI
+# probe. Compiled only on Windows (used only under the `cuda` feature); absent
+# on Linux/macOS.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -49,6 +62,9 @@ serial_test = "3.0"
 [features]
 default = []
 cuda = ["cudarc", "dep:candle-kernels", "dep:ug-cuda", "float8/cuda"]
+# Expose the VRAM Governor's scripted probe/allocator test doubles to other
+# crates' tests (candle-core's own tests get them via `cfg(test)`).
+vram-test-util = []
 cudnn = ["cuda", "cudarc/cudnn"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]

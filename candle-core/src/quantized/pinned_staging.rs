@@ -223,6 +223,26 @@ impl PinnedBuf {
         Self::alloc_owned_with_flags(len, 0)
     }
 
+    /// Staging allocation that never aborts the process under memory pressure:
+    /// try pinned host memory first, and on failure fall back to a **fallible**
+    /// plain host `Vec` via `try_reserve_exact` (NOT `vec![]`, which calls
+    /// `handle_alloc_error` and aborts). Returns `Err` when the host heap can't
+    /// supply `len` contiguous bytes — so a caller under pressure can shrink its
+    /// batch and retry, or defer the work, instead of crashing.
+    pub fn alloc_default_or_host_fallible(len: usize) -> Result<Self> {
+        if let Ok(b) = Self::alloc_owned_default(len) {
+            return Ok(b);
+        }
+        let mut data: Vec<u8> = Vec::new();
+        data.try_reserve_exact(len).map_err(|e| {
+            crate::Error::Msg(format!(
+                "host staging alloc of {len} bytes failed (pinned host + heap both exhausted): {e}"
+            ))
+        })?;
+        data.resize(len, 0);
+        Ok(Self::Host { data })
+    }
+
     fn alloc_owned_with_flags(len: usize, flags: u32) -> Result<Self> {
         if len == 0 {
             return Ok(Self::Bump {
@@ -783,5 +803,28 @@ impl Drop for PinnedStagerInner {
             self.pending_owned.clear();
         }
         // arenas are dropped automatically (each frees its slab)
+    }
+}
+
+#[cfg(test)]
+mod fallible_alloc_tests {
+    use super::*;
+
+    /// The staging fallback must return `Err` — never abort the process — when
+    /// neither pinned host memory nor the plain host heap can supply the size.
+    /// This is the whole point of `try_reserve_exact` over `vec![0u8; n]`, whose
+    /// `handle_alloc_error` aborted a full overnight load.
+    #[test]
+    fn errs_on_impossible_size_instead_of_aborting() {
+        let r = PinnedBuf::alloc_default_or_host_fallible(usize::MAX);
+        assert!(r.is_err(), "impossible alloc must return Err, not abort");
+    }
+
+    /// A modest size still succeeds (pinned when a CUDA context is present, else
+    /// the fallible host heap).
+    #[test]
+    fn small_alloc_succeeds() {
+        let b = PinnedBuf::alloc_default_or_host_fallible(4096).expect("4 KiB staging");
+        assert!(b.len() >= 4096);
     }
 }

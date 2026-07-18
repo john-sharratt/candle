@@ -418,6 +418,125 @@ fn palette4_convert_multi_layer_multi_head() -> Result<()> {
     Ok(())
 }
 
+/// A/B equivalence: converting N chunks in ONE batched launch (`num_layers=N`)
+/// must be **bit-identical** to N separate per-chunk launches (`num_layers=1`,
+/// looped) — the production hot→warm quantize batches this way to collapse the
+/// per-launch overhead. Each `(chunk, head)` job carries its OWN dst pal_map
+/// (shuffled, seeded by job) so this genuinely exercises the per-job "dst-side
+/// state variance" the per-chunk path existed to preserve; if batching bled
+/// state across grid blocks, the dst bytes would diverge.
+#[test]
+fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
+    use candle_core::quantized::cuda::{
+        quantize_palette4_convert_buffered, shuffled_pal_map_128, PalHeadDesc,
+    };
+    let dev = match get_cuda_dev() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let cuda_dev = match &dev {
+        Device::Cuda(d) => d,
+        _ => return Ok(()),
+    };
+    let stream = cuda_dev.cuda_stream();
+
+    let num_chunks = 1usize; // each grid "layer" is one independent chunk
+    let n_layers = 4usize; // 4 chunks batched into one launch in mode B
+    let num_kv_heads = 2usize;
+    let total_jobs = n_layers * num_kv_heads;
+    let arena_size = PAL_DIM * num_chunks * R16_BLOCK_BYTES;
+    let ident = identity_pal_map();
+
+    // Shared src arenas; separate dst sets for A (per-chunk) and B (batched).
+    let mut src_gpus = Vec::new();
+    let mut dst_a_gpus = Vec::new();
+    let mut dst_b_gpus = Vec::new();
+    for job in 0..total_jobs {
+        let mut sj = Vec::new();
+        let mut da = Vec::new();
+        let mut db = Vec::new();
+        for p in 0..N_PAL {
+            let base = (job * N_PAL + p) as f32 * 100.0;
+            let data = fill_r16_arena(PAL_DIM, num_chunks, base);
+            sj.push(cuda_dev.memcpy_stod(&data)?);
+            da.push(cuda_dev.memcpy_stod(&vec![0u8; arena_size])?);
+            db.push(cuda_dev.memcpy_stod(&vec![0u8; arena_size])?);
+        }
+        src_gpus.push(sj);
+        dst_a_gpus.push(da);
+        dst_b_gpus.push(db);
+    }
+
+    // Build descriptors against a given dst arena set. Identical per-job state
+    // (a shuffled dst pal_map seeded by job) for A and B — only the dst arena
+    // pointers and the launch grouping differ.
+    let build = |dst_gpus: &[Vec<cudarc::driver::CudaSlice<u8>>]| -> Vec<PalHeadDesc> {
+        (0..total_jobs)
+            .map(|job| {
+                let sp: [u64; N_PAL] =
+                    std::array::from_fn(|p| src_gpus[job][p].device_ptr(&stream).0 as u64);
+                let dp: [u64; N_PAL] =
+                    std::array::from_fn(|p| dst_gpus[job][p].device_ptr(&stream).0 as u64);
+                let dst_pal = shuffled_pal_map_128(job as u64 + 1);
+                PalHeadDesc {
+                    k_src_arena_ptrs: sp,
+                    v_src_arena_ptrs: sp,
+                    k_src_fmts: [GgmlDType::R16; N_PAL],
+                    v_src_fmts: [GgmlDType::R16; N_PAL],
+                    k_src_pal_map: ident,
+                    v_src_pal_map: ident,
+                    k_src_scales: [1.0f32; N_PAL],
+                    v_src_scales: [1.0f32; N_PAL],
+                    k_dst_arena_ptrs: dp,
+                    v_dst_arena_ptrs: dp,
+                    k_dst_fmts: [GgmlDType::R16; N_PAL],
+                    v_dst_fmts: [GgmlDType::R16; N_PAL],
+                    k_dst_pal_map: dst_pal,
+                    v_dst_pal_map: dst_pal,
+                    k_dst_scales: [1.0f32; N_PAL],
+                    v_dst_scales: [1.0f32; N_PAL],
+                }
+            })
+            .collect()
+    };
+    let descs_a = build(&dst_a_gpus);
+    let descs_b = build(&dst_b_gpus);
+
+    // Mode A: N per-chunk launches (num_layers=1), the old production path.
+    for layer in 0..n_layers {
+        let start = layer * num_kv_heads;
+        let end = start + num_kv_heads;
+        quantize_palette4_convert_buffered(
+            &descs_a[start..end],
+            num_kv_heads,
+            1,
+            num_chunks,
+            &PinnedStager::new(cuda_dev).begin_generation(),
+            &stream,
+        )?;
+    }
+    // Mode B: one batched launch (num_layers=N), the new production path.
+    quantize_palette4_convert_buffered(
+        &descs_b,
+        num_kv_heads,
+        n_layers,
+        num_chunks,
+        &PinnedStager::new(cuda_dev).begin_generation(),
+        &stream,
+    )?;
+    dev.synchronize()?;
+
+    // Bit-identical dst bytes for every job/palette.
+    for job in 0..total_jobs {
+        for p in 0..N_PAL {
+            let a = cuda_dev.memcpy_dtov(&dst_a_gpus[job][p])?;
+            let b = cuda_dev.memcpy_dtov(&dst_b_gpus[job][p])?;
+            assert_eq!(a, b, "batched != per-chunk at job={job} pal={p}");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn palette4_convert_r16_identity_copy_check() -> Result<()> {
     // Basic correctness test: copy R16 palette chunks through the buffered API

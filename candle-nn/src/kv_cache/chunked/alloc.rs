@@ -200,12 +200,15 @@ fn vram_has_room(device: &Device, want: usize) -> bool {
 }
 
 /// Accurate "how many bytes of KV VRAM budget are free right now", for the
-/// scheduler's budget-aware eviction. Returns `init_free − pool_used − reserve`
-/// — the same primary budget [`vram_has_room`] gates on (so
-/// `want <= vram_budget_available(d)` ⟺ `vram_has_room(d, want)` on the primary
-/// budget; the driver-free floor is an extra allocation-time safety, not part of
-/// the steady-state budget). `None` on non-CUDA / query failure (caller should
-/// treat that as "unknown — don't evict on a guess").
+/// scheduler's budget-aware eviction.
+///
+/// When a [`VRAM Governor`](candle::vram) is installed, its **live measurement**
+/// is the source of truth: on WDDM that is DXGI's per-process real free
+/// (`Budget − CurrentUsage`), on Linux `cuMemGetInfo` — neither of which lies the
+/// way the legacy `init_free − pool_used` estimate did (it stayed positive while
+/// the pool oversubscribed the card and WDDM paged, causing the 14–1300 s stalls).
+/// Falls back to the legacy estimate only when no governor is installed. `None`
+/// on non-CUDA / query failure (caller treats that as "unknown — don't evict").
 #[cfg(feature = "cuda")]
 pub fn vram_budget_available(device: &Device) -> Option<usize> {
     let Device::Cuda(d) = device else {
@@ -215,11 +218,26 @@ pub fn vram_budget_available(device: &Device) -> Option<usize> {
         candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
         _ => return None,
     };
+    // Governor path: the honest, physically-resident free VRAM PLUS the pool's
+    // reserved-but-free bytes. A new KV arena reuses a pool free-block with **no
+    // new OS memory** — `reserved` doesn't move, DXGI's per-process usage doesn't
+    // move — so those bytes are available too. Without counting them the governor
+    // reported false pressure while 10+ GiB of reusable pool sat free (the pool
+    // can't return it to the OS: freed chunks are scattered inside partially-used
+    // segments, so `cuMemPoolTrimTo` reclaims nothing), evicting pointlessly and
+    // collapsing the admission window. Pool *growth* is still capped at the DXGI
+    // budget (`headroom`), so this can never oversubscribe the card.
+    if let Some(gov) = candle::vram::get(gpu_id) {
+        let headroom = gov.measure().ok()?.headroom as usize;
+        let reuse = match (d.pool_reserved_bytes(), d.pool_used_bytes()) {
+            (Ok(r), Ok(u)) => r.saturating_sub(u),
+            _ => 0,
+        };
+        return Some(headroom.saturating_add(reuse));
+    }
+    // Legacy fallback: init_free − pool_used − reserve.
     let used = d.pool_used_bytes().ok()?;
     let (_free, total) = d.mem_get_info().ok()?;
-    // The scheduler's KV growth is ordinary allocation, so it must treat BOTH
-    // the base reserve and the dedicated eviction slice as unavailable — keeping
-    // the eviction headroom genuinely reserved for the compress-to-free path.
     let reserve = vram_reserve_bytes(total) + eviction_reserve_bytes();
     let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
     Some(ceiling.saturating_sub(used).saturating_sub(reserve))

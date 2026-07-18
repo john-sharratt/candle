@@ -48,15 +48,19 @@ pub use backing::ChunkedKvBacking;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
+pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 #[cfg(feature = "cuda")]
-pub use compress::{dequantize_sealed_in_place, quantize_sealed_in_place};
+pub use compress::{
+    convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
+    quantize_sealed_in_place, quantize_sealed_in_place_deferred,
+};
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
-pub use gid_pool::{ChunkGid, ChunkGidPool};
+pub use gid_pool::{ChunkGid, ChunkGidPool, GpuArenaFormatStats};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};

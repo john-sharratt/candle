@@ -36,7 +36,7 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{dtype_to_ggml_float, identity_pal_map_128, PalHeadDesc};
 #[cfg(feature = "cuda")]
-use candle::quantized::pinned_staging::PinnedBuf;
+use candle::quantized::pinned_staging::{Generation, PinnedBuf};
 #[cfg(feature = "cuda")]
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
@@ -154,6 +154,8 @@ fn pack_head_palette_maps(
 /// in-session reconcile purely on-GPU (decode reads the convert
 /// kernel's output bytes directly, no intervening `kv_migrate` scatter).
 #[cfg(feature = "cuda")]
+/// Single-layer entry point: quantize + launch the convert immediately. See
+/// [`quantize_sealed_in_place_deferred`] for the cross-layer batched form.
 pub fn quantize_sealed_in_place(
     backing: &ChunkedKvBacking,
     sequences: &[&SealedSequence],
@@ -161,6 +163,374 @@ pub fn quantize_sealed_in_place(
     device: &Device,
     copy_stream: &Arc<CudaStream>,
     pinned_scratch: &mut Option<PinnedBuf>,
+) -> Result<Vec<SealedSequence>> {
+    quantize_sealed_in_place_impl(
+        backing,
+        sequences,
+        policy,
+        device,
+        copy_stream,
+        pinned_scratch,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Cross-layer batched form: quantize this layer but **do not** launch the
+/// convert — append its per-(chunk, head) descriptors to `descs_acc` instead.
+/// The caller runs ONE convert over every layer's accumulated descriptors via
+/// [`convert_deferred_descs`] before the produced bytes are read, collapsing the
+/// per-layer convert launches (the WDDM-bound cost that dominates the hot→warm
+/// drain). The returned sequences already point at the allocated dst arenas; the
+/// deferred convert fills them. Bit-identical to converting per layer.
+#[cfg(feature = "cuda")]
+pub fn quantize_sealed_in_place_deferred(
+    backing: &ChunkedKvBacking,
+    sequences: &[&SealedSequence],
+    policy: &CompressionPolicy,
+    device: &Device,
+    copy_stream: &Arc<CudaStream>,
+    pinned_scratch: &mut Option<PinnedBuf>,
+    descs_acc: &mut Vec<PalHeadDesc>,
+) -> Result<Vec<SealedSequence>> {
+    quantize_sealed_in_place_impl(
+        backing,
+        sequences,
+        policy,
+        device,
+        copy_stream,
+        pinned_scratch,
+        Some(descs_acc),
+        None,
+        None,
+    )
+}
+
+/// Cross-layer batched quantize: run the format-selection kernel **once** across
+/// every layer's chunks (via [`PagedSelectionGpuInputs::from_head_gids_multi`])
+/// instead of once per layer, then quantize each layer with its slice of the
+/// shared selection — deferring the convert into `descs_acc` exactly like
+/// [`quantize_sealed_in_place_deferred`]. This collapses the per-layer selection
+/// launch + 8 host readbacks (the WDDM-bound term that dominates the hot→warm
+/// drain) to a single launch + readback. `backings[i]` owns `per_layer_seqs[i]`;
+/// returns the GPU-quant sequences per layer, in order. Bit-identical to the
+/// per-layer path: the unified table's per-layer `arena_idx` offset is a pure
+/// relabelling of rows the kernel reads by pointer, and chunks never interact
+/// across the selection.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_layers_deferred(
+    backings: &[&ChunkedKvBacking],
+    per_layer_seqs: &[Vec<&SealedSequence>],
+    policy: &CompressionPolicy,
+    device: &Device,
+    copy_stream: &Arc<CudaStream>,
+    pinned_scratch: &mut Option<PinnedBuf>,
+    descs_acc: &mut Vec<PalHeadDesc>,
+    // Timing breakdown of this pass's quantize phase, so the persist log can see
+    // whether the cross-layer selection or the dst-arena allocation dominates.
+    select_ms: &mut u64,
+    alloc_ms: &mut u64,
+) -> Result<Vec<Vec<SealedSequence>>> {
+    if backings.len() != per_layer_seqs.len() {
+        candle::bail!("quantize_layers_deferred: backings/seqs length mismatch");
+    }
+    if backings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cuda_dev = match device {
+        Device::Cuda(d) => d,
+        _ => candle::bail!("quantize_layers_deferred: requires a CUDA device"),
+    };
+    // Covers the shared selection's transient allocations (staging + table
+    // tensor); the per-layer `_impl` calls nest their own scope (re-entrant).
+    let _evict = EvictionScope::enter();
+    let n_kv_head = backings[0].n_kv_head();
+    let head_dim = backings[0].head_dim();
+
+    // Per-layer bucket. `None` ⇒ that layer has no kernel-eligible chunks.
+    let buckets: Vec<Option<QuantBucket>> = backings
+        .iter()
+        .zip(per_layer_seqs)
+        .map(|(b, seqs)| bucket_quant_chunks(b, seqs))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Gather every layer's chunk_jobs + valid_ranges for ONE selection. Empty
+    // entries stay in place so arena offsets and the per-layer split align with
+    // `backings` indices.
+    let backings_inner: Vec<_> = backings.iter().map(|b| b.inner.clone()).collect();
+    let chunk_gids_per_layer: Vec<Vec<HeadGids>> = buckets
+        .iter()
+        .map(|b| b.as_ref().map(|q| q.chunk_jobs.clone()).unwrap_or_default())
+        .collect();
+    let mut unified_valid_ranges: Vec<i32> = Vec::new();
+    for b in buckets.iter().flatten() {
+        unified_valid_ranges.extend_from_slice(&b.chunk_valid_ranges);
+    }
+
+    let total_jobs: usize = chunk_gids_per_layer.iter().map(|g| g.len()).sum();
+    if total_jobs == 0 {
+        // Nothing eligible anywhere — pass every layer through verbatim.
+        return Ok(per_layer_seqs
+            .iter()
+            .map(|seqs| seqs.iter().map(|s| (*s).clone()).collect())
+            .collect());
+    }
+
+    // Candidates + thresholds are policy-derived — identical for every layer.
+    let (k_candidates, v_candidates) = {
+        let (k_profile, v_profile) =
+            super::compression_policy::production_adaptive_candidates(policy.compression_level);
+        let k: Vec<SampleFormat> = k_profile
+            .into_iter()
+            .filter_map(SampleFormat::from_kv_format)
+            .filter(|f| !f.is_float())
+            .collect();
+        let v: Vec<SampleFormat> = v_profile
+            .into_iter()
+            .filter_map(SampleFormat::from_kv_format)
+            .filter(|f| !f.is_float())
+            .collect();
+        if k.is_empty() || v.is_empty() {
+            candle::bail!(
+                "quantize_layers_deferred: missing K/V production candidates for level {}",
+                policy.compression_level
+            );
+        }
+        (k, v)
+    };
+    let ti = policy.compression_level.min(10) as usize;
+    let k_hi = PRODUCTION_K_QREL_HIGH_THRESHOLDS[ti] * policy.k_hi_error_threshold_factor;
+    let k_lo = PRODUCTION_K_QREL_LOW_THRESHOLDS[ti] * policy.k_low_error_threshold_factor;
+    let v_hi = PRODUCTION_V_QREL_HIGH_THRESHOLDS[ti] * policy.v_hi_error_threshold_factor;
+    let v_lo = PRODUCTION_V_QREL_LOW_THRESHOLDS[ti] * policy.v_low_error_threshold_factor;
+
+    // ── ONE selection across every layer's chunks ──────────────────────
+    let t_sel = std::time::Instant::now();
+    let stager = backings[0].begin_stager_generation_required();
+    let (gpu_inputs, chunk_counts) = PagedSelectionGpuInputs::from_head_gids_multi(
+        &backings_inner,
+        &chunk_gids_per_layer,
+        Some(&stager),
+        cuda_dev,
+    )?;
+    let (k_rows, v_rows, k_scale_rows, v_scale_rows, k_assign, v_assign, _ka, _va) = gpu_inputs
+        .select_palette4_formats_fused(
+            &k_candidates,
+            &v_candidates,
+            k_hi,
+            k_lo,
+            v_hi,
+            v_lo,
+            Some(&unified_valid_ranges),
+            Some(&stager),
+        )?;
+    drop(gpu_inputs);
+    drop(stager);
+    *select_ms += t_sel.elapsed().as_millis() as u64;
+
+    // Split the flat rows per layer (chunk-major, then head; assignments also ×
+    // head_dim) and finish each layer, deferring its convert into `descs_acc`.
+    let rows_per_chunk = n_kv_head;
+    let assign_per_chunk = n_kv_head * head_dim;
+    let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
+    let mut chunk_base = 0usize;
+    for (li, bucket) in buckets.into_iter().enumerate() {
+        let seqs = &per_layer_seqs[li];
+        let Some(bucket) = bucket else {
+            out.push(seqs.iter().map(|s| (*s).clone()).collect());
+            continue;
+        };
+        let n_chunks = chunk_counts[li];
+        debug_assert_eq!(n_chunks, bucket.chunk_jobs.len());
+        let r0 = chunk_base * rows_per_chunk;
+        let r1 = (chunk_base + n_chunks) * rows_per_chunk;
+        let a0 = chunk_base * assign_per_chunk;
+        let a1 = (chunk_base + n_chunks) * assign_per_chunk;
+        let formats = derive_layer_formats(
+            &k_rows[r0..r1],
+            &v_rows[r0..r1],
+            &k_scale_rows[r0..r1],
+            &v_scale_rows[r0..r1],
+            &k_assign[a0..a1],
+            &v_assign[a0..a1],
+            n_chunks,
+            n_kv_head,
+            head_dim,
+        )?;
+        chunk_base += n_chunks;
+        out.push(quantize_sealed_in_place_impl(
+            backings[li],
+            seqs,
+            policy,
+            device,
+            copy_stream,
+            pinned_scratch,
+            Some(descs_acc),
+            Some((bucket, formats)),
+            Some(&mut *alloc_ms),
+        )?);
+    }
+    Ok(out)
+}
+
+/// One layer's chunks partitioned for quantization: the kernel-eligible jobs
+/// (full/partial GPU-`Float` or `R16` chunks) and the preserve bucket (mixed-Q
+/// chunks passed through unchanged). Owned, so it outlives the storage read lock
+/// and can be threaded through a cross-layer selection.
+#[cfg(feature = "cuda")]
+struct QuantBucket {
+    chunk_jobs: Vec<HeadGids>,
+    chunk_valid_ranges: Vec<i32>,
+    seq_chunk_map: Vec<(usize, usize)>,
+    preserve_per_seq: Vec<Vec<(usize, SealedChunk)>>,
+}
+
+/// Partition `sequences`' chunks into kernel-eligible jobs vs the preserve
+/// bucket. A chunk is eligible when every `(h, p)` source GID lives in a GPU
+/// `Float` or `Quantized(R16)` arena — the formats the selection + convert
+/// kernels read directly. Full and partial chunks both qualify (partial dead
+/// slots are zero — arenas are zeroed at creation/recycle — and the packed
+/// valid range corrects the count-normalized metrics). Ineligible chunks (e.g. a
+/// view borrowing cold-loaded mixed-Q chunks) go to `preserve` and merge back
+/// unchanged. `Ok(None)` ⇒ nothing eligible (caller passes the sequences
+/// through verbatim).
+#[cfg(feature = "cuda")]
+fn bucket_quant_chunks(
+    backing: &ChunkedKvBacking,
+    sequences: &[&SealedSequence],
+) -> Result<Option<QuantBucket>> {
+    let mut chunk_jobs: Vec<HeadGids> = Vec::new();
+    let mut chunk_valid_ranges: Vec<i32> = Vec::new();
+    let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
+    let mut preserve_per_seq: Vec<Vec<(usize, SealedChunk)>> =
+        sequences.iter().map(|_| Vec::new()).collect();
+    backing.inner.storage.read(|storage| {
+        for (seq_idx, seq) in sequences.iter().enumerate() {
+            for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
+                let mut all_gids_kernel_eligible = true;
+                for gid in chunk.gids.as_slice() {
+                    let ok = matches!(
+                        storage.arena_key(gid.arena_idx()),
+                        Some(k) if k.location == ArenaLocation::Gpu
+                            && super::chunk_ops::needs_reconcile_source_format(k.format)
+                    );
+                    if !ok {
+                        all_gids_kernel_eligible = false;
+                        break;
+                    }
+                }
+                if all_gids_kernel_eligible {
+                    chunk_jobs.push(chunk.gids.clone());
+                    let len = usize::from(chunk.token_count).clamp(1, CHUNK_SIZE) as i32;
+                    chunk_valid_ranges.push(((chunk.offset as i32) << 8) | len);
+                    seq_chunk_map.push((seq_idx, chunk_idx));
+                } else {
+                    preserve_per_seq[seq_idx].push((chunk_idx, chunk.clone()));
+                }
+            }
+        }
+        Ok::<(), candle::Error>(())
+    })??;
+    if chunk_jobs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(QuantBucket {
+        chunk_jobs,
+        chunk_valid_ranges,
+        seq_chunk_map,
+        preserve_per_seq,
+    }))
+}
+
+/// One layer's selected per-`(chunk, head, palette)` quant formats, outer
+/// scales, and packed palette maps — the host-side product of the selection
+/// kernel, ready to drive the alloc + convert-descriptor build.
+#[cfg(feature = "cuda")]
+struct LayerFormats {
+    k_palette_formats: Vec<Vec<QuantFormat>>,
+    v_palette_formats: Vec<Vec<QuantFormat>>,
+    k_palette_scales: Vec<Vec<f32>>,
+    v_palette_scales: Vec<Vec<f32>>,
+    k_palette_maps: Vec<Vec<u8>>,
+    v_palette_maps: Vec<Vec<u8>>,
+}
+
+/// Reshape the selection kernel's flat per-`(chunk, head)` rows into the
+/// per-chunk [`LayerFormats`]. The input rows may be a slice of a larger
+/// cross-layer readback (this layer's chunk range); `n_chunks` is this layer's
+/// chunk count. Pure host transform — identical whether the rows came from a
+/// per-layer or a batched cross-layer selection.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn derive_layer_formats(
+    k_palette4_rows: &[[SampleFormat; 4]],
+    v_palette4_rows: &[[SampleFormat; 4]],
+    k_palette_scale_rows: &[[f32; 4]],
+    v_palette_scale_rows: &[[f32; 4]],
+    k_assignments: &[u8],
+    v_assignments: &[u8],
+    n_chunks: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+) -> Result<LayerFormats> {
+    let to_quant = |fmt: SampleFormat| -> Result<QuantFormat> {
+        fmt.to_quant_format().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "quantize_sealed_in_place: selection produced non-quant format {fmt}"
+            ))
+        })
+    };
+    let build_fmt = |rows: &[[SampleFormat; 4]]| -> Result<Vec<Vec<QuantFormat>>> {
+        (0..n_chunks)
+            .map(|c| {
+                let start = c * n_kv_head;
+                let end = start + n_kv_head;
+                rows[start..end]
+                    .iter()
+                    .flat_map(|row| row.iter().copied())
+                    .map(to_quant)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let build_scale = |rows: &[[f32; 4]]| -> Vec<Vec<f32>> {
+        (0..n_chunks)
+            .map(|c| {
+                let start = c * n_kv_head;
+                let end = start + n_kv_head;
+                rows[start..end]
+                    .iter()
+                    .flat_map(|row| row.iter().copied())
+                    .collect::<Vec<f32>>()
+            })
+            .collect()
+    };
+    Ok(LayerFormats {
+        k_palette_formats: build_fmt(k_palette4_rows)?,
+        v_palette_formats: build_fmt(v_palette4_rows)?,
+        k_palette_scales: build_scale(k_palette_scale_rows),
+        v_palette_scales: build_scale(v_palette_scale_rows),
+        k_palette_maps: pack_head_palette_maps(k_assignments, n_chunks, n_kv_head, head_dim)?,
+        v_palette_maps: pack_head_palette_maps(v_assignments, n_chunks, n_kv_head, head_dim)?,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn quantize_sealed_in_place_impl(
+    backing: &ChunkedKvBacking,
+    sequences: &[&SealedSequence],
+    policy: &CompressionPolicy,
+    device: &Device,
+    copy_stream: &Arc<CudaStream>,
+    pinned_scratch: &mut Option<PinnedBuf>,
+    deferred_descs: Option<&mut Vec<PalHeadDesc>>,
+    precomputed: Option<(QuantBucket, LayerFormats)>,
+    // Accumulator for the dst-arena allocation time (the suspected
+    // pressure-regime bottleneck). `None` on single-layer callers.
+    alloc_ms: Option<&mut u64>,
 ) -> Result<Vec<SealedSequence>> {
     let _ = pinned_scratch; // kept for signature compatibility; no DtoH performed.
     if sequences.is_empty() {
@@ -209,194 +579,118 @@ pub fn quantize_sealed_in_place(
     // through the kernel. `seq_chunk_map[i] = (seq_idx, chunk_idx)`
     // lets us reassemble per-sequence outputs in the original chunk
     // order at the end.
-    let mut chunk_jobs: Vec<HeadGids> = Vec::new();
-    let mut chunk_valid_ranges: Vec<i32> = Vec::new();
-    let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
-    let mut source_seq_chunks: Vec<&SealedChunk> = Vec::new();
-    // Per-sequence preserve list, recorded as `(chunk_idx_within_seq,
-    // chunk_clone)` so we can rebuild the original chunk order at merge
-    // time. Preserve-bucket chunks are passed through unchanged — same
-    // GIDs, same arenas, no re-quantization.
-    let mut preserve_per_seq: Vec<Vec<(usize, SealedChunk)>> =
-        sequences.iter().map(|_| Vec::new()).collect();
-    backing.inner.storage.read(|storage| {
-        for (seq_idx, seq) in sequences.iter().enumerate() {
-            for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
-                // Partial chunks (token_count < CHUNK_SIZE) quantize like
-                // full ones. Their dead token slots are ZERO — arena chunks
-                // are zeroed at creation (`Tensor::zeros`) and on free-list
-                // recycle (`zero_recycled_chunk`) — so they contribute
-                // nothing to the selection kernel's amax or error sums; the
-                // per-chunk valid range passed below corrects the
-                // count-normalized metrics (V's mean-over-32 MSE, K's top-4
-                // mean) and the sink statistics for the missing lanes.
-                //
-                // A chunk goes through the fused palette4 kernel when every
-                // (h, p) source GID lives in a GPU `Float` or
-                // `Quantized(R16)` arena — the formats the selection + convert
-                // kernels read directly. Otherwise (e.g. a view borrowing
-                // older chunks that came back from cold storage in mixed
-                // Q-formats) it goes to the preserve bucket: those GIDs
-                // already carry the format/pal_map/scale an earlier persist
-                // pass selected, and re-quantizing would be redundant.
-                let mut all_gids_kernel_eligible = true;
-                {
-                    for gid in chunk.gids.as_slice() {
-                        let ok = matches!(
-                            storage.arena_key(gid.arena_idx()),
-                            Some(k) if k.location == ArenaLocation::Gpu
-                                && super::chunk_ops::needs_reconcile_source_format(k.format)
-                        );
-                        if !ok {
-                            all_gids_kernel_eligible = false;
-                            break;
-                        }
-                    }
-                }
-                if all_gids_kernel_eligible {
-                    chunk_jobs.push(chunk.gids.clone());
-                    // Packed (offset << 8) | len valid window for the
-                    // selection kernel's count-normalized metrics.
-                    let len = usize::from(chunk.token_count).clamp(1, CHUNK_SIZE) as i32;
-                    chunk_valid_ranges.push(((chunk.offset as i32) << 8) | len);
-                    seq_chunk_map.push((seq_idx, chunk_idx));
-                    source_seq_chunks.push(chunk);
-                } else {
-                    preserve_per_seq[seq_idx].push((chunk_idx, chunk.clone()));
-                }
-            }
-        }
-        Ok::<(), candle::Error>(())
-    })??;
-    if chunk_jobs.is_empty() {
-        // Nothing eligible for the kernel — every chunk is either
-        // partial or already in a non-R16 quant arena. Pass through
-        // verbatim (chunks are already on GPU; we just clone the
-        // SealedSequence wrappers).
-        return Ok(sequences.iter().map(|s| (*s).clone()).collect());
-    }
+    // Bucket source chunks (quantize vs preserve) — from the caller's
+    // precomputed cross-layer plan when present, else a fresh per-layer bucket.
+    let (bucket, precomputed_formats) = match precomputed {
+        Some((b, f)) => (b, Some(f)),
+        None => match bucket_quant_chunks(backing, sequences)? {
+            Some(b) => (b, None),
+            None => return Ok(sequences.iter().map(|s| (*s).clone()).collect()),
+        },
+    };
+    let QuantBucket {
+        chunk_jobs,
+        chunk_valid_ranges,
+        seq_chunk_map,
+        preserve_per_seq,
+    } = bucket;
+    let n_chunks = chunk_jobs.len();
 
     // ── Per-(chunk, head, palette) format selection ───────────────────
-    // The selection kernel runs across all chunk jobs in one launch
-    // and returns:
-    //   - per-(chunk, head) array of 4 palette format choices,
-    //   - per-(chunk, head) array of 4 palette outer scales,
-    //   - per-(chunk, head, dim) palette assignment (which slot
-    //     each dim belongs to — used to derive the packed palette map).
-    let (k_candidates, v_candidates) = {
-        let (k_profile, v_profile) =
-            super::compression_policy::production_adaptive_candidates(policy.compression_level);
-        let k: Vec<SampleFormat> = k_profile
-            .into_iter()
-            .filter_map(SampleFormat::from_kv_format)
-            .filter(|fmt| !fmt.is_float())
-            .collect();
-        let v: Vec<SampleFormat> = v_profile
-            .into_iter()
-            .filter_map(SampleFormat::from_kv_format)
-            .filter(|fmt| !fmt.is_float())
-            .collect();
-        if k.is_empty() || v.is_empty() {
-            candle::bail!(
-                "quantize_sealed_in_place: missing K/V production candidates for level {}",
-                policy.compression_level
-            );
-        }
-        (k, v)
-    };
-
-    let threshold_idx = policy.compression_level.min(10) as usize;
-    let k_threshold_hi =
-        PRODUCTION_K_QREL_HIGH_THRESHOLDS[threshold_idx] * policy.k_hi_error_threshold_factor;
-    let k_threshold_lo =
-        PRODUCTION_K_QREL_LOW_THRESHOLDS[threshold_idx] * policy.k_low_error_threshold_factor;
-    let v_threshold_hi =
-        PRODUCTION_V_QREL_HIGH_THRESHOLDS[threshold_idx] * policy.v_hi_error_threshold_factor;
-    let v_threshold_lo =
-        PRODUCTION_V_QREL_LOW_THRESHOLDS[threshold_idx] * policy.v_low_error_threshold_factor;
-
-    let stager_generation = backing.begin_stager_generation_required();
-    let gpu_inputs = PagedSelectionGpuInputs::from_head_gids(
-        backing.inner.clone(),
-        &chunk_jobs,
-        Some(&stager_generation),
-        cuda_dev,
-    )?;
-
+    // Use the caller's precomputed cross-layer selection when present; else run
+    // this layer's selection kernel now (one launch across all chunk jobs) and
+    // reshape its flat readback rows. `stager_generation` is `Some` only on the
+    // per-layer path — the deferred cross-layer path never runs an immediate
+    // convert, so it needs no stager here.
     let (
-        k_palette4_rows,
-        v_palette4_rows,
-        k_palette_scale_rows,
-        v_palette_scale_rows,
-        k_assignments,
-        v_assignments,
-        _k_head_amax,
-        _v_head_amax,
-    ) = gpu_inputs.select_palette4_formats_fused(
-        &k_candidates,
-        &v_candidates,
-        k_threshold_hi,
-        k_threshold_lo,
-        v_threshold_hi,
-        v_threshold_lo,
-        Some(&chunk_valid_ranges),
-        Some(&stager_generation),
-    )?;
+        LayerFormats {
+            k_palette_formats,
+            v_palette_formats,
+            k_palette_scales,
+            v_palette_scales,
+            k_palette_maps,
+            v_palette_maps,
+        },
+        stager_generation,
+    ) = match precomputed_formats {
+        Some(f) => (f, None),
+        None => {
+            let (k_candidates, v_candidates) = {
+                let (k_profile, v_profile) =
+                    super::compression_policy::production_adaptive_candidates(
+                        policy.compression_level,
+                    );
+                let k: Vec<SampleFormat> = k_profile
+                    .into_iter()
+                    .filter_map(SampleFormat::from_kv_format)
+                    .filter(|fmt| !fmt.is_float())
+                    .collect();
+                let v: Vec<SampleFormat> = v_profile
+                    .into_iter()
+                    .filter_map(SampleFormat::from_kv_format)
+                    .filter(|fmt| !fmt.is_float())
+                    .collect();
+                if k.is_empty() || v.is_empty() {
+                    candle::bail!(
+                        "quantize_sealed_in_place: missing K/V production candidates for level {}",
+                        policy.compression_level
+                    );
+                }
+                (k, v)
+            };
 
-    let to_quant = |fmt: SampleFormat| -> Result<QuantFormat> {
-        fmt.to_quant_format().ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "quantize_sealed_in_place: selection produced non-quant format {fmt}"
-            ))
-        })
+            let threshold_idx = policy.compression_level.min(10) as usize;
+            let k_threshold_hi = PRODUCTION_K_QREL_HIGH_THRESHOLDS[threshold_idx]
+                * policy.k_hi_error_threshold_factor;
+            let k_threshold_lo = PRODUCTION_K_QREL_LOW_THRESHOLDS[threshold_idx]
+                * policy.k_low_error_threshold_factor;
+            let v_threshold_hi = PRODUCTION_V_QREL_HIGH_THRESHOLDS[threshold_idx]
+                * policy.v_hi_error_threshold_factor;
+            let v_threshold_lo = PRODUCTION_V_QREL_LOW_THRESHOLDS[threshold_idx]
+                * policy.v_low_error_threshold_factor;
+
+            let sg = backing.begin_stager_generation_required();
+            let gpu_inputs = PagedSelectionGpuInputs::from_head_gids(
+                backing.inner.clone(),
+                &chunk_jobs,
+                Some(&sg),
+                cuda_dev,
+            )?;
+
+            let (
+                k_palette4_rows,
+                v_palette4_rows,
+                k_palette_scale_rows,
+                v_palette_scale_rows,
+                k_assignments,
+                v_assignments,
+                _k_head_amax,
+                _v_head_amax,
+            ) = gpu_inputs.select_palette4_formats_fused(
+                &k_candidates,
+                &v_candidates,
+                k_threshold_hi,
+                k_threshold_lo,
+                v_threshold_hi,
+                v_threshold_lo,
+                Some(&chunk_valid_ranges),
+                Some(&sg),
+            )?;
+
+            let formats = derive_layer_formats(
+                &k_palette4_rows,
+                &v_palette4_rows,
+                &k_palette_scale_rows,
+                &v_palette_scale_rows,
+                &k_assignments,
+                &v_assignments,
+                n_chunks,
+                n_kv_head,
+                head_dim,
+            )?;
+            (formats, Some(sg))
+        }
     };
-
-    let n_chunks = chunk_jobs.len();
-    let k_palette_formats: Vec<Vec<QuantFormat>> = (0..n_chunks)
-        .map(|c| {
-            let start = c * n_kv_head;
-            let end = start + n_kv_head;
-            k_palette4_rows[start..end]
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .map(to_quant)
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let v_palette_formats: Vec<Vec<QuantFormat>> = (0..n_chunks)
-        .map(|c| {
-            let start = c * n_kv_head;
-            let end = start + n_kv_head;
-            v_palette4_rows[start..end]
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .map(to_quant)
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let k_palette_scales: Vec<Vec<f32>> = (0..n_chunks)
-        .map(|c| {
-            let start = c * n_kv_head;
-            let end = start + n_kv_head;
-            k_palette_scale_rows[start..end]
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect::<Vec<f32>>()
-        })
-        .collect();
-    let v_palette_scales: Vec<Vec<f32>> = (0..n_chunks)
-        .map(|c| {
-            let start = c * n_kv_head;
-            let end = start + n_kv_head;
-            v_palette_scale_rows[start..end]
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect::<Vec<f32>>()
-        })
-        .collect();
-    let k_palette_maps = pack_head_palette_maps(&k_assignments, n_chunks, n_kv_head, head_dim)?;
-    let v_palette_maps = pack_head_palette_maps(&v_assignments, n_chunks, n_kv_head, head_dim)?;
 
     // ── Allocate GPU-quant destination GIDs ───────────────────────────
     // One destination GID per (chunk, head, palette, K/V). The
@@ -406,6 +700,7 @@ pub fn quantize_sealed_in_place(
     // When `policy.override_k_quant` is set, K dst is uniform `fmt`
     // regardless of selection's K format pick. V always uses selection's
     // per-(c, h, p) format.
+    let t_alloc = std::time::Instant::now();
     let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
     for chunk_i in 0..n_chunks {
         let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
@@ -425,6 +720,9 @@ pub fn quantize_sealed_in_place(
             }
         }
         new_gids_per_chunk.push(chunk_gids);
+    }
+    if let Some(a) = alloc_ms {
+        *a += t_alloc.elapsed().as_millis() as u64;
     }
 
     // ── Build PalHeadDesc structs + launch kernel ─────────────────────
@@ -622,24 +920,28 @@ pub fn quantize_sealed_in_place(
     // thread does this once after the per-layer loop completes; that
     // single sync also covers any subsequent DtoH on `copy_stream`,
     // which records a wait on the primary stream's event).
-    let primary_stream = cuda_dev.cuda_stream();
-    // One launch per chunk. The convert kernel mishandles per-chunk
-    // dst-side state variance (pal_map + outer scales) when multiple
-    // chunks share a launch; selection produces those per (chunk, head),
-    // so we must keep each chunk in its own launch to preserve the
-    // variance correctly. Layer-level FIFO ordering on the primary
-    // stream means these queue cleanly behind each other.
-    for chunk_i in 0..n_chunks {
-        let start = chunk_i * n_kv_head;
-        let end = start + n_kv_head;
-        candle::quantized::cuda::quantize_palette4_convert_buffered(
-            &descs[start..end],
-            n_kv_head,
-            1, // one chunk per launch
-            1,
-            &stager_generation,
-            &primary_stream,
-        )?;
+    // Convert step. `deferred_descs = None` (single-layer callers) launches the
+    // batched convert now; `Some(acc)` (the cross-layer persist pass) appends our
+    // per-(chunk, head) descriptors to the caller's accumulator so it runs ONE
+    // convert over EVERY layer's descriptors (collapsing the per-layer launches
+    // too). Either way each block runs the unchanged kernel body against the same
+    // descriptor — only the launch grouping changes, so it is bit-identical
+    // (proven by the A/B tests). The dst arenas are already allocated above (the
+    // reassembled sequences below point at them); the immediate-or-deferred
+    // convert fills them on the primary stream before any downstream read.
+    match deferred_descs {
+        Some(acc) => acc.append(&mut descs),
+        None => {
+            let primary_stream = cuda_dev.cuda_stream();
+            let sg = stager_generation.as_ref().ok_or_else(|| {
+                candle::Error::Msg(
+                    "quantize_sealed_in_place: immediate convert requires a stager (precomputed \
+                     formats must defer the convert)"
+                        .into(),
+                )
+            })?;
+            convert_descs_batched(&descs, n_kv_head, sg, &primary_stream)?;
+        }
     }
     let _ = copy_stream; // intentionally unused: convert runs on primary.
     drop(stager_generation);
@@ -650,7 +952,15 @@ pub fn quantize_sealed_in_place(
     // and `None` lets selection's full K state propagate to storage directly.
 
     // ── Reassemble per-sequence GPU-quant SealedSequences ────────────
-    let arena_infos = backing.resolve_arena_info()?;
+    // Only the dst quant arenas we just allocated are read below (via
+    // `arena_byte_size` + `build_meta_records`), so resolve just those instead
+    // of every arena — the O(num_arenas) `to_arena_entry` walk is the dominant
+    // `other` term at pressure.
+    let needed_arenas: std::collections::HashSet<usize> = new_gids_per_chunk
+        .iter()
+        .flat_map(|gids| gids.iter().map(|g| g.arena_idx()))
+        .collect();
+    let arena_infos = backing.resolve_arena_info_for(&needed_arenas)?;
     // For each (seq_idx, chunk_idx_within_seq), build the new GPU
     // Q-format SealedChunk. The kernel just wrote the per-(h, p)
     // palette4 bytes into the GIDs in `new_gids_per_chunk`; we wrap
@@ -664,7 +974,8 @@ pub fn quantize_sealed_in_place(
     for (job_idx, &(seq_idx, chunk_idx)) in seq_chunk_map.iter().enumerate() {
         let new_gids = HeadGids::from_vec(new_gids_per_chunk[job_idx].clone());
         let byte_size = new_gids.arena_byte_size(&arena_infos);
-        let src = source_seq_chunks[job_idx];
+        let (src_seq_idx, src_chunk_idx) = seq_chunk_map[job_idx];
+        let src = &sequences[src_seq_idx].chunks[src_chunk_idx];
         // K and V pal_map / scale match what convert-1 wrote per side:
         // identity layout + empty Arc (1.0 fallback) when the corresponding
         // override is set; selection's full state otherwise. Identity bytes
@@ -809,6 +1120,69 @@ pub fn quantize_sealed_in_place(
 /// Eligible chunks are full chunks whose every `(h, p)` GID lives in a GPU
 /// `Quantized` (incl. `R16`) arena. Chunks already in GPU `Float` (partial
 /// tails) pass through the preserve bucket unchanged. `head_dim` must be 128.
+/// Launch the batched palette4 convert over `descs` (`[jobs × n_kv_head]`, one
+/// "job" per chunk mapped onto the kernel's `num_layers` grid dim). Tiled at the
+/// 65535 grid.y cap. Bit-identical to converting the jobs in separate launches —
+/// only the launch grouping changes. Shared by the immediate single-layer path
+/// and the deferred cross-layer path.
+#[cfg(feature = "cuda")]
+fn convert_descs_batched(
+    descs: &[PalHeadDesc],
+    n_kv_head: usize,
+    stager: &Generation,
+    stream: &Arc<CudaStream>,
+) -> Result<()> {
+    if descs.is_empty() {
+        return Ok(());
+    }
+    debug_assert_eq!(descs.len() % n_kv_head, 0, "descs must be [jobs × n_kv_head]");
+    let n_jobs = descs.len() / n_kv_head;
+    const MAX_GRID_Y: usize = 65_535;
+    let mut base = 0usize;
+    while base < n_jobs {
+        let tile = (n_jobs - base).min(MAX_GRID_Y);
+        let start = base * n_kv_head;
+        let end = (base + tile) * n_kv_head;
+        candle::quantized::cuda::quantize_palette4_convert_buffered(
+            &descs[start..end],
+            n_kv_head,
+            tile, // num_layers = job count in this tile (one chunk per block)
+            1,    // num_chunks per block = 1 (each chunk is its own arena set)
+            stager,
+            stream,
+        )?;
+        base += tile;
+    }
+    Ok(())
+}
+
+/// Run the deferred cross-layer convert accumulated by
+/// [`quantize_sealed_in_place_deferred`]: ONE batched launch over EVERY layer's
+/// descriptors on the primary stream (`n_layers × n_chunks × n_kv_head` blocks),
+/// filling the dst arenas the returned sequences point at, before the persist
+/// pass reads them. `backing` supplies the pinned stager + CUDA device; any
+/// layer's backing works (the descriptors carry their own arena pointers).
+#[cfg(feature = "cuda")]
+pub fn convert_deferred_descs(
+    backing: &ChunkedKvBacking,
+    descs: &[PalHeadDesc],
+    n_kv_head: usize,
+    device: &Device,
+) -> Result<()> {
+    if descs.is_empty() {
+        return Ok(());
+    }
+    let cuda_dev = match device {
+        Device::Cuda(d) => d,
+        _ => candle::bail!("convert_deferred_descs: requires a CUDA device"),
+    };
+    let stager = backing.begin_stager_generation_required();
+    let primary_stream = cuda_dev.cuda_stream();
+    convert_descs_batched(descs, n_kv_head, &stager, &primary_stream)?;
+    drop(stager);
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 pub fn dequantize_sealed_in_place(
     backing: &ChunkedKvBacking,
@@ -1044,7 +1418,13 @@ pub fn dequantize_sealed_in_place(
     drop(stager_generation);
 
     // ── Reassemble per-sequence F16 SealedSequences ──────────────────
-    let arena_infos = backing.resolve_arena_info()?;
+    // Only the dst float arenas just allocated are read below — resolve just
+    // those (see the quantize path for the O(num_arenas) rationale).
+    let needed_arenas: std::collections::HashSet<usize> = new_gids_per_chunk
+        .iter()
+        .flat_map(|gids| gids.iter().map(|g| g.arena_idx()))
+        .collect();
+    let arena_infos = backing.resolve_arena_info_for(&needed_arenas)?;
     // Float chunks carry an identity palette map and unit (empty) scales.
     let mut identity_head_bytes = vec![0u8; n_kv_head * pal_bytes_per_head];
     for h in 0..n_kv_head {

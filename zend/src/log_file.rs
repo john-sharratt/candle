@@ -20,7 +20,7 @@ const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Number of rotated archives kept (`zend.log.1` … `zend.log.N`).
 const MAX_ARCHIVES: usize = 4;
 /// Active log file name under `.substrate/`.
-const LOG_NAME: &str = "zend.log";
+pub const LOG_NAME: &str = "zend.log";
 
 /// `…/zend.log` → `…/zend.log.{n}` (append, not extension-replace).
 fn archive_path(base: &Path, n: usize) -> PathBuf {

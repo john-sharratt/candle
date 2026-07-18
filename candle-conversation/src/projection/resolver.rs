@@ -381,9 +381,12 @@ impl Conversation {
                 // back to declaration order (the first tool in the catalog) and
                 // pins there. This is THE signature of "wrong tool every turn".
                 // An empty gallery is also the persistent steady state of an
-                // uncalibrated workspace, and the scan runs several times per
-                // turn — WARN once per collection, then demote repeats to DEBUG
-                // so the actionable signal isn't buried in its own repetition.
+                // uncalibrated workspace — and during the calibration load-phase
+                // the scan runs on every one of hundreds of per-tool example
+                // decodes while the gallery is still being built, so the repeat
+                // fires en masse. WARN once per collection (the actionable
+                // signal), then demote repeats to TRACE so they don't bury the log
+                // during calibration; steady-state behaviour is unchanged.
                 static EMPTY_GALLERY_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
                 let first = EMPTY_GALLERY_WARNED
                     .get_or_init(|| Mutex::new(HashSet::new()))
@@ -398,10 +401,10 @@ impl Conversation {
                         sections = n,
                         probe_windows = probe.len(),
                         "belief gallery EMPTY — no tag-scoped gallery turns; tool selection \
-                         falls back to catalog order (repeats logged at debug)"
+                         falls back to catalog order (repeats logged at trace)"
                     );
                 } else {
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::belief",
                         collection = %coll.name,
                         "belief gallery still empty"

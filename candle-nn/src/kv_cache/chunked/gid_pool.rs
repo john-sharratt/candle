@@ -8,11 +8,15 @@
 //!
 //! Each registered arena has a single contiguous [`ArenaRefcounts`] struct
 //! holding:
-//!   - `counts: Vec<AtomicU16>` — one refcount per chunk slot. `0` means
-//!     free; `≥ 1` means allocated with N holders.
-//!   - `first_free: AtomicU64` — a best-effort hint pointing at the lowest
-//!     known free slot. Allocators read it as a scan starting point; drops
-//!     conditionally lower it via CAS when they free a slot below it.
+//!   - `counts: Vec<AtomicU16>` — one word per chunk slot, overlapped by the
+//!     `occupancy` bit: the slot's **refcount** while occupied, or the
+//!     recycle-stack **next-free link** while free. A free slot has no live
+//!     gid, so the two uses never coincide in time.
+//!   - `occupancy: Vec<AtomicU64>` — one bit per slot, the authoritative
+//!     free/occupied discriminator for the overlapped `counts` word.
+//!   - `recycle_head: AtomicU64` + `hwm: AtomicU32` — the O(1) free list: a
+//!     lock-free intrusive Treiber stack of freed slots (`recycle_head`) plus a
+//!     high-water mark (`hwm`) that hands out never-used slots. No scan.
 //!
 //! Every [`ChunkGid`] carries an `Arc<ArenaRefcounts>` (shared with every
 //! other gid in the same arena) plus an `i64` id. No per-gid heap
@@ -22,29 +26,26 @@
 //!
 //! ### Allocation path
 //!
-//! `ArenaPool::allocate_n` iterates arenas in `arena_idx` order. For each
-//! arena, it scans `counts` forward from `first_free`, trying
-//! `compare_exchange(0, 1)` on each slot. Success claims the slot;
-//! failure means another thread got it first or it's occupied — scan
-//! continues. After a claim, the allocator does a best-effort
-//! `first_free.compare_exchange(start, i + 1)` to advance the hint.
+//! `ArenaPool::allocate_n` iterates arenas in `arena_idx` order (skipping full
+//! ones via the pool capacity bitmap). For each arena it claims slots in O(1):
+//! pop the `recycle_head` stack if non-empty, else bump `hwm`. No per-slot
+//! scan, so allocation cost is independent of how fragmented the arena is.
 //!
 //! ### Drop path
 //!
-//! `ChunkGid::drop` does `counts[chunk_idx].fetch_sub(1)`. If the value
-//! transitioned to zero, the slot is now free and a tiny CAS-loop tries
-//! to lower `first_free` to `chunk_idx`. If the CAS loses to another
-//! thread, the hint just stays higher than optimal — correctness is
-//! unaffected; the next alloc will scan past stale entries and find the
-//! actual free slot.
+//! `ChunkGid::drop` does `counts[chunk_idx].fetch_sub(1)`. On the `1→0`
+//! last-drop the slot is freed: its `occupancy` bit is cleared and it is pushed
+//! onto the `recycle_head` stack (its `counts` word becomes the next-free link).
+//! Drops are ungated and only ever push; allocation is gated to a single popper,
+//! which keeps the Treiber pop ABA-free.
 //!
 //! No mutex anywhere on the hot path. The pool's `RwLock<HashMap>` is
 //! taken only on `register_arena` / `release_arena` (rare).
 //!
 //! ## What was replaced
 //!
-//! The previous design held the free set as `Mutex<BinaryHeap<Reverse<i64>>>`
-//! + `BTreeSet<arena_idx>` + `HashMap<arena_idx, free_count>` per format.
+//! The previous design held the free set as a per-format `Mutex<BinaryHeap>`
+//! plus `BTreeSet<arena_idx>` plus `HashMap<arena_idx, free_count>`.
 //! Every alloc and drop took the per-format mutex; every gid was a
 //! separate `Arc<GidInner>` heap allocation. The lock-free refcount-table
 //! design collapses all of that into one contiguous `Vec<AtomicU16>` per
@@ -57,42 +58,51 @@ use std::{
     collections::VecDeque,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
 };
 use strum::IntoEnumIterator;
 
 use super::arena::ArenaKey;
-use crate::kv_cache::chunked::types::{arena_chunks_for_format, arena_gid_stride};
+use crate::kv_cache::chunked::types::{arena_chunks_for_format, arena_gid_stride, TARGET_ARENA_BYTES};
 use crate::kv_cache::{ArenaLocation, KvFormat, QuantFormat};
 
 /// Per-arena refcount table. Lives behind an `Arc` shared by every
 /// `ChunkGid` allocated from this arena. Lock-free: all mutation is via
-/// atomics on `counts[chunk_idx]` and `first_free`.
+/// atomics on `counts[chunk_idx]`, `occupancy`, and `recycle_head`/`hwm`.
 #[derive(Debug)]
 pub struct ArenaRefcounts {
-    /// Refcount per chunk slot. `0` = free, `≥ 1` = allocated. This is the
-    /// **authority**; the `compare_exchange(0→1)` against it is the real
-    /// claim.
-    counts: Vec<AtomicU16>,
-    /// Occupancy summary: one BIT per slot (set ⟺ `counts[i] > 0`), packed
-    /// 64 slots per `u64` word, so the scan skips 64 occupied slots in one
-    /// relaxed load instead of probing each `counts` entry.
+    /// Dual-purpose per-slot word, disambiguated by the `occupancy` bit:
+    ///   * **occupied** (`occupancy` bit set) → the slot's **refcount**
+    ///     (`≥ 1`); `compare_exchange`/`fetch_add`/`fetch_sub` against it are
+    ///     the real COW-share bookkeeping.
+    ///   * **free** (`occupancy` bit clear) → the intrusive recycle-stack
+    ///     **link**: the index of the next free slot, or `arena_chunks` for the
+    ///     bottom of the stack. A free slot has no live `ChunkGid`, so nothing
+    ///     ever reads it as a refcount — the two uses never overlap in time.
     ///
-    /// This is a **scan hint only** — never consulted for correctness. It is
-    /// maintained on exactly the same `0↔1` transitions as `live`: the bit is
-    /// set right after a successful claim in `try_claim_one`, and cleared on
-    /// the `1→0` last drop in `dec`. `inc`/non-last `dec` (clone / shared
-    /// drop) never cross `0↔1` and never touch it. Updates use atomic
-    /// `fetch_or` / `fetch_and` so concurrent set/clear of *different* bits in
-    /// the same word compose without lost updates. See the race analysis
-    /// above `try_claim_one`.
+    /// `u16` holds either (arena chunk counts and indices are both far below
+    /// 65536), so the free list needs no separate links array.
+    counts: Vec<AtomicU16>,
+    /// Occupancy: one BIT per slot, `set ⟺ slot is allocated`. With `counts`
+    /// overlapped (refcount xor link) this is now the **authoritative** free/
+    /// occupied discriminator (not just a scan hint): set on claim, cleared on
+    /// the `1→0` last drop, `fetch_or`/`fetch_and` so different bits of a word
+    /// compose. Read by `live_gids` to enumerate live slots.
     occupancy: Vec<AtomicU64>,
-    /// Best-effort hint for the lowest known free slot. Allocators read
-    /// it as a scan starting point; drops lower it via CAS when they
-    /// free a slot below it.
-    first_free: AtomicU64,
+    /// Lock-free intrusive recycle stack of freed slots (Treiber). Links live
+    /// in `counts` (a free slot's word = next-free index, or `arena_chunks` =
+    /// bottom). Packed head: low 32 bits = top slot index (`arena_chunks` ⇒
+    /// empty), high 32 bits = ABA version tag. `dec` pushes a freed slot; alloc
+    /// pops — both O(1), no scan, fragmentation-immune. Allocs are gated
+    /// (single popper), so ABA can't actually arise; the tag is belt-and-braces.
+    recycle_head: AtomicU64,
+    /// High-water mark: index of the next never-allocated slot. Fresh capacity
+    /// comes from bumping this (so a new arena needs no O(A) free-list init —
+    /// the "one range `[0, A)`"); only *freed* slots ride `recycle_head`.
+    /// Written only by the gated allocator, so plain relaxed load/store.
+    hwm: AtomicU32,
     /// Number of currently-allocated slots in this arena (slots with
     /// `counts[i] > 0`). Maintained on each successful alloc/drop
     /// transition. Used by `try_tombstone` (arena is tombstoneable
@@ -112,6 +122,10 @@ pub struct ArenaRefcounts {
     /// Format key this arena was registered with. Inlined here so
     /// `ChunkGid::route_key` is a single pointer-deref away.
     key: ArenaKey,
+    /// Shared pool arena-capacity bitmap. `dec` sets this arena's bit on a
+    /// full → non-full transition so the pool's `allocate_any` can find it via
+    /// find-first-set instead of scanning every arena.
+    capacity: Arc<CapacityBitmap>,
 }
 
 impl ArenaRefcounts {
@@ -120,6 +134,7 @@ impl ArenaRefcounts {
         arena_idx: usize,
         key: ArenaKey,
         pool_total_live: Arc<AtomicUsize>,
+        capacity: Arc<CapacityBitmap>,
     ) -> Self {
         let mut counts = Vec::with_capacity(arena_chunks);
         for _ in 0..arena_chunks {
@@ -135,13 +150,36 @@ impl ArenaRefcounts {
         Self {
             counts,
             occupancy,
-            first_free: AtomicU64::new(0),
+            // Empty stack: low 32 bits = `arena_chunks` sentinel, version 0.
+            recycle_head: AtomicU64::new(arena_chunks as u64),
+            hwm: AtomicU32::new(0),
             live: AtomicUsize::new(0),
             pool_total_live,
             arena_chunks,
             arena_idx,
             key,
+            capacity,
         }
+    }
+
+    /// Unpack the recycle head into `(top_slot_idx, version)`; `top == arena_chunks`
+    /// means the stack is empty.
+    #[inline]
+    fn head_parts(head: u64) -> (usize, u64) {
+        ((head & 0xFFFF_FFFF) as usize, head >> 32)
+    }
+
+    /// Pack a `(top_slot_idx, version)` into a recycle-head word.
+    #[inline]
+    fn head_pack(idx: usize, version: u64) -> u64 {
+        ((version & 0xFFFF_FFFF) << 32) | (idx as u64 & 0xFFFF_FFFF)
+    }
+
+    /// Whether every slot is claimed (`live == arena_chunks`). The authoritative
+    /// full check the pool capacity bit mirrors.
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.live.load(Ordering::Acquire) >= self.arena_chunks
     }
 
     /// Mark slot `i` occupied in the scan bitmap (set its bit).
@@ -156,112 +194,66 @@ impl ArenaRefcounts {
         self.occupancy[i / 64].fetch_or(1u64 << (i % 64), Ordering::Relaxed);
     }
 
-    /// Mark slot `i` free in the scan bitmap (clear its bit).
+    /// Mark slot `i` free in the occupancy discriminator (clear its bit).
     ///
     /// Atomic `fetch_and` so it composes with a concurrent `set_occupied`.
-    /// **Release**: `dec` calls this and then lowers `first_free` with a
-    /// Release CAS, and the scan reads bitmap words with Acquire — so a
-    /// claimer that observes either the cleared bit or the lowered hint is
-    /// guaranteed to see this clear (drops are not gated, so this is the
-    /// synchronization that publishes a free slot to the scanner).
+    /// **Release**: `dec` calls this before overwriting `counts[i]` with the
+    /// recycle-stack link, so a reader that Acquire-observes the cleared bit
+    /// (slot free) never still sees the stale refcount in the word.
     #[inline]
     fn set_free(&self, i: usize) {
         self.occupancy[i / 64].fetch_and(!(1u64 << (i % 64)), Ordering::Release);
     }
 
-    // ── Occupancy-bitmap race analysis ───────────────────────────────────────
-    //
-    // `counts[i]` is the truth; the bitmap is a hint and the `compare_exchange`
-    // below is the authoritative claim. Two skews are possible; neither is a
-    // correctness bug:
-    //
-    //  * **bit set while slot free (would leak the slot): IMPOSSIBLE as a
-    //    persistent state.** A bit is only set by `set_occupied`, always right
-    //    after a successful `cmpxchg(0→1)` (i.e. with `count == 1`). For a
-    //    slot to reach `count == 0` a last-drop ran, and that `dec` always
-    //    calls `set_free` (an atomic `fetch_and`, never lost). Any `set_occupied`
-    //    after that implies another `cmpxchg(0→1)` → `count == 1` again. So
-    //    whenever `count` is stably 0 the bit is 0. The only `bit=1, count=0`
-    //    instant is the window *inside* a single `dec` between its `fetch_sub`
-    //    and its `set_free`, which the same thread closes immediately.
-    //
-    //  * **bit clear while slot occupied (a wasted probe): possible, transient,
-    //    self-healing.** If a `dec` frees a slot (`fetch_sub`→0) and a claimer
-    //    re-takes it (`cmpxchg 0→1`, `set_occupied`) before the `dec`'s trailing
-    //    `set_free` lands, the late `set_free` can clear a bit that now belongs
-    //    to the new owner → `bit=0, count>0`. The scan then probes that slot and
-    //    the `cmpxchg` cleanly fails (count≠0) — one wasted relaxed read+cmpxchg.
-    //    It heals on that owner's next drop (`count→0` with the bit already 0 =
-    //    consistent free). We deliberately do NOT re-set the bit on a failed
-    //    claim: a concurrent `dec` could be freeing the slot, and setting it
-    //    then would manufacture the leak skew above.
-    //
-    // Same-word concurrency is safe because `set_occupied`/`set_free` are atomic
-    // RMWs (OR / AND), so two threads flipping different bits of one word both
-    // take effect.
+    /// Finish claiming slot `i`: overwrite its `counts` word (was a free-list
+    /// link) with refcount 1, mark it occupied, and bump the live counters.
+    /// Runs under `alloc_gate`, and no `ChunkGid` for `i` exists yet, so no one
+    /// races these writes.
+    #[inline]
+    fn occupy(&self, i: usize) {
+        self.counts[i].store(1, Ordering::Relaxed);
+        self.set_occupied(i);
+        self.live.fetch_add(1, Ordering::Relaxed);
+        self.pool_total_live.fetch_add(1, Ordering::Relaxed);
+    }
 
-    /// Try to claim a single free slot at or after the `first_free` hint.
-    /// Returns the chunk_idx claimed, or `None` if no free slot is observable.
-    ///
-    /// Callers serialize this via `ArenaPool::alloc_gate`, so at most one
-    /// claimer scans at a time; concurrent `dec` drops (ungated) only ever
-    /// *free* slots and clear bits.
+    /// Claim a free slot in O(1): pop the recycle stack, else bump the high-
+    /// water mark. No scan — fully fragmentation-immune. Callers serialize this
+    /// via `ArenaPool::alloc_gate`, so there is exactly one popper; concurrent
+    /// `dec` drops only ever *push*, which is what makes the single-popper
+    /// Treiber pop ABA-free (a slot can't be popped and re-pushed under us).
     fn try_claim_one(&self) -> Option<usize> {
-        let n_words = self.occupancy.len();
-        let mut start = self.first_free.load(Ordering::Acquire) as usize;
+        // 1) Reuse a freed slot from the recycle stack.
         loop {
-            let mut w = start / 64;
-            // In the first scanned word, ignore bits below `start`.
-            let mut first_word_skip = (start % 64) as u32;
-            while w < n_words {
-                // Free bits = zero bits of the occupancy word. Acquire pairs
-                // with the Release `set_free` in `dec` so a freed slot is
-                // visible here.
-                let occ = self.occupancy[w].load(Ordering::Acquire);
-                let mut free = !occ;
-                if first_word_skip != 0 {
-                    free &= u64::MAX << first_word_skip;
-                    first_word_skip = 0;
-                }
-                while free != 0 {
-                    let b = free.trailing_zeros() as usize;
-                    let i = w * 64 + b;
-                    if i >= self.arena_chunks {
-                        // Phantom high bits past capacity in the final word —
-                        // always zero in `occupancy`, never real free slots.
-                        break;
-                    }
-                    // Authoritative claim — the bitmap is only a hint.
-                    if self.counts[i]
-                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        self.set_occupied(i);
-                        let _ = self.first_free.compare_exchange(
-                            start as u64,
-                            (i + 1) as u64,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                        self.live.fetch_add(1, Ordering::Relaxed);
-                        self.pool_total_live.fetch_add(1, Ordering::Relaxed);
-                        return Some(i);
-                    }
-                    // Stale-free bit (occupied despite the 0): skip it. Do not
-                    // set it — see the race analysis above.
-                    free &= free - 1;
-                }
-                w += 1;
+            let head = self.recycle_head.load(Ordering::Acquire);
+            let (top, version) = Self::head_parts(head);
+            if top == self.arena_chunks {
+                break; // empty — fall through to the high-water mark.
             }
-            // Scanned [start, arena_chunks) with nothing claimable. If a
-            // concurrent drop lowered `first_free` below `start`, rescan that
-            // lower window; otherwise the arena is (observably) full.
-            let new_start = self.first_free.load(Ordering::Acquire) as usize;
-            if new_start >= start {
-                return None;
+            // The next-link lives in the free slot's `counts` word. Reading it as
+            // a link is sound: `top` is on the stack, so the pushing `dec`'s
+            // `Release` link store happens-before this `Acquire` head load.
+            let next = self.counts[top].load(Ordering::Acquire) as usize;
+            let new_head = Self::head_pack(next, version.wrapping_add(1));
+            if self
+                .recycle_head
+                .compare_exchange_weak(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.occupy(top);
+                return Some(top);
             }
-            start = new_start;
+            // Lost the CAS to a concurrent push — retry with the fresh head.
         }
+        // 2) No recycled slot: hand out the next never-used slot. `hwm` is
+        //    written only by the gated allocator, so a plain load/store is enough.
+        let h = self.hwm.load(Ordering::Relaxed) as usize;
+        if h < self.arena_chunks {
+            self.hwm.store((h + 1) as u32, Ordering::Relaxed);
+            self.occupy(h);
+            return Some(h);
+        }
+        None // full: recycle stack empty and high-water mark exhausted.
     }
 
     /// Increment a slot's refcount — called by `ChunkGid::clone`. The
@@ -272,31 +264,46 @@ impl ArenaRefcounts {
         self.counts[chunk_idx].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement a slot's refcount — called by `ChunkGid::drop`. If the
-    /// count transitions to 0, lower `first_free` if this slot is below
-    /// it (best-effort CAS loop), and decrement the live counters
-    /// (per-arena and pool-wide).
+    /// Decrement a slot's refcount — called by `ChunkGid::drop`. On the `1→0`
+    /// last drop, free the slot: clear its occupancy bit, push it onto the
+    /// recycle stack (its `counts` word becomes the next-free link), and
+    /// decrement the live counters (per-arena and pool-wide).
     #[inline]
     fn dec(&self, chunk_idx: usize) {
         let prev = self.counts[chunk_idx].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            self.live.fetch_sub(1, Ordering::Relaxed);
+            let prev_live = self.live.fetch_sub(1, Ordering::Relaxed);
             self.pool_total_live.fetch_sub(1, Ordering::Relaxed);
-            // Clear the scan bitmap bit (Release) BEFORE lowering `first_free`
-            // below, so a claimer that Acquire-observes the lowered hint also
-            // sees this freed slot's bit. Sequenced before the first_free CAS.
+            // Mark the slot free in the occupancy discriminator FIRST, so a
+            // reader never sees it "occupied" while `counts` already holds a
+            // link, nor "free" while `counts` still holds the stale refcount.
             self.set_free(chunk_idx);
-            let mut cur = self.first_free.load(Ordering::Acquire);
-            while (chunk_idx as u64) < cur {
-                match self.first_free.compare_exchange_weak(
-                    cur,
-                    chunk_idx as u64,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => cur = actual,
+            // Push the freed slot onto the recycle stack. Its next-link lives in
+            // its own (now-free) `counts` word; the `Release` head CAS publishes
+            // that link store to whichever claimer later pops it. Only pushes are
+            // concurrent here (drops are ungated); the single gated popper means
+            // the popped slot's link can't change under a claimer, so no ABA.
+            loop {
+                let head = self.recycle_head.load(Ordering::Acquire);
+                let (top, version) = Self::head_parts(head);
+                self.counts[chunk_idx].store(top as u16, Ordering::Release);
+                let new_head = Self::head_pack(chunk_idx, version.wrapping_add(1));
+                if self
+                    .recycle_head
+                    .compare_exchange_weak(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
                 }
+            }
+            // Publish capacity to the pool bitmap AFTER the push (the slot is now
+            // poppable). Only the drop that takes the arena full → non-full sets
+            // it (`prev_live` was the full count), at most once per fill/empty
+            // cycle. A wrongly-cleared bit (this racing an alloc's fill-clear)
+            // can only *hide* capacity, which `allocate_any`'s fallback resync
+            // recovers — it can never leak a slot permanently.
+            if prev_live == self.arena_chunks {
+                self.capacity.set(self.arena_idx);
             }
         } else if prev == 0 {
             // Underflow: someone over-decremented. Panic loudly — this
@@ -336,7 +343,10 @@ impl ArenaRefcounts {
         let base = (self.arena_idx * arena_gid_stride()) as i64;
         let mut out = Vec::with_capacity(self.live_count());
         for i in 0..self.arena_chunks {
-            if self.counts[i].load(Ordering::Relaxed) > 0 {
+            // `counts[i]` is now overlapped (refcount when occupied, free-list
+            // link when free), so the occupancy bit is the free/occupied
+            // discriminator — not `counts > 0`.
+            if self.occupancy[i / 64].load(Ordering::Acquire) & (1u64 << (i % 64)) != 0 {
                 out.push(base + i as i64);
             }
         }
@@ -502,6 +512,58 @@ impl Eq for ChunkGid {}
 ///
 /// Each arena owns a lock-free [`ArenaRefcounts`] table behind an `Arc`.
 /// The pool only takes its `RwLock` on `register_arena` / `release_arena`
+/// Per-format bitmap: bit `i` set ⇒ arena `i` of this format has ≥1 free slot.
+/// The pool's O(1) "which arena has capacity" index — it replaces the per-alloc
+/// walk over every arena that was the pressure-regime `alloc` bottleneck
+/// (`allocate_any` used to iterate the whole `tables` map, O(num_arenas), for
+/// every one of the ~1M allocations a drain pass issues). Fully lock-free: `dec`
+/// sets a bit on a full→non-full transition, alloc clears it on non-full→full
+/// and reads it via find-first-set. Fixed-size so `dec` never contends a resize;
+/// sized from a 512 GiB VRAM ceiling / arena size, far past any single card, so
+/// `arena_idx` (VRAM-bounded — indices are recycled on tombstone) never exceeds
+/// it. `find-first-set` returns the lowest such arena, preserving the lowest-
+/// first packing compaction relies on.
+#[derive(Debug)]
+struct CapacityBitmap {
+    words: Box<[AtomicU64]>,
+}
+
+impl CapacityBitmap {
+    fn new() -> Self {
+        let max_arenas = ((512usize << 30) / TARGET_ARENA_BYTES).max(4096);
+        let words = (0..max_arenas.div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        Self { words }
+    }
+
+    #[inline]
+    fn set(&self, arena_idx: usize) {
+        if let Some(w) = self.words.get(arena_idx >> 6) {
+            w.fetch_or(1u64 << (arena_idx & 63), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn clear(&self, arena_idx: usize) {
+        if let Some(w) = self.words.get(arena_idx >> 6) {
+            w.fetch_and(!(1u64 << (arena_idx & 63)), Ordering::Release);
+        }
+    }
+
+    /// Lowest arena index whose has-capacity bit is set, or `None` if all clear.
+    #[inline]
+    fn first_set(&self) -> Option<usize> {
+        for (wi, w) in self.words.iter().enumerate() {
+            let bits = w.load(Ordering::Acquire);
+            if bits != 0 {
+                return Some(wi * 64 + bits.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+}
+
 /// (rare); allocation walks the tables read-locked and operates lock-
 /// free against the chosen arena's counts.
 #[derive(Debug)]
@@ -532,6 +594,9 @@ struct ArenaPool {
     /// lock-free on arbitrary threads; the gate only removes claimer↔claimer
     /// contention. Held for bookkeeping only, never across GPU work.
     alloc_gate: Mutex<()>,
+    /// Bit `i` set ⇒ arena `i` has ≥1 free slot. `allocate_any` finds the
+    /// lowest such arena via find-first-set instead of walking every arena.
+    capacity: Arc<CapacityBitmap>,
 }
 
 impl ArenaPool {
@@ -542,6 +607,7 @@ impl ArenaPool {
             total_live: Arc::new(AtomicUsize::new(0)),
             arena_chunks: arena_chunks_for_format(format),
             alloc_gate: Mutex::new(()),
+            capacity: Arc::new(CapacityBitmap::new()),
         }
     }
 
@@ -552,12 +618,16 @@ impl ArenaPool {
             arena_idx,
             key,
             Arc::clone(&self.total_live),
+            Arc::clone(&self.capacity),
         ));
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(arena_idx, Arc::clone(&table));
         }
         self.total_arenas.fetch_add(1, Ordering::Relaxed);
+        // A fresh arena is all free — mark it available. Ordered after the
+        // `tables` insert so a claimer that sees the bit also finds the table.
+        self.capacity.set(arena_idx);
         table
     }
 
@@ -570,15 +640,56 @@ impl ArenaPool {
         // with a relaxed load (no per-slot locked RMW) without 128 threads
         // ping-ponging the same cache lines. Drops stay lock-free.
         let _gate = self.alloc_gate.lock().unwrap();
-        // `tables` is a BTreeMap, so `iter()` yields arenas in ascending
-        // arena_idx order — the lowest-first packing that keeps live data
-        // clustered for compaction — with no per-call index collect + sort.
         let stride = arena_gid_stride();
         let tables = self.tables.read().unwrap();
+        // Fast path: the capacity bitmap points at the lowest arena with a free
+        // slot (find-first-set = lowest-first packing), skipping the full-arena
+        // prefix that made this an O(num_arenas) walk per alloc at pressure. A
+        // set bit can be stale (the arena filled since it was set) → the claim
+        // fails → clear it and try the next set bit.
+        while let Some(arena_idx) = self.capacity.first_set() {
+            match tables.get(&arena_idx) {
+                Some(table) => {
+                    if let Some(chunk_idx) = table.try_claim_one() {
+                        if table.is_full() {
+                            self.capacity.clear(arena_idx);
+                        }
+                        return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
+                    }
+                    // Stale set bit — arena is full. Clear and try the next.
+                    self.capacity.clear(arena_idx);
+                }
+                // Bit set for a tombstoned arena (register/release race) — clear.
+                None => self.capacity.clear(arena_idx),
+            }
+        }
+        // Fallback: the bitmap says every arena is full. That's authoritative
+        // *unless* a bit was over-cleared (an alloc's fill-clear raced a dec's
+        // set), which can only hide capacity, never invent fullness. Rebuild the
+        // whole bitmap once from the authoritative `free_count` — recovering
+        // every over-cleared bit in a single pass — then retry the fast path. We
+        // hold `alloc_gate`, so no concurrent claim can consume the recovered
+        // capacity before we do; concurrent drops only add more.
+        let mut recovered = false;
         for (&arena_idx, table) in tables.iter() {
-            if let Some(chunk_idx) = table.try_claim_one() {
-                let gid = (arena_idx * stride + chunk_idx) as i64;
-                return Some((gid, Arc::clone(table)));
+            if table.free_count() > 0 {
+                self.capacity.set(arena_idx);
+                recovered = true;
+            }
+        }
+        if recovered {
+            if let Some(arena_idx) = self.capacity.first_set() {
+                if let Some(table) = tables.get(&arena_idx) {
+                    if let Some(chunk_idx) = table.try_claim_one() {
+                        if table.is_full() {
+                            self.capacity.clear(arena_idx);
+                        }
+                        return Some((
+                            (arena_idx * stride + chunk_idx) as i64,
+                            Arc::clone(table),
+                        ));
+                    }
+                }
             }
         }
         None
@@ -690,6 +801,9 @@ impl ArenaPool {
         let mut tables = self.tables.write().unwrap();
         tables.remove(&candidate);
         self.total_arenas.fetch_sub(1, Ordering::Relaxed);
+        // Arena gone — clear its capacity bit so `allocate_any` doesn't chase a
+        // dangling index (it self-heals via the `tables.get` miss anyway).
+        self.capacity.clear(candidate);
         Some(candidate)
     }
 
@@ -699,6 +813,7 @@ impl ArenaPool {
         let mut tables = self.tables.write().unwrap();
         if tables.remove(&arena_idx).is_some() {
             self.total_arenas.fetch_sub(1, Ordering::Relaxed);
+            self.capacity.clear(arena_idx);
         }
     }
 
@@ -839,6 +954,26 @@ fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
         }
     }
     pools
+}
+
+/// GPU arena occupancy split by float vs quant format — the diagnostic the
+/// compress-to-free relief rung is judged by. Compress shrinks the float side
+/// (working-set arenas the persistence thread would quantize anyway) while the
+/// quant side grows less, so a working rung shows float bytes dropping across a
+/// pressure episode. `reserved` counts whole ~16 MiB slabs
+/// ([`TARGET_ARENA_BYTES`]); `live` counts occupied chunk slots at the format's
+/// per-chunk size. These are GidPool arena-slab quantities, distinct from the
+/// CUDA stream-ordered pool's `reserved`/`used` (which include segment slack the
+/// GidPool never sees) — report them on their own line, not as a partition of
+/// the CUDA-pool gap.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuArenaFormatStats {
+    pub float_arenas: usize,
+    pub float_reserved_bytes: usize,
+    pub float_live_bytes: usize,
+    pub quant_arenas: usize,
+    pub quant_reserved_bytes: usize,
+    pub quant_live_bytes: usize,
 }
 
 /// Pool for allocating and recycling gids, partitioned by ArenaKey.
@@ -1189,6 +1324,37 @@ impl ChunkGidPool {
             .map(|pool| pool.total_live())
             .sum()
     }
+
+    /// GPU arena occupancy split float vs quant. Reads the lock-free per-pool
+    /// atomics (`O(registered formats)`, ~58 entries most empty) — cheap enough
+    /// for the per-wave `kv-pool` diagnostic. See [`GpuArenaFormatStats`].
+    pub(crate) fn gpu_format_stats(&self) -> GpuArenaFormatStats {
+        let mut s = GpuArenaFormatStats::default();
+        for (key, pool) in self.inner.pools.iter() {
+            if key.location != ArenaLocation::Gpu {
+                continue;
+            }
+            let arenas = pool.total_arenas.load(Ordering::Relaxed);
+            if arenas == 0 {
+                continue;
+            }
+            let reserved = arenas.saturating_mul(TARGET_ARENA_BYTES);
+            // Slab is ~TARGET_ARENA_BYTES regardless of format, so per-chunk
+            // bytes = slab / chunks-per-slab; live bytes = occupied slots × that.
+            let per_chunk = TARGET_ARENA_BYTES.checked_div(pool.arena_chunks).unwrap_or(0);
+            let live = pool.total_live().saturating_mul(per_chunk);
+            if matches!(key.format, KvFormat::Float(_)) {
+                s.float_arenas += arenas;
+                s.float_reserved_bytes += reserved;
+                s.float_live_bytes += live;
+            } else {
+                s.quant_arenas += arenas;
+                s.quant_reserved_bytes += reserved;
+                s.quant_live_bytes += live;
+            }
+        }
+        s
+    }
 }
 
 impl Default for ChunkGidPool {
@@ -1239,6 +1405,53 @@ mod tests {
     }
 
     #[test]
+    fn test_gpu_format_stats_splits_float_and_quant() {
+        use crate::kv_cache::QuantFormat;
+        let pool = ChunkGidPool::new();
+        let fkey = ArenaKey::gpu_float(DType::BF16);
+        let qkey = ArenaKey::gpu_quant(QuantFormat::Q8_0);
+
+        // Two float arenas with three live slots; one quant arena with five.
+        pool.register_arena(fkey.clone());
+        pool.register_arena(fkey.clone());
+        pool.register_arena(qkey.clone());
+        let _f: Vec<_> = (0..3)
+            .map(|_| pool.allocate_for(fkey.clone()).unwrap())
+            .collect();
+        let _q: Vec<_> = (0..5)
+            .map(|_| pool.allocate_for(qkey.clone()).unwrap())
+            .collect();
+
+        let s = pool.gpu_format_stats();
+
+        // Per-chunk bytes derive from the same slab-capacity helper the accessor
+        // uses, so the expected live bytes are exact, not tolerance-based.
+        let f_per_chunk = TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Float(DType::BF16));
+        let q_per_chunk =
+            TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Quantized(QuantFormat::Q8_0));
+
+        assert_eq!(s.float_arenas, 2);
+        assert_eq!(s.float_reserved_bytes, 2 * TARGET_ARENA_BYTES);
+        assert_eq!(s.float_live_bytes, 3 * f_per_chunk);
+        assert_eq!(s.quant_arenas, 1);
+        assert_eq!(s.quant_reserved_bytes, TARGET_ARENA_BYTES);
+        assert_eq!(s.quant_live_bytes, 5 * q_per_chunk);
+    }
+
+    #[test]
+    fn test_gpu_format_stats_empty_pool_is_zero() {
+        // A pool with registered-but-unallocated formats reports nothing: the
+        // per-wave diagnostic must not count preallocated empty pool-table
+        // entries as resident arenas.
+        let pool = ChunkGidPool::new();
+        let s = pool.gpu_format_stats();
+        assert_eq!(s.float_arenas, 0);
+        assert_eq!(s.quant_arenas, 0);
+        assert_eq!(s.float_reserved_bytes, 0);
+        assert_eq!(s.quant_reserved_bytes, 0);
+    }
+
+    #[test]
     fn test_gid_drop_returns_to_pool() {
         let pool = ChunkGidPool::new();
         let key = float_key();
@@ -1251,7 +1464,8 @@ mod tests {
         // After drop, the slot is free again — total free == capacity.
         assert_eq!(pool.free_list_len_for(key.clone()), test_arena_chunks());
 
-        // Allocating again should reuse it (lowest gid via first_free hint).
+        // Allocating again should reuse it — the freed slot is popped straight
+        // back off the recycle stack, so the same gid comes out.
         let gid2 = pool.allocate_for(key.clone()).unwrap();
         assert_eq!(gid2.raw(), gid1_raw);
     }
@@ -1367,6 +1581,72 @@ mod tests {
         assert!(
             pool.can_reclaim_arena(),
             "2 arenas, 1 live chunk: one whole arena is reclaimable"
+        );
+    }
+
+    /// Hammer the capacity-bitmap allocator with concurrent lock-free drops
+    /// racing gated allocs, filling and emptying arenas so the full↔non-full
+    /// bit transitions (and their races with alloc's fill-clear) actually fire.
+    /// Two invariants are asserted:
+    ///   * **no double-allocation** — two threads claiming the same slot would
+    ///     drive its refcount below zero on the second drop, panicking in `dec`
+    ///     (`refcount underflow`), so the test would fail with that panic;
+    ///   * **no permanently hidden capacity** — after every batch is dropped the
+    ///     pool is fully free, so draining it must yield *exactly* the total free
+    ///     count; a wrongly-cleared bit the fallback failed to recover would make
+    ///     the drain come up short.
+    #[test]
+    fn concurrent_alloc_drop_recovers_all_capacity() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(ChunkGidPool::new());
+        let key = float_key();
+        pool.register_arena(key.clone());
+
+        let n_threads = 12;
+        let batch = 400; // batches of live gids so arenas fill and empty
+        let rounds = 40;
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let key = key.clone();
+                thread::spawn(move || {
+                    for _ in 0..rounds {
+                        let mut held = Vec::with_capacity(batch);
+                        for _ in 0..batch {
+                            // Mirror `alloc_chunk_for_key`: register on exhaustion.
+                            let g = loop {
+                                if let Some(g) = pool.allocate_for(key.clone()) {
+                                    break g;
+                                }
+                                pool.register_arena(key.clone());
+                            };
+                            held.push(g);
+                        }
+                        // Drop the whole batch — lock-free `dec`s racing other
+                        // threads' gated allocs (and their bit set/clear).
+                        drop(held);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Everything dropped ⇒ the pool is fully free. Drain it and prove every
+        // free slot is reachable via the bitmap fast path + the fallback scan.
+        let cap = pool.free_list_len_for(key.clone());
+        assert!(cap > 0);
+        let mut drained = Vec::new();
+        while let Some(g) = pool.allocate_for(key.clone()) {
+            drained.push(g);
+        }
+        assert_eq!(
+            drained.len(),
+            cap,
+            "bitmap + fallback must reach every free slot after concurrent churn"
         );
     }
 }

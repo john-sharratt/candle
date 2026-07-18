@@ -260,6 +260,7 @@
     substrateGroupOpen: {},        // group key → open? (default closed/collapsed)
     substrateExpanded: {},         // section key → expanded (show content)?
     filesOpen: false,
+    topMenuOpen: false,   // narrow only: the top-right actions collapsed under a menu button
     dragActive: false,
     lastUploadedId: null,
     fileView: null,
@@ -1009,11 +1010,26 @@
     // A re-render rebuilds the dots, so drop any open hover popover — it would
     // otherwise dangle, anchored to a destroyed dot.
     hideProjPopover();
-    // Startup: while the daemon loads the model, show the loading overlay only.
+    // Startup: while the daemon loads the model / builds the substrate, show the
+    // loading overlay — plus Logs + Perf so the build can be watched in realtime.
     if (S.boot && S.boot.state !== 'ready') {
+      // Preserve the log panel's scroll across this full re-render (fired on each
+      // status poll): keep the exact position, or stay pinned to the tail if the
+      // user was following it — so watching the build isn't jerked to the top.
+      const savedLog = logEl ? { top: logEl.scrollTop, stick: nearBottom(logEl) } : null;
       promptEl = chatEl = logEl = filesListEl = null;
       root.innerHTML = '';
       root.appendChild(buildLoadingScreen(S.boot));
+      if (S.logsOpen) {
+        // Dock the live log panel over the loading overlay (it renders as a
+        // self-contained full-height column).
+        root.appendChild(h('div', { style: 'position:fixed; top:0; right:0; bottom:0; z-index:520;' }, buildLogs()));
+        if (logEl && savedLog) {
+          if (savedLog.stick) scrollLog();
+          else logEl.scrollTop = savedLog.top;
+        }
+      }
+      root.appendChild(buildTopRight({ loading: true }));
       return;
     }
     const hadFocus = promptEl && document.activeElement === promptEl;
@@ -1459,20 +1475,76 @@
     zmd.appendChild(frag);
   }
 
-  function buildTopRight() {
+  // SVG glyphs for the top-right actions (share the pill/menu-item chrome).
+  const ICON = {
+    logs: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M1.5 3.5h11M1.5 7h11M1.5 10.5h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    files: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:12px;"><path d="M3 1.2h4.4l3 3v8.6H3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M7.2 1.4v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>',
+    perf: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.5 1.5v11h11M4 9l2.5-3 2 2L12 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    substrate: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M7 1.2 12.5 4 7 6.8 1.5 4 7 1.2ZM1.5 7 7 9.8 12.5 7M1.5 10 7 12.8 12.5 10" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>',
+    menu: '<svg viewBox="0 0 16 16" fill="none" style="width:15px;height:15px;"><circle cx="8" cy="3" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="13" r="1.4" fill="currentColor"/></svg>',
+  };
+
+  // The top-right action set. `href` opens a new tab (external page); otherwise
+  // `onClick` flips app state. `logs` is present only while the log panel is closed.
+  function topActions() {
     const conv = activeConv();
     const filesCount = (conv && conv.files) ? conv.files.length : 0;
-    const wrap = h('div', { style: 'position:absolute; top:14px; right:20px; z-index:30; display:flex; flex-direction:column; gap:8px; align-items:flex-end;' });
-    if (!S.logsOpen) wrap.appendChild(h('button', { onClick: () => setState({ logsOpen: true }), title: 'Show logs', style: pillStyle(false), html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M1.5 3.5h11M1.5 7h11M1.5 10.5h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span>&nbsp;Logs</span>' }));
-    const filesBtn = h('button', { onClick: () => setState({ filesOpen: !S.filesOpen }), title: 'Conversation files', style: pillStyle(S.filesOpen) },
-      h('span', { html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:12px;"><path d="M3 1.2h4.4l3 3v8.6H3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M7.2 1.4v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>' }),
-      h('span', {}, ' Files'),
-      filesCount ? h('span', { style: 'font-size:0.66rem; color:#9a9490;' }, ' ' + filesCount) : null);
-    wrap.appendChild(filesBtn);
+    return [
+      !S.logsOpen && { key: 'logs', label: 'Logs', icon: ICON.logs, title: 'Show logs', onClick: () => setState({ logsOpen: true, topMenuOpen: false }) },
+      { key: 'files', label: 'Files', icon: ICON.files, active: S.filesOpen, badge: filesCount || null, title: 'Conversation files', onClick: () => setState({ filesOpen: !S.filesOpen, topMenuOpen: false }) },
+      { key: 'perf', label: 'Perf', icon: ICON.perf, href: '/perf', title: 'Wave & pressure telemetry' },
+      { key: 'substrate', label: 'Substrate', icon: ICON.substrate, href: '/substrate', title: 'Substrate inspector' },
+    ].filter(Boolean);
+  }
+
+  function actionEl(a, style) {
+    const kids = [
+      h('span', { style: 'display:flex;', html: a.icon }),
+      h('span', {}, ' ' + a.label),
+      a.badge ? h('span', { style: 'font-size:0.66rem; color:#9a9490;' }, ' ' + a.badge) : null,
+    ];
+    if (a.href) {
+      // Same-window navigation to a standalone page (Perf / Substrate) — these
+      // pages carry their own "back to zen" link, mirroring the substrate view.
+      return h('a', { href: a.href, title: a.title, style: style + ' text-decoration:none;' }, kids);
+    }
+    return h('button', { onClick: a.onClick, title: a.title, style: style }, kids);
+  }
+
+  function buildTopRight(opts) {
+    opts = opts || {};
+    let actions = topActions();
+    // On the loading screen there is no conversation yet — expose only Logs and
+    // Perf, so the substrate build can be watched in realtime. They float ABOVE
+    // the full-screen loading overlay (z 500) and the docked logs panel (z 520).
+    if (opts.loading) actions = actions.filter((a) => a.key === 'logs' || a.key === 'perf');
+    const z = opts.loading ? 540 : 30;
+    const pos = opts.loading ? 'position:fixed' : 'position:absolute';
+    // Mobile / narrow: collapse everything behind a single menu button so the
+    // pills don't eat the (already tight) horizontal space.
+    if (S.narrow) {
+      const wrap = h('div', { style: pos + '; top:14px; right:14px; z-index:' + z + '; display:flex; flex-direction:column; align-items:flex-end; gap:8px;' });
+      wrap.appendChild(h('button', { onClick: () => setState({ topMenuOpen: !S.topMenuOpen }), title: 'More', style: menuBtnStyle(S.topMenuOpen), html: ICON.menu }));
+      if (S.topMenuOpen) {
+        const menu = h('div', { style: 'display:flex; flex-direction:column; gap:4px; padding:5px; border-radius:10px; border:1px solid #50493f; background:#2b2723; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);' });
+        actions.forEach((a) => menu.appendChild(actionEl(a, menuItemStyle(a.active))));
+        wrap.appendChild(menu);
+      }
+      return wrap;
+    }
+    // Desktop: the vertical column of pills.
+    const wrap = h('div', { style: pos + '; top:14px; right:20px; z-index:' + z + '; display:flex; flex-direction:column; gap:8px; align-items:flex-end;' });
+    actions.forEach((a) => wrap.appendChild(actionEl(a, pillStyle(a.active))));
     return wrap;
   }
   function pillStyle(activeOn) {
     return 'display:flex; align-items:center; justify-content:flex-start; gap:0.4rem; width:98px; height:30px; padding:0 0.7rem; border-radius:8px; border:1px solid ' + (activeOn ? '#6a6258' : '#50493f') + '; background:' + (activeOn ? '#37322d' : '#2e2a26') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:600; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);';
+  }
+  function menuItemStyle(activeOn) {
+    return 'display:flex; align-items:center; justify-content:flex-start; gap:0.5rem; width:130px; height:32px; padding:0 0.7rem; border-radius:7px; border:none; background:' + (activeOn ? '#37322d' : 'transparent') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; font:inherit; font-size:0.78rem; font-weight:600;';
+  }
+  function menuBtnStyle(activeOn) {
+    return 'display:flex; align-items:center; justify-content:center; width:36px; height:32px; border-radius:8px; border:1px solid ' + (activeOn ? '#6a6258' : '#50493f') + '; background:' + (activeOn ? '#37322d' : '#2e2a26') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);';
   }
 
   // ── composer ─────────────────────────────────────────────────────────────

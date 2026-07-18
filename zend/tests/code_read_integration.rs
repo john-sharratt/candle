@@ -1,9 +1,14 @@
 //! Tier-2 integration test for the `code_reading` layer's per-file
 //! tool-call conversation shape.
 //!
-//! Each file becomes ONE conversation: one prefill turn per carved part —
+//! Each file becomes ONE conversation: one prefill turn per carved part, whose
+//! stored ChatML has three role segments —
 //!       user      : "Source excerpt — `X` lines N-M:"
-//!       assistant : `<tool_call>{...}</tool_call>\n<tool_response>...`
+//!       assistant : `<tool_call>{...}</tool_call>`
+//!       user      : `<tool_response>...</tool_response>`
+//! The `(user, assistant)` pair the sink records fuses the last two into its
+//! `assistant` string with the dialect role boundary spliced between them, so
+//! the tool response reconstructs as its own user turn (Hermes/Qwen convention).
 //!
 //! There is no inline whole-file summary decode: the file summary is the
 //! async summary tree's root, built by the summariser over these recorded
@@ -105,8 +110,10 @@ fn code_read_part_assistant_is_hermes_tool_call_then_response() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    // The assistant slot of the first part turn carries the tool-call
-    // echo immediately followed by the tool response.
+    // The assistant slot fuses the four-segment exchange: <tool_call>, then the
+    // call→response boundary, the <tool_response>, the response→close boundary,
+    // and finally the assistant read-confirmation. So the response lands in its
+    // own user turn and the exchange closes on an assistant turn.
     let assistant1 = &sink.turns[0].1;
     assert!(assistant1.starts_with("<tool_call>"));
     assert!(assistant1.contains("</tool_call>"));
@@ -115,7 +122,33 @@ fn code_read_part_assistant_is_hermes_tool_call_then_response() {
     assert!(assistant1.contains("\"start_line\":"));
     assert!(assistant1.contains("\"end_line\":"));
     assert!(assistant1.contains("<tool_response>"));
-    assert!(assistant1.ends_with("</tool_response>"));
+    assert!(assistant1.contains("</tool_response>"));
+    // Closes on the assistant read-confirmation, NOT on the user tool response.
+    assert!(!assistant1.ends_with("</tool_response>"));
+    assert!(assistant1.trim_end().ends_with('.'));
+    assert!(assistant1.contains("Read `src/lib.rs` lines "));
+
+    // Boundary 1 sits BETWEEN the call and the response: the assistant turn ends
+    // (`<|im_end|>`) and a user turn opens (`<|im_start|>user`). Without it the
+    // model reads the response as the assistant answering its own call.
+    let call_end = assistant1.find("</tool_call>").unwrap();
+    let resp_start = assistant1.find("<tool_response>").unwrap();
+    let between = &assistant1[call_end + "</tool_call>".len()..resp_start];
+    assert_eq!(
+        between, "<|im_end|>\n<|im_start|>user\n",
+        "expected an assistant→user role boundary between call and response, got {between:?}"
+    );
+
+    // Boundary 2 sits BETWEEN the response and the closing confirmation: the user
+    // turn ends and an assistant turn opens, so the exchange doesn't hang on a
+    // user turn.
+    let resp_end = assistant1.find("</tool_response>").unwrap();
+    let ack_start = assistant1.find("Read `src/lib.rs`").unwrap();
+    let between2 = &assistant1[resp_end + "</tool_response>".len()..ack_start];
+    assert_eq!(
+        between2, "<|im_end|>\n<|im_start|>assistant\n",
+        "expected a user→assistant role boundary between response and confirmation, got {between2:?}"
+    );
 }
 
 #[test]
@@ -135,9 +168,10 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
         .iter()
         .find(|(_, a, _)| a.contains("<tool_response>") && a.contains("pub fn two"))
         .expect("part turn carrying fn two in its tool_response");
-    // The content lives in the assistant slot of a prefill turn.
+    // The content lives in the assistant slot of a prefill turn (the tool
+    // response segment, which is now followed by the closing confirmation).
     assert!(tr.1.contains("<tool_response>\n"));
-    assert!(tr.1.ends_with("</tool_response>"));
+    assert!(tr.1.contains("</tool_response>"));
     assert!(tr.1.contains("```rust"));
     assert!(tr.1.contains("pub fn two() {"));
     assert!(tr.1.contains("let x = 42;"));

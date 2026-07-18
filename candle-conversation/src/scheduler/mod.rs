@@ -40,7 +40,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::turn_layout::TurnLayout;
+use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -51,7 +51,7 @@ use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
 };
 use crossbeam::channel::{Receiver, Sender};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1110,6 +1110,36 @@ fn widen_window(w: usize, ceil: usize) -> usize {
     (w + 1).min(ceil)
 }
 
+/// Admission action chosen by the drain-backlog controller.
+#[derive(Debug, PartialEq, Eq)]
+enum BacklogAction {
+    Shrink,
+    Grow,
+    Hold,
+}
+
+/// Pure decision core of [`Scheduler::regulate_ingest_admission`]: from the live
+/// hot→warm `backlog`, its `target`, the current `window`/`ceil`, and whether
+/// VRAM is under pressure, decide whether to narrow, widen, or hold ingest
+/// admission. Hysteresis — shrink above `target`, grow only below `target / 2`,
+/// hold in the deadband between — keeps the window from flapping around the
+/// target as the backlog jitters.
+fn backlog_admit_action(
+    backlog: usize,
+    target: usize,
+    window: usize,
+    ceil: usize,
+    vram_pressure: bool,
+) -> BacklogAction {
+    if backlog > target {
+        BacklogAction::Shrink
+    } else if backlog < target / 2 && window < ceil && !vram_pressure {
+        BacklogAction::Grow
+    } else {
+        BacklogAction::Hold
+    }
+}
+
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
 ///
@@ -1862,6 +1892,30 @@ pub(crate) struct Scheduler {
     /// floor that still makes progress); with headroom it returns to the full width.
     admit_window: usize,
 
+    /// Cached OS memory probe for host-tier ingest backpressure, as
+    /// `(checked_at, available_bytes, total_bytes)`. The warm (RAM) KV tier can
+    /// fill host memory faster than warm→cold demotion drains it; when free RAM
+    /// runs low, `regulate_ingest_admission` throttles ingest so the hot→warm
+    /// migration always finds a staging buffer it can allocate (the host-OOM that
+    /// aborted a full overnight load). `sysinfo` is a syscall, so this is
+    /// refreshed at most once per `HOST_RAM_PROBE_INTERVAL`, never per wave.
+    host_ram_probe: Option<(std::time::Instant, u64, u64)>,
+
+    /// When the footprint reclaim last ran, to rate-limit it. Without this, a
+    /// `reserved` pinned just over the compact-ceiling (a fragmented gap the
+    /// engine keeps reusing, which compaction can't lower) trips the pressure
+    /// gate on every scheduler-loop iteration and fires relief many times/second.
+    /// See `Scheduler::reclaim_footprint` / `vram_under_pressure_for`.
+    last_footprint_relief: Option<std::time::Instant>,
+
+    /// Timelines being ingested append-only (`disable_reprojection` submits, e.g.
+    /// `code_reading` / `repo_map`). Their sealed turns are never re-attended
+    /// until query time, so the gentle-early ladder rung
+    /// (`demote_cold_ingest_if_pressured`) demotes their warm-backed hot KV to
+    /// RAM at ~50% capacity — long before the near-cap eviction ladder — keeping
+    /// only a small rolling hot window resident during a bulk repo ingest.
+    ingest_timelines: HashSet<TimelineId>,
+
     /// Per-slot live receiver for a compression pass's private event channel.
     /// A compression decode's `DecodeState::event_tx` reports through the job,
     /// not to a caller, so its `TurnEvent`s drain into this sink. Holding the
@@ -1975,6 +2029,9 @@ impl Scheduler {
             pending_scope_prefills: HashMap::new(),
             active_scope_slots: 0,
             admit_window: Self::MAX_PREFILL_WIDTH,
+            host_ram_probe: None,
+            last_footprint_relief: None,
+            ingest_timelines: HashSet::new(),
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
             workspace_projection: None,
@@ -2148,6 +2205,15 @@ impl Scheduler {
                 // only fixed sections, so this is exact for them.
                 let skip_projection = disable_reprojection
                     && self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
+                // Mark this as an append-only ingest timeline so the gentle-early
+                // ladder can demote its sealed, warm-backed KV to RAM at ~50%
+                // capacity — it is never re-attended until query time. See
+                // `demote_cold_ingest_if_pressured`.
+                if disable_reprojection {
+                    if let Some(tgt) = slot_target {
+                        self.ingest_timelines.insert(tgt.timeline);
+                    }
+                }
                 // Step 1: run projection (if requested) and apply it
                 // — reset `parent_id` to empty and write the
                 // projected sections + projected turns from the
@@ -2564,10 +2630,11 @@ impl Scheduler {
                 // Drop the conversation handle and projection target
                 // bound to this slot.
                 self.slot_conversations.remove(&sequence_id);
-                self.slot_targets.remove(&sequence_id);
+                let freed_target = self.slot_targets.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.slot_projection_state.remove(&sequence_id);
+                self.prune_ingest_timeline(freed_target);
                 true
             }
 
@@ -2693,6 +2760,18 @@ impl Scheduler {
                     // `inject_sealed_section` would warn-and-skip
                     // and the primed slot would be missing every
                     // persisted section from the schema's prelude.
+                    // Load-phase VRAM gate: elevation scatters sealed KV into
+                    // fresh GPU arenas BEFORE the projection attends over it — a
+                    // "load KV into VRAM before attention" phase. The freed-float
+                    // free-list is the destination of that load, so relieve first
+                    // (compress/evict make real headroom) rather than allocating
+                    // straight into space the load will consume. Without this the
+                    // elevation had no scheduler pressure gate at all — only the
+                    // per-arena `vram_has_room` check, which OOMs per-arena instead
+                    // of shedding ahead of the load.
+                    if self.vram_under_pressure_for(prefill::VramPhase::Load) {
+                        self.relieve_vram_pressure("elevate", prefill::VramPhase::Load);
+                    }
                     if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
                         let backings = self.session.backings().to_vec();
                         let device = self.session.device().clone();
@@ -3837,7 +3916,98 @@ impl Scheduler {
                 return layout.with_thinking_split(block, think_len, ethereal_thinking);
             }
         }
+        // Code_read tool-exchange turns bake their assistant→user→assistant
+        // sub-structure into `assistant_text` as dialect role markers; split the
+        // single Assistant span into the real sub-segments so the layout — and
+        // the details view built from it — reflects the true role boundaries.
+        if let Some(subs) =
+            self.tool_exchange_segments(&assistant_text, assistant_content_start, total)
+        {
+            return layout.with_assistant_split(subs);
+        }
         layout
+    }
+
+    /// If `asst_text` is a code_read tool exchange — `<tool_call>`, the
+    /// call→response boundary (`assistant_end` + `user_start`), `<tool_response>`,
+    /// the response→close boundary (`user_end` + `assistant_start`), then the
+    /// confirmation — split its single `[asst_start, total)` assistant span into
+    /// the real `Assistant → ImEnd → UserStart → User → ImEnd → AssistantStart →
+    /// Assistant` sub-segments. Boundary token offsets come from re-tokenising the
+    /// byte prefixes, clamped monotonic into the span so the pieces always tile
+    /// exactly (`validate_tiling` guards the seal). Returns `None` for an ordinary
+    /// single-body assistant turn (a normal reply never contains the boundary).
+    fn tool_exchange_segments(
+        &self,
+        asst_text: &str,
+        asst_start: u32,
+        total: u32,
+    ) -> Option<Vec<TurnSegment>> {
+        let g = &self.boundary_markers;
+        let call_to_resp = format!("{}{}", g.assistant_end_str, g.user_start_str);
+        let resp_to_close = format!("{}{}", g.user_end_str, g.assistant_start_str);
+        if call_to_resp.is_empty() || resp_to_close.is_empty() {
+            return None;
+        }
+        // The tool_call is the read_file JSON (no markers), so the FIRST
+        // call→response boundary is the real one. The tool_response is arbitrary
+        // source, which could itself contain the response→close marker string, so
+        // take the LAST occurrence: the real boundary sits just before the short,
+        // marker-free confirmation, so `rfind` can't be fooled by embedded markup.
+        let b1 = asst_text.find(&call_to_resp)?; // tool_call ends here
+        let after1 = b1 + call_to_resp.len(); // tool_response starts here
+        let b2 = after1 + asst_text[after1..].rfind(&resp_to_close)?; // tool_response ends
+        let after2 = b2 + resp_to_close.len(); // confirmation starts here
+
+        let span = total.saturating_sub(asst_start);
+        let tlen = |s: &str| {
+            self.tokenizer
+                .encode(s, false)
+                .map(|t| t.get_ids().len() as u32)
+                .unwrap_or(0)
+        };
+        // Absolute grid offset of the byte prefix `asst_text[..byte]`, clamped
+        // into the span so a tokenizer merge across a join can never break tiling.
+        let at = |byte: usize| asst_start + tlen(&asst_text[..byte]).min(span);
+        let im_end_len = tlen(&g.user_end_str);
+
+        let a1 = at(b1); // end of tool_call
+        let a2 = at(after1).max(a1); // end of call→response boundary
+        let a3 = at(b2).max(a2); // end of tool_response
+        let a4 = at(after2).max(a3).min(total); // end of response→close boundary
+        let im1 = im_end_len.min(a2 - a1);
+        let im2 = im_end_len.min(a4 - a3);
+
+        Some(vec![
+            TurnSegment::Assistant {
+                text: Some(asst_text[..b1].to_string()),
+                kv: KvSpan::new(asst_start, a1 - asst_start),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(a1, im1)),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: Some(KvSpan::new(a1 + im1, (a2 - a1) - im1)),
+            },
+            TurnSegment::User {
+                text: asst_text[after1..b2].to_string(),
+                kv: KvSpan::new(a2, a3 - a2),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(a3, im2)),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::AssistantStart,
+                kv: Some(KvSpan::new(a3 + im2, (a4 - a3) - im2)),
+            },
+            TurnSegment::Assistant {
+                text: Some(asst_text[after2..].to_string()),
+                kv: KvSpan::new(a4, total.saturating_sub(a4)),
+            },
+        ])
     }
 
     /// Defer a finished dialogue turn's seal: re-prefill it with the
@@ -4322,6 +4492,11 @@ impl Scheduler {
                 tags,
             });
         self.scope_submitted.entry(timeline).or_insert(0);
+        // A scope-ingest file timeline is append-only by construction — its sealed
+        // turns are never re-attended until query time, so mark it for the
+        // gentle-early ladder (`demote_cold_ingest_if_pressured`) to demote its
+        // warm-backed hot KV at ~50% capacity.
+        self.ingest_timelines.insert(timeline);
         self.pump_scope_prefills();
         Ok(())
     }
@@ -4347,7 +4522,7 @@ impl Scheduler {
             // fix: bound the pinned working set *before* the wide forward runs,
             // rather than only reacting once its transient peak has OOM'd.
             if self.active_scope_slots > 0 && self.vram_under_pressure() {
-                if self.relieve_vram_pressure("pump") {
+                if self.relieve_vram_pressure("pump", prefill::VramPhase::Load) {
                     self.shrink_admit_window();
                     break;
                 }
@@ -4727,10 +4902,32 @@ impl Scheduler {
     fn free_summary_slot(&mut self, slot: SequenceId) {
         let _ = self.session.free_sequence(slot.0);
         self.slot_conversations.remove(&slot);
-        self.slot_targets.remove(&slot);
+        let freed_target = self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
         self.slot_projection_state.remove(&slot);
         self.compression_event_sinks.remove(&slot);
+        self.prune_ingest_timeline(freed_target);
+    }
+
+    /// Drop a freed slot's timeline from [`Self::ingest_timelines`] once no
+    /// other live slot still targets it. Without this, the set grows by one
+    /// entry per ingested file for the daemon's lifetime (a slow leak, and a
+    /// growing scan for [`demote_cold_ingest_if_pressured`]). Called from every
+    /// slot-teardown path; a `None` target (raw/non-projecting slot) is a no-op.
+    fn prune_ingest_timeline(&mut self, freed_target: Option<ProjectionTarget>) {
+        let Some(tgt) = freed_target else {
+            return;
+        };
+        if !self.ingest_timelines.contains(&tgt.timeline) {
+            return;
+        }
+        if !self
+            .slot_targets
+            .values()
+            .any(|t| t.timeline == tgt.timeline)
+        {
+            self.ingest_timelines.remove(&tgt.timeline);
+        }
     }
 
     // —— Sequence creation ——————————————————————————————————————————
@@ -4867,6 +5064,9 @@ impl Scheduler {
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
         let state = self.slot_projection_state.entry(parent_id).or_default();
+        // Record the sealed working set this projection attends over, so relief
+        // eviction can protect it (see `evict_cold_tail`).
+        state.working_set = projection_assembler::working_set_from_segments(segments);
 
         profile::reset();
         let r = projection_assembler::apply_segments(
@@ -4910,6 +5110,14 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
+        // Record the sealed working set this projection attends over, so relief
+        // eviction can protect it (see `evict_cold_tail`). Same as the single-slot
+        // `apply_projection`; the wave path threads build/finish separately, so we
+        // stamp it here where the segments are in hand.
+        self.slot_projection_state
+            .entry(parent_id)
+            .or_default()
+            .working_set = projection_assembler::working_set_from_segments(segments);
         profile::reset();
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
@@ -7434,6 +7642,33 @@ mod tests {
         // A shrink is undone by exactly `n` grows for an n-halving descent — the
         // window is a plain saturating counter with no hidden state.
         assert_eq!(widen_window(narrow_window(2, floor), ceil), 2);
+    }
+
+    #[test]
+    fn backlog_admit_action_hysteresis() {
+        use BacklogAction::{Grow, Hold, Shrink};
+        let ceil = Scheduler::MAX_PREFILL_WIDTH;
+        let target = 8000;
+
+        // Above target → shrink, regardless of window position.
+        assert_eq!(backlog_admit_action(8001, target, ceil, ceil, false), Shrink);
+        assert_eq!(backlog_admit_action(20000, target, 1, ceil, false), Shrink);
+
+        // Deadband [target/2, target] → hold — no flapping as the backlog jitters.
+        assert_eq!(backlog_admit_action(target, target, 4, ceil, false), Hold);
+        assert_eq!(backlog_admit_action(target / 2, target, 4, ceil, false), Hold);
+        assert_eq!(backlog_admit_action(5000, target, 4, ceil, false), Hold);
+
+        // Below target/2 with headroom and no VRAM pressure → grow.
+        assert_eq!(backlog_admit_action(3999, target, 4, ceil, false), Grow);
+        assert_eq!(backlog_admit_action(0, target, 1, ceil, false), Grow);
+
+        // Grow is suppressed at the ceiling (nothing to reopen)…
+        assert_eq!(backlog_admit_action(0, target, ceil, ceil, false), Hold);
+        // …and while VRAM is under pressure (the hard floor wins over reopening).
+        assert_eq!(backlog_admit_action(0, target, 4, ceil, true), Hold);
+        // But a high backlog still shrinks even under VRAM pressure.
+        assert_eq!(backlog_admit_action(9000, target, 4, ceil, true), Shrink);
     }
 
     use candle_transformers::models::batched_inference::{

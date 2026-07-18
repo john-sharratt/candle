@@ -27,7 +27,8 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, HeadGids, KvCache, KvFormat, QuantFormat,
+    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvCache, KvFormat,
+    QuantFormat,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1267,6 +1268,36 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// Bounded forced defragment across backings: relocate at most `max_moves`
+    /// chunks total (the budget is threaded across layers so a large fragmented
+    /// gap consolidates over several bounded passes instead of one long blocking
+    /// compaction). Does NOT release the emptied arenas — pair with
+    /// [`release_empty_arenas`](Self::release_empty_arenas). Returns chunks moved.
+    pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
+        let n = self.backings.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut remaining = max_moves;
+        let mut moved = 0;
+        for (i, backing) in self.backings.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            // Fair share of the remaining budget for the backings still to
+            // visit, so an early fragmented layer can't consume the whole
+            // budget and starve the rest (which would leave later layers'
+            // reserved gaps un-compacted). Layers that use less than their
+            // share leave the remainder for later ones (the divisor shrinks),
+            // so the full budget is still spent when work exists.
+            let share = remaining.div_ceil(n - i);
+            let m = backing.defragment_bounded(share)?;
+            remaining = remaining.saturating_sub(m);
+            moved += m;
+        }
+        Ok(moved)
+    }
+
     /// Release fully-empty KV arenas across all backings **without** the
     /// chunk-moving defrag — cheap VRAM relief for the scheduler's pressure
     /// path (the costly speculative defrag is left to the allocation-time OOM
@@ -1305,6 +1336,17 @@ impl BatchedInferenceSession {
         return None;
     }
 
+    /// The VRAM Governor for this session's device, if installed. Lets the
+    /// scheduler drive admission/eviction off the governor's honest measurement,
+    /// forecast, and thresholds.
+    pub fn vram_governor(&self) -> Option<std::sync::Arc<candle::vram::VramGovernor>> {
+        #[cfg(feature = "cuda")]
+        if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+            return candle::vram::get(gpu_id);
+        }
+        None
+    }
+
     /// True when a forced compaction could free at least one whole arena from
     /// any KV backing. When false, the cache is packed to within a single arena
     /// of free space and compaction would reclaim nothing — the scheduler uses
@@ -1327,6 +1369,39 @@ impl BatchedInferenceSession {
                 }
             }
         }
+        None
+    }
+
+    /// GPU KV arena occupancy split float vs quant. Reads the shared GID pool
+    /// via layer 0's backing (arenas pool globally across same-config layers, so
+    /// one backing is the whole model). `None` when there are no backings.
+    pub fn kv_gpu_format_stats(&self) -> Option<GpuArenaFormatStats> {
+        self.backings.first().map(|b| b.gpu_arena_format_stats())
+    }
+
+    /// Release reserved-but-free CUDA pool memory back to the OS, keeping at
+    /// least `keep_bytes` reserved. Returns the `(reserved_before,
+    /// reserved_after)` bytes on success so callers can log what was reclaimed,
+    /// or `None` on non-CUDA / when the pool allocator is unavailable.
+    ///
+    /// The async pool only returns freed blocks to the OS when the stream idles,
+    /// which never happens under continuous inference — so `pool_reserved`
+    /// climbs to its fragmentation high-water and oversubscribes the card while
+    /// `pool_used` (the budget's denominator) reads far lower. Trimming keeps
+    /// `pool_reserved` tracking `pool_used` so the VRAM budget stays physically
+    /// accurate. Only releases memory nothing is using; never touches live KV.
+    pub fn trim_kv_pool(&self, keep_bytes: usize) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(d) = &self.device {
+                let before = d.pool_reserved_bytes().ok()?;
+                d.trim_pool(keep_bytes).ok()?;
+                let after = d.pool_reserved_bytes().unwrap_or(before);
+                return Some((before, after));
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = keep_bytes;
         None
     }
 

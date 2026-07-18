@@ -159,9 +159,14 @@ The most complex part of the codebase. Key files:
 | `chunked/gpu_chunks.rs` | GPU-side arena storage, kernel table builders |
 | `chunked/types.rs` | `SealedSequence`, `SealedChunk`, `ChunkMeta` |
 
-> **Tiering status:** the KV cache is currently **GPU-only**. The RAM-warm /
-> NVMe-cold tiers from the project vision are not yet built — see
-> `docs/kv_tier_migration.md` for the VRAM↔RAM migration design.
+> **Tiering status:** the three-tier KV cache is **built and wired** — GPU (hot)
+> → RAM (warm, CPU arenas) → NVMe (cold, append-only redo log). hot→warm runs on
+> the persistence thread (`migrate_group_hot_to_warm` → `migrate_sealed_to_cpu_batch_async`),
+> warm→hot on demand (`elevate_to_hot`), cold is the redo log at `.substrate/substrate.log`.
+> Two divergences from the `docs/kv_tier_migration.md` target remain: warm residency
+> is *pageable* CPU arenas (not the doc's pinned `warm_pool.rs`, which was never built —
+> so warm↔hot runs at ~½ PCIe bandwidth), and the hot→warm copy runs on the primary
+> stream (no dedicated overlap stream). See `docs/kv_tier_migration.md` for the design.
 
 **`KvFormat`**: `Float(DType)` or `Quantized(QuantFormat)`. All quant blocks = 32 elements.
 

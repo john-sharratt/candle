@@ -16,6 +16,7 @@ pub mod conversations;
 pub mod files;
 pub mod models;
 pub mod status;
+pub mod telemetry;
 pub mod ws_logs;
 
 static WEB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/web");
@@ -33,6 +34,8 @@ pub fn build_id() -> &'static str {
         let mut h = DefaultHasher::new();
         for name in [
             "index.html",
+            "perf.html",
+            "substrate.html",
             "zend-api.js",
             "zend-api.mock.js",
             "zend-api.live.js",
@@ -51,6 +54,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/chat/completions", post(chat::completions))
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
+        .route("/v1/telemetry", get(telemetry::telemetry))
         .route("/v1/conversations", get(conversations::list))
         .route(
             "/v1/conversations/:id",
@@ -74,12 +78,21 @@ pub fn router(session: Arc<ZendSession>) -> Router {
 }
 
 async fn embedded_asset(req: Request<Body>) -> Response {
-    let path = req.uri().path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
+    let raw = req.uri().path().trim_start_matches('/');
+    let want = if raw.is_empty() { "index.html" } else { raw };
+    // Clean extensionless routes (`/perf`, `/substrate`) resolve to the matching
+    // `<name>.html`, so those pages get pretty URLs without a `.html` suffix.
+    let name: String = if WEB.get_file(want).is_some() {
+        want.to_string()
+    } else if !want.contains('.') && WEB.get_file(&format!("{want}.html")).is_some() {
+        format!("{want}.html")
+    } else {
+        want.to_string()
+    };
 
-    match WEB.get_file(path) {
+    match WEB.get_file(&name) {
         Some(f) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let mime = mime_guess::from_path(&name).first_or_octet_stream();
             // `no-store` so a hot rebuild never leaves the browser running a
             // cached `index.html` against a stale `zend-api.*.js` (or vice
             // versa) — the two would disagree on the API surface and silently

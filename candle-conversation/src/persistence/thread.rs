@@ -30,6 +30,7 @@
 //! gather/write work happen unlocked. Write locks are taken briefly
 //! per residence to install the new tier.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -40,7 +41,7 @@ use candle::Device;
 use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, SealedSequence};
 use crossbeam::channel::{self, Receiver, Sender};
 
-use super::cold_load::{preallocate_pinned_scratch, PINNED_PREALLOC_BYTES};
+use super::cold_load::preallocate_pinned_scratch;
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
@@ -61,6 +62,10 @@ pub struct PersistenceTrigger {
     /// Carries a one-shot ack sender into the loop: the next pass runs the
     /// hot→warm migration and replies on the ack once pending_warm is drained.
     flush_tx: Sender<Sender<()>>,
+    /// Live hot→warm drain backlog in bytes, stamped by the persistence loop
+    /// each pass (pre- and post-drain). The scheduler polls this to throttle
+    /// ingest admission off a leading signal. See [`Substrate::pending_warm_bytes`].
+    pending_warm_bytes: Arc<AtomicU64>,
 }
 
 impl PersistenceTrigger {
@@ -88,6 +93,15 @@ impl PersistenceTrigger {
         ack_rx.recv_timeout(timeout).is_ok()
     }
 
+    /// The persistence thread's most recent hot→warm drain backlog, in bytes.
+    /// A *leading* pressure signal (drain deficit) the scheduler reads every
+    /// wave to size the ingest admission window — it rises as seals outrun the
+    /// drain and falls as the drain catches up, before the lagging VRAM-pressure
+    /// trip ever fires.
+    pub fn pending_warm_bytes(&self) -> u64 {
+        self.pending_warm_bytes.load(Ordering::Relaxed)
+    }
+
     /// Test-only no-op trigger. Holds senders whose receivers are dropped
     /// immediately, so [`Self::fire`]/[`Self::flush_blocking`] silently fail.
     /// For tests that construct a `Scheduler` without spawning a real
@@ -96,7 +110,11 @@ impl PersistenceTrigger {
     pub fn noop() -> Self {
         let (tx, _rx) = channel::bounded(1);
         let (flush_tx, _flush_rx) = channel::bounded(1);
-        Self { tx, flush_tx }
+        Self {
+            tx,
+            flush_tx,
+            pending_warm_bytes: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -113,6 +131,9 @@ pub struct PersistenceThread {
     trigger_tx: Sender<()>,
     flush_tx: Sender<Sender<()>>,
     shutdown_tx: Sender<()>,
+    /// Shared with the loop (which stamps it) and every [`PersistenceTrigger`]
+    /// handed out (which read it) — the live hot→warm drain backlog in bytes.
+    pending_warm_bytes: Arc<AtomicU64>,
 }
 
 impl PersistenceThread {
@@ -136,6 +157,8 @@ impl PersistenceThread {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
         let (flush_tx, flush_rx) = channel::bounded::<Sender<()>>(1);
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
+        let pending_warm_bytes = Arc::new(AtomicU64::new(0));
+        let loop_backlog = pending_warm_bytes.clone();
 
         // All persist-thread CUDA work runs on the device's primary
         // stream — selection, convert, gather, DtoH. Sharing the primary
@@ -165,6 +188,7 @@ impl PersistenceThread {
                     trigger_rx,
                     flush_rx,
                     shutdown_rx,
+                    loop_backlog,
                 );
             })
             .expect("failed to spawn substrate-persistence thread");
@@ -174,6 +198,7 @@ impl PersistenceThread {
             trigger_tx,
             flush_tx,
             shutdown_tx,
+            pending_warm_bytes,
         }
     }
 
@@ -190,6 +215,7 @@ impl PersistenceThread {
         PersistenceTrigger {
             tx: self.trigger_tx.clone(),
             flush_tx: self.flush_tx.clone(),
+            pending_warm_bytes: self.pending_warm_bytes.clone(),
         }
     }
 
@@ -221,6 +247,7 @@ fn run_loop(
     trigger_rx: Receiver<()>,
     flush_rx: Receiver<Sender<()>>,
     shutdown_rx: Receiver<()>,
+    pending_warm_bytes: Arc<AtomicU64>,
 ) {
     // Bind this thread to the device's CUDA context BEFORE any pinned
     // alloc — the CUDA context is per-thread on Windows and the
@@ -232,13 +259,17 @@ fn run_loop(
         let _ = d.cuda_context().bind_to_thread();
     }
 
-    // Re-used pinned host scratch for the hot→warm DtoH. Eagerly
-    // allocated at thread start so the first migration doesn't pay
-    // the `cuMemHostAlloc` cost on the hot path; stays allocated
-    // across passes and grows in-place if a turn exceeds the
-    // preallocation size.
-    let mut pinned_scratch: Option<PinnedBuf> =
-        preallocate_pinned_scratch(PINNED_PREALLOC_BYTES, "persistence::pinned_scratch");
+    // Re-used pinned host scratch for the hot→warm DtoH. Eagerly allocated at
+    // thread start — while the host heap is still clean and unfragmented — at
+    // the full migration staging cap, so it holds the largest batch any pass can
+    // produce and **never has to re-grow** later. A late re-grow to a large
+    // contiguous size is exactly what fails once the warm tier has fragmented
+    // the heap (the OOM that aborted a full overnight load); pre-sizing here
+    // sidesteps it. Stays allocated across passes.
+    let mut pinned_scratch: Option<PinnedBuf> = preallocate_pinned_scratch(
+        candle_nn::kv_cache::MIGRATION_STAGING_CAP_BYTES,
+        "persistence::pinned_scratch",
+    );
     loop {
         // Wait for trigger, shutdown, or the periodic tick — whichever
         // fires first. The `default` arm fires after `DEFAULT_TICK` if
@@ -254,6 +285,14 @@ fn run_loop(
             default(DEFAULT_TICK) => {}
         }
 
+        // Stamp the backlog this pass is about to face (pre-drain). Held high
+        // for the whole pass so the scheduler keeps ingest throttled while a
+        // long drain is in flight — the conservative direction.
+        pending_warm_bytes.store(
+            conversation.read().pending_warm_bytes(),
+            Ordering::Relaxed,
+        );
+
         run_pass(
             &conversation,
             &backings,
@@ -261,6 +300,13 @@ fn run_loop(
             &copy_stream,
             compression_policy.as_ref(),
             &mut pinned_scratch,
+        );
+
+        // Re-stamp the residual backlog (post-drain) so the signal decays as
+        // soon as the pass installs warm, letting admission reopen promptly.
+        pending_warm_bytes.store(
+            conversation.read().pending_warm_bytes(),
+            Ordering::Relaxed,
         );
 
         // run_pass migrates all pending hot→warm before returning, so by here
@@ -290,7 +336,7 @@ fn run_loop(
 /// Returns `None` (no quantization) only when the engine itself has no
 /// policy — a per-conversation override never *introduces* quantization on
 /// an otherwise-float engine.
-fn effective_turn_policy(
+pub(crate) fn effective_turn_policy(
     base: Option<&CompressionPolicy>,
     cc: Option<ConvCompression>,
 ) -> Option<CompressionPolicy> {
@@ -320,6 +366,25 @@ fn effective_turn_policy(
     }
 }
 
+/// Ask the VRAM governor to escalate recovery after a compress-to-free pass
+/// failed to allocate. Only fires for VRAM-exhaustion errors ([`is_device_oom`])
+/// — the compression couldn't fit even a small transient quant arena, the
+/// strongest "critically full" signal — where the scheduler making room lets the
+/// (untouched, still-consistent) turn's next compression attempt succeed. Other
+/// error kinds won't be helped by evicting, so they don't signal.
+///
+/// [`is_device_oom`]: candle_nn::kv_cache::is_device_oom
+fn signal_vram_starvation(device: &Device, err: &candle::Error) {
+    if !candle_nn::kv_cache::is_device_oom(err) {
+        return;
+    }
+    if let candle::DeviceLocation::Cuda { gpu_id } = device.location() {
+        if let Some(gov) = candle::vram::get(gpu_id) {
+            gov.signal_starvation();
+        }
+    }
+}
+
 /// Migrate one policy-group's residences hot→warm: per layer, quantize the
 /// group's hot sequences in place (or pass them through when `policy` is
 /// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
@@ -336,6 +401,11 @@ fn migrate_group_hot_to_warm(
     pinned_scratch: &mut Option<PinnedBuf>,
     n_layers: usize,
     installs: &mut Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
+    quantize_ms: &mut u64,
+    copy_ms: &mut u64,
+    select_ms: &mut u64,
+    alloc_ms: &mut u64,
+    convert_ms: &mut u64,
 ) {
     if group.is_empty() {
         return;
@@ -348,80 +418,149 @@ fn migrate_group_hot_to_warm(
         .map(|_| Vec::with_capacity(n_layers))
         .collect();
     let mut ok = vec![true; group.len()];
-    for layer in 0..n_layers {
-        let layer_inputs: Vec<&SealedSequence> = group.iter().map(|(_, hot)| &hot[layer]).collect();
+    // K/V heads per layer (uniform across layers of one model) — the batched
+    // convert reads the accumulated descriptors as `[jobs × n_kv_head]`.
+    let n_kv_head = backings.first().map(|b| b.n_kv_head()).unwrap_or(0);
+    // Per-(chunk, head) convert descriptors accumulated across EVERY layer, so a
+    // single batched convert launch replaces the 48 per-layer launches.
+    let mut all_descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
+    // Each layer's quantized (but not-yet-converted) hot sequences, in layer
+    // order, one Vec-per-residence entry each.
+    let mut gpu_hot_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(n_layers);
 
-        // Step 1: when a policy is configured, run the GPU-only
-        // quantize-in-place pass — a fresh `Vec<SealedSequence>` whose full
-        // chunks live in new GPU Q arenas (palette-4 per-(h, p) format).
-        // Partial trailing chunks are left in their source float format
-        // (`quantize_sealed_in_place` skips them): the selection kernel is
-        // token-count-blind, and the active writer chunk's unused slots are
-        // not guaranteed zero, so quantizing a partial would corrupt its
-        // amax. See `compress.rs`.
-        let gpu_hot_result: candle::Result<Vec<SealedSequence>> = match policy {
-            Some(policy) => candle_nn::kv_cache::quantize_sealed_in_place(
-                &backings[layer],
-                &layer_inputs,
-                policy,
-                device,
-                copy_stream,
-                pinned_scratch,
-            ),
-            None => Ok(layer_inputs.iter().map(|s| (*s).clone()).collect()),
-        };
-        let gpu_hot = match gpu_hot_result {
-            Ok(v) => v,
-            Err(e) => {
-                // CUDA errors are async — the error surfaces on the next
-                // synchronous call, not at the kernel launch site. Use the
-                // thread-local breadcrumb to identify the suspect kernel.
+    let success = 'work: {
+        // ── Phase 1: quantize EVERY layer with ONE cross-layer selection,
+        //    deferring the convert ─────────────────────────────────────────
+        // `quantize_layers_deferred` runs the palette-4 format selection as a
+        // SINGLE fused kernel + readback across all layers (not 48× per layer —
+        // the term that dominated the drain), allocates each layer's dst GPU-Q
+        // arenas, and appends every layer's per-(chunk, head) descriptors to
+        // `all_descs` WITHOUT launching the convert. Returned sequences already
+        // point at the (soon-to-be-filled) dst arenas. Partial trailing chunks
+        // quantize too (dead slots are zero; the packed valid-range window keeps
+        // amax correct); already-quant chunks pass through the preserve bucket.
+        // Bit-identical to the per-layer selection — see the compress-test A/B.
+        let t_q = std::time::Instant::now();
+        match policy {
+            Some(policy) => {
+                let per_layer_inputs: Vec<Vec<&SealedSequence>> = (0..n_layers)
+                    .map(|layer| group.iter().map(|(_, hot)| &hot[layer]).collect())
+                    .collect();
+                let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+                match candle_nn::kv_cache::quantize_layers_deferred(
+                    &backing_refs,
+                    &per_layer_inputs,
+                    policy,
+                    device,
+                    copy_stream,
+                    pinned_scratch,
+                    &mut all_descs,
+                    select_ms,
+                    alloc_ms,
+                ) {
+                    Ok(v) => gpu_hot_per_layer = v,
+                    Err(e) => {
+                        // CUDA errors are async — surfaced on the next sync call,
+                        // not at the launch site; use the breadcrumb to identify it.
+                        tracing::warn!(
+                            "cache: hot→warm cross-layer quantize failed: {e} (last CUDA kernel on this thread: {})",
+                            candle::last_cuda_kernel_launch()
+                        );
+                        // Non-destructive: the group stays hot-float + consistent
+                        // and retries next pass. If it was VRAM exhaustion, the
+                        // retry needs room — signal the scheduler to escalate.
+                        signal_vram_starvation(device, &e);
+                        *quantize_ms += t_q.elapsed().as_millis() as u64;
+                        break 'work false;
+                    }
+                }
+            }
+            None => {
+                // No policy: pass each layer's hot sequences through unchanged.
+                for layer in 0..n_layers {
+                    gpu_hot_per_layer
+                        .push(group.iter().map(|(_, hot)| hot[layer].clone()).collect());
+                }
+            }
+        }
+        *quantize_ms += t_q.elapsed().as_millis() as u64;
+
+        // ── Phase 2: ONE batched convert across every layer's descriptors ───
+        // `n_layers × n_chunks × n_kv_head` blocks in a single launch (tiled at
+        // the grid.y cap), filling all dst arenas before the migrate DtoH reads
+        // them (same primary stream, FIFO). No-op when `policy` is None
+        // (`all_descs` empty). Counts toward `quantize_ms`. Bit-identical to the
+        // per-layer convert — proven by `quantize_layers_batched_matches_per_layer`.
+        if !all_descs.is_empty() {
+            let t_conv = std::time::Instant::now();
+            let conv =
+                candle_nn::kv_cache::convert_deferred_descs(&backings[0], &all_descs, n_kv_head, device);
+            let dt = t_conv.elapsed().as_millis() as u64;
+            *quantize_ms += dt;
+            *convert_ms += dt;
+            if let Err(e) = conv {
                 tracing::warn!(
-                    "cache: hot→warm layer {layer} quantize failed: {e} (last CUDA kernel on this thread: {})",
+                    "cache: hot→warm batched convert failed: {e} (last CUDA kernel on this thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
-                ok.fill(false);
-                break;
+                signal_vram_starvation(device, &e);
+                break 'work false;
             }
-        };
+        }
 
-        // Step 2: format-preserving DtoH copy of the (possibly-quantized)
-        // GPU sequences to CPU. Simple byte-scatter — no kernel work.
-        let gpu_hot_refs: Vec<&SealedSequence> = gpu_hot.iter().collect();
-        let cpu_warm_result = backings[layer].migrate_sealed_to_cpu_batch_async(
+        // ── Phase 3: ONE batched hot → warm DtoH across every layer ─────────
+        // A single gather + DtoH + sync for all layers (vs 48 per-layer gathers +
+        // syncs), which was the dominant `copy_ms` term. Bit-identical to the
+        // per-layer migrate — proven by the compress-test A/B.
+        let t_c = std::time::Instant::now();
+        let per_layer_refs: Vec<Vec<&SealedSequence>> =
+            gpu_hot_per_layer.iter().map(|v| v.iter().collect()).collect();
+        let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+        let warm_result = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch(
+            &backing_refs,
             device,
             copy_stream,
             pinned_scratch,
-            &gpu_hot_refs,
+            &per_layer_refs,
         );
-        let cpu_warm = match cpu_warm_result {
+        *copy_ms += t_c.elapsed().as_millis() as u64;
+        drop(per_layer_refs); // release the borrow of gpu_hot_per_layer
+        let warm_per_layer = match warm_result {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    "cache: hot→warm layer {layer} DtoH failed: {e} (last CUDA kernel on this thread: {})",
+                    "cache: hot→warm batched DtoH failed: {e} (last CUDA kernel on this thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
-                ok.fill(false);
-                break;
+                break 'work false;
             }
         };
-
-        if cpu_warm.len() != gpu_hot.len() {
-            tracing::warn!(
-                "cache: hot→warm layer {layer} mismatch — {} hot vs {} warm",
-                gpu_hot.len(),
-                cpu_warm.len()
-            );
-            ok.fill(false);
-            break;
+        // Distribute warm (per layer, in layer order) into per-residence order.
+        for (layer, layer_warm) in warm_per_layer.into_iter().enumerate() {
+            if layer_warm.len() != gpu_hot_per_layer[layer].len() {
+                tracing::warn!(
+                    "cache: hot→warm layer {layer} mismatch — {} hot vs {} warm",
+                    gpu_hot_per_layer[layer].len(),
+                    layer_warm.len()
+                );
+                break 'work false;
+            }
+            for (i, w) in layer_warm.into_iter().enumerate() {
+                warm_per[i].push(w);
+            }
         }
 
-        for (i, h) in gpu_hot.into_iter().enumerate() {
-            hot_per[i].push(h);
+        // Distribute the per-layer hot sequences into per-residence order.
+        for layer_hot in gpu_hot_per_layer.into_iter() {
+            for (i, h) in layer_hot.into_iter().enumerate() {
+                hot_per[i].push(h);
+            }
         }
-        for (i, w) in cpu_warm.into_iter().enumerate() {
-            warm_per[i].push(w);
-        }
+        true
+    };
+
+    if !success {
+        ok.fill(false);
     }
 
     for (i, (idx, _)) in group.iter().enumerate() {
@@ -451,12 +590,17 @@ fn run_pass(
     // K/V. Synchronize the device once, up front, so every prior decode write
     // is retired before we read any source arena. This is on the background
     // thread, off the decode hot path.
+    let t_pass = std::time::Instant::now();
     if let Err(e) = device.synchronize() {
         tracing::warn!(
             target: "candle_conversation::persistence::tier",
             "persist: pre-migrate device sync failed: {e:?}"
         );
     }
+    // Phase-timing breakdown so we can see *where* the hot→warm drain spends its
+    // time (the demote starves when this can't keep up with the ingest seal rate).
+    let sync_pre_ms = t_pass.elapsed().as_millis() as u64;
+    let t_migrate = std::time::Instant::now();
 
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
     //
@@ -500,6 +644,11 @@ fn run_pass(
     }
 
     let mut installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)> = Vec::new();
+    let mut quantize_ms = 0u64;
+    let mut copy_ms = 0u64;
+    let mut select_ms = 0u64;
+    let mut alloc_ms = 0u64;
+    let mut convert_ms = 0u64;
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);
         migrate_group_hot_to_warm(
@@ -511,8 +660,15 @@ fn run_pass(
             pinned_scratch,
             n_layers,
             &mut installs,
+            &mut quantize_ms,
+            &mut copy_ms,
+            &mut select_ms,
+            &mut alloc_ms,
+            &mut convert_ms,
         );
     }
+    let migrate_ms = t_migrate.elapsed().as_millis() as u64;
+    let t_sync_post = std::time::Instant::now();
     // Primary-stream sync after ALL groups/layers complete.
     //
     // `quantize_sealed_in_place` and the format-preserving DtoH leave
@@ -538,6 +694,8 @@ fn run_pass(
         // The whole batch's GPU work is suspect — don't install any of it.
         installs.clear();
     }
+    let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
+    let t_install = std::time::Instant::now();
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
     if !installs.is_empty() {
@@ -565,6 +723,30 @@ fn run_pass(
             // exactly the bytes the convert kernel wrote.
             view.install_warm_and_hot(idx, hot, warm);
         }
+    }
+    let install_ms = t_install.elapsed().as_millis() as u64;
+    // Log the breakdown when the pass did real work OR was slow even with nothing
+    // to install (isolates a dominant `device.synchronize()` cost). This is the
+    // number that tells us whether the drain is sync-bound, the serial 48-layer
+    // migrate, or install-lock-bound.
+    if hot_to_warm_count > 0 || sync_pre_ms + migrate_ms + sync_post_ms > 50 {
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            residences = hot_to_warm_count,
+            mib = hot_to_warm_bytes / (1 << 20),
+            n_layers,
+            sync_pre_ms,
+            migrate_ms,
+            quantize_ms,
+            select_ms,
+            alloc_ms,
+            convert_ms,
+            copy_ms,
+            sync_post_ms,
+            install_ms,
+            total_ms = t_pass.elapsed().as_millis() as u64,
+            "hot→warm pass timing"
+        );
     }
 
     // ── Phase 2: warm → cold ────────────────────────────────────────────

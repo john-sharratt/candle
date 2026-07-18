@@ -48,18 +48,23 @@ pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;
+pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::{
     arena_chunks_for_format, arena_gid_stride, LiveChunkRef, MetaGid, SealedChunk, SealedSequence,
     WriterTail, CHUNK_SIZE,
 };
 #[cfg(feature = "cuda")]
-pub use chunked::{dequantize_sealed_in_place, quantize_sealed_in_place};
+pub use chunked::{
+    convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
+    quantize_sealed_in_place, quantize_sealed_in_place_deferred,
+};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
-    ChunkedKvBacking, CompressionPolicy, HeadGids, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
+    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvErrorThresholdFactors,
+    LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,

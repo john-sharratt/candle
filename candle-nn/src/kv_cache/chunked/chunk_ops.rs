@@ -29,6 +29,17 @@ use candle::{DType, Device, Result, Tensor};
 // Shared production thresholds are defined in compression_policy.rs and are
 // consumed here directly so the runtime and table harness stay in sync.
 
+/// Upper bound on one hot→warm migration batch's contiguous staging buffer
+/// (host pinned/heap AND transient GPU staging). Kept deliberately small: the
+/// warm tier fills host RAM with thousands of 16 MiB CPU arenas, so a *large*
+/// contiguous host allocation (the old 2 GiB) can fail on a fragmented heap and
+/// abort the process. At 512 MiB a full ~1.4 GiB pass migrates in ~3 batches
+/// (≈3 DtoH syncs) — still far below the per-layer 48 that made `copy_ms` the
+/// drain bottleneck, while bounding every staging allocation to a size the heap
+/// can reliably supply. The persistence thread pre-sizes its reusable scratch to
+/// this at startup (clean heap), so it never has to re-grow under fragmentation.
+pub const MIGRATION_STAGING_CAP_BYTES: usize = 512 * 1024 * 1024;
+
 /// Source formats the quantize-on-evict kernel can ingest directly:
 /// GPU `Float` (any dtype) or `Quantized(R16)`. Anything else has to
 /// take the format-preserving migration path because the selection /
@@ -1947,12 +1958,11 @@ impl ChunkedKvBacking {
             .map(|b| b.len() < total_bytes)
             .unwrap_or(true);
         if need_grow {
-            *pinned_scratch = Some(match PinnedBuf::alloc_owned_default(total_bytes) {
-                Ok(b) => b,
-                Err(_) => PinnedBuf::Host {
-                    data: vec![0u8; total_bytes],
-                },
-            });
+            // Fallible: under host-RAM pressure this returns Err instead of
+            // aborting the process (the old `vec![0u8; total_bytes]` fallback
+            // called `handle_alloc_error`). A failed migration leaves the turn
+            // hot-float + consistent, retried on the next persistence pass.
+            *pinned_scratch = Some(PinnedBuf::alloc_default_or_host_fallible(total_bytes)?);
         }
 
         // ── Phase 1: device-side gather on the copy stream ─────────────
@@ -2045,6 +2055,299 @@ impl ChunkedKvBacking {
                 })
             })
             .collect()
+    }
+
+    /// Cross-layer batched hot→warm DtoH. The per-layer
+    /// [`Self::migrate_sealed_to_cpu_batch_async`] issues a gather + DtoH + sync
+    /// **per backing** (48× per persist pass on Qwen3); this resolves EVERY
+    /// layer's chunks into ONE contiguous staging blob, runs a SINGLE gather +
+    /// SINGLE DtoH + SINGLE `copy_stream.synchronize()`, then scatters per-layer
+    /// into fresh CPU arenas. Collapses the WDDM per-launch/per-sync overhead
+    /// that made `copy_ms` the hot→warm drain bottleneck. `backings[i]` owns
+    /// `per_layer_seqs[i]`; returns the warm (CPU) sequences per layer, in the
+    /// same order. Bit-identical to the per-layer path — proven by
+    /// `migrate_layers_deferred_matches_immediate_bytes` extended, and the
+    /// dedicated `migrate_layers_batched_matches_per_layer_bytes`.
+    #[cfg(feature = "cuda")]
+    pub fn migrate_sealed_layers_to_cpu_batch(
+        backings: &[&ChunkedKvBacking],
+        device: &Device,
+        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        per_layer_seqs: &[Vec<&SealedSequence>],
+    ) -> candle::Result<Vec<Vec<SealedSequence>>> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::WrapErr;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::collections::{HashMap, HashSet};
+
+        use super::migrate::{kv_migrate_on, MigrationPlan};
+
+        if backings.len() != per_layer_seqs.len() {
+            return Err(candle::Error::Msg(
+                "migrate_sealed_layers_to_cpu_batch: backings/seqs length mismatch".into(),
+            ));
+        }
+        match device {
+            candle::Device::Cuda(_) => {}
+            _ => {
+                return Err(candle::Error::Msg(
+                    "migrate_sealed_layers_to_cpu_batch requires a CUDA device".into(),
+                ))
+            }
+        }
+
+        // Per-layer resolution kept for the scatter phase. Offsets are assigned
+        // per staging batch below (not globally), so the transient GPU staging
+        // buffer never scales with the whole cross-layer batch.
+        struct LayerResolve {
+            unique_raws: Vec<i64>,
+            /// Source device ptr + byte length per unique raw gid.
+            src: HashMap<i64, (i64, usize)>,
+            src_keys: HashMap<i64, ArenaKey>,
+            layer_bytes: usize,
+        }
+
+        // ── Resolve every layer's sources (device ptr + len per gid) ────
+        let arena_chunks = arena_gid_stride();
+        let mut layers: Vec<LayerResolve> = Vec::with_capacity(backings.len());
+        let mut grand_total: usize = 0;
+        for (li, backing) in backings.iter().enumerate() {
+            let arena_info = backing.resolve_arena_info()?;
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut unique_raws: Vec<i64> = Vec::new();
+            let mut src: HashMap<i64, (i64, usize)> = HashMap::new();
+            let mut src_keys: HashMap<i64, ArenaKey> = HashMap::new();
+            let mut layer_bytes = 0usize;
+            for seq in &per_layer_seqs[li] {
+                for chunk in &seq.chunks {
+                    for gid in chunk.gids.0.iter() {
+                        let raw = gid.raw();
+                        if !seen.insert(raw) {
+                            continue;
+                        }
+                        let arena_idx = (raw as usize) / arena_chunks;
+                        let chunk_idx = (raw as usize) % arena_chunks;
+                        let info = arena_info.get(arena_idx).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "migrate_sealed_layers_to_cpu_batch: layer {li} arena {arena_idx} out of range"
+                            ))
+                        })?;
+                        if info.base_ptr == 0 {
+                            return Err(candle::Error::Msg(
+                                "migrate_sealed_layers_to_cpu_batch: source arena not GPU-resident".into(),
+                            ));
+                        }
+                        let len = info.chunk_byte_stride as usize;
+                        let ptr = info.base_ptr as i64 + chunk_idx as i64 * info.chunk_byte_stride;
+                        src.insert(raw, (ptr, len));
+                        unique_raws.push(raw);
+                        layer_bytes += len;
+                        let key = backing
+                            .inner
+                            .storage
+                            .read(|s| s.arena_key(arena_idx))?
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!(
+                                    "migrate_sealed_layers_to_cpu_batch: layer {li} arena key {arena_idx} not found"
+                                ))
+                            })?;
+                        src_keys.insert(raw, key);
+                    }
+                }
+            }
+            grand_total += layer_bytes;
+            layers.push(LayerResolve {
+                unique_raws,
+                src,
+                src_keys,
+                layer_bytes,
+            });
+        }
+
+        if grand_total == 0 {
+            return Ok(per_layer_seqs
+                .iter()
+                .map(|seqs| seqs.iter().map(|s| (*s).clone()).collect())
+                .collect());
+        }
+
+        // ── Migrate in contiguous layer batches, each capped by STAGING_CAP ─
+        // A single cross-layer gather would size the transient GPU staging to
+        // the ENTIRE batch (all layers at once) — under ingest pressure that
+        // alloc can OOM the very copy meant to relieve pressure. Instead, group
+        // layers so each batch's staging stays ≤ cap and issue ONE gather + DtoH
+        // + sync per batch. Layers are ~uniform (≈1/n_layers of the total each),
+        // so this is ceil(total/cap) syncs — still collapsing the WDDM per-launch
+        // overhead that made `copy_ms` the drain bottleneck, not the per-layer 48.
+        const STAGING_CAP_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
+        let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
+        let mut li = 0usize;
+        while li < backings.len() {
+            // Grow the batch while under the cap; always take ≥1 layer so a lone
+            // layer larger than the cap still makes progress.
+            let mut batch_bytes = 0usize;
+            let mut lj = li;
+            while lj < backings.len() {
+                let lb = layers[lj].layer_bytes;
+                if lj > li && batch_bytes + lb > STAGING_CAP_BYTES {
+                    break;
+                }
+                batch_bytes += lb;
+                lj += 1;
+            }
+
+            if batch_bytes == 0 {
+                // A trailing run of wholly-empty layers — emit their (empty)
+                // sequences with no GPU work.
+                for seqs in &per_layer_seqs[li..lj] {
+                    out.push(seqs.iter().map(|s| (*s).clone()).collect());
+                }
+                li = lj;
+                continue;
+            }
+
+            // Allocate the host + GPU staging for [li, lj), shrinking the batch
+            // and retrying on OOM. Both allocs happen BEFORE any scatter side
+            // effect, so a failed attempt leaves no partial state — halving the
+            // layer span (down to a single ~30 MB layer) lets migration make
+            // progress even when host RAM is fragmented or VRAM is tight, instead
+            // of aborting. Only when a lone layer still won't fit do we propagate
+            // the error (the turn stays hot-float + consistent, retried next pass).
+            let (staging, batch_bytes) = loop {
+                let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
+                // Host scratch (fallible — see the per-layer variant's note).
+                let host_res = {
+                    let need_grow = pinned_scratch
+                        .as_ref()
+                        .map(|b| b.len() < batch_bytes)
+                        .unwrap_or(true);
+                    if need_grow {
+                        PinnedBuf::alloc_default_or_host_fallible(batch_bytes)
+                            .map(|b| *pinned_scratch = Some(b))
+                    } else {
+                        Ok(())
+                    }
+                };
+                // GPU staging (only once the host scratch is in place).
+                let alloc_res =
+                    host_res.and_then(|_| unsafe { copy_stream.alloc::<u8>(batch_bytes) }.w());
+                match alloc_res {
+                    Ok(s) => break (s, batch_bytes),
+                    Err(e) if lj > li + 1 => {
+                        lj = li + ((lj - li) / 2).max(1);
+                        tracing::warn!(
+                            target: "candle_conversation::persistence::tier",
+                            batch_bytes,
+                            layers = lj - li,
+                            "hot→warm staging alloc failed under memory pressure; \
+                             shrinking migration batch and retrying: {e}"
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            // ── ONE gather + ONE DtoH + ONE sync for this batch ─────────────
+            let staging_base = {
+                let (p, _g) = staging.device_ptr(copy_stream);
+                p as i64
+            };
+            let mut plan = MigrationPlan::new();
+            // Batch-local byte offset per unique gid, per layer, for the scatter.
+            let mut batch_ranges: Vec<HashMap<i64, (usize, usize)>> = Vec::with_capacity(lj - li);
+            let mut off = 0i64;
+            for layer in &layers[li..lj] {
+                let mut ranges: HashMap<i64, (usize, usize)> = HashMap::new();
+                for &raw in &layer.unique_raws {
+                    let (ptr, len) = layer.src[&raw];
+                    plan.push(ptr, staging_base + off, len as i64);
+                    ranges.insert(raw, (off as usize, len));
+                    off += len as i64;
+                }
+                batch_ranges.push(ranges);
+            }
+            kv_migrate_on(device, &plan, Some(copy_stream))?;
+            {
+                let scratch = pinned_scratch
+                    .as_mut()
+                    .expect("pinned scratch allocated above");
+                let dst = &mut scratch.as_mut_slice()[..batch_bytes];
+                copy_stream.memcpy_dtoh(&staging, dst).w()?;
+                copy_stream.synchronize().w()?;
+            }
+            drop(staging);
+
+            // ── Per-layer scatter into fresh CPU arenas ─────────────────────
+            for (k, backing) in backings[li..lj].iter().enumerate() {
+                let resolve = &layers[li + k];
+                let ranges = &batch_ranges[k];
+                // Phase 3: allocate dest CPU GIDs (one state.write per backing).
+                let mut new_gids: HashMap<i64, ChunkGid> = HashMap::new();
+                {
+                    let _state = backing
+                        .state
+                        .write()
+                        .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+                    for &raw in &resolve.unique_raws {
+                        let src_key = &resolve.src_keys[&raw];
+                        let cpu_key = ArenaKey {
+                            format: src_key.format,
+                            location: ArenaLocation::Cpu,
+                        };
+                        new_gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
+                    }
+                }
+                // Phase 4: write this layer's slice of the batch blob → CPU arena.
+                let scratch_ref = pinned_scratch
+                    .as_ref()
+                    .expect("pinned scratch allocated above");
+                backing.inner.storage.try_write(|s| -> candle::Result<()> {
+                    for &raw in &resolve.unique_raws {
+                        let (off, len) = ranges[&raw];
+                        let bytes = &scratch_ref.as_slice()[off..off + len];
+                        let new_gid = new_gids[&raw].clone();
+                        Self::write_chunk_from_pinned_bytes(
+                            s.arenas_mut(),
+                            new_gid.arena_idx(),
+                            new_gid.chunk_idx(),
+                            bytes,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                // Phase 5: rebuild SealedSequences with mapped CPU GIDs.
+                let seqs: candle::Result<Vec<SealedSequence>> = per_layer_seqs[li + k]
+                    .iter()
+                    .map(|seq| -> candle::Result<SealedSequence> {
+                        let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                            .chunks
+                            .iter()
+                            .map(|chunk| {
+                                let mapped = chunk
+                                    .gids
+                                    .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                                Ok(SealedChunk {
+                                    gids: mapped,
+                                    meta: None,
+                                    ..chunk.clone()
+                                })
+                            })
+                            .collect();
+                        Ok(SealedSequence {
+                            chunks: new_chunks?,
+                            token_count: seq.token_count,
+                            chunk_size: seq.chunk_size,
+                            location: ArenaLocation::Cpu,
+                        })
+                    })
+                    .collect();
+                out.push(seqs?);
+            }
+            li = lj;
+        }
+        Ok(out)
     }
 
     /// Write one chunk-slot's worth of raw bytes into a CPU `Arena::Float`

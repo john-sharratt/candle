@@ -1312,6 +1312,36 @@ impl ModelWeights {
             free_vram as f64 / 1e9,
         );
 
+        // ── VRAM Governor ──
+        // Balloon (fast-path skip on a free card) to measure the real resident
+        // capacity C, then install it so the expert budget, KV budget, and
+        // scheduler all coordinate through one authority (see
+        // `docs/vram_governor_design.md`).
+        #[cfg(feature = "cuda")]
+        let gpu_id = match device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+            _ => 0,
+        };
+        #[cfg(feature = "cuda")]
+        if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
+            match candle::vram::VramGovernor::from_device(device, gpu_id) {
+                Ok(gov) => {
+                    let mut balloon =
+                        candle::vram::balloon::DeviceBalloonAllocator::new(device.clone());
+                    match gov.run_balloon(&mut balloon) {
+                        Ok(c) => tracing::info!(
+                            target: "candle_core::vram",
+                            "VRAM governor installed: capacity C={:.1}GB",
+                            c as f64 / 1e9
+                        ),
+                        Err(e) => tracing::warn!("VRAM governor balloon failed: {e}"),
+                    }
+                    candle::vram::install(gov);
+                }
+                Err(e) => tracing::warn!("VRAM governor init failed: {e}"),
+            }
+        }
+
         // Helper: load tensor directly to VRAM
         let load_tensor = |name: &str| -> Result<QTensor> {
             let tensor_info = ct
@@ -1478,19 +1508,25 @@ impl ModelWeights {
             let total_expert_bytes = total_experts * max_expert_size;
 
             // ── VRAM budget for expert LRU cache ──
-            // Formula: min(max(free − 5 GB, free × 50%), total_expert_bytes)
-            //  • max(free−5GB, 50%) → on small GPUs the 50% floor keeps a usable
-            //    pool; on larger GPUs free−5GB greedily takes most of VRAM.
-            //  • Crossover is at free=10 GB.
-            //  • The min() cap prevents allocating more slots than experts exist,
-            //    freeing leftover VRAM for KV cache / context length.
-            const RESERVE_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GB
-            let generous = {
-                let option_a = free_vram.saturating_sub(RESERVE_BYTES);
-                let option_b = free_vram / 2;
-                option_a.max(option_b)
+            // Preferred: the VRAM Governor computes it from the live measurement
+            // at this instant (weights already resident), leaving the KV floor +
+            // scratch cushion free so experts can never starve KV
+            // (`docs/vram_governor_design.md` §11). Fallback (no governor): the
+            // legacy `min(max(free−5GB, free×50%), total_expert_bytes)`.
+            #[cfg(feature = "cuda")]
+            let gov_budget = candle::vram::get(gpu_id).and_then(|g| g.expert_budget().ok());
+            #[cfg(not(feature = "cuda"))]
+            let gov_budget: Option<u64> = None;
+            let expert_budget = match gov_budget {
+                Some(b) => (b as usize).min(total_expert_bytes),
+                None => {
+                    const RESERVE_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GB
+                    let generous = free_vram
+                        .saturating_sub(RESERVE_BYTES)
+                        .max(free_vram / 2);
+                    generous.min(total_expert_bytes)
+                }
             };
-            let expert_budget = generous.min(total_expert_bytes);
 
             let num_slots = if max_expert_size > 0 {
                 let base = expert_budget / max_expert_size;
@@ -1533,6 +1569,15 @@ impl ModelWeights {
                 cache_progress,
                 int8mode,
             )?;
+            // Record the resident expert footprint with the governor (tally +
+            // kv_floor base; the availability gate stays the live measurement).
+            #[cfg(feature = "cuda")]
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.credit_class(
+                    candle::vram::AllocClass::Expert,
+                    (num_slots * max_expert_size) as u64,
+                );
+            }
             Some(Arc::new(cache))
         } else {
             // No MoE layers — warm the entire mmap the simple way.

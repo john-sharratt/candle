@@ -897,6 +897,103 @@ impl PagedSelectionGpuInputs {
         })
     }
 
+    /// Cross-layer selection inputs: concatenate every layer's per-head arena
+    /// table and gids into ONE upload, so a single fused selection kernel + a
+    /// single set of readbacks replaces the per-layer 48× launch/readback loop
+    /// that dominates the hot→warm drain. Each layer's `arena_idx` is offset by
+    /// the running arena count, keeping the unified table densely indexable as
+    /// `table[arena_idx * n_kv_head + head]`. Returns the unified inputs plus the
+    /// per-layer chunk counts, so the caller can split the flat results back out
+    /// per layer.
+    ///
+    /// Bit-identical to running [`Self::from_head_gids`] per layer and selecting
+    /// each separately: the offset is a pure relabelling of arena rows the kernel
+    /// reads by pointer, and chunks never interact across the selection.
+    pub fn from_head_gids_multi(
+        backings: &[Arc<BackingInner>],
+        chunk_gids_per_layer: &[Vec<HeadGids>],
+        generation: Option<&Generation>,
+        dev: &candle::CudaDevice,
+    ) -> Result<(Self, Vec<usize>)> {
+        use crate::kv_cache::arena_table::PerHeadEntry;
+        if backings.len() != chunk_gids_per_layer.len() {
+            candle::bail!("from_head_gids_multi: backings/gids layer count mismatch");
+        }
+        if backings.is_empty() {
+            candle::bail!("from_head_gids_multi: no layers");
+        }
+        let n_kv_head = backings[0].n_kv_head;
+        let head_dim = backings[0].head_dim;
+        let arena_chunks = arena_gid_stride() as i64;
+
+        let mut unified_table: Vec<i64> = Vec::new();
+        let mut unified_head_gids: Vec<i64> = Vec::new();
+        let mut chunk_counts: Vec<usize> = Vec::with_capacity(backings.len());
+        let mut chunk_gids_keepalive: Vec<HeadGids> = Vec::new();
+        let mut arena_offset: usize = 0; // running arena count, in arenas
+
+        for (backing, gids_layer) in backings.iter().zip(chunk_gids_per_layer) {
+            if backing.n_kv_head != n_kv_head || backing.head_dim != head_dim {
+                candle::bail!("from_head_gids_multi: heterogeneous layer geometry");
+            }
+            let (table, num_arenas) = backing.per_head_table_host()?;
+            // Append this layer's dense [0, num_arenas) arena rows; the offset
+            // makes its local arena_idx land at global (arena_offset + idx).
+            unified_table.extend_from_slice(&table);
+            let gid_off = arena_offset as i64 * arena_chunks;
+            for gids in gids_layer.iter() {
+                for h in 0..n_kv_head {
+                    unified_head_gids.push(gids.k_gid(h).raw() + gid_off);
+                    unified_head_gids.push(gids.v_gid(h).raw() + gid_off);
+                }
+            }
+            chunk_counts.push(gids_layer.len());
+            chunk_gids_keepalive.extend(gids_layer.iter().cloned());
+            arena_offset += num_arenas;
+        }
+
+        let total_arenas = arena_offset;
+        let device = candle::Device::Cuda(dev.clone());
+        let per_head_table = if total_arenas == 0 {
+            candle::Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, &device)?
+        } else {
+            candle::Tensor::from_vec(
+                unified_table,
+                (total_arenas * n_kv_head, PerHeadEntry::COLS),
+                &device,
+            )?
+        };
+        let per_head_table_buf = {
+            let (storage, layout) = per_head_table.storage_and_layout();
+            match &*storage {
+                candle::Storage::Cuda(cuda) => {
+                    let slice = cuda.as_cuda_slice::<i64>()?;
+                    let stream = dev.cuda_stream();
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    let len = layout.shape().elem_count() * std::mem::size_of::<i64>();
+                    GpuBuf::from_borrowed(ptr, len)
+                }
+                _ => candle::bail!("paged selection backing must be on CUDA"),
+            }
+        };
+        let head_gids_buf = stage_i64_slice(&unified_head_gids, generation, dev)?;
+
+        Ok((
+            Self {
+                chunk_gids_keepalive,
+                _per_head_table_tensor: Some(per_head_table),
+                per_head_table_buf,
+                head_gids: unified_head_gids,
+                head_gids_buf,
+                blocks_per_chunk: n_kv_head * head_dim,
+                n_kv_head,
+                arena_chunks: arena_gid_stride(),
+                dev: dev.clone(),
+            },
+            chunk_counts,
+        ))
+    }
+
     pub fn select_chunks(
         &self,
         start_chunk: usize,

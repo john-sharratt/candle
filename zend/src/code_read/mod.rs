@@ -107,14 +107,27 @@ fn emit_file_turns<S: InsertTurnSink>(
     // all in parallel — one scratch slot per scope — so the file's scopes batch
     // into large amortising forwards instead of prefilling one-at-a-time. The
     // scopes are recorded into the file timeline in this (source) order.
+    // Each scope reconstructs as a full four-segment tool exchange:
+    //   user(excerpt header) → assistant(<tool_call>) → user(<tool_response>) →
+    //   assistant(read confirmation).
+    // The `<tool_response>` comes back in a *user* turn (the Hermes/Qwen
+    // tool-result convention), and the closing assistant turn keeps the sequence
+    // from ending on a user turn (which would collide with the next turn's user
+    // opener). Both dialect role boundaries are spliced into the one `assistant`
+    // string the sink records — the substrate frames the leading user header and
+    // trailing assistant-end itself.
+    let bounds = sink.tool_exchange_boundaries();
     let mut scope_turns: Vec<(String, String)> = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
         let user = header::render_part_user_prompt(path, scope);
         let assistant = format!(
-            "{}\n{}",
-            header::render_tool_call(path, scope),
-            header::render_tool_response(path, scope, language, &body),
+            "{call}{b1}{response}{b2}{ack}",
+            call = header::render_tool_call(path, scope),
+            b1 = bounds.call_to_response,
+            response = header::render_tool_response(path, scope, language, &body),
+            b2 = bounds.response_to_close,
+            ack = header::render_read_ack(path, scope),
         );
         scope_turns.push((user, assistant));
     }

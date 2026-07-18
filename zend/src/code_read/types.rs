@@ -41,13 +41,9 @@ pub struct Scope {
 
 impl Scope {
     /// Joined nesting path — `mod cache > impl KvCache > fn
-    /// seal_chunk`.  Used by parser unit tests (asserted against
-    /// expected nesting shapes) and by telemetry consumers that want
-    /// a human-readable scope label.  The binary path proper only
-    /// reads `scope.path` directly when rendering the prefill
-    /// header, so this surfaces as dead from the lib-build's
-    /// perspective.
-    #[allow(dead_code)]
+    /// seal_chunk`.  Names the scope in the closing assistant segment of a
+    /// code-read part turn (see `header::render_read_ack`) and in parser unit
+    /// tests asserted against expected nesting shapes.
     pub fn qualified_path(&self) -> String {
         self.path.join(" > ")
     }

@@ -305,10 +305,19 @@ mod tests {
 
             let row = k_gid_snapshot(&backing)[4].clone();
 
-            // Should recycle the lowest freed K head-0 GID.
-            // With palette-split blocks, K0 strides by 32: 0, 32, 64, 96, ...
-            // Freed seqs 1 and 3 therefore return K0 gids 32 and 96.
-            assert_eq!(row[0], 32);
+            // The 4 initial seqs filled contiguous slots 0..128 (fresh arena → the
+            // high-water mark hands them out in order). Freeing seqs 1 and 3 pushes
+            // their slots onto the recycle stack; the new alloc pops from it, so it
+            // reuses a freed slot in [0, 128) rather than growing the arena (which
+            // would hand out a slot ≥ 128 via the high-water mark). The recycle
+            // list is LIFO, so the exact slot is unspecified — and the free list
+            // deliberately no longer packs a chunk's sub-band gids contiguously
+            // (within-arena order is irrelevant to compaction).
+            assert!(
+                row[0] < 128,
+                "recycled K head-0 GID must reuse a freed slot in [0,128), got {}",
+                row[0]
+            );
         }
     }
 
@@ -377,10 +386,15 @@ mod tests {
             backing.write_contiguous(4, 0, &k, &v).unwrap();
 
             let row = k_gid_snapshot(&backing)[4].clone();
-            // Freed seqs 1 (K0=32) and 3 (K0=96). Lowest freed K head-0 GID is 32.
-            assert_eq!(
-                row[0], 32,
-                "recycled slot should be GID 32 (lowest freed K head-0)"
+            // The 4 initial seqs took contiguous slots 0..128 (high-water mark).
+            // Freeing seqs 1 and 3 returns their slots to the recycle stack, so
+            // the new alloc pops one back — reusing a slot in [0,128) rather than
+            // growing the arena (a fresh slot would be ≥ 128). LIFO order ⇒ the
+            // exact slot is unspecified.
+            assert!(
+                row[0] < 128,
+                "recycled slot should reuse a freed GID in [0,128), got {}",
+                row[0]
             );
         }
 
@@ -465,8 +479,15 @@ mod tests {
             backing.write_contiguous(2, 0, &k, &v).unwrap();
 
             let row = k_gid_snapshot(&backing)[2].clone();
-            assert_eq!(row[0], 0, "first recycled K head-0 GID should be 0");
-            assert_eq!(row[1], 32, "second recycled K head-0 GID should be 32");
+            // Seq 0 took slots [0,64) (two blocks), seq 1 took [64,128). Freeing
+            // seq 0 returns [0,64) to the recycle stack; seq 2's two blocks pop
+            // them all back, so both its K head-0 gids land in [0,64) — recycled,
+            // not freshly grown. LIFO order ⇒ the per-block positions are
+            // unspecified, so assert membership rather than exact values.
+            assert!(
+                row[0] < 64 && row[1] < 64,
+                "both blocks should recycle seq 0's freed slots in [0,64), got {row:?}"
+            );
         }
 
         /// migrate_chunk must return a GID from the pool (not a raw mint), and

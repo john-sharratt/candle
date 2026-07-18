@@ -301,7 +301,7 @@ layers:
             nothing.
     groups:
       - id: scopes
-        selection: { kind: top_k, k: 8 }
+        selection: { kind: top_k, k: 4 }
         score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
         budget:
           priority: 100

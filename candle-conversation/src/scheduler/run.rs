@@ -1,4 +1,5 @@
 use super::*;
+use super::prefill::VramPhase;
 use std::time::Instant;
 
 /// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
@@ -35,6 +36,14 @@ impl Scheduler {
     /// the outer dispatcher already chose this phase to run, and the budget
     /// is what guarantees the other phase gets airtime.
     fn run_decode_until_budget(&mut self) {
+        // Phase-b VRAM relief: a sustained decode grows KV every step with no
+        // admission gate of its own, so relieve once at the quantum boundary when
+        // under pressure — the governor's cheapest-first ladder sheds cold turns,
+        // and the reprojection drain below handles working-set turnover. One check
+        // per quantum (not per step) keeps it cheap.
+        if self.vram_under_pressure_for(VramPhase::Decode) {
+            self.relieve_vram_pressure("decode", VramPhase::Decode);
+        }
         // Fire any reprojection queued by the just-completed prefill quantum
         // BEFORE the first decode step of this quantum. The turn's first
         // reprojection is queued in `finalise_prefill`, right after the first
@@ -107,6 +116,12 @@ impl Scheduler {
     /// budget when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
+        // One-time snapshot of the governor's budget partition (capacity C, KV
+        // floor, ladder thresholds, per-class reserved, live headroom) so a run's
+        // starting VRAM state is visible in the log before any waves.
+        if let Some(gov) = self.session.vram_governor() {
+            gov.log_budget("startup");
+        }
 
         loop {
             // 1. Drain pending submissions (non-blocking). This synchronously
@@ -119,6 +134,21 @@ impl Scheduler {
                 .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
             if !cont {
                 break; // Shutdown requested or channel closed.
+            }
+
+            // 1b. Drain any background-compression VRAM-starvation signal. A
+            // persistence hot→warm compress-to-free that couldn't allocate its
+            // quant arena leaves its turn hot-float + consistent (retried next
+            // pass) but signals the governor; escalate recovery here so that retry
+            // has room, before we admit more prefills that would tighten VRAM
+            // further. Cheap atomic swap in the common (no-starvation) case.
+            let starved = self
+                .session
+                .vram_governor()
+                .map(|g| g.take_starvation())
+                .unwrap_or(0);
+            if starved > 0 {
+                self.relieve_compression_starvation(starved);
             }
 
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
@@ -169,13 +199,18 @@ impl Scheduler {
                 self.timed_decode();
             }
 
-            // AIMD reopen: if a prior pressure episode narrowed the admission
-            // window, probe it back open by one slot per loop once VRAM is no
-            // longer under pressure — gradual recovery so we don't snap to full
-            // width and re-trip on the next wide wave. Gated on the window being
-            // closed so the steady state (window at full width) never pays the
-            // VRAM query.
-            if self.admit_window < Self::MAX_PREFILL_WIDTH && !self.vram_under_pressure() {
+            // AIMD reopen (non-ingest): if a prior pressure episode narrowed the
+            // admission window, probe it back open by one slot per loop once VRAM
+            // is no longer under pressure — gradual recovery so we don't snap to
+            // full width and re-trip on the next wide wave. Gated on the window
+            // being closed so the steady state never pays the VRAM query. Ingest
+            // is excluded here: its window is driven from the drain backlog at the
+            // wave cadence below (`regulate_ingest_admission`), and a per-loop
+            // reopen would fight that throttle.
+            if self.admit_window < Self::MAX_PREFILL_WIDTH
+                && self.ingest_timelines.is_empty()
+                && !self.vram_under_pressure()
+            {
                 self.grow_admit_window();
             }
 
@@ -196,6 +231,52 @@ impl Scheduler {
                     .map(|(budget, (used, _reserved))| (budget, used));
                 let backlog = self.pending_prefill_tokens();
                 self.wave_stats.flush(kv_vram, backlog);
+                // Return freed KV VRAM to the OS every wave. FIRST release
+                // now-empty arenas: compression (hot→warm) and eviction leave
+                // arenas fully free but still *reserved*, and the async pool never
+                // reclaims them on its own — so without this they pile up (~14 GiB
+                // / 871 arenas observed) and drive the driver's real free toward
+                // zero. When real free craters, a wide prefill's CONTIGUOUS
+                // transient activation peak — which the scattered pool free-list
+                // (counted in `vram_budget_available`) can't satisfy — spills to
+                // host memory, a multi-second stall the budget never saw coming.
+                // THEN trim the pool so `pool_reserved` (the card's real
+                // footprint) tracks `pool_used`. Sweeping every wave keeps real
+                // OS-free healthy; cheap and KV-preserving (only fully-empty
+                // arenas), i.e. the relief ladder's Trivial rung run ahead of the
+                // pressure instead of reactively after a forward already stalled.
+                let swept = self.session.release_empty_arenas().unwrap_or(0);
+                if swept > 0 {
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::vram_relief",
+                        arenas_swept = swept,
+                        "proactive empty-arena sweep (per-wave)"
+                    );
+                }
+                self.trim_kv_pool();
+                // Gentle-early ladder (bottom rung): demote cold, warm-backed
+                // ingest KV to RAM once `used` crosses ~50% of C — long before the
+                // near-cap footprint controllers. Ingest KV is zero-reload-cost, so
+                // shedding it first keeps a bulk repo ingest from pinning the whole
+                // corpus hot. No-op when nothing is ingesting / below the watermark.
+                self.demote_cold_ingest_if_pressured();
+                // Leading backpressure: size the ingest admission window to the
+                // hot→warm drain backlog so throughput scales down as seals outrun
+                // the drain and back up as it catches up — keeping `used` off the
+                // warm-starved climb the demote alone can't prevent under load.
+                self.regulate_ingest_admission();
+                // Footprint reclaim: defrag the fragmented reserved gap when it
+                // nears capacity (so a wide forward's transient peak can't push the
+                // card into WDDM paging), and bulk-evict resident KV only when
+                // `used` itself nears capacity. No-op (cheap stats read) when
+                // comfortably below both watermarks.
+                self.reclaim_footprint();
+                // Last resort under heavy backlog: block the wave loop on a
+                // device sync so ingest stops outrunning the drain and the
+                // primary stream empties — letting the (short, batched) hot→warm
+                // pass run uncontended. Fires only well above the throttle
+                // target; no-op otherwise.
+                self.sync_if_backlog_critical();
             }
         }
 
@@ -227,5 +308,79 @@ impl Scheduler {
         self.run_section_ingest_until_budget();
         self.wave_stats
             .add_phase(WavePhase::Section, t.elapsed().as_millis() as u64);
+    }
+
+    /// Trim the CUDA pool's reserved-but-free fragmentation back to the OS,
+    /// keeping a slack floor of `pool_used + TRIM_SLACK` reserved so the next
+    /// allocations reuse pool memory instead of re-hitting the OS.
+    ///
+    /// Keeps `pool_reserved` (the card's physical footprint) tracking
+    /// `pool_used` (what [`vram_budget_available`] measures), so the budget
+    /// never under-reads the true occupancy and lets KV oversubscribe VRAM.
+    /// No-op on non-CUDA / when the pool allocator is unavailable.
+    ///
+    /// [`vram_budget_available`]: candle_nn::kv_cache::vram_budget_available
+    pub(super) fn trim_kv_pool(&self) {
+        let Some((used, reserved)) = self.session.vram_pool_stats() else {
+            return;
+        };
+        let mib = |b: usize| b / (1024 * 1024);
+        // Slack floor of ready blocks retained so a single wave's seal/realloc
+        // churn reuses pool memory rather than re-allocating from the OS every
+        // trim. Default 2 GiB; override with `CANDLE_KV_POOL_TRIM_SLACK_MB`.
+        let slack = std::env::var("CANDLE_KV_POOL_TRIM_SLACK_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024);
+        let keep = used.saturating_add(slack);
+        // Diagnostic: surface the pool's true physical footprint every wave so we
+        // can watch `reserved` track (or diverge from) `used` — the number the
+        // VRAM budget can't see. Once per ~2 s, so cheap.
+        tracing::debug!(
+            "kv-pool: used={}MiB reserved={}MiB gap={}MiB keep={}MiB",
+            mib(used),
+            mib(reserved),
+            mib(reserved.saturating_sub(used)),
+            mib(keep),
+        );
+        // Split the resident GPU arenas into float (the live decode/prefill
+        // working set + not-yet-compressed completed turns — reusable, and what
+        // the compress-to-free rung shrinks) vs quant (sealed attended-over
+        // context, held). Its own line: these are GidPool arena-slab bytes, NOT a
+        // partition of the CUDA-pool `gap` above (that also holds segment slack
+        // the GidPool never sees). Watch `float` fall across a pressure episode
+        // to confirm compress is bringing quantization forward.
+        if let Some(fs) = self.session.kv_gpu_format_stats() {
+            tracing::debug!(
+                "kv-pool fmt: float={}arenas/{}MiB (live {}MiB) quant={}arenas/{}MiB (live {}MiB)",
+                fs.float_arenas,
+                mib(fs.float_reserved_bytes),
+                mib(fs.float_live_bytes),
+                fs.quant_arenas,
+                mib(fs.quant_reserved_bytes),
+                mib(fs.quant_live_bytes),
+            );
+        }
+        // Nothing to reclaim if the pool is already within the slack floor.
+        if reserved <= keep {
+            return;
+        }
+        // Best-effort return of whole free segments to the OS. The pool usually
+        // can't release much — freed chunks are scattered inside partially-used
+        // segments — but that reserved-but-free memory is REUSABLE by new KV with
+        // no new OS allocation, and `vram_budget_available` now counts it, so a
+        // large `gap` is not a problem to chase. No sync here (it reclaimed 0
+        // anyway; the memory is fragmented, not merely pending-free).
+        if let Some((before, after)) = self.session.trim_kv_pool(keep) {
+            let freed = before.saturating_sub(after);
+            tracing::debug!(
+                "trimmed KV pool: reserved {}MiB -> {}MiB (freed {}MiB, kept used {}MiB + slack)",
+                mib(before),
+                mib(after),
+                mib(freed),
+                mib(used),
+            );
+        }
     }
 }

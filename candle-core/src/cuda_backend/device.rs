@@ -364,6 +364,36 @@ impl CudaDevice {
         }
         Ok(value as usize)
     }
+
+    /// Release reserved-but-free pool memory back to the OS, keeping at least
+    /// `keep_bytes` reserved. Wraps `cuMemPoolTrimTo` on the default async pool.
+    ///
+    /// cudarc allocates via `cuMemAllocAsync`, whose pool only returns freed
+    /// blocks to the OS when the stream goes idle — which never happens under
+    /// continuous inference. So `pool_reserved` (the physical footprint) climbs
+    /// to its fragmentation high-water mark and stays there, oversubscribing the
+    /// card while `pool_used` (what the VRAM budget measures) reads far lower.
+    /// An explicit trim releases that fragmentation immediately, so
+    /// `pool_reserved` tracks `pool_used` and the budget stays physically
+    /// accurate. `keep_bytes` leaves a slack floor of ready blocks so the very
+    /// next allocation reuses pool memory instead of re-hitting the OS.
+    ///
+    /// Only trims memory nothing is using — never touches live allocations.
+    /// Errors if the device doesn't use the async pool allocator (callers treat
+    /// that as "trim unavailable" and skip).
+    pub fn trim_pool(&self, keep_bytes: usize) -> Result<()> {
+        use cudarc::driver::sys;
+        self.context.bind_to_thread().w()?;
+        let dev = self.context.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, dev)
+                .result()
+                .w()?;
+            sys::cuMemPoolTrimTo(pool, keep_bytes).result().w()?;
+        }
+        Ok(())
+    }
 }
 
 impl BackendDevice for CudaDevice {

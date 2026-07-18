@@ -2323,6 +2323,14 @@ impl ZendSession {
     /// somehow not under the workspace. This is the form persisted in the
     /// upload event — a portable, workspace-relative reference, not an
     /// absolute host path.
+    /// Path of the daemon's rolling tracing log (`<workspace>/.substrate/zend.log`),
+    /// the source the `/v1/telemetry` endpoint tail-parses for the live dashboard.
+    /// The file name mirrors `log_file::LOG_NAME` (that module lives in the binary
+    /// crate, so it can't be referenced from here).
+    pub fn tracing_log_path(&self) -> PathBuf {
+        self.config.workspace.join(SUBSTRATE_DIR).join("zend.log")
+    }
+
     pub fn workspace_relative(&self, path: &std::path::Path) -> String {
         path.strip_prefix(&self.config.workspace)
             .ok()

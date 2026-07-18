@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zend · substrate</title>
+<link rel="icon" href="favicon.svg">
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#111820; --line:#1e2a37; --line2:#28384a;
+    --ink:#e6edf3; --ink-dim:#8aa0b4; --ink-faint:#5b7186; --accent:#38bdf8;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,"Roboto Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  /* Dark-native like the main app; light/vivid come from the same CSS filter the
+     app applies (see the theme script below), driven by the `zend.theme` dropdown. */
+  html{background:var(--bg)}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}
+  .card{max-width:560px;width:100%;background:var(--panel);border:1px solid var(--line);
+    border-radius:16px;padding:34px 32px 28px;text-align:center}
+  .badge{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--accent);
+    border:1px solid var(--line2);border-radius:999px;padding:5px 12px;margin-bottom:18px}
+  .glyph{width:56px;height:56px;margin:0 auto 16px;color:var(--accent);opacity:.9}
+  h1{font-size:22px;font-weight:650;letter-spacing:-.01em;margin:0 0 8px}
+  p{color:var(--ink-dim);font-size:14.5px;line-height:1.65;margin:0 auto 22px;max-width:44ch}
+  .plan{text-align:left;display:grid;gap:9px;margin:0 auto 26px;max-width:400px}
+  .plan .row{display:flex;gap:11px;align-items:flex-start;font-size:13.5px;color:var(--ink-dim)}
+  .plan .row b{color:var(--ink);font-weight:600}
+  .plan .dot{flex-shrink:0;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-top:7px;opacity:.7}
+  .back{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12.5px;
+    color:var(--ink-dim);text-decoration:none;border:1px solid var(--line2);border-radius:9px;padding:8px 14px}
+  .back:hover{color:var(--ink);border-color:var(--accent)}
+  .foot{margin-top:20px;color:var(--ink-faint);font-family:var(--mono);font-size:11px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">&#9679; coming soon</div>
+    <svg class="glyph" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+      <path d="M24 5 43 14 24 23 5 14 24 5Z"/>
+      <path d="M5 24 24 33 43 24" opacity=".7"/>
+      <path d="M5 34 24 43 43 34" opacity=".45"/>
+    </svg>
+    <h1>Substrate inspector</h1>
+    <p>A window into the conversation substrate itself &mdash; the on-disk persistence
+       layer behind every turn. Not built yet; this page is the placeholder we'll grow into it.</p>
+    <div class="plan">
+      <div class="row"><span class="dot"></span><span><b>Redo log</b> &mdash; live view of <code>.substrate/substrate.log</code>: records, dead-byte counter, compaction state.</span></div>
+      <div class="row"><span class="dot"></span><span><b>KV tiers</b> &mdash; hot / warm / cold residency per turn, and the migrations moving between them.</span></div>
+      <div class="row"><span class="dot"></span><span><b>Provenance</b> &mdash; the sig &rarr; event &rarr; turn chains a query resolves through at retrieval time.</span></div>
+    </div>
+    <a class="back" href="/" onclick="if(history.length>1){history.back();return false;}">&larr; back</a>
+    <div class="foot">zend substrate &middot; /substrate.html</div>
+  </div>
+  <script>
+    // Respect the main app's theme dropdown: it is dark-native and applies a CSS
+    // filter for light/vivid (stored in `zend.theme`). Mirror that exact filter.
+    try {
+      var t = localStorage.getItem('zend.theme') || 'dark';
+      document.documentElement.style.filter =
+        t === 'light' ? 'invert(1) hue-rotate(180deg)'
+        : t === 'vivid' ? 'saturate(1.75) contrast(1.06)'
+        : 'none';
+    } catch (e) {}
+  </script>
+</body>
+</html>

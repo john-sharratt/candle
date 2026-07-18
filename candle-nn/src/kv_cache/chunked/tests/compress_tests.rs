@@ -21,7 +21,11 @@ use half::f16;
 
 use crate::kv_cache::arena_table::ArenaLocation;
 use crate::kv_cache::chunked::{ChunkedKvBacking, CompressionPolicy};
-use crate::kv_cache::{quantize_sealed_in_place, KvFormat, SealedSequence};
+use crate::kv_cache::{
+    convert_deferred_descs, quantize_layers_deferred, quantize_sealed_in_place,
+    quantize_sealed_in_place_deferred, KvFormat,
+    SealedSequence,
+};
 
 const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 128;
@@ -190,6 +194,263 @@ fn quantize_to_cpu_batches_two_sequences() {
     assert_eq!(out[1].token_count, seq_b.token_count);
     assert_eq!(out[0].location, ArenaLocation::Gpu);
     assert_eq!(out[1].location, ArenaLocation::Gpu);
+}
+
+/// A/B: the cross-layer **deferred** path (`quantize_sealed_in_place_deferred`
+/// per layer + one `convert_deferred_descs`) must produce warm KV whose raw
+/// quantized bytes are **bit-identical** to the **immediate** per-layer path
+/// (`quantize_sealed_in_place`). Both paths run the same deterministic selection;
+/// the only difference is that the deferred path batches every layer's convert
+/// into one launch. Each layer's warm sequence is injected into a fresh slot and
+/// its per-chunk raw K/V bytes are read back for a byte-for-byte compare — the
+/// strongest possible functional-equivalence check for the persist-pass rewire.
+#[test]
+fn quantize_layers_deferred_matches_immediate_bytes() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let copy_stream = cuda_stream(&device);
+    let n_layers = 3usize;
+    let n_tokens = 96usize; // 3 full 32-token chunks → all go through the convert
+
+    // Quantize `n_layers` fresh backings (identical per-layer inputs), then read
+    // each layer's warm chunk raw bytes back. `deferred=false` converts each layer
+    // immediately; `deferred=true` accumulates all layers' descriptors and runs a
+    // single batched convert.
+    let run = |deferred: bool| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
+        let mut items: Vec<(ChunkedKvBacking, SealedSequence)> = Vec::new();
+        for layer in 0..n_layers {
+            let backing = cuda_backing_with_policy(&device, &policy);
+            let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 1) * 1000);
+            let mut pinned: Option<PinnedBuf> = None;
+            let warm = if deferred {
+                quantize_sealed_in_place_deferred(
+                    &backing,
+                    &[&src],
+                    &policy,
+                    &device,
+                    &copy_stream,
+                    &mut pinned,
+                    &mut descs,
+                )
+            } else {
+                quantize_sealed_in_place(
+                    &backing,
+                    &[&src],
+                    &policy,
+                    &device,
+                    &copy_stream,
+                    &mut pinned,
+                )
+            }
+            .expect("quantize");
+            items.push((backing, warm.into_iter().next().expect("one sequence")));
+        }
+        if deferred {
+            // ONE batched convert across every layer's descriptors.
+            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device).expect("batched convert");
+        }
+        device.synchronize().unwrap();
+
+        // Read each layer's warm chunk raw K/V bytes back.
+        let mut out = Vec::with_capacity(n_layers);
+        for (backing, warm) in items {
+            let n_chunks = warm.chunks.len();
+            let slot = backing.alloc_sequence().unwrap();
+            backing.inject_sealed_at_tail(slot, &warm).expect("inject warm");
+            let mut layer_bytes = Vec::with_capacity(n_chunks);
+            for blk in 0..n_chunks {
+                layer_bytes.push(backing.read_raw_sealed_chunk(slot, blk).expect("read raw chunk"));
+            }
+            out.push(layer_bytes);
+        }
+        out
+    };
+
+    let bytes_immediate = run(false);
+    let bytes_deferred = run(true);
+    assert_eq!(
+        bytes_immediate, bytes_deferred,
+        "deferred cross-layer batched convert produced different quant bytes than the immediate per-layer path"
+    );
+}
+
+/// A/B: the cross-layer batched *selection* (`quantize_layers_deferred` — ONE
+/// fused selection kernel + ONE readback across every layer, via the unified
+/// per-head table with per-layer `arena_idx` offsets) must produce
+/// **bit-identical** quantized bytes vs running the per-layer selection
+/// (`quantize_sealed_in_place_deferred`) on each layer. Both defer the convert
+/// and run the *same* batched convert, so only the selection differs: a bug in
+/// the unified-table arena offset or the per-layer row split would pick
+/// different formats/scales/maps and diverge the bytes here.
+#[test]
+fn quantize_layers_selection_batched_matches_per_layer_bytes() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let copy_stream = cuda_stream(&device);
+    let n_layers = 4usize;
+    let n_tokens = 96usize; // 3 full 32-token chunks per layer
+
+    let run = |cross_layer: bool| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
+        let mut backings: Vec<ChunkedKvBacking> = Vec::new();
+        let mut srcs: Vec<SealedSequence> = Vec::new();
+        for layer in 0..n_layers {
+            let backing = cuda_backing_with_policy(&device, &policy);
+            let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 1) * 1000);
+            backings.push(backing);
+            srcs.push(src);
+        }
+        let mut pinned: Option<PinnedBuf> = None;
+        let warms: Vec<SealedSequence> = if cross_layer {
+            let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+            let per_layer: Vec<Vec<&SealedSequence>> = srcs.iter().map(|s| vec![s]).collect();
+            quantize_layers_deferred(
+                &backing_refs,
+                &per_layer,
+                &policy,
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &mut descs,
+                &mut 0u64,
+                &mut 0u64,
+            )
+            .expect("cross-layer quantize")
+            .into_iter()
+            .map(|mut layer| layer.pop().expect("one sequence per layer"))
+            .collect()
+        } else {
+            let mut ws = Vec::with_capacity(n_layers);
+            for (backing, src) in backings.iter().zip(&srcs) {
+                let w = quantize_sealed_in_place_deferred(
+                    backing,
+                    &[src],
+                    &policy,
+                    &device,
+                    &copy_stream,
+                    &mut pinned,
+                    &mut descs,
+                )
+                .expect("per-layer quantize");
+                ws.push(w.into_iter().next().expect("one sequence"));
+            }
+            ws
+        };
+        // ONE batched convert across every layer's descriptors — identical for
+        // both paths, so the compare isolates the selection.
+        convert_deferred_descs(&backings[0], &descs, N_KV_HEAD, &device).expect("batched convert");
+        device.synchronize().unwrap();
+
+        let mut out = Vec::with_capacity(n_layers);
+        for (backing, warm) in backings.iter().zip(&warms) {
+            let n_chunks = warm.chunks.len();
+            let slot = backing.alloc_sequence().unwrap();
+            backing.inject_sealed_at_tail(slot, warm).expect("inject warm");
+            let mut layer_bytes = Vec::with_capacity(n_chunks);
+            for blk in 0..n_chunks {
+                layer_bytes
+                    .push(backing.read_raw_sealed_chunk(slot, blk).expect("read raw chunk"));
+            }
+            out.push(layer_bytes);
+        }
+        out
+    };
+
+    let per_layer = run(false);
+    let cross_layer = run(true);
+    assert_eq!(
+        per_layer, cross_layer,
+        "cross-layer batched selection produced different quant bytes than per-layer selection"
+    );
+}
+
+/// A/B: the cross-layer batched DtoH (`migrate_sealed_layers_to_cpu_batch` — one
+/// gather + one DtoH + one sync for every layer) must move **bit-identical**
+/// bytes vs. the per-layer migrate. Both paths are pushed through the *same*
+/// elevate-back-to-GPU + read pipeline, so any quirk of the read/elevate cancels
+/// and only the migrate differs: an offset-bookkeeping bug in the shared staging
+/// blob would make a layer's warm bytes diverge and fail this.
+#[test]
+fn migrate_layers_batched_matches_per_layer_bytes() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let copy_stream = cuda_stream(&device);
+    let n_layers = 3usize;
+    let n_tokens = 64usize; // 2 full chunks
+
+    // Quantize `n_layers` fresh backings → GPU quant sequences (the migrate src).
+    let mut backings: Vec<ChunkedKvBacking> = Vec::new();
+    let mut gpu_seqs: Vec<SealedSequence> = Vec::new();
+    for layer in 0..n_layers {
+        let backing = cuda_backing_with_policy(&device, &policy);
+        let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 1) * 500);
+        let mut pinned: Option<PinnedBuf> = None;
+        let warm =
+            quantize_sealed_in_place(&backing, &[&src], &policy, &device, &copy_stream, &mut pinned)
+                .expect("quantize");
+        gpu_seqs.push(warm.into_iter().next().expect("one sequence"));
+        backings.push(backing);
+    }
+
+    // Read a GPU sequence's raw per-chunk bytes (inject into a fresh slot).
+    let read_bytes = |backing: &ChunkedKvBacking, seq: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let n = seq.chunks.len();
+        let slot = backing.alloc_sequence().unwrap();
+        backing.inject_sealed_at_tail(slot, seq).expect("inject");
+        (0..n)
+            .map(|blk| backing.read_raw_sealed_chunk(slot, blk).expect("read raw"))
+            .collect()
+    };
+    // Warm CPU seq → elevate back to GPU → read: canonical bytes for comparison.
+    let warm_to_bytes = |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut pin: Option<PinnedBuf> = None;
+        let round = backing
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
+            .expect("elevate warm → gpu");
+        device.synchronize().unwrap();
+        read_bytes(backing, &round[0])
+    };
+
+    // Path A — per-layer migrate.
+    let bytes_a: Vec<_> = (0..n_layers)
+        .map(|l| {
+            let mut pin: Option<PinnedBuf> = None;
+            let warm = backings[l]
+                .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pin, &[&gpu_seqs[l]])
+                .expect("per-layer migrate");
+            device.synchronize().unwrap();
+            warm_to_bytes(&backings[l], &warm[0])
+        })
+        .collect();
+
+    // Path B — ONE batched cross-layer migrate.
+    let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+    let per_layer_refs: Vec<Vec<&SealedSequence>> = gpu_seqs.iter().map(|s| vec![s]).collect();
+    let mut pinned: Option<PinnedBuf> = None;
+    let warm_b = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch(
+        &backing_refs,
+        &device,
+        &copy_stream,
+        &mut pinned,
+        &per_layer_refs,
+    )
+    .expect("batched cross-layer migrate");
+    device.synchronize().unwrap();
+    let bytes_b: Vec<_> = (0..n_layers)
+        .map(|l| warm_to_bytes(&backings[l], &warm_b[l][0]))
+        .collect();
+
+    assert_eq!(
+        bytes_a, bytes_b,
+        "batched cross-layer migrate produced different warm bytes than the per-layer path"
+    );
 }
 
 /// An empty input list is a clean no-op.

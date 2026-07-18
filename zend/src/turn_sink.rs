@@ -17,6 +17,22 @@
 
 use candle_conversation::{ScopeTurn, Sequence};
 
+/// The dialect role boundaries the code-read layer splices into a scope's
+/// assistant string to reconstruct the full tool-exchange alternation
+/// `user(excerpt) → assistant(<tool_call>) → user(<tool_response>) →
+/// assistant(close)`. A tool response returns in a *user* turn (Hermes/Qwen
+/// convention), and the exchange is closed by an assistant turn so the sequence
+/// never ends hanging on a user turn (which would collide with the next turn's
+/// user opener).
+pub struct ToolExchangeBoundaries {
+    /// Closes the assistant `<tool_call>` and opens the user `<tool_response>`:
+    /// `assistant_end` + `user_start`.
+    pub call_to_response: String,
+    /// Closes the user `<tool_response>` and opens the closing assistant
+    /// segment: `user_end` + `assistant_start`.
+    pub response_to_close: String,
+}
+
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
 pub trait InsertTurnSink {
@@ -78,6 +94,20 @@ pub trait InsertTurnSink {
                 Ok(tokens)
             })
             .collect()
+    }
+
+    /// The two dialect role boundaries a prefilled code-read tool exchange
+    /// splices in, so a scope reconstructs as the full
+    /// `user → assistant → user → assistant` alternation rather than one blob.
+    /// See [`ToolExchangeBoundaries`].
+    ///
+    /// Default is the ChatML form (the daemon's dialect), so model-less sinks
+    /// still produce a structurally valid turn.
+    fn tool_exchange_boundaries(&self) -> ToolExchangeBoundaries {
+        ToolExchangeBoundaries {
+            call_to_response: "<|im_end|>\n<|im_start|>user\n".to_string(),
+            response_to_close: "<|im_end|>\n<|im_start|>assistant\n".to_string(),
+        }
     }
 
     /// Restart-resume cache probe: whether some conversation in the
@@ -176,6 +206,16 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             "insert_prefill_turns_parallel: returned",
         );
         result
+    }
+
+    fn tool_exchange_boundaries(&self) -> ToolExchangeBoundaries {
+        // Pull the real markers from the live dialect rather than assuming
+        // ChatML, so the boundaries match the model's chat template exactly.
+        let g = self.inner.glue_markers();
+        ToolExchangeBoundaries {
+            call_to_response: format!("{}{}", g.assistant_end, g.user_start),
+            response_to_close: format!("{}{}", g.user_end, g.assistant_start),
+        }
     }
 
     fn unit_cached(&self, key: &str, value: &str) -> bool {

@@ -1,15 +1,27 @@
 # KV Tier Migration & Persistence — VRAM ↔ RAM ↔ NVMe
 
-> **Status — Design v7, ready to build.** Specifies the full three-tier
-> KV-cache storage path: the clean-slate VRAM↔RAM migration kernels, the
-> RAM warm tier, and the append-only NVMe redo log of content-addressed
-> streams — a **complete, self-contained substrate image** (§5.7). The
-> persistence layer is a mandatory, generalized module in
+> **Status — Design v7; BUILT (2026-07), with two divergences.** Specifies the
+> full three-tier KV-cache storage path: the clean-slate VRAM↔RAM migration
+> kernels, the RAM warm tier, and the append-only NVMe redo log of
+> content-addressed streams — a **complete, self-contained substrate image**
+> (§5.7). The persistence layer is a mandatory, generalized module in
 > `candle-conversation` (§13); it replaces the existing ad-hoc
 > `migrate_to_cpu` warm path and retires the redundant `store.rs` /
 > `provenance/` persistence (§7). §16 is the executable, nine-phase
 > implementation plan — **every feature is in scope; nothing is deferred,
 > stubbed, or left as a `TODO`.**
+>
+> **What actually shipped vs. this design** (verified 2026-07-17): the
+> `kv_pack`/`kv_unpack` migration kernel, the hot→warm→cold pipeline
+> (`persistence/thread.rs`, `elevate.rs`), the redo log + skip-load + recovery +
+> compaction, and warm-backed eviction (`evict_hot_to_free`) are all **built and
+> live**. **Two deliberate divergences remain from the target shape:** (1) the
+> warm tier lives in **pageable CPU arenas**, not the pinned host-buffer pool of
+> §10 — `warm_pool.rs` was never created, so warm↔hot DtoH/HtoD runs at ~½ PCIe
+> bandwidth; (2) the hot→warm copy runs on the **primary CUDA stream**, not the
+> dedicated overlap copy stream of §11 (a correctness-motivated choice to avoid
+> shared-state races — see `persistence/thread.rs`). Both are the remaining
+> performance work; the tier is functional without them.
 
 ---
 

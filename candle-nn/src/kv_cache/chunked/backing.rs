@@ -17,8 +17,11 @@ use candle::{DType, Device, Result, Tensor};
 
 use super::{
     Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    LiveChunkRef, SealedChunk, StoragePolicy,
+    GpuArenaFormatStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
+// Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
+#[cfg(feature = "cuda")]
+use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaLocation, PerHeadEntry};
 use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo};
 use crate::{arena_gid_stride, CHUNK_SIZE};
@@ -304,14 +307,27 @@ impl BackingInner {
     /// dropped (auto-returned to the pool) and the batch carries on without
     /// them.  The only unrecoverable path is a successful GPU copy followed by
     /// a remap failure, which would leave host and device state diverged.
-    pub(crate) fn defragment_arenas(&self, fragmentation_threshold: f32) -> Result<usize> {
+    ///
+    /// `max_moves` bounds how many chunk relocations one call performs (whole
+    /// arenas are always fully drained, so the bound is honoured at the arena
+    /// boundary). A bounded call defrags the emptiest arenas first and stops —
+    /// the caller escalates the budget across relief rungs so a large fragmented
+    /// gap consolidates over several bounded passes instead of one long blocking
+    /// compaction. `usize::MAX` = unbounded (the allocation-time OOM path). Logs a
+    /// per-phase timing breakdown (build / GPU copy / remap) so a slow compaction
+    /// is attributable.
+    pub(crate) fn defragment_arenas(
+        &self,
+        fragmentation_threshold: f32,
+        max_moves: usize,
+    ) -> Result<usize> {
         if !self.pool.needs_defragmentation(fragmentation_threshold) {
             return Ok(0);
         }
 
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = fragmentation_threshold;
+            let _ = (fragmentation_threshold, max_moves);
             return Ok(0);
         }
 
@@ -320,6 +336,7 @@ impl BackingInner {
             let Device::Cuda(cuda_dev) = &self.device else {
                 return Ok(0);
             };
+            let t_build = std::time::Instant::now();
 
             // Phase 1 — build the full move batch across all keys.
             //
@@ -347,7 +364,7 @@ impl BackingInner {
                     Some(span)
                 };
 
-                for key in self.pool.format_keys() {
+                'build: for key in self.pool.format_keys() {
                     if self.pool.defragmentable_ratio_for(&key) <= fragmentation_threshold {
                         continue;
                     }
@@ -437,15 +454,24 @@ impl BackingInner {
                         {
                             remap.insert(src_raw, dst_gid.clone());
                         }
+
+                        // Budget honoured at the arena boundary — this arena is
+                        // fully drained, so stopping here leaves a clean state.
+                        if all_moves.len() >= max_moves {
+                            break 'build;
+                        }
                     }
                 }
             })?;
 
+            let build_ms = t_build.elapsed().as_millis() as u64;
             if all_moves.is_empty() {
                 return Ok(0);
             }
+            let n_moves = all_moves.len();
 
             // Phase 2 — one lock, one GPU copy, one sync, one remap.
+            let t_copy = std::time::Instant::now();
             let state_arcs = self.registered_states();
             let mut locked_states: Vec<RwLockWriteGuard<'_, BlockTableState>> =
                 Vec::with_capacity(state_arcs.len());
@@ -476,15 +502,27 @@ impl BackingInner {
             {
                 return Ok(0);
             }
+            let copy_ms = t_copy.elapsed().as_millis() as u64;
 
             // Replaced source ChunkGids are dropped by set_block_gids,
             // auto-returning them to the pool and emptying the drained arenas.
             // After this point GPU data has moved; a remap failure would leave
             // host references stale — propagate it upward.
+            let t_remap = std::time::Instant::now();
             if let Err(e) = Self::apply_gid_remap(&mut locked_states, &remap) {
                 return Err(e);
             }
             self.pool.resync_counters();
+            let remap_ms = t_remap.elapsed().as_millis() as u64;
+            tracing::debug!(
+                target: "candle_nn::kv_cache::compact",
+                moves = n_moves,
+                bounded = max_moves != usize::MAX,
+                build_ms,
+                copy_ms,
+                remap_ms,
+                "arena defragment"
+            );
             Ok(remap.len())
         }
     }
@@ -492,7 +530,7 @@ impl BackingInner {
     /// Compact arenas by first pack-down defragmenting when worthwhile, then
     /// tombstoning any empty middle arenas and truncating unused tails.
     pub(crate) fn compact_arenas(&self) -> Result<usize> {
-        let _ = self.defragment_arenas(DEFAULT_DEFRAG_THRESHOLD)?;
+        let _ = self.defragment_arenas(DEFAULT_DEFRAG_THRESHOLD, usize::MAX)?;
         self.release_empty_arenas()
     }
 
@@ -501,7 +539,7 @@ impl BackingInner {
     /// OOM path ([`request_global_compact`]) where reclaiming any arena beats
     /// leaving it resident.
     pub(crate) fn compact_arenas_forced(&self) -> Result<usize> {
-        let _ = self.defragment_arenas(0.0)?;
+        let _ = self.defragment_arenas(0.0, usize::MAX)?;
         self.release_empty_arenas()
     }
 }
@@ -846,7 +884,9 @@ impl ChunkedKvBacking {
     /// Defragment and compact the backing when the reclaimable-arena ratio for
     /// any key exceeds `fragmentation_threshold`.
     pub fn defragment(&self, fragmentation_threshold: f32) -> Result<usize> {
-        let _ = self.inner.defragment_arenas(fragmentation_threshold)?;
+        let _ = self
+            .inner
+            .defragment_arenas(fragmentation_threshold, usize::MAX)?;
         self.inner.release_empty_arenas()
     }
 
@@ -862,6 +902,16 @@ impl ChunkedKvBacking {
     /// waiting for the steady-state fragmentation threshold.
     pub fn compact_forced(&self) -> Result<usize> {
         self.inner.compact_arenas_forced()
+    }
+
+    /// Bounded forced defragment: relocate at most `max_moves` chunks (whole
+    /// arenas drained, so honoured at the arena boundary), consolidating the
+    /// emptiest arenas first. Returns the number of chunks moved so a caller can
+    /// thread a budget across layers / relief rungs. Does NOT release the emptied
+    /// arenas — the caller pairs this with `release_empty_arenas` (so a bounded
+    /// pass + release is one escalating step). See `defragment_arenas`.
+    pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
+        self.inner.defragment_arenas(0.0, max_moves)
     }
 
     /// Release any fully-empty arenas back to the pool **without** the
@@ -1314,6 +1364,24 @@ impl BackingInner {
     /// When per-head quantization is active and different heads use different
     /// arenas, the GID scan automatically covers all referenced arenas.
     pub fn per_head_table_sync(&self) -> Result<Tensor> {
+        let (data, num_arenas) = self.per_head_table_host()?;
+        if num_arenas == 0 {
+            return Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, &self.device);
+        }
+        Tensor::from_vec(
+            data,
+            (num_arenas * self.n_kv_head, PerHeadEntry::COLS),
+            &self.device,
+        )
+    }
+
+    /// Host-side build of the per-head arena table: the flat `i64` row data
+    /// (`arena_idx * n_kv_head + head`, each `PerHeadEntry::COLS` wide) plus the
+    /// arena count. Exposed so the cross-layer persist selection can concatenate
+    /// every layer's table into ONE device upload — with per-layer `arena_idx`
+    /// offsets applied to the gids — instead of building and syncing 48 separate
+    /// tables. `num_arenas == 0` ⇒ `(empty, 0)`.
+    pub fn per_head_table_host(&self) -> Result<(Vec<i64>, usize)> {
         // ⚠️  CP3 COLLAPSE POINT — READ docs/kv_cache_unification.md §7.6, §11.4 FIRST  ⚠️
         //
         // With palette4, this table uses N_PALETTE=4 sub-entries per (arena, head) row.
@@ -1332,7 +1400,6 @@ impl BackingInner {
         let n_kv_head = self.n_kv_head;
         let chunk_size = CHUNK_SIZE;
         let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
-        let device = &self.device;
 
         // Size the table to cover every arena in storage, not just those
         // referenced by live slots. The kernel indexes the table as
@@ -1359,7 +1426,7 @@ impl BackingInner {
             .read(|s| s.arenas().keys().max().copied().map(|m| m + 1).unwrap_or(0))?;
 
         if num_arenas == 0 {
-            return Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, device);
+            return Ok((Vec::new(), 0));
         }
 
         self.storage.read(|s| {
@@ -1415,7 +1482,7 @@ impl BackingInner {
                 }
             }
 
-            Tensor::from_vec(data, (num_arenas * n_kv_head, PerHeadEntry::COLS), device)
+            Ok((data, num_arenas))
         })?
     }
 
@@ -1505,6 +1572,20 @@ impl ChunkedKvBacking {
         self.inner.resolve_arena_info()
     }
 
+    /// Like [`Self::resolve_arena_info`] but only resolves the device pointers
+    /// for the arenas in `needed`, leaving the rest at the zero default. The
+    /// return is still a dense `arena_idx`-indexed Vec, so callers index it the
+    /// same way — they just must only read the arenas they asked for. The
+    /// per-arena `to_arena_entry` pointer resolve is the pass's dominant `other`
+    /// cost at pressure (O(num_arenas)); a reassemble only touches the handful of
+    /// dst arenas it just allocated, so this collapses it to O(touched).
+    pub fn resolve_arena_info_for(
+        &self,
+        needed: &std::collections::HashSet<usize>,
+    ) -> Result<Vec<ResolvedArenaInfo>> {
+        self.inner.resolve_arena_info_for(needed)
+    }
+
     /// Get the number of arenas in backing storage.
     pub fn arena_count(&self) -> Result<usize> {
         self.inner.storage.arena_count()
@@ -1530,6 +1611,43 @@ impl ChunkedKvBacking {
                 .count();
             (quantized, total)
         })
+    }
+
+    /// GPU arena occupancy split float vs quant across the pool this backing
+    /// shares (arenas are pooled globally across layers with the same head
+    /// config, so one backing's view is the whole model's). Feeds the per-wave
+    /// `kv-pool` diagnostic that validates the compress-to-free rung shrinks the
+    /// float side. See [`GpuArenaFormatStats`].
+    pub fn gpu_arena_format_stats(&self) -> GpuArenaFormatStats {
+        self.inner.pool.gpu_format_stats()
+    }
+
+    /// True when at least one of `seq`'s chunks is still wholly in a GPU float /
+    /// R16 source arena — i.e. `quantize_sealed_in_place` would do real kernel
+    /// work on this sequence rather than pass it through unchanged.
+    ///
+    /// Mirrors the per-chunk eligibility test in `compress.rs`: a chunk is
+    /// compressible when every one of its `(h, p)` source GIDs lives in a GPU
+    /// `Float` or `Quantized(R16)` arena. Used by the scheduler's compress-to-
+    /// free relief rung to skip turns whose hot is already quantized (a prior
+    /// relief pass, or the persistence thread, beat it to them), so an
+    /// undrained `snapshot_pending_warm` backlog doesn't re-walk finished turns.
+    #[cfg(feature = "cuda")]
+    pub fn sealed_has_compressible_chunk(&self, seq: &SealedSequence) -> bool {
+        self.inner
+            .storage
+            .read(|storage| {
+                seq.chunks.iter().any(|chunk| {
+                    chunk.gids.as_slice().iter().all(|gid| {
+                        matches!(
+                            storage.arena_key(gid.arena_idx()),
+                            Some(k) if k.location == ArenaLocation::Gpu
+                                && super::chunk_ops::needs_reconcile_source_format(k.format)
+                        )
+                    })
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Calculate the percentage of a sequence's tokens that are stored in quantized arenas.

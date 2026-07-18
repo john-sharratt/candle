@@ -375,6 +375,28 @@ impl TurnLayout {
         Self { segments }
     }
 
+    /// Replace the trailing single `Assistant` segment with a pre-tiled run of
+    /// sub-segments — used when the assistant half is itself a multi-part tool
+    /// exchange (`Assistant(<tool_call>) → ImEnd → UserStart → User(<tool_response>)
+    /// → ImEnd → AssistantStart → Assistant(confirmation)`) rather than one body.
+    /// The caller supplies segments whose spans already tile the replaced
+    /// `Assistant` span exactly (offsets absolute, contiguous); `validate_tiling`
+    /// still guards the result. No-op if there is no assistant segment.
+    pub fn with_assistant_split(mut self, subsegments: Vec<TurnSegment>) -> Self {
+        if subsegments.is_empty() {
+            return self;
+        }
+        let Some(pos) = self
+            .segments
+            .iter()
+            .rposition(|s| matches!(s, TurnSegment::Assistant { .. }))
+        else {
+            return self;
+        };
+        self.segments.splice(pos..=pos, subsegments);
+        self
+    }
+
     /// Split the trailing assistant segment into a leading reasoning block + the
     /// answer.  `think_len` tokens of `<think>…</think>` sit at the start of the
     /// assistant body; `thinking_text` is its prose.  `ethereal = true` drops the
@@ -700,6 +722,38 @@ mod tests {
         assert_eq!(layout.thinking_text(), Some("<think>r</think>"));
         assert_eq!(layout.assistant_content_start(), 8); // thinking span offset
         assert_eq!(layout.assistant_span(), KvSpan::new(13, 7));
+    }
+
+    /// A code_read tool-exchange turn: the single trailing `Assistant` span is
+    /// replaced by the real `Assistant → ImEnd → UserStart → User → ImEnd →
+    /// AssistantStart → Assistant` run, and the result still tiles the grid.
+    #[test]
+    fn assistant_split_tiles_tool_exchange() {
+        // Base: user[0,3) im_end[3,5) a_start[5,8) assistant[8,24).
+        let layout = TurnLayout::from_flat_grid(
+            0, 3, 8, 24, 2, 3, "excerpt".into(), Some("call…resp…ack".into()), true,
+        );
+        assert_eq!(layout.assistant_span(), KvSpan::new(8, 16));
+        // Sub-segments tiling [8,24): tc[8,10) im_end[10,12) us[12,15) tr[15,18)
+        // im_end[18,20) as[20,23) ack[23,24).
+        let subs = vec![
+            TurnSegment::Assistant { text: Some("<tool_call>".into()), kv: KvSpan::new(8, 2) },
+            TurnSegment::Glue { marker: GlueKind::ImEnd, kv: Some(KvSpan::new(10, 2)) },
+            TurnSegment::Glue { marker: GlueKind::UserStart, kv: Some(KvSpan::new(12, 3)) },
+            TurnSegment::User { text: "<tool_response>".into(), kv: KvSpan::new(15, 3) },
+            TurnSegment::Glue { marker: GlueKind::ImEnd, kv: Some(KvSpan::new(18, 2)) },
+            TurnSegment::Glue { marker: GlueKind::AssistantStart, kv: Some(KvSpan::new(20, 3)) },
+            TurnSegment::Assistant { text: Some("Read …".into()), kv: KvSpan::new(23, 1) },
+        ];
+        let layout = layout.with_assistant_split(subs);
+        assert_eq!(layout.validate_tiling(24), Ok(()));
+        // Two user segments (header + tool response) and two assistant segments
+        // (tool call + confirmation).
+        let users = layout.segments.iter().filter(|s| matches!(s, TurnSegment::User { .. })).count();
+        let assts = layout.segments.iter().filter(|s| matches!(s, TurnSegment::Assistant { .. })).count();
+        assert_eq!((users, assts), (2, 2));
+        // Assistant content still begins at the first assistant body (tool call).
+        assert_eq!(layout.assistant_content_start(), 8);
     }
 
     /// A gap between real segments is rejected.
