@@ -1784,6 +1784,23 @@ impl Conversation {
         self.maintenance.lock().unwrap().clone()
     }
 
+    /// Non-blocking snapshot of the redo log's dead-byte ratio — superseded
+    /// last-writer-wins records plus tombstoned-stream bytes over total record
+    /// bytes, the same measure the auto-compaction trigger polls. `try_lock`s
+    /// the persistence layer so a read endpoint (the substrate viewer) never
+    /// stalls behind a compaction holding it across I/O; returns `None` when the
+    /// lock is momentarily contended rather than blocking.
+    pub fn dead_ratio(&self) -> Option<f32> {
+        // Lock order MUST be `inner` then `persistence` — the same order the
+        // write path takes (see `with_persistence_scan` below) — or a viewer
+        // poll holding `persistence` while waiting on `inner` would deadlock a
+        // seal holding `inner` while waiting on `persistence`. `try_lock` on
+        // persistence keeps this non-blocking against an in-flight compaction.
+        let substrate = self.inner.read().unwrap();
+        let persistence = self.persistence.try_lock().ok()?;
+        Some(persistence.dead_ratio(&substrate))
+    }
+
     /// Run `f` against the persistence layer's current manifest snapshot.
     /// Read-only accessor for callers that need to inspect the redo
     /// log's stream/chunk locations (sizes, formats, offsets) without

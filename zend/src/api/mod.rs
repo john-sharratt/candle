@@ -16,6 +16,7 @@ pub mod conversations;
 pub mod files;
 pub mod models;
 pub mod status;
+pub mod substrate;
 pub mod telemetry;
 pub mod ws_logs;
 
@@ -55,6 +56,11 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
         .route("/v1/telemetry", get(telemetry::telemetry))
+        .route("/v1/substrate", get(substrate::overview))
+        .route("/v1/substrate/system-prompt", get(substrate::system_prompt))
+        .route("/v1/substrate/tools", get(substrate::tools))
+        .route("/v1/substrate/layer/:name", get(substrate::layer))
+        .route("/v1/substrate/timeline/:tl", get(substrate::timeline))
         .route("/v1/debug/maintenance", post(status::force_maintenance))
         .route("/v1/conversations", get(conversations::list))
         .route(
