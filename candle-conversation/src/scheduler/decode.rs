@@ -1130,6 +1130,10 @@ impl Scheduler {
         // The batched gap-fill forward time — for the wave it's shared across all
         // slots, so each view's reproject log reports the same `glue_ms`.
         let glue_ms = t_fire.elapsed().as_millis() as u64;
+        super::REPROJ_GLUE_US.fetch_add(
+            t_fire.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Phase 3 — complete each view: finish (deferred user + restore tail) +
         // carve the new view + re-key. Independent per view.

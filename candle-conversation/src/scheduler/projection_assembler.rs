@@ -424,7 +424,9 @@ pub(super) fn apply_segments(
     new_segments: &[ProjectionSegment],
 ) -> Result<(), ConversationError> {
     let plan = apply_segments_build(&mut ctx, new_segments)?;
+    let t_glue = std::time::Instant::now();
     fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan])?;
+    super::drain_add_us(&super::DRAIN_GLUE_US, t_glue.elapsed().as_micros() as u64);
     apply_segments_finish(state, &mut ctx, plan)
 }
 
@@ -483,7 +485,9 @@ pub(super) fn apply_segments_build(
                 reserve_glue_island(ctx, &mut walker, tokens, fwd)?;
             }
             AssembledPiece::Section(id) => {
+                let t = std::time::Instant::now();
                 inject_sealed_section(ctx, &mut walker, *id)?;
+                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
             }
             AssembledPiece::Turn {
                 group,
@@ -491,7 +495,9 @@ pub(super) fn apply_segments_build(
                 role,
                 timeline,
             } => {
+                let t = std::time::Instant::now();
                 inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
+                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
             }
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens.clone());
@@ -501,7 +507,9 @@ pub(super) fn apply_segments_build(
                 index,
                 timeline,
             } => {
+                let t = std::time::Instant::now();
                 inject_sealed_turn_half(ctx, &mut walker, *timeline, *group, *index)?;
+                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
             }
         }
     }
@@ -964,6 +972,12 @@ fn handle_new_user_message(
 /// `max_prefill_pass_tokens`, writing their K/V into the slot's writer tail.
 fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
+    // Drain-path prefill accounting: this forward runs during a submission drain
+    // (the newly-ingested turn's content) AND during reproject (re-prefilling the
+    // in-flight user message); `drain_add_us` only counts the former. The tokens go
+    // to `DRAIN_PREFILL_TOKENS` so the Prefill phase can reclaim them from the
+    // otherwise-token-less projection band.
+    let t_fwd = std::time::Instant::now();
     let mut offset = 0;
     while offset < tokens.len() {
         let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_pass_tokens);
@@ -983,6 +997,8 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
             .map_err(ConversationError::Model)?;
         offset += chunk_len;
     }
+    super::drain_add_us(&super::DRAIN_PREFILL_US, t_fwd.elapsed().as_micros() as u64);
+    super::drain_add_us(&super::DRAIN_PREFILL_TOKENS, tokens.len() as u64);
     Ok(())
 }
 

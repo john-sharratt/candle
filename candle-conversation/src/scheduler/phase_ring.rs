@@ -36,9 +36,17 @@ pub enum PhaseKind {
     Eviction,
     /// Slot promote + KV-pool trim/reclaim (allocation churn).
     Allocation,
-    /// Wall-clock the scheduler thread spent blocked off-thread (persistence
-    /// flush wait, lock contention) — the window remainder not in any phase.
+    /// Wall-clock the scheduler thread spent blocked off-thread DURING active work
+    /// (persistence flush wait, device sync, lock contention, flush-block
+    /// housekeeping) — the window remainder after idle is carved out.
     Blocked,
+    /// Wall-clock the loop spent waiting on `rx.recv()` with no work to run — idle
+    /// between requests, distinct from [`PhaseKind::Blocked`].
+    Idle,
+    /// Deliberate GPU/persistence wait — `device.synchronize()` draining the GPU
+    /// queue + `flush_blocking` waiting on the hot→warm drain. The backpressure
+    /// stall, distinct from Idle (no work) and Blocked (unattributed remainder).
+    Sync,
 }
 
 impl PhaseKind {
@@ -52,6 +60,8 @@ impl PhaseKind {
             PhaseKind::Eviction => "eviction",
             PhaseKind::Allocation => "allocation",
             PhaseKind::Blocked => "blocked",
+            PhaseKind::Idle => "idle",
+            PhaseKind::Sync => "sync",
         }
     }
 }
@@ -160,7 +170,8 @@ pub fn snapshot() -> Vec<PhaseSnapshot> {
 // log and no `-v`.
 
 /// One wave's headline numbers: VRAM budget/used, prefill backlog, tokens fed,
-/// mean forward time, the wall-clock window, and the resident-arena format split.
+/// mean forward time, the wall-clock window, the resident-arena format split, and
+/// the whole-card VRAM decomposition (pool reserved + driver total/free). All MiB.
 #[derive(Clone, Copy)]
 pub struct WaveSample {
     at: Instant,
@@ -176,6 +187,30 @@ pub struct WaveSample {
     pub quant_arenas: u32,
     pub quant_mib: u64,
     pub quant_live_mib: u64,
+    /// KV pool reserved footprint (MiB) — quant + float + slack/fragmentation.
+    pub reserved_mib: u64,
+    /// Driver total / free VRAM (MiB, `cuMemGetInfo`) for the whole-card decomp.
+    pub total_mib: u64,
+    pub free_mib: u64,
+    /// Projection decomposition (ms). `pdrain` = submission drain MINUS the prefill
+    /// re-attributed to the Prefill phase, decomposed into `drain_elevate`
+    /// (sealed-prefix inject / warm→hot) + `drain_glue` (submit gap-fill) + drain
+    /// "other" remainder. `reproj` total decomposes into `scan` (provenance
+    /// re-selection) + `reproj_glue` (gap-fill) + `layout` (view project+swap) +
+    /// reproject "other".
+    pub pdrain_ms: u64,
+    pub drain_elevate_ms: u64,
+    pub drain_glue_ms: u64,
+    pub reproj_ms: u64,
+    pub reproj_scan_ms: u64,
+    pub reproj_glue_ms: u64,
+    pub reproj_layout_ms: u64,
+    /// Active-work counts at the wave: resident conversations (`slots`) and the
+    /// decode / prefill / section-ingest sequence widths.
+    pub slots: u32,
+    pub decodes: u32,
+    pub prefills: u32,
+    pub sections: u32,
 }
 
 /// One hot→warm migration pass's timing + volume (persistence thread).
@@ -269,7 +304,10 @@ pub fn snapshot_migrates() -> Vec<MigrateSnapshot> {
         .collect()
 }
 
-/// Constructor used by the scheduler — `at` is stamped in [`push_wave`].
+/// Constructor used by the scheduler — `at` is stamped in [`push_wave`]. `vram` is
+/// `(reserved, total, free)` MiB, `proj` is `(pdrain, drain_elevate, drain_glue,
+/// reproj, scan, reproj_glue, layout)` ms, `slots` is `(slots, decodes, prefills,
+/// sections)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wave_sample(
     ws_ms: u32,
@@ -279,8 +317,22 @@ pub(crate) fn wave_sample(
     used_mib: u64,
     backlog: u64,
     fmt: Option<(u32, u64, u64, u32, u64, u64)>,
+    vram: (u64, u64, u64),
+    proj: (u64, u64, u64, u64, u64, u64, u64),
+    slots: (u32, u32, u32, u32),
 ) -> WaveSample {
     let (fa, fm, fl, qa, qm, ql) = fmt.unwrap_or((0, 0, 0, 0, 0, 0));
+    let (reserved_mib, total_mib, free_mib) = vram;
+    let (
+        pdrain_ms,
+        drain_elevate_ms,
+        drain_glue_ms,
+        reproj_ms,
+        reproj_scan_ms,
+        reproj_glue_ms,
+        reproj_layout_ms,
+    ) = proj;
+    let (slots, decodes, prefills, sections) = slots;
     WaveSample {
         at: Instant::now(),
         ws_ms,
@@ -295,6 +347,20 @@ pub(crate) fn wave_sample(
         quant_arenas: qa,
         quant_mib: qm,
         quant_live_mib: ql,
+        reserved_mib,
+        total_mib,
+        free_mib,
+        pdrain_ms,
+        drain_elevate_ms,
+        drain_glue_ms,
+        reproj_ms,
+        reproj_scan_ms,
+        reproj_glue_ms,
+        reproj_layout_ms,
+        slots,
+        decodes,
+        prefills,
+        sections,
     }
 }
 
@@ -373,12 +439,25 @@ mod tests {
             58000,
             123,
             Some((70, 1120, 1001, 467, 7472, 3360)),
+            (9000, 65536, 20000),
+            (12, 3, 4, 34, 5, 6, 7),
+            (48, 8, 2, 40),
         ));
         let w = snapshot_waves();
         let s = &w.last().unwrap().sample;
         assert_eq!((s.ws_ms, s.fwd_ms, s.tok), (2000, 74, 96));
         assert_eq!((s.budget_mib, s.used_mib, s.backlog), (14000, 58000, 123));
         assert_eq!((s.quant_arenas, s.quant_live_mib), (467, 3360));
+        assert_eq!(
+            (s.reserved_mib, s.total_mib, s.free_mib),
+            (9000, 65536, 20000)
+        );
+        assert_eq!(
+            (s.pdrain_ms, s.drain_elevate_ms, s.drain_glue_ms),
+            (12, 3, 4)
+        );
+        assert_eq!((s.reproj_ms, s.reproj_glue_ms), (34, 6));
+        assert_eq!((s.slots, s.decodes, s.sections), (48, 8, 40));
         assert!(w.last().unwrap().age_s >= 0.0);
 
         push_migrate(migrate_sample(308, 2314, 77540, 72352, 5151, 77782));

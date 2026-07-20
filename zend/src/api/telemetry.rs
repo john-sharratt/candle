@@ -36,6 +36,28 @@ struct Wave {
     budget: f64,
     used: f64,
     backlog: f64,
+    // Whole-card VRAM decomposition (MiB): KV-pool reserved, driver total, free,
+    // and the KV quant/float reserved split (so the decomp chart reads from one
+    // series).
+    res: f64,
+    tot: f64,
+    free: f64,
+    qkv: f64,
+    fkv: f64,
+    // Projection decomposition (ms): pdrain (drain minus re-attributed prefill) +
+    // drain elevate/glue; reproject total + scan/glue/layout.
+    pdrain: f64,
+    delev: f64,
+    dglue: f64,
+    reproj: f64,
+    scan: f64,
+    rglue: f64,
+    layout: f64,
+    // Active-work counts: resident conversations + decode/prefill/section widths.
+    slots: f64,
+    dec: f64,
+    pre: f64,
+    sec: f64,
 }
 #[derive(Serialize, Clone)]
 struct Fmt {
@@ -155,6 +177,22 @@ fn build_body() -> Telemetry {
                 budget: s.budget_mib as f64,
                 used: s.used_mib as f64,
                 backlog: s.backlog as f64,
+                res: s.reserved_mib as f64,
+                tot: s.total_mib as f64,
+                free: s.free_mib as f64,
+                qkv: s.quant_mib as f64,
+                fkv: s.float_mib as f64,
+                pdrain: s.pdrain_ms as f64,
+                delev: s.drain_elevate_ms as f64,
+                dglue: s.drain_glue_ms as f64,
+                reproj: s.reproj_ms as f64,
+                scan: s.reproj_scan_ms as f64,
+                rglue: s.reproj_glue_ms as f64,
+                layout: s.reproj_layout_ms as f64,
+                slots: s.slots as f64,
+                dec: s.decodes as f64,
+                pre: s.prefills as f64,
+                sec: s.sections as f64,
             }
         })
         .collect();

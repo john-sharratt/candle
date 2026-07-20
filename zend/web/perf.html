@@ -32,7 +32,8 @@
        reads at a glance. */
     --ph-decode:#34d399; --ph-prefill:#38bdf8; --ph-section:#818cf8;
     --ph-projection:#c084fc; --ph-sealing:#fbbf24; --ph-eviction:#f87171; --ph-allocation:#94a3b8;
-    --ph-blocked:#475569;
+    --ph-blocked:#ec4899; --ph-idle:#334155; --ph-sync:#e11d48;
+    --weights:#fb923c; --slack:#64748b; --freevram:#1f2a37;
     --ok:#34d399; --warn:#fbbf24; --crit:#f87171;
     --mono:ui-monospace,"SF Mono","Cascadia Code","Cascadia Mono",Consolas,"Roboto Mono",monospace;
     --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -155,37 +156,26 @@
   <div class="grid">
     <div class="card wide">
       <h3>Phase timeline &mdash; last 2 minutes</h3>
-      <div class="cap">Where the scheduler's wall-clock goes over time, newest on the <b>right</b> (0m). Each bar is one wave: its <b>width its duration</b>, its height the <b>time in each phase</b> stacked &mdash; so a tall <span style="color:var(--ph-projection)">projection</span> or <span style="color:var(--ph-sealing)">sealing</span> segment is time <i>not</i> spent generating. Watch the flip between small-batch <span style="color:var(--ph-decode)">decode</span> and large-batch <span style="color:var(--ph-prefill)">prefill</span>&thinsp;/&thinsp;<span style="color:var(--ph-section)">section</span>. Hover for tokens, tok/s and sequences per phase.</div>
+      <div class="cap">Where the scheduler's wall-clock goes over time, newest on the <b>right</b> (0m). Each bar is one wave: its <b>width its duration</b>, its height the <b>time in each phase</b> stacked &mdash; so a tall <span style="color:var(--ph-projection)">projection</span>, <span style="color:var(--ph-sync)">sync</span> or <span style="color:var(--ph-idle)">idle</span> segment is time <i>not</i> spent generating. Watch the flip between small-batch <span style="color:var(--ph-decode)">decode</span> and large-batch <span style="color:var(--ph-prefill)">prefill</span>&thinsp;/&thinsp;<span style="color:var(--ph-section)">section</span>. Hover for tokens, tok/s and sequences per phase.</div>
       <div class="legend" id="phlegend"></div>
       <canvas id="c_phbar" height="230"></canvas>
     </div>
 
-    <div class="card wide">
-      <h3>Phase throughput &mdash; last 60 minutes</h3>
-      <div class="cap">Per-phase <b>tokens/sec</b> over the last hour (newest on the right). Two scales: the <b>left axis</b> is the large-batch phases (<span style="color:var(--ph-prefill)">prefill</span>&thinsp;/&thinsp;<span style="color:var(--ph-section)">section</span>), the <b>right axis</b> is <span style="color:var(--ph-decode)">decode</span> &mdash; so single-sequence decode gets its own full-resolution scale instead of flat-lining under prefill. Hover for the per-phase rates.</div>
-      <div class="legend">
-        <span style="color:var(--ph-decode)"><i style="background:var(--ph-decode)"></i>decode &mdash; right axis</span>
-        <span style="color:var(--ph-prefill)"><i style="background:var(--ph-prefill)"></i>prefill &mdash; left axis</span>
-        <span style="color:var(--ph-section)"><i style="background:var(--ph-section)"></i>section &mdash; left axis</span>
-      </div>
-      <canvas id="c_phline" height="210"></canvas>
-    </div>
-
-    <div class="card wide">
-      <h3>VRAM pressure</h3>
-      <div class="cap">Pool <span style="color:var(--vram)">used</span> vs <span style="color:var(--budget)">budget</span>, over the run. Dashed red = the 64 GiB level that wedged the previous (pre-fix) run.</div>
-      <div class="legend">
-        <span style="color:var(--vram)"><i style="background:var(--vram)"></i>used</span>
-        <span style="color:var(--budget)"><i class="dash" style="color:var(--budget)"></i>budget</span>
-        <span style="color:var(--crit)"><i class="dash" style="color:var(--crit)"></i>64 GiB crash line</span>
-      </div>
-      <canvas id="c_vram" height="230"></canvas>
-    </div>
-
-    <div class="card wide">
+    <div class="card">
       <h3>Token throughput</h3>
-      <div class="cap">End-to-end tokens processed per second (<span style="color:var(--tps)">tok&nbsp;total &divide; wave&nbsp;wall-time</span>). Falls as the migration drain steals the shared stream from prefill under pressure.</div>
+      <div class="cap">End-to-end tokens/sec (<span style="color:var(--tps)">tok &divide; wave wall-time</span>), per-minute. Falls as the migration drain steals the shared stream from prefill under pressure.</div>
       <canvas id="c_tokrate" height="200"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Phase throughput &mdash; last 60 minutes</h3>
+      <div class="cap">Per-phase <b>tokens/sec</b>, per-minute (newest on the right). Two scales: <b>left</b> = large-batch (<span style="color:var(--ph-prefill)">prefill</span>&thinsp;/&thinsp;<span style="color:var(--ph-section)">section</span>), <b>right</b> = <span style="color:var(--ph-decode)">decode</span>, so single-sequence decode gets its own full-resolution scale instead of flat-lining under prefill.</div>
+      <div class="legend">
+        <span style="color:var(--ph-decode)"><i style="background:var(--ph-decode)"></i>decode &mdash; right</span>
+        <span style="color:var(--ph-prefill)"><i style="background:var(--ph-prefill)"></i>prefill &mdash; left</span>
+        <span style="color:var(--ph-section)"><i style="background:var(--ph-section)"></i>section &mdash; left</span>
+      </div>
+      <canvas id="c_phline" height="200"></canvas>
     </div>
 
     <div class="card">
@@ -200,16 +190,6 @@
       <canvas id="c_wave" height="190"></canvas>
     </div>
 
-    <div class="card wide">
-      <h3>Migration drain &mdash; the load-bearing metric</h3>
-      <div class="cap"><span style="color:var(--mig)">Bytes moved</span> per hot&rarr;warm pass and its <span style="color:var(--migms)">wall time</span>. Each pass chunks into &le;512 MiB staging batches; watch the wall time climb as the resident corpus grows.</div>
-      <div class="legend">
-        <span style="color:var(--mig)"><i style="background:var(--mig)"></i>pass size (MiB)</span>
-        <span style="color:var(--migms)"><i style="background:var(--migms)"></i>pass wall time (s)</span>
-      </div>
-      <canvas id="c_mig" height="220"></canvas>
-    </div>
-
     <div class="card">
       <h3>Resident KV</h3>
       <div class="cap">Live GPU arena bytes by format (GiB). Quant grows as sealed turns compress in place.</div>
@@ -218,6 +198,66 @@
         <span style="color:var(--float)"><i style="background:var(--float)"></i>float</span>
       </div>
       <canvas id="c_arenas" height="190"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>VRAM decomposition</h3>
+      <div class="cap">Whole-card VRAM over time (GiB), stacked to the driver total. <span style="color:var(--quant)">KV quant</span> + <span style="color:var(--float)">KV float</span> are the pool's reserved KV; <span style="color:var(--slack)">slack</span> is reserved-but-free pool fragmentation; <span style="color:var(--weights)">weights + runtime</span> is everything resident outside the KV pool (weights, scratch, CUDA context); the rest is <span style="color:var(--ink-faint)">free</span>. Weights and scratch aren't separately instrumented, so they share one band.</div>
+      <div class="legend">
+        <span style="color:var(--quant)"><i style="background:var(--quant)"></i>KV quant</span>
+        <span style="color:var(--float)"><i style="background:var(--float)"></i>KV float</span>
+        <span style="color:var(--slack)"><i style="background:var(--slack)"></i>slack</span>
+        <span style="color:var(--weights)"><i style="background:var(--weights)"></i>weights + runtime</span>
+        <span style="color:var(--ink-faint)"><i style="background:var(--freevram)"></i>free</span>
+      </div>
+      <canvas id="c_vramdecomp" height="190"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>VRAM pressure</h3>
+      <div class="cap">Pool <span style="color:var(--vram)">used</span> vs <span style="color:var(--budget)">budget</span> (GiB), per-minute. Dashed red = the 64 GiB level that wedged the previous (pre-fix) run.</div>
+      <div class="legend">
+        <span style="color:var(--vram)"><i style="background:var(--vram)"></i>used</span>
+        <span style="color:var(--budget)"><i class="dash" style="color:var(--budget)"></i>budget</span>
+        <span style="color:var(--crit)"><i class="dash" style="color:var(--crit)"></i>64 GiB line</span>
+      </div>
+      <canvas id="c_vram" height="200"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Migration drain</h3>
+      <div class="cap"><span style="color:var(--mig)">Bytes moved</span> per hot&rarr;warm pass and its <span style="color:var(--migms)">wall time</span>. Each pass chunks into &le;512 MiB staging batches; watch the wall time climb as the resident corpus grows.</div>
+      <div class="legend">
+        <span style="color:var(--mig)"><i style="background:var(--mig)"></i>pass (MiB)</span>
+        <span style="color:var(--migms)"><i style="background:var(--migms)"></i>wall (s)</span>
+      </div>
+      <canvas id="c_mig" height="200"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Projection decomposition</h3>
+      <div class="cap">What projection spends its time on (ms/wave, per-minute), stacked. Warm bands are submission <b>drain</b>: <span style="color:var(--weights)">elevate</span> (warm&rarr;hot context lift), <span style="color:var(--ph-sealing)">d-glue</span> (submit gap-fill). Cool bands are <b>reproject</b>: <span style="color:var(--ph-projection)">scan</span> (provenance re-selection), <span style="color:var(--ph-section)">r-glue</span>, <span style="color:var(--float)">layout</span> (view project+swap). The turn-content prefill is re-attributed to the Prefill phase, so this is pure projection overhead.</div>
+      <div class="legend">
+        <span style="color:var(--weights)"><i style="background:var(--weights)"></i>elevate</span>
+        <span style="color:var(--ph-sealing)"><i style="background:var(--ph-sealing)"></i>d-glue</span>
+        <span style="color:var(--ph-projection)"><i style="background:var(--ph-projection)"></i>scan</span>
+        <span style="color:var(--ph-section)"><i style="background:var(--ph-section)"></i>r-glue</span>
+        <span style="color:var(--float)"><i style="background:var(--float)"></i>layout</span>
+        <span style="color:var(--ink-faint)"><i style="background:var(--ink-faint)"></i>other</span>
+      </div>
+      <canvas id="c_projdecomp" height="190"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Active conversations &amp; slots</h3>
+      <div class="cap">Concurrency over time (per-minute). <span style="color:var(--float)">slots</span> = resident conversations; <span style="color:var(--ph-decode)">decode</span> / <span style="color:var(--ph-prefill)">prefill</span> / <span style="color:var(--ph-section)">section</span> are the active sequence widths feeding each wave.</div>
+      <div class="legend">
+        <span style="color:var(--float)"><i style="background:var(--float)"></i>slots</span>
+        <span style="color:var(--ph-decode)"><i style="background:var(--ph-decode)"></i>decode</span>
+        <span style="color:var(--ph-prefill)"><i style="background:var(--ph-prefill)"></i>prefill</span>
+        <span style="color:var(--ph-section)"><i style="background:var(--ph-section)"></i>section</span>
+      </div>
+      <canvas id="c_slots" height="190"></canvas>
     </div>
 
   </div>
@@ -230,9 +270,32 @@
 // ===== live telemetry: fetch /v1/telemetry, poll, render =====
 let DATA = {waves:[],fmt:[],migrate:[],host:{free_gib:0,total_gib:0},has_pressure:false};
 let PHDATA = {points:[]};             // /v1/phases — the in-process phase ring
-let W=[],FM=[],MG=[],PG=[];
+let W=[],FM=[],MG=[],PG=[],W1=[],FM1=[],PLM=[]; // *1/PLM = per-minute aggregates
 let TNOW=0;                           // global elapsed-seconds "now" (right edge = 0m ago)
 const CAP_MIN=240;                    // every generic graph is capped to this window
+const DS=2;                           // downsample factor — fewer, wider points to hover
+// Keep every DS-th sample, anchored at the NEWEST (last) so 0m stays populated.
+function decimate(arr,f){
+  if(f<=1||arr.length<=2) return arr;
+  const out=[];
+  for(let i=arr.length-1;i>=0;i-=f) out.unshift(arr[i]);
+  return out;
+}
+// Aggregate to one point per minute (average every numeric field), anchoring each
+// bucket's `t` to its newest sample. Coarser + far easier to read/hover.
+function perMinute(arr){
+  if(arr.length<2) return arr;
+  const buckets=new Map();
+  for(const x of arr){ const m=Math.floor(x.t/60); let b=buckets.get(m); if(!b){b=[]; buckets.set(m,b);} b.push(x); }
+  const out=[];
+  for(const grp of buckets.values()){
+    const o={};
+    for(const k in grp[0]) o[k]= typeof grp[0][k]==='number' ? grp.reduce((a,x)=>a+(x[k]||0),0)/grp.length : grp[0][k];
+    o.t=Math.max(...grp.map(x=>x.t));
+    out.push(o);
+  }
+  return out.sort((a,b)=>a.t-b.t);
+}
 // Group the flat phase points into wave-windows: every phase of one wave shares
 // that wave's `age`, so bucketing by age reconstructs the window with its phases.
 // Oldest first (drawn left → right, newest = 0m on the right).
@@ -248,12 +311,30 @@ function groupPhases(points){
   }
   return [...byAge.values()].sort((a,b)=>b.age-a.age);
 }
+// Pre-aggregate the 60-min phase throughput into per-minute buckets ONCE per
+// refresh (was rebuilt on every hover redraw — the main perf sink). Each bucket
+// sums tokens + active-ms per inference phase, so the plotted rate is the minute's
+// true tok/s.
+function phaseLineMinutes(pg){
+  const byMin=new Map();
+  for(const w of pg){ if(w.age>3600) continue; const m=Math.floor(w.age/60);
+    let b=byMin.get(m); if(!b){b={age:m*60, ph:{}}; byMin.set(m,b);}
+    for(const k of ['decode','prefill','section']){ const p=w.ph[k]; if(!p) continue;
+      let e=b.ph[k]; if(!e){e={tok:0,dur:0,seq:0}; b.ph[k]=e;}
+      e.tok+=p.tok; e.dur+=p.dur; e.seq=Math.max(e.seq,p.seq); } }
+  return [...byMin.values()].sort((a,b)=>a.age-b.age);
+}
 function apply(){
   const raw={W:DATA.waves||[],FM:DATA.fmt||[],MG:DATA.migrate||[]};
   TNOW=Math.max(0,...Object.values(raw).filter(a=>a.length).map(a=>a[a.length-1].t));
   const cap=a=>a.filter(x=>x.t>=TNOW-CAP_MIN*60);
-  W=cap(raw.W); FM=cap(raw.FM); MG=cap(raw.MG);
+  // Halve the dense per-wave series (W, FM) for easier hover; migration is sparse
+  // (one point per drain pass), so leave it at full resolution.
+  W=decimate(cap(raw.W),DS); FM=decimate(cap(raw.FM),DS);
+  MG=perMinute(cap(raw.MG));  // per-minute — migration passes are noisy at full res
+  W1=perMinute(cap(raw.W)); FM1=perMinute(cap(raw.FM)); // per-minute panels (+perf)
   PG=groupPhases(PHDATA.points||[]);
+  PLM=phaseLineMinutes(PG);   // pre-aggregate the 60-min phase throughput (perf)
 }
 const ageStr=t=>((TNOW-t)/60).toFixed(1)+'m ago';
 
@@ -268,6 +349,10 @@ const gib = m => (m/1024);
 // scroll-jump bug). The logical height is captured ONCE into a data-attribute:
 // drawChart overwrites the height *attribute* with the dpr-scaled backing size,
 // so re-reading it later would double the canvas every refresh.
+// Coalesce rapid redraws (hover moves, resize) into ONE draw per animation frame —
+// without this, every mousemove pixel triggered a full canvas redraw of every
+// series, the main cause of the sluggish hover.
+function schedDraw(spec){ if(spec._raf) return; spec._raf=requestAnimationFrame(()=>{ spec._raf=0; spec.draw(); }); }
 function makeChart(id, optsFn){
   const cv = document.getElementById(id); if(!cv) return null;
   const h = cv.dataset.h ? +cv.dataset.h : (cv.getAttribute('height')*1);
@@ -275,9 +360,9 @@ function makeChart(id, optsFn){
   const spec = {cv, optsFn, opts: optsFn(), h, _mx:null};
   spec.draw = ()=>drawChart(spec);
   spec.refresh = ()=>{ spec.opts = spec.optsFn(); spec.draw(); };
-  new ResizeObserver(()=>spec.draw()).observe(cv);
-  cv.onmousemove = e=>{ const r=cv.getBoundingClientRect(); spec._mx=e.clientX-r.left; spec.draw(); };
-  cv.onmouseleave = ()=>{ spec._mx=null; spec.draw(); };
+  new ResizeObserver(()=>schedDraw(spec)).observe(cv);
+  cv.onmousemove = e=>{ const r=cv.getBoundingClientRect(); spec._mx=e.clientX-r.left; schedDraw(spec); };
+  cv.onmouseleave = ()=>{ spec._mx=null; schedDraw(spec); };
   return spec;
 }
 function drawChart(spec){
@@ -349,7 +434,7 @@ function roundRect(g,x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,
 // The inference phases carry a token volume + seqs; the memory / overhead phases
 // carry bytes / counts / ms. Both hang off one wave-window record (PG entry).
 const INF=['decode','prefill','section'];                 // token-volume phases, stacked
-const MEM=['projection','sealing','eviction','allocation','blocked']; // overhead phases
+const MEM=['projection','sealing','eviction','allocation','sync','idle','blocked']; // overhead phases
 const phc=k=>cssvar('--ph-'+k);
 const tokps=p=>(p&&p.dur>0)?p.tok/(p.dur/1000):0;
 const miB=b=>b/(1024*1024);
@@ -452,33 +537,34 @@ function drawPhaseBars(spec){
 function drawPhaseLines(spec){
   const {g,cssW,cssH}=phSetup(spec);
   const maxAge=3600;
-  const wins=PG.filter(w=>w.age<=maxAge);
-  if(!wins.length){ g.fillStyle=cssvar('--ink-faint'); g.font='11px '+cssvar('--mono');
+  // Uses the per-minute aggregation computed once per refresh (`PLM`).
+  const mins=PLM;
+  if(!mins.length){ g.fillStyle=cssvar('--ink-faint'); g.font='11px '+cssvar('--mono');
     g.textAlign='center'; g.fillText('waiting for phase data…',cssW/2,cssH/2); return; }
+  const rate=e=>(e&&e.dur>0)?e.tok/(e.dur/1000):0;
   // Two scales: LEFT for the large-batch phases (prefill + section), RIGHT for
   // decode — a single seq at ~30 tok/s would be a flat line against a 3k-tok/s
-  // prefill, so decode gets its own axis and fills the resolution. `L` = phases on
-  // the left scale, `dec` on the right.
+  // prefill, so decode gets its own axis and fills the resolution.
   const L=['prefill','section'];
-  const lmax=Math.max(1,...wins.flatMap(w=>L.map(k=>tokps(w.ph[k]))))*1.08;
-  const rmax=Math.max(1,...wins.map(w=>tokps(w.ph.decode)))*1.15;
+  const lmax=Math.max(1,...mins.flatMap(w=>L.map(k=>rate(w.ph[k]))))*1.08;
+  const rmax=Math.max(1,...mins.map(w=>rate(w.ph.decode)))*1.15;
   const F=phFrame(g,cssW,cssH,maxAge,lmax,
     v=>v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(0),0,
     rmax, v=>v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(0), cssvar('--ph-decode'));
-  const line=(k,yf)=>{ const pts=wins.filter(w=>w.ph[k]).map(w=>[F.X(w.age),yf(tokps(w.ph[k]))]);
+  const line=(k,yf)=>{ const pts=mins.filter(w=>w.ph[k]).map(w=>[F.X(w.age),yf(rate(w.ph[k]))]);
     if(!pts.length) return; g.strokeStyle=phc(k); g.lineWidth=1.8; g.lineJoin='round';
     g.beginPath(); pts.forEach((p,i)=>i?g.lineTo(p[0],p[1]):g.moveTo(p[0],p[1])); g.stroke();
-    g.fillStyle=phc(k); pts.forEach(p=>{ g.beginPath(); g.arc(p[0],p[1],1.5,0,7); g.fill(); }); };
+    g.fillStyle=phc(k); pts.forEach(p=>{ g.beginPath(); g.arc(p[0],p[1],2,0,7); g.fill(); }); };
   L.forEach(k=>line(k,F.Y));            // prefill/section on the left scale
   line('decode',F.Y2);                   // decode on the right scale
   if(spec._mx!=null){
-    let idx=-1,best=1e9; wins.forEach((w,i)=>{ const d=Math.abs(F.X(w.age)-spec._mx); if(d<best){best=d;idx=i;} });
-    if(idx>=0 && best<10){ const w=wins[idx], hx=F.X(w.age);
+    let idx=-1,best=1e9; mins.forEach((w,i)=>{ const d=Math.abs(F.X(w.age)-spec._mx); if(d<best){best=d;idx=i;} });
+    if(idx>=0 && best<12){ const w=mins[idx], hx=F.X(w.age);
       g.strokeStyle=cssvar('--line2'); g.lineWidth=1; g.beginPath(); g.moveTo(hx,F.padT); g.lineTo(hx,F.y0); g.stroke();
-      const rows=[{t:(w.age/60).toFixed(1)+'m ago'}];
+      const rows=[{t:(w.age/60).toFixed(0)+'m ago'}];
       INF.forEach(k=>{ const p=w.ph[k]; if(!p) return; const yf=(k==='decode')?F.Y2:F.Y;
-        rows.push({t:k.padEnd(9)+fmtN(tokps(p))+' tok/s · '+p.seq+' seq',c:phc(k)});
-        g.fillStyle=phc(k); g.beginPath(); g.arc(hx,yf(tokps(p)),3,0,7); g.fill(); });
+        rows.push({t:k.padEnd(9)+fmtN(rate(p))+' tok/s · '+p.seq+' seq',c:phc(k)});
+        g.fillStyle=phc(k); g.beginPath(); g.arc(hx,yf(rate(p)),3,0,7); g.fill(); });
       phTip(g,cssW,rows,hx,F.padT,F.plotH);
     }
   }
@@ -489,16 +575,17 @@ function makePhaseChart(id,drawFn){
   cv.dataset.h=h; cv.style.height=h+'px';
   const spec={cv,h,_mx:null,draw:()=>drawFn(spec)};
   spec.refresh=()=>spec.draw();
-  new ResizeObserver(()=>spec.draw()).observe(cv);
-  cv.onmousemove=e=>{ const r=cv.getBoundingClientRect(); spec._mx=e.clientX-r.left; spec.draw(); };
-  cv.onmouseleave=()=>{ spec._mx=null; spec.draw(); };
+  new ResizeObserver(()=>schedDraw(spec)).observe(cv);
+  cv.onmousemove=e=>{ const r=cv.getBoundingClientRect(); spec._mx=e.clientX-r.left; schedDraw(spec); };
+  cv.onmouseleave=()=>{ spec._mx=null; schedDraw(spec); };
   return spec;
 }
 // Phase legend: the inference phases (stacked) + memory phases (strip), built once.
 function buildPhaseLegend(){
   const el=document.getElementById('phlegend'); if(!el||el.dataset.built) return; el.dataset.built='1';
   const lab={decode:'decode (small)',prefill:'prefill (large)',section:'section ingest',
-    eviction:'eviction',sealing:'sealing',projection:'projection',allocation:'allocation',blocked:'blocked (off-thread)'};
+    eviction:'eviction',sealing:'sealing',projection:'projection',allocation:'allocation',
+    sync:'sync (GPU/persist wait)',blocked:'blocked',idle:'idle'};
   el.innerHTML=[...INF,...MEM].map(k=>
     `<span style="color:var(--ph-${k})"><i style="background:var(--ph-${k})"></i>${lab[k]}</span>`).join('');
 }
@@ -515,13 +602,13 @@ function createCharts(){
     makePhaseChart('c_phbar', drawPhaseBars),
     makePhaseChart('c_phline', drawPhaseLines),
     makeChart('c_vram', ()=>({
-      xs:W.map(w=>w.t), ymax:Math.max(68,...W.map(w=>Math.max(gib(w.used),gib(w.budget))))*1.02, yFmt:v=>v.toFixed(0),
+      xs:W1.map(w=>w.t), ymax:Math.max(68,...W1.map(w=>Math.max(gib(w.used),gib(w.budget))))*1.02, yFmt:v=>v.toFixed(0),
       markers:[{y:64,color:cssvar('--crit')}],
-      series:[{data:W.map(w=>gib(w.used)),color:cssvar('--vram'),type:'area',lw:2},
-        {data:W.map(w=>gib(w.budget)),color:cssvar('--budget'),type:'line',dash:true,lw:1.4}],
-      tip:i=>[{t:ageStr(W[i].t)},{t:'used  '+gib(W[i].used).toFixed(1)+' GiB',c:cssvar('--vram')},
-        {t:'budget '+gib(W[i].budget).toFixed(1)+' GiB',c:cssvar('--budget')}]})),
-    makeChart('c_tokrate', ()=>{ const TR=W.filter(w=>w.ws>0); return {
+      series:[{data:W1.map(w=>gib(w.used)),color:cssvar('--vram'),type:'area',lw:2},
+        {data:W1.map(w=>gib(w.budget)),color:cssvar('--budget'),type:'line',dash:true,lw:1.4}],
+      tip:i=>[{t:ageStr(W1[i].t)},{t:'used  '+gib(W1[i].used).toFixed(1)+' GiB',c:cssvar('--vram')},
+        {t:'budget '+gib(W1[i].budget).toFixed(1)+' GiB',c:cssvar('--budget')}]})),
+    makeChart('c_tokrate', ()=>{ const TR=W1.filter(w=>w.ws>0); return {
       xs:TR.map(w=>w.t), yFmt:v=>v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(0),
       series:[{data:TR.map(w=>w.tok/w.ws),color:cssvar('--tps'),type:'area',lw:1.9}],
       tip:i=>[{t:ageStr(TR[i].t)},{t:fmtN(TR[i].tok/TR[i].ws)+' tok/s',c:cssvar('--tps')},
@@ -542,11 +629,65 @@ function createCharts(){
         {t:'wall  '+(MG[i].total/1000).toFixed(1)+' s',c:cssvar('--migms')},
         {t:'copy '+fmtN(MG[i].copy)+'  quant '+fmtN(MG[i].quant)}]})),
     makeChart('c_arenas', ()=>({
-      xs:FM.map(f=>f.t), yFmt:v=>v.toFixed(0),
-      series:[{data:FM.map(f=>gib(f.ql)+gib(f.fl)),color:cssvar('--float'),type:'area',baseData:FM.map(f=>gib(f.ql)),lw:1.4},
-        {data:FM.map(f=>gib(f.ql)),color:cssvar('--quant'),type:'area',lw:1.6}],
-      tip:i=>[{t:ageStr(FM[i].t)},{t:'quant '+gib(FM[i].ql).toFixed(1)+' GiB / '+FM[i].qa+' arenas',c:cssvar('--quant')},
-        {t:'float '+gib(FM[i].fl).toFixed(1)+' GiB / '+FM[i].fa+' arenas',c:cssvar('--float')}]})),
+      xs:FM1.map(f=>f.t), yFmt:v=>v.toFixed(0),
+      series:[{data:FM1.map(f=>gib(f.ql)+gib(f.fl)),color:cssvar('--float'),type:'area',baseData:FM1.map(f=>gib(f.ql)),lw:1.4},
+        {data:FM1.map(f=>gib(f.ql)),color:cssvar('--quant'),type:'area',lw:1.6}],
+      tip:i=>[{t:ageStr(FM1[i].t)},{t:'quant '+gib(FM1[i].ql).toFixed(1)+' GiB / '+Math.round(FM1[i].qa)+' arenas',c:cssvar('--quant')},
+        {t:'float '+gib(FM1[i].fl).toFixed(1)+' GiB / '+Math.round(FM1[i].fa)+' arenas',c:cssvar('--float')}]})),
+    // Whole-card VRAM stacked to the driver total. Bands are cumulative tops:
+    // quant → +float → +slack(=res) → +weights/runtime(=used_total) → +free(=total).
+    // Drawn top-band first so the small KV bands paint last (on top).
+    makeChart('c_vramdecomp', ()=>({
+      xs:W1.map(w=>w.t), ymax:Math.max(1,...W1.map(w=>gib(w.tot)))*1.02, yFmt:v=>v.toFixed(0),
+      series:[
+        {data:W1.map(w=>gib(w.tot)),color:cssvar('--freevram'),type:'area',baseData:W1.map(w=>gib(w.tot-w.free)),lw:1},
+        {data:W1.map(w=>gib(w.tot-w.free)),color:cssvar('--weights'),type:'area',baseData:W1.map(w=>gib(w.res)),lw:1},
+        {data:W1.map(w=>gib(w.res)),color:cssvar('--slack'),type:'area',baseData:W1.map(w=>gib(w.qkv+w.fkv)),lw:1},
+        {data:W1.map(w=>gib(w.qkv+w.fkv)),color:cssvar('--float'),type:'area',baseData:W1.map(w=>gib(w.qkv)),lw:1.2},
+        {data:W1.map(w=>gib(w.qkv)),color:cssvar('--quant'),type:'area',lw:1.4}],
+      tip:i=>{ const w=W1[i]; return [{t:ageStr(w.t)},
+        {t:'quant   '+gib(w.qkv).toFixed(1)+' GiB',c:cssvar('--quant')},
+        {t:'float   '+gib(w.fkv).toFixed(1)+' GiB',c:cssvar('--float')},
+        {t:'slack   '+gib(Math.max(0,w.res-w.qkv-w.fkv)).toFixed(1)+' GiB',c:cssvar('--slack')},
+        {t:'weights '+gib(Math.max(0,(w.tot-w.free)-w.res)).toFixed(1)+' GiB',c:cssvar('--weights')},
+        {t:'free    '+gib(w.free).toFixed(1)+' GiB',c:cssvar('--ink-faint')},
+        {t:'total   '+gib(w.tot).toFixed(1)+' GiB'}]; }})),
+    // Projection decomposition (per-minute avg ms/wave), stacked to pdrain+reproj.
+    // Drain bands (warm): elevate → +d-glue → +d-other(=pdrain). Reproject bands
+    // (cool): +scan → +r-glue → +layout → +r-other(=reproj). Prefill was already
+    // re-attributed OUT to the Prefill phase, so this is pure projection overhead.
+    makeChart('c_projdecomp', ()=>({
+      xs:W1.map(w=>w.t), ymax:Math.max(1,...W1.map(w=>w.pdrain+w.reproj))*1.05, yFmt:v=>v.toFixed(0),
+      series:[
+        {data:W1.map(w=>w.pdrain+w.reproj),color:cssvar('--ink-faint'),type:'area',baseData:W1.map(w=>w.pdrain+w.scan+w.rglue+w.layout),lw:1},
+        {data:W1.map(w=>w.pdrain+w.scan+w.rglue+w.layout),color:cssvar('--float'),type:'area',baseData:W1.map(w=>w.pdrain+w.scan+w.rglue),lw:1},
+        {data:W1.map(w=>w.pdrain+w.scan+w.rglue),color:cssvar('--ph-section'),type:'area',baseData:W1.map(w=>w.pdrain+w.scan),lw:1},
+        {data:W1.map(w=>w.pdrain+w.scan),color:cssvar('--ph-projection'),type:'area',baseData:W1.map(w=>w.pdrain),lw:1},
+        {data:W1.map(w=>w.pdrain),color:cssvar('--ph-allocation'),type:'area',baseData:W1.map(w=>w.delev+w.dglue),lw:1},
+        {data:W1.map(w=>w.delev+w.dglue),color:cssvar('--ph-sealing'),type:'area',baseData:W1.map(w=>w.delev),lw:1},
+        {data:W1.map(w=>w.delev),color:cssvar('--weights'),type:'area',lw:1.2}],
+      tip:i=>{ const w=W1[i], dother=Math.max(0,w.pdrain-w.delev-w.dglue), rother=Math.max(0,w.reproj-w.scan-w.rglue-w.layout); return [{t:ageStr(w.t)},
+        {t:'elevate '+fmtN(w.delev)+' ms',c:cssvar('--weights')},
+        {t:'d-glue  '+fmtN(w.dglue)+' ms',c:cssvar('--ph-sealing')},
+        {t:'d-other '+fmtN(dother)+' ms',c:cssvar('--ph-allocation')},
+        {t:'scan    '+fmtN(w.scan)+' ms',c:cssvar('--ph-projection')},
+        {t:'r-glue  '+fmtN(w.rglue)+' ms',c:cssvar('--ph-section')},
+        {t:'layout  '+fmtN(w.layout)+' ms',c:cssvar('--float')},
+        {t:'r-other '+fmtN(rother)+' ms',c:cssvar('--ink-faint')},
+        {t:'total   '+fmtN(w.pdrain+w.reproj)+' ms'}]; }})),
+    // Active conversations / slots (per-minute), lines with nodes.
+    makeChart('c_slots', ()=>({
+      xs:W1.map(w=>w.t), ymax:Math.max(1,...W1.map(w=>Math.max(w.slots,w.dec,w.pre,w.sec)))*1.12, yFmt:v=>v.toFixed(0),
+      series:[
+        {data:W1.map(w=>w.slots),color:cssvar('--float'),type:'line',lw:2},
+        {data:W1.map(w=>w.dec),color:cssvar('--ph-decode'),type:'line',lw:1.6},
+        {data:W1.map(w=>w.pre),color:cssvar('--ph-prefill'),type:'line',lw:1.6},
+        {data:W1.map(w=>w.sec),color:cssvar('--ph-section'),type:'line',lw:1.6}],
+      tip:i=>{ const w=W1[i]; return [{t:ageStr(w.t)},
+        {t:'slots   '+fmtN(w.slots),c:cssvar('--float')},
+        {t:'decode  '+fmtN(w.dec),c:cssvar('--ph-decode')},
+        {t:'prefill '+fmtN(w.pre),c:cssvar('--ph-prefill')},
+        {t:'section '+fmtN(w.sec),c:cssvar('--ph-section')}]; }})),
   ].filter(Boolean);
 }
 function redraw(){ charts.forEach(c=>c&&c.refresh()); }

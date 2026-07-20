@@ -135,7 +135,11 @@ impl Scheduler {
             // + view create) on the scheduler thread — a prime suspect for the
             // wall-clock that is NOT a forward, so time it.
             let t_drain = Instant::now();
+            // Flag the drain so the assembler's shared sub-timers (inject / prefill
+            // / gap-fill, also used by reproject) attribute to the drain buckets.
+            IN_DRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
             let cont = self.drain_submissions();
+            IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
             self.wave_stats
                 .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
             if !cont {
@@ -174,13 +178,18 @@ impl Scheduler {
                 && self.prefill_queue.is_empty()
                 && self.active_section_ingests.is_empty()
             {
-                match self.rx.recv() {
-                    Ok(req) => {
-                        if !self.handle_request(req) {
-                            break;
-                        }
-                    }
+                // Time ONLY the recv block (not the request handling) — this is the
+                // scheduler idle between requests, attributed to the Idle phase so it
+                // isn't mislabeled as Blocked in the GUI.
+                let t_idle = Instant::now();
+                let req = match self.rx.recv() {
+                    Ok(req) => req,
                     Err(_) => break, // Engine dropped.
+                };
+                self.wave_stats
+                    .add_idle(t_idle.elapsed().as_millis() as u64);
+                if !self.handle_request(req) {
+                    break;
                 }
                 continue;
             }
@@ -236,18 +245,47 @@ impl Scheduler {
                     .zip(self.session.vram_pool_stats())
                     .map(|(budget, (used, _reserved))| (budget, used));
                 let backlog = self.pending_prefill_tokens();
-                // Resident-arena format split for the instrumented arena panel.
+                // Resident-arena format split for the arena panel. `mem_get_info`
+                // returns bytes → convert to MiB here so the ring fields match
+                // their `_mib` names (and the dashboard's GiB scale).
+                let mib = |b: usize| (b >> 20) as u64;
                 let fmt = self.session.kv_gpu_format_stats().map(|fs| {
                     (
                         fs.float_arenas as u32,
-                        fs.float_reserved_bytes as u64,
-                        fs.float_live_bytes as u64,
+                        mib(fs.float_reserved_bytes),
+                        mib(fs.float_live_bytes),
                         fs.quant_arenas as u32,
-                        fs.quant_reserved_bytes as u64,
-                        fs.quant_live_bytes as u64,
+                        mib(fs.quant_reserved_bytes),
+                        mib(fs.quant_live_bytes),
                     )
                 });
-                self.wave_stats.flush(kv_vram, backlog, fmt);
+                // Whole-card VRAM decomposition: KV-pool reserved footprint +
+                // driver total/free (`cuMemGetInfo`). `0` when unavailable
+                // (non-CUDA) — the panel then shows an empty decomposition.
+                let reserved_mib = self
+                    .session
+                    .vram_pool_stats()
+                    .map(|(_, r)| mib(r))
+                    .unwrap_or(0);
+                let (total_mib, free_mib) = self
+                    .session
+                    .vram_free_total()
+                    .map(|(f, t)| (mib(t), mib(f)))
+                    .unwrap_or((0, 0));
+                // Active-work counts at this wave for the slots panel.
+                let slots = (
+                    self.slot_conversations.len() as u32,
+                    self.decode_width() as u32,
+                    self.prefill_width() as u32,
+                    self.section_ingest_width() as u32,
+                );
+                self.wave_stats.flush(
+                    kv_vram,
+                    backlog,
+                    fmt,
+                    (reserved_mib, total_mib, free_mib),
+                    slots,
+                );
                 // Return freed KV VRAM to the OS every wave. FIRST release
                 // now-empty arenas: compression (hot→warm) and eviction leave
                 // arenas fully free but still *reserved*, and the async pool never

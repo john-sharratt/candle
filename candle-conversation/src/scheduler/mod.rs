@@ -538,6 +538,67 @@ static PROV_RESOLVE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static PROV_KERNEL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROV_ASSEMBLE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Scheduler-thread time spent blocked on a deliberate GPU/persistence **wait** —
+/// `device.synchronize()` (draining the GPU queue) and `flush_blocking` (waiting
+/// on the persistence thread's hot→warm drain). Accumulated across a wave and
+/// swapped into the Sync phase in `flush`, so a multi-second stall shows as its own
+/// band instead of hiding inside decode/prefill or the opaque "blocked" remainder.
+static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reprojection sub-phase timers (µs), swapped into the projection-decomposition
+/// panel each wave: `scan` = probe-extract + belief scan (provenance re-selection),
+/// `glue` = the shared gap-fill forward (boundary-seam tokens), `layout` = view
+/// project + swap. The remainder of `reproj_ms` is "other".
+static REPROJ_SCAN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPROJ_GLUE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPROJ_LAYOUT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `true` while `drain_submissions` is running, so the projection-assembler
+/// sub-timers (which run in BOTH the drain and reproject paths) attribute their
+/// cost to the drain buckets only when it's actually a submission drain.
+static IN_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Drain (submission-projection) sub-phase timers (µs) + prefilled token count,
+/// accumulated only while [`IN_DRAIN`]: `elevate` = sealed-prefix inject / warm→hot
+/// lift, `prefill` = the turn-content forward (its tokens land in `DRAIN_PREFILL_TOKENS`
+/// and are re-attributed to the Prefill phase), `glue` = the submit-time gap-fill.
+static DRAIN_ELEVATE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAIN_PREFILL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAIN_GLUE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAIN_PREFILL_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Add `us` to a drain sub-timer, but only during a submission drain (so the
+/// shared assembler helpers don't miscount reproject-path work). Used by
+/// `projection_assembler`.
+pub(super) fn drain_add_us(atom: &std::sync::atomic::AtomicU64, us: u64) {
+    if IN_DRAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        atom.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `device.synchronize()`, timed into [`WAIT_US`]. Use at every deliberate GPU
+/// drain on the scheduler thread so the wait surfaces as the Sync phase.
+fn timed_synchronize(device: &Device) {
+    let t = Instant::now();
+    let _ = device.synchronize();
+    WAIT_US.fetch_add(
+        t.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Run a blocking wait (e.g. `flush_blocking`) and add its wall-clock to
+/// [`WAIT_US`], so a multi-second persistence stall surfaces as the Sync phase.
+fn timed_wait<T>(f: impl FnOnce() -> T) -> T {
+    let t = Instant::now();
+    let r = f();
+    WAIT_US.fetch_add(
+        t.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    r
+}
+
 #[inline]
 fn record_phase(start: Instant, phase: &'static str) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1493,6 +1554,23 @@ struct WaveStats {
     evict_bytes: u64,
     evict_count: u64,
     evict_ms: u64,
+    /// Idle phase this window: wall-clock the loop spent blocked on `rx.recv()`
+    /// with NO work to run — waiting for the next request. Carved out of the
+    /// window remainder so it isn't mislabeled as "blocked" (which is reserved for
+    /// off-thread stalls *during* active work).
+    idle_ms: u64,
+    /// Sync phase this window: deliberate GPU/persistence waits ([`WAIT_US`],
+    /// swapped in at flush). Carved out of the compute phases + blocked so a
+    /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
+    wait_ms: u64,
+    /// Drain sub-timers (ms) + prefilled tokens, swapped from the `DRAIN_*` atoms.
+    /// `prefill` (time + tokens) is re-attributed OUT of the Projection/drain band
+    /// INTO the Prefill phase so the ingest prefill shows real throughput; `elevate`
+    /// and `glue` decompose the remaining drain for the projection panel.
+    drain_prefill_ms: u64,
+    drain_prefill_tokens: u64,
+    drain_elevate_ms: u64,
+    drain_glue_ms: u64,
 }
 
 impl WaveStats {
@@ -1515,6 +1593,12 @@ impl WaveStats {
             evict_bytes: 0,
             evict_count: 0,
             evict_ms: 0,
+            idle_ms: 0,
+            wait_ms: 0,
+            drain_prefill_ms: 0,
+            drain_prefill_tokens: 0,
+            drain_elevate_ms: 0,
+            drain_glue_ms: 0,
         }
     }
 
@@ -1523,6 +1607,11 @@ impl WaveStats {
         self.evict_bytes += bytes;
         self.evict_count += count;
         self.evict_ms += ms;
+    }
+
+    /// Accumulate one idle wait — the loop blocked on `rx.recv()` with no work.
+    fn add_idle(&mut self, ms: u64) {
+        self.idle_ms += ms;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -1606,13 +1695,17 @@ impl WaveStats {
     /// *executed* forwards, so this is the only view of pending *work*.
     /// Call only when [`Self::due`] — windows with NO forwards still flush so
     /// stalls surface their phase split. `fmt` is the resident-arena format split
-    /// `(float_arenas, float_reserved_bytes, float_live_bytes, quant_arenas,
-    /// quant_reserved_bytes, quant_live_bytes)` for the instrumented arena panel.
+    /// `(float_arenas, float_reserved_mib, float_live_mib, quant_arenas,
+    /// quant_reserved_mib, quant_live_mib)` for the arena panel. `vram` is the
+    /// whole-card decomposition `(pool_reserved_mib, driver_total_mib,
+    /// driver_free_mib)` for the VRAM-decomposition panel.
     fn flush(
         &mut self,
         kv_vram: Option<(usize, usize)>,
         backlog: u64,
         fmt: Option<(u32, u64, u64, u32, u64, u64)>,
+        vram_decomp: (u64, u64, u64),
+        slots: (u32, u32, u32, u32),
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -1706,6 +1799,17 @@ impl WaveStats {
                 PROV_ASSEMBLE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
             "wave phase breakdown (scheduler-thread wall-clock; watch which grows)"
         );
+        // Swap in this window's accumulated GPU/persistence wait for the Sync phase,
+        // plus the drain sub-timers (prefill re-attributed to Prefill; elevate/glue
+        // decompose the drain).
+        self.wait_ms = WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
+        self.drain_prefill_ms =
+            DRAIN_PREFILL_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
+        self.drain_prefill_tokens =
+            DRAIN_PREFILL_TOKENS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.drain_elevate_ms =
+            DRAIN_ELEVATE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
+        self.drain_glue_ms = DRAIN_GLUE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
         // Feed the live GUI's phase timeline: one measurement per phase that ran
         // this window. Volume is tokens for the inference phases and bytes for the
         // memory phases; the GUI colors by kind and shows the flip over time.
@@ -1713,13 +1817,33 @@ impl WaveStats {
         // Feed the instrumented generic panels (VRAM / throughput / backlog / wave
         // latency / arenas) — the same numbers the log line carries, straight from
         // the ring so the dashboard needs no log tail.
-        let tok = self.prefill.tok_sum + self.decode.tok_sum + self.section.tok_sum;
+        let tok = self.prefill.tok_sum
+            + self.decode.tok_sum
+            + self.section.tok_sum
+            + self.drain_prefill_tokens;
         let fwds = self.prefill.fwds + self.decode.fwds + self.section.fwds;
         let fwd_sum = self.prefill.ms_sum + self.decode.ms_sum + self.section.ms_sum;
         let fwd_ms = if fwds > 0 { fwd_sum / fwds } else { 0 };
         let (budget_mib, used_mib) = kv_vram
             .map(|(b, u)| ((b / (1 << 20)) as u64, (u / (1 << 20)) as u64))
             .unwrap_or((0, 0));
+        // Projection decomposition. The drain-path PREFILL is re-attributed to the
+        // Prefill phase (below), so the projection band's drain contribution is
+        // `drain_ms - drain_prefill`, decomposed into elevate / glue / other.
+        // Reproject decomposes into scan / glue / layout / other.
+        let use_ms = |a: &std::sync::atomic::AtomicU64| {
+            a.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000
+        };
+        let pdrain = self.drain_ms.saturating_sub(self.drain_prefill_ms);
+        let proj = (
+            pdrain,
+            self.drain_elevate_ms.min(pdrain),
+            self.drain_glue_ms.min(pdrain),
+            self.reproj_ms,
+            use_ms(&REPROJ_SCAN_US),
+            use_ms(&REPROJ_GLUE_US),
+            use_ms(&REPROJ_LAYOUT_US),
+        );
         phase_ring::push_wave(phase_ring::wave_sample(
             elapsed.as_millis() as u32,
             fwd_ms as u32,
@@ -1728,6 +1852,9 @@ impl WaveStats {
             used_mib,
             backlog,
             fmt,
+            vram_decomp,
+            proj,
+            slots,
         ));
         self.window_start = std::time::Instant::now();
         self.prefill = WaveChannel::default();
@@ -1746,6 +1873,12 @@ impl WaveStats {
         self.evict_bytes = 0;
         self.evict_count = 0;
         self.evict_ms = 0;
+        self.idle_ms = 0;
+        self.wait_ms = 0;
+        self.drain_prefill_ms = 0;
+        self.drain_prefill_tokens = 0;
+        self.drain_elevate_ms = 0;
+        self.drain_glue_ms = 0;
     }
 
     /// Emit this window's per-phase measurements to the GUI ring as a **disjoint**
@@ -1770,11 +1903,16 @@ impl WaveStats {
     fn push_phase_window(&self, window_ms: u32) {
         use phase_ring::{PhaseKind, PhaseMeasure};
 
-        // Disjoint base buckets (sum to window_ms).
-        let proj_dur = self.drain_ms + self.reproj_ms; // drain + the decode-quantum reproj
+        // Disjoint base buckets (sum to window_ms). The drain-path prefill (the
+        // ingest turn's own content forward) is real prefill work that happens
+        // inside `drain_submissions`, so move its time OUT of the projection band
+        // and INTO Prefill — with its tokens (below) — so ingest throughput isn't
+        // hidden as token-less projection time.
+        let drain_prefill = self.drain_prefill_ms.min(self.drain_ms);
+        let proj_dur = self.drain_ms.saturating_sub(drain_prefill) + self.reproj_ms;
         let mut decode_dur = self.decode_ms.saturating_sub(self.reproj_ms);
-        let mut prefill_dur = self.prefill_ms;
-        let section_dur = self.section_ms;
+        let mut prefill_dur = self.prefill_ms + drain_prefill;
+        let mut section_dur = self.section_ms;
         let alloc_dur = self.promote_ms;
         let accounted =
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
@@ -1789,6 +1927,26 @@ impl WaveStats {
             self.evict_ms,
             &mut [&mut blocked_dur, &mut decode_dur, &mut prefill_dur],
         );
+        // Sync (deliberate GPU `synchronize` + persistence `flush_blocking` waits)
+        // happens both in the flush block (→ blocked remainder) and inside the
+        // quanta (relief mid-decode/prefill) → carve blocked first, then the
+        // compute quanta, so a multi-second stall reads as Sync rather than
+        // inflating decode/prefill or hiding in blocked.
+        let sync_dur = carve_ms(
+            self.wait_ms,
+            &mut [
+                &mut blocked_dur,
+                &mut decode_dur,
+                &mut prefill_dur,
+                &mut section_dur,
+            ],
+        );
+        // Idle (loop blocked on `rx.recv()` with no work) is unaccounted time, so
+        // it sits in the blocked remainder — carve it out so a scheduler sitting
+        // idle between requests reads as Idle, not Blocked. What's left in
+        // `blocked_dur` is genuinely unattributed remainder (lock contention, the
+        // cheap on-thread flush-block housekeeping).
+        let idle_dur = carve_ms(self.idle_ms, &mut [&mut blocked_dur]);
 
         let mut phases: Vec<PhaseMeasure> = Vec::new();
         let mut inference = |kind: PhaseKind, ch: &WaveChannel, dur_ms: u64| {
@@ -1805,8 +1963,25 @@ impl WaveStats {
             });
         };
         inference(PhaseKind::Decode, &self.decode, decode_dur);
-        inference(PhaseKind::Prefill, &self.prefill, prefill_dur);
         inference(PhaseKind::Section, &self.section, section_dur);
+        // Prefill emitted directly (not via `inference`) so the drain-path ingest
+        // prefill's tokens are folded in with the async-queue prefill's — matching
+        // the `drain_prefill` time already folded into `prefill_dur`.
+        let prefill_tok = self.prefill.tok_sum + self.drain_prefill_tokens;
+        let prefill_seqs = self
+            .prefill
+            .seq_max
+            .max(if drain_prefill > 0 { 1 } else { 0 });
+        if self.prefill.fwds > 0 || prefill_dur > 0 || prefill_tok > 0 {
+            phases.push(PhaseMeasure {
+                kind: PhaseKind::Prefill,
+                dur_ms: prefill_dur as u32,
+                tokens: prefill_tok,
+                bytes: 0,
+                seqs: prefill_seqs as u32,
+                count: self.prefill.fwds as u32,
+            });
+        }
         let push = |phases: &mut Vec<PhaseMeasure>, kind, dur: u64, bytes, count| {
             phases.push(PhaseMeasure {
                 kind,
@@ -1840,6 +2015,12 @@ impl WaveStats {
         }
         if alloc_dur > 0 {
             push(&mut phases, PhaseKind::Allocation, alloc_dur, 0, 0);
+        }
+        if sync_dur > 0 {
+            push(&mut phases, PhaseKind::Sync, sync_dur, 0, 0);
+        }
+        if idle_dur > 0 {
+            push(&mut phases, PhaseKind::Idle, idle_dur, 0, 0);
         }
         if blocked_dur > 0 {
             push(&mut phases, PhaseKind::Blocked, blocked_dur, 0, 0);
@@ -3095,8 +3276,10 @@ impl Scheduler {
                     // batch keeps its own concurrency; this seam only gates
                     // between batches so the native catalog can't outrun the
                     // offload under VRAM pressure.
-                    self.persist_trigger
-                        .flush_blocking(std::time::Duration::from_secs(30));
+                    timed_wait(|| {
+                        self.persist_trigger
+                            .flush_blocking(std::time::Duration::from_secs(30))
+                    });
                     Ok(())
                 })();
                 let _ = response_tx.send(result);
@@ -7435,6 +7618,10 @@ impl Scheduler {
         }
         let probe_ms = t_probe.elapsed().as_millis() as u64;
         record_phase(t_probe, "reproject_probe_extract");
+        REPROJ_SCAN_US.fetch_add(
+            t_probe.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // 4. Wide-Q belief scoring: scan the probe against each belief-driven
         //    collection's tag-scoped gallery of past turns→selected-section AND
@@ -7454,6 +7641,10 @@ impl Scheduler {
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
+        REPROJ_SCAN_US.fetch_add(
+            t_scan.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Turn-boundary challenger: on this turn's FIRST reprojection, give each
         // top-N belief collection's strongest fresh signal a slot even when it's
@@ -7631,6 +7822,10 @@ impl Scheduler {
         };
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
+        REPROJ_LAYOUT_US.fetch_add(
+            t_project.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Count of sealed turns this projection selected — the reproject cost
         // scales linearly with it (each adds one boundary-glue prefill).
@@ -7788,6 +7983,10 @@ impl Scheduler {
         // only the chunk-pool rebalance, not the whole reproject.
         let swap_ms = t_swap.elapsed().as_millis() as u64;
         record_phase(t_swap, "reproject_swap");
+        REPROJ_LAYOUT_US.fetch_add(
+            t_swap.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Select-promote (warm/cold → hot) the new working set before re-applying,
         // turning the per-unit `ensure_*_hot` calls inside `apply_projection` into

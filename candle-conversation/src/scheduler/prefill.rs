@@ -339,9 +339,10 @@ impl Scheduler {
                 let mut flushed = false;
                 let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
                 if self.vram_under_pressure_for(phase) {
-                    flushed = self
-                        .persist_trigger
-                        .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT);
+                    flushed = super::timed_wait(|| {
+                        self.persist_trigger
+                            .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT)
+                    });
                     evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
                     released += self.session.release_empty_arenas().unwrap_or(0);
                     self.trim_kv_pool();
@@ -708,7 +709,7 @@ impl Scheduler {
                 let t = std::time::Instant::now();
                 compact_moves = self.session.defragment_bounded(budget).unwrap_or(0);
                 let _ = self.session.release_empty_arenas();
-                let _ = self.device.synchronize();
+                super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
                 compact_ms = t.elapsed().as_millis() as u64;
             }
@@ -744,7 +745,7 @@ impl Scheduler {
                     let _ = self.session.defragment_bounded(compact_base_moves());
                 }
                 let _ = self.session.release_empty_arenas();
-                let _ = self.device.synchronize();
+                super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
             }
             evict_ms = t.elapsed().as_millis() as u64;
@@ -807,7 +808,7 @@ impl Scheduler {
                         .defragment_bounded(compact_base_moves().saturating_mul(3));
                 }
                 let _ = self.session.release_empty_arenas();
-                let _ = self.device.synchronize();
+                super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
             }
             evict_ms = t.elapsed().as_millis() as u64;
@@ -1048,7 +1049,7 @@ impl Scheduler {
             return;
         }
         let t = std::time::Instant::now();
-        let _ = self.device.synchronize();
+        super::timed_synchronize(&self.device);
         tracing::debug!(
             target: "candle_conversation::scheduler::vram_relief",
             backlog_mib = backlog / (1 << 20),
@@ -2300,7 +2301,7 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                 self.compressed += turns;
                 let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
                 self.released += arenas;
-                let _ = self.sched.device.synchronize();
+                super::timed_synchronize(&self.sched.device);
                 self.sched.trim_kv_pool();
                 let used_after = self
                     .sched
@@ -2337,10 +2338,11 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                 let evict_t = std::time::Instant::now();
                 let mut rep = self.sched.evict_cold_tail(want);
                 if rep.bytes < want {
-                    self.flushed |= self
-                        .sched
-                        .persist_trigger
-                        .flush_blocking(std::time::Duration::from_secs(1));
+                    self.flushed |= super::timed_wait(|| {
+                        self.sched
+                            .persist_trigger
+                            .flush_blocking(std::time::Duration::from_secs(1))
+                    });
                     let more = self.sched.evict_cold_tail(want.saturating_sub(rep.bytes));
                     rep.count += more.count;
                     rep.bytes += more.bytes;
@@ -2366,7 +2368,7 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                 }
                 let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
                 self.released += arenas;
-                let _ = self.sched.device.synchronize();
+                super::timed_synchronize(&self.sched.device);
                 self.sched.trim_kv_pool();
                 let freed = rep.bytes + arenas as u64 * ARENA_BYTES;
                 if rep.count > 0 || arenas > 0 {
