@@ -121,7 +121,13 @@ fn env_pct(var: &str, default: usize, max: usize) -> usize {
 }
 fn vram_evict_high_pct() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_VRAM_EVICT_HIGH_PCT", DEFAULT_VRAM_EVICT_HIGH_PCT, 50))
+    *V.get_or_init(|| {
+        env_pct(
+            "CANDLE_VRAM_EVICT_HIGH_PCT",
+            DEFAULT_VRAM_EVICT_HIGH_PCT,
+            50,
+        )
+    })
 }
 fn vram_evict_low_pct() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -185,14 +191,23 @@ fn host_ram_floor_bytes(total_ram: u64) -> u64 {
 const HOST_RAM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 /// Sealed ingest turns kept hot per timeline (the rolling window) before the
 /// gentle-early demote sheds the rest to RAM. Env `CANDLE_INGEST_HOT_WINDOW`,
-/// default 2.
+/// default 8.
+///
+/// **Must cover the ingest projection's gather width.** With the tool-round-trip
+/// ingest, each scope's summary decode projects the `scopes` group (`top_k` turns)
+/// — i.e. an actively-ingesting conversation RE-ATTENDS its own recent turns every
+/// scope. If this window is narrower than that gather, the demote sheds turns the
+/// very next projection re-elevates: a warm↔hot churn that stalls the decode batch.
+/// The scopes group is `top_k: 4`, so a scope's projected working set is ~4 turns
+/// (2 coupled turns × ~2 scopes); 8 keeps a couple of scopes of margin resident so
+/// the active working set never leaves hot.
 fn ingest_hot_window() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("CANDLE_INGEST_HOT_WINDOW")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(2)
+            .unwrap_or(8)
     })
 }
 
@@ -285,63 +300,66 @@ impl Scheduler {
         // (the scheduler) thread with full working-set context — never off-thread
         // racing a live forward. See `docs/vram_governor_design.md` §8.
         let band = self.vram_band_for(phase) as u64;
-        let (freed, deepest, flushed, evicted, compressed, released) = if let Some(gov) =
-            self.session.vram_governor()
-        {
-            // Restore headroom to band + 50% — enough to clear pressure with
-            // margin, but reachable in a single eviction pass (2× band asked for
-            // ~9 GiB on a 73 GiB card, which one pass can't free, so the ladder
-            // reported `relieved=false` and pointlessly climbed to Critical).
-            let target = band.saturating_add(band / 2);
-            let mut driver = SchedulerReliefDriver {
-                sched: self,
-                evicted: crate::substrate::EvictionReport { count: 0, bytes: 0 },
-                compressed: 0,
-                flushed: false,
-                released: 0,
+        let (freed, deepest, flushed, evicted, compressed, released) =
+            if let Some(gov) = self.session.vram_governor() {
+                // Restore headroom to band + 50% — enough to clear pressure with
+                // margin, but reachable in a single eviction pass (2× band asked for
+                // ~9 GiB on a 73 GiB card, which one pass can't free, so the ladder
+                // reported `relieved=false` and pointlessly climbed to Critical).
+                let target = band.saturating_add(band / 2);
+                let mut driver = SchedulerReliefDriver {
+                    sched: self,
+                    evicted: crate::substrate::EvictionReport { count: 0, bytes: 0 },
+                    compressed: 0,
+                    flushed: false,
+                    released: 0,
+                };
+                let freed = gov
+                    .relieve_with(target, &mut driver)
+                    .map(|r| r.freed())
+                    .unwrap_or(0);
+                let deepest = gov.last_relief().map(|(tier, _)| tier);
+                let SchedulerReliefDriver {
+                    evicted,
+                    compressed,
+                    flushed,
+                    released,
+                    ..
+                } = driver;
+                (freed, deepest, flushed, evicted, compressed, released)
+            } else {
+                // Non-CUDA / no governor: direct cheapest-first ladder.
+                let mut released = self.session.release_empty_arenas().unwrap_or(0);
+                self.trim_kv_pool();
+                if self.vram_under_pressure_for(phase) && self.session.can_reclaim_arena() {
+                    let _ = self.session.defragment_bounded(compact_base_moves());
+                    released += self.session.release_empty_arenas().unwrap_or(0);
+                    self.trim_kv_pool();
+                }
+                let mut flushed = false;
+                let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+                if self.vram_under_pressure_for(phase) {
+                    flushed = self
+                        .persist_trigger
+                        .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT);
+                    evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
+                    released += self.session.release_empty_arenas().unwrap_or(0);
+                    self.trim_kv_pool();
+                }
+                // No governor ⇒ non-CUDA / no compress-to-free (quantize is CUDA-only).
+                (released as u64, None, flushed, evicted, 0, released)
             };
-            let freed = gov
-                .relieve_with(target, &mut driver)
-                .map(|r| r.freed())
-                .unwrap_or(0);
-            let deepest = gov.last_relief().map(|(tier, _)| tier);
-            let SchedulerReliefDriver {
-                evicted,
-                compressed,
-                flushed,
-                released,
-                ..
-            } = driver;
-            (freed, deepest, flushed, evicted, compressed, released)
-        } else {
-            // Non-CUDA / no governor: direct cheapest-first ladder.
-            let mut released = self.session.release_empty_arenas().unwrap_or(0);
-            self.trim_kv_pool();
-            if self.vram_under_pressure_for(phase) && self.session.can_reclaim_arena() {
-                let _ = self.session.defragment_bounded(compact_base_moves());
-                released += self.session.release_empty_arenas().unwrap_or(0);
-                self.trim_kv_pool();
-            }
-            let mut flushed = false;
-            let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
-            if self.vram_under_pressure_for(phase) {
-                flushed = self
-                    .persist_trigger
-                    .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT);
-                evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
-                released += self.session.release_empty_arenas().unwrap_or(0);
-                self.trim_kv_pool();
-            }
-            // No governor ⇒ non-CUDA / no compress-to-free (quantize is CUDA-only).
-            (released as u64, None, flushed, evicted, 0, released)
-        };
         let still = self.vram_under_pressure_for(phase);
+        // (Eviction volume is accounted at the `evict_cold_tail` chokepoint, not
+        // here, so the governor driver's evictions aren't double-counted.)
         if let Some((free, total)) = self.session.vram_free_total() {
             let (pool_used, pool_reserved) = self.session.vram_pool_stats().unwrap_or((0, 0));
             let offload_ms = t.elapsed().as_millis() as u64;
             let evicted_mib = evicted.bytes / (1 << 20);
             let freed_mib = freed / (1 << 20);
-            let rung = deepest.map(|r| format!("{r:?}")).unwrap_or_else(|| "none".into());
+            let rung = deepest
+                .map(|r| format!("{r:?}"))
+                .unwrap_or_else(|| "none".into());
             // Our footprint vs the OS-reserved high-water: this, not `vram_free`,
             // says what's actually consuming the card.
             let pool_used_mib = (pool_used / (1 << 20)) as u64;
@@ -627,8 +645,11 @@ impl Scheduler {
         };
         // Watermarks (see the constants for the % / floor scaling).
         let compact_ceiling = capacity.saturating_sub(vram_budget_band());
-        let evict_high = capacity
-            .saturating_sub(cap_margin(capacity, vram_evict_high_pct(), VRAM_EVICT_HIGH_FLOOR_MB));
+        let evict_high = capacity.saturating_sub(cap_margin(
+            capacity,
+            vram_evict_high_pct(),
+            VRAM_EVICT_HIGH_FLOOR_MB,
+        ));
         // Actionable pressure only. Defrag is actionable when `reserved` overshoots
         // the ceiling AND a whole arena is reclaimable (compaction has something to
         // consolidate). A reserved overshoot on un-returnable CUDA-pool free memory
@@ -694,15 +715,22 @@ impl Scheduler {
         }
 
         // ── Eviction controller (watermarks computed above) ─────────────────
-        let used_now = self.session.vram_pool_stats().map(|(u, _)| u).unwrap_or(used);
+        let used_now = self
+            .session
+            .vram_pool_stats()
+            .map(|(u, _)| u)
+            .unwrap_or(used);
         if used_now > evict_high {
             // Ramp the eviction depth with how far `used` is past the soft
             // threshold, so eviction is gradual and converges to steady state
             // rather than one bulk dump: shed ~1.5× the overage just past the
             // threshold, ramping to ~6× (capped at the deep low watermark) as
             // `used` nears capacity.
-            let evict_low = capacity
-                .saturating_sub(cap_margin(capacity, vram_evict_low_pct(), VRAM_EVICT_LOW_FLOOR_MB));
+            let evict_low = capacity.saturating_sub(cap_margin(
+                capacity,
+                vram_evict_low_pct(),
+                VRAM_EVICT_LOW_FLOOR_MB,
+            ));
             let overage = used_now.saturating_sub(evict_high);
             let deep = used_now.saturating_sub(evict_low);
             let span = capacity.saturating_sub(evict_high).max(1);
@@ -722,7 +750,11 @@ impl Scheduler {
             evict_ms = t.elapsed().as_millis() as u64;
         }
 
-        let after = self.session.vram_pool_stats().map(|(_, r)| r).unwrap_or(before);
+        let after = self
+            .session
+            .vram_pool_stats()
+            .map(|(_, r)| r)
+            .unwrap_or(before);
         let shed = before.saturating_sub(after) as u64;
         // Always log once we're in the pressure path (past the early-return),
         // including the case where we couldn't lower `reserved` (compact_ms=0,
@@ -770,14 +802,20 @@ impl Scheduler {
             if evicted.count > 0 {
                 if self.session.can_reclaim_arena() {
                     // Starvation is acute — use the deeper (Costly-level) budget.
-                    let _ = self.session.defragment_bounded(compact_base_moves().saturating_mul(3));
+                    let _ = self
+                        .session
+                        .defragment_bounded(compact_base_moves().saturating_mul(3));
                 }
                 let _ = self.session.release_empty_arenas();
                 let _ = self.device.synchronize();
                 self.trim_kv_pool();
             }
             evict_ms = t.elapsed().as_millis() as u64;
-            let after = self.session.vram_pool_stats().map(|(_, r)| r).unwrap_or(before);
+            let after = self
+                .session
+                .vram_pool_stats()
+                .map(|(_, r)| r)
+                .unwrap_or(before);
             shed = shed.saturating_add(before.saturating_sub(after) as u64);
         }
         tracing::warn!(
@@ -818,6 +856,7 @@ impl Scheduler {
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
 
+        let t = std::time::Instant::now();
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
         let mut remaining = target_bytes;
         let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
@@ -832,6 +871,15 @@ impl Scheduler {
             report.count += r.count;
             report.bytes += r.bytes;
         }
+        // Feed the GUI's phase timeline here — the single chokepoint every relief
+        // path (governor driver, footprint reclaim, compression-starvation
+        // recovery) funnels through, so each eviction is counted exactly once
+        // regardless of caller.
+        self.wave_stats.add_evict(
+            report.bytes,
+            report.count as u64,
+            t.elapsed().as_millis() as u64,
+        );
         report
     }
 
@@ -859,8 +907,19 @@ impl Scheduler {
             return;
         }
         let window = ingest_hot_window();
+        // Relieve back to the watermark, no further: `target` bounds the LRU walk
+        // so the demote sheds the least-recently-active ingest tail just enough to
+        // clear the pressure, never the whole hot working set.
+        let target_bytes = used.saturating_sub(watermark) as u64;
         // 1. Shed whatever is already warm-backed — free, no migration.
-        let report = self.demote_ingest_once(window);
+        let t_demote = std::time::Instant::now();
+        let report = self.demote_ingest_once(window, target_bytes);
+        // Feed the GUI's phase timeline: the gentle-rung ingest demotion.
+        self.wave_stats.add_evict(
+            report.bytes,
+            report.count as u64,
+            t_demote.elapsed().as_millis() as u64,
+        );
         // 2. If `used` is still over the watermark, the demote is **warm-starved**:
         //    warm-copy production (the async persistence pass) lags the ingest seal
         //    rate, so the cold backlog is hot-without-warm and not yet demotable.
@@ -999,18 +1058,46 @@ impl Scheduler {
         );
     }
 
-    /// One pass of cold-ingest demotion across every live conversation.
-    /// `demote_cold_ingest` self-filters to the timelines each conversation owns
-    /// (a non-matching id is a no-op) and is idempotent (already-demoted turns
-    /// have `hot = None` and are skipped), so passing the global ingest set to
-    /// every live conversation is safe — mirrors [`Self::evict_cold_tail`].
-    fn demote_ingest_once(&mut self, window: usize) -> crate::substrate::EvictionReport {
+    /// One pass of LRU-smart cold-ingest demotion across every live conversation,
+    /// freeing at most `target_bytes` total (the `remaining` budget threads across
+    /// conversations, so the walk stops the moment the watermark is cleared).
+    /// `demote_cold_ingest` self-filters to the timelines each conversation owns (a
+    /// non-matching id is a no-op), walks that conversation's `hot_lru` oldest-first
+    /// so the least-recently-active tail sheds before an active window, and is
+    /// idempotent (already-demoted turns have `hot = None` and are skipped). The
+    /// global working-set protect-list is passed to every conversation but only
+    /// ever matches that conversation's own attended turns — mirrors
+    /// [`Self::evict_cold_tail`].
+    fn demote_ingest_once(
+        &mut self,
+        window: usize,
+        target_bytes: u64,
+    ) -> crate::substrate::EvictionReport {
+        // Protect the active working set of every live slot (what in-flight
+        // prefills/decodes are attending) — the same union `evict_cold_tail`
+        // builds, so an actively-ingesting conversation's gathered turns are never
+        // demoted out from under the next projection.
+        let mut keep_sections: Vec<SectionId> = Vec::new();
+        let mut keep_turns: Vec<TurnKey> = Vec::new();
+        for st in self.slot_projection_state.values() {
+            keep_sections.extend(st.working_set.sections.iter().copied());
+            keep_turns.extend(st.working_set.turns.iter().copied());
+        }
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        let mut remaining = target_bytes;
         let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
         for conv in convs {
-            let r = conv
-                .write()
-                .demote_cold_ingest(&self.ingest_timelines, window);
+            if remaining == 0 {
+                break;
+            }
+            let r = conv.write().demote_cold_ingest(
+                &self.ingest_timelines,
+                &keep_turns,
+                &keep_sections,
+                window,
+                remaining,
+            );
+            remaining = remaining.saturating_sub(r.bytes);
             report.count += r.count;
             report.bytes += r.bytes;
         }
@@ -1082,7 +1169,10 @@ impl Scheduler {
             // is still GPU-float so an undrained warm backlog can't make us
             // re-walk already-quant turns. Stop collecting once the byte budget is
             // reached so a big backlog doesn't compress all at once.
-            let groups: HashMap<Option<ConvCompression>, Vec<(ResidenceIndex, Vec<SealedSequence>)>> = {
+            let groups: HashMap<
+                Option<ConvCompression>,
+                Vec<(ResidenceIndex, Vec<SealedSequence>)>,
+            > = {
                 let view = conv.read();
                 let mut g: HashMap<_, Vec<_>> = HashMap::new();
                 for (idx, hot, cc) in view.snapshot_pending_warm() {
@@ -1618,7 +1708,7 @@ impl Scheduler {
                 .push_front(QueuedScope {
                     scope_index: p.scope_index,
                     tokens: p.token_ids,
-                    layout: p.layout,
+                    layout_inputs: p.layout_inputs,
                     token_count: p.token_count,
                     tags: p.tags.clone(),
                 });
@@ -1673,15 +1763,27 @@ impl Scheduler {
                 }
                 continue;
             }
-            // A code-scope ingest re-prefill finished on the wave. Snapshot its
-            // K/V into its file batch (no decode, reports to the ingest caller via
-            // the batch's per-scope channel); on error, fail just that scope so its
-            // siblings still flush.
+            // A code-scope's cold-prefill (excerpt + tool exchange) finished on the
+            // wave. Frame `assistant_start` and register the bounded summary decode
+            // on the same slot; the decode's completion (`complete_scope_summary_decoded`)
+            // snapshots the excerpt + summary into the file batch. On prefill error,
+            // fail just that scope so its siblings still flush.
             if let SealAction::ScopeIngest = &work.seal_action {
                 let slot = work.sequence_id;
                 match error {
                     Some(e) => self.fail_scope_ingest(slot, e),
-                    None => self.complete_scope_ingest(slot),
+                    None => self.begin_scope_summary_decode(slot),
+                }
+                continue;
+            }
+            // A code-scope's reasoning-free re-prefill (post-summary-decode) landed:
+            // snapshot the clean K/V into its file batch. On error, fail just that
+            // scope so its siblings still flush.
+            if let SealAction::ScopeReprefill = &work.seal_action {
+                let slot = work.sequence_id;
+                match error {
+                    Some(e) => self.fail_scope_ingest(slot, e),
+                    None => self.complete_scope_summary_sealed(slot),
                 }
                 continue;
             }
@@ -2309,7 +2411,10 @@ mod host_ram_floor_tests {
                 floor <= purge_target,
                 "floor {floor} must be <= purge target {purge_target} at total {total}"
             );
-            assert!(floor >= 2 * GIB, "floor must keep at least 2 GiB of migration headroom");
+            assert!(
+                floor >= 2 * GIB,
+                "floor must keep at least 2 GiB of migration headroom"
+            );
         }
     }
 }

@@ -731,28 +731,119 @@ mod tests {
     fn assistant_split_tiles_tool_exchange() {
         // Base: user[0,3) im_end[3,5) a_start[5,8) assistant[8,24).
         let layout = TurnLayout::from_flat_grid(
-            0, 3, 8, 24, 2, 3, "excerpt".into(), Some("call…resp…ack".into()), true,
+            0,
+            3,
+            8,
+            24,
+            2,
+            3,
+            "excerpt".into(),
+            Some("call…resp…ack".into()),
+            true,
         );
         assert_eq!(layout.assistant_span(), KvSpan::new(8, 16));
         // Sub-segments tiling [8,24): tc[8,10) im_end[10,12) us[12,15) tr[15,18)
         // im_end[18,20) as[20,23) ack[23,24).
         let subs = vec![
-            TurnSegment::Assistant { text: Some("<tool_call>".into()), kv: KvSpan::new(8, 2) },
-            TurnSegment::Glue { marker: GlueKind::ImEnd, kv: Some(KvSpan::new(10, 2)) },
-            TurnSegment::Glue { marker: GlueKind::UserStart, kv: Some(KvSpan::new(12, 3)) },
-            TurnSegment::User { text: "<tool_response>".into(), kv: KvSpan::new(15, 3) },
-            TurnSegment::Glue { marker: GlueKind::ImEnd, kv: Some(KvSpan::new(18, 2)) },
-            TurnSegment::Glue { marker: GlueKind::AssistantStart, kv: Some(KvSpan::new(20, 3)) },
-            TurnSegment::Assistant { text: Some("Read …".into()), kv: KvSpan::new(23, 1) },
+            TurnSegment::Assistant {
+                text: Some("<tool_call>".into()),
+                kv: KvSpan::new(8, 2),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(10, 2)),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::UserStart,
+                kv: Some(KvSpan::new(12, 3)),
+            },
+            TurnSegment::User {
+                text: "<tool_response>".into(),
+                kv: KvSpan::new(15, 3),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(18, 2)),
+            },
+            TurnSegment::Glue {
+                marker: GlueKind::AssistantStart,
+                kv: Some(KvSpan::new(20, 3)),
+            },
+            TurnSegment::Assistant {
+                text: Some("Read …".into()),
+                kv: KvSpan::new(23, 1),
+            },
         ];
         let layout = layout.with_assistant_split(subs);
         assert_eq!(layout.validate_tiling(24), Ok(()));
         // Two user segments (header + tool response) and two assistant segments
         // (tool call + confirmation).
-        let users = layout.segments.iter().filter(|s| matches!(s, TurnSegment::User { .. })).count();
-        let assts = layout.segments.iter().filter(|s| matches!(s, TurnSegment::Assistant { .. })).count();
+        let users = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s, TurnSegment::User { .. }))
+            .count();
+        let assts = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s, TurnSegment::Assistant { .. }))
+            .count();
         assert_eq!((users, assts), (2, 2));
         // Assistant content still begins at the first assistant body (tool call).
+        assert_eq!(layout.assistant_content_start(), 8);
+    }
+
+    /// Regression: a code_read scope turn must open EXACTLY like a normal turn —
+    /// the leading `user_start` is ethereal glue (`kv: None`, materialized by the
+    /// projection spine), NOT a baked `UserStart` span, and there is no separate
+    /// `NoThink` glue segment: the scope folds its `/no_think` into the user body
+    /// and seals with `no_think() == false`, so the assembler emits exactly one
+    /// `user_start` and no duplicate soft-switch. Guards against the
+    /// doubled-soft-switch / mislabeled-opener bug where `user_content_start > 0` +
+    /// `no_think = true` made every code_read turn reconstruct as
+    /// `[user_start][/no_think][/no_think][user]…`.
+    #[test]
+    fn code_read_scope_opener_matches_a_normal_turn() {
+        // Scope params after the fix: user_content_start = 0, no_think = false, no
+        // baked soft-switch.
+        let layout = TurnLayout::from_flat_grid(
+            0,
+            5,
+            8,
+            24,
+            2,
+            3,
+            "Summarize `x` (lines 1-5) in no more than two sentences.".into(),
+            Some("<tool_call>…</tool_call>…<tool_response>…".into()),
+            false,
+        );
+        // Leading glue is an ETHEREAL user_start — the spine materializes it, it is
+        // not baked from this turn's grid.
+        assert!(
+            matches!(
+                layout.segments.first(),
+                Some(TurnSegment::Glue {
+                    marker: GlueKind::UserStart,
+                    kv: None,
+                }),
+            ),
+            "expected an ethereal leading UserStart, got {:?}",
+            layout.segments.first(),
+        );
+        // No NoThink glue segment at all — the scope carries no soft-switch.
+        assert!(
+            !layout.segments.iter().any(|s| matches!(
+                s,
+                TurnSegment::Glue {
+                    marker: GlueKind::NoThink,
+                    ..
+                }
+            )),
+            "a scope turn must not carry a NoThink glue segment",
+        );
+        // The turn's no_think flag is false, so the assembler emits no `/no_think`.
+        assert!(!layout.no_think());
+        assert_eq!(layout.user_content_start(), 0);
         assert_eq!(layout.assistant_content_start(), 8);
     }
 

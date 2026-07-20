@@ -17,9 +17,9 @@ use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TimelineId,
 };
+use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
-use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::{
     ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
     TurnEvent, TurnHandle, TurnResponse,
@@ -3646,7 +3646,10 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 .to_string();
             let summary_nodes = s
                 .turn_indices(tl)
-                .filter(|idx| s.tree_meta_of(tl, *idx).is_some_and(|m| m.kind.is_summary()))
+                .filter(|idx| {
+                    s.tree_meta_of(tl, *idx)
+                        .is_some_and(|m| m.kind.is_summary())
+                })
                 .count();
             conversations.push(ConvView {
                 timeline: tl.raw().to_string(),

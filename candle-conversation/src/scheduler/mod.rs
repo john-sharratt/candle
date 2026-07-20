@@ -5,6 +5,7 @@
 mod decode;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
+pub mod phase_ring;
 mod prefill;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
@@ -1003,31 +1004,59 @@ struct PendingTurnSeal {
 /// each becomes a `QueuedScope` in [`Scheduler::scope_pending`]. `pump_scope_prefills`
 /// drains them fairly (least-advanced file first) onto scratch slots, bounded so no
 /// more than [`Scheduler::MAX_SCOPE_SLOTS`] scratch slots exist at once.
+/// The inputs `build_turn_layout` needs to (re)build a scope turn's segment
+/// layout. Carried unbuilt through the queue + prefill because the closing
+/// assistant segment is DECODED: the layout can only be finalised once
+/// `complete_scope_summary_decoded` has the summary tokens, so the offsets + texts are
+/// threaded through and the layout is built once, post-decode. `assistant_text`
+/// is the prefilled prefix only — `<tool_call>` … `<tool_response>` up to the
+/// tool_response's user_end — with the `assistant_start` + decoded summary
+/// appended at seal.
+struct ScopeLayoutInputs {
+    user_content_start: u32,
+    user_content_end: u32,
+    /// Grid offset of the FIRST assistant segment (`<tool_call>`), after the
+    /// user request's `user_end` + `assistant_start`.
+    assistant_content_start: u32,
+    user_text: String,
+    assistant_text: String,
+}
+
 struct QueuedScope {
     /// Position within the file (record order). Indexes the file batch's slots.
     scope_index: u32,
-    /// Cold-prefill grid: `[/no_think][user][user_end][assistant_start][assistant]`.
+    /// Cold-prefill grid: `[/no_think][user][user_end][assistant_start][assistant]`,
+    /// where `assistant` stops at the tool_response's user_end (the summary is decoded).
     tokens: Vec<u32>,
-    /// The scope turn's segment layout, built at submit from the content offsets.
-    layout: TurnLayout,
-    /// Token count of `tokens` — pinned as the recorded turn's `token_count`.
+    /// Inputs to (re)build the turn layout post-decode. See [`ScopeLayoutInputs`].
+    layout_inputs: ScopeLayoutInputs,
+    /// Token count of `tokens` — the prefill grid length, before the decode.
     token_count: usize,
     /// Gather-scope tags carried to the recorded turn's `TurnDecl`.
     tags: Vec<String>,
 }
 
 /// A scope prefill in flight on the wave, keyed by its scratch slot in
-/// [`Scheduler::pending_scope_prefills`]. Carries what `complete_scope_ingest`
-/// needs to snapshot the scope into its file batch — the batch itself is keyed
-/// by `timeline` in [`Scheduler::scope_batches`].
+/// [`Scheduler::pending_scope_prefills`]. Carries what `complete_scope_summary_decoded`
+/// needs to snapshot the scope + rebuild its layout into its file batch — the
+/// batch itself is keyed by `timeline` in [`Scheduler::scope_batches`].
 struct PendingScopePrefill {
     timeline: TimelineId,
     scope_index: u32,
-    layout: TurnLayout,
+    layout_inputs: ScopeLayoutInputs,
+    /// The prefill grid tokens (up to the tool_response's user_end). The decode's
+    /// `assistant_start` + summary tokens are appended in
+    /// `complete_scope_summary_decoded`.
     token_ids: Vec<u32>,
     token_count: usize,
     /// Gather-scope tags carried to the recorded turn's `TurnDecl`.
     tags: Vec<String>,
+    /// The reasoning-free layout + token ids built in
+    /// `complete_scope_summary_decoded` (summary `<think>` stripped) and consumed
+    /// by `complete_scope_summary_sealed` once the clean re-prefill lands. `None`
+    /// until the summary has decoded.
+    sealed_layout: Option<TurnLayout>,
+    sealed_token_ids: Option<Vec<u32>>,
 }
 
 /// One scope's snapshotted K/V, buffered in its file batch until the flush cursor
@@ -1207,13 +1236,38 @@ pub(crate) enum SealAction {
     /// A parallel code-scope ingest unit: one scope of a file, cold-prefilled on
     /// its own scratch slot so N scopes of a file (and scopes across files) batch
     /// on the shared wave instead of prefilling serially. `max_decode_tokens` is
-    /// 0 — prefill + snapshot, no decode. When the prefill finishes,
-    /// `promote_finished_prefills_to_decodes` calls `complete_scope_ingest`, which
-    /// snapshots the scope's K/V into its file batch; `advance_scope_flush` then
-    /// records the contiguous run of landed scopes into the file timeline in scope
-    /// order, as they land. The slot is the routing key — its
-    /// [`Scheduler::pending_scope_prefills`] entry carries the timeline + index.
+    /// 0 — prefill + summary decode, no decode ON the prefill unit itself. When
+    /// the prefill finishes, `promote_finished_prefills_to_decodes` calls
+    /// `begin_scope_summary_decode`, which frames `assistant_start` and registers
+    /// the [`Self::ScopeSummary`] decode on the same slot. The slot is the routing
+    /// key — its [`Scheduler::pending_scope_prefills`] entry carries the timeline +
+    /// index + layout inputs.
     ScopeIngest,
+    /// The two-sentence summary decode for a code-scope, riding on the SAME slot
+    /// the scope prefilled onto. When the `ScopeIngest` prefill finishes,
+    /// `begin_scope_summary_decode` frames `assistant_start` and registers this
+    /// bounded decode (mirroring [`Self::CompressionPass`]); the decode attends
+    /// over the excerpt in-slot, so the summary is anchored to the code. On
+    /// completion `cleanup_finished` routes to `complete_scope_summary_decoded`, which
+    /// snapshots the whole slot (excerpt + summary), rebuilds the turn layout
+    /// with the decoded summary as its closing assistant segment, gathers wide-Q
+    /// sigs over the summary-inclusive grid (the provenance anchor), and records
+    /// the scope through `advance_scope_flush` exactly like `ScopeIngest`. The
+    /// slot is the routing key — its [`Scheduler::pending_scope_prefills`] entry
+    /// carries the timeline + index + layout inputs.
+    ScopeSummary,
+    /// The reasoning-free RE-PREFILL of a code-scope after its summary decoded,
+    /// mirroring [`Self::TurnReprefill`] for the scope path. The summary decode
+    /// may emit a `<think>…</think>` block (empty under `/no_think`, or a full
+    /// reasoning leak); `complete_scope_summary_decoded` strips it and re-prefills
+    /// the clean `[excerpt tool-exchange][assistant_start][stripped summary]` grid
+    /// on the same scratch slot, so the SEALED K/V and its wide-Q provenance
+    /// signature never carry reasoning. When this prefill finishes,
+    /// `promote_finished_prefills_to_decodes` calls `complete_scope_summary_sealed`,
+    /// which snapshots the clean K/V into the file batch. The slot is the routing
+    /// key — its [`Scheduler::pending_scope_prefills`] entry carries the rebuilt
+    /// clean layout + token ids.
+    ScopeReprefill,
 }
 
 /// Content the substrate pins on a `SealAction::Turn` write — the
@@ -1433,6 +1487,12 @@ struct WaveStats {
     seal_sig_us: u64,
     seal_flush_us: u64,
     seal_count: u64,
+    /// Eviction phase this window: resident KV bytes freed by the relief ladder
+    /// (cold-tail evict + ingest demote + footprint reclaim), the residence count,
+    /// and the wall-clock spent doing it. Fed the GUI's phase timeline.
+    evict_bytes: u64,
+    evict_count: u64,
+    evict_ms: u64,
 }
 
 impl WaveStats {
@@ -1452,7 +1512,17 @@ impl WaveStats {
             seal_sig_us: 0,
             seal_flush_us: 0,
             seal_count: 0,
+            evict_bytes: 0,
+            evict_count: 0,
+            evict_ms: 0,
         }
+    }
+
+    /// Accumulate one eviction event (relief-ladder shed of resident KV).
+    fn add_evict(&mut self, bytes: u64, count: u64, ms: u64) {
+        self.evict_bytes += bytes;
+        self.evict_count += count;
+        self.evict_ms += ms;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -1535,8 +1605,15 @@ impl WaveStats {
     /// `docs/unified_wave_inference_engine.md` §4.5); the line reports
     /// *executed* forwards, so this is the only view of pending *work*.
     /// Call only when [`Self::due`] — windows with NO forwards still flush so
-    /// stalls surface their phase split.
-    fn flush(&mut self, kv_vram: Option<(usize, usize)>, backlog: u64) {
+    /// stalls surface their phase split. `fmt` is the resident-arena format split
+    /// `(float_arenas, float_reserved_bytes, float_live_bytes, quant_arenas,
+    /// quant_reserved_bytes, quant_live_bytes)` for the instrumented arena panel.
+    fn flush(
+        &mut self,
+        kv_vram: Option<(usize, usize)>,
+        backlog: u64,
+        fmt: Option<(u32, u64, u64, u32, u64, u64)>,
+    ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
         let phase_sum =
@@ -1629,6 +1706,29 @@ impl WaveStats {
                 PROV_ASSEMBLE_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000,
             "wave phase breakdown (scheduler-thread wall-clock; watch which grows)"
         );
+        // Feed the live GUI's phase timeline: one measurement per phase that ran
+        // this window. Volume is tokens for the inference phases and bytes for the
+        // memory phases; the GUI colors by kind and shows the flip over time.
+        self.push_phase_window(elapsed.as_millis() as u32);
+        // Feed the instrumented generic panels (VRAM / throughput / backlog / wave
+        // latency / arenas) — the same numbers the log line carries, straight from
+        // the ring so the dashboard needs no log tail.
+        let tok = self.prefill.tok_sum + self.decode.tok_sum + self.section.tok_sum;
+        let fwds = self.prefill.fwds + self.decode.fwds + self.section.fwds;
+        let fwd_sum = self.prefill.ms_sum + self.decode.ms_sum + self.section.ms_sum;
+        let fwd_ms = if fwds > 0 { fwd_sum / fwds } else { 0 };
+        let (budget_mib, used_mib) = kv_vram
+            .map(|(b, u)| ((b / (1 << 20)) as u64, (u / (1 << 20)) as u64))
+            .unwrap_or((0, 0));
+        phase_ring::push_wave(phase_ring::wave_sample(
+            elapsed.as_millis() as u32,
+            fwd_ms as u32,
+            tok,
+            budget_mib,
+            used_mib,
+            backlog,
+            fmt,
+        ));
         self.window_start = std::time::Instant::now();
         self.prefill = WaveChannel::default();
         self.decode = WaveChannel::default();
@@ -1643,7 +1743,130 @@ impl WaveStats {
         self.seal_sig_us = 0;
         self.seal_flush_us = 0;
         self.seal_count = 0;
+        self.evict_bytes = 0;
+        self.evict_count = 0;
+        self.evict_ms = 0;
     }
+
+    /// Emit this window's per-phase measurements to the GUI ring as a **disjoint**
+    /// decomposition of the wave's wall-clock — the phase durations sum to
+    /// `window_ms`, so the GUI can stack them as "time in phase" without
+    /// over-counting.
+    ///
+    /// The reliable top-level split is the five timed quanta (drain, promote,
+    /// decode, prefill, section) plus the leftover "blocked". Two costs are
+    /// SUB-SLICES that run *inside* those quanta and would double-count if drawn as
+    /// their own segment on top:
+    /// - `reproj_ms` runs inside the decode quantum → carved out of decode into
+    ///   Projection.
+    /// - `seal_ms` runs inside prefill (`complete_turn_reprefill`) and decode
+    ///   (`perform_seal_and_write`) → carved out of those into Sealing.
+    /// - `evict_ms` runs partly in the flush block (reclaim/demote → the blocked
+    ///   remainder) and partly inside the quanta (relief) → carved out, blocked
+    ///   first, into Eviction.
+    ///
+    /// Carving redistributes ms between buckets (never adds), so the sum is
+    /// preserved at `window_ms`.
+    fn push_phase_window(&self, window_ms: u32) {
+        use phase_ring::{PhaseKind, PhaseMeasure};
+
+        // Disjoint base buckets (sum to window_ms).
+        let proj_dur = self.drain_ms + self.reproj_ms; // drain + the decode-quantum reproj
+        let mut decode_dur = self.decode_ms.saturating_sub(self.reproj_ms);
+        let mut prefill_dur = self.prefill_ms;
+        let section_dur = self.section_ms;
+        let alloc_dur = self.promote_ms;
+        let accounted =
+            self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
+        let mut blocked_dur = (window_ms as u64).saturating_sub(accounted);
+
+        // Sealing lives inside prefill + decode; carve it out (prefill first).
+        let seal_ms = (self.seal_snapshot_us + self.seal_sig_us + self.seal_flush_us) / 1000;
+        let seal_dur = carve_ms(seal_ms, &mut [&mut prefill_dur, &mut decode_dur]);
+        // Eviction lives in the flush block (blocked) + relief inside the quanta;
+        // carve blocked first, then the quanta.
+        let evict_dur = carve_ms(
+            self.evict_ms,
+            &mut [&mut blocked_dur, &mut decode_dur, &mut prefill_dur],
+        );
+
+        let mut phases: Vec<PhaseMeasure> = Vec::new();
+        let mut inference = |kind: PhaseKind, ch: &WaveChannel, dur_ms: u64| {
+            if ch.fwds == 0 && dur_ms == 0 {
+                return;
+            }
+            phases.push(PhaseMeasure {
+                kind,
+                dur_ms: dur_ms as u32,
+                tokens: ch.tok_sum,
+                bytes: 0,
+                seqs: ch.seq_max as u32,
+                count: ch.fwds as u32,
+            });
+        };
+        inference(PhaseKind::Decode, &self.decode, decode_dur);
+        inference(PhaseKind::Prefill, &self.prefill, prefill_dur);
+        inference(PhaseKind::Section, &self.section, section_dur);
+        let push = |phases: &mut Vec<PhaseMeasure>, kind, dur: u64, bytes, count| {
+            phases.push(PhaseMeasure {
+                kind,
+                dur_ms: dur as u32,
+                tokens: 0,
+                bytes,
+                seqs: 0,
+                count,
+            });
+        };
+        if proj_dur > 0 {
+            push(&mut phases, PhaseKind::Projection, proj_dur, 0, 0);
+        }
+        if self.seal_count > 0 || seal_dur > 0 {
+            push(
+                &mut phases,
+                PhaseKind::Sealing,
+                seal_dur,
+                0,
+                self.seal_count as u32,
+            );
+        }
+        if self.evict_count > 0 || self.evict_bytes > 0 {
+            push(
+                &mut phases,
+                PhaseKind::Eviction,
+                evict_dur,
+                self.evict_bytes,
+                self.evict_count as u32,
+            );
+        }
+        if alloc_dur > 0 {
+            push(&mut phases, PhaseKind::Allocation, alloc_dur, 0, 0);
+        }
+        if blocked_dur > 0 {
+            push(&mut phases, PhaseKind::Blocked, blocked_dur, 0, 0);
+        }
+        phase_ring::push_window(window_ms, phases);
+    }
+}
+
+/// Carve a sub-slice of `amt` ms out of `buckets` in priority order, draining each
+/// before moving to the next. Returns the amount actually carved — bounded by the
+/// total the buckets hold, so a carved-out phase segment can never push the stacked
+/// decomposition past the window. Redistributes ms (subtracts from a bucket, hands
+/// it to the caller's segment), so the overall sum across buckets + segment is
+/// preserved.
+fn carve_ms(amt: u64, buckets: &mut [&mut u64]) -> u64 {
+    let mut rem = amt;
+    let mut taken = 0;
+    for b in buckets.iter_mut() {
+        let t = rem.min(**b);
+        **b -= t;
+        rem -= t;
+        taken += t;
+        if rem == 0 {
+            break;
+        }
+    }
+    taken
 }
 
 /// Named scheduler-loop phases for [`WaveStats::add_phase`].
@@ -3930,6 +4153,24 @@ impl Scheduler {
             (!assistant_text.is_empty()).then(|| assistant_text.clone()),
             no_think,
         );
+        // Code_read tool-exchange turns bake their assistant→user→assistant
+        // sub-structure into `assistant_text` as dialect role markers; split the
+        // single Assistant span into the real sub-segments so the layout — and
+        // the details view built from it — reflects the true role boundaries.
+        //
+        // Checked BEFORE the `<think>` split: a tool-exchange turn is identified
+        // unambiguously by its baked role boundaries, and its DECODED closing
+        // summary may itself contain a `<think>` block (the scope grid carries no
+        // `/no_think`). Were the think split to run first, that summary-internal
+        // reasoning would hijack the layout and the tool exchange would never be
+        // split. A normal assistant reply never contains the role-boundary marker,
+        // so this branch is a no-op for ordinary turns and they fall through to the
+        // think split below.
+        if let Some(subs) =
+            self.tool_exchange_segments(&assistant_text, assistant_content_start, total)
+        {
+            return layout.with_assistant_split(subs);
+        }
         // Split the `<think>…</think>` reasoning out of the assistant body. Its
         // token length is measured by re-tokenising the block; `ethereal_thinking`
         // decides whether that length is a real K/V span or dropped.
@@ -3946,15 +4187,6 @@ impl Scheduler {
                     .unwrap_or(0);
                 return layout.with_thinking_split(block, think_len, ethereal_thinking);
             }
-        }
-        // Code_read tool-exchange turns bake their assistant→user→assistant
-        // sub-structure into `assistant_text` as dialect role markers; split the
-        // single Assistant span into the real sub-segments so the layout — and
-        // the details view built from it — reflects the true role boundaries.
-        if let Some(subs) =
-            self.tool_exchange_segments(&assistant_text, assistant_content_start, total)
-        {
-            return layout.with_assistant_split(subs);
         }
         layout
     }
@@ -4236,7 +4468,12 @@ impl Scheduler {
         // live — the re-prefill's K/V is freshly R16 here, exactly as at a
         // normal turn seal. The whole slot is the marker-framed turn
         // (`reprojection: None`), so the range is 1:1 with the Tokens record.
+        // Live seal (code-read roundtrip summary turns) — count it for the GUI's
+        // sealing phase, timing the dominant sig-gather cost.
+        let t_sig = Instant::now();
         let wide_sigs = self.gather_wide_sigs(slot, (0, block_count));
+        self.wave_stats
+            .add_seal(0, t_sig.elapsed().as_micros() as u64, 0);
         // The slice holds RAII `ChunkGid` clones, so the K/V survives the free.
         self.free_summary_slot(slot);
         let block_end = sealed_gpu.first().map(|s| s.chunks.len()).unwrap_or(0);
@@ -4388,6 +4625,11 @@ impl Scheduler {
     /// reserve in `candle-nn`'s `alloc.rs`) without meaningfully slowing ingest.
     const MAX_SCOPE_SLOTS: usize = 20;
 
+    /// Token cap on a code-scope's two-sentence summary decode. Loose enough that
+    /// a genuine two-sentence summary is never truncated mid-thought; EOS ends it
+    /// earlier in the common case.
+    const SCOPE_SUMMARY_MAX_TOKENS: usize = 100;
+
     /// Static ceiling on the ragged prefill forward's width — how many in-flight
     /// prefills coalesce into one `forward_batched`. The [`Self::admit_window`]
     /// congestion window rides below this and shrinks it under VRAM pressure.
@@ -4463,23 +4705,22 @@ impl Scheduler {
                     "PrefillScope: no conversation registered for timeline {timeline}"
                 ))
             })?;
-        // Build the scope turn's layout from the content offsets. Scopes cold-prefill
-        // under `/no_think` (supplied content, no reasoning), so `no_think = true`
-        // and there is no ethereal think block to split.
+        // Carry the layout inputs (offsets + texts) unbuilt: the scope's closing
+        // assistant segment is DECODED, so the layout is finalised only once
+        // `complete_scope_summary_decoded` has the summary tokens. Clamp the offsets to
+        // the prefill grid here (monotonic) so a tokenizer merge across a join
+        // can't invert the windows. Scopes cold-prefill under `/no_think`.
         let total = tokens.len() as u32;
         let user_content_start = user_content_start.min(total);
         let user_content_end = user_content_end.min(total).max(user_content_start);
         let assistant_content_start = assistant_content_start.min(total).max(user_content_end);
-        let layout = self.build_turn_layout(
+        let layout_inputs = ScopeLayoutInputs {
             user_content_start,
             user_content_end,
             assistant_content_start,
-            total,
             user_text,
             assistant_text,
-            true,
-            false,
-        );
+        };
         let token_ids: Vec<u32> = tokens[..].to_vec();
         let token_count = token_ids.len();
 
@@ -4518,7 +4759,7 @@ impl Scheduler {
             .push_back(QueuedScope {
                 scope_index,
                 tokens: token_ids,
-                layout,
+                layout_inputs,
                 token_count,
                 tags,
             });
@@ -4626,10 +4867,12 @@ impl Scheduler {
                 PendingScopePrefill {
                     timeline,
                     scope_index: queued.scope_index,
-                    layout: queued.layout,
+                    layout_inputs: queued.layout_inputs,
                     token_ids: queued.tokens,
                     token_count: queued.token_count,
                     tags: queued.tags,
+                    sealed_layout: None,
+                    sealed_token_ids: None,
                 },
             );
             // Private event sink so the prefill's progress/error sends never fail;
@@ -4692,14 +4935,243 @@ impl Scheduler {
         self.pump_scope_prefills();
     }
 
-    /// A scope prefill finished on the wave: snapshot its K/V (+ BDP sigs) into
-    /// the file batch, free the slot, and flush the batch if this was the file's
-    /// last scope. Then re-pump. Mirrors `complete_compression_turn` minus the
-    /// two-half framing — a scope is one body, recorded in `advance_scope_flush`.
-    fn complete_scope_ingest(&mut self, slot: SequenceId) {
+    /// A scope's cold-prefill (`<tool_call>` … `<tool_response>` up to the
+    /// tool_response's user_end) finished on the wave. Frame `assistant_start` and
+    /// register a bounded two-sentence summary decode on the SAME slot, so the
+    /// decode attends over the excerpt in-slot (anchoring the summary to the
+    /// code). Mirrors [`Self::finish_compression_pass_setup`], but the decode's
+    /// K/V is KEPT (it becomes the scope's closing assistant segment), it seals
+    /// through the scope-batch path, and the slot stays counted as an active scope
+    /// slot until `complete_scope_summary_sealed` frees it. `SamplingConfig::compression`
+    /// is argmax; the grid is already `/no_think`, so the summary is reasoning-free.
+    /// On a prefill/sample error, fail just this scope so its siblings still flush.
+    fn begin_scope_summary_decode(&mut self, slot: SequenceId) {
+        let asst_start = self.boundary_markers.assistant_start.as_ref().clone();
+        let turn_start = Instant::now();
+        let prefill_logits = match self.run_prefill(slot, &asst_start) {
+            Ok(l) => l,
+            Err(e) => {
+                self.fail_scope_ingest(slot, e);
+                return;
+            }
+        };
+        let prefill_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
+        let prefill_token_count = self.session.sequence_offset(slot.0).unwrap_or(0);
+
+        let config = SamplingConfig::compression();
+        let mut sstate = match self.sampling_states.remove(&slot) {
+            Some(s) => s,
+            None => {
+                self.fail_scope_ingest(
+                    slot,
+                    ConversationError::Channel("ScopeSummary: missing sampling state".into()),
+                );
+                return;
+            }
+        };
+        let first = match self.sample_single(&prefill_logits, &config, &mut sstate) {
+            Ok(t) => t,
+            Err(e) => {
+                self.sampling_states.insert(slot, sstate.clone());
+                self.fail_scope_ingest(slot, e);
+                return;
+            }
+        };
+        self.sampling_states.insert(slot, sstate);
+
+        if self.is_eos(first) {
+            // Immediate EOS — the model has nothing to add. Seal the scope with an
+            // empty decode buffer: the `assistant_start` framing already gives it a
+            // (terse) closing assistant turn, so the alternation still closes cleanly.
+            self.complete_scope_summary_decoded(slot, TokenBuffer::default());
+            return;
+        }
+
+        // Private event sink: the decode's per-token sends go nowhere (a scope
+        // summary reports through the batch, not `TurnEvent`), so a dropped
+        // receiver is fine — it just marks the decode finished the same way EOS /
+        // max_tokens would, and `cleanup_finished` reaps it.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        self.compression_event_sinks.insert(slot, event_rx);
+        let health = {
+            let mut hs = DecodeHealthState::new(
+                self.health_config.repetition_window,
+                self.health_config.health_log_capacity,
+            );
+            hs.apply_baseline_config(
+                self.health_config.entropy_baseline_window,
+                self.health_config.entropy_trend_relative_factor,
+                self.health_config.entropy_trend_absolute_min_nats,
+            );
+            hs.skip_entropy_checks = config.temperature <= 0.01;
+            hs
+        };
+        self.active_decodes.insert(
+            slot,
+            DecodeState {
+                event_tx,
+                generated_tokens: TokenBuffer::from(vec![first]),
+                max_tokens: Self::SCOPE_SUMMARY_MAX_TOKENS,
+                sampling_config: config,
+                seal_action: SealAction::ScopeSummary,
+                prefill_assistant_text: String::new(),
+                finished: false,
+                decode_start: Instant::now(),
+                prefill_ms,
+                prefill_token_count,
+                turn_start,
+                health,
+                reprojection: None,
+                non_punct_since_reproject: 0,
+                last_projection_end: 0,
+                post_decode_tokens: TokenBuffer::default(),
+                belief: PriorBelief::default(),
+                prefill_tokens: TokenBuffer::default(),
+                user_text: String::new(),
+                tags: Vec::new(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
+                in_tool_call: false,
+                triggers: Arc::new(TriggerRegistry::new()),
+                stencil: None,
+                pending_mask: None,
+            },
+        );
+    }
+
+    /// A scope's two-sentence summary decode finished on the SAME slot it
+    /// prefilled onto. Strip any `<think>…</think>` block from the summary (empty
+    /// under `/no_think`, or a full reasoning leak) and RE-PREFILL the clean
+    /// `[excerpt][assistant_start][stripped summary]` grid on the slot — mirroring
+    /// the dialogue clean re-prefill ([`Self::enqueue_clean_turn_reprefill`]) and
+    /// the compression pass, so the sealed K/V and its wide-Q provenance signature
+    /// never carry reasoning. The reasoning-free snapshot + record happens in
+    /// [`Self::complete_scope_summary_sealed`] once the re-prefill lands. The slot
+    /// stays a live scope slot until then. `generated`'s last sampled token is
+    /// dropped (never forwarded).
+    fn complete_scope_summary_decoded(&mut self, slot: SequenceId, generated: TokenBuffer) {
+        let Some(mut pending) = self.pending_scope_prefills.remove(&slot) else {
+            self.active_scope_slots = self.active_scope_slots.saturating_sub(1);
+            self.free_summary_slot(slot);
+            self.pump_scope_prefills();
+            return;
+        };
+        // Reasoning-free summary: drop the decode's last (un-forwarded) token, then
+        // strip the `<think>` block so the sealed summary is plain content.
+        let summary_forwarded: &[u32] = generated.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
+        let clean_summary = self.strip_think_from_tokens_keep_layout(summary_forwarded);
+        // The clean grid the re-prefill forwards: the prefill tokens (up to the
+        // tool_response's user_end), the `assistant_start` marker, then the
+        // think-stripped summary. A prefill forwards ALL tokens, so this aligns 1:1
+        // with the re-prefilled chunk grid (no un-forwarded tail like a decode).
+        let asst_start_ids: &[u32] = self.boundary_markers.assistant_start.as_ref();
+        let mut clean_tokens = Vec::with_capacity(
+            pending.token_ids.len() + asst_start_ids.len() + clean_summary.len(),
+        );
+        clean_tokens.extend_from_slice(&pending.token_ids);
+        clean_tokens.extend_from_slice(asst_start_ids);
+        clean_tokens.extend_from_slice(&clean_summary);
+        let total = clean_tokens.len() as u32;
+        // Rebuild the layout with the STRIPPED summary as the closing assistant
+        // segment: `tool_exchange_segments` splits the reconstructed assistant text
+        // into its real role sub-segments; the summary is the final Assistant span,
+        // filling to `total`. `no_think = false` — the `/no_think` soft-switch is
+        // baked in the user body (see `prepare_scope_grid`), not re-emitted glue.
+        let summary_text = self
+            .tokenizer
+            .decode(&clean_summary, true)
+            .unwrap_or_default();
+        let full_assistant_text = format!(
+            "{}{}{}",
+            pending.layout_inputs.assistant_text,
+            self.boundary_markers.assistant_start_str,
+            summary_text,
+        );
+        let layout = self.build_turn_layout(
+            pending.layout_inputs.user_content_start,
+            pending.layout_inputs.user_content_end,
+            pending.layout_inputs.assistant_content_start,
+            total,
+            pending.layout_inputs.user_text.clone(),
+            full_assistant_text,
+            false,
+            false,
+        );
+        let timeline = pending.timeline;
+        let scope_index = pending.scope_index;
+        pending.sealed_layout = Some(layout);
+        pending.sealed_token_ids = Some(clean_tokens.clone());
+        self.pending_scope_prefills.insert(slot, pending);
+
+        // Clear the decode's K/V (with its `<think>` tokens) and re-prefill the
+        // clean grid on the same slot as a `max_decode=0` unit that rides the
+        // shared wave. On a truncate error, fail just this scope.
+        if let Err(e) = self.session.truncate_sequence_to_blocks(slot.0, 0) {
+            self.active_scope_slots = self.active_scope_slots.saturating_sub(1);
+            self.pending_scope_prefills.remove(&slot);
+            self.free_summary_slot(slot);
+            self.fail_scope(timeline, scope_index, ConversationError::Model(e));
+            self.pump_scope_prefills();
+            return;
+        }
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        self.compression_event_sinks.insert(slot, event_rx);
+        self.prefill_queue.push_back(PrefillWork {
+            sequence_id: slot,
+            tokens: TokenBuffer::from(clean_tokens),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            prefill_assistant_text: String::new(),
+            event_tx,
+            max_decode_tokens: 0,
+            sampling: SamplingConfig::compression(),
+            submitted_at: Instant::now(),
+            reprojection: None,
+            belief: PriorBelief::default(),
+            seal_action: SealAction::ScopeReprefill,
+            post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::new()),
+        });
+    }
+
+    /// A scope's reasoning-free re-prefill landed on the wave. Snapshot the clean
+    /// K/V (excerpt + `<think>`-stripped summary), gather wide-Q sigs over it (the
+    /// provenance anchor — now free of reasoning tokens), and buffer the scope into
+    /// its file batch with the clean layout + token ids stashed by
+    /// [`Self::complete_scope_summary_decoded`]. `advance_scope_flush` records the
+    /// contiguous run of landed scopes. Then free the slot and re-pump.
+    fn complete_scope_summary_sealed(&mut self, slot: SequenceId) {
         self.active_scope_slots = self.active_scope_slots.saturating_sub(1);
         let Some(pending) = self.pending_scope_prefills.remove(&slot) else {
             self.free_summary_slot(slot);
+            self.pump_scope_prefills();
+            return;
+        };
+        let PendingScopePrefill {
+            timeline,
+            scope_index,
+            sealed_layout,
+            sealed_token_ids,
+            tags,
+            ..
+        } = pending;
+        let (Some(layout), Some(full_token_ids)) = (sealed_layout, sealed_token_ids) else {
+            // The decoded phase always stashes both before enqueuing this unit.
+            self.free_summary_slot(slot);
+            self.fail_scope(
+                timeline,
+                scope_index,
+                ConversationError::Channel("scope re-prefill missing sealed layout".into()),
+            );
             self.pump_scope_prefills();
             return;
         };
@@ -4709,56 +5181,42 @@ impl Scheduler {
             Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
             Err(e) => {
                 self.free_summary_slot(slot);
-                self.fail_scope(
-                    pending.timeline,
-                    pending.scope_index,
-                    ConversationError::Model(e),
-                );
+                self.fail_scope(timeline, scope_index, ConversationError::Model(e));
                 self.pump_scope_prefills();
                 return;
             }
         };
         let snap_us = t_snap.elapsed().as_micros() as u64;
-        // Wide-Q sigs over the fresh (still-R16) blocks BEFORE the free — the
-        // sealed slice holds RAII `ChunkGid` clones, so the K/V survives too. Done
-        // per scope (not batched): the scope must be recorded immediately below so
-        // its K/V enters the eviction pipeline — deferring the record pins the
-        // unrecorded snapshots invisibly to eviction and exhausts VRAM.
+        // Wide-Q sigs over the fresh (still-R16) clean blocks BEFORE the free — the
+        // sealed slice holds RAII `ChunkGid` clones, so the K/V survives too. The
+        // grid spans the excerpt AND the reasoning-free summary, so the summary's
+        // Q vectors anchor the scope semantically without think-block pollution.
         let t_sig = Instant::now();
         let sigs = self.gather_wide_sigs(slot, (0, block_count));
         let sig_us = t_sig.elapsed().as_micros() as u64;
         self.free_summary_slot(slot);
         let block_end = sealed_gpu.first().map(|s| s.chunks.len()).unwrap_or(0);
-        let PendingScopePrefill {
-            timeline,
-            scope_index,
-            layout,
-            token_ids,
-            token_count,
-            tags,
-        } = pending;
+        let full_token_count = full_token_ids.len();
         if let Some(batch) = self.scope_batches.get_mut(&timeline) {
             batch.sealed[scope_index as usize] = Some(SealedScope {
                 sealed_gpu,
                 sigs,
                 tags,
                 layout,
-                token_ids,
-                token_count,
+                token_ids: full_token_ids,
+                token_count: full_token_count,
                 block_end,
             });
             batch.landed[scope_index as usize] = true;
             // Report this scope's arrival live so the ingest bar + token count
             // climb per scope instead of jumping only when the whole file flushes.
-            (batch.on_prefilled)(token_count);
+            (batch.on_prefilled)(full_token_count);
         }
         // Record the contiguous run of landed scopes now — its VRAM K/V flows into
         // the persist/eviction pipeline instead of piling up until the file ends.
         let t_flush = Instant::now();
         self.advance_scope_flush(timeline);
         let flush_us = t_flush.elapsed().as_micros() as u64;
-        // Split this scope's non-forward seal cost into the wave breakdown so we
-        // can see whether snapshot / provenance-sig / record-flush dominates.
         self.wave_stats.add_seal(snap_us, sig_us, flush_us);
         self.pump_scope_prefills();
     }
@@ -5223,6 +5681,15 @@ impl Scheduler {
                 // fired by `complete_compression_pass`.
                 if let SealAction::CompressionPass { job_id } = state.seal_action {
                     self.complete_compression_pass(seq_id, job_id, state.generated_tokens);
+                    continue;
+                }
+
+                // A code-scope's summary decode finished: strip its `<think>` block
+                // and re-prefill the clean grid (no view, no Done event — the ingest
+                // caller is answered per-scope via the batch channel once the clean
+                // re-prefill lands and `complete_scope_summary_sealed` records it).
+                if let SealAction::ScopeSummary = state.seal_action {
+                    self.complete_scope_summary_decoded(seq_id, state.generated_tokens);
                     continue;
                 }
 
@@ -6120,7 +6587,12 @@ impl Scheduler {
         // `record_turn` (below) detaches the sealed KV. All heads / all layers,
         // un-folded. Complete while the turn's KV is R16 (`kv_lossless`); a block
         // whose R16 is already gone (compressed) simply contributes nothing.
+        // This is the LIVE turn seal (dialogue + code-read roundtrip turns) — count
+        // it for the GUI's sealing phase, timing the dominant sig-gather cost.
+        let t_sig = Instant::now();
         let wide_sigs = self.gather_wide_sigs(seal_slot, (block_from, block_to));
+        self.wave_stats
+            .add_seal(0, t_sig.elapsed().as_micros() as u64, 0);
 
         // KV-zero check: scan the PARENT slot at the seal range, right before the
         // chunks are persisted — i.e. exactly what gets written to the substrate.
@@ -6364,6 +6836,18 @@ impl Scheduler {
             SealAction::ScopeIngest => {
                 unreachable!(
                     "scope ingests snapshot in complete_scope_ingest and record in \
+                     advance_scope_flush, not through perform_seal_and_write"
+                )
+            }
+            SealAction::ScopeSummary => {
+                unreachable!(
+                    "scope summaries complete in cleanup_finished → complete_scope_summary_decoded, \
+                     not through perform_seal_and_write"
+                )
+            }
+            SealAction::ScopeReprefill => {
+                unreachable!(
+                    "scope re-prefills snapshot in complete_scope_summary_sealed and record in \
                      advance_scope_flush, not through perform_seal_and_write"
                 )
             }
@@ -7532,6 +8016,29 @@ mod tests {
     use super::*;
     use candle::{DType, Tensor};
 
+    #[test]
+    fn carve_ms_redistributes_and_bounds() {
+        // Carves in priority order, draining each bucket before the next.
+        let (mut a, mut b) = (100u64, 50u64);
+        let taken = carve_ms(120, &mut [&mut a, &mut b]);
+        assert_eq!((taken, a, b), (120, 0, 30)); // 100 from a, 20 from b
+
+        // Bounded by what the buckets hold — never carves more than available, so a
+        // segment can't push the stack past the window.
+        let (mut a, mut b) = (10u64, 5u64);
+        let taken = carve_ms(1000, &mut [&mut a, &mut b]);
+        assert_eq!((taken, a, b), (15, 0, 0));
+
+        // Sum preservation: carved segment + remaining buckets == original total,
+        // for any request. This is the invariant the phase decomposition relies on.
+        for req in [0u64, 7, 33, 80, 200] {
+            let orig = 80u64;
+            let mut only = orig;
+            let seg = carve_ms(req, &mut [&mut only]);
+            assert_eq!(seg + only, orig, "req={req}");
+        }
+    }
+
     /// The GPU provenance path's on-CPU tail (`assemble_folded_prov_sigs`) must be
     /// bit-identical to the CPU path (`fold_provenance(WideQSig::from_band(..))`).
     /// This drives both from the same synthetic signs — the kernel just produces
@@ -7683,12 +8190,18 @@ mod tests {
         let target = 8000;
 
         // Above target → shrink, regardless of window position.
-        assert_eq!(backlog_admit_action(8001, target, ceil, ceil, false), Shrink);
+        assert_eq!(
+            backlog_admit_action(8001, target, ceil, ceil, false),
+            Shrink
+        );
         assert_eq!(backlog_admit_action(20000, target, 1, ceil, false), Shrink);
 
         // Deadband [target/2, target] → hold — no flapping as the backlog jitters.
         assert_eq!(backlog_admit_action(target, target, 4, ceil, false), Hold);
-        assert_eq!(backlog_admit_action(target / 2, target, 4, ceil, false), Hold);
+        assert_eq!(
+            backlog_admit_action(target / 2, target, 4, ceil, false),
+            Hold
+        );
         assert_eq!(backlog_admit_action(5000, target, 4, ceil, false), Hold);
 
         // Below target/2 with headroom and no VRAM pressure → grow.

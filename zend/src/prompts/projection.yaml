@@ -234,8 +234,8 @@ layers:
     summary:
       turns:
         max_tokens: 512
-        # The user half of a code_reading turn is an excerpt header naming a file
-        # and a line range (`Source excerpt — `path` lines 47-93:`), so the scope
+        # The user half of a code_reading turn is a summarise request naming a file
+        # and a line range (`Summarize `path` (lines 47-93) …`), so the scope
         # of a roll-up is those ranges coalesced per file: reads of 1-40 and 41-93
         # are one read of 1-93. Derived, never decoded.
         scope: line_spans

@@ -15,23 +15,7 @@
 //! into memory, so the conversation shape can be verified without loading a
 //! model.
 
-use candle_conversation::{ScopeTurn, Sequence};
-
-/// The dialect role boundaries the code-read layer splices into a scope's
-/// assistant string to reconstruct the full tool-exchange alternation
-/// `user(excerpt) → assistant(<tool_call>) → user(<tool_response>) →
-/// assistant(close)`. A tool response returns in a *user* turn (Hermes/Qwen
-/// convention), and the exchange is closed by an assistant turn so the sequence
-/// never ends hanging on a user turn (which would collide with the next turn's
-/// user opener).
-pub struct ToolExchangeBoundaries {
-    /// Closes the assistant `<tool_call>` and opens the user `<tool_response>`:
-    /// `assistant_end` + `user_start`.
-    pub call_to_response: String,
-    /// Closes the user `<tool_response>` and opens the closing assistant
-    /// segment: `user_end` + `assistant_start`.
-    pub response_to_close: String,
-}
+use candle_conversation::Sequence;
 
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
@@ -66,48 +50,28 @@ pub trait InsertTurnSink {
         Ok(())
     }
 
-    /// Prefill every `(user, assistant)` scope of one file **in parallel** — each
-    /// on its own scratch slot so the file's scopes (and scopes across
-    /// concurrently-ingesting files) batch into large amortising forwards instead
-    /// of prefilling one-at-a-time — then record them into the conversation's
-    /// timeline in scope order. Returns the per-scope prefilled token counts, in
-    /// order, so the ingest bar can advance one unit per scope. `tags` apply to
-    /// every scope turn (provenance scoping), exactly as [`Self::insert_prefill_turn`].
+    /// Ingest one code scope as a TOOL ROUND-TRIP of two coupled turns — the
+    /// call (`user(request)` → `assistant(<tool_call>)`) and the response
+    /// (`user(<tool_response>)` → `assistant(summary)`). Recording it as two
+    /// coupled turns (not one baked exchange) keeps the inter-turn seams as
+    /// regenerated glue and the `/no_think` / `<think>` handling correct — see
+    /// [`candle_conversation::Sequence::ingest_scope_roundtrip`]. Returns the
+    /// tokens ingested.
     ///
-    /// `on_prefilled(tokens)` fires as each scope's prefill lands, so the caller
-    /// can advance a live per-scope progress bar + token count instead of only
-    /// updating once the whole file's batch completes.
-    ///
-    /// Default: the serial fallback (one [`Self::insert_prefill_turn`] per scope),
-    /// for sinks without a batched engine behind them.
-    fn insert_prefill_turns_parallel(
+    /// Default (model-less sinks, e.g. tests): record the two turns with an empty
+    /// response summary — no engine to decode it. Real engines override to decode
+    /// the summary under `/no_think` and couple the pair.
+    fn ingest_scope_roundtrip(
         &mut self,
-        scopes: &[(String, String)],
+        call_user: &str,
+        call_assistant: &str,
+        response_user: &str,
         tags: Vec<String>,
-        on_prefilled: candle_conversation::ScopeProgressFn,
-    ) -> anyhow::Result<Vec<usize>> {
-        scopes
-            .iter()
-            .map(|(user, assistant)| {
-                let tokens = self.insert_prefill_turn(user, assistant, tags.clone())?;
-                on_prefilled(tokens);
-                Ok(tokens)
-            })
-            .collect()
-    }
-
-    /// The two dialect role boundaries a prefilled code-read tool exchange
-    /// splices in, so a scope reconstructs as the full
-    /// `user → assistant → user → assistant` alternation rather than one blob.
-    /// See [`ToolExchangeBoundaries`].
-    ///
-    /// Default is the ChatML form (the daemon's dialect), so model-less sinks
-    /// still produce a structurally valid turn.
-    fn tool_exchange_boundaries(&self) -> ToolExchangeBoundaries {
-        ToolExchangeBoundaries {
-            call_to_response: "<|im_end|>\n<|im_start|>user\n".to_string(),
-            response_to_close: "<|im_end|>\n<|im_start|>assistant\n".to_string(),
-        }
+        _max_summary_tokens: usize,
+    ) -> anyhow::Result<usize> {
+        let a = self.insert_prefill_turn(call_user, call_assistant, tags.clone())?;
+        let b = self.insert_prefill_turn(response_user, "", tags)?;
+        Ok(a + b)
     }
 
     /// Restart-resume cache probe: whether some conversation in the
@@ -176,46 +140,23 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         result
     }
 
-    fn insert_prefill_turns_parallel(
+    fn ingest_scope_roundtrip(
         &mut self,
-        scopes: &[(String, String)],
+        call_user: &str,
+        call_assistant: &str,
+        response_user: &str,
         tags: Vec<String>,
-        on_prefilled: candle_conversation::ScopeProgressFn,
-    ) -> anyhow::Result<Vec<usize>> {
-        let start = std::time::Instant::now();
-        let turns: Vec<ScopeTurn> = scopes
-            .iter()
-            .map(|(user, assistant)| ScopeTurn {
-                user: user.clone(),
-                assistant: assistant.clone(),
-            })
-            .collect();
-        tracing::debug!(
-            target: "zend::turn_sink",
-            n_scopes = turns.len(),
-            "insert_prefill_turns_parallel: calling Sequence::ingest_scopes_parallel",
-        );
-        let result = self
-            .inner
-            .ingest_scopes_parallel(&turns, tags, on_prefilled)
-            .map_err(|e| anyhow::anyhow!("ingest_scopes_parallel: {e}"));
-        tracing::debug!(
-            target: "zend::turn_sink",
-            ms = start.elapsed().as_millis() as u64,
-            ok = result.is_ok(),
-            "insert_prefill_turns_parallel: returned",
-        );
-        result
-    }
-
-    fn tool_exchange_boundaries(&self) -> ToolExchangeBoundaries {
-        // Pull the real markers from the live dialect rather than assuming
-        // ChatML, so the boundaries match the model's chat template exactly.
-        let g = self.inner.glue_markers();
-        ToolExchangeBoundaries {
-            call_to_response: format!("{}{}", g.assistant_end, g.user_start),
-            response_to_close: format!("{}{}", g.user_end, g.assistant_start),
-        }
+        max_summary_tokens: usize,
+    ) -> anyhow::Result<usize> {
+        self.inner
+            .ingest_scope_roundtrip(
+                call_user,
+                call_assistant,
+                response_user,
+                tags,
+                max_summary_tokens,
+            )
+            .map_err(|e| anyhow::anyhow!("ingest_scope_roundtrip: {e}"))
     }
 
     fn unit_cached(&self, key: &str, value: &str) -> bool {

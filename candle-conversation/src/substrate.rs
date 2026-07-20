@@ -1835,44 +1835,79 @@ impl Substrate {
         demoted
     }
 
-    /// Gentle-early demotion for append-only **ingest** timelines: drop the hot
-    /// copy of every sealed, warm-backed turn on an ingest timeline except the
-    /// newest `keep_recent` per timeline, keeping warm. Ingest turns are never
-    /// re-attended until query time — scopes are independent (each is its own
-    /// `[0..scope]`) and `apply_projection` never runs for these — so a sealed
-    /// ingest turn's hot copy is pure zero-reload-cost footprint the instant it
-    /// seals; it re-elevates warm→hot on demand at query time. Firing this at a
-    /// **low** capacity watermark (~50%) sheds that footprint long before the
-    /// near-cap eviction ladder, so a bulk repo ingest holds only a small rolling
-    /// hot window instead of the whole corpus. The active (unsealed,
-    /// warm-absent) writer turn is protected by the hot+warm guard. Returns the
-    /// turns demoted + VRAM bytes freed.
+    /// Gentle-early relief, LRU-smart: shed the **least-recently-active** ingest
+    /// hot KV to warm, freeing at most `target_bytes` (relieve to the watermark,
+    /// not everything), while PROTECTING the active working set so it never
+    /// churns. Only ingest KV is touched — it re-elevates from warm at zero cost,
+    /// unlike a live-chat turn.
+    ///
+    /// Two protections keep an actively-ingesting conversation resident:
+    /// 1. `keep_turns` / `keep_sections` — the union working set of every live
+    ///    slot (what in-flight prefills/decodes are attending RIGHT NOW).
+    /// 2. `keep_recent` — the rolling window of the newest turns per ingest
+    ///    timeline (what the NEXT scope's projection will re-gather). This must
+    ///    cover the projection's gather width or the demote fights it.
+    ///
+    /// Everything else is walked oldest-first off `hot_lru` (least-recently
+    /// promoted ≈ least-recently active) and demoted until `target_bytes` is met —
+    /// so a settled conversation's cold tail is shed before an active one's window.
     pub fn demote_cold_ingest(
         &mut self,
         ingest_timelines: &std::collections::HashSet<TimelineId>,
+        keep_turns: &[TurnKey],
+        keep_sections: &[SectionId],
         keep_recent: usize,
+        target_bytes: u64,
     ) -> EvictionReport {
-        let mut victims: Vec<ResidenceIndex> = Vec::new();
-        let mut freed: u64 = 0;
+        if target_bytes == 0 {
+            return EvictionReport { count: 0, bytes: 0 };
+        }
+        // Protected residence: live working sets + each ingest timeline's rolling
+        // window. Also collect which residence belongs to an ingest timeline —
+        // only those are evictable here (zero reload cost).
+        let mut protected: std::collections::HashSet<ResidenceIndex> =
+            std::collections::HashSet::new();
+        for &key in keep_turns {
+            if let Some(e) = self.turn(key.timeline, key.index) {
+                protected.insert(e.content.residence);
+            }
+        }
+        for &sid in keep_sections {
+            if let Some(e) = self.sections.get(&sid) {
+                protected.insert(e.residence);
+            }
+        }
+        let mut ingest_residence: std::collections::HashSet<ResidenceIndex> =
+            std::collections::HashSet::new();
         for (tl, entry) in self.timelines.iter() {
             if !ingest_timelines.contains(tl) {
                 continue;
             }
             let n = entry.turns.len();
-            if n <= keep_recent {
+            let cutoff = n.saturating_sub(keep_recent);
+            for (i, turn_data) in entry.turns.values().enumerate() {
+                let r = turn_data.content.residence;
+                ingest_residence.insert(r);
+                if i >= cutoff {
+                    protected.insert(r); // the will-be-regathered rolling window
+                }
+            }
+        }
+        // Walk `hot_lru` oldest→newest (back is oldest), demoting warm-backed
+        // ingest KV that isn't protected, until we've freed `target_bytes`.
+        let mut freed: u64 = 0;
+        let mut victims: Vec<ResidenceIndex> = Vec::new();
+        for idx in self.hot_lru.iter().rev().copied() {
+            if freed >= target_bytes {
+                break;
+            }
+            if !ingest_residence.contains(&idx) || protected.contains(&idx) {
                 continue;
             }
-            // `turns` is a `BTreeMap` — iterate ascending by `TurnIndex` and stop
-            // before the newest `keep_recent`, which stay hot as the rolling
-            // window.
-            let cutoff = n - keep_recent;
-            for turn_data in entry.turns.values().take(cutoff) {
-                let residence = turn_data.content.residence;
-                let slot = &self.residence[residence.0];
-                if slot.hot.is_some() && slot.warm.is_some() {
-                    freed += slot.byte_size;
-                    victims.push(residence);
-                }
+            let slot = &self.residence[idx.0];
+            if slot.hot.is_some() && slot.warm.is_some() {
+                freed += slot.byte_size;
+                victims.push(idx);
             }
         }
         let count = victims.len();
@@ -1886,7 +1921,8 @@ impl Substrate {
                 count,
                 bytes = freed,
                 keep_recent,
-                "demote_cold_ingest (gentle-early) complete"
+                target_bytes,
+                "demote_cold_ingest (gentle-early, LRU) complete"
             );
         }
         EvictionReport {
@@ -4969,13 +5005,21 @@ mod tests {
         let mut ingest = std::collections::HashSet::new();
         ingest.insert(timeline);
 
-        // keep_recent = 2 → protect t3, t4; demote t0, t1, t2 (all warm-backed).
-        let report = sub.demote_cold_ingest(&ingest, 2);
+        // keep_recent = 2 → protect t3, t4 (the rolling window); no live working
+        // set; unbounded target → demote the whole LRU tail t0, t1, t2 (all
+        // warm-backed), oldest-first.
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX);
         assert_eq!(report.count, 3, "t0,t1,t2 demoted; t3,t4 window kept");
         assert_eq!(report.bytes, 300_000_000);
         for r in [t0, t1, t2] {
-            assert!(sub.residence[r.0].hot.is_none(), "older ingest turn demoted");
-            assert!(sub.residence[r.0].warm.is_some(), "warm KEPT (cheap reload)");
+            assert!(
+                sub.residence[r.0].hot.is_none(),
+                "older ingest turn demoted"
+            );
+            assert!(
+                sub.residence[r.0].warm.is_some(),
+                "warm KEPT (cheap reload)"
+            );
         }
         assert!(sub.residence[t3.0].hot.is_some(), "window turn stays hot");
         assert!(
@@ -4985,7 +5029,43 @@ mod tests {
 
         // Idempotent: the demoted turns are now warm-only, so a second pass frees
         // nothing.
-        assert_eq!(sub.demote_cold_ingest(&ingest, 2).count, 0, "already demoted");
+        assert_eq!(
+            sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX).count,
+            0,
+            "already demoted"
+        );
+    }
+
+    /// `target_bytes` bounds the LRU walk: with a target that covers only two
+    /// turns, the demote stops after shedding the two oldest and leaves the rest
+    /// hot — relief to the watermark, never the whole working set.
+    #[test]
+    fn demote_cold_ingest_stops_at_target() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, t0) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t1) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t2) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, t3) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        let mut ingest = std::collections::HashSet::new();
+        ingest.insert(timeline);
+
+        // keep_recent = 0 (nothing protected), target = 150 MB → the walk frees t0
+        // (100 MB, still < target) then t1 (200 MB, ≥ target) and stops. t2, t3 stay
+        // hot.
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, 150_000_000);
+        assert_eq!(report.count, 2, "only the two oldest shed to meet target");
+        assert_eq!(report.bytes, 200_000_000);
+        assert!(sub.residence[t0.0].hot.is_none(), "oldest demoted");
+        assert!(sub.residence[t1.0].hot.is_none(), "second-oldest demoted");
+        assert!(
+            sub.residence[t2.0].hot.is_some(),
+            "target met → t2 kept hot"
+        );
+        assert!(
+            sub.residence[t3.0].hot.is_some(),
+            "target met → t3 kept hot"
+        );
     }
 
     /// A timeline NOT in the ingest set is never touched — the demotion is scoped
@@ -4997,8 +5077,10 @@ mod tests {
         let (_, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
         let (_, c) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
 
-        // Empty ingest set → this timeline is not an ingest timeline.
-        let report = sub.demote_cold_ingest(&std::collections::HashSet::new(), 0);
+        // Empty ingest set → this timeline is not an ingest timeline, so even an
+        // unbounded target frees nothing.
+        let report =
+            sub.demote_cold_ingest(&std::collections::HashSet::new(), &[], &[], 0, u64::MAX);
         assert_eq!(report.count, 0);
         for r in [a, b, c] {
             assert!(

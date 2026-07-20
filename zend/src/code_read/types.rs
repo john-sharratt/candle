@@ -41,8 +41,7 @@ pub struct Scope {
 
 impl Scope {
     /// Joined nesting path — `mod cache > impl KvCache > fn
-    /// seal_chunk`.  Names the scope in the closing assistant segment of a
-    /// code-read part turn (see `header::render_read_ack`) and in parser unit
+    /// seal_chunk`.  Names the scope in the carve/AST layer and in parser unit
     /// tests asserted against expected nesting shapes.
     pub fn qualified_path(&self) -> String {
         self.path.join(" > ")

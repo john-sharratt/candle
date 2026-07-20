@@ -1,5 +1,5 @@
-use super::*;
 use super::prefill::VramPhase;
+use super::*;
 use std::time::Instant;
 
 /// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
@@ -14,18 +14,24 @@ impl Scheduler {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
-    /// Active *foreground* decode sequences — excludes compression passes.
+    /// Active *foreground* decode sequences — excludes compression passes and
+    /// code-scope summary decodes.
     ///
     /// Count the active foreground dialogue decodes that feed the
-    /// prefill/decode flip heuristic. Compression half-passes ride
-    /// `active_decodes` and the decode wave like any decode, but are excluded
-    /// here so they never hold the loop in decode-first mode at the expense of
-    /// dialogue prefills (they are off the critical path).
+    /// prefill/decode flip heuristic. Compression half-passes and scope-summary
+    /// decodes ride `active_decodes` and the decode wave like any decode, but are
+    /// excluded here so they never hold the loop in decode-first mode at the
+    /// expense of dialogue prefills (both are off the critical path — a scope
+    /// summary is background ingest work that co-batches opportunistically).
     fn foreground_decode_width(&self) -> usize {
         self.active_decodes
             .iter()
             .filter(|(_, s)| {
-                !s.finished && !matches!(s.seal_action, super::SealAction::CompressionPass { .. })
+                !s.finished
+                    && !matches!(
+                        s.seal_action,
+                        super::SealAction::CompressionPass { .. } | super::SealAction::ScopeSummary
+                    )
             })
             .count()
     }
@@ -230,7 +236,18 @@ impl Scheduler {
                     .zip(self.session.vram_pool_stats())
                     .map(|(budget, (used, _reserved))| (budget, used));
                 let backlog = self.pending_prefill_tokens();
-                self.wave_stats.flush(kv_vram, backlog);
+                // Resident-arena format split for the instrumented arena panel.
+                let fmt = self.session.kv_gpu_format_stats().map(|fs| {
+                    (
+                        fs.float_arenas as u32,
+                        fs.float_reserved_bytes as u64,
+                        fs.float_live_bytes as u64,
+                        fs.quant_arenas as u32,
+                        fs.quant_reserved_bytes as u64,
+                        fs.quant_live_bytes as u64,
+                    )
+                });
+                self.wave_stats.flush(kv_vram, backlog, fmt);
                 // Return freed KV VRAM to the OS every wave. FIRST release
                 // now-empty arenas: compression (hot→warm) and eviction leave
                 // arenas fully free but still *reserved*, and the async pool never
@@ -270,6 +287,10 @@ impl Scheduler {
                 // card into WDDM paging), and bulk-evict resident KV only when
                 // `used` itself nears capacity. No-op (cheap stats read) when
                 // comfortably below both watermarks.
+                // (Any KV eviction inside reclaim is accounted at the
+                // `evict_cold_tail` chokepoint; the defrag/trim bytes it also sheds
+                // are pool-footprint reclaim, not eviction, so they aren't counted
+                // as eviction volume here.)
                 self.reclaim_footprint();
                 // Last resort under heavy backlog: block the wave loop on a
                 // device sync so ingest stops outrunning the drain and the

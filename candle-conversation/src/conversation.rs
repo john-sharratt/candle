@@ -14,7 +14,7 @@ use crate::projection::{
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
-use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
+use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
@@ -140,26 +140,6 @@ use crossbeam::channel::Sender;
 use std::sync::Arc;
 
 /// One code scope to ingest in parallel — the `(user, assistant)` pair a single
-/// [`Sequence::insert_turn`] takes, but many are prefilled concurrently on
-/// scratch slots and recombined into the conversation's timeline in scope order.
-/// The user half is the tool-call request ("Read X lines A–B"), the assistant
-/// half the file-content echo. See [`Sequence::ingest_scopes_parallel`].
-pub struct ScopeTurn {
-    pub user: String,
-    pub assistant: String,
-}
-
-/// A scope tokenised into its cold-prefill grid + the content offsets the sealed
-/// turn's layout needs — the client-side product handed to the scheduler's
-/// `PrefillScope` request.
-struct PreparedScopeGrid {
-    tokens: TokenBuffer,
-    token_count: usize,
-    user_content_start: u32,
-    user_content_end: u32,
-    assistant_content_start: u32,
-}
-
 /// A client-side conversation handle.
 ///
 /// Manages turn history and submits GPU work to the scheduler via channel.
@@ -1604,28 +1584,25 @@ impl Sequence {
         // Format the full exchange (user + assistant_start prefix +
         // assistant_text) and tokenize as a single prefill payload.
         //
-        // Prefilled content turns (repo_map, code_reading, tool ingests, …)
-        // carry SUPPLIED content — they never run a decoded reasoning pass — so
-        // the `/no_think` prefix is hard-applied here (independent of any
-        // per-turn dial) to keep the model out of a reasoning frame over the
-        // supplied text.  The assistant header is left clean: no block is baked
-        // into it.
-        let no_think_prefix = self.config.dialect.no_think;
-        // Format: {user_start}/no_think{user}{user_end}{assistant_start}{assistant_text}.
-        // The assistant role-end comes through `post_decode_tokens`
-        // — there is no decode in this path so the EOS isn't emitted
-        // by the model; we append the full `assistant_end` (EOS +
-        // structural tail) ourselves so the seal captures a
-        // structurally-complete turn.
-        // Same boundary shape as `submit_turn`: `user_start` and
-        // `assistant_end` are stripped from the persisted bytes; the
-        // projection's live `Generated` segments re-emit them around
-        // the sealed turn on every future projection.  The trailing
-        // `Generated(UserStart)` the scheduler appends ahead of this
-        // prefill supplies the live `<|im_start|>user\n` opener.
+        // Prefilled content turns (repo_map, tool ingests, …) carry SUPPLIED
+        // content — they never run a decoded reasoning pass — so there is nothing
+        // to suppress at ingest. The `/no_think` soft-switch is NOT baked into the
+        // grid: like `submit_turn`, it is a live `Generated` glue segment the
+        // projection re-emits around the sealed turn on every future projection
+        // (gated on the turn's `no_think()` flag, set below). Baking it here — as
+        // this path used to — sealed the switch into the turn K/V AND left the
+        // assembler re-emitting a second one, so every reconstructed turn opened
+        // `[user_start][/no_think][/no_think][user]…` (a doubled soft-switch, a
+        // model-degrading malformed opener). The role markers follow the same
+        // rule: `user_start` / `assistant_end` are stripped from the persisted
+        // bytes and re-emitted as glue; only the intra-turn `user_end` /
+        // `assistant_start` stay baked.
+        // Format: {user}{user_end}{assistant_start}{assistant_text}. The assistant
+        // role-end comes through `post_decode_tokens` — no decode here, so the EOS
+        // isn't emitted by the model; the projection's live `Generated` segments
+        // supply the surrounding `user_start` / `/no_think` / `assistant_end`.
         let formatted = format!(
-            "{}{}{}{}{}",
-            no_think_prefix,
+            "{}{}{}{}",
             user_message,
             self.config.dialect.user_end,
             self.config.dialect.assistant_start,
@@ -1634,24 +1611,21 @@ impl Sequence {
         let prefill_tokens = self.tokenize(&formatted)?;
         let post_decode_tokens = TokenBuffer::new();
 
-        // Content boundaries inside the sealed grid.  The prefill grid is
-        // `[no_think_prefix][user_msg][user_end][assistant_start][assistant_text]`
-        // (no leading `user_start` — that's a live `Generated` segment).
-        // The user message body spans `[len(no_think_prefix), len(no_think +
-        // user_msg))`; the assistant content begins after the
-        // `[user_end][assistant_start]` markers.  Tokenise each prefix
-        // against the SAME strings the prefill is built from so the indices
-        // land on the real grid; clamp/monotonise so a tokenizer that
+        // Content boundaries inside the sealed grid. The prefill grid is
+        // `[user_msg][user_end][assistant_start][assistant_text]` (no leading
+        // `user_start`, no baked `/no_think` — both are live `Generated`
+        // segments). The user body spans `[0, len(user_msg))`; the assistant
+        // content begins after the `[user_end][assistant_start]` markers. Tokenise
+        // each prefix against the SAME strings the prefill is built from so the
+        // indices land on the real grid; clamp/monotonise so a tokenizer that
         // merges across a join can never invert the windows.
         let assistant_start_marker = self.config.dialect.assistant_start;
-        let user_content_start = self.tokenize(no_think_prefix)?.len();
-        let user_content_end = self
-            .tokenize(&format!("{no_think_prefix}{user_message}"))?
-            .len();
+        let user_content_start = 0usize;
+        let user_content_end = self.tokenize(user_message)?.len();
         let assistant_content_start = self
             .tokenize(&format!(
-                "{}{}{}{}",
-                no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
+                "{}{}{}",
+                user_message, self.config.dialect.user_end, assistant_start_marker,
             ))?
             .len();
         let total = prefill_tokens.len();
@@ -1684,8 +1658,9 @@ impl Sequence {
             user_content_start,
             user_content_end,
             assistant_content_start,
-            // Prefill content turns hard-apply `/no_think` (see the prefix above)
-            // — record it so the re-render is consistent with the sealed grid.
+            // `no_think()` = true: the turn is a no-reasoning content turn, so the
+            // projection re-emits `/no_think` as glue before it (NOT baked into the
+            // grid — see above). Exactly one soft-switch on reconstruction.
             true,
             tags,
             // Structured ingest: one projection, no staged prefill segments.
@@ -1713,149 +1688,65 @@ impl Sequence {
         Ok((assistant_content_start, turn_index, total))
     }
 
-    /// Ingest `scopes` into this conversation's timeline, prefilled **in parallel**
-    /// and recorded in scope order. Returns the per-scope prefilled token counts
-    /// (in scope order — sum for the "tokens ingested" metric). Blocks until every
-    /// scope is recorded.
+    /// Ingest one code scope as a TOOL ROUND-TRIP of two coupled turns — the
+    /// correct shape for a simulated `read_file` call. Recording it as two turns
+    /// (not one baked four-segment exchange) is what keeps the inter-turn role
+    /// seams as REGENERATED live glue on every projection: a seam baked into K/V
+    /// carries a hidden state computed against its ingest-time prefix (an empty
+    /// scratch slot) and goes stale when the scope is re-injected at a different
+    /// position mid-dialogue — the exact degradation provenance-selected attention
+    /// forbids. Mirrors the dialogue's own tool-call recording via
+    /// [`couple_turn`](Self::couple_turn):
     ///
-    /// Unlike a run of [`insert_turn`](Self::insert_turn) calls — each prefilling
-    /// one-at-a-time on this conversation's single slot — every scope here cold-
-    /// prefills on its own scratch slot, so a file's N scopes (and scopes across
-    /// concurrently-ingesting files) batch into large forwards that amortise the
-    /// MoE expert-weight load (design §6). The scheduler owns cross-file fairness
-    /// and the scratch-slot bound, so this fires all scopes up-front without
-    /// managing backpressure; it then waits for the batch to record.
+    /// - Turn A (call): `user(request)` → `assistant(<tool_call>…)`, prefilled.
+    /// - Turn B (response): `user(<tool_response>…code…)` → `assistant(summary)`,
+    ///   DECODED under `/no_think` (short) — so `<think>` is stripped by the
+    ///   normal clean re-prefill and `/no_think` rides as live glue, never baked.
     ///
-    /// Each scope's K/V is system-unconditioned (like a compression summary's
-    /// re-prefill) — the async summary tree bridges the scopes with
-    /// `SummaryOfTurns` nodes so the recombined file reads coherently.
-    /// `tags` (e.g. `["code", <path>]`) are applied to every scope turn's
-    /// `TurnDecl` and drive its staged provenance linkage, exactly as
-    /// [`insert_turn_staged`](Self::insert_turn_staged) does for the serial path.
-    pub fn ingest_scopes_parallel(
+    /// The two turns are coupled, so provenance selecting either injects both,
+    /// adjacent, with the seam regenerated between them. Serial by construction:
+    /// Turn B's summary must decode with Turn A in its projected prefix. Returns
+    /// tokens ingested (call prefill + decoded summary).
+    pub fn ingest_scope_roundtrip(
         &mut self,
-        scopes: &[ScopeTurn],
+        call_user: &str,
+        call_assistant: &str,
+        response_user: &str,
         tags: Vec<String>,
-        on_prefilled: ScopeProgressFn,
-    ) -> crate::Result<Vec<usize>> {
-        if self.turn_in_flight {
-            return Err(ConversationError::TurnInFlight {
-                sequence_id: self.id,
-            });
+        max_summary_tokens: usize,
+    ) -> crate::Result<usize> {
+        // Turn A — the call: prefill `[request][tool_call]` + staged provenance
+        // (mirrors `insert_turn_staged`). `user_start` / `assistant_end` /
+        // `/no_think` are live glue; only intra-turn `user_end` / `assistant_start`
+        // bake, which the design allows (dominated by the turn's own content).
+        let (call_acs, call_idx, call_tokens) =
+            self.insert_turn_inner(call_user, call_assistant, tags.clone())?;
+        if let Some(idx) = call_idx {
+            self.persist_staged_ingest_events(idx, call_acs, 0.0, &[])?;
         }
-        if scopes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let timeline = self.target.timeline;
-        let scope_total = scopes.len() as u32;
-        let mut receivers = Vec::with_capacity(scopes.len());
-        let mut per_scope_tokens = Vec::with_capacity(scopes.len());
-        let mut per_scope_asst_start = Vec::with_capacity(scopes.len());
-        for (i, scope) in scopes.iter().enumerate() {
-            let grid = self.prepare_scope_grid(&scope.user, &scope.assistant)?;
-            per_scope_tokens.push(grid.token_count);
-            per_scope_asst_start.push(grid.assistant_content_start);
-            let (tx, rx) = crossbeam::channel::unbounded();
-            self.scheduler_tx
-                .send(SchedulerRequest::PrefillScope {
-                    timeline,
-                    projection: Arc::clone(&self.projection),
-                    scope_index: i as u32,
-                    scope_total,
-                    tokens: grid.tokens,
-                    user_content_start: grid.user_content_start,
-                    user_content_end: grid.user_content_end,
-                    assistant_content_start: grid.assistant_content_start,
-                    user_text: scope.user.clone(),
-                    assistant_text: scope.assistant.clone(),
-                    tags: tags.clone(),
-                    response_tx: tx,
-                    on_prefilled: Arc::clone(&on_prefilled),
-                })
-                .map_err(|_| ConversationError::SchedulerGone)?;
-            receivers.push(rx);
-        }
-        // The scheduler records the whole batch in scope order once every scope has
-        // landed, then answers each channel — so these recvs unblock together, in
-        // submission order. Collect each recorded turn index (in scope order) for
-        // the staged-provenance pass. Surface the first scope error (if any) after
-        // draining the rest so no channel is left dangling.
-        let mut recorded: Vec<(usize, u32)> = Vec::with_capacity(scopes.len());
-        let mut first_err = None;
-        for (i, rx) in receivers.into_iter().enumerate() {
-            match rx.recv() {
-                Ok(Ok(idx)) => recorded.push((i, idx.0)),
-                Ok(Err(e)) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-                Err(_) => {
-                    if first_err.is_none() {
-                        first_err = Some(ConversationError::SchedulerGone);
-                    }
-                }
-            }
-        }
-        // Stage the sig→event→turn provenance chain for each recorded scope turn —
-        // the parallel analog of `insert_turn_staged`'s per-turn linkage, run once
-        // the whole batch is in the substrate.
-        for (scope_i, turn_index) in recorded {
-            self.persist_staged_ingest_events(turn_index, per_scope_asst_start[scope_i], 0.0, &[])?;
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(per_scope_tokens),
-        }
-    }
-
-    /// Tokenise one scope into its cold-prefill grid + content offsets, matching
-    /// [`insert_turn`](Self::insert_turn)'s layout byte-for-byte:
-    /// `[/no_think][user][user_end][assistant_start][assistant]`. The `/no_think`
-    /// prefix keeps the model out of a reasoning frame over the supplied content.
-    fn prepare_scope_grid(
-        &self,
-        user_message: &str,
-        assistant_text: &str,
-    ) -> crate::Result<PreparedScopeGrid> {
-        let no_think_prefix = self.config.dialect.no_think;
-        let assistant_start_marker = self.config.dialect.assistant_start;
-        let formatted = format!(
-            "{}{}{}{}{}",
-            no_think_prefix,
-            user_message,
-            self.config.dialect.user_end,
-            assistant_start_marker,
-            assistant_text,
+        // Turn B — the response: submit the tool_response and DECODE the summary,
+        // `/no_think` + short + argmax. The decode sees Turn A (just recorded, so
+        // recent) — the summary answers the original request over the returned code.
+        let mut opts = TurnOptions {
+            max_tokens: Some(max_summary_tokens),
+            sampling: Some(SamplingConfig::compression()),
+            tags,
+            ..Default::default()
+        };
+        opts.selection.set_optional(
+            crate::projection::NO_THINK_SELECTOR,
+            crate::projection::OptionalState::Present,
         );
-        let tokens = self.tokenize(&formatted)?;
-        // Tokenise each prefix against the SAME strings the grid is built from so
-        // the offsets land on the real token grid; clamp + monotonise so a
-        // tokenizer that merges across a join can never invert the windows.
-        let user_content_start = self.tokenize(no_think_prefix)?.len();
-        let user_content_end = self
-            .tokenize(&format!("{no_think_prefix}{user_message}"))?
-            .len();
-        let assistant_content_start = self
-            .tokenize(&format!(
-                "{}{}{}{}",
-                no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
-            ))?
-            .len();
-        let total = tokens.len();
-        let user_content_start = user_content_start.min(total) as u32;
-        let user_content_end =
-            (user_content_end.min(total).max(user_content_start as usize)) as u32;
-        let assistant_content_start = (assistant_content_start
-            .min(total)
-            .max(user_content_end as usize)) as u32;
-        Ok(PreparedScopeGrid {
-            token_count: total,
-            tokens,
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-        })
+        let handle = self.submit_turn_with_options(response_user, opts)?;
+        let response = handle.wait()?;
+        let resp_tokens = response.token_ids.len();
+        // Records Turn B + its staged provenance events (the decoded-ingest path).
+        self.finish_turn_staged(handle, &response)?;
+        // Couple the call turn to the response turn — the two halves of one round-trip.
+        if let Some(idx) = call_idx {
+            self.couple_turn(idx)?;
+        }
+        Ok(call_tokens + resp_tokens)
     }
 
     /// Blocking convenience: submit + wait.

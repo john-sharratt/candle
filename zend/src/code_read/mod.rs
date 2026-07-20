@@ -17,14 +17,16 @@
 //! of files, a single-session ingest would run for tens of hours.
 //! Instead [`CODE_READ_PARALLELISM`] workers each process whole files
 //! concurrently, minting a distinct per-file conversation per file.
-//! Within a file, the scopes prefill in parallel too — each on its own
-//! scratch slot via `Sequence::ingest_scopes_parallel`, then recombined
-//! into the file timeline in source order — so a file's scopes (and
-//! scopes across files) batch into large forwards that amortise the MoE
-//! expert-weight load instead of prefilling one-at-a-time.  The
-//! scheduler owns cross-file fairness and the scratch-slot bound; the
-//! resolver's `active_timelines_for_group` iterator surfaces every
-//! file's timeline to dialogue retrieval without code changes.
+//! Within a file, scopes are ingested SERIALLY as two-coupled-turn tool
+//! round-trips ([`Sequence::ingest_scope_roundtrip`]) — the response
+//! turn's summary must decode with the call turn in its projected
+//! prefix, so the two halves can't batch independently. The parallelism
+//! is therefore across FILES: each concurrent worker contributes one
+//! sequence to the engine's shared multi-session batching (its scope
+//! decodes coalesce with every other worker's into one forward), which
+//! amortises the MoE expert-weight load. The resolver's
+//! `active_timelines_for_group` iterator surfaces every file's timeline
+//! to dialogue retrieval without code changes.
 
 pub mod carve;
 pub mod header;
@@ -87,12 +89,21 @@ impl CodeReadState {
     }
 }
 
-/// Emit one file's scope turns into `sink` — a prefill turn per carved scope
-/// (read_file tool-call + response) so the model absorbs the whole file across
-/// the conversation. There is NO per-file summary decode: the file summary is
-/// the root of the async summary tree the summariser builds over these turns
-/// (`log₈(N)` `SummaryOfSummaries` rollup). Shared by the production per-file
-/// ingest ([`process_one_file`]) and the sink-driven reference/test path
+/// Max tokens for a scope's decoded two-sentence summary (the response turn).
+const SCOPE_SUMMARY_MAX_TOKENS: usize = 100;
+
+/// Emit one file's scopes into `sink` — each scope as a TOOL ROUND-TRIP of two
+/// coupled turns:
+///   Turn A (call):     user("Summarize `path` (lines a-b)…") → assistant(<tool_call>)
+///   Turn B (response):  user(<tool_response> with the source) → assistant(DECODED summary)
+///
+/// Recording each scope as two coupled turns (rather than one baked four-segment
+/// blob) is what keeps the inter-turn role seams as REGENERATED glue — a seam
+/// baked into K/V goes stale when the scope is re-injected at a different
+/// position mid-dialogue. The `read_file` tool round-trip teaches the model the
+/// "use a tool, read the response, answer" pattern, and the decoded summary
+/// anchors the scope for provenance. Shared by the production per-file ingest
+/// ([`process_one_file`]) and the sink-driven reference/test path
 /// ([`ingest_code_reading_into_sink`]).
 fn emit_file_turns<S: InsertTurnSink>(
     sink: &mut S,
@@ -103,45 +114,29 @@ fn emit_file_turns<S: InsertTurnSink>(
     on_prefilled: candle_conversation::ScopeProgressFn,
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
-    // Build every scope's (user, assistant) exchange up-front, then prefill them
-    // all in parallel — one scratch slot per scope — so the file's scopes batch
-    // into large amortising forwards instead of prefilling one-at-a-time. The
-    // scopes are recorded into the file timeline in this (source) order.
-    // Each scope reconstructs as a full four-segment tool exchange:
-    //   user(excerpt header) → assistant(<tool_call>) → user(<tool_response>) →
-    //   assistant(read confirmation).
-    // The `<tool_response>` comes back in a *user* turn (the Hermes/Qwen
-    // tool-result convention), and the closing assistant turn keeps the sequence
-    // from ending on a user turn (which would collide with the next turn's user
-    // opener). Both dialect role boundaries are spliced into the one `assistant`
-    // string the sink records — the substrate frames the leading user header and
-    // trailing assistant-end itself.
-    let bounds = sink.tool_exchange_boundaries();
-    let mut scope_turns: Vec<(String, String)> = Vec::with_capacity(scopes.len());
+    // Serial per scope: the response turn's summary must decode with the call
+    // turn in its projected prefix, so the two halves can't batch independently.
+    // Gather-scope tags `["code", <path>]` scope every turn into a code-tagged
+    // provenance gallery (and out of the untagged dialogue partition).
+    let tags = vec!["code".to_string(), path.to_string()];
     for scope in scopes {
         let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
-        let user = header::render_part_user_prompt(path, scope);
-        let assistant = format!(
-            "{call}{b1}{response}{b2}{ack}",
-            call = header::render_tool_call(path, scope),
-            b1 = bounds.call_to_response,
-            response = header::render_tool_response(path, scope, language, &body),
-            b2 = bounds.response_to_close,
-            ack = header::render_read_ack(path, scope),
-        );
-        scope_turns.push((user, assistant));
+        let call_user = header::render_part_user_prompt(path, scope);
+        let call_assistant = header::render_tool_call(path, scope);
+        let response_user = header::render_tool_response(path, scope, language, &body);
+        // Records the call turn, decodes + records the response summary, couples
+        // the pair. The role boundaries between and around the two turns are
+        // regenerated glue, never baked (see `Sequence::ingest_scope_roundtrip`).
+        let tokens = sink.ingest_scope_roundtrip(
+            &call_user,
+            &call_assistant,
+            &response_user,
+            tags.clone(),
+            SCOPE_SUMMARY_MAX_TOKENS,
+        )?;
+        // Fire per scope so the ingest bar + token count advance live.
+        on_prefilled(tokens);
     }
-    // `on_prefilled` fires per scope as it lands on the wave, so the ingest bar
-    // and token count advance live instead of jumping only when the file's whole
-    // batch flushes. Gather-scope tags `["code", <path>]` scope every scope turn
-    // into a code-tagged provenance gallery (and out of the untagged dialogue
-    // partition); the path tag doubles as the slot label. The whole-file summary
-    // is the async summariser's rollup — not decoded inline here.
-    sink.insert_prefill_turns_parallel(
-        &scope_turns,
-        vec!["code".to_string(), path.to_string()],
-        on_prefilled,
-    )?;
     Ok(())
 }
 
@@ -215,21 +210,27 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 pub const MAX_DECODE_FAILURES: usize = 16;
 
 /// Number of files ingested concurrently by the worker pool. Each worker owns
-/// one file conversation and drives it through [`process_one_file`]; a file's
-/// own scopes prefill in parallel underneath, via the scheduler's parallel
-/// scope-ingest (`Sequence::ingest_scopes_parallel`). So the effective prefill
-/// width is the scheduler's scope-slot bound (`Scheduler::MAX_SCOPE_SLOTS`),
-/// NOT this — this only sets how many files' scopes are in flight at once for
-/// cross-file fairness (a lone file still claims all the scope slots).
+/// one file conversation and drives it through [`process_one_file`], ingesting
+/// that file's scopes SERIALLY as two-coupled-turn tool round-trips
+/// ([`Sequence::ingest_scope_roundtrip`]). So this IS the concurrency knob: it's
+/// the number of conversations feeding the engine at once, which is the width
+/// the engine's multi-session batching coalesces — every worker blocking on its
+/// scope's summary decode contributes one sequence to the shared
+/// `batch_decode_step` forward. (Decode width scales with this directly; PREFILL
+/// width is separately capped by `Scheduler::MAX_PREFILL_WIDTH` + the AIMD admit
+/// window, so raising this past ~24 widens decodes but not prefills.)
 ///
-/// 24 files concurrently. **Invariant:** this plus `MAX_SCOPE_SLOTS` must stay
-/// below the model's sequence-slot capacity — each worker holds one file
-/// conversation slot and the pump allocates up to `MAX_SCOPE_SLOTS` scratch
-/// slots on top, so `24 + 20 = 44` must fit (the dev target seats 64). If the
-/// two together exceed capacity the pump's re-queue-on-capacity backpressure
-/// keeps it correct (it just runs narrower), but it must not consume every slot
-/// or the blocked workers can't free theirs — keep the sum under capacity.
-pub const CODE_READ_PARALLELISM: usize = 24;
+/// **Invariant:** each worker holds exactly ONE conversation slot (no scratch
+/// slots — the old parallel scope-ingest pump is gone), so this must stay under
+/// the model's sequence-slot capacity WITH headroom for the non-ingest slots the
+/// engine also needs concurrently: the live dialogue session, the async
+/// summariser's compression passes, etc.
+///
+/// The engine is expected to absorb this many concurrent conversations and
+/// manage VRAM itself (evict the right cold KV, keep the working set hot), so
+/// this is a concurrency target, not a VRAM-safety valve — raising it should let
+/// the engine batch wider, not thrash.
+pub const CODE_READ_PARALLELISM: usize = 48;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
 /// (no reprojection), inheriting the utility C5 compression level.
@@ -481,7 +482,7 @@ pub fn ingest_code_reading(
         n_scopes = total,
         n_cached = present_hashes.len(),
         "code_read: per-file ingest across {n_workers} file workers; each file's \
-         scopes prefill in parallel underneath (scheduler scope-slot bound)",
+         scopes are serial tool round-trips, batched across workers by the engine",
     );
     progress.set_step_progress(0, total as u64);
 
@@ -647,14 +648,21 @@ fn process_one_file(
                 );
             }
         }
-        e.new_conversation_with_projection(
-            system_prompt,
-            proj_builder.clone(),
-            layer,
-            group,
-            utility_cfg.clone(),
-        )
-        .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?
+        let conv = e
+            .new_conversation_with_projection(
+                system_prompt,
+                proj_builder.clone(),
+                layer,
+                group,
+                utility_cfg.clone(),
+            )
+            .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
+        // Each code scope now carries its OWN decoded two-sentence summary as its
+        // closing assistant turn (see the redesign note above `emit_file_turns`),
+        // so the AVL summariser must not also compress these turns into a separate
+        // summary tree — disable summarisation for this per-file conversation.
+        e.set_timeline_summarize(conv.timeline_id(), false);
+        conv
     };
 
     // Shape the file's turns (per-part prefills + final summary decode),

@@ -171,9 +171,9 @@ fn line_spans_scope(children: &[String], height: u8) -> String {
 
 /// Parse a line reference out of one token, in either form it occurs in:
 ///
-/// - the **excerpt header** a `code_reading` turn's user half actually carries —
-///   ``Source excerpt — `src/auth/handler.rs` lines 47-93:`` (see
-///   `zend::code_read::header::render_part_user_prompt`);
+/// - the **summarise-request header** a `code_reading` turn's user half actually
+///   carries — ``Summarize `src/auth/handler.rs` (lines 47-93) in no more than
+///   two sentences.`` (see `zend::code_read::header::render_part_user_prompt`);
 /// - the **compact** `path:a-b` this derivation itself emits, so a roll-up can
 ///   re-parse its children's scopes and merge again one level up.
 ///
@@ -183,15 +183,25 @@ fn parse_ref(token: &str) -> Option<(&str, (u32, u32))> {
     parse_excerpt_ref(token).or_else(|| parse_compact_ref(token))
 }
 
-/// ``… `path` lines A-B …`` — the excerpt header form. The path is the
-/// backticked segment; requiring the backticks keeps the surrounding prose
-/// ("Source excerpt — ") out of it.
+/// ``… `path` (lines A-B) …`` (and the older ``… `path` lines A-B …``) — the
+/// request-header form. The path is the backticked segment; requiring the
+/// backticks keeps the surrounding prose ("Summarize ", the trailing sentence
+/// count) out of it. The span is the leading `A-B` immediately after `lines `,
+/// so trailing prose (`) in no more than two sentences.`) never bleeds into it.
 fn parse_excerpt_ref(token: &str) -> Option<(&str, (u32, u32))> {
-    let (head, tail) = token.rsplit_once(" lines ")?;
+    // Split on `lines ` (no leading space) so both `(lines 47-93)` and the older
+    // ` lines 47-93:` head forms leave the backticked path in `head`.
+    let (head, tail) = token.rsplit_once("lines ")?;
     let mut backticked = head.rsplit('`');
     let _after = backticked.next()?;
     let path = backticked.next().filter(|p| !p.is_empty())?;
-    let span = parse_span(tail.trim_end_matches(|c: char| !c.is_ascii_digit()))?;
+    // Take the leading span token only — digits, '-', spaces — up to the first
+    // other char (`)`, `:`, or the start of the trailing prose).
+    let span_str: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == ' ')
+        .collect();
+    let span = parse_span(span_str.trim())?;
     Some((path, span))
 }
 
@@ -390,6 +400,13 @@ mod tests {
     /// `line_spans` do anything at all on a live substrate.
     #[test]
     fn parses_the_production_excerpt_header() {
+        assert_eq!(
+            parse_ref(
+                "Summarize `src/auth/handler.rs` (lines 47-93) in no more than two sentences."
+            ),
+            Some(("src/auth/handler.rs", (47, 93)))
+        );
+        // The older ``… lines A-B:`` header form still parses (robustness).
         assert_eq!(
             parse_ref("Source excerpt — `src/auth/handler.rs` lines 47-93:"),
             Some(("src/auth/handler.rs", (47, 93)))

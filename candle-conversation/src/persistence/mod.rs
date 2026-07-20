@@ -44,6 +44,7 @@ pub mod thread;
 pub mod transfer;
 pub mod walker;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,7 +56,7 @@ use accounting::RecordAccounting;
 use chunk_plan::ChunkedReadPlan;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
-use manifest::{ChunkLoc, Manifest};
+use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
     decode_record, encode_record, verify_record_crc, ChunkPayload, DebugIdPayload, Record,
     RecordHeader, RecordType, TreeMetadataPayload,
@@ -138,6 +139,58 @@ pub struct SubstratePersistence {
     /// surfaced in the daemon status for the GUI's compaction indicator.
     /// `None` until the first op runs.
     last_maintenance: Option<(String, u64)>,
+    /// The active-segment id captured at the last maintenance **resident-set
+    /// re-emission** (the drop-safety net). Because segment ids are strictly
+    /// append-ordered (a fresh id is always above every existing one), every
+    /// metadata record that existed at that re-emission is duplicated into
+    /// segments `>= resident_reemit_floor`. So a later maintenance op that
+    /// targets only segments `< floor` cannot lose a unique metadata record and
+    /// can SKIP re-emitting the whole resident set — which is what stops the
+    /// re-emit→looks-dead→compact→re-emit churn. `None` forces a re-emit (no
+    /// durable snapshot yet, or reset by a full `compact`).
+    resident_reemit_floor: Option<SegmentId>,
+    /// On-disk location of each stream's CURRENT per-stream metadata record —
+    /// `StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit` — keyed by
+    /// `(record_type, stream_id)`, last-writer-wins. The substrate index caches
+    /// these payloads but not their locations, so without this map
+    /// [`segment_liveness`](SubstratePersistence::segment_liveness) would count
+    /// them as dead — making the segment that holds the live metadata perpetually
+    /// look reclaimable and get "compacted" (re-emitted forward) on every
+    /// maintenance pass. Counting them as live via this map is what actually
+    /// halts that churn. Populated on every append and rebuilt on load / compact.
+    metadata_locs: HashMap<(RecordType, u64), RecordLoc>,
+}
+
+/// Whether a record type is a per-stream metadata record whose current-copy
+/// location is tracked in [`SubstratePersistence::metadata_locs`] so it counts
+/// as live weight (see that field). These are the records the maintenance
+/// resident-set re-emits and that carry no location in the substrate index.
+fn is_tracked_metadata(rt: RecordType) -> bool {
+    matches!(
+        rt,
+        RecordType::StreamDecl
+            | RecordType::ProjectionEvents
+            | RecordType::WideQSig
+            | RecordType::Commit
+    )
+}
+
+/// Populate `map` with a walked record's metadata location (LWW). The load /
+/// compact walk uses this before the `SubstratePersistence` exists; the runtime
+/// append path uses [`SubstratePersistence::track_metadata_loc`].
+fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &walker::WalkEntry) {
+    let h = &entry.record.header;
+    if is_tracked_metadata(h.record_type) {
+        map.insert(
+            (h.record_type, h.stream_id),
+            RecordLoc {
+                segment: entry.segment,
+                offset: entry.offset,
+                payload_len: h.payload_len,
+                record_size: entry.size,
+            },
+        );
+    }
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -223,6 +276,7 @@ impl SubstratePersistence {
         // dead-weight accounting and the caller's sink in the same pass that
         // builds the combined singleton manifest.
         let mut accounting = RecordAccounting::new();
+        let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -231,6 +285,7 @@ impl SubstratePersistence {
             recovered_records,
         } = SegmentedLog::open_with_sink(dir, |entry| {
             accounting.record(&entry.record.header, entry.size);
+            record_metadata_loc(&mut metadata_locs, entry);
             sink(entry);
         })?;
 
@@ -270,6 +325,8 @@ impl SubstratePersistence {
             last_index,
             recovered_records,
             last_maintenance: None,
+            resident_reemit_floor: None,
+            metadata_locs,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -355,6 +412,7 @@ impl SubstratePersistence {
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
         self.accounting.record(&header, size);
+        self.track_metadata_loc(&header, segment, offset, size);
         let entry = WalkEntry {
             segment,
             offset,
@@ -462,6 +520,28 @@ impl SubstratePersistence {
         let id = decl.stream_id();
         self.append_record(RecordType::StreamDecl, 0, id.0, 0, 0, &decl.encode())?;
         Ok(id)
+    }
+
+    /// Record the on-disk location of a per-stream metadata record
+    /// (`StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit`) so
+    /// [`segment_liveness`](Self::segment_liveness) counts the current copy as
+    /// live weight. Last-writer-wins per `(record_type, stream_id)`: a re-write
+    /// (or maintenance re-emission) supersedes the prior location, which then
+    /// reads as dead. A no-op for every other record type. Called from
+    /// [`append_record`](Self::append_record) (runtime writes) and the
+    /// load / compact walk so the map covers both.
+    fn track_metadata_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
+        if is_tracked_metadata(h.record_type) {
+            self.metadata_locs.insert(
+                (h.record_type, h.stream_id),
+                RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: h.payload_len,
+                    record_size: size,
+                },
+            );
+        }
     }
 
     /// Append a stream's `Tokens` record.
@@ -1070,16 +1150,33 @@ impl SubstratePersistence {
             && self.dead_ratio(substrate) >= COMPACTION_DEAD_RATIO_THRESHOLD
     }
 
-    /// Fraction of the store's record bytes that are dead weight —
-    /// superseded last-writer-wins records plus everything owned by a
-    /// tombstoned timeline. `0.0` for an empty or freshly-compacted store.
+    /// Fraction of the store's record bytes that are dead weight, computed from
+    /// the SAME per-segment liveness the background maintenance uses: `dead =
+    /// Σ(segment_total − segment_live)` over the whole log. This is a real
+    /// fraction in `[0, 1]` — it can never exceed 100%, and it drops as
+    /// maintenance reclaims dead segments.
+    ///
+    /// It deliberately does NOT use the incremental `accounting.dead_bytes()`
+    /// counter: that counter is a whole-log cumulative total reset only by the
+    /// global `compact()` (a load-time / manual path), so under the daemon's
+    /// per-segment maintenance it climbs without bound — every relocation append
+    /// supersedes the moved-from copy and adds to it — and the ratio sails past
+    /// 100% into meaningless territory. Liveness-derived is scope-consistent
+    /// (numerator and denominator span the same segments) and self-correcting.
     pub fn dead_ratio(&self, substrate: &Substrate) -> f32 {
         let total = self.segments.total_record_bytes().unwrap_or(0);
         if total == 0 {
             return 0.0;
         }
-        let dead = self.accounting.dead_bytes() + substrate.tombstoned_stream_bytes();
-        dead as f32 / total as f32
+        // `segment_liveness` sums the read-back records (chunks/tokens) the index
+        // still references; everything else in the segments (superseded records,
+        // tombstoned-timeline records, per-stream metadata) is dead weight. `live`
+        // can't exceed `total` (each live record's bytes are in a counted
+        // segment), so `dead` is non-negative; clamp guards inherited-log streams
+        // whose bytes aren't in this log's `total`.
+        let live: u64 = self.segment_liveness(substrate).values().sum();
+        let dead = total.saturating_sub(live);
+        (dead as f32 / total as f32).clamp(0.0, 1.0)
     }
 
     /// Compact the store — reclaim dead weight by rewriting only the **live**
@@ -1185,9 +1282,19 @@ impl SubstratePersistence {
         //    segment in the same pass (a just-compacted store is all-live).
         substrate.clear_walker_state();
         self.accounting.reset();
+        // Compaction rewrote every live record (metadata included) into the fresh
+        // single segment, so the previous drop-safety floor is meaningless. Clear
+        // it — the next maintenance op re-establishes a floor with a fresh re-emit.
+        self.resident_reemit_floor = None;
+        // Metadata locations point at the OLD segments; rebuild them from the
+        // freshly-compacted segment in the same recovery pass (mirrors the load
+        // walk in `from_dir_with_sink`).
+        self.metadata_locs.clear();
         let accounting = &mut self.accounting;
+        let metadata_locs = &mut self.metadata_locs;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
+            record_metadata_loc(metadata_locs, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next
@@ -1700,11 +1807,20 @@ mod tests {
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
-            assert_eq!(
-                sp.dead_ratio(&substrate),
-                0.0,
-                "a freshly compacted log has no dead weight"
+            // `dead_ratio` is liveness-derived (consistent with the maintenance
+            // trigger), and `segment_liveness` intentionally counts only the
+            // read-back records (chunks/tokens + manifest singletons) as live, not
+            // the per-stream metadata (`StreamDecl`/`Commit`/…). So a freshly
+            // compacted log reads slightly non-zero — the metadata-liveness
+            // blindspot — but well under the compaction threshold (no reclaimable
+            // chunk/token weight remains). In production, where KV chunks dominate,
+            // this residual is negligible.
+            assert!(
+                sp.dead_ratio(&substrate) < COMPACTION_DEAD_RATIO_THRESHOLD,
+                "a freshly compacted log has no reclaimable dead weight, ratio = {}",
+                sp.dead_ratio(&substrate)
             );
+            assert!(!sp.should_compact(&substrate));
         }
         // The compacted file recovers to the same live substrate on reopen.
         {

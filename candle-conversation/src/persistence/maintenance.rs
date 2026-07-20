@@ -449,7 +449,15 @@ impl SubstratePersistence {
         let Some(op) = pick_maintenance_op(&stats, force) else {
             return Ok(None);
         };
-        let resident = gather_resident_set(substrate);
+        // Re-emit the resident (metadata) set only when this op could otherwise
+        // lose a unique metadata record — i.e. it targets a segment not covered by
+        // the last re-emission. Skipping it for older-only targets is what breaks
+        // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
+        let resident = if self.need_resident_reemit(&op.targets()) {
+            gather_resident_set(substrate)
+        } else {
+            Vec::new()
+        };
         let (chunk_relocs, token_relocs, singleton_relocs) =
             self.gather_relocations(substrate, &op.targets());
         Ok(Some(MaintenancePlan {
@@ -461,6 +469,24 @@ impl SubstratePersistence {
         }))
     }
 
+    /// Whether a maintenance op targeting `targets` must re-emit the whole
+    /// resident (metadata) set as a drop-safety net, or can safely skip it.
+    ///
+    /// Safe to skip iff every target segment is strictly older than
+    /// [`resident_reemit_floor`](SubstratePersistence::resident_reemit_floor):
+    /// segment ids are append-ordered, so the last re-emission duplicated every
+    /// then-existing metadata record into segments `>= floor`; a target `<
+    /// floor` therefore holds only records that predate the re-emission, each
+    /// with a surviving copy at `>= floor`. Dropping it loses nothing. A `None`
+    /// floor (no durable snapshot yet) or any target `>= floor` (which may hold
+    /// metadata written after the last re-emission) forces a re-emit.
+    fn need_resident_reemit(&self, targets: &[SegmentId]) -> bool {
+        match self.resident_reemit_floor {
+            None => true,
+            Some(floor) => targets.iter().any(|t| *t >= floor),
+        }
+    }
+
     /// **Phase 2** — the slow I/O: append the resident set, then relocate each
     /// target segment's live records into the active, then commit. Holds only
     /// the persistence lock; the caller does **not** hold the substrate lock
@@ -469,9 +495,17 @@ impl SubstratePersistence {
     /// new locations for [`MaintenanceResult::apply_to_substrate`].
     pub fn execute_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceResult> {
         // Resident set — re-emitted from in-RAM state (not read from disk), so
-        // the normal encoding append.
-        for r in &plan.resident {
-            self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, &r.payload)?;
+        // the normal encoding append. When re-emitted, record the active segment
+        // it lands into (captured BEFORE the appends, the floor of the segments
+        // the re-emission writes to) as the new drop-safety floor, so subsequent
+        // older-only ops can skip the re-emission (see `need_resident_reemit`). An
+        // empty resident set means the planner chose to skip — leave the floor.
+        if !plan.resident.is_empty() {
+            let reemit_floor = self.segments.active_id();
+            for r in &plan.resident {
+                self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, &r.payload)?;
+            }
+            self.resident_reemit_floor = Some(reemit_floor);
         }
 
         // Chunks — the relocation bulk. Group by source segment and move each
@@ -619,9 +653,18 @@ impl SubstratePersistence {
     /// apply. Safe because the index no longer points at any source (Phase 3
     /// repointed the live records; the rest were dead).
     pub fn finish_maintenance(&mut self, plan: &MaintenancePlan) -> Result<()> {
-        for t in plan.op.targets() {
+        let targets = plan.op.targets();
+        for &t in &targets {
             self.segments.drop_sealed(t)?;
         }
+        // Drop metadata-location entries that pointed into the now-unlinked
+        // segments. Live metadata for non-tombstoned streams was already
+        // re-pointed forward by the resident re-emission (or never lived here, per
+        // the reemit-floor invariant); any residue is a tombstoned stream's
+        // metadata, which is genuinely gone with its segment. Leaving stale
+        // entries would mis-attribute live bytes to a segment that no longer exists.
+        self.metadata_locs
+            .retain(|_, loc| !targets.contains(&loc.segment));
         let unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -638,7 +681,11 @@ impl SubstratePersistence {
         substrate: &mut Substrate,
         op: &MaintenanceOp,
     ) -> Result<()> {
-        let resident = gather_resident_set(substrate);
+        let resident = if self.need_resident_reemit(&op.targets()) {
+            gather_resident_set(substrate)
+        } else {
+            Vec::new()
+        };
         let (chunk_relocs, token_relocs, singleton_relocs) =
             self.gather_relocations(substrate, &op.targets());
         let plan = MaintenancePlan {
@@ -744,9 +791,15 @@ impl SubstratePersistence {
         {
             *live.entry(loc.segment).or_default() += loc.record_size;
         }
-        for (_sid, entry) in substrate.all_streams() {
+        // Stream ids whose timeline is tombstoned — their records (chunks, tokens,
+        // AND metadata) are all dead weight the maintenance reclaims, so exclude
+        // their metadata from the live count below (else the tombstoned segment
+        // never looks reclaimable).
+        let mut tombstoned_streams: HashSet<u64> = HashSet::new();
+        for (sid, entry) in substrate.all_streams() {
             let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
             if is_tomb {
+                tombstoned_streams.insert(sid.0);
                 continue;
             }
             if distill.is_none() {
@@ -759,6 +812,19 @@ impl SubstratePersistence {
                     *live.entry(loc.segment).or_default() += loc.record_size;
                 }
             }
+        }
+        // Per-stream metadata records (`StreamDecl` / `ProjectionEvents` /
+        // `WideQSig` / `Commit`) carry no location in the substrate index, so they
+        // are counted from the persistence-side `metadata_locs` map instead —
+        // last-writer-wins, so only the CURRENT copy of each is here; superseded
+        // copies are absent and correctly read as dead. Without this the segment
+        // holding a stream's live metadata reads as reclaimable and gets
+        // re-emitted-forward every maintenance pass (the periodic-compaction churn).
+        for ((_rt, stream_id), loc) in &self.metadata_locs {
+            if tombstoned_streams.contains(stream_id) {
+                continue;
+            }
+            *live.entry(loc.segment).or_default() += loc.record_size;
         }
         live
     }
@@ -953,6 +1019,81 @@ mod tests {
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), chunk_payload(2));
             assert_eq!(substrate.live_chunk_count(), 1);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stream's CURRENT per-stream metadata (here a `WideQSig`) counts as LIVE
+    /// weight in `segment_liveness`, so a segment holding only live metadata is
+    /// not seen as reclaimable dead — the fix that stops such a segment from being
+    /// re-emitted-forward on every maintenance pass. Also survives a reload (the
+    /// location map is rebuilt from the walk).
+    #[test]
+    fn current_metadata_counts_as_live_weight() {
+        let dir = tmp_dir("meta_live");
+        let sid = StreamId(777);
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.append_wide_q_sigs(sid, b"wide-q-signature-bytes")
+                .unwrap();
+            sp.commit().unwrap();
+            let live: u64 = sp.segment_liveness(&substrate).values().sum();
+            assert!(
+                live > 0,
+                "a stream's current WideQSig metadata must count as live weight"
+            );
+            // Superseding it leaves exactly one live copy (LWW) — liveness stays
+            // bounded, it does not accumulate per re-write.
+            sp.append_wide_q_sigs(sid, b"newer-wide-q-signature")
+                .unwrap();
+            sp.commit().unwrap();
+            assert_eq!(
+                sp.metadata_locs
+                    .keys()
+                    .filter(|(rt, s)| *rt == RecordType::WideQSig && *s == sid.0)
+                    .count(),
+                1,
+                "last-writer-wins: one current metadata location per (type, stream)"
+            );
+        }
+        // Rebuilt from the walk on reload.
+        {
+            let mut substrate = Substrate::new();
+            let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let live: u64 = sp.segment_liveness(&substrate).values().sum();
+            assert!(live > 0, "metadata liveness must survive a reload");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The re-emit skip guard (`need_resident_reemit`) is what breaks the
+    /// compaction churn: once the resident (metadata) set is durable at `floor`,
+    /// ops targeting only older segments skip the wholesale re-emission — so they
+    /// stop generating fresh uncounted-dead metadata that would trigger the next
+    /// compaction — while any target at/after `floor` (which may hold metadata
+    /// written after the snapshot) forces a re-emit.
+    #[test]
+    fn need_resident_reemit_skips_old_only_targets() {
+        let dir = tmp_dir("reemit_floor");
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+
+        // No durable snapshot yet → always re-emit.
+        assert!(sp.need_resident_reemit(&[SegmentId(1)]));
+
+        // A durable snapshot at floor = seg 10 duplicated every then-existing
+        // metadata record into segments >= 10.
+        sp.resident_reemit_floor = Some(SegmentId(10));
+        // Targets strictly older than the floor are all duplicated at >= floor → skip.
+        assert!(!sp.need_resident_reemit(&[SegmentId(5)]));
+        assert!(!sp.need_resident_reemit(&[SegmentId(9), SegmentId(1)]));
+        // A target at/after the floor may hold post-snapshot metadata → re-emit.
+        assert!(sp.need_resident_reemit(&[SegmentId(10)]));
+        assert!(sp.need_resident_reemit(&[SegmentId(12)]));
+        // Any target at/after the floor in a mixed set forces a re-emit.
+        assert!(sp.need_resident_reemit(&[SegmentId(5), SegmentId(11)]));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

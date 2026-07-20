@@ -300,10 +300,7 @@ fn run_loop(
         // Stamp the backlog this pass is about to face (pre-drain). Held high
         // for the whole pass so the scheduler keeps ingest throttled while a
         // long drain is in flight — the conservative direction.
-        pending_warm_bytes.store(
-            conversation.read().pending_warm_bytes(),
-            Ordering::Relaxed,
-        );
+        pending_warm_bytes.store(conversation.read().pending_warm_bytes(), Ordering::Relaxed);
 
         let run_maintenance = last_maintenance.elapsed() >= MAINTENANCE_INTERVAL;
         if run_maintenance {
@@ -321,10 +318,7 @@ fn run_loop(
 
         // Re-stamp the residual backlog (post-drain) so the signal decays as
         // soon as the pass installs warm, letting admission reopen promptly.
-        pending_warm_bytes.store(
-            conversation.read().pending_warm_bytes(),
-            Ordering::Relaxed,
-        );
+        pending_warm_bytes.store(conversation.read().pending_warm_bytes(), Ordering::Relaxed);
 
         // run_pass migrates all pending hot→warm before returning, so by here
         // the just-sealed turns hold a warm copy — signal the waiting flush.
@@ -510,8 +504,12 @@ fn migrate_group_hot_to_warm(
         // per-layer convert — proven by `quantize_layers_batched_matches_per_layer`.
         if !all_descs.is_empty() {
             let t_conv = std::time::Instant::now();
-            let conv =
-                candle_nn::kv_cache::convert_deferred_descs(&backings[0], &all_descs, n_kv_head, device);
+            let conv = candle_nn::kv_cache::convert_deferred_descs(
+                &backings[0],
+                &all_descs,
+                n_kv_head,
+                device,
+            );
             let dt = t_conv.elapsed().as_millis() as u64;
             *quantize_ms += dt;
             *convert_ms += dt;
@@ -530,8 +528,10 @@ fn migrate_group_hot_to_warm(
         // syncs), which was the dominant `copy_ms` term. Bit-identical to the
         // per-layer migrate — proven by the compress-test A/B.
         let t_c = std::time::Instant::now();
-        let per_layer_refs: Vec<Vec<&SealedSequence>> =
-            gpu_hot_per_layer.iter().map(|v| v.iter().collect()).collect();
+        let per_layer_refs: Vec<Vec<&SealedSequence>> = gpu_hot_per_layer
+            .iter()
+            .map(|v| v.iter().collect())
+            .collect();
         let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
         let warm_result = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch(
             &backing_refs,
@@ -747,6 +747,7 @@ fn run_pass(
     // to install (isolates a dominant `device.synchronize()` cost). This is the
     // number that tells us whether the drain is sync-bound, the serial 48-layer
     // migrate, or install-lock-bound.
+    let total_ms = t_pass.elapsed().as_millis() as u64;
     if hot_to_warm_count > 0 || sync_pre_ms + migrate_ms + sync_post_ms > 50 {
         tracing::debug!(
             target: "candle_conversation::persistence::tier",
@@ -762,9 +763,20 @@ fn run_pass(
             copy_ms,
             sync_post_ms,
             install_ms,
-            total_ms = t_pass.elapsed().as_millis() as u64,
+            total_ms,
             "hot→warm pass timing"
         );
+    }
+    // Feed the instrumented migration panel straight from the pass (no log tail).
+    if hot_to_warm_count > 0 {
+        crate::scheduler::phase_ring::push_migrate(crate::scheduler::phase_ring::migrate_sample(
+            hot_to_warm_count as u64,
+            hot_to_warm_bytes / (1 << 20),
+            migrate_ms,
+            quantize_ms,
+            copy_ms,
+            total_ms,
+        ));
     }
 
     // ── Phase 2: warm → cold ────────────────────────────────────────────

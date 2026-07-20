@@ -2,12 +2,13 @@
 //! tool-call conversation.
 //!
 //! Each file becomes ONE conversation. Every carved part of the file
-//! contributes a prefilled four-segment tool exchange that teaches the model
-//! the canonical "use a tool, read the response, confirm" pattern:
+//! contributes a prefilled tool exchange that ends on a real, DECODED assistant
+//! turn — a two-sentence summary the model generates over the excerpt it just
+//! "read":
 //!
 //! ````text
-//! Segment 1 (user):
-//!   Source excerpt — `src/auth/handler.rs` lines 47-93:
+//! Segment 1 (user — the request):
+//!   Summarize `src/auth/handler.rs` (lines 47-93) in no more than two sentences.
 //!
 //! Segment 2 (assistant — tool call):
 //!   <tool_call>{"name":"read_file","arguments":{"path":"src/auth/handler.rs",
@@ -25,8 +26,9 @@
 //!   ```
 //!   </tool_response>
 //!
-//! Segment 4 (assistant — read confirmation):
-//!   Read `src/auth/handler.rs` lines 47-93 — impl AuthHandler > fn validate_token.
+//! Segment 4 (assistant — DECODED two-sentence summary):
+//!   AuthHandler::validate_token verifies a bearer token and returns its Claims,
+//!   erroring on an expired or malformed token. …
 //!
 //! ... (one such exchange per part, in file order) ...
 //! ````
@@ -35,12 +37,14 @@
 //! 2 and 3 carry the call and its result, joined into the assistant string with
 //! the dialect role boundaries the substrate frames around. So a scope
 //! reconstructs as a complete `user → assistant → user → assistant`
-//! alternation, never ending on a user turn. The user prompt is rendered by
-//! [`render_part_user_prompt`], the call/response by [`render_tool_call`] /
-//! [`render_tool_response`], and the closer by [`render_read_ack`]; the parts
-//! are inserted via [`crate::turn_sink::InsertTurnSink`]. There is no inline
-//! whole-file summary decode: the file's semantic summary is the async summary
-//! tree's root, which the summariser builds by rolling up these scope turns.
+//! alternation, never ending on a user turn. Segment 1 (a genuine summarise
+//! *request*) is rendered by [`render_part_user_prompt`], the call/response by
+//! [`render_tool_call`] / [`render_tool_response`]; the prefilled string stops
+//! at the `<tool_response>`'s user-end, and the scheduler then DECODES segment 4
+//! — the two-sentence summary — as the closing assistant turn. That decoded
+//! summary doubles as the scope's provenance anchor (a semantic key retrieves
+//! better than raw source), so there is no separate async whole-file summary for
+//! these turns — the summariser is disabled on the code_reading timeline.
 //!
 //! The `<tool_call>` / `</tool_call>` tags in the part turns mirror the
 //! Hermes format the dialogue layer's tool-call extractor scans for
@@ -51,16 +55,15 @@
 use super::types::Scope;
 use crate::repo_scan::Language;
 
-/// Per-part user prompt for the one-conversation-per-file layout: a
-/// labelled reference header naming the file and line range (no per-part
-/// summary — the whole file is summarised by the async summary tree).
+/// Per-part user prompt for the one-conversation-per-file layout: a genuine
+/// summarise request naming the file (full path) and line range. The scheduler
+/// answers it by decoding a two-sentence summary as the closing assistant turn,
+/// so this turn reconstructs as a real request→answer exchange (not a
+/// context-stuffed reference blob) and the decoded summary anchors the scope for
+/// provenance retrieval.
 pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
-    // Reference header, not a first-person request: this prefill turn is
-    // context-stuffed source the model attends to as background, so framing it
-    // as "Read X" would make it read as a user question in conversation-history
-    // recall. A labelled excerpt header reads as injected reference instead.
     format!(
-        "Source excerpt — `{path}` lines {start}-{end}:",
+        "Summarize `{path}` (lines {start}-{end}) in no more than two sentences.",
         path = path,
         start = scope.start_line,
         end = scope.end_line,
@@ -123,22 +126,6 @@ pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body:
     )
 }
 
-/// Closing assistant segment for a part turn — a concise confirmation that
-/// names the scope just read (file, line range, and the symbol nesting path).
-/// It closes the tool exchange with an assistant turn so the reconstructed
-/// scope is a complete `user → assistant → user → assistant` alternation
-/// instead of ending on the `<tool_response>` user turn. Prefilled, not
-/// decoded; the file's semantic summary is the async summary tree's rollup.
-pub fn render_read_ack(path: &str, scope: &Scope) -> String {
-    format!(
-        "Read `{path}` lines {start}-{end} — {symbol}.",
-        path = path,
-        start = scope.start_line,
-        end = scope.end_line,
-        symbol = scope.qualified_path(),
-    )
-}
-
 fn digit_width(mut n: u32) -> usize {
     if n == 0 {
         return 1;
@@ -170,12 +157,12 @@ mod tests {
     // ── per-file layout: render_part_user_prompt ─────────────────────────────
 
     #[test]
-    fn part_user_prompt_reads_range_without_summary_instruction() {
+    fn part_user_prompt_is_a_two_sentence_summary_request() {
         let p = render_part_user_prompt("src/lib.rs", &scope(10, 20));
-        assert_eq!(p, "Source excerpt — `src/lib.rs` lines 10-20:");
-        // The per-part turn is prefill-only; the summary happens once at
-        // the end of the file conversation, not per part.
-        assert!(!p.to_lowercase().contains("summarize"));
+        assert_eq!(
+            p,
+            "Summarize `src/lib.rs` (lines 10-20) in no more than two sentences."
+        );
     }
 
     #[test]
@@ -300,25 +287,6 @@ mod tests {
         let r = render_tool_response("notes.txt", &scope(1, 1), Language::PlainText, "hello\n");
         assert!(r.contains("```\n"));
         assert!(!r.contains("```text"));
-    }
-
-    // ── render_read_ack ──────────────────────────────────────────────────────
-
-    #[test]
-    fn read_ack_names_file_range_and_symbol() {
-        let mut s = scope(47, 93);
-        s.path = vec!["impl AuthHandler".into(), "fn validate_token".into()];
-        let a = render_read_ack("src/auth/handler.rs", &s);
-        assert_eq!(
-            a,
-            "Read `src/auth/handler.rs` lines 47-93 — impl AuthHandler > fn validate_token."
-        );
-    }
-
-    #[test]
-    fn read_ack_is_single_line() {
-        let a = render_read_ack("src/lib.rs", &scope(1, 5));
-        assert!(!a.contains('\n'), "read ack should be a single line");
     }
 
     // ── digit_width ──────────────────────────────────────────────────────────
