@@ -1101,8 +1101,8 @@ impl Schema {
     /// `turns`/`summaries` compression prompts.
     ///
     /// Runtime section-id allocation
-    /// ([`super::Builder::add_section_to_system_collection`]) must stay disjoint
-    /// from all of these — the compression-prompt sections never appear in
+    /// ([`super::Builder::add_section_to_collection`]) must stay disjoint from all
+    /// of these — the compression-prompt sections never appear in
     /// `system_prompt.items`, so a max over only the *visible* sections would
     /// alias them.
     pub fn all_section_ids(&self) -> Vec<u32> {

@@ -1262,22 +1262,35 @@ pub fn run_with_sink<R: ContentResolver>(
     // catalogs (tool definitions), and per-layer thinking/length/tool dials while
     // its sealed K/V is reused across all layers.
     let mut resolved_selections: Vec<ResolvedSelection> = Vec::new();
-    let effective_selection = {
-        let mut eff = selection.clone();
-        if let Some(l) = schema.layers.iter().find(|l| l.id == target.layer) {
-            for (sel, opt) in l.dials.iter() {
+    // Seed the section-tree selection from the target layer's dials beneath the
+    // caller's per-turn selection. Only clone when the layer actually overrides a
+    // dial — the dialogue layer has none, and this runs per reprojection (per
+    // decoded token), so an empty-dial merge would clone the selection for nothing.
+    let target_dials = schema
+        .layers
+        .iter()
+        .find(|l| l.id == target.layer)
+        .map(|l| &l.dials)
+        .filter(|d| !d.is_empty());
+    let merged_selection;
+    let effective_selection: &SelectionState = match target_dials {
+        Some(dials) => {
+            let mut eff = selection.clone();
+            for (sel, opt) in dials.iter() {
                 if eff.get(sel).is_none() {
                     eff.select(sel.to_string(), opt.to_string());
                 }
             }
+            merged_selection = eff;
+            &merged_selection
         }
-        eff
+        None => selection,
     };
     let system_prompt_segments: Vec<ProjectionSegment> = emit_system_prompt_items(
         &schema.system_prompt,
         resolver,
         mode,
-        &effective_selection,
+        effective_selection,
         prior,
         decode_pos,
         &mut selection_scores,

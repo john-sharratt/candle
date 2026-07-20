@@ -1017,8 +1017,8 @@ layers:
     fn from_projection_buckets_system_collection_and_turns() {
         let b = Builder::from_yaml(YAML).unwrap();
         let schema = b.schema();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
         let conv = b.id_for_group("conversation").unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
         let frame = b.id_for_system_section("frame").unwrap();
         let file_a = b.id_for_system_section("file_a").unwrap();
         let file_b = b.id_for_system_section("file_b").unwrap();
@@ -1214,8 +1214,8 @@ layers:
     fn from_projection_captures_selection_with_skipped_sections() {
         let b = Builder::from_yaml(YAML).unwrap();
         let schema = b.schema();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
         let conv = b.id_for_group("conversation").unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
         let frame = b.id_for_system_section("frame").unwrap();
         let file_a = b.id_for_system_section("file_a").unwrap();
         let file_b = b.id_for_system_section("file_b").unwrap();
@@ -1318,7 +1318,6 @@ layers:
         let dlct = Dialect::chat_ml();
         let b = Builder::from_yaml_with_vars_and_dialect(YAML_T, &[], Some(&dlct)).unwrap();
         let schema = b.schema();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
         let frame = b.id_for_system_section("frame").unwrap();
 
         let mut res = TokResolver::default();
@@ -1438,7 +1437,6 @@ layers:
 "#;
         let dlct = Dialect::chat_ml();
         let mut b = Builder::from_yaml_with_vars_and_dialect(YAML, &[], Some(&dlct)).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
         let tools = b.id_for_system_collection("tools").unwrap();
         let summary = SectionId::reserved(Reserved::ToolSummary);
         b.set_collection_summary_section(tools, summary).unwrap();
