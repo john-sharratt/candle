@@ -2603,10 +2603,15 @@
       h('div', { class: 'z-load-eyebrow' }, 'Starting up'),
       h('div', { class: 'z-load-row' },
         h('div', { class: 'z-spin' }),
-        h('span', { class: 'z-load-cur' }, ld.current || 'Loading model')),
+        // Show the specific current action prominently (e.g. "Scanning
+        // repository", "Reading code") — the phase-level detail when the step
+        // reports one, falling back to the step label otherwise.
+        h('span', { class: 'z-load-cur' }, (boot && boot.detail) || ld.current || 'Loading model')),
       h('div', { class: 'z-load-track' }, h('div', { class: 'z-load-bar', style: 'width:' + pct + '%;' })),
       completed.length ? h('ul', { class: 'z-load-list' }, completed) : null,
-      h('div', { class: 'z-load-detail' }, (boot && boot.detail) || ''));
+      // Keep the step category as the sub-label once the action line shows the
+      // phase, so the grouping ("Ingesting workspace") stays visible.
+      h('div', { class: 'z-load-detail' }, (boot && boot.detail) ? (ld.current || '') : ''));
     return h('div', { style: 'position:fixed; inset:0; background:#1c1917; display:flex; align-items:center; justify-content:center; z-index:500;' }, card);
   }
 

@@ -5252,6 +5252,118 @@ layers:
         }));
     }
 
+    /// A two-layer schema where a NON-dialogue layer carries `dials:` for the
+    /// shared prompt's section-tree selector. Projecting that layer seeds the
+    /// selector from its dial (beneath the tree default); the caller's per-turn
+    /// selection still overrides it. This is the unified-prompt contract: layers
+    /// differ only by the branch their dials pick, not by a prompt of their own.
+    const DIALS_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: section
+          id: role
+          content: "You are an assistant."
+        - kind: selector
+          id: length
+          default: standard
+          options:
+            - id: terse
+              content: "Be terse."
+            - id: standard
+              content: "Be balanced."
+            - id: verbose
+              content: "Be verbose."
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+  - name: analysis
+    window: 1000
+    dials:
+      length: verbose
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: analysis_group
+        selection: { kind: always_visible }
+"#;
+
+    #[test]
+    fn layer_dials_seed_section_tree_selection() {
+        use crate::projection::{ProjectionMode, ResolvedSelection, SelectionState};
+        let b = Builder::from_yaml(DIALS_YAML).unwrap();
+        let resolver = MockResolver::new();
+        let length_is = |proj: &crate::projection::Projection, opt: &str| {
+            proj.selections.contains(&ResolvedSelection {
+                selector: "length".to_string(),
+                option: opt.to_string(),
+            })
+        };
+        let target = |layer: &str, group: &str, tl: u64| ProjectionTarget {
+            layer: b.id_for_layer(layer).unwrap(),
+            group: b.id_for_group(group).unwrap(),
+            timeline: TimelineId::for_test(tl),
+        };
+
+        // dialogue has no dials → the section-tree's authored default (standard).
+        let proj = b.project_with_selection(
+            target("dialogue", "convo", 1),
+            &resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        );
+        assert!(
+            length_is(&proj, "standard"),
+            "dialogue (no dials) uses the tree default: {:?}",
+            proj.selections
+        );
+
+        // analysis carries `length: verbose`; with no caller selection the layer
+        // dial seeds the branch.
+        let ana = target("analysis", "analysis_group", 2);
+        let proj = b.project_with_selection(
+            ana,
+            &resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        );
+        assert!(
+            length_is(&proj, "verbose"),
+            "analysis layer's dial seeds length=verbose: {:?}",
+            proj.selections
+        );
+
+        // A caller's per-turn selection overrides the layer dial.
+        let mut sel = SelectionState::new();
+        sel.select("length", "terse");
+        let proj = b.project_with_selection(ana, &resolver, ProjectionMode::Decode, &sel);
+        assert!(
+            length_is(&proj, "terse"),
+            "caller selection beats the layer dial: {:?}",
+            proj.selections
+        );
+    }
+
     #[test]
     fn section_tree_seals_full_cross_product_with_correct_prefixes() {
         let b = Builder::from_yaml(TREE_YAML).unwrap();
