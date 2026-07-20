@@ -1,0 +1,313 @@
+name: hkdf_expand_label
+category: Cryptography
+description: 'HKDF-Expand-Label from the TLS 1.3 key schedule: expand a pseudorandom key into named traffic secrets using a labeled, versioned context. Use for TLS 1.3 key-schedule analysis.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    HkdfHash:
+      description: HKDF hash function.
+      enum:
+      - sha256
+      - sha512
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/HkdfHash'
+      description: 'HKDF hash function. One of: sha256, sha512.'
+      minItems: 1
+      minLength: 1
+    context_hex:
+      description: Optional context (e.g. a transcript hash) as hex. Empty if omitted.
+      type:
+      - string
+      - 'null'
+    label:
+      description: The bare TLS 1.3 label, e.g. "c hs traffic" or "iv". The "tls13 " prefix is prepended automatically — do not include it.
+      minLength: 1
+      type: string
+    length:
+      description: Output length in bytes (1–8160).
+      format: uint32
+      maximum: 8160.0
+      minimum: 1.0
+      type: integer
+    prk_hex:
+      description: Pseudorandom key as hex (the `prk_hex` from hkdf_extract).
+      minLength: 1
+      type: string
+  required:
+  - algorithm
+  - label
+  - length
+  - prk_hex
+  title: HkdfExpandLabelRequest
+  type: object
+examples:
+- |-
+  HKDF-Expand-Label with SHA-256 the hex secret 33ad0a1c607ec03b09e6cd9893680ce2 with label 'c hs traffic' to 32 bytes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the HKDF-Expand-Label tool. The user provided a specific request: using HKDF-Expand-Label with SHA-256, a hex secret "33ad0a1c607ec03b09e<|projection|>6cd9893680ce2", a label of "c hs traffic", and they want 32 bytes output.
+
+  First, I need to check the parameters required for the hkdf_expand_label function. The parameters are algorithm (which is SHA-256 here), context_hex (optional<|projection|>, but the user didn't mention it, so maybe leave it as null), label ("c hs traffic"), length (32 bytes), and prk_hex (the secret provided).
+
+  Wait, the label needs to be a bare label. The tool mentions that the "tls13 " prefix is added automatically. So<|projection|> the label should be "c hs traffic" without any prefix. Also, the context_hex is optional; since the user didn't provide it, we can set it to null.
+
+  So putting it all together: algorithm is "sha256", label is "c hs traffic", length 32, prk<|projection|>_hex is the given hex string. The context_hex is not provided, so null. That should cover all required parameters. Let me double-check the required fields: yes, algorithm, label, length, and prk_hex are all there. Looks good.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "context_hex": null, "label": "c hs traffic", "length": 32, "prk_hex": "33ad0a1c607ec03b09e6cd9893680ce2"}}
+  </tool_call><|projection|>
+- |-
+  derive a 16-byte TLS 1.3 key with SHA-256 from the hex PRK aabbccddeeff00112233445566778899 with label 'key'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to do this. The user wants to derive a 16-byte TLS 1.3 key using SHA-256 from a given PRK. The label is 'key'.
+
+  First, I remember that TLS 1.3 uses HKDF-<|projection|>Expand-Label for deriving keys. The tool provided is hkdf_expand_label. So I need to use that.
+
+  The parameters required are algorithm, context_hex (optional), label, length, and prk_hex. The user provided the PRK as a hex string: aabbccddeeff00112<|projection|>233445566778899. The label is 'key', and the length is 16 bytes. The algorithm is SHA-256.
+
+  Wait, the label in the tool's description says that the 'tls13 ' prefix is added automatically. So I<|projection|> shouldn't include that. Just the label 'key' is enough.
+
+  So the arguments should be:
+  - algorithm: sha256
+  <|projection|>- label: key
+  - length: 16
+  - prk_hex: aabbccddeeff00112233445566<|projection|>778899
+
+  I don't think context_hex is needed here unless there's a transcript hash, which the user didn't mention. So that can be omitted or set to null.
+
+  Let me double-check the parameters. The required fields are algorithm, label, length, and prk_hex. All are<|projection|> provided. The context_hex is optional. So the tool call should include those four parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "key", "length": 16, "prk_hex": "aabbccddeeff00112233445566778899"}}
+  </tool_call><|projection|>
+- |-
+  run HKDF-Expand-Label with SHA-256 on the hex secret 0102030405060708 with label 'finished' for 32 bytes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the hkdf_expand_label tool. The user wants to run HKDF-Expand-Label with SHA-256 on the hex secret 0102030405060708 with the label 'finished'<|projection|> for 32 bytes.
+
+  First, I need to check the parameters required for the tool. The tool requires algorithm, context_hex (optional), label, length, and prk_hex. The algorithm should be one of the HkdfHash enums, which are sha256 or sha512. The<|projection|> user specified SHA-256, so that's straightforward.
+
+  The label is given as 'finished'. The tool's description mentions that the 'tls13 ' prefix is added automatically, so I shouldn't include it here. The length is 32 bytes.
+
+  The prk_hex is the pseudorandom<|projection|> key in hex. The user provided the secret as 0102030405060708, which I assume is the prk_hex. Wait, but HKDF-Extract is usually used first to get the prk from a shared secret. However, the user's question<|projection|> says "on the hex secret", so maybe they're using the secret directly as the prk. So in this case, the prk_hex would be the same as the input secret.
+
+  Wait, but the tool's parameters require prk_hex. So the user's input of 0102030<|projection|>405060708 is the prk_hex. The context_hex is optional; since the user didn't mention it, we can leave it out or set it to null.
+
+  Putting it all together: algorithm is 'sha256', label is 'finished', length is 32<|projection|>, prk_hex is '0102030405060708'. The context_hex isn't provided, so maybe it's omitted. Wait, looking at the tool's required parameters, context_hex is not in the required list. The required fields are algorithm, label, length<|projection|>, and prk_hex. So context_hex is optional.
+
+  So the JSON call should have name "hkdf_expand_label" with arguments:
+
+  {
+    "algorithm": "sha256",
+    "label": "finished",
+    "length": 32,
+    "prk_hex": "010<|projection|>2030405060708"
+  }
+
+  I think that's all. Let me double-check the parameters. The user didn't mention a context, so it's omitted. The label is correct, the length is 32 bytes. Yes, this should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "finished", "length": 32, "prk_hex": "0102030405060708"}}
+  </tool_call><|projection|>
+- |-
+  expand the hex secret deadbeefcafebabe into a 12-byte 'iv' with HKDF-Expand-Label using SHA-256<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to expand the hex secret deadbeefcafebabe into a 12-byte 'iv' using HKDF-Expand-Label with SHA-256.
+
+  First, I need to recall how the HKDF-Expand-Label works. The function<|projection|> takes parameters like the PRK (pseudorandom key), label, context, and length. The label here is 'iv', and the context is optional. Since the user didn't mention a context, I'll leave it out.
+
+  The algorithm should be SHA-256 as specified. The length is <|projection|>12 bytes. The prk_hex is the given hex value, which is deadbeefcafebabe. Wait, but HKDF requires the PRK to be of the correct size for the hash function. SHA-256 has a block size of 64 bytes, so the PRK should be<|projection|> 32 bytes. But the input here is 16 bytes (deadbeefcafebabe is 16 bytes). Wait, maybe the user provided the raw key, and the hkdf_extract would handle it? But in this case, the user is directly using the hex as the PRK. So<|projection|> I need to check if that's valid. However, the tool's parameters require the prk_hex, which is the output from hkdf_extract. But the user hasn't done that step. Hmm, but the user might be assuming that the given secret is already the PRK. Maybe they're skipping the extract step<|projection|>. But according to the tool's description, the 'prk_hex' is the output of hkdf_extract. So perhaps the user's input needs to go through hkdf_extract first. But the current question is about hkdf_expand_label.
+
+  Wait, the user's request is to "expand the hex secret dead<|projection|>beefcafebabe into a 12-byte 'iv' with HKDF-Expand-Label using SHA-256". So the steps would be: take the secret, perform HKDF-Extract (maybe), then HKDF-Expand-Label. However, the user might not have done the extract<|projection|> step. But the tool's parameters for hkdf_expand_label require the prk_hex, which is the output of hkdf_extract. Therefore, the user's input (the secret) needs to be processed through hkdf_extract first. But the current question is about expanding the secret, so maybe the user assumes that the<|projection|> secret is already the PRK.
+
+  But in reality, the correct process is to first use HKDF-Extract with a salt (often zero) to get the PRK. However, if the secret is already a key of the appropriate length, you can skip the extract. But for SHA-256,<|projection|> the PRK should be 32 bytes. The given secret is 16 bytes (deadbeefcafebabe is 16 bytes). So it's shorter than 32. Therefore, the user might need to perform hkdf_extract first. But since the user hasn't mentioned that step and is<|projection|> directly asking for expand_label, maybe they're assuming that the secret is the PRK. However, this would be incorrect.
+
+  But given the tool's parameters, the prk_hex is required. Since the user provided a secret, perhaps the correct approach is to use that as the prk_hex. Even though in<|projection|> practice, it's not ideal. So, I'll proceed with the information given.
+
+  So, the parameters for the tool call would be:
+
+  algorithm: sha256
+  <|projection|>label: iv
+  length: 12
+  prk_hex: deadbeefcafebabe
+
+  The context_hex is optional and not provided<|projection|>, so it's omitted.
+
+  Therefore, the JSON object should have these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "iv", "length": 12, "prk_hex": "deadbeefcafebabe"}}
+  </tool_call><|projection|>
+- |-
+  HKDF-Expand-Label with SHA-256 from the hex secret 112233445566778899aabbccddeeff00 with label 's hs traffic' to 32 bytes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the HKDF-Expand-Label tool. The user wants to perform an HKDF-Expand-Label operation using SHA-256 on a given hexadecimal secret. Let's break down the problem.
+
+  First, I need to recall what the HKDF<|projection|>-Expand-Label function does. From what I remember, this function is part of the TLS 1.3 key schedule. It takes a pseudorandom key (PRK) and expands it into a longer key using a specific label and context. The label helps in deriving different keys for different purposes, like encryption<|projection|> or authentication.
+
+  The parameters required for the HKDF-Expand-Label are:
+
+  1. Algorithm: Which hash function to use, here SHA-256.
+  2. Label: The label used for expansion. The user provided 's hs traffic' but I should check if there's any specific formatting needed. Wait<|projection|>, the tool's description says that the label doesn't need the "tls13 " prefix, which is automatically added. So the user's input is correct as 's hs traffic'.
+  3. Context (optional): The user hasn't provided a context, so this can be omitted or set to null.
+  4.<|projection|> Length: The output length in bytes. The user wants 32 bytes.
+  5. PRK (Pseudorandom Key): The hex string provided is 112233445566778899aabbccddeeff00. I need to make sure<|projection|> it's correctly formatted.
+
+  Wait, the user mentioned "label 's hs traffic'". Let me check if that's a valid label. In TLS 1.3, labels are typically like "client application traffic" or "server application traffic", but the exact labels might vary. However, the tool doesn't validate<|projection|> the label's correctness, just passes it as given. So even if it's not a standard label, the function will process it.
+
+  Now, checking the parameters:
+
+  - Algorithm: SHA-256 is one of the allowed options.
+  - Label: 's hs traffic' — this should be passed as-is.<|projection|> The tool's documentation says to omit the 'tls13 ' prefix, which the user didn't include, so that's correct.
+  - Context (context_hex): Not provided, so set to null.
+  - Length: 32 bytes.
+  - PRK: The hex string is 32 bytes long (each<|projection|> pair is a byte). Let me count: 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff 00. Wait, that's 16 pairs, which is 32 bytes. So the<|projection|> input is valid.
+
+  Putting it all together into the tool call:
+
+  The required parameters are algorithm, label, length, and prk_hex. Context is optional and can be omitted or set to null.
+
+  So the JSON arguments should be:
+
+  {
+    "algorithm": "sha256",
+    "label": "s<|projection|> hs traffic",
+    "length": 32,
+    "prk_hex": "112233445566778899aabbccddeeff00"
+  }
+
+  Wait, but the user's PRK is '112233445<|projection|>566778899aabbccddeeff00'. Let me check the hex string. Each pair represents a byte. The length of the hex string is 32 characters (since each byte is two hex digits). So 32/2 = 16 bytes? Wait no<|projection|>: 16 bytes would be 32 hex characters. Wait, the user's input is "112233445566778899aabbccddeeff00" — let's count:
+
+  Breaking it down:
+  11 22 33<|projection|> 44 55 66 77 88 99 aa bb cc dd ee ff 00 → that's 16 pairs, so 16 bytes. But the PRK should be 32 bytes for SHA-256? Or is that for the output<|projection|>? Wait, no: the PRK is the input to HKDF-Expand-Label. The PRK can be any length, but in TLS 1.3, the initial key is derived from a hash, which for SHA-256 would be 32 bytes (256 bits). So<|projection|> if the user provided a 16-byte (128-bit) PRK, that might be incorrect. However, the tool doesn't validate the PRK's length; it just passes it along. So even if the PRK is of invalid length, the function will process it as per the input.
+
+  But<|projection|> in this case, the user's input is "112233445566778899aabbccddeeff00" — let me count the characters:
+
+  The string is "11223344556677889<|projection|>9aabbccddeeff00". Let's count each character:
+
+  1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 a a b b c c d d e e f f 0<|projection|> 0. Wait, that's 32 characters (each pair is two digits). So the hex string is 32 characters long, which is 16 bytes. So the PRK is 16 bytes. But for SHA-256, the output of HKDF-Expand would be <|projection|>32 bytes (256 bits), but the input PRK can be any length.
+
+  But the user's input seems to be correct in terms of format. The tool doesn't validate the PRK's length, so it's up to the user to provide a valid one.
+
+  So the JSON arguments are as above<|projection|>.
+
+  Therefore, the tool call should be made with those parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "s hs traffic", "length": 32, "prk_hex": "112233445566778899aabbccddeeff00"}}
+  </tool_call><|projection|>
+- |-
+  give me a 32-byte 'c ap traffic' secret via HKDF-Expand-Label SHA-256 from the hex PRK 5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking for a 32-byte 'c ap traffic' secret using HKDF-Expand-Label with SHA-256, starting from a given PRK in hexadecimal.
+
+  First, I need to recall how HKDF-Expand-Label works. From TLS<|projection|> 1.3, the label is processed by prepending "tls13 " to the label. But wait, the user mentioned the label as 'c ap traffic'. Wait, the actual label for client and server traffic secrets in TLS 1.3 is something like "c ap traffic" or "s ap<|projection|> traffic". So the label here is "c ap traffic".
+
+  But according to the tool's description, the label parameter should be the bare label without the "tls13 " prefix. The tool automatically adds the "tls13 " prefix. So I need to make sure that the label passed is "c ap traffic<|projection|>".
+
+  Next, the PRK is given as a hex string: 5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d. That's 16 bytes (32 hex chars), which is valid for a<|projection|> PRK.
+
+  The algorithm is SHA-256, so the 'algorithm' parameter should be "sha256".
+
+  The length is 32 bytes. The context is optional, but the user didn't mention it, so we can omit it or set to null.
+
+  Putting this all together into the tool<|projection|> call:
+
+  - name: hkdf_expand_label
+  - arguments: {
+      "algorithm": "sha256",
+      "label": "c ap traffic",
+      "length": 32,
+      "prk_hex": "5a5a5a5a6b6b6b6b<|projection|>7c7c7c7c8d8d8d8d"
+  }
+
+  I should check if the label is correct. Wait, in TLS 1.3, the labels for client and server traffic are "c ap traffic" and "s ap traffic". So yes, "c ap traffic" is<|projection|> correct.
+
+  Also, the PRK is 16 bytes, which is valid. The output length is 32, which is allowed (up to 8160).
+
+  So this should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "c ap traffic", "length": 32, "prk_hex": "5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d"}}
+  </tool_call><|projection|>
+- |-
+  run HKDF-Expand-Label SHA-256 on hex secret cafef00dbaadf00dcafef00dbaadf00d with label 'res master' for 32 bytes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the provided tool for this HKDF-Expand-Label operation. The user wants to run HKDF-Expand-Label with SHA-256 on a given secret.
+
+  First, I need to check the parameters required by the tool. The tool<|projection|>'s parameters include algorithm, context_hex, label, length, and prk_hex.
+
+  The user provided the secret as "cafef00dbaadf00dcafef00dbaadf00d". Wait, but in the tool's parameters, the prk_hex is required. But wait<|projection|>, the tool's description says that prk_hex is the pseudorandom key from hkdf_extract. However, in this case, the user is directly providing a secret, not the output of HKDF-Extract. So maybe there's confusion here.
+
+  Wait, the tool's name is hkdf_expand_label, which<|projection|> is part of the TLS 1.3 key schedule. The HKDF-Expand-Label function takes a PRK (pseudorandom key) and expands it into traffic secrets. But in this case, the user might be providing the raw secret, not the PRK. Hmm, but according to the tool<|projection|>'s parameters, the prk_hex is required. So perhaps the user needs to first perform HKDF-Extract with the secret and some salt, but the user hasn't provided that.
+
+  But wait, looking at the problem again: the user says "run HKDF-Expand-Label SHA-256 on<|projection|> hex secret ...". So maybe they're assuming that the secret is already the PRK. However, typically, the PRK is derived from a shared secret using HKDF-Extract. But if the user is directly passing the secret as the PRK, then we can proceed.
+
+  So, in this case, the user<|projection|>'s 'secret' is the PRK. Therefore, prk_hex would be "cafef00dbaadf00dcafef00dbaadf00d".
+
+  The label is given as 'res master'. The tool requires the label without the "tls13 " prefix, which the tool<|projection|> adds automatically. So that's correct.
+
+  The length is 32 bytes. The algorithm is SHA-256.
+
+  The context_hex is not provided, so it's optional and can be omitted or set to null.
+
+  Putting it all together:
+
+  algorithm: "sha256"
+  label: "res master"
+  <|projection|>length: 32
+  prk_hex: "cafef00dbaadf00dcafef00dbaadf00d"
+  context_hex: null (or omitted)
+
+  Wait, but in the parameters, context_hex is a string or null. So maybe we should include it as null.
+
+  <|projection|>But looking at the tool's parameters, the required fields are algorithm, label, length, prk_hex. So context_hex is optional.
+
+  Therefore, the JSON should have:
+
+  {
+    "algorithm": "sha256",
+    "label": "res master",
+    "length": 32,
+    "<|projection|>prk_hex": "cafef00dbaadf00dcafef00dbaadf00d"
+  }
+
+  I think that's all. The user didn't provide a context, so it's omitted. The tool will handle the rest.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "res master", "length": 32, "prk_hex": "cafef00dbaadf00dcafef00dbaadf00d"}}
+  </tool_call><|projection|>
+- |-
+  expand the hex secret 0011223344556677 into a 16-byte 'quic key' using HKDF-Expand-Label with SHA-256<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to expand the hex secret 0011223344556677 into a 16-byte 'quic key' using HKDF-Expand-Label with SHA-256.
+
+  First, I need to<|projection|> recall how HKDF-Expand-Label works. From the tool description, the function requires parameters like algorithm, context_hex, label, length, and prk_hex. The label here should be "quic key" as per the user's request. Wait, the note says the label doesn't include the "tls<|projection|>13 " prefix, but since this is for QUIC, maybe the label is different. Wait, the user specified "quic key", so the label should be "quic key". But I should check if there's a standard label for QUIC. However, the user's instruction says to use the label<|projection|> as given, so "quic key" is correct.
+
+  The context_hex is optional. The user didn't mention a context, so I'll leave it as null. The length is 16 bytes. The prk_hex is the provided secret, 001122334455<|projection|>6677. The algorithm is SHA-256.
+
+  So the parameters would be: algorithm is "sha256", label is "quic key", length 16, prk_hex is "0011223344556677". Context is<|projection|> omitted.
+
+  I need to make sure all required fields are included. The required parameters are algorithm, label, length, prk_hex. All are present here. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_expand_label", "arguments": {"algorithm": "sha256", "label": "quic key", "length": 16, "prk_hex": "0011223344556677"}}
+  </tool_call><|projection|>

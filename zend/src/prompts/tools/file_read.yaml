@@ -1,0 +1,129 @@
+name: file_read
+category: Files
+description: 'Read a file''s content from the session virtual filesystem (VFS). Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns path, full content, and line count. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    path:
+      description: VFS path of the file to read (session-relative, e.g. `src/main.rs`). Required.
+      minLength: 1
+      type: string
+  required:
+  - path
+  title: ReadRequest
+  type: object
+examples:
+- |-
+  show me the contents of /workspace/Cargo.toml<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see the contents of the file at path "/workspace/Cargo.toml". Let me check the tools available. There's a tool called file_read which reads a file's content from the session VFS. The parameters require the path, which the user provided.
+
+  So I need<|projection|> to call file_read with the path "/workspace/Cargo.toml". The response should include the path, full content, and line count. Since the user just wants to see the file, this tool should handle it. No other tools are needed here. Just make sure the JSON is correctly formatted with the right arguments.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml"}}
+  </tool_call><|projection|>
+- |-
+  read the file /workspace/src/main.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to read the file /workspace/src/main.rs. Let me check the tools available. There's a function called file_read that takes a path. The parameters require the path as a string. The user provided the exact path, so I should call file_read with path "/workspace/src/main<|projection|>.rs". No other steps needed since it's a direct read.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs"}}
+  </tool_call><|projection|>
+- |-
+  what's in /workspace/.gitignore<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking "what's in /workspace/.gitignore". I need to figure out how to respond using the available tools. Let me check the tools provided.
+
+  The available tool is file_read, which reads a file's content from the session VFS. The parameters require a path. The<|projection|> user is asking about .gitignore, so the path would be "/workspace/.gitignore".
+
+  I should call the file_read function with that path. The response should include the file's content, line count, and path. Since the user just wants to know what's in the file, this should suffice. No other<|projection|> tools are needed here. Let me structure the tool call correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore"}}
+  </tool_call><|projection|>
+- |-
+  open /workspace/config/settings.yaml and show it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to open and show the contents of the file located at "/workspace/config/settings.yaml". Let me check the tools I have available.
+
+  Looking at the tools provided, there's a function called "file_read" which is meant to read a file's content from the session virtual filesystem.<|projection|> The parameters require a "path" which is a string. The user's request directly mentions the path "/workspace/config/settings.yaml", so that's the path I need to use.
+
+  I need to make sure that the path is correctly formatted as per the tool's requirements. The tool expects a session-relative path, but since<|projection|> the user provided an absolute path, I should use it as is unless there's a reason not to. Since the tool's description says it's for the session VFS, I'll assume that the path is valid in that context.
+
+  So, the next step is to construct the tool call. The name of the tool<|projection|> is "file_read", and the arguments should be a JSON object with the "path" key set to "/workspace/config/settings.yaml".
+
+  I need to ensure that the JSON is properly formatted, with correct escaping if necessary. However, since the path doesn't contain any special characters that need escaping, it should be straightforward.
+
+  <|projection|>Finally, I'll wrap the tool call in the specified XML tags as per the instructions. The response should only include the tool_call section, no extra text or explanations.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/config/settings.yaml"}}
+  </tool_call><|projection|>
+- |-
+  cat /workspace/docs/architecture.md for me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see the contents of the file "architecture.md" located in the "/workspace/docs" directory. They used the command "cat /workspace/docs/architecture.md", which is a common Unix command to display file contents.
+
+  First, I need to check if there's a tool available<|projection|> that can handle this request. Looking at the provided tools, there's a function called "file_read" that's designed to read a file's content from the session's virtual filesystem (VFS). The parameters required are the path of the file.
+
+  The user's request directly provides the path "/workspace/docs/architecture<|projection|>.md", so I should use that path in the tool call. The "file_read" tool is meant for scenarios like this—reading the content of a file that's part of the session's filesystem. Since the user is asking to "cat" the file, which is equivalent to reading its contents, the "file<|projection|>_read" tool is the correct choice here.
+
+  I need to make sure the arguments passed to the tool are correctly formatted as per the schema provided. The tool requires a JSON object with a "path" property. The path should be a string, and it's required. In this case, the path is "/workspace/docs<|projection|>/architecture.md", so the arguments should be {"path": "/workspace/docs/architecture.md"}.
+
+  There's no mention of needing to handle remote files or any other complexities, so the straightforward use of "file_read" suffices. No additional steps like downloading the file first are necessary here. Therefore, the correct tool<|projection|> call is to invoke "file_read" with the specified path.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md"}}
+  </tool_call><|projection|>
+- |-
+  I need to see what's inside /workspace/scripts/build.sh<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to see the contents of the file /workspace/scripts/build.sh. Let me check the tools available. There's a function called file_read that reads a file from the session's VFS. The parameters require the path, which in this case is /workspace/scripts/build.sh. I need<|projection|> to make sure the path is correctly specified. Since the user is asking to read the file, I should call file_read with that path. No other tools are needed here. Just return the tool call with the correct arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/scripts/build.sh"}}
+  </tool_call><|projection|>
+- |-
+  pull up the contents of /workspace/tests/fixtures/sample.json<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to pull up the contents of /workspace/tests/fixtures/sample.json. Let me check the tools available. There's the file_read tool which requires a path parameter. The description says it's for reading a file from the session VFS. The user's request matches that.
+
+  I need<|projection|> to make sure the path is correct. The user provided "/workspace/tests/fixtures/sample.json", which should be the path in the VFS. The tool requires the path as a string. So I'll call file_read with that path.
+
+  No other tools are needed here. The response should return the content, but the actual<|projection|> content isn't necessary for the tool call. Just the correct JSON structure with the name and arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/tests/fixtures/sample.json"}}
+  </tool_call><|projection|>
+- |-
+  grab the text of /workspace/LICENSE and print it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to grab the text of the file at /workspace/LICENSE and print it. Let me see how to do this.
+
+  Looking at the tools provided, there's a function called file_read. The description says it reads a file's content from the session VFS. That sounds right.<|projection|> The parameters require a path, which in this case is "/workspace/LICENSE".
+
+  I need to make sure the path is correct. The user specified "/workspace/LICENSE", so I should use that exact path. The tool requires the path parameter, so I'll structure the JSON accordingly.
+
+  So the tool call should be file_read with<|projection|> the path set to "/workspace/LICENSE". There's no mention of needing any other parameters, so that's all I need to include.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/LICENSE"}}
+  </tool_call><|projection|>

@@ -1,0 +1,106 @@
+name: file_list
+category: Files
+description: Enumerate the files currently in the session virtual filesystem, optionally narrowed to a path prefix. Returns names and sizes, not file contents.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    prefix:
+      description: VFS path prefix to filter results (e.g. `src/`). Defaults to "" (lists all files).
+      type:
+      - string
+      - 'null'
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list the files in /workspace/src<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list the files in the /workspace/src directory. Let me check the tools available. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters include a prefix, which corresponds to the path prefix. The user specified "/workspace/src",<|projection|> so I need to set the prefix to that. I should call file_list with the prefix parameter set to "/workspace/src". That should return the list of files in that directory. Let me make sure I'm using the correct JSON structure for the tool call. Yes, the name is "file_list" and the arguments<|projection|> should be a JSON object with the prefix.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/src"}}
+  </tool_call><|projection|>
+- |-
+  what files are in /workspace<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking "what files are in /workspace". I need to figure out which tool to use here. Looking at the available tools, there's one called file_list. The description says it enumerates files in the session's virtual filesystem, and it can take a prefix parameter.
+
+  The user<|projection|> is asking about the /workspace directory, so the prefix should be "/workspace/". The tool's parameters accept a prefix, which can be a string or null. Since the user specified /workspace, I should set the prefix to that.
+
+  Wait, the tool's parameters have a $schema that's a JSON schema<|projection|>. The properties for the tool include a "prefix" property with type ["string", "null"]. So the prefix can be a string or null. The default is an empty string, but in this case, the user is specifying /workspace, so I need to pass that as the prefix.
+
+  So the arguments for the<|projection|> file_list tool should be {"prefix": "/workspace/"}. That should list all files under that path. I need to make sure the JSON is correctly formatted. Let me double-check the syntax. Yes, the key is "prefix" and the value is the string "/workspace/".
+
+  I think that's it. The<|projection|> user wants to know the files in /workspace, so calling file_list with the prefix set to /workspace/ should return the correct list.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/"}}
+  </tool_call><|projection|>
+- |-
+  show me everything under /workspace/tests<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see everything under /workspace/tests. I need to use the file_list tool for this. The tool's parameters include a prefix, which in this case is "/workspace/tests". I should structure the tool call with that prefix. Let me make sure the JSON is correctly formatted with<|projection|> the name and arguments. That should retrieve the list of files and their sizes from that directory.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/tests"}}
+  </tool_call><|projection|>
+- |-
+  list the files under /workspace/benches<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list the files under the /workspace/benches directory. Let me check the available tools. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters allow specifying a prefix, which in this case should be "/workspace/benches<|projection|>". I need to make sure the prefix is correctly set. The function returns names and sizes, which matches the user's request. So the correct tool call would be file_list with the prefix parameter set to "/workspace/benches".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/benches"}}
+  </tool_call><|projection|>
+- |-
+  what's in the /workspace/migrations directory<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the contents of the /workspace/migrations directory. I need to figure out how to list the files there using the available tool.
+
+  Looking at the tools provided, there's a function called file_list that enumerates files in the virtual filesystem. The parameters include an optional prefix,<|projection|> which matches the user's request for the migrations directory.
+
+  So, I should call file_list with the prefix set to "/workspace/migrations". That should return the list of files and their sizes in that specific directory. I need to make sure the JSON structure is correct, with the name as "file_list" and the<|projection|> arguments including the prefix parameter. Let me double-check the schema to ensure the parameters are correctly formatted. Once that's done, the response should provide the user with the necessary information about the directory's contents.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/migrations"}}
+  </tool_call><|projection|>
+- |-
+  give me a directory listing of /workspace/assets/images<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a directory listing of /workspace/assets/images. Let me check the tools available. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters include a prefix, which matches the path the user provided. So I need to call file_list<|projection|> with the prefix set to "/workspace/assets/images/". I should make sure the JSON is correctly formatted with the prefix parameter. No other tools are needed here. Alright, let's structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/assets/images/"}}
+  </tool_call><|projection|>
+- |-
+  which files live under /workspace/config<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which files are located under the /workspace/config path in the virtual filesystem. I need to use the file_list tool for this. The file_list tool allows enumerating files, and it has a parameter called prefix which can narrow down the results to a specific path prefix. The user<|projection|>'s query specifies the prefix as /workspace/config, so I should set the prefix parameter to that value. If the prefix is empty or not provided, the tool would list all files, but in this case, we need to filter by the given path. So I'll construct the tool call with the prefix set to "/<|projection|>workspace/config".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/config"}}
+  </tool_call><|projection|>
+- |-
+  enumerate the contents of /workspace/scripts<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list the contents of the /workspace/scripts directory. Let me check the available tools. There's a tool called file_list that enumerates files in the virtual filesystem. The parameters include a prefix, which defaults to an empty string. Since the user specified /workspace/scripts, I should<|projection|> set the prefix to that path. I need to make sure the JSON is correctly formatted with the prefix parameter. Alright, calling file_list with the prefix should return the list of files and their sizes.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/scripts"}}
+  </tool_call><|projection|>

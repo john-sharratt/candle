@@ -1,0 +1,189 @@
+name: hash_compute
+category: Security utilities
+description: Compute a one-shot cryptographic digest — a fixed-size fingerprint — of data, using sha256, sha512, sha1, md5, sha3_256, sha3_512, or blake3. Returns the digest as hex or base64 for content fingerprinting and integrity checks.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    HashAlgorithm:
+      description: Hash algorithm.
+      enum:
+      - sha256
+      - sha512
+      - sha1
+      - md5
+      - sha3_256
+      - sha3_512
+      - blake3
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/HashAlgorithm'
+      description: 'Hash algorithm. One of: sha256, sha512, sha1, md5, sha3_256, sha3_512, blake3. Required.'
+      minItems: 1
+      minLength: 1
+    data:
+      description: The data to hash, interpreted according to `data_encoding`.
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned digest. One of: text, hex, base64. Defaults to hex.'
+  required:
+  - algorithm
+  - data
+  title: ComputeRequest
+  type: object
+examples:
+- |-
+  compute the SHA-256 of the string hello world<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to compute the SHA-256 hash of the string "hello world".
+
+  First, I need to use the provided tool called hash_compute. The parameters required are algorithm, data, data_encoding, and output_encoding.
+
+  The user specified SHA-256,<|projection|> so the algorithm should be "sha256". The data is "hello world". Since the data is a text string, the data_encoding should be "text" which is the default. The output_encoding isn't specified, so I'll leave it as the default, which is hex.
+
+  So the arguments would be<|projection|>:
+  algorithm: "sha256"
+  data: "hello world"
+  data_encoding: "text" (though since it's the default, maybe it's optional, but including it might be safer)
+  output_encoding: "hex" (but again, default)
+
+  Wait, looking at the parameters, the required fields are<|projection|> algorithm and data. The others have defaults. So data_encoding defaults to text, and output_encoding defaults to hex. So in the tool call, I can just provide algorithm and data.
+
+  So the JSON should be:
+  {
+    "name": "hash_compute",
+    "arguments": {
+      "algorithm": "sha<|projection|>256",
+      "data": "hello world"
+    }
+  }
+
+  I think that's all. The other parameters will use their defaults. That should compute the SHA-256 hash of "hello world" and return it in hex format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha256", "data": "hello world"}}
+  </tool_call><|projection|>
+- |-
+  compute the MD5 hash of the string 'correct horse battery staple'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to compute the MD5 hash of the string 'correct horse battery staple'. Let me check the tools available. The provided tool is called hash_compute. Let me look at its parameters.
+
+  The hash_compute tool requires the algorithm, data, data_encoding, and output_encoding. The user<|projection|> specified MD5, so I need to set the algorithm to "md5". The data is the string given. The data_encoding defaults to text, which is correct here. The output_encoding defaults to hex, which is standard for hashes.
+
+  Wait, the user didn't specify the output encoding, so using the default hex<|projection|> is right. So the arguments should be algorithm: "md5", data: "correct horse battery staple". The other parameters can use their defaults. So the JSON call should include those values. Let me make sure there's no mistake in the parameter names. Yes, 'algorithm' and 'data' are required.<|projection|> Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "md5", "data": "correct horse battery staple"}}
+  </tool_call><|projection|>
+- |-
+  compute the SHA-1 digest of the string 'commit message v1'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to compute the SHA-1 digest of the string 'commit message v1'. Let me check the tools available. There's a hash_compute tool that supports various algorithms, including SHA-1.
+
+  First, I need to make sure the parameters are correct. The algorithm should be '<|projection|>sha1', the data is the string provided, and the output encoding should be hex as per default. The data encoding is text since the input is a string.
+
+  Wait, the tool's parameters require 'algorithm' as a required field. So I'll set that to 'sha1'. The data is 'commit<|projection|> message v1', and since it's a text string, data_encoding is 'text' by default. The output_encoding isn't specified, so it will default to 'hex', which is standard for hashes.
+
+  So the JSON call should have the name 'hash_compute' with these arguments. Let me structure that properly.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha1", "data": "commit message v1", "data_encoding": "text", "output_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  hash the string 'foo' with SHA-512<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to hash the string 'foo' using SHA-512. Let me check the available tools. There's a function called hash_compute. The parameters needed are algorithm, data, data_encoding, and output_encoding. The algorithm should be 'sha512' as per the<|projection|> enum in the tool's definition. The data is 'foo', and since it's a text string, the data_encoding should be 'text'. The output_encoding isn't specified, so I'll default to 'hex' as that's common for hashes. I need to make sure all required fields are included. Let me<|projection|> structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha512", "data": "foo", "data_encoding": "text", "output_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  give me the SHA-256 digest of 'the quick brown fox jumps over the lazy dog'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the SHA-256 digest of the string 'the quick brown fox jumps over the lazy dog'. Let me check the tools available. There's a hash_compute tool that can handle this.
+
+  First, I need to make sure the parameters are correct. The algorithm should be<|projection|> 'sha256', the data is the given string, and the output encoding should be hex as default. The data encoding is text by default, which matches the input. So the tool call should include these parameters.
+
+  I'll structure the JSON with the name as 'hash_compute' and the arguments with the required<|projection|> fields. No need to specify output_encoding since it's optional and defaults to hex. Double-checking the parameters, everything looks good. Time to format the response correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha256", "data": "the quick brown fox jumps over the lazy dog"}}
+  </tool_call><|projection|>
+- |-
+  what's the MD5 of 'release-2026.07'?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the MD5 hash of the string 'release-2026.07'. Let me check the tools available.
+
+  Looking at the provided tools, there's a hash_compute function. It supports various algorithms like SHA256, SHA1, etc., but I<|projection|> don't see MD5 listed in the allowed algorithms. The HashAlgorithm enum in the tool's parameters only includes sha256, sha512, sha1, md5, sha3_256, sha3_512, and blake3. Wait, actually, looking again,<|projection|> md5 is included in the enum. Let me confirm:
+
+  The enum for HashAlgorithm has "md5" as one of the options. So the tool does support MD5. Great.
+
+  So I can use the hash_compute tool with algorithm set to "md5" and the data as 'release-202<|projection|>6.07'. The data_encoding is text by default. The output_encoding defaults to hex, which is standard for hashes. So the call should be straightforward.
+
+  I need to structure the JSON correctly. The parameters are algorithm, data, data_encoding (optional), and output_encoding (optional). Since the user didn't<|projection|> specify encoding, we'll omit those and use defaults.
+
+  Therefore, the tool call will have name "hash_compute" and arguments {"algorithm": "md5", "data": "release-2026.07"}.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "md5", "data": "release-2026.07"}}
+  </tool_call><|projection|>
+- |-
+  hash 'user:alice|role:admin' with SHA-512<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to hash the string 'user:alice|role:admin' using SHA-512. Let me check the available tools.
+
+  Looking at the tools provided, there's a function called hash_compute. The parameters include algorithm, data, data_encoding, and output_encoding. The algorithm<|projection|> can be set to sha512. The data is the string they provided. Since the data is given as text, I don't need to encode it unless specified. The output encoding defaults to hex, which is fine unless they want base64.
+
+  So I need to call hash_compute with algorithm "sha5<|projection|>12" and data "user:alice|role:admin". The other parameters can use their default values. That should generate the SHA-512 hash in hexadecimal format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha512", "data": "user:alice|role:admin"}}
+  </tool_call><|projection|>
+- |-
+  compute a SHA-1 checksum for the string 'v3.1.4-rc2'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to compute a SHA-1 checksum for the string 'v3.1.4-rc2'. Let me check the tools available.
+
+  Looking at the provided tools, there's a function called hash_compute. The description says it can compute a cryptographic digest using various algorithms, including<|projection|> SHA-1. Perfect.
+
+  Now, I need to make sure I use the correct parameters. The user specified the algorithm as SHA-1, the data is the string 'v3.1.4-rc2', and the output should be in hex format. The tool's parameters require the algorithm, data,<|projection|> data_encoding, and output_encoding.
+
+  The data_encoding defaults to text, which is fine here since the input is a string. The output_encoding defaults to hex, which matches the user's request. So I don't need to specify those unless necessary.
+
+  So the arguments would be: algorithm set to "sha1<|projection|>", data as "v3.1.4-rc2". The other parameters can use their defaults. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_compute", "arguments": {"algorithm": "sha1", "data": "v3.1.4-rc2"}}
+  </tool_call><|projection|>

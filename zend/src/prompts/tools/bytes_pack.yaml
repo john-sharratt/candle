@@ -1,0 +1,189 @@
+name: bytes_pack
+category: Byte encoding
+description: 'Pack structured values into binary bytes using a format string (like Python struct). Format: optional < (little-endian) or > (big-endian), then type chars: B(u8), H(u16), I/L(u32), Q(u64), b(i8), h(i16), i/l(i32), q(i64), f(f32), d(f64), Ns(N-byte string). Always call this tool to pack the values; never assemble the bytes yourself.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    BytesEncoding:
+      description: Byte encoding format.
+      enum:
+      - hex
+      - base64
+      - base64url
+      - utf8
+      type: string
+  properties:
+    format:
+      description: 'Python struct-style format string: optional endianness prefix (`<` little-endian, `>` big-endian) then type chars B/H/I/L/Q/b/h/i/l/q/f/d and `Ns` for an N-byte string. Required.'
+      minLength: 1
+      type: string
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/BytesEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned packed bytes. One of: hex, base64, base64url, utf8. Defaults to hex.'
+    values:
+      description: Values to pack, one per format field, in order. Required.
+      items: true
+      type: array
+  required:
+  - format
+  - values
+  title: PackRequest
+  type: object
+examples:
+- |-
+  pack the integers 3149642683, 1094795585, and 2882395258 as big-endian unsigned 32-bit ints<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to pack three integers as big-endian unsigned 32-bit integers. The tool they mentioned is bytes_pack. So I need to figure out the correct format string.
+
+  Each integer is a 32-bit unsigned int. In Python's struct notation, that's<|projection|> 'I' for each. Since there are three numbers, the format should be 'III'. But wait, the endianness. The user specified big-endian, so we need to prepend '>' to the format. So the format becomes '>III'.
+
+  The values are 314964268<|projection|>3, 1094795585, and 2882395258. Those are all valid 32-bit unsigned integers. Now, the output encoding isn't specified, but the default is hex. So the tool will handle that.
+
+  So the tool call<|projection|> should have the format as '>III' and the values as the array of those numbers. I need to make sure the JSON is correctly formatted with the parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": ">III", "values": [3149642683, 1094795585, 2882395258]}}
+  </tool_call><|projection|>
+- |-
+  pack the float 3.14 and the shorts 7 and 9 into bytes with format '>fHH'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to solve this problem. The user wants to pack a float 3.14 and two shorts (7 and 9) into bytes using the format '>fHH'.
+
+  First, I need to understand the format string. The '>' indicates big-endian.<|projection|> Then 'f' is a float, which is 4 bytes, and 'H' is an unsigned short, which is 2 bytes each. So the total size should be 4 + 2 + 2 = 8 bytes.
+
+  Next, I need to use the bytes_pack tool. The parameters are format<|projection|>, values, and output_encoding. The format is '>fHH'. The values are [3.14, 7, 9]. The output encoding isn't specified, so it defaults to hex. But the user might want the raw bytes, but according to the tool's description, if output_encoding is not<|projection|> provided, it's hex. Wait, no, the default for output_encoding is hex. But maybe the user just wants the bytes, but the tool requires specifying it. Wait, looking back at the tool's parameters: "output_encoding": {"anyOf": [...] , "description": "Encoding for the returned packed bytes<|projection|>. One of: hex, base64, etc. Defaults to hex."} So if not provided, it uses hex.
+
+  But the user didn't specify, so we can leave it out. So the call would be format '>fHH', values [3.14, 7, 9].<|projection|>
+
+  Wait, but the tool requires 'format' and 'values' as required parameters. So in the JSON, the arguments should be:
+
+  {
+    "format": ">fHH",
+    "values": [3.14, 7, 9]
+  }
+
+  And output_encoding is optional. So the tool will<|projection|> pack them. The result will be the packed bytes in hex, as per default.
+
+  I think that's all. Let me check if there are any issues. The float 3.14 in big-endian. Let me verify the packing. For example, 3.14 as a float in C would<|projection|> be 0x4048F5C3 (but I need to confirm). But the exact value isn't needed here; the tool handles it. So the correct call is as above.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": ">fHH", "values": [3.14, 7, 9]}}
+  </tool_call><|projection|>
+- |-
+  pack the values 46021 and 12873 as little-endian u16s<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to pack the values 46021 and 12873 as little-endian u16s. So, first, I need to figure out the correct format string for the bytes_pack tool.
+
+  Since they specified little-endian, the<|projection|> format should start with '<'. For unsigned 16-bit integers, the type code is 'H'. Since there are two values, the format would be '<HH'.
+
+  Wait, but the parameters for the tool require the format string. So the "format" parameter should be "<HH". Then the "values" array<|projection|> should contain 46021 and 12873. The output encoding isn't specified, so it'll default to hex. That should do it. Let me double-check the parameters. Yes, the required fields are format and values. Alright, the JSON should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": "<HH", "values": [46021, 12873]}}
+  </tool_call><|projection|>
+- |-
+  pack the values 3405691582 and 48350 into a binary buffer with the format '>IH'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to pack the values 3405691582 and 48350 into a binary buffer using the format '>IH'.
+
+  First, I need to understand the format string. The '>' indicates big-endian. Then 'I<|projection|>' is an unsigned int (4 bytes), and 'H' is an unsigned short (2 bytes). So the total size should be 4 + 2 = 6 bytes.
+
+  The values are 3405691582 and 48350. Let me check if they<|projection|> fit. For 'I', 3405691582 is within 0-4294967295, which is fine. 'H' for 48350 is up to 65535, so that's okay.
+
+  Now,<|projection|> using the bytes_pack tool. The parameters should be format '>IH', values [3405691582, 48350]. The output encoding isn't specified, so it'll default to hex. So the tool call should include those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": ">IH", "values": [3405691582, 48350]}}
+  </tool_call><|projection|>
+- |-
+  pack the double 2.71828 with the format '<d'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to pack the double 2.71828 using the format '<d'. Alright, so first, I need to recall how the bytes_pack tool works. The format string starts with a < for little-endian, then 'd' for double-<|projection|>precision float. The values array should have the double value.
+
+  Wait, the parameters for bytes_pack require 'format', 'values', and optionally 'output_encoding'. The user didn't specify an output encoding, so it'll default to hex. But since the user just said "pack", maybe the output is in hex.<|projection|> But the actual packed bytes would be binary. However, the tool's output is a string encoded based on the output_encoding. But the user hasn't specified that, so maybe we just proceed with the default, which is hex.
+
+  So, the arguments should be: format is '<d', values is [2.7<|projection|>1828], and output_encoding is not provided, so it defaults to 'hex'. Therefore, the tool call is correct as written.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": "<d", "values": [2.71828]}}
+  </tool_call><|projection|>
+- |-
+  encode the signed bytes -47, 112, and -9 with the format '>bbb'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encode the values -47, 112, and -9 using the format '>bbb'. Hmm, I need to use the bytes_pack tool here.
+
+  First, the format string starts with '>', which means big-endian. Then there are three<|projection|> 'b's. Each 'b' is a signed char (8-bit) in Python's struct module. But wait, in C, a 'char' can be signed or unsigned, but in Python's struct, 'b' is a signed char, and 'B' is unsigned. So for each 'b<|projection|>', the value must be between -128 and 127. Let me check the values: -47 is within range, 112 is also okay (since 112 < 127), and -9 is also fine.
+
+  So the format is correct. The tool requires<|projection|> the format, values, and optional output encoding. The user didn't specify the output encoding, so it will default to hex. But the user might expect the packed bytes as a hex string.
+
+  Wait, the parameters are format, values, and output_encoding. So I need to structure the call with those. The<|projection|> values are [-47, 112, -9].
+
+  So the JSON should be:
+
+  {
+    "format": ">bbb",
+    "values": [-47, 112, -9]
+  }
+
+  And output_encoding is not included since it's optional and defaults to hex. So the tool<|projection|> will handle the rest. That's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": ">bbb", "values": [-47, 112, -9]}}
+  </tool_call><|projection|>
+- |-
+  pack the value 65535 and the float 1.5 as little-endian with format '<Hf'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to solve this. The user wants to pack the value 65535 and the float 1.5 using the format '<Hf' in little-endian.
+
+  First, I remember that the tool 'bytes_pack' is used for packing values<|projection|> into bytes. The format string starts with '<' for little-endian. The 'H' is an unsigned short (2 bytes), and 'f' is a float (4 bytes). So the total size should be 2 + 4 = 6 bytes.
+
+  The values to pack are 6553<|projection|>5, which is 0xFFFF, and 1.5. For the float, I need to make sure it's represented correctly as a 32-bit float.
+
+  I need to call the 'bytes_pack' function with the format '<Hf', the values [65535, 1<|projection|>.5], and maybe specify the output encoding. The user didn't mention the encoding, so maybe default to hex. But the tool might handle that.
+
+  Wait, the parameters for 'bytes_pack' require 'format', 'values', and optional 'output_encoding'. So the arguments should be:
+
+  {
+    "format<|projection|>": "<Hf",
+    "values": [65535, 1.5]
+  }
+
+  The output_encoding is optional. Since the user didn't specify, perhaps it's okay to leave it out, or set it to 'hex' as default. But according to the tool's definition, the default<|projection|> isn't specified, so maybe it's better to include it. However, the user might expect the raw bytes, but the problem says to return the call.
+
+  So the correct tool call would be with the format and values as above. I think that's all. Let me check again: the format is correct,<|projection|> the values are in order. Yes.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": "<Hf", "values": [65535, 1.5]}}
+  </tool_call><|projection|>
+- |-
+  serialize the u64 4294967296 and the u8 200 using format '>QB'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to solve this. The user wants to serialize a u64 value 4294967296 and a u8 value 200 using the format '>QB'.
+
+  First, I remember that the tool 'bytes_pack' is<|projection|> used for packing values into bytes. The format string here is '>QB'. The '>' probably specifies big-endian byte order. Then 'Q' is for a 64-bit unsigned integer (u64), and 'B' is for an 8-bit unsigned integer (u8). So the format makes sense<|projection|> for the given values.
+
+  The parameters required for 'bytes_pack' are 'format', 'values', and optionally 'output_encoding'. The user didn't specify an output encoding, so it will default to hex. The 'values' array should have the two numbers: 4294967296<|projection|> and 200.
+
+  I need to make sure that the JSON structure is correct. The 'format' is '>QB', 'values' is [4294967296, 200], and since output_encoding isn't mentioned, it's omitted. The tool will handle the<|projection|> packing based on the format. I think that's all. Let me put this into the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_pack", "arguments": {"format": ">QB", "values": [4294967296, 200]}}
+  </tool_call><|projection|>

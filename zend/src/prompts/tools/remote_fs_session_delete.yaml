@@ -1,0 +1,131 @@
+name: remote_fs_session_delete
+category: Remote filesystem
+description: Remove a file on a remote host's filesystem over SFTP. For the local session VFS use file_delete instead.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    path:
+      description: Remote file path to delete.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - path
+  - session_id
+  title: DeleteRequest
+  type: object
+examples:
+- |-
+  delete /tmp/old.log on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delete the file /tmp/old.log on a remote filesystem using the session ID rfs-1. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. The parameters required are path and session_id. The path is /tmp/old.log,<|projection|> and the session ID is rfs-1. I need to make sure both are provided. The tool's description says it deletes a file via SFTP using the session. So the correct call should be to use this tool with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/tmp/old.log", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  remove /var/www/stale.html on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to remove the file /var/www/stale.html on a remote filesystem session with the ID rfs-1. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. Its parameters are path and session_id. The path is the file to delete, and<|projection|> session_id is from the remote session. The user provided both: the path is /var/www/stale.html and the session ID is rfs-1. So I need to call that tool with those arguments. I should make sure the JSON structure is correct, with the name of the tool and the arguments as a<|projection|> JSON object. No other tools are needed here. Just a straightforward call to remote_fs_session_delete with the given parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/var/www/stale.html", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  delete /backups/2019.sql on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delete the file /backups/2019.sql on a remote filesystem using the session rfs-2. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. Its parameters are path and session_id. The path is the remote file path<|projection|>, and the session_id is from the remote_fs_session_open tool. The user provided the session ID rfs-2, so that's the session_id. The path is /backups/2019.sql.
+
+  I need to make sure both parameters are included. The required fields are path and session_id.<|projection|> So the JSON should have "path": "/backups/2019.sql" and "session_id": "rfs-2".
+
+  Double-checking the tool's requirements: minLength for both is 1, which is satisfied. The type is object, correct. No other parameters needed. Looks good.<|projection|> Time to format the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/backups/2019.sql", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  remove /opt/app/debug.log on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to remove the file /opt/app/debug.log on a remote filesystem session with the ID rfs-1. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. Its parameters are path and session_id. The path is the file to delete, and session<|projection|>_id is from the remote session. The user provided both: the path is /opt/app/debug.log and the session is rfs-1.
+
+  So I need to call remote_fs_session_delete with those arguments. Make sure the JSON has the correct keys. No other tools are needed here. Just the delete function with<|projection|> the given parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/opt/app/debug.log", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  get rid of /srv/cache/session-tmp.dat on remote-fs session rfs-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delete the file /srv/cache/session-tmp.dat on a remote FS session with the ID rfs-3. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. Its parameters are path and session_id. The path is the file path, and<|projection|> the session_id is the session identifier. The user provided both: the path is /srv/cache/session-tmp.dat and the session ID is rfs-3.
+
+  I need to make sure the parameters are correctly formatted. The path should be a string, and the session ID as well. The required fields are present<|projection|>. So the tool call should have the name remote_fs_session_delete with these arguments. No other tools are needed here. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/srv/cache/session-tmp.dat", "session_id": "rfs-3"}}
+  </tool_call><|projection|>
+- |-
+  can you delete /home/ci/artifacts/build-01.tar.gz on remote-fs session rfs-4?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to delete the file /home/ci/artifacts/build-01.tar.gz on a remote filesystem session called rfs-4.
+
+  First, I need to check the available tools. There's a tool called remote_fs_session_delete<|projection|>, which is meant for deleting files on a remote host via SFTP. The parameters required are 'path' and 'session_id'. The 'path' is the file path they want to delete, and 'session_id' is the ID of the open session.
+
+  The user provided the session name as "rfs-<|projection|>4", which I assume is the session ID. So I should use that as the session_id parameter. The path is clearly /home/ci/artifacts/build-01.tar.gz.
+
+  I need to make sure both parameters are included in the tool call. Since the user is asking to delete the file, the tool<|projection|> call should have the name remote_fs_session_delete with the arguments path and session_id set appropriately. I don't see any other tools that would be relevant here, so this should be the correct approach.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/home/ci/artifacts/build-01.tar.gz", "session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  erase /var/log/nginx/access.log.1 on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delete the file /var/log/nginx/access.log.1 on a remote filesystem using the session rfs-2. Let me check the available tools.
+
+  There's a tool called remote_fs_session_delete. The parameters required are path and session_id. The path is given as /var<|projection|>/log/nginx/access.log.1, and the session ID is rfs-2. I need to make sure both parameters are included in the JSON call. Let me structure the JSON object correctly. No other tools are needed here. Just call remote_fs_session_delete with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/var/log/nginx/access.log.1", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  rm /etc/cron.d/stale-job on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to remove the file /etc/cron.d/stale-job on a remote filesystem session called rfs-1. Let me check the tools available.
+
+  There's a tool called remote_fs_session_delete. Its parameters are path and session_id. The path is the file location, which is<|projection|> /etc/cron.d/stale-job. The session ID is given as rfs-1.
+
+  I need to make sure both parameters are included. The required fields are path and session_id. So the JSON should have those two. Let me structure the tool call correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_delete", "arguments": {"path": "/etc/cron.d/stale-job", "session_id": "rfs-1"}}
+  </tool_call><|projection|>

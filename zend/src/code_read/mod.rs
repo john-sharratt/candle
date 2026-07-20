@@ -308,6 +308,7 @@ fn carve_workspace(
 /// files whose ingest tolerated-failed (e.g. out of KV VRAM), so the upload can
 /// surface a real failure. Summarisation of the ingested scopes runs entirely in
 /// the background summariser and is not awaited here.
+#[allow(clippy::too_many_arguments)]
 pub fn ingest_files(
     engine: &Mutex<ConversationEngine>,
     proj_builder: &Builder,
@@ -315,6 +316,8 @@ pub fn ingest_files(
     rel_paths: &[String],
     config: SequenceConfig,
     progress: &Arc<LoadProgress>,
+    layer_name: &str,
+    group_name: &str,
 ) -> anyhow::Result<(CodeReadState, usize)> {
     // Build a minimal RepoMap for just these files — `carve_workspace` needs
     // only the path + language; the other `FileEntry` fields are unused by the
@@ -339,12 +342,12 @@ pub fn ingest_files(
     }
 
     let layer = proj_builder
-        .id_for_layer("code_reading")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
+        .id_for_layer(layer_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
     let group = proj_builder
-        .id_for_group("scopes")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
-    let system_prompt = layer_system_prompt(proj_builder, "code_reading", &config);
+        .id_for_group(group_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    let system_prompt = layer_system_prompt(proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
 
     let (per_file, state) = carve_workspace(workspace, &map);
@@ -439,6 +442,7 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet
 /// that many conversations are live at once (VRAM bound) while the
 /// scheduler wave-batches their prefills/decodes. The engine mutex is
 /// taken only for the quick create/tombstone ops, never across a decode.
+#[allow(clippy::too_many_arguments)]
 pub fn ingest_code_reading(
     engine: &Mutex<ConversationEngine>,
     proj_builder: Builder,
@@ -446,14 +450,16 @@ pub fn ingest_code_reading(
     map: &RepoMap,
     config: SequenceConfig,
     progress: &Arc<LoadProgress>,
+    layer_name: &str,
+    group_name: &str,
 ) -> anyhow::Result<CodeReadState> {
     let layer = proj_builder
-        .id_for_layer("code_reading")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
+        .id_for_layer(layer_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
     let group = proj_builder
-        .id_for_group("scopes")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
-    let system_prompt = layer_system_prompt(&proj_builder, "code_reading", &config);
+        .id_for_group(group_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
     let n_workers = parallelism();
 
@@ -774,6 +780,8 @@ pub fn refresh_code_reading(
     map: &RepoMap,
     prior: &CodeReadState,
     progress: &Arc<LoadProgress>,
+    layer_name: &str,
+    group_name: &str,
 ) -> anyhow::Result<RefreshOutcome> {
     // Carve once — drives both the change comparison and the re-ingest.
     let (per_file, next) = carve_workspace(workspace, map);
@@ -791,13 +799,13 @@ pub fn refresh_code_reading(
 
     let layer = ctx
         .proj_builder
-        .id_for_layer("code_reading")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
+        .id_for_layer(layer_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
     let group = ctx
         .proj_builder
-        .id_for_group("scopes")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
-    let system_prompt = layer_system_prompt(&ctx.proj_builder, "code_reading", &ctx.config);
+        .id_for_group(group_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    let system_prompt = layer_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
     let utility_cfg = code_read_config(ctx.config.clone());
     let n_workers = parallelism();
     let total: usize = per_file

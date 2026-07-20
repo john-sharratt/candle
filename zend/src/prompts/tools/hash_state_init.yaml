@@ -1,0 +1,144 @@
+name: hash_state_init
+category: Hash streaming
+description: Begin an incremental, streaming hash computation — data is fed in chunks rather than all at once. Returns a state id for the subsequent hash_state_update and hash_state_finalize calls. Use when the input is too large to hold in memory at once.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    HashAlgorithm:
+      description: Hash algorithm.
+      enum:
+      - sha256
+      - sha512
+      - sha1
+      - md5
+      - sha3_256
+      - sha3_512
+      - blake3
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/HashAlgorithm'
+      description: 'Hash algorithm. One of: sha256, sha512, sha1, md5, sha3_256, sha3_512, blake3. Required.'
+      minItems: 1
+      minLength: 1
+    id:
+      description: Optional state id to assign. Defaults to a generated `hs_<uuid>` value.
+      type:
+      - string
+      - 'null'
+  required:
+  - algorithm
+  title: InitRequest
+  type: object
+examples:
+- |-
+  start a streaming SHA-256 hash<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start a streaming SHA-256 hash. Let me check the available tools. There's the hash_state_init function. It requires the algorithm parameter, which should be "sha256" in this case. The user didn't specify an ID, so I'll leave<|projection|> that out. Just need to call hash_state_init with the algorithm set to sha256.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha256"}}
+  </tool_call><|projection|>
+- |-
+  begin an incremental SHA-512 computation<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start an incremental SHA-512 hash computation. Let me check the available tools. There's the hash_state_init function. It requires the algorithm parameter, which should be "sha512" based on the enum in the tool's JSON. The user didn't specify<|projection|> a state ID, so I'll omit the 'id' parameter. So the call should be hash_state_init with {"algorithm": "sha512"}. That should return a state ID for subsequent updates.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha512"}}
+  </tool_call><|projection|>
+- |-
+  open a new streaming hash with SHA-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a new streaming hash using SHA-1. Let me check the available tools.
+
+  Looking at the tools provided, there's a function called hash_state_init. Its description says it's for incremental hash computation, which matches the user's need for streaming. The parameters include an algorithm<|projection|> and an optional id. The allowed algorithms are listed, but wait, the user specified SHA-1. Let me check the enum in the tool's parameters.
+
+  The tool's HashAlgorithm enum includes sha1. So SHA-1 is supported. The user didn't specify an ID, so the tool will generate one.<|projection|> So I need to call hash_state_init with algorithm set to "sha1".
+
+  I should structure the tool call accordingly. The response should be a JSON object inside the tool_call tags. Making sure the name is correct and the arguments are properly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha1"}}
+  </tool_call><|projection|>
+- |-
+  initialize an incremental SHA-256 hash for feeding data in chunks<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to initialize an incremental SHA-256 hash. Let me check the available tools. There's the hash_state_init function. The parameters require an algorithm and an optional id. The algorithm needs to be one of the allowed values, and SHA-256 is listed. So<|projection|> I should call hash_state_init with algorithm set to "sha256". The id can be omitted or a UUID generated. Since the user didn't specify an ID, I'll leave it out. The response will give a state ID for subsequent steps. That should start the incremental hashing as requested.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "hash_state_init", "arguments": {"algorithm": "sha256"}}
+  </tool_call><|projection|>
+- |-
+  spin up a fresh streaming MD5 hash<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to "spin up a fresh streaming MD5 hash." Let me think about how to approach this.
+
+  First, I need to understand what they mean by "streaming MD5 hash." A streaming hash would process data in chunks, which is useful for large files or continuous data streams<|projection|>. The user might be working with a tool that requires initializing a hashing state, then feeding it data incrementally.
+
+  Looking at the available tools, there's a function called hash_state_init. Its description says it begins an incremental, streaming hash computation. It takes parameters like the algorithm and an optional state ID. The supported<|projection|> algorithms include MD5, which matches the user's request.
+
+  So, the first step is to call hash_state_init with the algorithm set to "md5". The user didn't specify a state ID, so we can omit that parameter, allowing the system to generate a default one. This should return a state ID that<|projection|> the user can use in subsequent calls to update the hash with more data.
+
+  I need to make sure I'm using the correct JSON structure for the tool call. The name should be "hash_state_init" and the arguments should be a JSON object with "algorithm": "md5". Since the state ID is optional,<|projection|> I don't include it unless specified.
+
+  Wait, the parameters for hash_state_init require the "algorithm" as a required field. The user's request clearly states MD5, so that's straightforward. No other parameters are needed here. The response from this call will give the state ID, which the user can then use<|projection|> in further interactions with the streaming hash function.
+
+  I think that's all. The user just needs the initial setup for the streaming MD5 hash, which is handled by the hash_state_init tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "md5"}}
+  </tool_call><|projection|>
+- |-
+  I want to hash a big file piece by piece with SHA-512 — set up the state<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to hash a large file incrementally using SHA-512. Let me check the available tools. There's the hash_state_init function which initializes a hashing state. The parameters require specifying the algorithm and an optional ID.
+
+  The user mentioned SHA-512, which is listed<|projection|> in the enum as "sha512". So I need to call hash_state_init with algorithm "sha512". The ID is optional, so I can omit it or generate a UUID. Since the user didn't specify, I'll let the system handle the ID.
+
+  So the correct tool call is hash<|projection|>_state_init with {"algorithm": "sha512"}. That should start the incremental hash process.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha512"}}
+  </tool_call><|projection|>
+- |-
+  create a new incremental SHA-1 hashing session<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create a new incremental SHA-1 hashing session. Let me check the available tools.
+
+  Looking at the provided tools, there's a function called hash_state_init. Its description says it begins an incremental hash computation, which is exactly what's needed here. The parameters include the algorithm,<|projection|> which should be "sha1" in this case. The function returns a state id for subsequent updates and finalization.
+
+  The user didn't specify any other parameters, so I just need to call hash_state_init with the algorithm set to "sha1". The id is optional, so leaving it out will let the system<|projection|> generate a default ID. That should start the session properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha1"}}
+  </tool_call><|projection|>
+- |-
+  open a streaming SHA-256 context so I can push data as it arrives<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a streaming SHA-256 context. They mentioned they'll be pushing data as it arrives, so they probably have a large file or stream they're processing in chunks.
+
+  Looking at the available tools, there's the hash_state_init function. It initializes a hashing state,<|projection|> which is exactly what's needed here. The parameters required are the algorithm and an optional id. Since the user specified SHA-256, I need to set the algorithm to "sha256". The id is optional, and if not provided, the system will generate a default ID like "hs_<uuid<|projection|>>".
+
+  The user didn't mention a specific ID, so I'll omit that parameter. The key thing is to make sure the algorithm is correctly set to "sha256" as per their request. This should start the streaming context properly, allowing them to then use hash_state_update with each data chunk and finally<|projection|> finalize the hash when done.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_init", "arguments": {"algorithm": "sha256"}}
+  </tool_call><|projection|>

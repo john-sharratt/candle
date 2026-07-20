@@ -1,0 +1,237 @@
+name: http_request
+category: HTTP sessions
+description: 'Issue an HTTP request through an existing session — GET, POST, PUT, PATCH, DELETE, HEAD, or OPTIONS — with optional headers, query parameters, and body. Use for: REST API calls, GraphQL queries, posting JSON data, fetching authenticated resources, anything needing cookies or auth state across calls. Triggered by "call the API", "POST to", "GET from", "send a request to", "hit the endpoint", "submit to". Returns status, headers, body (text) or body_b64 (binary), final URL, and duration. GET/HEAD/OPTIONS skip confirmation; POST/PUT/PATCH/DELETE confirm. For one-shot public page retrieval use web_fetch instead.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    body:
+      description: Raw request body sent as-is. Use `body_json` instead for JSON. Omit for no body.
+      type:
+      - string
+      - 'null'
+    body_json:
+      description: JSON request body; sets Content-Type to application/json. Takes precedence over `body`. Omit for no JSON body.
+    headers:
+      additionalProperties:
+        type: string
+      description: Per-request headers, merged over the session defaults. Omit for none.
+      type:
+      - object
+      - 'null'
+    max_response_bytes:
+      description: 'Cap on bytes read from the response body (max 1048576). Default: 32768.'
+      format: uint
+      maximum: 1048576.0
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    method:
+      description: 'HTTP verb: GET, POST, PUT, PATCH, DELETE, HEAD, or OPTIONS. Default: GET.'
+      type:
+      - string
+      - 'null'
+    path:
+      description: Request path appended to the session's base_url, or an absolute http(s):// URL.
+      type: string
+    query:
+      additionalProperties:
+        type: string
+      description: Query-string parameters appended to the URL. Omit for none.
+      type:
+      - object
+      - 'null'
+    session_id:
+      description: ID of an open session (from http_session_open). Must be non-empty.
+      minLength: 1
+      type: string
+    timeout_sec:
+      description: Per-request timeout override in seconds. Omit to use the session timeout.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - path
+  - session_id
+  title: ReqRequest
+  type: object
+examples:
+- |-
+  send a GET request to /users on HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send a GET request to /users using the HTTP session named http-1. I need to figure out which tool to use here.
+
+  Looking at the available tools, there's the http_request function. The description says it's for issuing HTTP requests through an existing<|projection|> session. The parameters include things like method, path, session_id, and others.
+
+  The user specified a GET request, so the method should be "GET". The path is /users. The session ID is given as http-1.
+
+  I need to make sure all required parameters are included. The http_request<|projection|> tool requires 'path' and 'session_id'. The other parameters like method, headers, etc., are optional. Since the user didn't mention any additional headers or query parameters, I can omit those.
+
+  So the arguments should be: path="/users", session_id="http-1", and method="GET". Let<|projection|> me double-check the JSON structure. The keys should be in quotes, and the values as specified. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"path": "/users", "session_id": "http-1", "method": "GET"}}
+  </tool_call><|projection|>
+- |-
+  POST the JSON body {"item":"widget","qty":3} to /orders on HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to POST a JSON body with "item" and "qty" to the /orders endpoint using an HTTP session called http-1.
+
+  First, I need to check the available tools. There's the http_request tool. Let me look at its parameters. The<|projection|> required fields are path and session_id. The method is optional, defaulting to GET. But here, it's a POST, so I need to set method to "POST". The body_json should be the JSON object provided. The path is /orders. The session_id is given as http-1.
+
+  Wait,<|projection|> the parameters mention that body_json is for JSON, which sets the Content-Type header. That's correct. Also, the headers can be set if needed, but the user didn't specify any, so I can omit that. The query parameters are not mentioned either, so no need for that either.
+
+  So putting it all<|projection|> together: the tool call should have name http_request, with arguments including path="/orders", session_id="http-1", method="POST", and body_json={"item":"widget","qty":3}. Let me double-check the required parameters. Yes, path and session_id are required. The rest are optional. This<|projection|> should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"path": "/orders", "session_id": "http-1", "method": "POST", "body_json": {"item": "widget", "qty": 3}}}
+  </tool_call><|projection|>
+- |-
+  make a DELETE request to /items/42 on HTTP session http-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to make a DELETE request to /items/42 using the HTTP session named http-2. Let me check the tools available.
+
+  The tool provided is http_request. The parameters needed are path, session_id, and method. The path is /items/42. The session<|projection|>_id should be http-2. The method for DELETE is specified. Other parameters like headers, body, etc., aren't mentioned, so I can omit them. Let me structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"path": "/items/42", "session_id": "http-2", "method": "DELETE"}}
+  </tool_call><|projection|>
+- |-
+  send a PATCH to /config with body {"debug":true} on HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to send a PATCH request to /config with the body {"debug": true} using the HTTP session called http-1.
+
+  First, I need to check the available tools. There's the http_request tool. Let me look at its<|projection|> parameters. The required parameters are path and session_id. The method can be set to PATCH. The body should be the JSON object provided. Also, the session_id should be "http-1" as specified.
+
+  Wait, the user mentioned "HTTP session http-1", so the session_id is "http-1<|projection|>". The path is "/config". The method is PATCH. The body is {"debug": true}, which should be sent as a JSON body. So in the tool call, I need to set method to "PATCH", path to "/config", session_id to "http-1", and body_json to {"debug":<|projection|> true}.
+
+  I should make sure that the parameters are correctly formatted. The headers are optional and not needed here. The max_response_bytes and other parameters can use their defaults. The timeout_sec is not specified, so it will use the session's timeout.
+
+  So the final tool call should have the correct name "http<|projection|>_request" with the arguments as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"method": "PATCH", "path": "/config", "session_id": "http-1", "body_json": {"debug": true}}}
+  </tool_call><|projection|>
+- |-
+  do a PUT to /profile/7 with body {"name":"Ada"} on HTTP session http-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to do a PUT request to /profile/7 with the body {"name":"Ada"} using the HTTP session http-3.
+
+  First, I need to check the available tools. There's the http_request tool. The parameters for that include method, path,<|projection|> body, session_id, etc.
+
+  The user specified a PUT method, so I should set the method to "PUT". The path is /profile/7. The body is the JSON object provided. The session ID is given as http-3.
+
+  I need to make sure that the parameters are correctly structured. The<|projection|> body should be a string, so I'll convert the JSON object to a string. Also, since it's a PUT request, the content type might need to be set, but the tool might handle that automatically or the session might have default headers.
+
+  Wait, the tool's parameters include a 'headers' field. But<|projection|> the user didn't specify any additional headers, so maybe I can omit that. The session might already have the necessary authentication or content type settings.
+
+  So putting it all together: the tool call should have the name "http_request", and the arguments include method, path, body, and session_id. Let me check the<|projection|> required parameters for the tool. The required fields are path and session_id. The other parameters like method, body, etc., are optional but needed here.
+
+  So the JSON object would be:
+
+  {
+    "name": "http_request",
+    "arguments": {
+      "method": "PUT",
+      "path": "/<|projection|>profile/7",
+      "body": "{\"name\":\"Ada\"}",
+      "session_id": "http-3"
+    }
+  }
+
+  I need to make sure that the JSON is properly formatted. Also, the body is a string, so the quotes are escaped. That should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"method": "PUT", "path": "/profile/7", "body": "{\"name\":\"Ada\"}", "session_id": "http-3"}}
+  </tool_call><|projection|>
+- |-
+  fire off a GET to /health on HTTP session http-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to fire off a GET request to the /health endpoint using the HTTP session called "http-2".
+
+  First, I need to recall the available tools. There's the http_request tool, which handles HTTP requests. The parameters include method, path, session_id<|projection|>, and others.
+
+  The user specified a GET method, so I should set the 'method' parameter to "GET". The path is "/health". The session ID is given as "http-2".
+
+  I need to make sure all required parameters are included. The http_request tool requires 'path' and 'session<|projection|>_id'. The 'method' is optional but here it's specified as GET.
+
+  So, constructing the JSON object with name "http_request" and the arguments: path="/health", session_id="http-2", and method="GET".
+
+  I should check if any other parameters are needed. The user didn't<|projection|> mention headers, body, or other options, so those can be omitted.
+
+  Yes, that should do it. The tool will handle the rest.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"method": "GET", "path": "/health", "session_id": "http-2"}}
+  </tool_call><|projection|>
+- |-
+  on HTTP session http-4, POST {"email":"a@b.com"} to /subscribe<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to make an HTTP POST request as part of the HTTP session named "http-4". The payload is a JSON object with the email "a@b.com", and the endpoint is "/subscribe".
+
+  First, I need to check the available tools. There's the<|projection|> http_request tool. Let me look at its parameters. The required parameters are path and session_id. The method is optional, defaulting to GET. Since this is a POST, I need to set method to "POST". The body_json should be {"email": "a@b.com"}. The path is "/<|projection|>subscribe". The session_id is "http-4".
+
+  Wait, the user mentioned "HTTP session http-4", so the session_id parameter should be "http-4". The path is "/subscribe". The headers might not be needed unless there's a specific content type. But since we're sending JSON, maybe setting<|projection|> Content-Type to application/json is necessary. However, the tool's body_json parameter automatically sets the Content-Type header, so perhaps I don't need to include it in headers.
+
+  So the parameters would be: method "POST", path "/subscribe", body_json {"email": "a@b.com"}, session_id "http<|projection|>-4". Other parameters like max_response_bytes or timeout_sec are optional and can be omitted if using defaults.
+
+  I need to make sure that all required parameters are included. The http_request tool requires path and session_id. The user provided both. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"method": "POST", "path": "/subscribe", "body_json": {"email": "a@b.com"}, "session_id": "http-4"}}
+  </tool_call><|projection|>
+- |-
+  hit /search?q=candle with a GET on HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. The user wrote: "hit /search?q=candle with a GET on HTTP session http-1".
+
+  First, I need to understand what the user is asking for. They want to perform an HTTP GET request to the path<|projection|> "/search" with a query parameter "q=candle" using an existing HTTP session called "http-1".
+
+  Looking at the tools provided, there's a function called http_request. Let me check its parameters. The required parameters are "path" and "session_id". The user provided the path as "/search<|projection|>", but they also mentioned the query string "?q=candle". So I should include that in the 'query' parameter of the http_request.
+
+  Wait, the 'query' parameter in the tool's JSON schema is an object where each key-value pair becomes a query parameter. So for "q=candle", the<|projection|> query object would be {"q": "candle"}.
+
+  The method is GET, which is the default, so I don't need to specify it unless the user specifies otherwise. The session_id is given as "http-1".
+
+  Putting this all together, the http_request call should have:
+
+  - path: "/search<|projection|>"
+  - query: {"q": "candle"}
+  - session_id: "http-1"
+
+  I should make sure that the other parameters like headers, body, etc., are omitted unless required. Since the user didn't mention them, they can be left out.
+
+  Wait, the 'method' parameter in the<|projection|> tool's JSON schema is a string with allowed values like GET, POST, etc. But since the user specified a GET request, which is the default, maybe it's optional. However, to be explicit, perhaps including method: "GET" would be better. But the tool's documentation says that the method defaults to<|projection|> GET if not provided. So maybe it's safe to omit it.
+
+  So the final arguments for the http_request call should be:
+
+  {
+    "path": "/search",
+    "query": {"q": "candle"},
+    "session_id": "http-1"
+  }
+
+  I think that's all. Let me<|projection|> double-check the required parameters. The tool requires 'path' and 'session_id', both of which are provided. The query is optional but necessary here. Yes, this should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_request", "arguments": {"path": "/search", "query": {"q": "candle"}, "session_id": "http-1"}}
+  </tool_call><|projection|>

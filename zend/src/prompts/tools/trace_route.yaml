@@ -1,0 +1,130 @@
+name: trace_route
+category: Network diagnostics
+description: Map the router-by-router path packets take to reach a host, reporting every intermediate hop and its latency. Use to locate where along the route traffic fails or slows.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: Hostname or IP address to trace the route to.
+      minLength: 1
+      type: string
+    max_hops:
+      description: Maximum number of hops to probe. Defaults to 30.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    timeout_sec:
+      description: Per-hop probe timeout in seconds. Uses the OS default if omitted.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - host
+  title: TraceRequest
+  type: object
+examples:
+- |-
+  trace the route to google.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to trace the route to google.com. Let me check the available tools. There's a trace_route tool. The parameters needed are host, max_hops, and timeout_sec. The user didn't specify max_hops or timeout, so I'll use defaults. The host is clearly<|projection|> google.com. So I'll call trace_route with host set to "google.com". The other parameters will be omitted, letting the tool use their defaults. That should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "google.com"}}
+  </tool_call><|projection|>
+- |-
+  show me the network path to 1.1.1.1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the network path to 1.1.1.1. Let me think about how to approach this.
+
+  First, I remember that tracing the route to a host involves using a tool like traceroute. The user mentioned "network path," which typically refers to the list<|projection|> of hops packets take from the source to the destination.
+
+  Looking at the available tools, there's a trace_route function. The parameters required are the host (which is 1.1.1.1 here), and optional ones like max_hops and timeout_sec. The user didn't specify those, so I<|projection|> should use the defaults.
+
+  Wait, the parameters for the trace_route tool: the host is required, and the other parameters are optional. So I need to call trace_route with the host set to "1.1.1.1". The other parameters can be omitted since the user hasn't provided them.
+
+  <|projection|>I should make sure that the JSON structure is correct. The tool's name is "trace_route", and the arguments should include "host": "1.1.1.1". The other parameters like max_hops and timeout_sec aren't specified, so they can be excluded from the JSON object.
+
+  So the final<|projection|> step is to format the tool call correctly within the XML tags as specified. The JSON should have the name of the tool and the arguments as a JSON object with the host parameter.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "1.1.1.1"}}
+  </tool_call><|projection|>
+- |-
+  traceroute to example.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to trace the route to example.com. Let me check the available tools. There's a trace_route function. The parameters needed are host, max_hops, and timeout_sec. The host is clearly example.com. The other parameters are optional. Since the user didn't specify,<|projection|> I'll use the defaults. So max_hops defaults to 30, and timeout_sec is handled by the OS. I just need to call trace_route with the host as example.com. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "example.com"}}
+  </tool_call><|projection|>
+- |-
+  map the hops to github.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to map the hops to github.com. So, I need to use the trace_route tool. Let me check the parameters. The required parameter is 'host', which in this case is 'github.com'. The other parameters are optional: max_hops and timeout_sec. Since the user<|projection|> didn't specify them, I'll use the defaults. Max_hops defaults to 30, and timeout_sec is handled by the OS. So the tool call should just have the host as 'github.com'. I need to make sure the JSON is correctly formatted with the host parameter. Alright, that's all.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "github.com"}}
+  </tool_call><|projection|>
+- |-
+  where does traffic to 8.8.8.8 get slow?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking where the traffic to 8.8.8.8 gets slow. So, I need to figure out the path that the packets take and identify any hops with high latency.
+
+  The tool available is trace_route, which maps the router-by-router path and reports each hop's latency<|projection|>. That's exactly what's needed here. The parameters required are the host (which is 8.8.8.8), and optional ones like max_hops and timeout_sec. Since the user didn't specify, I'll use default values. Max_hops defaults to 30, and timeout_sec can<|projection|> be left as the OS default.
+
+  So, I should call the trace_route function with the host set to 8.8.8.8. Once the data is gathered, the output will show each hop's latency. I'll look for hops with high latency or packet loss, which would indicate where the slowdown occurs<|projection|>. If there's a sudden increase in latency, that's likely the bottleneck. If the packets time out at a certain hop, that could mean an issue beyond that point.
+
+  But first, I need to run the traceroute to get the data. Then analyze the results to pinpoint the slow part of the route.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "8.8.8.8"}}
+  </tool_call><|projection|>
+- |-
+  run a traceroute to cdn.jsdelivr.net and list every hop<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to run a traceroute to cdn.jsdelivr.net and list every hop. Let me check the tools available. There's a trace_route tool. The parameters needed are host, max_hops, and timeout_sec. The user didn't specify max_hops or timeout, so I<|projection|>'ll use the defaults. The host is definitely cdn.jsdelivr.net. So I need to call trace_route with host="cdn.jsdelivr.net". Let me make sure there's no other required parameters. The required field is just host, so that's all I need. Alright, time to structure the tool call.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "cdn.jsdelivr.net"}}
+  </tool_call><|projection|>
+- |-
+  trace the path to 203.0.113.42<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to trace the path to the IP address 203.0.113.42. Let me check the available tools. There's a trace_route tool that takes a host parameter. The required parameter is "host", which the user provided. The other parameters like<|projection|> max_hops and timeout_sec are optional. Since the user didn't specify them, I should use the defaults. So I need to call trace_route with the host set to 203.0.113.42. No other arguments needed. Let me make sure the JSON is correctly formatted.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "203.0.113.42"}}
+  </tool_call><|projection|>
+- |-
+  which routers sit between me and aws.amazon.com?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which routers are between their device and aws.amazon.com. They want to know the path packets take, probably to troubleshoot connectivity issues or latency.
+
+  The tool available is trace_route, which maps the router-by-router path. The parameters needed are the host (aws.amazon.com), and<|projection|> optional ones like max_hops and timeout_sec. Since the user didn't specify, I'll use defaults: max_hops=30 and timeout_sec=default.
+
+  So, I need to call trace_route with host="aws.amazon.com". The other parameters can be omitted as they have defaults. That should return the<|projection|> list of hops, including the routers in between.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "trace_route", "arguments": {"host": "aws.amazon.com"}}
+  </tool_call><|projection|>

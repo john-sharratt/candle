@@ -1,0 +1,138 @@
+name: totp
+category: Security utilities
+description: 'Generate a current TOTP (Time-based One-Time Password / authenticator app) code from a stored totp_secret credential. Use for: producing a 2FA or MFA code before logging in to a service, automating authentication flows that require a rotating OTP, getting the current 6-digit authenticator code for a named secret. Triggered by "generate a 2FA code", "get the TOTP code for", "what''s the authenticator code for my <name> secret", "generate OTP for". Pass the credential''s name in `credential_name` — this tool reads the stored totp_secret itself, so do NOT fetch or look up the credential first; call this directly. Returns the current code, seconds remaining until it expires, and the credential name.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    algorithm:
+      description: 'Hash algorithm. One of: "sha1", "sha256", "sha512". Defaults to "sha1".'
+      type:
+      - string
+      - 'null'
+    credential_name:
+      description: Name of the stored totp_secret credential to read. Required, non-empty.
+      minLength: 1
+      type: string
+    digits:
+      description: Number of digits in the generated code. Defaults to 6.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    period_sec:
+      description: Time step in seconds for code rotation. Defaults to 30.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - credential_name
+  title: Request
+  type: object
+examples:
+- |-
+  generate the current TOTP code for the credential named github<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to generate the current TOTP code for the GitHub credential. Let me check the tools available. There's a tool called 'totp' that does exactly this. The parameters required are the credential_name, which in this case is 'github'. The other parameters like algorithm, digits, and<|projection|> period_sec have defaults, so I don't need to specify them unless I want to override the default. Since the user didn't mention any specific settings, I'll use the defaults. So the call should be to the totp tool with the credential_name set to 'github'. Let me make sure I'm not missing<|projection|> any required fields. The 'credential_name' is required, and that's provided. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "github"}}
+  </tool_call><|projection|>
+- |-
+  what's the current 6-digit 2FA code for the credential named aws-root<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current 6-digit 2FA code for the credential named "aws-root". Let me check the tools available.
+
+  There's a tool called 'totp' that generates a TOTP code. The parameters required are credential_name, and optionally algorithm, digits, period_sec<|projection|>. The user specified 6 digits, so I should set digits=6. The credential name is "aws-root".
+
+  I need to make sure to call the tool with those parameters. The tool will handle the rest, like fetching the secret from the credential and generating the code. Alright, let's structure the tool call<|projection|> correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "aws-root", "digits": 6}}
+  </tool_call><|projection|>
+- |-
+  give me the current one-time password for the credential named gitlab<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current TOTP code for a credential named "gitlab". Let me check the tools available. There's a tool called 'totp' that generates the code. The parameters needed are the credential_name, which is "gitlab" here. The other parameters like algorithm<|projection|>, digits, period_sec have defaults, so I don't need to specify them unless the user wants something different. Since the user didn't mention any specifics, I'll use the default values. So the function call should include the credential_name as "gitlab". Let me make sure I'm not missing any required fields<|projection|>. The required field is credential_name, which is provided. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "gitlab"}}
+  </tool_call><|projection|>
+- |-
+  compute the TOTP for the credential named okta<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to compute the TOTP for a credential named "okta". Let me check the tools available.
+
+  There's a tool called 'totp' that generates a TOTP code. The parameters required are credential_name, and optional ones like algorithm, digits, period_sec. The user<|projection|> didn't specify any of the optional parameters, so I should use the defaults. The required parameter is credential_name, which is given as "okta".
+
+  So the function call should be to the 'totp' tool with {"credential_name": "okta"}. I don't need to include the other parameters since<|projection|> they have defaults. Let me make sure that the JSON is correctly formatted. Yes, that's right. The response will then provide the TOTP code, seconds remaining, and the credential name.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "okta"}}
+  </tool_call><|projection|>
+- |-
+  I need the current authenticator code for the credential named cloudflare<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current TOTP code for the credential named "cloudflare". Let me check the tools available.
+
+  There's a tool called 'totp' that generates the code. The parameters needed are credential_name, and optional ones like algorithm, digits, period_sec. The user didn<|projection|>'t specify those, so I should use defaults. The required parameter is credential_name, which is provided as "cloudflare".
+
+  So I need to call the totp function with {"credential_name": "cloudflare"}. The other parameters will default to their defaults: algorithm is sha1, digits 6, period <|projection|>30 seconds. That should get the current code for them.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "cloudflare"}}
+  </tool_call><|projection|>
+- |-
+  read off the live 2FA digits for the credential named vault-admin<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current 2FA code for the credential named "vault-admin". Let me check the tools available.
+
+  There's a tool called 'totp' that generates a TOTP code. The parameters needed are the credential_name, and optional ones like algorithm, digits, period_sec<|projection|>. The user didn't specify any of the optional fields, so I should use the defaults. The required parameter is credential_name, which is "vault-admin" here.
+
+  So I need to call the totp tool with the credential_name set to "vault-admin". The other parameters will default to their respective values. The<|projection|> response should give back the current code, seconds left, and the name. That's exactly what the user needs. No mistakes here, everything seems straightforward.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "vault-admin"}}
+  </tool_call><|projection|>
+- |-
+  what one-time passcode does the credential named bitwarden show right now?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current TOTP code for a credential named "bitwarden". Let me check the tools available.
+
+  There's a tool called 'totp' that generates a TOTP code. The parameters needed are the credential_name, and optionally algorithm, digits, and period_sec.<|projection|> The user didn't specify those, so I should use defaults. The required parameter is credential_name, which is "bitwarden" here.
+
+  So I need to call the totp tool with the credential_name set to "bitwarden". The other parameters can be omitted since they have default values. The tool will<|projection|> handle generating the code based on the stored secret. I should return the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "bitwarden"}}
+  </tool_call><|projection|>
+- |-
+  grab the current TOTP for the credential named npm-registry<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current TOTP code for the credential named "npm-registry". Let me check the tools available.
+
+  There's a tool called 'totp' that generates a TOTP code. The parameters required are the credential_name, and optionally algorithm, digits, and period_sec.<|projection|> The user didn't specify any of the optional parameters, so I should use the defaults.
+
+  The required parameter is credential_name, which in this case is "npm-registry". So I need to call the totp tool with that name. The response should include the current code, seconds remaining, and the credential name.<|projection|> Alright, that's all I need to make the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "totp", "arguments": {"credential_name": "npm-registry"}}
+  </tool_call><|projection|>

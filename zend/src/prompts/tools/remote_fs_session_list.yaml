@@ -1,0 +1,120 @@
+name: remote_fs_session_list
+category: Remote filesystem
+description: Enumerate the remote-filesystem sessions currently connected to hosts over SFTP in this conversation.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: FsListRequest
+  type: object
+examples:
+- |-
+  list my open remote filesystem sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open remote filesystem sessions over SFTP. Let me check the tools available. There's a tool called remote_fs_session_list that enumerates these sessions. The parameters are straightforward, just a JSON object with a schema. Since the user wants to list their sessions, I<|projection|> need to call this tool. No arguments are needed because the tool doesn't require any parameters. So I'll generate the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which SFTP sessions are active<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which SFTP sessions are active. Let me check the tools available. There's a tool called remote_fs_session_list that enumerates remote-filesystem sessions connected via SFTP. The parameters for this tool are specified in the JSON schema provided. Since the user wants to know the active<|projection|> sessions, I should call this tool. The tool doesn't require any arguments, so the arguments object will be empty. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the open remote FS connections<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the open remote FS connections. I remember that there's a tool called remote_fs_session_list which can list these sessions. The user probably wants to see which hosts they're connected to via SFTP right now.
+
+  I need to check if the tool requires any parameters. Looking<|projection|> at the tool definition, the parameters object is empty. So, the call should be straightforward without any arguments.
+
+  Wait, the tool's name is remote_fs_session_list, and the parameters are an empty object. So the correct JSON call would have the name as "remote_fs_session_list" and the arguments as an<|projection|> empty object.
+
+  I should make sure there's no typo in the JSON structure. Also, the user might be expecting a list of connections, so the tool should handle that. Alright, I'll generate the proper tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many remote filesystem sessions do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many remote filesystem sessions do I have?" Let me figure out how to respond using the tools provided.
+
+  First, I need to check the available tools. The user mentioned "remote-filesystem sessions" and SFTP, so the relevant tool here is probably the one that<|projection|> lists these sessions. Looking at the tools section, there's a tool called "remote_fs_session_list" which seems to fit. The description says it enumerates the remote-filesystem sessions connected via SFTP in the current conversation.
+
+  The user is asking for the count of these sessions. Since the tool's purpose is to<|projection|> list them, I should call this tool. The parameters for the tool are specified as an empty object (the JSON schema is a simple object with no properties). So, the arguments for the tool call would be an empty object.
+
+  I need to structure the response correctly. The user expects a JSON object inside XML tags indicating<|projection|> the tool call. The name of the tool is "remote_fs_session_list", and the arguments are an empty object.
+
+  Wait, let me double-check. The tool's parameters are defined as {"$schema": "...", "title": "FsListRequest", "type": "object"}. But there are no<|projection|> properties listed, so the parameters are indeed empty. Therefore, when calling the tool, I don't need to provide any arguments beyond the name.
+
+  So the correct tool call should be:
+
+  {
+    "name": "remote_fs_session_list",
+    "arguments": {}
+  }
+
+  I should wrap this in the XML tags as specified<|projection|>. The user's question is straightforward, and since the tool is designed to list these sessions, calling this tool will retrieve the necessary information. The actual count would then be part of the response from the tool, but according to the instructions, I just need to make the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what remote-fs sessions are currently connected?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the current remote-filesystem sessions connected via SFTP. I need to check the tools available. Oh right, there's the remote_fs_session_list tool. It doesn't require any parameters, so I just need to call that function. Let me make sure I'm using the<|projection|> right JSON structure. The response should be a JSON object inside the tool_call tags. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me a rundown of every open SFTP session and its host<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of all open SFTP sessions and their corresponding hosts. Let me check the tools available.
+
+  Looking at the provided tools, there's a function called remote_fs_session_list. The description says it enumerates remote-filesystem sessions connected via SFTP in the current conversation.<|projection|> That's exactly what the user needs.
+
+  The parameters for this tool are specified as a JSON object with a $schema, title, type, and properties. However, the parameters section seems a bit unclear. The properties part is empty, which might mean that no additional arguments are required beyond the schema.
+
+  Since the user<|projection|> wants to list all open sessions, I should call the remote_fs_session_list function. Even though the parameters aren't clearly defined, the tool's purpose matches the request. There's no other tool available, so this is the correct choice.
+
+  So, I'll generate the tool call with the remote_fs_session_list name and<|projection|> an empty arguments object as per the schema.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are there any remote filesystem sessions still open right now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any remote filesystem sessions still open. I need to check the current SFTP sessions. The available tool is remote_fs_session_list, which lists connected hosts via SFTP. Since the user wants to know about active sessions, I should call this tool. The parameters for<|projection|> the tool are empty because the request doesn't need any arguments. So, I'll generate the tool call with the name and empty arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate my active remote FS session ids<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to enumerate their active remote FS session IDs. Let me check the available tools. There's a tool called remote_fs_session_list that's supposed to list the sessions. The parameters are empty, so I just need to call that function. I don't need any arguments here. I<|projection|>'ll make sure the JSON is correctly formatted and send it back.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list", "arguments": {}}
+  </tool_call><|projection|>

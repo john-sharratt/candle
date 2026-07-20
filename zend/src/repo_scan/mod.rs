@@ -12,6 +12,7 @@ pub mod types;
 pub mod walk;
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
@@ -270,40 +271,40 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
 /// layer's BDP retrieval), the walked map for the `code_reading`
 /// pass, and the recorded [`ClusterState`] for the refresh path.
 pub fn ingest_repo_map(
-    engine: &ConversationEngine,
+    engine: &Mutex<ConversationEngine>,
     proj_builder: projection::Builder,
     workspace: &Path,
     config: SequenceConfig,
     progress: &LoadProgress,
-    skip: bool,
+    layer_name: &str,
+    group_name: &str,
 ) -> anyhow::Result<(Sequence, RepoMap, ClusterState)> {
     let layer = proj_builder
-        .id_for_layer("repo_map")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'repo_map' layer"))?;
+        .id_for_layer(layer_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
     let group = proj_builder
-        .id_for_group("structure")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'structure' group"))?;
+        .id_for_group(group_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
 
-    let system_prompt = layer_system_prompt(&proj_builder, "repo_map", &config);
-    let mut sequence = engine
-        .new_conversation_with_projection(
-            &system_prompt,
-            proj_builder,
-            layer,
-            group,
-            utility_config(config),
-        )
-        .map_err(|e| anyhow::anyhow!("repo_map conv create: {e}"))?;
-
-    // `--skip-repo-scan`: the `repo_map` layer conversation is still minted (the
-    // projection schema requires it) but left empty — no walk, no cluster ingest.
-    let (map, state) = if skip {
-        tracing::info!("--skip-repo-scan: bypassing repo-map walk + cluster ingest");
-        (RepoMap::default(), ClusterState::default())
-    } else {
-        let mut sink = SequenceTurnSink::new(&mut sequence);
-        ingest_repo_map_into_sink(&mut sink, workspace, progress)?
+    let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
+    // Lock only to mint the sequence; the sink-driven walk + cluster ingest below
+    // runs on the sequence's own handle, lock-free, so concurrent engine
+    // consumers keep running for the duration of the scan.
+    let mut sequence = {
+        let engine = engine.lock().unwrap();
+        engine
+            .new_conversation_with_projection(
+                &system_prompt,
+                proj_builder,
+                layer,
+                group,
+                utility_config(config),
+            )
+            .map_err(|e| anyhow::anyhow!("{layer_name} conv create: {e}"))?
     };
+
+    let mut sink = SequenceTurnSink::new(&mut sequence);
+    let (map, state) = ingest_repo_map_into_sink(&mut sink, workspace, progress)?;
     Ok((sequence, map, state))
 }
 
@@ -353,6 +354,8 @@ pub fn refresh_repo_map(
     prior: &ClusterState,
     old_timeline: TimelineId,
     progress: &LoadProgress,
+    layer_name: &str,
+    group_name: &str,
 ) -> anyhow::Result<RefreshOutcome> {
     let clusters = build_clusters(map);
     if prior.equivalent_to(&clusters) {
@@ -370,13 +373,13 @@ pub fn refresh_repo_map(
 
     let layer = ctx
         .proj_builder
-        .id_for_layer("repo_map")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'repo_map' layer"))?;
+        .id_for_layer(layer_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
     let group = ctx
         .proj_builder
-        .id_for_group("structure")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'structure' group"))?;
-    let system_prompt = layer_system_prompt(&ctx.proj_builder, "repo_map", &ctx.config);
+        .id_for_group(group_name)
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    let system_prompt = layer_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
 
     let mut new_sequence = {
         let engine = ctx.engine.lock().unwrap();

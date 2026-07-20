@@ -1,0 +1,246 @@
+name: aead_encrypt
+category: Cryptography
+description: Encrypt plaintext into authenticated ciphertext with an AEAD cipher — aes128gcm, aes256gcm, or chacha20poly1305 — giving confidentiality and tamper-detection in one step. Returns ciphertext plus a fresh nonce; key as hex (16 bytes for aes128gcm, else 32 bytes).
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    AeadAlgorithm:
+      description: AEAD cipher.
+      enum:
+      - aes128gcm
+      - aes256gcm
+      - chacha20poly1305
+      type: string
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+  properties:
+    aad:
+      description: Optional additional authenticated data (UTF-8 text), bound to the tag but not encrypted.
+      type:
+      - string
+      - 'null'
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/AeadAlgorithm'
+      description: 'AEAD cipher. One of: aes128gcm, aes256gcm, chacha20poly1305.'
+      minItems: 1
+      minLength: 1
+    data:
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+    key_hex:
+      description: 'Secret key as hex: 32 hex chars (16 bytes) for aes128gcm; 64 hex chars (32 bytes) for aes256gcm and chacha20poly1305.'
+      maxLength: 64
+      minLength: 32
+      type: string
+    nonce_hex:
+      description: Optional 12-byte nonce as 24 hex chars. A fresh random nonce is generated if omitted.
+      type:
+      - string
+      - 'null'
+  required:
+  - algorithm
+  - data
+  - key_hex
+  title: AeadEncryptRequest
+  type: object
+examples:
+- |-
+  encrypt the text 'meet at noon' with AES-256-GCM, key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 0102030405060708090a0b0c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the text 'meet at noon' using AES-256-GCM. They provided a key and a nonce. First, I need to check if the parameters are correct.
+
+  The key is given as a hexadecimal string. For AES-256<|projection|>-GCM, the key should be 32 bytes, which is 64 hex characters. The provided key is 64 characters long, so that's good. The nonce is 12 bytes, which is 24 hex digits. The user's nonce is 24 characters, so that's<|projection|> correct.
+
+  Next, the tool requires the algorithm, data, key_hex, and optional parameters like nonce_hex. The data is 'meet at noon', which needs to be in the request. The nonce is provided, so I'll include that. The data encoding is text by default, so no need to change that.
+
+  <|projection|>I should structure the JSON with the algorithm as 'aes256gcm', data as the plaintext, key_hex as the provided key, and nonce_hex as the given nonce. All required fields are present. Let me double-check the parameters. Yes, everything seems correct. Time to format the tool call.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes256gcm", "data": "meet at noon", "key_hex": "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee", "nonce_hex": "0102030405060708090a0b0c"}}
+  </tool_call><|projection|>
+- |-
+  encrypt the text 'top secret' with ChaCha20-Poly1305, key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 000102030405060708090a0b<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the text 'top secret' using ChaCha20-Poly1305. They provided a key and a nonce. I need to use the aead_encrypt tool.
+
+  First, check the parameters. The algorithm should be chacha20poly<|projection|>1305. The key is given as a hex string. The nonce is provided too. The data is 'top secret'.
+
+  Wait, the key's length: for ChaCha20, the key is 32 bytes, which is 64 hex chars. The user's key is 6<|projection|>4 characters long (0011...ee), so that's correct. The nonce is 12 bytes (24 hex chars), which matches the input.
+
+  The data is 'top secret', which is UTF-8. The tool's parameters require the data as a string. So I need to set data<|projection|> to 'top secret', algorithm to chacha20poly1305, key_hex as the given key, and nonce_hex as the provided nonce. AAD isn't mentioned, so leave it out. The data_encoding defaults to text, which is fine.
+
+  So the JSON should have those parameters. Let me<|projection|> structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "chacha20poly1305", "data": "top secret", "key_hex": "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee", "nonce_hex": "000102030405060708090a0b"}}
+  </tool_call><|projection|>
+- |-
+  encrypt the text 'launch code 7' with AES-128-GCM, key 000102030405060708090a0b0c0d0e0f, nonce 0102030405060708090a0b0c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the text 'launch code 7' using AES-128-GCM. They provided the key as 000102030405060708090a0b0c0d<|projection|>0e0f and a nonce of 0102030405060708090a0b0c.
+
+  First, I need to check if the tool supports this. The available tool is aead_encrypt. Let me look at its parameters. The algorithm can<|projection|> be aes128gcm, which matches. The key_hex should be 32 hex chars (16 bytes) for AES-128. The provided key is 32 characters, so that's correct. The nonce is 24 hex chars (12 bytes), which is right for<|projection|> AES-GCM. The data is 'launch code 7', and no AAD is mentioned.
+
+  So, I'll structure the call with these parameters. Make sure all required fields are included: algorithm, data, key_hex. The nonce is optional but provided here. The data_encoding defaults to text. So the<|projection|> JSON should have "algorithm": "aes128gcm", "data": "launch code 7", "key_hex": "000102030405060708090a0b0c0d0e0f", "nonce_hex<|projection|>": "0102030405060708090a0b0c".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes128gcm", "data": "launch code 7", "key_hex": "000102030405060708090a0b0c0d0e0f", "nonce_hex": "0102030405060708090a0b0c"}}
+  </tool_call><|projection|>
+- |-
+  encrypt the text 'confidential memo' with AES-128-GCM, key aabbccddeeff00112233445566778899, nonce 00112233445566778899aabb<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the text 'confidential memo' using AES-128-GCM. They provided a key and a nonce. I need to use the aead_encrypt tool.
+
+  First, check the parameters. The algorithm is aes128gcm. The<|projection|> key is given as a hex string: aabbccddeeff00112233445566778899. Wait, but for AES-128, the key should be 16 bytes (32 hex chars). Let me count the hex chars<|projection|> here. The key is 32 characters long, which is 16 bytes. So that's correct.
+
+  The nonce is 00112233445566778899aabb. Let me check the length. Each byte is two hex chars. So<|projection|> 24 hex chars would be 12 bytes. The nonce is 12 bytes, which is correct for GCM.
+
+  The data is 'confidential memo'. The user didn't specify the data encoding, so it defaults to text. So the data parameter is 'confidential memo'.
+
+  So the tool call<|projection|> should have algorithm: aes128gcm, data: 'confidential memo', key_hex: aabbccddeeff00112233445566778899, and nonce_hex: 001122334455<|projection|>66778899aabb.
+
+  I need to make sure all required parameters are present. The required ones are algorithm, data, and key_hex. The nonce is optional, but the user provided it, so include it.
+
+  So the JSON arguments would be:
+
+  {
+    "algorithm": "aes1<|projection|>28gcm",
+    "data": "confidential memo",
+    "key_hex": "aabbccddeeff00112233445566778899",
+    "nonce_hex": "001122334455<|projection|>66778899aabb"
+  }
+
+  That's correct. I'll format this as a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes128gcm", "data": "confidential memo", "key_hex": "aabbccddeeff00112233445566778899", "nonce_hex": "00112233445566778899aabb"}}
+  </tool_call><|projection|>
+- |-
+  seal 'wire the funds' using AES-256-GCM with key cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677 and nonce a1b2c3d4e5f60718293a4b5c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the message "wire the funds" using AES-256-GCM. They provided a key and a nonce. First, I need to check the parameters.
+
+  The key is given as a hex string: cafebabedeadbeef001<|projection|>1223344556677cafebabedeadbeef0011223344556677. Since AES-256 requires a 32-byte key, this looks right because each hex char is 4 bits, so<|projection|> 64 hex chars make 32 bytes. So that's correct.
+
+  The nonce is a1b2c3d4e5f60718293a4b5c. For AES-GCM, the nonce is typically 12 bytes (24 hex chars). The<|projection|> provided nonce is 24 hex chars, which is 12 bytes. That's correct.
+
+  The data to encrypt is "wire the funds". The function requires the data, the key in hex, the algorithm, and optionally the nonce. Since the user provided the nonce, we should include it. Also, check<|projection|> if the data encoding is text, which it is here.
+
+  So the parameters would be: algorithm is aes256gcm, data is "wire the funds", key_hex is the given hex string, nonce_hex is a1b2c3d4e5f60718293<|projection|>a4b5c. No AAD is mentioned, so that's optional.
+
+  I need to structure this into the tool call as specified. Make sure all required fields are present. The tool call should have the name aead_encrypt and the arguments as a JSON object with the parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes256gcm", "data": "wire the funds", "key_hex": "cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677", "nonce_hex": "a1b2c3d4e5f60718293a4b5c"}}
+  </tool_call><|projection|>
+- |-
+  can you AES-128-GCM encrypt 'ping ok' with the key 112233445566778899aabbccddeeff00 and nonce ffeeddccbbaa99887766554433<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to do this. The user wants to encrypt "ping ok" using AES-128-GCM with the given key and nonce. First, I need to check the tools available. There's the aead_encrypt function.
+
+  Looking at the parameters for aead<|projection|>_encrypt, the algorithm should be one of the allowed options. The user specified AES-128-GCM, which is listed as "aes128gcm". So that's correct.
+
+  The key_hex needs to be 32 hex chars (16 bytes) for aes128gcm.<|projection|> The provided key is 112233445566778899aabbccddeeff00. Let me count the characters: 32 characters, so that's good. Wait, no, wait. Wait, each byte is two hex digits. So <|projection|>16 bytes would be 32 hex chars. The key given here is 32 hex chars? Let me check: "112233445566778899aabbccddeeff00" — let's count: 11 22<|projection|> 33 44 55 66 77 88 99 aa bb cc dd ee ff 00 — that's 16 pairs, 32 characters. Yes, correct for AES-128.
+
+  The nonce is given as ffeeddccbbaa<|projection|>99887766554433. Wait, the nonce for AES-GCM is 12 bytes (96 bits), which is 24 hex chars. The provided nonce is ffeeddccbbaa9988776655443<|projection|>3 — let me count: ffee ddcc bbaa 9988 7766 5544 33. Wait, that's 24 hex digits? Let me check:
+
+  f f e e d d c c b b a a 9 9 8<|projection|> 8 7 7 6 6 5 5 4 4 3 3 — no, wait, the user wrote "ffeeddccbbaa99887766554433". Let's break it down:
+
+  "ffee ddcc b<|projection|>baa 9988 7766 5544 33" — but maybe I'm miscounting. Let's write it as a continuous string: "ffeeeddccbbaa99887766554433". Let me count each<|projection|> character:
+
+  f f e e d d c c b b a a 9 9 8 8 7 7 6 6 5 5 4 4 3 3 → that's 24 characters. Yes, 24 hex digits, which is 12 bytes<|projection|>. So the nonce is correctly formatted.
+
+  So the parameters would be:
+
+  algorithm: "aes128gcm"
+  data: "ping ok"
+  key_hex: "112233445566778899aabbccddeeff00"
+  nonce_hex: "<|projection|>ffeeeddccbbaa99887766554433"
+
+  Wait, but the user provided the nonce as "ffeeddccbbaa99887766554433" — but in the example above, I wrote "ffee..." maybe<|projection|> there's a typo. Wait, the user's input is: "nonce ffeeddccbbaa99887766554433". Let me check that. The user wrote:
+
+  "nonce ffeeddccbbaa99887766554<|projection|>433"
+
+  So the nonce is "f feedd ccb ba a9 98... wait, perhaps it's "ffee ddcc bbaa 9988 7766 5544 33"? But regardless, as long as it's 24 hex<|projection|> digits, it's okay.
+
+  So in the tool call, I need to pass all these parameters. The data is "ping ok", which is the plaintext. The key is as given. The nonce is provided. So the tool call should be:
+
+  {
+    "name": "aead_encrypt",
+    "arguments":<|projection|> {
+      "algorithm": "aes128gcm",
+      "data": "ping ok",
+      "key_hex": "112233445566778899aabbccddeeff00",
+      "nonce_hex": "ffeeeddccbbaa<|projection|>99887766554433"
+    }
+  }
+
+  Wait, but I need to make sure that all required parameters are included. The required fields are algorithm, data, key_hex. The nonce is optional. So this should be correct.
+
+  I think that's it. The user provided<|projection|> all necessary info, so the tool can be called with these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes128gcm", "data": "ping ok", "key_hex": "112233445566778899aabbccddeeff00", "nonce_hex": "ffeeeddccbbaa99887766554433"}}
+  </tool_call><|projection|>
+- |-
+  encrypt 'session token grant' with ChaCha20-Poly1305, key ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100, nonce 0b0a090807060504030201ff<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to encrypt the plaintext "session token grant" using ChaCha20-Poly1305. The key provided is ffeeddccbbaa99887766554433221100ffeed<|projection|>dccbbaa99887766554433221100, and the nonce is 0b0a090807060504030201ff.
+
+  First, I need to check if the tool supports<|projection|> ChaCha20-Poly1305. Looking at the tools, yes, the aead_encrypt function includes chacha20poly1305 as an option.
+
+  Next, the parameters required are algorithm, data, key_hex, and optionally nonce_hex. The user provided all necessary inputs. The<|projection|> data is the plaintext, which is "session token grant". The key is given in hex, so that's straightforward. The nonce is also provided as a hex string.
+
+  I should make sure the key length is correct. For ChaCha20-Poly1305, the key should be 32 bytes<|projection|> (64 hex chars). The provided key is 64 characters long, so that's correct. The nonce is 24 hex chars, which is 12 bytes, which matches the requirement for a nonce in this context.
+
+  No additional parameters like AAD are mentioned, so those can be omitted. The<|projection|> data_encoding is not specified, so it defaults to 'text', which is correct here since the data is text.
+
+  Putting it all together, the tool call should have the algorithm set to 'chacha20poly1305', data as the plaintext, key_hex as the provided key, and nonce_hex as<|projection|> the given nonce. That should perform the encryption as requested.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "chacha20poly1305", "data": "session token grant", "key_hex": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100", "nonce_hex": "0b0a090807060504030201ff"}}
+  </tool_call><|projection|>
+- |-
+  run AES-256-GCM over the message 'rotate the master key' with key 1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100 and nonce 00112233445566778899aabb<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to run AES-256-GCM on the message 'rotate the master key' with a specific key and nonce. First, I need to check the parameters.
+
+  The key given is 1f1e1d1c1b1a19<|projection|>1817161514131211100f0e0d0c0b0a09080706050403020100. Let me count the hex characters. Each byte is two hex digits<|projection|>, so 32 bytes? Wait, 32 bytes would be 64 hex chars. Let me check: 1f1e... up to 00. Let's see: 1f is 2, and there are 64 characters. So that's 32 bytes.<|projection|> But wait, AES-256 requires a 32-byte key, which is 64 hex chars. So this key is correct.
+
+  The nonce is 00112233445566778899aabb. Let me count the hex digits.<|projection|> 00 11 22 33 44 55 66 77 88 99 aa bb. That's 12 bytes (each pair is one byte). So 12 bytes, which is correct for GCM. The user provided it,<|projection|> so we'll use that instead of generating a new one.
+
+  The message is 'rotate the master key'. I need to make sure the data is in the right format. The tool allows specifying the data as text, but the function parameters have 'data' as a string. The data_encoding parameter can be set to '<|projection|>text', which is the default. So the data is 'rotate the master key'.
+
+  Now, the algorithm is AES-256-GCM, which is 'aes256gcm' in the enum. The tool requires the algorithm, data, and key_hex. The nonce is provided, so we include<|projection|> that as well. The AAD is optional, but the user didn't mention it, so leave it out.
+
+  Putting it all together: the function call should have name 'aead_encrypt', with arguments including algorithm 'aes256gcm', data 'rotate the master key', key_hex as given, and<|projection|> nonce_hex as 00112233445566778899aabb. No data_encoding since it's text by default.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_encrypt", "arguments": {"algorithm": "aes256gcm", "data": "rotate the master key", "key_hex": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100", "nonce_hex": "00112233445566778899aabb"}}
+  </tool_call><|projection|>

@@ -1,0 +1,121 @@
+name: host_info
+category: Network diagnostics
+description: 'Profile a host: resolve its name to IP addresses, then run a reverse-DNS lookup back from those IPs. Use for host identification and DNS-record auditing — no connectivity probe is sent.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: Hostname or IP address to profile.
+      minLength: 1
+      type: string
+  required:
+  - host
+  title: HostInfoRequest
+  type: object
+examples:
+- |-
+  give me a full profile of example.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a full profile of example.com. Let me see what tools I have available. Oh, there's the host_info tool. It profiles a host by resolving the name to IP addresses and then doing a reverse-DNS lookup. That's exactly what's needed here.
+
+  So,<|projection|> the parameters require a 'host' which can be a hostname or IP. The user provided 'example.com', which is a hostname. I need to call the host_info function with that value. I should make sure the JSON is correctly formatted with the host parameter. No other parameters are needed since the tool only requires the<|projection|> host. Let me structure the tool call properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "example.com"}}
+  </tool_call><|projection|>
+- |-
+  what can you tell me about the host github.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the host github.com. I need to figure out what information I can provide using the available tools. The tool provided is called host_info, which profiles a host by resolving its name to IP addresses and then doing a reverse-DNS lookup. The purpose is for host identification and<|projection|> DNS record auditing without sending any connectivity probes.
+
+  So, the user wants to know about github.com. I should call the host_info tool with the host parameter set to "github.com". The tool will handle resolving the IPs and then the reverse DNS. The user probably wants to see the IP addresses associated with github.com and<|projection|> possibly verify the DNS records. Since the tool does both steps, I just need to execute that command and present the results once I get them. I should make sure to structure the tool call correctly as per the instructions, using the JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "github.com"}}
+  </tool_call><|projection|>
+- |-
+  profile the server at 10.0.0.5<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to profile the server at 10.0.0.5. Let me check the available tools. There's a tool called host_info that takes a host parameter, which can be a hostname or IP address. The purpose of this tool is to resolve the host's name to<|projection|> IPs and then do a reverse DNS lookup. That's exactly what's needed here.
+
+  So, I need to call the host_info function with the host argument set to "10.0.0.5". The user didn't specify any other parameters, and the tool only requires the host, so that's straightforward<|projection|>. I'll structure the tool call as specified, making sure the JSON is correctly formatted with the name and arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "10.0.0.5"}}
+  </tool_call><|projection|>
+- |-
+  gather host info for rust-lang.org<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to gather information about rust-lang.org using the host_info tool. Let me check the tool's parameters. The tool requires a 'host' parameter, which can be a hostname or IP address. Since the user provided 'rust-lang.org', I should structure the tool call with that value<|projection|>. I need to make sure the JSON is correctly formatted with the host key. No other parameters are needed here. Alright, time to output the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "rust-lang.org"}}
+  </tool_call><|projection|>
+- |-
+  pull together everything you can find on 1.1.1.1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants information about the IP address 1.1.1.1. Let me check the tools available. There's the host_info tool which takes a host parameter, which can be an IP. The tool does a reverse DNS lookup. So I should call host_info with the host set<|projection|> to 1.1.1.1. That should get the necessary details.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "1.1.1.1"}}
+  </tool_call><|projection|>
+- |-
+  what's the full rundown on mail.protonmail.com?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a full rundown on mail.protonmail.com. Let me think about what they need. The query is pretty broad, so I should break it down.
+
+  First, they might want basic information like IP addresses and DNS records. Since there's a tool called host_info, that<|projection|> could resolve the hostname to IPs and do reverse DNS lookups. That would help identify the host and check DNS records without sending any packets.
+
+  But wait, the user mentioned "full rundown." Maybe they also want details on the service itself, like TLS certificates, open ports, or vulnerabilities. However, the available tools only<|projection|> include host_info. Without other tools like nmap or SSL inspectors, I can't get that data.
+
+  I should check if there are more tools. The user provided only the host_info tool. So I need to inform them that my current capabilities are limited to DNS-related info. But the initial response did use the<|projection|> host_info tool. Wait, in the example, the assistant called host_info for mail.protonmail.com. So maybe the user expects that step first.
+
+  But the user's question is broader. They might not know what details are possible. I should start by using the available tool to get DNS and IP info, then<|projection|> explain limitations. That way, they get some useful info and understand what else might be needed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "mail.protonmail.com"}}
+  </tool_call><|projection|>
+- |-
+  build an identification profile for the host at 208.67.220.220<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to build an identification profile for the host at 208.67.220.220. Let me think about what tools I have available. Oh, there's the host_info tool. It takes a hostname or IP address and does a reverse DNS lookup<|projection|>. Wait, but the user provided an IP. So I should call host_info with the host parameter set to 208.67.220.220. That should resolve the IP to a hostname and maybe some other details. Let me make sure I'm using the right parameters. The<|projection|> tool requires the 'host' parameter, which can be an IP. So the JSON should be {"host": "208.67.220.220"}. Yeah, that's correct. I'll format the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "208.67.220.220"}}
+  </tool_call><|projection|>
+- |-
+  tell me about the machine behind cloudflare.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the machine behind cloudflare.com. Let me think about how to approach this.
+
+  First, I need to figure out what information the user is really looking for. They might want to know the IP addresses associated with cloudflare.com, or maybe details about the server infrastructure. Since<|projection|> they mentioned "machine," maybe they're interested in the hosting provider, data centers, or network configuration.
+
+  Looking at the tools available, there's the host_info tool which resolves a hostname to IPs and does a reverse DNS lookup. That could help identify the IP addresses and any associated domain names. But the user asked about<|projection|> the "machine," which might require more than just IP info. However, the provided tools don't include things like WHOIS lookups or network scanning, so I have to work with what's available.
+
+  I should start by using the host_info tool on cloudflare.com. That will give the IP addresses and reverse DNS<|projection|> entries. Even though Cloudflare is a CDN, their origin servers might have specific IPs, but Cloudflare often uses private IP ranges. The reverse DNS might show something like cloudflare.com or related subdomains.
+
+  Wait, but if I run host_info on cloudflare.com, it would resolve the IP addresses that cloud<|projection|>flare.com points to. But since Cloudflare is a CDN, the actual server IPs might not be publicly listed. However, some information might still be accessible through DNS records.
+
+  Another thought: maybe the user is trying to understand the infrastructure for security reasons, like identifying potential attack vectors. But without more tools, I<|projection|> can only provide the DNS-related info.
+
+  So, the best course of action is to call the host_info tool with the host parameter set to "cloudflare.com". That should return the necessary details about the machine, even if it's just the IP addresses and reverse DNS entries. If the results are limited, the user<|projection|> might need to use other methods or tools.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "host_info", "arguments": {"host": "cloudflare.com"}}
+  </tool_call><|projection|>

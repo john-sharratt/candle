@@ -1,0 +1,96 @@
+name: remote_fs_session_close
+category: Remote filesystem
+description: End a remote-filesystem session, tearing down the SFTP transport to the remote host.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: CloseRequest
+  type: object
+examples:
+- |-
+  close remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a remote filesystem session with the ID rfs-1. Let me check the available tools. There's a tool called remote_fs_session_close. The parameters require a session_id, which the user provided as rfs-1. I need to make sure the JSON is correctly<|projection|> formatted with the session_id in the arguments. Alright, that's all. Time to structure the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  disconnect remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to disconnect a remote-fs session with the ID rfs-2. Let me check the tools available. There's a tool called remote_fs_session_close, which requires the session_id. The parameters need the session_id as a string. So I should call that tool with session_id<|projection|> set to "rfs-2". Make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  end remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end a remote filesystem session with the ID rfs-1. Let me check the available tools. There's a tool called remote_fs_session_close which requires the session_id. The parameters need the session_id as a string. Since the user provided "rfs-1", I<|projection|> should call the tool with that ID. Make sure the JSON is correctly formatted with the session_id in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  tear down remote-fs session rfs-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to tear down a remote-fs session with the ID rfs-3. Let me check the tools available. There's a tool called remote_fs_session_close that ends the session. The parameters require a session_id. The user provided "rfs-3" as the session ID<|projection|>. So I need to call the close function with that ID. Make sure the JSON is correctly formatted with the session_id key. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-3"}}
+  </tool_call><|projection|>
+- |-
+  can you shut down remote-fs session rfs-4?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to shut down a remote-fs session with the ID rfs-4. Let me check the available tools. There's a tool called remote_fs_session_close which requires the session_id. The parameters need the session_id as a string. Since the user provided rfs-4<|projection|>, I should call the tool with that ID. Make sure the JSON is correctly formatted with the session_id in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  hang up the connection for remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to hang up the connection for the remote-fs session with ID rfs-2. Let me check the available tools. There's a tool called remote_fs_session_close. The description says it ends the session by tearing down the SFTP transport. The parameters require a session_id,<|projection|> which the user provided as rfs-2. So I need to call that tool with the session_id set to rfs-2. I should make sure the JSON is correctly formatted with the name and arguments. No other tools are needed here. Just the close function with the correct ID.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  please close out remote-fs session rfs-5 now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a remote filesystem session with the ID rfs-5. Let me check the available tools. There's a tool called remote_fs_session_close that takes a session_id. The parameters require the session_id as a string. The user provided "rfs-5" as the<|projection|> session ID. So I need to call the close function with that ID. Make sure the JSON is correctly formatted with the session_id in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-5"}}
+  </tool_call><|projection|>
+- |-
+  drop remote-fs session rfs-1, I'm done with it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drop a remote filesystem session. They mentioned "rfs-1" which is the session ID. The tool available is remote_fs_session_close. I need to call that with the session_id set to "rfs-1". Let me check the parameters. The required parameter is<|projection|> session_id, which the user provided. So the JSON should be {"session_id": "rfs-1"}. The tool call should be formatted correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_close", "arguments": {"session_id": "rfs-1"}}
+  </tool_call><|projection|>

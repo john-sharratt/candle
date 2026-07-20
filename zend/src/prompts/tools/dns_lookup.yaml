@@ -1,0 +1,110 @@
+name: dns_lookup
+category: Network diagnostics
+description: 'Perform a DNS lookup for a hostname and return its IP address records. Use for: resolving a hostname to its IP, verifying DNS is set up correctly for a domain, checking what address a name points to, confirming a DNS change has propagated. Triggered by "what is the IP of", "resolve this hostname", "DNS lookup for", "what does X resolve to", "dig", "nslookup". Returns record type and resolved addresses. A/AAAA records use the OS resolver. MX/TXT/NS records return not_supported. Use web_search for information about a domain; use ping_icmp to test connectivity to the resolved address.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: Hostname to look up (for A/AAAA) or IP address (for PTR reverse lookup).
+      minLength: 1
+      type: string
+    record_type:
+      description: 'Record type: "A" (IPv4), "AAAA" (IPv6), or "PTR" (reverse). Case-insensitive. MX/TXT/NS are not supported and return not_supported. Default: "A".'
+      type:
+      - string
+      - 'null'
+  required:
+  - host
+  title: DnsRequest
+  type: object
+examples:
+- |-
+  look up the A records for example.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to look up the A records for example.com. Let me check the tools available. There's a DNS lookup tool called dns_lookup. The parameters required are the host and record_type. The user specified A records, so I should set record_type to "A". The host is<|projection|> example.com. I need to make sure the arguments are correctly formatted in JSON. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "example.com", "record_type": "A"}}
+  </tool_call><|projection|>
+- |-
+  what's the IP address of rust-lang.org<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the IP address of rust-lang.org. I need to use the dns_lookup tool for this. Let me check the parameters. The tool requires a host and an optional record type. The default record type is A, which is what we need for an IPv4 address. So<|projection|> I'll set the host to "rust-lang.org" and leave the record_type as A. Let me make sure there are no typos. Everything looks good. Time to format the tool call correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "rust-lang.org", "record_type": "A"}}
+  </tool_call><|projection|>
+- |-
+  resolve the DNS for github.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to resolve the DNS for github.com. Let me see. The available tool is dns_lookup. The parameters needed are host and record_type. The user didn't specify the record type, so I should use the default, which is "A" for IPv4. So I'll<|projection|> call dns_lookup with host "github.com" and record_type "A". That should get the IP address as per the tool's functionality.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "github.com", "record_type": "A"}}
+  </tool_call><|projection|>
+- |-
+  look up the IP address of cloudflare.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to look up the IP address of cloudflare.com. Let me check the tools available. There's a DNS lookup tool called dns_lookup. The parameters needed are the host and record_type. The default record type is A, which is for IPv4. Since the user didn't specify<|projection|> any other type, I should use A. So the host is cloudflare.com, record_type is A. I need to make sure the JSON is correctly formatted with those values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "cloudflare.com", "record_type": "A"}}
+  </tool_call><|projection|>
+- |-
+  resolve the IPv4 address for api.stripe.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to resolve the IPv4 address for api.stripe.com. Let me check the tools available. There's a DNS lookup tool called dns_lookup. The parameters needed are the host and record_type. Since they want IPv4, the record_type should be "A". I need to<|projection|> make sure the host is set to "api.stripe.com" and the record_type is "A". Let me structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "api.stripe.com", "record_type": "A"}}
+  </tool_call><|projection|>
+- |-
+  what does the AAAA record for ipv6.google.com resolve to?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the AAAA record for ipv6.google.com. Let me think. The AAAA record is used for IPv6 addresses. The tool available here is dns_lookup. The parameters needed are 'host' and 'record_type'. The user specified "AAAA", so I should set<|projection|> record_type to "AAAA". The host is ipv6.google.com. I need to make sure the JSON is correctly formatted. Let me check the parameters again. Host is correct, record_type is uppercase. The tool should handle that. Alright, the call should be proper.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "ipv6.google.com", "record_type": "AAAA"}}
+  </tool_call><|projection|>
+- |-
+  do a reverse DNS lookup on 8.8.4.4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to perform a reverse DNS lookup on 8.8.4.4. Let me think about how to approach this.
+
+  First, I remember that a reverse DNS lookup typically uses the PTR record. The tool provided here is dns_lookup, which can handle PTR lookups. The<|projection|> parameters required are 'host' and optionally 'record_type'.
+
+  The user provided the IP address 8.8.4.4, so the 'host' parameter should be "8.8.4.4". The record type needs to be "PTR" since it's a reverse lookup. I need to<|projection|> make sure that the 'record_type' is set to "PTR" explicitly because the default is "A", which is for IPv4 addresses.
+
+  Wait, the description says that for PTR, it's a reverse lookup. So setting record_type to "PTR" should trigger the correct behavior. The tool's documentation also<|projection|> mentions that the 'host' can be an IP address for PTR.
+
+  So the arguments would be: host="8.8.4.4" and record_type="PTR". I should structure the JSON accordingly. Let me double-check the parameters. The 'host' is required, and 'record_type' is<|projection|> optional but necessary here.
+
+  I think that's all. The user wants the reverse DNS info for 8.8.4.4, so this call should fetch the PTR record.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "8.8.4.4", "record_type": "PTR"}}
+  </tool_call><|projection|>
+- |-
+  reverse-resolve the IP 208.67.222.222 to a hostname<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to reverse-resolve the IP 208.67.222.222 to a hostname. Let me check the available tools. There's the dns_lookup tool, which can perform a PTR lookup for reverse DNS. The parameters require the host (which in<|projection|> this case is the IP address) and the record type. Since it's a reverse lookup, the record type should be "PTR". I need to make sure the arguments are correctly formatted. The host is "208.67.222.222" and the record_type is "PTR<|projection|>". Let me structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "dns_lookup", "arguments": {"host": "208.67.222.222", "record_type": "PTR"}}
+  </tool_call><|projection|>

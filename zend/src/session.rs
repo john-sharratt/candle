@@ -31,14 +31,14 @@ use crate::api::substrate::{
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
     ToolView, ToolsView, TurnView,
 };
-use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
 use crate::conv_file_store::ConvFileStore;
+use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::{ClusterState, RepoMap};
+use crate::repo_scan::RepoMap;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
 };
@@ -62,31 +62,12 @@ enum TitleJob {
     Shutdown,
 }
 
-// ── Repo-map handle ──────────────────────────────────────────────────────────
-
-/// The `repo_map` layer's owning conversation paired with the
-/// per-cluster hash record.  Refresh is at this granularity — the
-/// whole conversation resets and re-inserts when any cluster's
-/// file-name hash changes, so the [`Sequence`] and the [`ClusterState`]
-/// must stay in lock-step.  Wrapping them in one struct keeps that
-/// invariant under one mutex.
-pub(crate) struct RepoMapConv {
-    pub(crate) sequence: Sequence,
-    pub(crate) state: ClusterState,
-}
-
-/// The `code_reading` layer's owning conversation paired with the
-/// per-file content-hash record.  Same lock-step contract as
-/// [`RepoMapConv`].
-pub(crate) struct CodeReadConv {
-    /// Merged per-file content-hash record. There are no live sequences:
-    /// `code_reading` is now **one conversation per file**, each freed
-    /// after its turns seal into the substrate. Retrieval queries the
-    /// substrate's `active_timelines_for_group`; refresh finds and
-    /// tombstones a changed file's conversation(s) by a `path` metadata
-    /// scan rather than from a held sequence list.
-    pub(crate) state: CodeReadState,
-}
+// Per-layer ingest state ([`IngestConv`]) and the schema-driven ingest registry
+// live in [`crate::ingest`]. A layer's live state is keyed by layer name in
+// `InferenceState::ingest_convs`; the folder-scan variant holds an owning
+// `Sequence` (so its sealed K/V stays reachable by dialogue retrieval), the
+// per-file variant holds only its content-hash record (its per-file
+// conversations are freed after their turns seal into the substrate).
 
 // The number of tools surfaced into the system prompt is governed by
 // the `selection: { kind: top_k, k: N }` rule on the `tools` collection
@@ -215,24 +196,22 @@ struct InferenceState {
     /// Set once shutdown begins. The titler worker checks it between jobs and
     /// stops draining; the request path stops enqueuing new title jobs.
     shutting_down: AtomicBool,
-    /// `repo_map` layer's owning conversation.  Holds one
-    /// prefilled turn pair per directory cluster; [`ClusterState`]
-    /// is the per-cluster file-name hash record the refresh path
-    /// consults to decide whether to rebuild atomically.
-    repo_map_conv: Mutex<RepoMapConv>,
+    /// Live per-layer ingest state, keyed by projection layer name. One entry
+    /// per schema ingest layer that was actually populated at boot (disabled
+    /// layers are absent). The watcher-driven refresh and the upload path both
+    /// iterate this registry; a projection with no ingest layers leaves it empty.
+    ingest_convs: Mutex<HashMap<String, IngestConv>>,
+    /// The schema's ingest layers in declaration order (identity + strategy +
+    /// display label), resolved once at load. Drives the refresh dispatch —
+    /// each entry names how to re-ingest the matching [`IngestConv`].
+    ingest_layers: Vec<IngestLayer>,
     /// Workspace root captured at startup — the refresh path
     /// re-walks from here on every filesystem event.
     workspace: PathBuf,
-    /// `code_reading` layer's owning conversations — one per file,
-    /// each a per-part tool-call exchange closed by a whole-file
-    /// summary; [`CodeReadState`] is the per-file content hash record
-    /// the refresh path consults.
-    code_read_conv: Mutex<CodeReadConv>,
     /// Projection builder + sequence config kept alive for the
-    /// atomic refresh paths.  Minting a fresh repo_map or
-    /// code_reading timeline after a file change reuses the same
-    /// schema clone and the same dialect config the initial
-    /// ingestion ran under.
+    /// atomic refresh paths.  Minting a fresh ingest-layer timeline
+    /// after a file change reuses the same schema clone and the same
+    /// dialect config the initial ingestion ran under.
     refresh_builder: Builder,
     refresh_config: candle_conversation::SequenceConfig,
     /// Per-tools-mode projection builders, built once at startup (Restricted
@@ -406,11 +385,11 @@ impl InferenceState {
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: PathBuf,
-        skip_code_read: bool,
-        skip_repo_scan: bool,
+        disabled_layers: HashSet<String>,
         disable_summariser: bool,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
+        status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Arc<Self>> {
         // Step 1: model. Engine ctor also reloads the substrate
         // internally, so the visible boundary between Model and
@@ -472,12 +451,56 @@ impl InferenceState {
         // is one prefill pass over the catalog per daemon start
         // (~90 tools × short JSON line); cheap on the 4090 mobile
         // baseline and easy to re-flip once cold-load is back.
+        // Resolve the effective tool catalog before any consumer touches it: a
+        // `<workspace>/tools/` folder (a mind/game's own tools) overrides the
+        // bundled built-ins; absent it, the built-in coding-assistant catalog.
+        crate::tool_def::init(&workspace);
         let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
             .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
         tracing::info!(
             n_tools = tool_sections.len(),
             "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         );
+
+        // Structure-derived section-collection population. Each empty section
+        // collection (e.g. `response`, `mood`) is filled from its content folder
+        // — `<collection>s/*.yaml` — as authored sections BEFORE base-conv build,
+        // so each template's KV seals into the frame (baseline provenance from its
+        // own prefill, exactly like a tool's JSON line). The folder and the fact
+        // that it needs loading are DERIVED from the declared schema (see
+        // `crate::ingest::section_sinks`); nothing is annotated in projection.yaml.
+        // Each section's `examples` are parsed and validated here; selection
+        // provenance currently comes from each template's own prefill (the
+        // calibration phase below calibrates tool selection only). For the
+        // coding-assistant schema there are no such collections, so this is a no-op.
+        let identity = crate::response_section::Identity::load(&workspace);
+        for sink in crate::ingest::section_sinks(proj_builder.schema()) {
+            if disabled_layers.contains(&sink.collection) {
+                tracing::info!(collection = %sink.collection, "--disable-layer: section collection suppressed");
+                continue;
+            }
+            let Some(layer_id) = proj_builder.id_for_layer(&sink.layer) else {
+                continue;
+            };
+            let sections =
+                crate::response_section::load_sections(&workspace.join(&sink.folder), &identity);
+            if sections.is_empty() {
+                continue;
+            }
+            let installed = crate::response_section::install_sections(
+                &mut proj_builder,
+                layer_id,
+                &sink.collection,
+                &sections,
+            )
+            .map_err(|e| anyhow::anyhow!("install '{}' sections: {e}", sink.collection))?;
+            tracing::info!(
+                collection = %sink.collection,
+                folder = %sink.folder,
+                n = installed.len(),
+                "installed calibrated section collection",
+            );
+        }
 
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
@@ -522,13 +545,21 @@ impl InferenceState {
         // Compile the whole tool catalog into one constrained-decoding stencil,
         // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
         // tool call the model starts is forced to the catalog's exact shape.
-        let tool_specs: Vec<ToolSpec> = zend_tools::registry::all_tools()
-            .iter()
-            .map(|t| ToolSpec::from_json_schema(t.name, &(t.schema)()))
-            .collect();
-        let tool_stencil = engine
-            .compile_tool_stencil(&tool_specs)
-            .map_err(|e| anyhow::anyhow!("tool stencil compile: {e}"))?;
+        // Only arm the stencil for tools that were actually installed into the
+        // dialogue prompt. A tool-free projection installs none — it gets an empty
+        // `TriggerRegistry` (never fires) rather than compiling a stencil, which
+        // rejects an empty catalog.
+        let tool_stencil = if tool_sections.is_empty() {
+            Arc::new(TriggerRegistry::new())
+        } else {
+            let tool_specs: Vec<ToolSpec> = crate::tool_def::all()
+                .iter()
+                .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
+                .collect();
+            engine
+                .compile_tool_stencil(&tool_specs)
+                .map_err(|e| anyhow::anyhow!("tool stencil compile: {e}"))?
+        };
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
@@ -616,16 +647,11 @@ impl InferenceState {
             let scaled = if total == 0 { 0 } else { done * 5_000 / total };
             section_progress.set_step_progress(scaled, 10_000);
         };
-        // Two clones of the (tools-installed + templates-tokenised)
-        // projection builder go to the repo_map and code_reading
-        // conversations below.  Cloning is cheap (schemas are
-        // `Arc`-backed) and avoids re-running the install +
-        // tokenise passes.
-        let proj_builder_repo_map = proj_builder.clone();
-        let proj_builder_code_read = proj_builder.clone();
-        // Third clone stays on `InferenceState` for the atomic
-        // refresh paths to mint fresh repo_map / code_reading
-        // timelines when the watcher fires.
+        // A clone of the (tools-installed + templates-tokenised) projection
+        // builder is kept for the schema-driven ingest passes (one cheap clone
+        // per ingest layer below — schemas are `Arc`-backed) and stays on
+        // `InferenceState` afterwards for the atomic refresh paths to mint fresh
+        // ingest-layer timelines when the watcher fires.
         let proj_builder_refresh = proj_builder.clone();
         let mut base_conv = engine
             .new_conversation_with_projection_progress(
@@ -728,15 +754,13 @@ impl InferenceState {
         // conversation per (tool, example); a failing case is logged and skipped so
         // it can never break daemon load.
         progress.set_step(LoadStep::CalibratingSections);
-        {
-            let tools = zend_tools::registry::all_tools();
-            let total: usize = tools
-                .iter()
-                .map(|t| t.examples.iter().filter(|e| !e.is_empty()).count())
-                .sum();
+        // Skip entirely for a tool-free projection — nothing to calibrate.
+        if !tool_sections.is_empty() {
+            let defs = crate::tool_def::all();
+            let total: usize = defs.iter().map(|d| d.examples.len()).sum();
             tracing::info!(
                 cases = total,
-                "calibrating sections: per-tool example decodes (named tool selection)"
+                "calibrating sections: per-tool example prefills (named tool selection)"
             );
             let (calib_builder, calib_layer, calib_group) =
                 crate::tools::build_calibration_projection(&conv_config.dialect)
@@ -750,19 +774,13 @@ impl InferenceState {
                 c.kv_lossless = true;
                 c
             };
-            // Flatten to (tool, example, index) cases in registry order. The
-            // 1-based index is the position in the tool's `[_; 8]` examples array
-            // (before filtering empties) — it keys the exported `{tool}_{NN}.md`
-            // trajectory the prefill path loads.
-            let cases: Vec<(&str, &str, usize)> = tools
+            // Flatten to (tool, example) cases. Each `example` is the full ChatML
+            // calibration trajectory from the tool's definition file — prompt +
+            // `<|im_end|><|im_start|>assistant` + think→call with projection markers.
+            // The prefill path splits it on the assistant header (below).
+            let cases: Vec<(&str, &str)> = defs
                 .iter()
-                .flat_map(|t| {
-                    t.examples
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| !e.is_empty())
-                        .map(move |(i, e)| (t.name, *e, i + 1))
-                })
+                .flat_map(|d| d.examples.iter().map(move |ex| (d.name.as_str(), ex.as_str())))
                 .collect();
 
             // A calibration case is "done" only once its conversation is
@@ -782,17 +800,24 @@ impl InferenceState {
             // is created lazily as the window refills (below), bounding the live
             // slot count to `CALIBRATION_BATCH` — the concurrency the decode/prefill
             // window can actually keep busy.
+            // A case's resume marker: the tool name plus a content hash of its
+            // ChatML example, so editing an example (in its tool file) changes the
+            // marker and the case regenerates automatically.
+            let calib_marker = |name: &str, example: &str| -> String {
+                use sha2::{Digest, Sha256};
+                format!("{name}|{:x}", Sha256::digest(example.as_bytes()))
+            };
             let mut done = 0usize;
-            let mut to_run: Vec<(&str, &str, usize)> = Vec::new();
-            for (name, example, idx) in cases.iter() {
-                let marker = format!("{name}|{example}");
+            let mut to_run: Vec<(&str, &str)> = Vec::new();
+            for (name, example) in cases.iter() {
+                let marker = calib_marker(name, example);
                 let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, &marker);
                 // Done iff a prior conversation for this case is archived.
                 if prior.iter().any(|t| engine.is_conversation_archived(*t)) {
                     // The completed corpus only needs its wide-Q sigs, so mark the
                     // archived conversation for distillation — compaction reclaims
-                    // its trajectory content (`.md` files are the source of truth).
-                    // Idempotent: skip a timeline that's already distilled.
+                    // its trajectory content (the tool file's example is the source
+                    // of truth). Idempotent: skip a timeline already distilled.
                     for t in prior
                         .iter()
                         .filter(|t| engine.is_conversation_archived(**t))
@@ -811,7 +836,7 @@ impl InferenceState {
                         tracing::warn!(tool = name, "tombstone partial calibration failed: {e}");
                     }
                 }
-                to_run.push((*name, *example, *idx));
+                to_run.push((*name, *example));
             }
 
             // Non-blocking sweep: archive + retire every case finished since the
@@ -890,9 +915,11 @@ impl InferenceState {
                     retired
                 };
 
-            // The assistant header marker the exported trajectory is split on —
-            // everything after it is the verbatim body we prefill.
+            // The ChatML markers a calibration example is split on: everything
+            // after `assistant_start` is the verbatim body we prefill; the user
+            // prompt is what precedes it, minus the trailing `user_end`.
             let assistant_start = conv_config.dialect.assistant_start;
+            let user_end = conv_config.dialect.user_end;
             let mut to_run_iter = to_run.into_iter();
             let mut warmed = false;
             // Timelines of archived (retired) calibration cases, awaiting hot→warm
@@ -917,7 +944,7 @@ impl InferenceState {
                 } else {
                     1
                 };
-                let batch: Vec<(&str, &str, usize)> =
+                let batch: Vec<(&str, &str)> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
                 let convs = if created_any {
@@ -932,7 +959,7 @@ impl InferenceState {
                 } else {
                     Vec::new()
                 };
-                for ((name, example, idx), conv_res) in batch.into_iter().zip(convs) {
+                for ((name, example), conv_res) in batch.into_iter().zip(convs) {
                     let mut conv = match conv_res {
                         Ok(conv) => conv,
                         Err(e) => {
@@ -943,7 +970,7 @@ impl InferenceState {
                         }
                     };
                     // Tag at creation so a half-finished case is findable next load.
-                    let marker = format!("{name}|{example}");
+                    let marker = calib_marker(name, example);
                     if let Err(e) = engine.set_conversation_metadata(
                         conv.timeline_id(),
                         CALIB_MARKER_KEY,
@@ -963,33 +990,40 @@ impl InferenceState {
                     // catalog member whose name matches the selector value.
                     opts.selection
                         .select(crate::tools::CALIB_TOOL_SELECTOR, name);
-                    // Fast path: prefill the exported trajectory verbatim in one
-                    // batched forward pass instead of decoding it token by token —
-                    // the wide-Q is captured identically at seal. The body is
-                    // everything after the assistant header (markers stripped). If
-                    // the case has no exported trajectory, or a malformed one where
-                    // the header isn't found, fall back to a live decode rather than
-                    // prefilling a wrong-grid body.
-                    // Keep the projection markers in the body: `submit_prefilled_turn`
-                    // strips them for the prefilled text and records each one's token
-                    // offset so the staged prefill wave fires a projection there,
-                    // reproducing the decode's per-segment projection sequence.
-                    let body =
-                        zend_tools::calibration::trajectory_for(name, idx).and_then(|traj| {
-                            traj.split_once(assistant_start).map(|(_, b)| b.to_string())
-                        });
+                    // Fast path: prefill the tool file's ChatML trajectory verbatim
+                    // in one batched forward pass instead of decoding it token by
+                    // token — the wide-Q is captured identically at seal. Prefill
+                    // only a single-turn example (exactly one assistant header):
+                    // split into the body (after the header — the think→call we
+                    // prefill, projection markers kept) and the user prompt (before
+                    // it, minus the trailing `user_end`). A bare prompt (no header)
+                    // or a multi-turn lead-in (more than one) is decoded live rather
+                    // than prefilling a wrong-grid body. `submit_prefilled_turn`
+                    // strips the markers for the prefilled text and records each
+                    // one's token offset so the staged prefill wave fires a
+                    // projection there, reproducing the decode's projection sequence.
+                    let (user_prompt, body): (&str, Option<String>) =
+                        if example.matches(assistant_start).count() == 1 {
+                            let (before, b) =
+                                example.split_once(assistant_start).expect("count == 1");
+                            let p = before.trim_end();
+                            let p = p.strip_suffix(user_end.trim()).unwrap_or(p).trim_end();
+                            (p, Some(b.to_string()))
+                        } else {
+                            (example.trim(), None)
+                        };
                     let (submit_result, is_prefill) = match body {
                         Some(body) => (
                             conv.submit_prefilled_turn(
-                                example,
+                                user_prompt,
                                 &body,
-                                zend_tools::calibration::PROJECTION_MARKER,
+                                crate::tool_def::PROJECTION_MARKER,
                                 opts.selection.clone(),
                                 opts.tags.clone(),
                             ),
                             true,
                         ),
-                        None => (conv.submit_turn_with_options(example, opts), false),
+                        None => (conv.submit_turn_with_options(user_prompt, opts), false),
                     };
                     match submit_result {
                         Ok(handle) => {
@@ -1098,45 +1132,82 @@ impl InferenceState {
             );
         }
 
-        // Walk the workspace, cluster the directory tree under a
-        // token budget, and prefill one (user, assistant) turn pair
-        // per cluster into the `repo_map` layer.  `ClusterState`
-        // is the per-cluster file-name hash record `refresh_repo_map`
-        // consults so a filesystem event triggers a rebuild only
-        // when something actually changed.
-        progress.set_step(LoadStep::RepoScan);
-        let (repo_map_sequence, repo_map, repo_map_state) = crate::repo_scan::ingest_repo_map(
-            &engine,
-            proj_builder_repo_map,
-            &workspace,
-            conv_config.clone(),
-            &progress,
-            skip_repo_scan,
-        )?;
-
-        // Wrap the engine in its session Mutex now: code_read's per-file
-        // pool takes `&Mutex<ConversationEngine>` so it can hold the lock
-        // only for the quick create/tombstone ops and release it across the
-        // decode-heavy summary generation (keeping refresh non-blocking).
+        // Wrap the engine in its session Mutex now: every ingest pass takes the
+        // shared `&Mutex<ConversationEngine>` handle (folder scans lock briefly to
+        // mint their sequence; the per-file pool holds the lock only for the quick
+        // create/tombstone ops and releases it across each decode), so the loop
+        // below is uniform across injection types and refresh stays non-blocking.
         let engine = Mutex::new(engine);
 
-        // For every file the walker surfaced, carve into scope-aware parts
-        // and build a one-conversation-per-file `code_reading` ingest (one
-        // prefill turn per part + a final whole-file summary).
-        progress.set_step(LoadStep::CodeRead);
-        let code_read_state = if skip_code_read {
-            tracing::info!("--skip-code-read: bypassing per-file code-reading ingest");
-            CodeReadState::default()
-        } else {
-            crate::code_read::ingest_code_reading(
-                &engine,
-                proj_builder_code_read,
-                &workspace,
-                &repo_map,
-                conv_config.clone(),
-                &progress,
-            )?
-        };
+        // Structure-derived ingestion. The load plan is derived from the declared
+        // schema (see `crate::ingest`), not annotated in it: each turn-sink layer
+        // is populated here, in schema order, skipping any named by
+        // `--disable-layer`. Each reads from its content folder
+        // (`workspace/<folder>`); folder/file walks are cached per folder so
+        // co-located sinks pay for a single walk. A projection with no turn-sinks
+        // (a pure conversational mind) does no filesystem reading here.
+        let ingest_layers = crate::ingest::ingest_layers(proj_builder_refresh.schema(), &workspace);
+        progress.set_step(LoadStep::Ingesting);
+        let mut ingest_convs: HashMap<String, IngestConv> = HashMap::new();
+        let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
+        for il in &ingest_layers {
+            if disabled_layers.contains(&il.name) {
+                tracing::info!(layer = %il.name, "--disable-layer: startup ingest suppressed");
+                continue;
+            }
+            // The layer's display label rides the step's `detail` sub-status.
+            status_tx.send(il.display.clone()).ok();
+            progress.set_step_progress(0, 0);
+            let content_root = workspace.join(&il.folder);
+            tracing::info!(layer = %il.name, mode = ?il.mode, folder = %il.folder, "ingest pass starting");
+            match il.mode {
+                IngestMode::Folders => {
+                    let (sequence, walked, state) = crate::repo_scan::ingest_repo_map(
+                        &engine,
+                        proj_builder_refresh.clone(),
+                        &content_root,
+                        conv_config.clone(),
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    // Cache this folder's walk for a co-located per-file layer.
+                    walk_cache.insert(il.folder.clone(), walked);
+                    ingest_convs
+                        .insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                }
+                IngestMode::Files => {
+                    let map = walk_cache
+                        .entry(il.folder.clone())
+                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let state = crate::code_read::ingest_code_reading(
+                        &engine,
+                        proj_builder_refresh.clone(),
+                        &content_root,
+                        map,
+                        conv_config.clone(),
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    ingest_convs.insert(il.name.clone(), IngestConv::Files { state });
+                }
+                IngestMode::Raw => {
+                    let (sequence, state) = crate::raw_read::ingest_raw(
+                        &engine,
+                        proj_builder_refresh.clone(),
+                        &content_root,
+                        conv_config.clone(),
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    ingest_convs.insert(il.name.clone(), IngestConv::Raw { sequence, state });
+                }
+            }
+        }
+        // Clear the ingest sub-status now the phase is done.
+        status_tx.send(String::new()).ok();
 
         // The titler runs on a single dedicated worker thread fed by this
         // queue. The worker owns the titler `Sequence` exclusively (no shared
@@ -1162,13 +1233,8 @@ impl InferenceState {
             titler_worker: Mutex::new(None),
             titler_timeline,
             shutting_down: AtomicBool::new(false),
-            repo_map_conv: Mutex::new(RepoMapConv {
-                sequence: repo_map_sequence,
-                state: repo_map_state,
-            }),
-            code_read_conv: Mutex::new(CodeReadConv {
-                state: code_read_state,
-            }),
+            ingest_convs: Mutex::new(ingest_convs),
+            ingest_layers,
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             mode_builders,
@@ -1198,83 +1264,173 @@ impl InferenceState {
         }
     }
 
-    /// Atomic refresh of the `repo_map` conversation when any
-    /// directory cluster's file-name hash changed.  Mints a fresh
-    /// timeline, prefills the new clusters, tombstones the old
-    /// timeline (so projection / compaction physically drop it),
-    /// then swaps the new `Sequence` into `repo_map_conv`.  Returns
-    /// `Ok(true)` when the conversation was replaced, `Ok(false)`
-    /// when the hash check found nothing to do.
+    /// Refresh every populated ingest layer after a filesystem-event burst.
     ///
-    /// Stale-better-than-missing: between the new timeline being
-    /// registered (start of prefill) and the tombstone being
-    /// written, both timelines are alive in the substrate.  The
-    /// resolver's `active_timelines_for_group` iterator picks the
-    /// older one (registered first), so dialogue retrieval against
-    /// this layer keeps seeing the prior content the whole way
-    /// through the refresh.  The swap-in is observed by the next
-    /// query as a single atomic transition from old to new.
+    /// Iterates the live [`IngestConv`] registry and dispatches each layer to its
+    /// loading mode's atomic refresh:
+    ///  * **folder-scan** — re-cluster the walk; on a cluster-hash change mint a
+    ///    fresh timeline, prefill the new clusters, tombstone the old timeline,
+    ///    and swap the new `Sequence` into the registry entry.
+    ///  * **per-file** — reconcile deleted files, then re-ingest the changed
+    ///    ones (each into a fresh per-file conversation that tombstones its
+    ///    predecessor), merging the new content-hash record into the entry.
+    ///  * **raw** — re-read the folder's ChatML records; on a content-hash change
+    ///    mint a fresh timeline, re-prefill, tombstone the old, and swap it in.
     ///
-    /// When `map` is `Some`, the refresh reuses that workspace walk
-    /// instead of doing its own — the watcher callback walks once
-    /// per filesystem-event burst and shares the result with both
-    /// refresh paths.
-    pub(crate) fn refresh_repo_map(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
+    /// Each layer reads from its own `folder` (`workspace/<folder>`); walks are
+    /// cached per folder so co-located layers share one walk. Stale-better-than-
+    /// missing holds throughout: the old timeline stays alive (and is what the
+    /// resolver picks) until its replacement's tombstone fires. Returns
+    /// `Ok(true)` if any layer was replaced. No ingest layers → a cheap no-op.
+    pub(crate) fn refresh_ingest_layers(&self) -> anyhow::Result<bool> {
+        if self.ingest_layers.is_empty() {
+            return Ok(false);
+        }
         // Throwaway progress sink (a refresh, not the model-load lifecycle) —
         // silent so a watcher burst doesn't log "load step started Loading model".
-        let progress = LoadProgress::silent();
-        let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
-        let (old_timeline, prior_state) = {
-            let guard = self.repo_map_conv.lock().unwrap();
-            (guard.sequence.timeline_id(), guard.state.clone())
-        };
-        let ctx = self.refresh_ctx();
-        let outcome =
-            crate::repo_scan::refresh_repo_map(&ctx, &map, &prior_state, old_timeline, &progress)?;
-        match outcome {
-            crate::repo_scan::RefreshOutcome::NoOp => Ok(false),
-            crate::repo_scan::RefreshOutcome::Replaced { sequence, state } => {
-                let mut guard = self.repo_map_conv.lock().unwrap();
-                *guard = RepoMapConv { sequence, state };
-                Ok(true)
+        let progress = Arc::new(LoadProgress::silent());
+        // Walk each distinct content folder at most once per burst.
+        let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
+        let mut any = false;
+        for il in &self.ingest_layers {
+            let content_root = self.workspace.join(&il.folder);
+            match il.mode {
+                IngestMode::Folders => {
+                    // Snapshot the prior timeline + cluster state, then refresh
+                    // lock-free, then swap the replacement in — all keyed by name.
+                    let snapshot = {
+                        let convs = self.ingest_convs.lock().unwrap();
+                        match convs.get(&il.name) {
+                            Some(IngestConv::Folders { sequence, state }) => {
+                                Some((sequence.timeline_id(), state.clone()))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some((old_timeline, prior_state)) = snapshot else {
+                        continue;
+                    };
+                    let map = walk_cache
+                        .entry(il.folder.clone())
+                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let ctx = self.refresh_ctx();
+                    let outcome = crate::repo_scan::refresh_repo_map(
+                        &ctx,
+                        map,
+                        &prior_state,
+                        old_timeline,
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    if let crate::repo_scan::RefreshOutcome::Replaced { sequence, state } = outcome {
+                        self.ingest_convs
+                            .lock()
+                            .unwrap()
+                            .insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                        any = true;
+                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
+                    }
+                }
+                IngestMode::Files => {
+                    let prior_state = {
+                        let convs = self.ingest_convs.lock().unwrap();
+                        match convs.get(&il.name) {
+                            Some(IngestConv::Files { state }) => Some(state.clone()),
+                            _ => None,
+                        }
+                    };
+                    let Some(prior_state) = prior_state else {
+                        continue;
+                    };
+                    let map = walk_cache
+                        .entry(il.folder.clone())
+                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let ctx = self.refresh_ctx();
+                    let outcome = crate::code_read::refresh_code_reading(
+                        &ctx,
+                        &content_root,
+                        map,
+                        &prior_state,
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    if let crate::code_read::RefreshOutcome::Replaced { state } = outcome {
+                        self.ingest_convs
+                            .lock()
+                            .unwrap()
+                            .insert(il.name.clone(), IngestConv::Files { state });
+                        any = true;
+                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
+                    }
+                }
+                IngestMode::Raw => {
+                    let snapshot = {
+                        let convs = self.ingest_convs.lock().unwrap();
+                        match convs.get(&il.name) {
+                            Some(IngestConv::Raw { sequence, state }) => {
+                                Some((sequence.timeline_id(), state.clone()))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some((old_timeline, prior_state)) = snapshot else {
+                        continue;
+                    };
+                    let ctx = self.refresh_ctx();
+                    let outcome = crate::raw_read::refresh_raw(
+                        &ctx,
+                        &content_root,
+                        &prior_state,
+                        old_timeline,
+                        &progress,
+                        &il.name,
+                        &il.group,
+                    )?;
+                    if let crate::raw_read::RefreshOutcome::Replaced { sequence, state } = outcome {
+                        self.ingest_convs
+                            .lock()
+                            .unwrap()
+                            .insert(il.name.clone(), IngestConv::Raw { sequence, state });
+                        any = true;
+                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
+                    }
+                }
             }
         }
+        Ok(any)
     }
 
-    /// Atomic refresh of the `code_reading` layer when any file's
-    /// content hash changed.  Reconciles deleted files (tombstones
-    /// their per-file conversations), then re-runs the parallel
-    /// per-file ingestion — each changed file gets a fresh per-file
-    /// conversation (per-part tool-call prefills closed by a decoded
-    /// whole-file summary) while files whose hash is unchanged are
-    /// skipped via the resume cache.  Stale-better-than-missing holds
-    /// throughout: dialogue retrieval sees a file's old content until
-    /// that file's new conversation tombstones the old one.
+    /// Ingest **only** the given workspace-relative files into the projection's
+    /// per-file ingest layer — the upload's read_file phase. Bounded to those
+    /// files (never a whole-workspace re-ingest, never a tombstone sweep), so it
+    /// can't overload the model with the entire repo. Merges the ingested files'
+    /// content hashes into that layer's running record so the resume cache and
+    /// future watcher refreshes skip them. Reports per-scope progress into
+    /// `progress`. Returns `(ingested, failed)`: whether anything was newly
+    /// ingested, and whether at least one file's ingest tolerated-failed (e.g.
+    /// out of KV VRAM) — so the upload can report a real failure.
     ///
-    /// When `map` is `Some`, the refresh reuses that workspace walk
-    /// instead of doing its own.
-    pub(crate) fn refresh_code_reading(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
-        // Throwaway progress sink (a refresh, not the model-load lifecycle) —
-        // silent so a watcher burst doesn't log "load step started Loading model".
-        self.refresh_code_reading_with_progress(map, &Arc::new(LoadProgress::silent()))
-    }
-
-    /// Ingest **only** the given workspace-relative files into the
-    /// `code_reading` layer — the upload's read_file phase. Bounded to those
-    /// files (never a whole-workspace re-ingest, never a tombstone sweep), so
-    /// it's safe under `--skip-code-read` and can't overload the model with the
-    /// entire repo. Merges the ingested files' content hashes into the running
-    /// `CodeReadState` so the resume cache and future watcher refreshes skip
-    /// them. Reports per-scope progress into `progress`. Returns
-    /// `(ingested, failed)`: whether anything was newly ingested, and whether
-    /// at least one file's ingest tolerated-failed (e.g. the GPU ran out of KV
-    /// VRAM) — so the upload can report a real failure instead of a silent
-    /// no-op.
+    /// If the projection declares no per-file ingest layer (a pure conversational
+    /// mind), there is nowhere to read uploads into — a no-op. A per-file layer
+    /// suppressed by `--disable-layer` still accepts uploads (they're bounded and
+    /// safe): its registry entry is seeded on first upload.
     pub(crate) fn ingest_uploaded_files(
         &self,
         rel_paths: &[String],
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<(bool, bool)> {
+        let Some(files_layer) = self
+            .ingest_layers
+            .iter()
+            .find(|l| l.mode == IngestMode::Files)
+        else {
+            tracing::debug!(
+                "upload ingest: projection has no per-file ingest layer — skipping read_file"
+            );
+            return Ok((false, false));
+        };
         let ctx = self.refresh_ctx();
         let (state, n_failed) = crate::code_read::ingest_files(
             &self.engine,
@@ -1283,44 +1439,26 @@ impl InferenceState {
             rel_paths,
             ctx.config,
             progress,
+            &files_layer.name,
+            &files_layer.group,
         )?;
         let failed = n_failed > 0;
         if state.file_hashes.is_empty() {
             return Ok((false, failed));
         }
-        let mut guard = self.code_read_conv.lock().unwrap();
-        for (path, hash) in state.file_hashes {
-            guard.state.file_hashes.insert(path, hash);
-        }
-        Ok((true, failed))
-    }
-
-    /// As [`Self::refresh_code_reading`], but reports per-scope ingest
-    /// progress into the caller's `progress` handle — the upload's read_file
-    /// phase shares one and polls it to stream a progress bar to the GUI.
-    pub(crate) fn refresh_code_reading_with_progress(
-        &self,
-        map: Option<RepoMap>,
-        progress: &Arc<LoadProgress>,
-    ) -> anyhow::Result<bool> {
-        let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
-        let prior_state = self.code_read_conv.lock().unwrap().state.clone();
-        let ctx = self.refresh_ctx();
-        let outcome = crate::code_read::refresh_code_reading(
-            &ctx,
-            &self.workspace,
-            &map,
-            &prior_state,
-            progress,
-        )?;
-        match outcome {
-            crate::code_read::RefreshOutcome::NoOp => Ok(false),
-            crate::code_read::RefreshOutcome::Replaced { state } => {
-                let mut guard = self.code_read_conv.lock().unwrap();
-                *guard = CodeReadConv { state };
-                Ok(true)
+        let mut convs = self.ingest_convs.lock().unwrap();
+        match convs.get_mut(&files_layer.name) {
+            Some(IngestConv::Files { state: existing }) => {
+                for (path, hash) in state.file_hashes {
+                    existing.file_hashes.insert(path, hash);
+                }
+            }
+            // Layer declared but not populated at boot (disabled) — seed it now.
+            _ => {
+                convs.insert(files_layer.name.clone(), IngestConv::Files { state });
             }
         }
+        Ok((true, failed))
     }
 
     /// Tombstone the per-file `code_read` conversation of every uploaded file
@@ -2608,24 +2746,24 @@ impl ZendSession {
             target_layer,
             items: system_prompt_labels(&layer.system_prompt),
             sections,
-            tool_count: zend_tools::registry::all_tools().len(),
+            tool_count: crate::tool_def::all().len(),
         })
     }
 
     /// `GET /v1/substrate/tools` — the live tool catalog projected into the
-    /// dialogue layer's `tools` collection. Sourced from the runtime registry
-    /// (the schema YAML declares the collection empty — tools install at daemon
-    /// start). Fetched when the tools collection expands. Needs only the model
-    /// to be loaded.
+    /// dialogue layer's `tools` collection. Sourced from the bundled tool
+    /// definitions (`src/prompts/tools/`, embedded); the schema YAML declares the
+    /// collection empty and tools install at daemon start. Fetched when the tools
+    /// collection expands. Needs only the model to be loaded.
     pub fn substrate_tools(&self) -> Option<ToolsView> {
         let _state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         Some(ToolsView {
-            tools: zend_tools::registry::all_tools()
+            tools: crate::tool_def::all()
                 .iter()
-                .map(|t| ToolView {
-                    name: t.name.to_string(),
-                    description: t.description.to_string(),
-                    high_risk: t.high_risk,
+                .map(|d| ToolView {
+                    name: d.name.clone(),
+                    description: d.description.clone(),
+                    high_risk: d.high_risk,
                 })
                 .collect(),
         })
@@ -2807,12 +2945,13 @@ impl ZendSession {
             });
         }
 
-        // Scored section members (the collection tools). Text comes from the live
-        // registry (the schema declares the collection empty). Cut the noise floor:
-        // keep only members the query selected or gave a positive belief score.
-        let tool_desc: HashMap<&str, &str> = zend_tools::registry::all_tools()
+        // Scored section members (the collection tools). Text comes from the
+        // bundled tool definitions (the schema declares the collection empty). Cut
+        // the noise floor: keep only members the query selected or gave a positive
+        // belief score.
+        let tool_desc: HashMap<&str, &str> = crate::tool_def::all()
             .iter()
-            .map(|t| (t.name, t.description))
+            .map(|d| (d.name.as_str(), d.description.as_str()))
             .collect();
         for item in &event.selection.system {
             if let SystemItem::Collection { name, sections } = item {
@@ -3272,8 +3411,7 @@ impl ZendSession {
         let status_tx = self.status_tx.clone();
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
-        let skip_code_read = self.config.skip_code_read;
-        let skip_repo_scan = self.config.skip_repo_scan;
+        let disabled_layers = self.config.disabled_layers.clone();
         let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
@@ -3347,11 +3485,11 @@ impl ZendSession {
                     model_path,
                     tok_path,
                     workspace,
-                    skip_code_read,
-                    skip_repo_scan,
+                    disabled_layers,
                     disable_summariser,
                     compact_substrate,
                     load_progress_for_blocking,
+                    status_tx.clone(),
                 ) {
                     Ok(state) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
@@ -3362,21 +3500,21 @@ impl ZendSession {
                         // trigger from the scheduler — so no periodic-flush
                         // task is needed at the daemon level here.
                         //
-                        // `LoadStep::RepoScan` and `LoadStep::CodeRead`
-                        // are advanced inside `InferenceState::load`
-                        // itself — the ingestion passes own those steps
-                        // and report sub-step progress through the same
-                        // `LoadProgress` handle.
+                        // The schema-driven `LoadStep::Ingesting` step is
+                        // advanced inside `InferenceState::load` itself — the
+                        // ingest passes own it and report sub-step progress
+                        // through the same `LoadProgress` handle.
 
-                        // Arm the workspace watcher.  Filesystem events
-                        // debounce into a single refresh call covering
-                        // BOTH layers — name-relevant events (create /
-                        // remove / rename) can move the repo-map
-                        // cluster hashes, and content edits can move
-                        // the code-reading file-content hashes.  Each
-                        // refresh path short-circuits internally when
-                        // its hash record is unchanged, so the work is
-                        // bounded.
+                        // Arm the workspace watcher. A filesystem-event burst
+                        // debounces into a single refresh covering every
+                        // populated ingest layer: name-relevant events (create /
+                        // remove / rename) can move a folder-scan layer's cluster
+                        // hashes, content edits can move a per-file layer's
+                        // content hashes. Each layer short-circuits internally
+                        // when its hash record is unchanged, and a layer that was
+                        // never populated (absent from the registry — disabled, or
+                        // no ingest layers at all) is skipped, so the work is
+                        // bounded and a `--disable-layer` layer is never re-ingested.
                         let inference_for_watcher = Arc::clone(&slot);
                         let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                             let Some(state) = inference_for_watcher
@@ -3387,48 +3525,18 @@ impl ZendSession {
                             else {
                                 return;
                             };
-                            // Walk the workspace once per event burst and
-                            // share the result between both refresh paths.
-                            // Walks are the dominant cost on workspaces
-                            // with tens of thousands of files; doing it
-                            // twice per burst is wasted work.
-                            let map = crate::repo_scan::walk_workspace(&state.workspace);
-                            if skip_repo_scan {
-                                tracing::trace!(
-                                    "--skip-repo-scan: watcher repo-map refresh suppressed"
-                                );
-                            } else {
-                                match state.refresh_repo_map(Some(map.clone())) {
-                                    Ok(true) => {
-                                        tracing::info!("repo map refreshed after fs event burst")
-                                    }
-                                    Ok(false) => tracing::trace!(
-                                        "fs event burst saw no cluster hash change — repo map skipped"
-                                    ),
-                                    Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
+                            // Each ingest layer refreshes from its own content
+                            // folder; the refresh caches per-folder walks so
+                            // co-located layers share one — walks are the dominant
+                            // cost on large workspaces.
+                            match state.refresh_ingest_layers() {
+                                Ok(true) => {
+                                    tracing::info!("ingest layers refreshed after fs event burst")
                                 }
-                            }
-                            // Honour --skip-code-read for the watcher too: with code
-                            // reading disabled the per-file content state is empty,
-                            // so a refresh would treat every file as changed and
-                            // re-ingest the whole repo (flooding the scheduler and
-                            // starving interactive chat).
-                            if skip_code_read {
-                                tracing::trace!(
-                                    "--skip-code-read: watcher code-reading refresh suppressed"
-                                );
-                            } else {
-                                match state.refresh_code_reading(Some(map)) {
-                                    Ok(true) => {
-                                        tracing::info!(
-                                            "code reading refreshed after fs event burst"
-                                        )
-                                    }
-                                    Ok(false) => tracing::trace!(
-                                    "fs event burst saw no file content change — code read skipped"
+                                Ok(false) => tracing::trace!(
+                                    "fs event burst changed no ingest-layer hash — refresh skipped"
                                 ),
-                                    Err(e) => tracing::warn!("code read refresh failed: {e:#}"),
-                                }
+                                Err(e) => tracing::warn!("ingest-layer refresh failed: {e:#}"),
                             }
                         });
                         // Uploads are endpoint-managed, so upload churn never
@@ -3860,12 +3968,22 @@ fn build_projection_builder(workspace: &Path) -> Builder {
     // tool_block_open/close, no_think_prefix) resolve to the right
     // structural-token strings at parse time.
     let dialect = Dialect::chat_ml();
-    Builder::from_yaml_with_vars_and_dialect(
-        PROJECTION_SCHEMA_TEMPLATE,
-        &[("workspace", name)],
-        Some(&dialect),
-    )
-    .expect("projection.yaml failed to parse — check YAML syntax and {workspace} placeholder")
+    // A `projection.yaml` in the workspace OVERRIDES the embedded schema, so a
+    // dedicated (uncommitted) mind directory — e.g. `--working-dir ../mind` — can
+    // tune its own cognitive substrate without touching the checked-in default.
+    let override_path = workspace.join("projection.yaml");
+    let overridden = std::fs::read_to_string(&override_path).ok();
+    let (yaml, source): (&str, String) = match &overridden {
+        Some(s) => {
+            tracing::info!(path = %override_path.display(), "projection schema: workspace override");
+            (s.as_str(), override_path.display().to_string())
+        }
+        None => (PROJECTION_SCHEMA_TEMPLATE, "embedded default".to_string()),
+    };
+    Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", name)], Some(&dialect))
+        .unwrap_or_else(|e| {
+            panic!("projection.yaml ({source}) failed to parse — check YAML syntax and {{workspace}} placeholder: {e:#}")
+        })
 }
 
 /// Concatenate the content of every top-level Section that appears
@@ -4019,6 +4137,79 @@ mod projection_schema_tests {
             labels.iter().any(|l| l.starts_with("section tree (")),
             "the adaptive-thinking section tree is labelled: {labels:?}"
         );
+    }
+
+    /// The turn-sink load plan is DERIVED from the embedded schema's structure —
+    /// no `ingest:` annotations: the built-in `repo_map` (folder scan) and
+    /// `code_reading` (file carve) at the workspace root, the live `dialogue`
+    /// layer excluded.
+    #[test]
+    fn embedded_turn_sinks_are_derived_from_structure() {
+        use crate::ingest::IngestMode;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        // "demo-project" doesn't exist on disk, so no folder-backed raw sinks
+        // resolve — only the two built-in pipelines.
+        let layers = crate::ingest::ingest_layers(builder.schema(), Path::new("demo-project"));
+        let got: Vec<(&str, IngestMode, &str)> = layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.mode, l.folder.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("repo_map", IngestMode::Folders, "."),
+                ("code_reading", IngestMode::Files, "."),
+            ],
+            "derived turn-sinks: {got:?}"
+        );
+        // The live dialogue layer is never a turn-sink.
+        assert!(
+            !layers.iter().any(|l| l.name == "dialogue"),
+            "dialogue must be excluded as the live conversation layer",
+        );
+        // The coding-assistant schema has no folder-backed section collections:
+        // its only collection is the registry-backed `tools`, which is excluded.
+        assert!(
+            crate::ingest::section_sinks(builder.schema()).is_empty(),
+            "embedded schema should derive no section-collection sinks",
+        );
+    }
+
+    /// A coding-agent workspace with a folder matching a declared-but-pipeline-fed
+    /// layer name (e.g. `bug_analysis/`) must NOT be ingested as a raw sink; only a
+    /// mind (a workspace with its own `projection.yaml`) draws raw sinks from its
+    /// folders. Guards the folder-name-collision fix.
+    #[test]
+    fn coding_workspace_folder_never_ingests_a_pipeline_layer() {
+        use crate::ingest::IngestMode;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let ws = std::env::temp_dir().join(format!("zend_ingestws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("bug_analysis")).unwrap();
+
+        // Not a mind (no projection.yaml): the built-in pipelines only; the
+        // colliding `bug_analysis/` folder is never a raw sink.
+        let coding = crate::ingest::ingest_layers(builder.schema(), &ws);
+        assert_eq!(
+            coding.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["repo_map", "code_reading"],
+            "coding workspace must ingest only the built-in pipelines"
+        );
+        assert!(
+            !coding.iter().any(|l| l.mode == IngestMode::Raw),
+            "no raw sinks in a coding-agent workspace"
+        );
+
+        // Make it a mind: now the same folder IS drawn as a raw sink.
+        std::fs::write(ws.join("projection.yaml"), "layers: []").unwrap();
+        let mind = crate::ingest::ingest_layers(builder.schema(), &ws);
+        assert!(
+            mind.iter()
+                .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Raw),
+            "a mind draws its bug_analysis/ folder as a raw sink"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// The shipped `projection.yaml` parses, and the reconstructed repo map is

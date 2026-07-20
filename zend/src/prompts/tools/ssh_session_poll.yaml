@@ -1,0 +1,166 @@
+name: ssh_session_poll
+category: SSH sessions
+description: Poll a running async SSH process for output. Returns stdout/stderr chunks, running status, and exit code when done.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    format:
+      description: 'How to return output: "auto" (default — text if valid UTF-8, else hex), "text", or "hex".'
+      type:
+      - string
+      - 'null'
+    process_id:
+      description: The async process handle returned by ssh_session_exec_async (a `proc_…` id). This is NOT an ssh session id — poll the job, not the session.
+      minLength: 1
+      type: string
+    recv_wait_sec:
+      description: Seconds to wait for the process to finish before returning. Defaults to 0 (return immediately with whatever output has accumulated).
+      format: double
+      type:
+      - number
+      - 'null'
+    signal:
+      description: 'Signal to deliver if the process is still running: "TERM", "KILL", or "INT".'
+      type:
+      - string
+      - 'null'
+  required:
+  - process_id
+  title: PollRequest
+  type: object
+examples:
+- |-
+  check whether async process proc_8a3f2c1d4e5b has finished<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check if the async process with ID 'proc_8a3f2c1d4e5b' has finished. Let me see which tool to use.
+
+  Looking at the available tools, there's the ssh_session_poll function. The description says it polls a running async<|projection|> SSH process. The parameters include process_id, which is exactly what the user provided.
+
+  The required parameter is process_id, which the user provided as 'proc_8a3f2c1d4e5b'. The other parameters like format, recv_wait_sec, and signal are optional. Since the user just<|projection|> wants to check if it's done, maybe the default values for those others are fine.
+
+  So I need to call ssh_session_poll with the process_id set to 'proc_8a3f2c1d4e5b'. The other parameters can be omitted unless needed. The function should return the status<|projection|>, so the user can know if it's finished.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_8a3f2c1d4e5b"}}
+  </tool_call><|projection|>
+- |-
+  poll async process proc_4b7e9a02c1f3 for its output so far<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. The user is asking to poll an asynchronous SSH process with the ID "proc_4b7e9a02c1f3" to get its output so far.
+
+  First, I need to recall the available tools<|projection|>. There's a tool called ssh_session_poll which is meant for polling a running async SSH process. The parameters required are process_id, format, recv_wait_sec, and signal. The user hasn't specified any of these except the process_id.
+
+  The user mentioned "so far," which suggests they want any accumulated output without<|projection|> waiting. The default for recv_wait_sec is 0, which would return immediately. So I don't need to set that unless the user wants to wait. Since they just want what's there, the default should work.
+
+  The format isn't specified either. The tool's default is "auto", which is fine.<|projection|> Unless the user wants text or hex, but they didn't say. So I can leave format as default.
+
+  The signal parameter is for sending a signal if the process is still running. The user hasn't mentioned anything about stopping the process, just polling. So no need to include that.
+
+  So the only required parameter is<|projection|> process_id, which the user provided. Therefore, the correct tool call would be ssh_session_poll with the process_id set to "proc_4b7e9a02c1f3". No other parameters are needed unless the user specifies additional options.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_4b7e9a02c1f3"}}
+  </tool_call><|projection|>
+- |-
+  is the background job proc_1f2e3d4c5a6b done yet<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user is asking if the background job with the process ID proc_1f2e3d4c5a6b is done.
+
+  First, I need to recall the tools available. There's the ssh_session_poll tool, which is used<|projection|> to check the status of an async SSH process. The parameters required are process_id, format, recv_wait_sec, and signal. The user provided the process ID, so that's the key here.
+
+  The user's query is straightforward: check if the job is done. The default behavior of the poll command is to return<|projection|> immediately with whatever output has been accumulated. Since the user didn't specify a timeout or other options, I don't need to set recv_wait_sec or other parameters. The required parameter is process_id, which is provided.
+
+  So, the correct tool call would be to use ssh_session_poll with the given process ID. The<|projection|> other parameters can be omitted since they have defaults or aren't needed. The format can be left as default, which is 'auto'. The signal isn't needed here because we're just checking the status, not sending any signals.
+
+  I should make sure that the JSON structure is correct, with the name of the tool and<|projection|> the arguments as a JSON object. No errors in the parameters, so the tool call should be valid.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_1f2e3d4c5a6b"}}
+  </tool_call><|projection|>
+- |-
+  get the latest stdout from async process proc_9c8b7a6e5d4f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user is asking to get the latest stdout from an async process with the ID proc_9c8b7a6e5d4f. They mentioned using the ssh_session_poll tool.
+
+  First, I need to check the parameters required for that<|projection|> tool. The tool requires the process_id, which the user provided. The other parameters like format, recv_wait_sec, and signal are optional. Since the user didn't specify any of these, I can use their default values.
+
+  The format defaults to "auto", which should handle text or hex appropriately. The recv<|projection|>_wait_sec is 0 by default, meaning it will return immediately. The signal isn't needed here since we're just polling, not terminating the process.
+
+  So the correct function call should be to ssh_session_poll with the process_id set to proc_9c8b7a6e5d4f. I<|projection|> don't need to include the optional parameters unless the user specifies them. That should fetch the latest output without any issues.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_9c8b7a6e5d4f"}}
+  </tool_call><|projection|>
+- |-
+  has the async task proc_2d6f8b0a3c7e exited, and what was its status?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this. The user is asking if the async task with the process ID proc_2d6f8b0a3c7e has exited and what its status is.
+
+  First, I remember that there's a tool called ssh_session_poll used to<|projection|> check on running async SSH processes. The parameters needed are the process_id, which the user provided as proc_2d6f8b0a3c7e. The other parameters like format, recv_wait_sec, and signal are optional. Since the user just wants to know if it's exited and the status<|projection|>, maybe the default values for those others are okay.
+
+  Wait, the tool's description says it returns stdout/stderr chunks, running status, and exit code when done. So by calling ssh_session_poll with the process_id, we should get the necessary information. The user isn't asking for any specific output format,<|projection|> so the default 'auto' should work. The recv_wait_sec is set to 0 by default, which means it will return immediately with whatever has been accumulated. That's fine here.
+
+  I don't think the signal parameter is needed unless we need to send a signal to the process, which the user didn't mention<|projection|>. So the only required parameter is the process_id. Therefore, the correct tool call is to use ssh_session_poll with the given process ID.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_2d6f8b0a3c7e"}}
+  </tool_call><|projection|>
+- |-
+  show me any new output from background process proc_7e5c1a9b2d0f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see any new output from a background process with the ID "proc_7e5c1a9b2d0f". Let me check the tools available.
+
+  There's a tool called ssh_session_poll. The description says it polls a running async SSH process for output<|projection|>. The parameters include process_id, which is exactly what the user provided. The required parameter is process_id, so I need to use that.
+
+  The user didn't specify any other parameters like format, recv_wait_sec, or signal. So I should call the tool with just the process_id set to "proc_7<|projection|>e5c1a9b2d0f". The other parameters can be omitted since they have defaults or aren't needed here.
+
+  So the correct tool call would be using ssh_session_poll with the given process ID. That should fetch the latest output from that background process.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_7e5c1a9b2d0f"}}
+  </tool_call><|projection|>
+- |-
+  what's the current state of the async SSH job proc_0a1b2c3d4e5f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this. The user is asking about the current state of an async SSH job with the process ID proc_0a1b2c3d4e5f.
+
+  First, I need to recall the tools available. There's the ssh_session_poll<|projection|> tool, which is used to poll a running async SSH process. The parameters required are process_id, and optionally format, recv_wait_sec, and signal.
+
+  The user isn't asking for output yet but rather the current state. The ssh_session_poll tool can return the running status, so that's the right tool here.<|projection|> The required parameter is process_id, which the user provided.
+
+  I don't need to specify format unless they want a specific output format, which they didn't. Similarly, recv_wait_sec defaults to 0, which means it'll check immediately. Since the user just wants the current state, no need to adjust those parameters<|projection|>.
+
+  So the correct call should be to use ssh_session_poll with the given process ID. I should structure the JSON accordingly, making sure the arguments are correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_0a1b2c3d4e5f"}}
+  </tool_call><|projection|>
+- |-
+  poll proc_6f4e2d0c8b7a and tell me if it's still running<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check the status of a process with the ID proc_6f4e2d0c8b7a. They mentioned using the poll command. Let me look at the available tools.
+
+  There's a tool called ssh_session_poll. The description says it polls an async SSH<|projection|> process for output. The parameters include process_id, which is exactly what the user provided. The required parameter is process_id, so I need to include that. The other parameters like format, recv_wait_sec, and signal are optional. Since the user didn't specify any of them, I can omit them.
+
+  So the<|projection|> tool call should be ssh_session_poll with the process_id set to proc_6f4e2d0c8b7a. The other arguments aren't needed here. I'll structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_poll", "arguments": {"process_id": "proc_6f4e2d0c8b7a"}}
+  </tool_call><|projection|>

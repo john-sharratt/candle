@@ -1,0 +1,163 @@
+name: web_search
+category: Utilities & web
+description: 'Search the web for information using a query string and return ranked results with title, URL, snippet, and relevance score. Use for: looking up current information, finding articles or documentation, researching a topic, locating a URL when only the topic is known, getting recent news, identifying who or what something is. Triggered by "search for", "look up", "find information about", "what is X", "who is", "recent news on", "google", "search the web". Returns up to 10 ranked results. For DNS records use dns_lookup; for fetching a specific URL already known, use web_fetch; for authenticated API calls use http_session_*.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    max_results:
+      description: 'Maximum number of ranked results to return (1-10). Default: 5.'
+      format: uint8
+      maximum: 10.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+    query:
+      description: Search query string.
+      minLength: 1
+      type: string
+  required:
+  - query
+  title: Request
+  type: object
+examples:
+- |-
+  search the web for the latest Rust async runtime benchmarks<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants the latest Rust async runtime benchmarks. Let me think about how to approach this.
+
+  First, I need to use the web_search tool provided. The query should be specific enough to get recent results. Terms like "Rust async runtime benchmarks 2023" or "latest Rust<|projection|> async performance tests" might work. But maybe just "Rust async runtime benchmarks" would still catch the most recent ones.
+
+  Wait, the user said "latest," so including a date range could help. However, the tool's parameters don't mention date ranges. So I have to rely on the search engine's default<|projection|> behavior, which usually prioritizes recent results when possible.
+
+  I should check if the query is properly formatted. The parameters require a "query" string and optionally "max_results". The default max_results is 5, but maybe setting it to 10 would give more options, but the user might want the top results<|projection|>. Since the user didn't specify, sticking with the default is safer.
+
+  So the tool call would be web_search with query "Rust async runtime benchmarks" and max_results 5. That should fetch the latest articles or studies on the topic.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "Rust async runtime benchmarks", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  find recent news about the James Webb telescope<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants recent news about the James Webb Telescope. Let me see. The available tool is web_search, which can search the web and return ranked results. The parameters include a query string and max_results. The user specified "recent news", so I should set the query to "recent news about<|projection|> the James Webb telescope" or similar. The max_results default is 5, but maybe the user wants more? But the tool's max is 10. Wait, the user didn't specify how many, so maybe stick with the default. But the example in the tools shows a query with "recent news on<|projection|>" so perhaps structuring the query that way would be better. Let me structure the query as "recent news about the James Webb Telescope" and use the web_search tool. I'll call the tool with that query.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "recent news about the James Webb Telescope", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  look up the current population of Canada<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current population of Canada. I need to figure out how to get that information. Since I don't have access to a database or real-time data, I should use the web search tool provided. The tool allows me to perform a search and retrieve relevant results.
+
+  First,<|projection|> I'll construct a query. The user wants the "current population of Canada." So, the search query should be something like "current population of Canada." I should make sure to use the exact parameters required by the tool. The tool's parameters include "query" and "max_results." The default max_results is <|projection|>5, but maybe setting it to 10 would give more accurate results. However, the user didn't specify how many results they want, so sticking with the default might be safer. Wait, the tool's parameters say that max_results is an integer between 1-10, with a default of 5<|projection|>. So, if I don't specify, it'll return 5 results. But since the user is asking for a specific piece of information, maybe increasing the number of results could help in finding the most recent data. However, the tool's documentation says that the search returns up to 10 ranked results. Hmm<|projection|>, perhaps the max_results parameter can be set to 10. Let me check the tool's parameters again.
+
+  Looking back at the tool definition, the "max_results" has a maximum of 10 and a minimum of 1. The description says it returns up to 10 ranked results. So,<|projection|> to get the most accurate and recent data, I should set max_results to 10. But wait, the user might not need all 10, but since the tool allows it, it's better to fetch more results to ensure the latest information. However, the default is 5, which is probably sufficient<|projection|>. Wait, the user didn't specify, so maybe just use the default. Alternatively, since the tool allows up to 10, setting it to 10 would be better for accuracy.
+
+  But I need to make sure that the parameters are correctly formatted. The query parameter is required, and the max_results<|projection|> is optional. So, in this case, the arguments should be {"query": "current population of Canada", "max_results": 10}. But wait, the user might not have specified the number of results, but since the tool allows up to 10, it's better to fetch more results to ensure<|projection|> that the most recent data is included. However, sometimes more results can include less relevant ones. But given that the search is for a specific topic, the top 10 should be sufficient.
+
+  Alternatively, maybe the default of 5 is enough. However, considering that the tool's maximum is 10, and<|projection|> there's no penalty for using a higher number, I'll set max_results to 10. So the JSON call would be:
+
+  {
+    "name": "web_search",
+    "arguments": {
+      "query": "current population of Canada",
+      "max_results": 10
+  <|projection|>  }
+  }
+
+  But<|projection|> wait, the user might not have specified the number of results, but since the tool allows it, it's better to use the maximum to ensure that the latest data is included. Therefore, I'll proceed with this configuration.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "current population of Canada", "max_results": 10}}
+  </tool_call><|projection|>
+- |-
+  search for how to configure nginx as a reverse proxy<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to know how to configure Nginx as a reverse proxy. Let me think about how to approach this.
+
+  First, I need to recall the steps required to set up Nginx as a reverse proxy. Typically, this involves editing the Nginx configuration file, usually located in<|projection|> /etc/nginx/conf.d/ or /etc/nginx/sites-available/. The user would need to create a server block that listens on port 80 (or 443 for HTTPS) and proxies requests to the backend server using the proxy_pass directive.
+
+  Key directives include proxy_pass, proxy_http_version, proxy_set_header<|projection|>, and others to forward headers like Host and X-Real-IP. Also, adjusting timeouts and buffer sizes might be necessary depending on the application's needs.
+
+  But since the user is asking for a search, I should use the web_search tool to find up-to-date guides or official documentation. The query should be specific<|projection|> enough to get relevant results. Terms like "configure Nginx reverse proxy" or "Nginx as reverse proxy setup" could work. Including "tutorial" or "official documentation" might help find reliable sources.
+
+  I need to make sure the search query is clear. Maybe "how to configure nginx as a reverse<|projection|> proxy" would yield the best results. The user might be looking for step-by-step instructions, so the search should include those keywords.
+
+  Now, I'll structure the tool call with the appropriate parameters. The max_results can be set to 5, which is the default, so maybe it's not necessary to specify.<|projection|> The query parameter should be the exact search term.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "how to configure nginx as a reverse proxy", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  who won the Formula 1 race last weekend<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking who won the Formula 1 race last weekend. I need to find the most recent F1 race winner. Let me use the web_search tool to look this up.
+
+  First, I'll check the parameters for the web_search tool. The query parameter is required, and I can<|projection|> set max_results to 5 to get the top 5 results. The query should be something like "Formula 1 last race winner" or "latest F1 race winner".
+
+  Wait, the user mentioned "last weekend," so the race was probably on Saturday or Sunday of the previous weekend. But the exact date<|projection|> isn't specified. Maybe the search will automatically pick up the most recent one.
+
+  I'll construct the query as "Formula 1 last race winner 2023" to ensure it's the latest. Then, the search results should have the name of the driver and the race. Once I get the data<|projection|>, I can present the answer to the user.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "Formula 1 last race winner 2023", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  what are the reviews saying about the new Framework laptop<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the reviews for the new Framework laptop. Let me think about how to approach this.
+
+  First, I need to find out what people are saying about the new Framework laptop. Since I don't have access to specific review sites or databases, I should use the web_search tool provided<|projection|>. The user probably wants both positive and negative feedback, maybe some highlights on performance, design, and any issues users are facing.
+
+  I should structure the search query to capture recent reviews. Terms like "Framework laptop 2023 reviews" or "Framework laptop user reviews" might work. But the exact query needs<|projection|> to be concise. Also, since the tool returns up to 10 results, I should make sure the query is specific enough to get relevant links.
+
+  Wait, the tool's parameters require a query string. So the function call would be web_search with the query parameter set to something like "new Framework laptop reviews <|projection|>2023". That should fetch the latest reviews. I need to check if there are any other parameters, but the max_results is optional, defaulting to 5. The user didn't specify how many results, so sticking with the default should be okay.
+
+  I should also consider that some reviews might be on<|projection|> tech websites, forums, or even social media. The search should cover those sources. Alright, time to make the tool call with the appropriate arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "new Framework laptop reviews 2023", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  find the official documentation for the tokio crate<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the official documentation of the tokio crate. Let me think about how to approach this.
+
+  First, I need to recall what tools I have available. There's the web_search tool which can perform a search and return results. Since the user wants the official documentation, I should<|projection|> structure a search query that specifically looks for the official docs.
+
+  The tokio crate is related to Rust, so the documentation is likely hosted on a site like docs.rs or the official Tokio website. But to make sure, a web search would help. The query should include terms like "official documentation", "tokio<|projection|> crate", "docs.rs", or "Tokio documentation".
+
+  I should use the web_search tool with a query like "official documentation tokio crate" or "Tokio crate documentation". Maybe adding "site:docs.rs" or "site:tokio.io" to narrow down the results. However, since the user<|projection|> might not know the exact domain, it's safer to let the search engine handle it.
+
+  So, the parameters for the web_search would be the query string and maybe max_results set to 5. Let me check the tool's parameters again. The max_results is an integer between 1-10, default <|projection|>5. So I can set that.
+
+  Putting it all together, the tool call would be web_search with the query "official documentation tokio crate" and max_results 5. That should fetch the top 5 results which should include the official documentation link.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "official documentation tokio crate", "max_results": 5}}
+  </tool_call><|projection|>
+- |-
+  search for vegetarian ramen recipes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to search for vegetarian ramen recipes. Let me check the available tools. There's a web_search tool that can handle this. The parameters needed are "query" and optionally "max_results". The query here would be "vegetarian ramen recipes". I should set the max_results<|projection|> to 5 as the default is 5. So I'll call the web_search function with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "web_search", "arguments": {"query": "vegetarian ramen recipes", "max_results": 5}}
+  </tool_call><|projection|>

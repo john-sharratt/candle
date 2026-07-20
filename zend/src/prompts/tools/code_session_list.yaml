@@ -1,0 +1,125 @@
+name: code_session_list
+category: Code execution
+description: 'List open code execution sandbox SESSIONS for the current conversation. This does NOT list files or directories — it lists live interpreter/REPL sessions (use file_list for filesystem contents). Use for: checking which sandboxes are currently running, finding a session_id before issuing code_session_exec, seeing which languages are active, identifying stale sessions to clean up. Triggered by "what code sessions do I have", "list active sandboxes", "show running execution environments". Returns session_id, language, opened_at, last_activity, and alive flag for each session.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: SessionListReq
+  type: object
+examples:
+- |-
+  list my open code sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open code sessions. I need to figure out which tool to use here. Looking at the available tools, there's one called code_session_list. The description says it lists open code execution sandbox sessions. That sounds exactly like what the user needs.
+
+  The parameters for code<|projection|>_session_list are specified in a JSON schema. The title is SessionListReq and the type is object. But the parameters don't have any properties listed. Maybe that's because the request doesn't require any arguments. Sometimes, endpoints just need a simple GET request without any query parameters or body data.
+
+  The user's query<|projection|> is straightforward: "list my open code sessions". The tool code_session_list is designed for this exact purpose. Since there are no additional parameters needed, I can call the tool without any arguments. I should structure the tool call correctly, making sure the name matches and the arguments are an empty object. That should retrieve the<|projection|> list of active sessions for the user.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which code execution sessions are running<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which code execution sessions are running. I need to figure out which tool to use here. Let me check the available tools.
+
+  Looking at the tools provided, there's a function called code_session_list. The description says it lists open code execution sandbox sessions for the current conversation. That<|projection|>'s exactly what the user is asking for. The parameters are straightforward; it doesn't require any arguments. So I just need to call code_session_list without any parameters.
+
+  I should make sure there's no other tool that could handle this request. The other tools aren't listed here, but based on the given information<|projection|>, code_session_list is the correct choice. The user might be trying to check running sessions, clean up old ones, or just get information about active sessions. Regardless, the tool call will provide the necessary data.
+
+  So the final step is to structure the response correctly. The user wants the answer in a specific JSON format<|projection|> inside the tool_call tags. I'll format the JSON with the tool name and an empty arguments object since there are no parameters needed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the active code sandboxes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the active code sandboxes. Let me check the available tools. There's a tool called code_session_list that lists open code execution sandbox sessions. The description says it returns session IDs, language, and other details. The user probably wants to know which sandboxes are currently<|projection|> running. I need to call this tool. The parameters are empty because the tool doesn't require any arguments. So I'll generate the tool call with the name code_session_list and an empty arguments object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many code sessions do I have open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many code sessions do I have open." Let me figure out how to handle this.
+
+  First, I need to understand what the user is asking. They want to know the number of active code execution sandbox sessions they have. The tools provided include a function called code_session<|projection|>_list, which lists all open sessions. The description says it returns details like session_id, language, and whether the session is alive.
+
+  So, to answer the user's question, I need to call the code_session_list tool. The user isn't asking for specific details about each session, just the count. However,<|projection|> the tool's response will include all the sessions, so once I get that data, I can count them and provide the number to the user.
+
+  I should check if there are any parameters needed for the code_session_list. Looking at the tool definition, the parameters are an empty object {} because the schema is an empty object<|projection|>. So, no arguments are required when calling this function.
+
+  Therefore, the correct step is to invoke code_session_list with no arguments. Once I get the list, I'll process it to find out how many sessions are active and relay that information back to the user in a clear manner.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate my open JavaScript sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to "enumerate my open JavaScript sessions." Let me check the tools available.
+
+  Looking at the provided tools, there's a function called code_session_list. Its description says it lists open code execution sandbox sessions, including details like session_id, language, and whether they're alive. The<|projection|> parameters are empty, just a GET request.
+
+  The user is specifically asking about JavaScript sessions. The code_session_list tool should return all active sessions, regardless of language. But the user wants only JavaScript ones. Wait, does the tool allow filtering? The parameters for code_session_list don't include a filter. So the response<|projection|> might need to be filtered by the client.
+
+  But as per the tools given, I can only call code_session_list. So I should invoke that tool, and then in the response, filter the results to show only those with the language set to JavaScript. However, the user's query is to "enumerate my open JavaScript<|projection|> sessions," so the correct approach is to list all sessions and then filter them based on the language.
+
+  So the first step is to call code_session_list. Once the data is retrieved, the assistant would process it to display only the JavaScript sessions. But since the current task is to generate the tool call, the answer should<|projection|> be the invocation of code_session_list.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what code session ids are currently alive?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the code session IDs that are currently alive. Let me check the tools available.
+
+  There's a tool called code_session_list which lists open code execution sandbox sessions. The description says it returns session_id, language, opened_at, last_activity, and alive flag for each session.<|projection|> That's exactly what the user needs.
+
+  The user specifically asked for "code session ids that are currently alive," so using code_session_list makes sense here. I don't need to call any other tool because this one directly addresses the query.
+
+  I should structure the tool call correctly. The parameters are empty since the tool<|projection|> doesn't require any arguments. So the JSON object will have the name as "code_session_list" and an empty arguments object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me a rundown of every running code sandbox<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of all running code sandboxes. Let me check the tools available. There's a tool called code_session_list that lists open code execution sessions. The description says it returns session IDs, languages, and other details. Since the user wants every running sandbox, this tool<|projection|> should handle the request. I need to call code_session_list with no parameters as per the tool's requirements. Just trigger the function, and it should return the needed information.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are there any code sessions still open?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any code sessions still open. I need to check the current state of the code execution sandboxes.
+
+  The available tool is code_session_list, which lists all open sessions. The user wants to know if there are any active sessions, so I should call that tool.<|projection|>
+
+  The parameters for code_session_list are empty because it's a simple list command. So I'll generate a tool call with the name code_session_list and an empty arguments object. That should retrieve the list of sessions for the user.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_list", "arguments": {}}
+  </tool_call><|projection|>

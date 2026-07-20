@@ -1,0 +1,177 @@
+name: code_session_exec
+category: Code execution
+description: Execute JavaScript in a persistent session. Variable/function/const definitions from earlier calls remain in scope. Returns stdout, stderr, an ok flag, the final expression's value in result, and error details when ok=false.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    code:
+      description: JavaScript to execute in the session. Definitions persist across calls.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the code_session_open tool.
+      minLength: 1
+      type: string
+    timeout_sec:
+      description: Advisory wall-clock hint. Runaway scripts are bounded by the VM's loop/recursion limits rather than a wall-clock timeout.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - code
+  - session_id
+  title: SessionExecReq
+  type: object
+examples:
+- |-
+  run `let x = 42` in code session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the JavaScript code `let x = 42` in a code session called js-1. Let me check the tools available.
+
+  The tool provided is code_session_exec. It requires the code to execute, the session_id, and an optional timeout. The user mentioned the<|projection|> session is js-1, so the session_id should be "js-1".
+
+  I need to structure the JSON call with the code as "let x = 42", session_id as "js-1". The timeout_sec is optional, but since the user didn't specify, I'll omit it or set<|projection|> it to null. Wait, the parameters say timeout_sec is a uint32, but the example might not require it. Since the user didn't mention a timeout, maybe it's safe to exclude it.
+
+  So the tool_call should have name "code_session_exec" and arguments with code and session_id. Let<|projection|> me double-check the required fields. The required are code and session_id. Yep, that's covered.
+
+  I think that's all. The user just wants to assign 42 to x in the session. The response will handle the execution.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "let x = 42", "session_id": "js-1"}}
+  </tool_call><|projection|>
+- |-
+  execute `const arr = [1, 2, 3, 4]` in code session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to execute the JavaScript code `const arr = [1, 2, 3, 4]` in a code session named js-1. Let me check the tools available.
+
+  There's a tool called code_session_exec. Its parameters are code, session_id, and<|projection|> timeout_sec. The required ones are code and session_id. The user provided the session ID as js-1, so I should use that. The code to execute is the array declaration.
+
+  I need to make sure the JSON is correctly formatted. The name of the tool is code_session_exec, and the arguments should include<|projection|> the code and session_id. The timeout_sec is optional, but since the user didn't specify it, I can omit it or set it to null. But looking at the parameters, the type is ["integer", "null"], so maybe setting it to null is better if not provided.
+
+  So the JSON should be:
+  <|projection|>{
+    "name": "code_session_exec",
+    "arguments": {
+      "code": "const arr = [1, 2, 3, 4]",
+      "session_id": "js-1"
+    }
+  }
+
+  I think that's all. No errors here. The user just wants to create<|projection|> the array in the session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "const arr = [1, 2, 3, 4]", "session_id": "js-1"}}
+  </tool_call><|projection|>
+- |-
+  run `function add(a, b) { return a + b; }` in code session js-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the JavaScript function `add(a, b) { return a + b; }` in a code session with the ID js-2. Let me check the tools available.
+
+  The tool provided is code_session_exec, which requires the code to execute, the session_id, and<|projection|> an optional timeout. The user specified the session ID as js-2, so I need to use that. The code is the function definition given.
+
+  I should structure the JSON call with the name "code_session_exec", the arguments including the code and session_id. Since the timeout is optional and not mentioned, I'll<|projection|> omit it. Let me make sure the JSON is correctly formatted with the required parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "function add(a, b) { return a + b; }", "session_id": "js-2"}}
+  </tool_call><|projection|>
+- |-
+  run `console.log(x + 1)` in code session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run `console.log(x + 1)` in the code session named js-1. Let me check the tools available.
+
+  There's a tool called code_session_exec. Its parameters are code, session_id, and timeout_sec. The user mentioned the session is js-1,<|projection|> so the session_id should be "js-1". The code to execute is console.log(x + 1).
+
+  Wait, the code is JavaScript, so it should be enclosed in quotes. The tool requires the code as a string. So I need to format the JSON arguments correctly. The session_id is "js<|projection|>-1", and the code is "console.log(x + 1);".
+
+  I need to make sure the JSON is properly formatted. The required fields are code and session_id. Timeout_sec is optional. So the tool call should have name "code_session_exec" and the arguments with those values. Let me double-check<|projection|> the parameters. Yes, that's correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "console.log(x + 1);", "session_id": "js-1"}}
+  </tool_call><|projection|>
+- |-
+  in code session js-3, run `arr.map(n => n * n)`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to run the JavaScript code `arr.map(n => n * n)` in a specific code session called js-3. Let me check the tools available.
+
+  There's a tool called code_session_exec. Its parameters are code, session_id, and timeout_sec. The user provided the<|projection|> session ID as js-3, I assume that's correct. The code to execute is `arr.map(n => n * n)`.
+
+  Wait, but the user mentioned "in code session js-3", so the session_id should be "js-3". The code is straightforward. I need to structure the<|projection|> JSON call with the name as code_session_exec, and the arguments with code and session_id. Timeout is optional, so I can omit it unless needed.
+
+  I should make sure that the JSON is correctly formatted. Let me double-check the parameters: code is the JavaScript string, session_id is "js-3".<|projection|> That's all. So the tool_call should be properly formed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "arr.map(n => n * n)", "session_id": "js-3"}}
+  </tool_call><|projection|>
+- |-
+  execute `const total = arr.reduce((a, b) => a + b, 0)` in code session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to execute the JavaScript code `const total = arr.reduce((a, b) => a + b, 0)` in a code session called js-1. Let me check the tools available.
+
+  The tool provided is code_session_exec. It requires parameters like code, session_id,<|projection|> and optional timeout_sec. The user mentioned the session id is js-1. Wait, the session_id should be the one from code_session_open, but the user says "code session js-1". Maybe js-1 is the session ID they're using.
+
+  So I need to call code_session_exec with code as<|projection|> the given JavaScript, session_id as "js-1", and maybe a timeout. The user didn't specify a timeout, so perhaps omit it or set a default. Since the timeout is optional, I can leave it out.
+
+  Wait, the code provided by the user is `const total = arr.reduce((a<|projection|>, b) => a + b, 0)`. But the tool's parameters require the code to execute. So the code parameter should be that line. However, the code needs to be a string. So in the JSON arguments, the code field is the JS code as a string.
+
+  So the JSON would be<|projection|> {"code": "const total = arr.reduce((a, b) => a + b, 0);", "session_id": "js-1"}. The timeout_sec is not required, so it's omitted.
+
+  Therefore, the correct tool call is code_session_exec with those arguments. I need to make sure<|projection|> the JSON is properly formatted, escaping quotes if necessary. But since the user's input is already in a code block, the actual JSON should have the code as a string.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "const total = arr.reduce((a, b) => a + b, 0);", "session_id": "js-1"}}
+  </tool_call><|projection|>
+- |-
+  run `add(x, 8)` in code session js-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the function add(x, 8) in the code session named js-2. Let me check the tools available.
+
+  There's a tool called code_session_exec. It requires the session_id and the code to execute. The user mentioned the session is js-2, so<|projection|> the session_id should be "js-2". The code parameter needs to be the JavaScript code to run.
+
+  The function add(x, 8) is supposed to be called. But I need to make sure that the code includes the definition of add or that it's already defined in the session. However, the<|projection|> user hasn't provided the definition of add, but maybe it's already present in the session.
+
+  So, the correct step is to call code_session_exec with session_id "js-2" and the code as "add(x, 8);". Wait, but in JavaScript, functions are called with parentheses. If<|projection|> add is a function, then it should be add(x, 8). But the user wrote add(x, 8) which is a function call. So the code parameter should be "add(x, 8);" to execute that call.
+
+  Therefore, the tool call would have name code_session_exec, arguments: {"<|projection|>session_id": "js-2", "code": "add(x, 8);"}.
+
+  I need to make sure that the JSON is correctly formatted. Also, check if any other parameters like timeout_sec are needed, but since the user didn't specify, it's not required. The required fields are code and<|projection|> session_id, which are provided.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"session_id": "js-2", "code": "add(x, 8);"}}
+  </tool_call><|projection|>
+- |-
+  evaluate `JSON.stringify({ x, total })` in code session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to evaluate the JavaScript expression `JSON.stringify({ x, total })` in a code session called "js-1". Let me think about how to approach this.
+
+  First, I need to use the tool provided, which is the code_session_exec. The parameters required are "code<|projection|>", "session_id", and optionally "timeout_sec". The user mentioned the session ID "js-1", so I'll use that.
+
+  The code to execute is the JSON.stringify statement. But wait, in JavaScript, when you pass an object with properties x and total, it will stringify them. However, if x<|projection|> or total are not defined, it might result in undefined. But the user just wants to evaluate the expression as is.
+
+  So the code parameter should be the string `JSON.stringify({ x, total })`. I need to make sure that the JSON is properly formatted. Also, since the session ID is given as "js<|projection|>-1", I'll include that.
+
+  I don't think a timeout is necessary here because the operation is straightforward and shouldn't take long. So the tool call should include the code and the session_id.
+
+  Let me double-check the parameters. The required fields are code and session_id. The code is the JavaScript string,<|projection|> and the session_id is "js-1". Alright, that's all set.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_exec", "arguments": {"code": "JSON.stringify({ x, total })", "session_id": "js-1"}}
+  </tool_call><|projection|>

@@ -1,0 +1,143 @@
+name: remote_fs_session_list_dir
+category: Remote filesystem
+description: List entries in a remote directory via SFTP. Returns name, size, is_dir, permissions, and modification time for each entry.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    path:
+      description: Remote directory to list. Defaults to the session's remote_prefix (the base path from the URI passed to remote_fs_session_open).
+      type:
+      - string
+      - 'null'
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: ListDirRequest
+  type: object
+examples:
+- |-
+  list the files in /var/www on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to list the files in /var/www on a remote FS session called rfs-1. Hmm, I need to use the tool provided. The tool is called remote_fs_session_list_dir. The parameters required are session_id and path. The session_id should be<|projection|> rfs-1 as mentioned. The path is /var/www. Wait, the tool's description says the path defaults to the session's remote_prefix, but here the user specified /var/www, so I should include that. So I'll structure the JSON with session_id "rfs-1" and path "/<|projection|>var/www". Let me double-check the parameters. Yes, that's right. Alright, the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-1", "path": "/var/www"}}
+  </tool_call><|projection|>
+- |-
+  show the contents of /home/deploy on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the contents of the /home/deploy directory on a remote filesystem session called rfs-1. Let me think about how to approach this.
+
+  First, I need to recall the available tools. There's the remote_fs_session_list_dir tool, which lists entries in a<|projection|> remote directory via SFTP. The parameters required are session_id and an optional path. The session_id is necessary, and the path defaults to the session's remote_prefix if not provided.
+
+  The user mentioned the session ID is rfs-1. So, I should use that as the session_id. The path they want<|projection|> is /home/deploy. So, I need to call the remote_fs_session_list_dir tool with session_id "rfs-1" and path "/home/deploy".
+
+  I need to make sure the JSON structure is correct. The tool's parameters require "session_id" as a string, which is provided. The<|projection|> path is a string, so that's straightforward. No other parameters are needed here.
+
+  Wait, the path in the tool's parameters is optional, but since the user specified /home/deploy, I must include it. The default is the session's remote_prefix, which might not be the same as /home/deploy<|projection|>. So including the path is necessary here.
+
+  So, the correct call should have name "remote_fs_session_list_dir" with arguments {"session_id": "rfs-1", "path": "/home/deploy"}.
+
+  I think that's all. Let me double-check the required fields. The session_id is required<|projection|>, and the path is optional. Since the user specified a path, including it makes sense. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-1", "path": "/home/deploy"}}
+  </tool_call><|projection|>
+- |-
+  what's in /etc on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the contents of the /etc directory on a remote filesystem session called rfs-2. Let me see how to approach this.
+
+  First, I need to use the tool provided, which is remote_fs_session_list_dir. The parameters required are session_id and optionally path. The<|projection|> user mentioned the session ID is rfs-2, so that's the session_id. The path they want is /etc.
+
+  I should check if the tool's parameters match. The path is a string, and the session_id is a required string. The default path in the tool's description is the session's remote<|projection|>_prefix, but here the user specified /etc, so I need to set the path parameter to "/etc".
+
+  So the JSON call should have name "remote_fs_session_list_dir" with arguments {"session_id": "rfs-2", "path": "/etc"}. That should retrieve the directory listing for /etc<|projection|> on the specified session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-2", "path": "/etc"}}
+  </tool_call><|projection|>
+- |-
+  list the directory /opt/app/logs on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list the directory /opt/app/logs on the remote filesystem session rfs-1. Let me check the tools available.
+
+  There's a tool called remote_fs_session_list_dir. The parameters are path and session_id. The path is optional and defaults to the session's remote_prefix.<|projection|> But here, the user specified /opt/app/logs, so I should use that. The session ID is given as rfs-1.
+
+  So I need to call remote_fs_session_list_dir with path="/opt/app/logs" and session_id="rfs-1". Let me make sure the parameters match the required ones<|projection|>. The session_id is required, and the path is a string. Looks good. I'll structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name":"remote_fs_session_list_dir","arguments":{"path":"/opt/app/logs","session_id":"rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  ls /srv/data/incoming on remote-fs session rfs-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list the contents of the directory /srv/data/incoming on a remote filesystem session called rfs-3. Let me check the tools available.
+
+  There's a tool called remote_fs_session_list_dir. Its parameters are session_id and path. The session_id is required, and<|projection|> the path is optional, defaulting to the session's remote_prefix. The user specified the path as /srv/data/incoming, so I need to include that.
+
+  So the session_id is rfs-3, and the path is /srv/data/incoming. I'll call the tool with those parameters. Make sure<|projection|> the JSON is correctly formatted with the right keys. No other tools are needed here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-3", "path": "/srv/data/incoming"}}
+  </tool_call><|projection|>
+- |-
+  can you show me everything under /var/lib/postgresql on remote-fs session rfs-2?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list everything under /var/lib/postgresql on a remote FS session called rfs-2. Let me check the tools available.
+
+  There's a tool called remote_fs_session_list_dir. It requires the session_id and an optional path. The session_id here is rfs-<|projection|>2. The path they want is /var/lib/postgresql.
+
+  So I need to call the list_dir tool with session_id "rfs-2" and path "/var/lib/postgresql". That should retrieve the directory contents. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-2", "path": "/var/lib/postgresql"}}
+  </tool_call><|projection|>
+- |-
+  enumerate the entries in /home/ci/artifacts on remote-fs session rfs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to list the entries in the /home/ci/artifacts directory on a remote filesystem session called rfs-4.
+
+  First, I need to recall the available tools. There's the remote_fs_session_list_dir tool. Its parameters are<|projection|> session_id and path. The session_id is required, and the path is optional, defaulting to the session's remote_prefix.
+
+  The user specified the session ID as rfs-4, so I'll use that. The path given is /home/ci/artifacts. So I need to call the list_dir function<|projection|> with session_id "rfs-4" and path "/home/ci/artifacts".
+
+  I should make sure there are no typos in the JSON structure. The tool's parameters expect "session_id" and "path". The JSON should be correctly formatted with the right keys. Alright, that should do it.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-4", "path": "/home/ci/artifacts"}}
+  </tool_call><|projection|>
+- |-
+  what files are sitting in /mnt/backup/nightly on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the files in the directory /mnt/backup/nightly on a remote filesystem session called rfs-1. Let me figure out how to approach this.
+
+  First, I need to use the tool provided, which is remote_fs_session_list_dir. The parameters required are session<|projection|>_id and path. The session_id is given as rfs-1. The path is /mnt/backup/nightly.
+
+  Wait, the tool's description says that the path defaults to the session's remote_prefix if not specified. But the user specifically mentioned /mnt/backup/nightly, so I should<|projection|> include that path parameter.
+
+  So, I'll structure the JSON call with session_id "rfs-1" and path "/mnt/backup/nightly". That should fetch the list of entries in that directory. Let me double-check the parameters: yes, session_id is required, and path is optional but needed here<|projection|>. Alright, ready to make the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_list_dir", "arguments": {"session_id": "rfs-1", "path": "/mnt/backup/nightly"}}
+  </tool_call><|projection|>

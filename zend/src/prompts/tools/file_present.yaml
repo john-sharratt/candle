@@ -1,0 +1,174 @@
+name: file_present
+category: Files
+description: Surface one or more virtual-filesystem files to the user in the chat interface, reporting which paths were found and shown versus missing.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    mode:
+      description: 'One of: auto, inline, preview. auto renders inline if small else as a preview card; inline always renders full content; preview always shows an openable card. Defaults to auto.'
+      type:
+      - string
+      - 'null'
+    paths:
+      description: VFS paths to surface to the user (1–10 entries, session-relative). Required.
+      items:
+        type: string
+      maxItems: 10
+      minItems: 1
+      type: array
+    title:
+      description: Optional short heading shown above the presented files. Defaults to none.
+      type:
+      - string
+      - 'null'
+  required:
+  - paths
+  title: PresentRequest
+  type: object
+examples:
+- |-
+  show me the file /workspace/Cargo.lock<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see the file /workspace/Cargo.lock. Let me check the tools available. There's the file_present tool which can surface files. The parameters include paths, which should be an array of strings. The user provided a single path, so I need to put that into an<|projection|> array. The mode is optional, and since the user didn't specify, I'll default to 'auto'. Also, the title is optional, so I can omit that unless needed. I need to make sure the JSON is correctly formatted with the paths array. Alright, the tool call should have the name "file_present<|projection|>" and the arguments with the paths.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/Cargo.lock"]}}
+  </tool_call><|projection|>
+- |-
+  display /workspace/src/main.rs in the chat<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to display the file /workspace/src/main.rs in the chat. Let me check the available tools. There's the file_present tool which surfaces files. The parameters include paths, mode, and title. The paths need to be an array of up to 10 entries. The user<|projection|> is asking for a single file, so I'll put that into an array. The mode can default to 'auto' unless specified otherwise. The title is optional. So the tool call should have the name 'file_present' with the paths parameter containing the path provided. I need to make sure the JSON is correctly formatted<|projection|> with the required parameters. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/src/main.rs"]}}
+  </tool_call><|projection|>
+- |-
+  surface /workspace/config/prod.yaml and /workspace/.env for me to look at<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to surface two files: /workspace/config/prod.yaml and /workspace/.env. Let me check the tools available. There's the file_present tool. The parameters required are mode, paths, and title. The paths need to be an array of up to 10 items<|projection|>. The user provided two paths, so that's within the limit.
+
+  The mode can be auto, inline, or preview. The user didn't specify, so I'll default to 'auto' as per the tool's default. The title is optional, but maybe adding a brief title like "Configuration Files" would help<|projection|> the user understand what they're looking at.
+
+  Wait, the tool's parameters have 'mode' as a string with enum values. So I should set "mode": "auto" explicitly. The 'paths' should be an array containing both file paths. Let me structure the JSON accordingly. Also, make sure the<|projection|> JSON is correctly formatted without any syntax errors. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"mode": "auto", "paths": ["/workspace/config/prod.yaml", "/workspace/.env"], "title": "Configuration Files"}}
+  </tool_call><|projection|>
+- |-
+  present the file /workspace/README.md to the user<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to present the file /workspace/README.md to the user. Let me check the available tools. There's the file_present tool. The parameters required are mode, paths, and title. The paths need to be an array of strings, up to 10 entries. The<|projection|> mode can be auto, inline, or preview. The user didn't specify the mode, so I should use the default, which is 'auto'. The title is optional.
+
+  So, the path here is /workspace/README.md. I need to put that into the paths array. Since there's only one file,<|projection|> the array will have one element. The mode is set to 'auto' by default, so I don't need to specify it unless the user wants a different behavior. The title isn't mentioned, so I'll omit that as well.
+
+  Wait, the required parameters are just 'paths', so the other fields are optional<|projection|>. Therefore, the tool call should include "paths": ["/workspace/README.md"]. The other parameters like mode and title can be excluded. But wait, looking at the tool definition again, the 'mode' has a default? Wait, in the JSON schema for the tool, the 'mode' property doesn't<|projection|> have a default. The description says "defaults to auto". So maybe I should include 'mode': 'auto' to be explicit, but the user might have their own default. Hmm. However, since the user didn't specify, it's safer to include 'auto' to ensure the correct behavior.
+
+  But looking at<|projection|> the parameters, the 'mode' is a string that can be 'auto', 'inline', or 'preview'. Since the user hasn't specified, using 'auto' makes sense. So the arguments would be:
+
+  {
+    "paths": ["/workspace/README.md"],
+    "mode": "auto"
+  }
+
+  But<|projection|> wait, in the tool's parameters, the 'mode' is part of the properties, but the required fields are only 'paths'. So including 'mode' is optional. But the user might have a default set. However, since the user didn't specify, maybe it's better to omit it and let the system<|projection|> handle the default. Wait, the tool's description says that the mode defaults to 'auto'. Therefore, even if we don't include 'mode', it should still work. So perhaps the correct call is just the 'paths'.
+
+  So the JSON would be:
+
+  {
+    "name": "file_present",
+    "arguments<|projection|>": {
+      "paths": ["/workspace/README.md"]
+    }
+  }
+
+  Yes, that's correct. The mode is not specified, so it uses the default of 'auto'. The title is optional and not provided, so it's omitted. This should surface the file as per the user's request.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/README.md"]}}
+  </tool_call><|projection|>
+- |-
+  pop /workspace/docs/api-reference.md into the conversation<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to "pop /workspace/docs/api-reference.md into the conversation." Let me figure out what that means. The term "pop" here probably means to bring up or present the file in the chat interface. Since there's a tool called file_present, I should check its parameters.
+
+  The<|projection|> file_present tool allows surfacing virtual-filesystem files. The parameters include paths (required, array of strings), mode (optional, default auto), and title (optional). The user is asking to "pop" a specific markdown file, so I need to call file_present with the path "/workspace/docs/api-reference.md".
+
+  <|projection|>I need to make sure the arguments are correctly formatted. The paths should be an array, even if there's only one entry. The mode can be left as default "auto" unless specified otherwise. The title is optional, so I can omit it unless the user mentioned a title, which they didn't.
+
+  So the<|projection|> correct JSON call would be to file_present with the paths array containing the given path. I'll structure the tool_call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/docs/api-reference.md"]}}
+  </tool_call><|projection|>
+- |-
+  can you bring up /workspace/src/lib.rs and /workspace/src/error.rs side by side<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open two files, lib.rs and error.rs, side by side. Let me check the available tools. There's the file_present tool which can surface files. The parameters include paths and mode. The paths need to be an array of strings. The user mentioned "side by side<|projection|>," but the tool doesn't have a layout parameter. Maybe the mode can affect how it's displayed. The mode options are auto, inline, preview. Since the user wants them side by side, maybe the default behavior of the tool handles that. I'll call the tool with both paths in the paths array. The<|projection|> title is optional, so I can leave that out. Let me make sure the JSON is correct. Paths should be in an array, and the name of the tool is file_present. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/src/lib.rs", "/workspace/src/error.rs"]}}
+  </tool_call><|projection|>
+- |-
+  put /workspace/CHANGELOG.md in front of me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to put the file /workspace/CHANGELOG.md in front of them. Let me see how to handle this.
+
+  First, I need to understand what the user is requesting. They want the contents of the CHANGELOG.md file displayed. Since there's a tool available called file_present<|projection|>, I should use that. The tool's description says it surfaces virtual-filesystem files, which matches the user's request.
+
+  Looking at the parameters for the file_present tool: it requires 'paths' as an array of strings, with 1-10 entries. The user provided one path, so that's within<|projection|> the limit. The 'mode' parameter is optional, defaulting to 'auto'. The 'title' is also optional.
+
+  Since the user didn't specify any options like mode or title, I can use the defaults. So, the arguments would be "paths": ["/workspace/CHANGELOG.md"], and the<|projection|> other parameters are omitted.
+
+  I need to make sure the JSON structure is correct. The tool call should have the name "file_present" and the arguments as a JSON object with the paths. No need to include mode or title here.
+
+  Double-checking the required parameters: "paths" is required, which is<|projection|> provided. The rest are optional. So the tool call should be correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/CHANGELOG.md"]}}
+  </tool_call><|projection|>
+- |-
+  attach /workspace/reports/coverage.html to the chat so I can view it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to attach the file at /workspace/reports/coverage.html so they can view it. Let me check the tools available.
+
+  Looking at the tools provided, there's a tool called file_present. Its description says it surfaces virtual-filesystem files to the user in the chat. The<|projection|> parameters include paths, which is an array of strings, and other options like mode and title.
+
+  The user is asking to "attach" the file, which probably means showing it in the chat. The file path given is /workspace/reports/coverage.html. Since the tool requires an array of paths, I need to<|projection|> pass that path in the 'paths' parameter.
+
+  The required parameter for the tool is 'paths', so I must include that. The other parameters like 'mode' and 'title' are optional. The user didn't specify any particular mode, so maybe using the default 'auto' is okay. But since the user<|projection|> just wants to view the file, maybe 'inline' would display it directly. However, the default is 'auto', which might handle it correctly.
+
+  So, the JSON call should have the name "file_present" and the arguments with "paths" as ["workspace/reports/coverage.html"]. Wait, the path given<|projection|> is /workspace/reports/coverage.html, but in the tool's parameters, the paths are session-relative. Does the leading slash matter? Maybe the tool expects the path relative to the session's root. So perhaps I should pass "workspace/reports/coverage.html" without the leading slash. But I'm not sure<|projection|>. The user provided the full path, so maybe I should use it as is. Or maybe the tool handles both. Since the example in the tool's parameters shows "VFS paths", which might be absolute.
+
+  Alternatively, maybe the paths are relative to the current working directory. But since the user specified the full path<|projection|>, I'll include it as given. However, in some systems, leading slashes can indicate absolute paths. But the tool's documentation says "session-relative", so maybe the leading slash is not needed. This could be a point of confusion. But since the user provided the path with the leading slash, I'll include it<|projection|> as is.
+
+  So, the arguments would be:
+
+  {
+    "paths": ["/workspace/reports/coverage.html"]
+  }
+
+  And the name is "file_present".
+
+  I need to make sure that the JSON is correctly formatted. Also, check if the maximum number of items (10) is not exceeded, but here<|projection|> it's just one path.
+
+  Therefore, the correct tool call should be the file_present function with the specified path.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/reports/coverage.html"]}}
+  </tool_call><|projection|>

@@ -1,0 +1,255 @@
+name: hkdf_extract
+category: Cryptography
+description: 'HKDF-Extract (RFC 5869): condense raw, possibly non-uniform input key material into one uniformly-random pseudorandom key — the first stage of the HKDF derivation chain. Supports sha256 and sha512.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    HkdfHash:
+      description: HKDF hash function.
+      enum:
+      - sha256
+      - sha512
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/HkdfHash'
+      description: 'HKDF hash function. One of: sha256, sha512.'
+      minItems: 1
+      minLength: 1
+    ikm:
+      minLength: 1
+      type: string
+    ikm_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `ikm` (input keying material) is encoded. One of: text, hex, base64. Defaults to hex.'
+    salt:
+      type:
+      - string
+      - 'null'
+    salt_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `salt` is encoded. One of: text, hex, base64. Defaults to hex.'
+  required:
+  - algorithm
+  - ikm
+  title: HkdfExtractRequest
+  type: object
+examples:
+- |-
+  HKDF-extract with SHA-256 from the hex IKM 0b0b0b0b0b0b0b0b0b0b0b and hex salt 000102030405060708090a0b0c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to perform HKDF-extract using SHA-256 with the given IKM and salt. The IKM is 0b0b0b0b0b0b0b0b0b0b0b in hex, and the salt<|projection|> is 000102030405060708090a0b0c.
+
+  First, I need to check the parameters. The tool requires the algorithm (SHA-256 or SHA-512), ikm (input keying material),<|projection|> and optional salt. The encoding for both IKM and salt can be text, hex, or base64. The default for ikm_encoding is hex, but since the user provided hex values, I should specify that.
+
+  Wait, the user provided the IKM and salt as hex strings. So I need to set<|projection|> ikm_encoding to "hex" and salt_encoding to "hex" as well. The salt is given in hex, so that's correct.
+
+  The HKDF-extract function will take these parameters. The required fields are algorithm, ikm. The salt is optional but the user provided it, so include it.
+
+  So<|projection|> the tool call should have name "hkdf_extract", with arguments: algorithm "sha256", ikm "0b0b0b0b0b0b0b0b0b0b0b", ikm_encoding "hex", salt "000102030<|projection|>405060708090a0b0c", and salt_encoding "hex". Wait, the salt in the user's input is 000102030405060708090a0b0c. Let me<|projection|> check the length. The hex string is 24 characters, which is 12 bytes. That's correct for a salt.
+
+  So all parameters are set. I need to make sure that the JSON structure is correct, with the right keys and values. No typos. The tool's parameters are as defined,<|projection|> so the call should be valid.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "0b0b0b0b0b0b0b0b0b0b0b", "ikm_encoding": "hex", "salt": "000102030405060708090a0b0c", "salt_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  HKDF-extract with SHA-256: condense the hex shared secret deadbeefcafebabedeadbeefcafebabe into a PRK using hex salt 0102030405<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the hkdf_extract tool for this problem. The user wants to perform HKDF-extract with SHA-256, using a shared secret of 'deadbeefcafebabedeadbeefcafebabe' and a hex salt '0<|projection|>102030405'.
+
+  First, I need to recall what the hkdf_extract function requires. From the tool's description, the parameters are algorithm (which is sha256 or sha512), ikm (input keying material), ikm_encoding (default is hex), salt<|projection|>, and salt_encoding (also default hex).
+
+  The user provided the shared secret as a hex string, so ikm should be 'deadbeefcafebabedeadbeefcafebabe'. The salt is given as '0102030405', which is also in hex. Since<|projection|> both are in hex, the ikm_encoding and salt_encoding can be set to 'hex' or left as default. However, the tool's parameters mention that if not specified, they default to hex. So maybe I don't need to specify them unless the input is different.
+
+  Wait, the tool's parameters say that<|projection|> ikm_encoding and salt_encoding have defaults of hex. So in the JSON arguments, I can omit those if the inputs are in hex. But the user explicitly mentioned "using hex salt", so perhaps it's safer to include it. But according to the tool's definition, the default for salt_encoding is hex. So<|projection|> maybe including it isn't necessary. Hmm.
+
+  So the required parameters are algorithm, ikm. The other parameters are optional. So the minimal call would be:
+
+  {
+    "algorithm": "sha256",
+    "ikm": "deadbeefcafebabedeadbeefcafebabe",
+   <|projection|> "salt": "0102030405"
+  }
+
+  But wait, the salt is provided as a hex string. Since the default for salt_encoding is hex, the tool should handle it. However, in some cases, the tool might expect the salt to be in a different encoding. But according<|projection|> to the problem statement, the user specified that the salt is in hex, so we can proceed.
+
+  So the JSON arguments should include algorithm as 'sha256', ikm as the shared secret, and salt as the given hex value. The other parameters like ikm_encoding and salt_encoding are not needed because they<|projection|> default to hex.
+
+  Therefore, the correct tool call would be the hkdf_extract function with those parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "deadbeefcafebabedeadbeefcafebabe", "salt": "0102030405"}}
+  </tool_call><|projection|>
+- |-
+  HKDF-extract with SHA-256 from the hex IKM aabbccddeeff00112233445566778899 and an empty salt<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the hkdf_extract tool. The user wants to perform HKDF-extract with SHA-256 using the IKM in hex format, which is "aabbccddeeff00112233445566<|projection|>778899", and an empty salt.
+
+  First, I need to check the parameters required for the hkdf_extract function. The parameters are algorithm (which should be "sha256" here), ikm (the input keying material), ikm_encoding (which defaults to hex if not specified<|projection|>), salt (which is empty here), and salt_encoding (defaults to hex).
+
+  Since the IKM is given in hex, I don't need to change the ikm_encoding. The salt is empty, so I can set salt to an empty string. The algorithm is definitely "sha256".
+
+  So the JSON<|projection|> arguments should include "algorithm": "sha256", "ikm": "aabbccddeeff00112233445566778899", and maybe specify "salt": "" to indicate an empty salt. The other parameters like ikm_encoding and<|projection|> salt_encoding can be omitted since they have defaults.
+
+  I need to make sure that the JSON structure is correct, with all required fields present. Let me double-check the required parameters: "algorithm" and "ikm" are required. The rest are optional. So the tool call should have those values.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "aabbccddeeff00112233445566778899", "salt": ""}}
+  </tool_call><|projection|>
+- |-
+  HKDF-extract with SHA-256 from the hex Diffie-Hellman output 1122334455667788 using hex salt 99aabbccdd<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the HKDF-Extract tool here. The user wants to perform HKDF-extract using SHA-256 with a Diffie-Hellman output of 1122334455667788 and a<|projection|> hex salt of 99aabbccdd.
+
+  First, I need to check the parameters required for the hkdf_extract function. The parameters are algorithm (which is SHA-256 in this case), ikm (the input keying material, which is the DH output), and optionally the salt. The<|projection|> user provided both the ikm and the salt, so I need to include those.
+
+  The ikm is given as a hex string, so I should set ikm_encoding to "hex" since that's the default. Similarly, the salt is also a hex string, so I'll set the salt_encoding to "hex<|projection|>" as well. Wait, the tool's parameters mention that if not specified, the default is hex for both ikm and salt. But the user explicitly provided the salt, so I should include it.
+
+  So putting it all together: algorithm is "sha256", ikm is "11223<|projection|>34455667788", salt is "99aabbccdd". The encodings are all hex, which is the default, but maybe I should specify them just in case. Let me check the tool's parameters again.
+
+  Looking at the tool's parameters, the ikm_encoding<|projection|> has a default of hex, and similarly for salt_encoding. So if we don't provide them, they'll default to hex. However, since the user provided the salt, perhaps it's better to include the salt_encoding as "hex" explicitly. But according to the tool's definition, the salt_encoding is optional and<|projection|> defaults to hex. So including it isn't necessary here.
+
+  Therefore, the correct call would be to use hkdf_extract with algorithm "sha256", ikm "1122334455667788", and salt "99aabbccdd". The enc<|projection|>odings are all hex by default, so no need to specify them unless required. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "1122334455667788", "salt": "99aabbccdd"}}
+  </tool_call><|projection|>
+- |-
+  run HKDF-extract with SHA-256 over the hex IKM ccddeeff00112233445566778899aabb with hex salt fedcba9876543210<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the hkdf_extract tool. The user wants to run HKDF-extract with SHA-256 on an IKM that's given in hex, along with a hex salt.
+
+  First, I need to recall what the parameters are for the hkdf<|projection|>_extract function. From the tool description, the required parameters are 'algorithm' (which is the hash function, here SHA-256), 'ikm' which is the input keying material, and optionally 'salt'. Also, there are encoding parameters for both ikm and the salt.
+
+  The user provided the<|projection|> IKM as "ccddeeff00112233445566778899aabb" and the salt as "fedcba9876543210", both in hex. Since they specified "hex" for both, I need to<|projection|> make sure the encodings are set to "hex".
+
+  Wait, the tool's parameters mention that the default for ikm_encoding is hex if not provided. But since the user explicitly mentioned "hex" in their request, maybe it's safer to include it. However, looking at the tool's parameters, the '<|projection|>ikm' is a string, and the encoding is separate. So the actual data is passed as a string, and the encoding tells how to interpret that string.
+
+  So for the ikm parameter, the value is "ccddeeff00112233445566778<|projection|>899aabb", and the ikm_encoding is "hex". Similarly, the salt is "fedcba9876543210" with salt_encoding "hex".
+
+  Wait, but in the tool's parameters, the 'salt' is a string, which can be null. But here<|projection|>, the user provided a salt, so it's included. Also, the 'algorithm' should be "sha256".
+
+  Putting this all together, the JSON arguments for the tool call would be:
+
+  {
+    "algorithm": "sha256",
+    "ikm": "ccddeeff001<|projection|>12233445566778899aabb",
+    "ikm_encoding": "hex",
+    "salt": "fedcba9876543210",
+    "salt_encoding": "hex"
+  }
+
+  Wait, but looking at the parameters again<|projection|>, the 'salt' is a string, and 'salt_encoding' is the encoding. The user specified that both IKM and salt are in hex, so those encodings should be set to "hex".
+
+  But wait, the tool's parameters for 'salt' have a type of ["string", "null"], so<|projection|> it's okay to pass the string. The 'salt_encoding' is a DataEncoding (text, hex, base64) or null. Since the user provided hex, we set that.
+
+  So the final JSON should include all these parameters. Let me check if any parameters are missing. The required parameters are algorithm and<|projection|> ikm. The others are optional but needed here: salt, and the encodings.
+
+  Yes, this should work. So the tool call would be as above.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "ccddeeff00112233445566778899aabb", "ikm_encoding": "hex", "salt": "fedcba9876543210", "salt_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  extract a PRK with SHA-256 from the hex ECDH secret 5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d and hex salt a0b1c2d3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to use the hkdf_extract tool here. The user wants to extract a PRK using SHA-256 from an ECDH secret and a salt.
+
+  First, the ECDH secret is given as a hexadecimal string: 5a5a5<|projection|>a5a6b6b6b6b7c7c7c7c8d8d8d8d. The salt is also in hex: a0b1c2d3.
+
+  Since the tool requires the input key material (ikm) and the salt, I need to<|projection|> make sure they're provided correctly. The ikm_encoding should be 'hex' because the input is in hex. Similarly, the salt's encoding is 'hex' too.
+
+  The algorithm parameter needs to be 'sha256' as specified. The tool's parameters mention that the 'algorithm' is an array<|projection|>, so I'll include it as ["sha256"].
+
+  Wait, looking at the parameters again, the 'algorithm' is an array with one element. So I should structure it as ["sha256"]. Also, the 'salt' is a string, so "a0b1c2d<|projection|>3".
+
+  I need to check if all required parameters are included. The 'ikm' is required, which is provided. The 'algorithm' is also required. The salt is optional, but since the user provided it, I should include it.
+
+  So putting it all together: the tool call should have the<|projection|> name 'hkdf_extract', and the arguments include 'algorithm' as ["sha256"], 'ikm' as the hex ECDH secret, 'ikm_encoding' as 'hex', 'salt' as the hex value, and 'salt_encoding' as 'hex'.
+
+  Wait, the 'salt<|projection|>' parameter in the tool's parameters is a string, so I can just pass "a0b1c2d3" for the salt. The encodings are set to 'hex' for both ikm and salt.
+
+  I think that's all. Let me make sure there are no typos in the<|projection|> JSON structure.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": ["sha256"], "ikm": "5a5a5a5a6b6b6b6b7c7c7c7c8d8d8d8d", "ikm_encoding": "hex", "salt": "a0b1c2d3", "salt_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  HKDF-extract SHA-256: take the hex IKM 00ff00ff00ff00ff and salt it with hex 1234567890<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to perform HKDF-extract using SHA-256 with an IKM of 00ff00ff00ff00ff and a salt of 1234567890.
+
+  First, I need to check<|projection|> the parameters. The HKDF-extract tool requires the algorithm (which is sha256 here), the ikm (input keying material), and optionally the salt. The ikm is given in hex, so the encoding should be set to 'hex'. The salt is also provided in hex, so its encoding<|projection|> is also 'hex'.
+
+  Wait, the user specified "salt it with hex 1234567890". That means the salt is the hexadecimal string "1234567890", not the raw bytes. So the salt parameter should be "1234<|projection|>567890" and the salt_encoding is "hex".
+
+  So putting it all together: the algorithm is "sha256", ikm is "00ff00ff00ff00ff" with ikm_encoding "hex", salt is "1234567<|projection|>890" and salt_encoding "hex".
+
+  I need to make sure that the tool call includes all these parameters correctly. The required fields are algorithm and ikm, which are present. The other parameters are optional but necessary here.
+
+  I think that's all. Let me structure the JSON accordingly.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": ["sha256"], "ikm": "00ff00ff00ff00ff", "ikm_encoding": "hex", "salt": "1234567890", "salt_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  condense the hex key material 9988776655443322110000112233445566 into a PRK via HKDF-extract SHA-256 with an empty salt<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to use the hkdf_extract tool. The user wants to condense a hex key material into a PRK using HKDF-extract with SHA-256 and an empty salt.
+
+  First, the input is the hex string "99887766<|projection|>55443322110000112233445566". The user specified that the salt is empty, so I need to set the 'salt' parameter to an empty string. The algorithm should be 'sha256' as per the<|projection|> request.
+
+  The parameters for the hkdf_extract function require 'algorithm', 'ikm', 'ikm_encoding', 'salt', 'salt_encoding'. The 'ikm' is the hex string, and since it's provided in hex, the 'ikm_encoding' should be 'hex'. The 'salt'<|projection|> is empty, and since the salt is empty, maybe the 'salt_encoding' can be omitted or set to 'hex' but the tool might handle it. But according to the tool's parameters, 'salt' is a string, so setting it to an empty string is correct.
+
+  So the arguments would be:
+  -<|projection|> algorithm: "sha256"
+  - ikm: "9988776655443322110000112233445566"
+  - ikm_encoding: "hex"
+  - salt: ""
+  - (salt_encoding<|projection|> is not needed as the salt is empty)
+
+  Wait, the 'salt' parameter is optional? The tool's required parameters are 'algorithm' and 'ikm'. So the other parameters are optional. So I can omit 'salt' if it's empty. But in the tool's parameters, 'salt' is a<|projection|> string, so setting it to an empty string is correct.
+
+  So the JSON arguments should be:
+
+  {
+    "algorithm": "sha256",
+    "ikm": "9988776655443322110000112233<|projection|>445566",
+    "ikm_encoding": "hex",
+    "salt": ""
+  }
+
+  I think that's all. The salt is empty, and the rest are set as per the user's request.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hkdf_extract", "arguments": {"algorithm": "sha256", "ikm": "9988776655443322110000112233445566", "ikm_encoding": "hex", "salt": ""}}
+  </tool_call><|projection|>

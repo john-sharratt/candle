@@ -1,0 +1,148 @@
+name: remote_fs_session_mkdir
+category: Remote filesystem
+description: Create a new directory on a remote host's filesystem over SFTP.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    mode:
+      description: Unix permission bits for the new directory. Defaults to 0o755.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    path:
+      description: Remote directory path to create.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - path
+  - session_id
+  title: MkdirRequest
+  type: object
+examples:
+- |-
+  create the directory /opt/app/releases on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to create a directory called /opt/app/releases on a remote filesystem using an existing session. The tool available is remote_fs_session_mkdir.
+
+  First, I need to check the parameters required for that tool. The parameters are path, session_id, and mode.<|projection|> The path is the directory they want to create, which is /opt/app/releases. The session_id is given as rfs-1. The mode is optional, defaulting to 0o755 if not provided.
+
+  Since the user didn't specify the permissions, I should use the default. So, I<|projection|> don't need to include the mode parameter in the request. The required fields are path and session_id, both of which are provided.
+
+  So the JSON object should have "path": "/opt/app/releases" and "session_id": "rfs-1". No mode since it's optional and the default is acceptable<|projection|>. That should correctly call the remote_fs_session_mkdir tool with the necessary arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/opt/app/releases", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  make the folder /var/www/uploads on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to create a directory called /var/www/uploads on a remote filesystem using an existing session ID, which is rfs-1.
+
+  First, I need to check the available tools. There's the remote_fs_session_mkdir tool. The parameters required are path, session<|projection|>_id, and optionally mode. The path here is /var/www/uploads, and the session ID is rfs-1. The mode isn't specified, so it should default to 0o755.
+
+  I need to make sure all required parameters are included. The required fields are path and session_id. Both<|projection|> are provided. So the JSON object should have those values. No need to include mode unless specified. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/var/www/uploads", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  mkdir /home/deploy/tmp on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to create a directory called "tmp" under "/home/deploy/" on a remote filesystem using an existing SFTP session with the ID "rfs-2".
+
+  First, I need to check the available tools. There's a<|projection|> tool called "remote_fs_session_mkdir" which is meant for creating directories on a remote host via SFTP. The parameters required are "path", "session_id", and optionally "mode".
+
+  The user provided the path as "/home/deploy/tmp" and the session ID "rfs-2". The mode isn<|projection|>'t mentioned, so I should use the default value of 0o755 unless specified otherwise. Since the user didn't mention any specific permissions, it's safe to omit the "mode" parameter, allowing the tool to apply the default.
+
+  I need to structure the JSON call correctly. The "path" should<|projection|> be the full directory path they want to create. The "session_id" is given as "rfs-2".
+
+  Wait, I should make sure that the path is correctly formatted. The user wrote "/home/deploy/tmp", which is a valid absolute path. No issues there. The session ID is "r<|projection|>fs-2", which matches the required format for the "session_id" parameter.
+
+  So putting it all together, the JSON object should have the name "remote_fs_session_mkdir" and the arguments with "path": "/home/deploy/tmp" and "session_id": "rfs-2". Since mode isn<|projection|>'t provided, it's omitted, and the tool will use the default.
+
+  I should double-check the required parameters. The tool's required fields are "path" and "session_id", both of which are provided. Everything looks good. No mistakes here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/home/deploy/tmp", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  create /data/2026 on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create a directory called /data/2026 on a remote filesystem using an existing session. Let me check the tools available.
+
+  There's a tool called remote_fs_session_mkdir. The parameters needed are path, session_id, and optionally mode. The path here is /<|projection|>data/2026, and the session ID is rfs-1 as given. The mode isn't specified, so it will default to 0o755. I need to make sure all required parameters are included. Path and session_id are required. So the JSON should have "path": "/<|projection|>data/2026", "session_id": "rfs-1". No need to include mode unless changing from the default. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/data/2026", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  can you make a /srv/backups/weekly directory on remote-fs session rfs-3?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create a directory called /srv/backups/weekly on a remote filesystem using an existing session. Let me check the tools available.
+
+  There's a tool called remote_fs_session_mkdir. The parameters required are path, session_id, and optionally mode. The path should be the full<|projection|> path they want, which is /srv/backups/weekly. The session ID is given as rfs-3. The mode is optional, defaulting to 0o755. Since the user didn't specify, I'll use the default. So I need to call the mkdir function with those parameters.<|projection|> Make sure the JSON is correctly formatted with the right keys. Let me double-check the required fields: path and session_id are required. Yep, that's all. Alright, time to structure the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/srv/backups/weekly", "session_id": "rfs-3"}}
+  </tool_call><|projection|>
+- |-
+  set up the folder /opt/app/staging/incoming on remote-fs session rfs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to create a directory called /opt/app/staging/incoming on a remote filesystem using an existing session. The tool available is remote_fs_session_mkdir.
+
+  First, I need to check the parameters required for that tool. The parameters are path, session_id,<|projection|> and mode. The path is the directory they want to create, which is /opt/app/staging/incoming. The session_id is given as rfs-4. The mode is optional with a default of 0o755.
+
+  Since the user didn't specify the permissions, I'll use the default.<|projection|> So, I need to call the remote_fs_session_mkdir tool with the path and session_id. No need to include mode unless specified. Let me make sure the arguments are correctly formatted in JSON. The required fields are path and session_id. Everything looks good. Time to structure the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/opt/app/staging/incoming", "session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  new directory /var/lib/zend/snapshots on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create a new directory called /var/lib/zend/snapshots on a remote filesystem using an existing session. Let me check the tools available.
+
+  There's a tool called remote_fs_session_mkdir. The parameters needed are path, session_id, and optionally mode. The user provided<|projection|> the path as /var/lib/zend/snapshots and the session ID is rfs-2. The mode isn't mentioned, so I'll use the default of 0o755.
+
+  I need to structure the JSON call with these parameters. Make sure the keys match the tool's required parameters. Path<|projection|> and session_id are required. Mode is optional but included here. So the arguments should be {"path": "/var/lib/zend/snapshots", "session_id": "rfs-2", "mode": 493} since 0o755 in octal is 493 in<|projection|> decimal.
+
+  Double-checking the tool's parameters: yes, mode is a uint32. The path is correct. Session ID is provided. This should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/var/lib/zend/snapshots", "session_id": "rfs-2", "mode": 493}}
+  </tool_call><|projection|>
+- |-
+  create /home/ci/artifacts/2026-07 on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create a directory called "2026-07" inside the "/home/ci/artifacts/" path on a remote filesystem using an existing session. Let me check the tools available.
+
+  The available tool is remote_fs_session_mkdir. The parameters needed are path, session<|projection|>_id, and optional mode. The user provided the path as "/home/ci/artifacts/2026-07" and the session ID "rfs-1". They didn't mention the mode, so I'll use the default 0o755.
+
+  I need to structure the JSON call<|projection|> with the name "remote_fs_session_mkdir" and the arguments. Make sure the path is correct and the session ID is included. Let me double-check the required fields: path and session_id are required. Looks good. So the tool call should be formatted properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_mkdir", "arguments": {"path": "/home/ci/artifacts/2026-07", "session_id": "rfs-1"}}
+  </tool_call><|projection|>

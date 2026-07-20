@@ -1,0 +1,175 @@
+name: ssh_open
+category: SSH sessions
+description: Open a persistent SSH shell session on a remote host using a stored credential. Use to start a working session before issuing commands, when the user names an SSH host to connect to, or before any operation phrased as "ssh in", "connect to the server", "log into". Triggered by "ssh into", "open a connection to", "connect to the bastion", "log into the server", "start a shell on", "open a session on prod". Returns session_id, host, initial working directory, and shell path. The session persists until closed or idle-timed-out (15 min default). Subsequent commands run via ssh_session_exec; close with ssh_session_close when done.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    credential_name:
+      description: Name of the stored credential to authenticate with. The username and auth secret come from this credential, not from `host`.
+      minLength: 1
+      type: string
+    host:
+      description: 'Remote host to connect to: a HOSTNAME or IP address ONLY — do NOT include a username (e.g. use "example.com", not "user@example.com"); the username comes from the credential. Defaults to the credential''s default host.'
+      type:
+      - string
+      - 'null'
+    idle_timeout_sec:
+      description: Seconds of inactivity before the session is auto-closed. Defaults to 900 (15 minutes).
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    port:
+      description: TCP port. Defaults to the credential's default port, or 22 if unset.
+      format: uint16
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - credential_name
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open an SSH session to 10.0.0.5 using the prod-server credential<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an SSH session to 10.0.0.5 using the prod-server credential. Let me check the tools available.
+
+  The ssh_open tool is the right one here. The parameters needed are credential_name, host, port, and idle_timeout_sec. The user specified<|projection|> the credential as prod-server, so that's the credential_name. The host is 10.0.0.5. The port isn't mentioned, so I should use the default from the credential. The idle timeout is optional, and the default is 900 seconds.
+
+  Wait, the host parameter<|projection|> in the tool says to use the hostname or IP, which the user provided. So I need to set host to "10.0.0.5". The port can be omitted since it's optional and the credential's default will be used.
+
+  So the JSON arguments should be {"credential_name": "prod<|projection|>-server", "host": "10.0.0.5"}. The other parameters like port and idle_timeout_sec are optional and can be left out.
+
+  I need to make sure that the JSON is correctly formatted. Let me double-check the required fields. The required field is credential_name, which is provided<|projection|>. Host is not required, but the user specified the IP, so including it is correct.
+
+  Alright, the tool call should be ssh_open with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "prod-server", "host": "10.0.0.5"}}
+  </tool_call><|projection|>
+- |-
+  connect over SSH to deploy@example.com using credential deploy-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to connect via SSH to deploy@example.com using the credential named deploy-key. Let me check the tools available.
+
+  The ssh_open tool is for opening an SSH session. The parameters needed are credential_name, host, port, and idle_timeout_sec. The user specified the credential as deploy-key<|projection|>, so that's the credential_name. The host is example.com, since the email is deploy@example.com. The port isn't mentioned, so I'll default it to 22. The idle timeout can be left as the default of 900 seconds.
+
+  I need to make sure the host is just the<|projection|> hostname or IP, not including the username. So, host should be "example.com". The credential's default port is probably 22, so unless specified, that's okay.
+
+  So the tool call should be ssh_open with credential_name "deploy-key", host "example.com", and port 22.<|projection|> The other parameters are optional and can be omitted. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "deploy-key", "host": "example.com", "port": 22}}
+  </tool_call><|projection|>
+- |-
+  start an SSH session to staging.example.com port 22 with credential staging-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start an SSH session to staging.example.com on port 22 using the credential called staging-key. Let me check the tools available.
+
+  The tool provided is ssh_open. The parameters needed are credential_name, host, port, and others. The user specified the credential name as "<|projection|>staging-key", which is correct. The host is staging.example.com, and the port is 22. The default for port in the tool is 22, but since the user specified it, I should include it.
+
+  I need to make sure the JSON structure is right. The required parameter is credential<|projection|>_name. The host is set to the given hostname. The port is 22. So the arguments should be:
+
+  {
+    "credential_name": "staging-key",
+    "host": "staging.example.com",
+    "port": 22
+  <|projection|>}
+
+  I don't think idle_timeout_sec is needed here<|projection|> unless specified. The user didn't mention it, so we can omit it. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "staging-key", "host": "staging.example.com", "port": 22}}
+  </tool_call><|projection|>
+- |-
+  open an SSH session to 192.168.1.20 as root using credential root-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an SSH session to 192.168.1.20 as root using the credential named root-key. Let me check the available tools.
+
+  The tool ssh_open is for opening a persistent SSH session. The parameters needed are credential_name, host, port<|projection|>, and idle_timeout_sec. The host should be the IP or hostname without the username. The credential_name is given as root-key. The port isn't specified, so it'll use the default from the credential or 22. The host is 192.168.1.20.<|projection|> So I need to call ssh_open with credential_name "root-key" and host "192.168.1.20". The other parameters can be omitted since they have defaults.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "root-key", "host": "192.168.1.20"}}
+  </tool_call><|projection|>
+- |-
+  can you SSH into db01.internal.net on port 2222 with the dba-key credential?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking to SSH into db01.internal.net on port 2222 using the dba-key credential. I need to figure out which tool to use here.
+
+  Looking at the available tools, there's the ssh_open function. The description says it's for<|projection|> opening a persistent SSH session using a stored credential. That fits because the user mentioned a specific credential, dba-key.
+
+  The parameters for ssh_open include credential_name, host, port, and others. The user provided the host as db01.internal.net and the port 2222. The credential name<|projection|> is given as dba-key.
+
+  I should check if all required parameters are present. The required parameter is credential_name, which is provided. The host is specified, so I'll include that. The port is 2222, which should be set in the parameters.
+
+  I don't see any other<|projection|> parameters needed here. The idle_timeout_sec and other optional fields aren't mentioned, so they can be omitted.
+
+  So the tool call should be to ssh_open with the arguments: credential_name "dba-key", host "db01.internal.net", and port 2222. That should establish the SSH session<|projection|> as requested.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "dba-key", "host": "db01.internal.net", "port": 2222}}
+  </tool_call><|projection|>
+- |-
+  establish an SSH connection to ubuntu@172.31.4.18 using credential ec2-pem<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to establish an SSH connection to ubuntu@172.31.4.18 using the ec2-pem credential. Let me check the available tools.
+
+  The tool provided is ssh_open, which requires a credential_name, host, port, etc. The credential_name is<|projection|> ec2-pem here. The host is 172.31.4.18. The username is ubuntu, but according to the tool's description, the username comes from the credential, not the host. So I shouldn't include the username in the host parameter. The port defaults to 2<|projection|>2 if not specified.
+
+  So the parameters should be: credential_name "ec2-pem", host "172.31.4.18". The port and other optional parameters can use their default values.
+
+  I need to structure the JSON call with these parameters. Make sure the JSON is correctly<|projection|> formatted without any syntax errors. Let me double-check the required fields. The required field is credential_name, which is provided. Host is optional but specified here. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "ec2-pem", "host": "172.31.4.18"}}
+  </tool_call><|projection|>
+- |-
+  log into the build box at 10.10.5.7 over SSH with the ci-runner credential<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to log into a build box at 10.10.5.7 via SSH using the ci-runner credential. I need to figure out which tool to use here.
+
+  Looking at the available tools, there's the ssh_open command. The description says it<|projection|>'s for opening an SSH session with a stored credential. The parameters include the credential name, host, port, etc. The user mentioned "ci-runner" as the credential, so that's the credential_name. The host is 10.10.5.7.
+
+  Wait, the SSH command usually has<|projection|> username@host, but the tool's parameters say the host is just the hostname or IP. The username comes from the credential. So I don't need to include the username in the host parameter. So the host is 10.10.5.7.
+
+  The port isn't specified, so maybe use<|projection|> the default. The tool's parameters mention that the port defaults to the credential's default or 22. Since the user didn't specify a port, I'll leave it out.
+
+  So the arguments should be: credential_name "ci-runner", host "10.10.5.7". The other<|projection|> parameters like idle_timeout_sec and port are optional and can be omitted.
+
+  I need to make sure the JSON is correctly formatted. The required parameter is credential_name. So the tool call would be ssh_open with those arguments. That should start the session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "ci-runner", "host": "10.10.5.7"}}
+  </tool_call><|projection|>
+- |-
+  SSH to backup@nas.lan using the credential nas-admin<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to SSH into backup@nas.lan using the credential nas-admin. Let me check the tools available.
+
+  The tool provided is ssh_open. The parameters needed are credential_name, host, port, and idle_timeout_sec. The credential_name is given as nas-admin. The host should be<|projection|> nas.lan, since the username is handled by the credential. The port isn't specified, so I'll default to the credential's port or 22. Since the user didn't mention a port, I'll leave it out. The idle timeout is optional, so I'll omit that too.
+
+  So the command<|projection|> should be ssh_open with credential_name "nas-admin" and host "nas.lan". That should establish the session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_open", "arguments": {"credential_name": "nas-admin", "host": "nas.lan"}}
+  </tool_call><|projection|>

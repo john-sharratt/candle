@@ -1,0 +1,162 @@
+name: sql_session_open
+category: SQL sessions
+description: Open a SQL database session. SQLite is supported natively and needs no credential — pass the database path (or ':memory:' for in-memory). A credential_name is optional and only supplies a default database. Use sql_session_query to run statements. Close with sql_session_close.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    credential_name:
+      description: Optional name of a stored `sql_password` credential, used for its default database. Omit to open a SQLite file or `:memory:` directly — SQLite needs no credential.
+      type:
+      - string
+      - 'null'
+    database:
+      description: SQLite database path, or `:memory:` for an in-memory database. Defaults to the credential's default database if one is named, otherwise `:memory:`.
+      type:
+      - string
+      - 'null'
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open a SQL session against the database at ./data/app.db<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an SQL session against the database located at ./data/app.db. Let me check the available tools.
+
+  There's a tool called sql_session_open. Its parameters are credential_name (optional) and database. The description says that for SQLite, you can pass the database path or :<|projection|>memory:. The credential_name is optional and only used for the default database. If no credential is provided, it defaults to :memory:.
+
+  The user specified the database path as ./data/app.db. Since this is a file path, I need to pass that into the database parameter. There's no mention of a credential<|projection|> name, so I can omit that.
+
+  So the call should be to sql_session_open with the database parameter set to "./data/app.db". That should open the SQL session correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "./data/app.db"}}
+  </tool_call><|projection|>
+- |-
+  connect to the SQLite database analytics.db<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to connect to an SQLite database called analytics.db. Let me check the tools available.
+
+  There's a tool called sql_session_open. Its parameters are credential_name and database. The description says that for SQLite, you can pass the database path or :memory: for in-memory. The credential<|projection|>_name is optional and used for default database if provided.
+
+  Since the user is asking to connect to analytics.db, I need to set the database parameter to 'analytics.db'. There's no mention of a credential, so I can leave credential_name as null.
+
+  So the tool call should be sql_session_open with database set<|projection|> to 'analytics.db'. That should open the connection properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "analytics.db"}}
+  </tool_call><|projection|>
+- |-
+  start a SQL session for the local users database<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start an SQL session for the local users database. Let me see.
+
+  First, I need to figure out what parameters to use for the sql_session_open tool. The user mentioned "local users database," but didn't specify the exact database path. Since it's a local database,<|projection|> maybe it's a SQLite file. But the user hasn't provided the filename.
+
+  The tool allows passing the database path or ':memory:' for an in-memory database. Since the user didn't specify, maybe I should default to a common location. But wait, the tool's documentation says that if a credential_name is<|projection|> provided, it uses that's default database. However, the user didn't mention a credential name either.
+
+  Hmm. If no database path is given, the tool might default to :memory: unless a credential is specified. But the user wants the local users database. Maybe the database path is something like 'users.db<|projection|>' in the current directory. But since the user didn't specify, perhaps I should ask for clarification. However, the user expects me to use the tool.
+
+  Wait, looking at the parameters again. The 'database' parameter's description says: "SQLite database path, or :memory: for an in-memory database.<|projection|> Defaults to the credential's default database if one is named, otherwise :memory:." So if no database is provided and no credential is named, it defaults to :memory:.
+
+  But the user wants the local users database. If the user hasn't specified the path, maybe I need to make an assumption. But as<|projection|> an AI, I shouldn't assume. However, since the user is asking to start a session, perhaps they expect the default behavior. Alternatively, maybe the 'local users database' refers to a specific file.
+
+  Wait, maybe the user expects that the 'database' parameter is set to a standard path, like '/<|projection|>path/to/users.db', but without knowing, I can't proceed. But the user might have set up a credential with a default database. But the user didn't provide a credential name either.
+
+  In this case, since no parameters are provided, the tool would open an in-memory database. But the user wants the<|projection|> local users database. So maybe the correct approach is to call sql_session_open with the database parameter as the path to the users database. However, since the path isn't given, perhaps the user made a mistake. But since I have to respond, maybe I should use a placeholder. Wait, no, the user expects<|projection|> me to generate the tool call based on their input.
+
+  Wait, the user's exact request is "start a SQL session for the local users database". Since the database path isn't specified, but it's local, maybe the intended action is to open a SQLite file named 'users.db' or similar. But without knowing<|projection|>, perhaps the correct answer is to call sql_session_open with the database parameter set to a default path. However, as an AI, I can't make up paths.
+
+  Alternatively, perhaps the user expects that the 'database' parameter is omitted, which would result in using :memory: if no credential is provided.<|projection|> But that might not be what the user wants.
+
+  In this case, since the user hasn't provided enough information, but the tool requires at least the database parameter, maybe the correct approach is to use a placeholder. However, the user might have intended to provide the database path, but forgot.
+
+  But given the<|projection|> information available, the best possible action is to call sql_session_open with the database parameter set to a typical local database file, like 'users.db'. However, I should check the parameters again. Wait, the tool's parameters allow for the 'database' parameter to be passed. Since the user mentioned "local users database<|projection|>", perhaps the database parameter is 'users.db' or similar. But without knowing, it's a guess.
+
+  Alternatively, if the user has a credential named something that points to the database, but the user didn't specify the credential_name. So, perhaps the correct answer is to call sql_session_open with the database parameter<|projection|> as the path to the local users database. But since the path isn't given, maybe the user made an error.
+
+  But since the user expects a response, I have to proceed. Maybe the intended answer is to use the default behavior, which would be :memory: if no database is provided. However, that<|projection|> might not be what the user wants.
+
+  In conclusion, since the user hasn't provided the necessary information about the database path, the tool call can't be accurately made. But since I need to provide a response, I'll assume that the user intends to open a SQLite file named 'users.db' and proceed with<|projection|> that.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "users.db"}}
+  </tool_call><|projection|>
+- |-
+  open the SQLite file inventory.db as a session<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an SQLite file called inventory.db as a session. Let me check the tools available.
+
+  There's a tool called sql_session_open. The parameters are credential_name and database. The description says that for SQLite, you just pass the database path. The credential_name is optional and only<|projection|> used for default database. Since the user is specifying the database file directly, I should set the database parameter to 'inventory.db'.
+
+  Wait, the tool's parameters: the 'database' parameter's default is the credential's default if a credential_name is provided. But here, the user isn't mentioning a credential,<|projection|> just the database file. So I should set the database parameter to 'inventory.db' and omit credential_name. That should open the SQLite file directly.
+
+  So the JSON call should be name: sql_session_open, arguments: {"database": "inventory.db"}. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "inventory.db"}}
+  </tool_call><|projection|>
+- |-
+  open an in-memory SQL session using :memory:<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an in-memory SQL session using :memory:. Let me check the tools provided.
+
+  The available tool is sql_session_open. The parameters are credential_name and database. The description says that for SQLite, passing the database path or :memory: is needed. The credential_name is optional<|projection|> and used for a default database.
+
+  Since the user specified :memory:, I should set the database parameter to ":memory:". There's no mention of a credential, so I can omit the credential_name.
+
+  So the correct call would be to sql_session_open with database set to ":memory:". That should open an in-memory<|projection|> SQLite session as requested.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": ":memory:"}}
+  </tool_call><|projection|>
+- |-
+  can you connect to the SQLite database at /var/lib/metrics/telemetry.db?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking me to connect to an SQLite database located at /var/lib/metrics/telemetry.db. Let me check the tools available.
+
+  Looking at the tools provided, there's a function called sql_session_open. Its description says it opens a SQL database session, supporting SQLite natively.<|projection|> The parameters include 'database' which specifies the database path, and 'credential_name' which is optional.
+
+  The user provided the path /var/lib/metrics/telemetry.db, so I should set the 'database' parameter to that path. Since it's an absolute path, I don't need to worry about the<|projection|> default. The 'credential_name' isn't mentioned, so I can omit that parameter.
+
+  So the correct call would be to use sql_session_open with the database argument set to the given path. I need to make sure the JSON is correctly formatted with the right parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "/var/lib/metrics/telemetry.db"}}
+  </tool_call><|projection|>
+- |-
+  start a SQL session on the orders database at ./db/orders.sqlite<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start a SQL session on the orders database located at ./db/orders.sqlite. Let me check the available tools.
+
+  There's a tool called sql_session_open. Its description says it opens a SQL database session. The parameters include credential_name and database. For SQLite, the database path is<|projection|> needed. The user provided "./db/orders.sqlite", so I should use that as the database parameter. Since it's SQLite, there's no need for a credential, so credential_name can be omitted.
+
+  The tool's parameters allow passing the database path directly. So the call should be sql_session_open with the database argument<|projection|> set to "./db/orders.sqlite". That should open the session as required.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "./db/orders.sqlite"}}
+  </tool_call><|projection|>
+- |-
+  open a database session for reporting.db<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a database session for "reporting.db". Let me check the available tools. There's the sql_session_open function. The parameters are credential_name and database. The description says that for SQLite, you can pass the database path or :memory:. Since the user specified "report<|projection|>ing.db", I should set the database parameter to that. The credential_name is optional and only needed if there's a stored credential. Since the user didn't mention any, I'll omit that. So the call should be sql_session_open with database set to "reporting.db". I need to format this as a<|projection|> JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_open", "arguments": {"database": "reporting.db"}}
+  </tool_call><|projection|>

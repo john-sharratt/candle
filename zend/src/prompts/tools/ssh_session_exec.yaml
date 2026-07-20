@@ -1,0 +1,150 @@
+name: ssh_session_exec
+category: SSH sessions
+description: Run a command on a remote server through an open SSH session. Returns stdout, stderr, exit code, working directory, and duration. Use ssh_open first. Every command requires confirmation.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    command:
+      description: The shell command to run on the remote host.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the corresponding ssh_open tool.
+      minLength: 1
+      type: string
+    timeout_sec:
+      description: Maximum seconds to wait for the command. No default is applied.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - command
+  - session_id
+  title: ExecRequest
+  type: object
+examples:
+- |-
+  run `df -h` on SSH session ssh-7f3a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the command `df -h` on an SSH session with the ID 'ssh-7f3a'. Let me check the tools available.
+
+  There's a tool called ssh_session_exec. The parameters required are command, session_id, and optionally timeout_sec. The user provided<|projection|> the session ID 'ssh-7f3a' and the command is 'df -h'.
+
+  I need to make sure all required parameters are included. The required ones are command and session_id. The timeout_sec is optional. Since the user didn't specify a timeout, maybe we can omit it or set a<|projection|> default. But the tool's description says no default is applied, so perhaps it's better to include it. Wait, the parameter's 'default' is not specified, so maybe it's up to the system. However, the user hasn't mentioned a timeout, so maybe just leave it out.
+
+  So the arguments would<|projection|> be:
+  command: "df -h"
+  session_id: "ssh-7f3a"
+
+  Therefore, the tool call should be ssh_session_exec with those arguments. Let me structure the JSON correctly. Ensure the session_id is a string and the command is a string. No other parameters needed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "df -h", "session_id": "ssh-7f3a"}}
+  </tool_call><|projection|>
+- |-
+  execute `systemctl status nginx` on SSH session ssh-7f3a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to execute the command 'systemctl status nginx' on an SSH session with the ID 'ssh-7f3a'. Let me check the tools available.
+
+  There's a tool called ssh_session_exec. Its parameters are command, session_id, and timeout_sec. The required ones are<|projection|> command and session_id. The user provided the session ID 'ssh-7f3a' and the command is 'systemctl status nginx'. So I need to call ssh_session_exec with those values. The timeout_sec is optional, but the user didn't specify it, so I'll omit it. Just make sure<|projection|> the JSON is correctly formatted with the command and session_id.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "systemctl status nginx", "session_id": "ssh-7f3a"}}
+  </tool_call><|projection|>
+- |-
+  check the uptime on SSH session ssh-2b1c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check the uptime on an SSH session with the ID ssh-2b1c. Let me see.
+
+  First, I need to use the tool provided, which is ssh_session_exec. The parameters required are command, session_id, and optionally timeout_sec. The command here is "<|projection|>uptime", and the session_id is given as ssh-2b1c. The user didn't mention a timeout, so maybe we can omit that or set a reasonable default. But according to the tool's parameters, timeout_sec is optional and defaults aren't applied, so maybe it's better to include it. However<|projection|>, the user didn't specify, so perhaps just include the required parameters. Wait, the tool's required fields are command and session_id. So I should include those. The timeout is optional. So the arguments would be "command": "uptime", "session_id": "ssh-2b1c".
+
+  Wait<|projection|>, but the user might expect the command to be executed. So the correct JSON object would have the name as ssh_session_exec and the arguments with the command and session_id. Let me structure that properly. Also, make sure the JSON is correctly formatted without any syntax errors. Alright, that should do it.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "uptime", "session_id": "ssh-2b1c"}}
+  </tool_call><|projection|>
+- |-
+  list the running docker containers on SSH session ssh-9d4e<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list the running Docker containers via an SSH session. Let me see. The tools available include ssh_session_exec, which runs commands on a remote server. But first, they need an open SSH session, which is handled by ssh_open. However, the user mentioned "ssh-9<|projection|>d4e" as the session ID. So, they probably already have an open session.
+
+  The command to list running Docker containers is 'docker ps'. So, I should use ssh_session_exec with the session_id "ssh-9d4e" and the command "docker ps". I need to make sure the<|projection|> parameters are correctly formatted in JSON. The required fields are command and session_id. Timeout is optional, but maybe set a reasonable limit, like 30 seconds. Let me check the tool's parameters. The timeout_sec is a uint32, so 30 is valid. Alright, constructing the JSON object with<|projection|> these values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "docker ps", "session_id": "ssh-9d4e", "timeout_sec": 30}}
+  </tool_call><|projection|>
+- |-
+  on SSH session ssh-4c8d, run `tail -n 50 /var/log/auth.log`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to run the command `tail -n 50 /var/log/auth.log` on an SSH session with the ID ssh-4c8d.
+
+  First, I need to check the available tools. There's the ssh_session<|projection|>_exec tool, which requires the session_id and the command. The user provided both: the session ID is ssh-4c8d, and the command is clear.
+
+  Wait, the parameters for ssh_session_exec require "command" and "session_id". The user's command is `tail -n 50 /<|projection|>var/log/auth.log`, so I need to put that into the "command" field. The session_id is given as ssh-4c8d.
+
+  I should make sure there are no typos. The tool's required fields are present. The timeout_sec is optional, but the user didn't specify a timeout<|projection|>, so I can omit it.
+
+  So the JSON object should have the name "ssh_session_exec" and the arguments with the command and session_id. Let me structure that properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "tail -n 50 /var/log/auth.log", "session_id": "ssh-4c8d"}}
+  </tool_call><|projection|>
+- |-
+  grab the free memory by running `free -m` over SSH session ssh-1a2b<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to run the command `free -m` over an existing SSH session called "ssh-1a2b". I need to use the tool provided, which is ssh_session_exec.
+
+  First, I check the parameters required for that tool. The parameters are command,<|projection|> session_id, and timeout_sec. The command is clearly "free -m", and the session_id should be "ssh-1a2b" as given. The timeout_sec is optional, but the user didn't specify a timeout, so maybe we can omit it or set a default. But since the tool requires<|projection|> the parameters, I should include all required ones. Wait, the required fields are command and session_id. Timeout is not required, so I can leave it out.
+
+  So the JSON object should have "command": "free -m" and "session_id": "ssh-1a2b". That's all.<|projection|> I need to make sure the JSON is correctly formatted. Let me double-check the syntax. Yes, that should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "free -m", "session_id": "ssh-1a2b"}}
+  </tool_call><|projection|>
+- |-
+  execute `whoami && hostname` on SSH session ssh-6e0f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to execute the command "whoami && hostname" on an SSH session with the ID "ssh-6e0f". Let me check the tools available.
+
+  There's a tool called ssh_session_exec. Its parameters are command, session_id, and timeout_sec. The required ones are<|projection|> command and session_id. The user provided the session ID "ssh-6e0f" and the command is "whoami && hostname".
+
+  I need to structure the JSON call for the tool. The command should be a string, and the session_id as well. No timeout is mentioned, so maybe it's<|projection|> optional. The tool doesn't require timeout, so I can omit it.
+
+  So the JSON should have "command": "whoami && hostname" and "session_id": "ssh-6e0f". That's all. Let me make sure there are no typos. Yep, looks good. Time to<|projection|> put it in the tool_call format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "whoami && hostname", "session_id": "ssh-6e0f"}}
+  </tool_call><|projection|>
+- |-
+  run `cat /etc/os-release` on the SSH session ssh-3d5a and show me the output<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to run the command `cat /etc/os-release` on an SSH session with the ID ssh-3d5a. I need to use the tool provided, which is ssh_session_exec.
+
+  First, I check the parameters required for that tool. The required ones<|projection|> are 'command' and 'session_id'. The user provided the session ID as ssh-3d5a, which fits. The command is clearly given as `cat /etc/os-release`.
+
+  I should structure the JSON call correctly. The 'session_id' is "ssh-3d5a", and the '<|projection|>command' is "cat /etc/os-release". There's no mention of a timeout, so I can omit that parameter since it's not required.
+
+  So the tool call should be ssh_session_exec with those arguments. I need to make sure the JSON is properly formatted without any syntax errors. Let me double-check the keys<|projection|> and values. Yep, looks good. That's all needed for the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec", "arguments": {"command": "cat /etc/os-release", "session_id": "ssh-3d5a"}}
+  </tool_call><|projection|>

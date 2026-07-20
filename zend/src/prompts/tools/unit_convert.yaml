@@ -1,0 +1,172 @@
+name: unit_convert
+category: Utilities & web
+description: 'Convert a numeric value between units of the same physical dimension — length, mass, volume, temperature, time, or data size. Use for: converting kilograms to pounds, miles to kilometres, GB to GiB, Celsius to Fahrenheit, hours to seconds. Triggered by "convert X to Y", "how many [unit] in", "what''s [value] in [other unit]", "X in metric/imperial", "express in". Recognises common aliases (celsius/C/°C) and the binary-vs-decimal distinction for data sizes (GB vs GiB). Returns the converted value, input value, from/to unit names. Cannot cross dimensions (metres to kilograms returns dimension_mismatch). For raw arithmetic without units use calculator.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    from:
+      description: Source unit name or alias (e.g. "kg", "celsius", "GiB", "mi"). Case -insensitive. Required; must be a recognised unit. Must share a dimension with `to`.
+      minLength: 1
+      type: string
+    to:
+      description: Target unit name or alias (e.g. "lb", "fahrenheit", "GB", "km"). Case -insensitive. Required; must be a recognised unit. Must share a dimension with `from`.
+      minLength: 1
+      type: string
+    value:
+      description: Numeric value to convert, expressed in the `from` unit. Required.
+      format: double
+      type: number
+  required:
+  - from
+  - to
+  - value
+  title: Request
+  type: object
+examples:
+- |-
+  convert 100 kilometers to miles<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to convert 100 kilometers to miles. Let me check the tools available. There's a unit conversion tool called unit_convert. The parameters needed are 'from', 'to', and 'value'. The 'from' should be 'kilometers' and 'to' should be<|projection|> 'miles'. The value is 100. I need to make sure that the units are correctly recognized. Wait, sometimes miles can be abbreviated as 'mi' but the tool's description mentions 'miles' as a possible input. Let me confirm. The tool's parameters say the 'from' and<|projection|> 'to' can be names or aliases. So using 'kilometers' and 'miles' should work. Alright, constructing the JSON call with these values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "kilometers", "to": "miles", "value": 100}}
+  </tool_call><|projection|>
+- |-
+  how many ounces are in 2.5 liters<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many ounces are in 2.5 liters. Let me figure out which tool to use here. The available tool is unit_convert, which handles conversions between different units of the same dimension.
+
+  First, I need to check if both "ounces" and "liters"<|projection|> are recognized units by the tool. The tool's description mentions it can convert between units like liters, so I assume "liter" is a valid unit. However, "ounces" could be ambiguous because there are different types of ounces (fluid ounce, ounce weight). But since the context is volume (liters), it<|projection|>'s likely referring to fluid ounces.
+
+  Next, I need to make sure that the tool's parameters are met. The function requires 'from', 'to', and 'value' parameters. Here, 'from' would be 'liters', 'to' would be 'fluid ounces', and the value is 2.<|projection|>5.
+
+  Wait, but the user wrote "ounces" instead of "fluid ounces". Does the tool accept abbreviations or common aliases? The tool's description says it recognizes common aliases, so maybe "oz" is acceptable. However, to be safe, I should use the full name if possible. But since the<|projection|> user used "ounces", I'll check if "ounce" is a valid unit. If not, the tool might return an error.
+
+  Alternatively, maybe the tool uses "liter" as the unit for liters. So, I should use "liter" for the 'from' parameter. Let me structure the JSON call with<|projection|> these parameters:
+
+  {
+    "name": "unit_convert",
+    "arguments": {
+      "from": "liter",
+      "to": "fluid ounce",
+      "value": 2.5
+  <|projection|>  }
+  }
+
+  But I need to confirm if "fluid ounce" is the exact name the tool expects. If not<|projection|>, it might not work. Alternatively, perhaps the tool uses "oz" as an alias. Since the user's query is in English, and the tool handles common aliases, this should be okay.
+
+  Another thing: the tool requires the units to be of the same dimension. Liters are volume, and fluid ounces are<|projection|> also volume, so that's valid.
+
+  I think this should work. Let me proceed with this call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "liter", "to": "fluid ounce", "value": 2.5}}
+  </tool_call><|projection|>
+- |-
+  convert 72 fahrenheit to celsius<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to convert 72 degrees Fahrenheit to Celsius. Let me check the available tools. There's a unit conversion tool called "unit_convert". The parameters needed are "from", "to", and "value".
+
+  First, I need to make sure that Fahrenheit and Celsius are recognized units<|projection|>. The tool's description mentions handling temperature, so that's covered. The "from" parameter should be "Fahrenheit" and "to" should be "Celsius". The value is 72.
+
+  I should structure the JSON call with these parameters. Let me double-check the required fields: "from", "<|projection|>to", "value" are all required. The tool should handle the conversion correctly. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "Fahrenheit", "to": "Celsius", "value": 72}}
+  </tool_call><|projection|>
+- |-
+  how many feet are in 3 meters<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many feet are in 3 meters. I need to use the unit_convert tool for this. Let me check the parameters. The function requires 'from', 'to', and 'value'. The 'from' should be 'meters' and 'to' should be '<|projection|>feet'. The value is 3. I should make sure the units are correct. Wait, sometimes meters can be abbreviated as 'm', but the tool might accept 'meters' as well. Similarly, feet could be 'ft' or 'feet'. But according to the tool's description, it accepts<|projection|> common aliases. Let me confirm. The example given uses "kg" and "lb", so maybe 'meters' and 'feet' are acceptable. Alternatively, maybe 'm' and 'ft'? But to be safe, I'll use 'meters' and 'feet' as the unit names.<|projection|> So the parameters would be from: "meters", to: "feet", value: 3. Then the tool should return the converted value. I think that's all. Let me structure the JSON call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "meters", "to": "feet", "value": 3}}
+  </tool_call><|projection|>
+- |-
+  turn 5 pounds into kilograms<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to convert 5 pounds into kilograms. Let me check the tools available. There's a unit conversion tool called 'unit_convert'. The parameters needed are 'from', 'to', and 'value'.
+
+  First, I need to confirm the correct units. Pounds can be abbreviated as<|projection|> 'lb' or 'lbs', and kilograms as 'kg' or 'kilograms'. The tool probably uses standard abbreviations. So, 'from' should be 'lb' and 'to' should be 'kg'.
+
+  The value is 5, which is straightforward. I should structure the JSON call with these parameters<|projection|>. Let me double-check if the tool requires any specific formatting, like case sensitivity. The description says it's case-insensitive, so 'LB' would work too, but using lowercase 'lb' is safer.
+
+  No other tools are needed here. Just call the unit_convert function with the correct arguments.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "unit_convert", "arguments": {"from": "lb", "to": "kg", "value": 5}}
+  </tool_call><|projection|>
+- |-
+  convert 90 miles per hour to meters per second<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to convert 90 miles per hour to meters per second. Let me think about how to approach this.
+
+  First, I need to use the unit_convert tool. But wait, the tool's description says it handles conversions between units of the same physical dimension. Speed is a derived unit<|projection|>, so maybe the tool can handle it. Wait, the examples given in the tool's description include converting between different units like kilograms to pounds, miles to kilometers, etc. But speed is a bit different. However, the tool might handle it by breaking it down into base units.
+
+  Alternatively, maybe the tool expects the<|projection|> conversion to be done step by step. For example, first convert miles to meters and then hours to seconds. Let me check the tool's parameters. The tool requires 'from' and 'to' units, which are strings, and a value. So if I can find the correct units for miles per hour and meters<|projection|> per second, the tool should handle the conversion.
+
+  Wait, but the tool might not have a direct conversion for miles per hour to meters per second. In that case, the tool might return an error or an incorrect result. But according to the problem statement, the user is expecting me to use the provided tool. So<|projection|> I need to proceed with the available tool.
+
+  So, the 'from' unit would be "miles per hour" and the 'to' unit would be "meters per second". The value is 90. Let me check if the tool accepts those units. The tool's description says it recognizes common aliases<|projection|>. However, "miles per hour" might be considered a compound unit. But the tool's parameters require the 'from' and 'to' to be single unit names. Wait, the tool's parameters for 'from' and 'to' are described as "Source unit name or alias (e.g. '<|projection|>kg', 'celsius', 'GiB', 'mi')". So maybe the tool doesn't support compound units like "miles per hour" directly. That's a problem.
+
+  Wait, the example given in the tool's documentation includes converting "miles to kilometers", which is a length unit. So the tool<|projection|> can handle simple units but not derived units like speed. Therefore, the user's request to convert miles per hour to meters per second might not be possible with the current tool. But the user is asking me to use the tool, so I need to find a way.
+
+  Alternatively, perhaps the tool allows specifying the units as<|projection|> "mph" and "mps" or similar abbreviations. Let me check the tool's parameters again. The 'from' and 'to' parameters accept aliases. For example, "mi" for miles, "km" for kilometers. So maybe "mph" is an accepted alias for miles per hour. Similarly,<|projection|> "m/s" could be the target unit. Let me try that.
+
+  So, the 'from' parameter would be "mph", the 'to' parameter would be "m/s", and the value is 90. Then, the tool would handle the conversion. But I need to make sure that "mph<|projection|>" and "m/s" are valid units in the tool's database. Since the tool's examples include converting miles to kilometers, it's possible that "mph" is a recognized unit. If not, the tool might return an error. However, given the user's request, this is the best approach.
+
+  Therefore,<|projection|> I'll structure the tool call with 'from' as "mph", 'to' as "m/s", and the value as 90.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "mph", "to": "m/s", "value": 90}}
+  </tool_call><|projection|>
+- |-
+  how many gigabytes is 4500 megabytes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many gigabytes are in 4500 megabytes. Let me think about the units here. So, I know that "mega" and "giga" are both prefixes used in data storage. But wait, there's a difference between the decimal and binary systems<|projection|>.
+
+  Wait, the user didn't specify whether they're using the decimal (SI) or binary (IEC) system. But in most cases, when someone refers to gigabytes and megabytes without specifying, it's usually the decimal version. However, sometimes in computing, especially with RAM, it's binary.<|projection|> But since the question is straightforward, maybe I should assume decimal.
+
+  But wait, the tool mentioned in the tools can handle this. The tool's description says it recognizes the difference between GB and GiB. So, if the user is asking about gigabytes (GB), which are 10^9 bytes, and<|projection|> megabytes (MB) as 10^6 bytes. So 4500 MB would be 4500 / 1000 = 4.5 GB. But if they meant mebibytes (MiB) and gibibytes (GiB), then it's<|projection|> different. However, since the user wrote "gigabytes" and "megabytes", not "GiB" or "MiB", I should use the decimal system.
+
+  So the conversion factor from MB to GB is 1000. So 4500 divided by 1000 equals<|projection|> 4.5. Therefore, the answer should be 4.5 gigabytes.
+
+  But let me double-check. The tool's parameters require 'from' and 'to' units. The 'from' would be 'MB' and 'to' would be 'GB'. The value is 450<|projection|>0. So the function call should be unit_convert with those parameters. The user didn't mention any other specifics, so this should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "megabytes", "to": "gigabytes", "value": 4500}}
+  </tool_call><|projection|>
+- |-
+  how many seconds are in 6.25 hours<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many seconds are in 6.25 hours. Let me think about how to approach this.
+
+  First, I need to convert hours to seconds. The tool provided is unit_convert, which handles unit conversions. So I should use that.
+
+  The parameters required are 'from<|projection|>', 'to', and 'value'. The 'from' unit here is 'hours', and the 'to' unit is 'seconds'. The value is 6.25.
+
+  Wait, I should make sure that the units are correct. Hours to seconds. Let me confirm the conversion factors. 1 hour<|projection|> is 60 minutes, and 1 minute is 60 seconds. So 1 hour is 60 * 60 = 3600 seconds. Therefore, 6.25 hours is 6.25 * 3600 seconds. But the tool should handle this<|projection|> calculation, so I just need to pass the parameters correctly.
+
+  So the 'from' parameter is 'hours', 'to' is 'seconds', and the value is 6.25. The function should return the converted value.
+
+  I should structure the JSON call accordingly. Check if there are any possible errors.<|projection|> For example, if the units are not in the same dimension, but since both are time units, it's okay. Alright, let's proceed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "unit_convert", "arguments": {"from": "hour", "to": "second", "value": 6.25}}
+  </tool_call><|projection|>

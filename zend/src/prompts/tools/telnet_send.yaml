@@ -1,0 +1,165 @@
+name: telnet_send
+category: Telnet sessions
+description: 'Send text to an open Telnet session and read until an expect regex matches (the device prompt, by default). Use for: running commands on network gear, querying device status, configuring routers/switches, navigating menu-driven legacy interfaces. Triggered by "run X on the switch", "configure the router", "show running-config", "send this to the device". Returns received text up to the matched pattern, a matched flag, and duration. Output capped at 32 KiB. Every send requires confirmation. Use ssh_session_exec instead for SSH-capable hosts — SSH provides exit codes and encryption.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    expect:
+      description: Regex to wait for. Defaults to the session's prompt_pattern.
+      type:
+      - string
+      - 'null'
+    send:
+      description: Text to send. A trailing "\r\n" is appended automatically if absent.
+      type: string
+    session_id:
+      description: The session id returned by the corresponding telnet_session_open tool.
+      minLength: 1
+      type: string
+    timeout_sec:
+      description: Maximum seconds to wait for the expect pattern (0–300). Defaults to 30.
+      format: uint32
+      maximum: 300.0
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - send
+  - session_id
+  title: SendRequest
+  type: object
+examples:
+- |-
+  send `show running-config` to telnet session telnet-1 and wait for the prompt<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to send the command "show running-config" to a Telnet session called "telnet-1" and wait for the prompt.
+
+  First, I need to check the available tools. There's the telnet_send tool, which sends<|projection|> text to an open Telnet session. The parameters required are session_id, send, and optionally expect and timeout_sec. The session_id should be "telnet-1" as mentioned. The send parameter is the command to send, which is "show running-config".
+
+  The user mentioned waiting for the prompt, so<|projection|> the expect parameter should be set to the session's prompt. However, the default for expect is already the session's prompt, so maybe it's optional. But to be safe, I can include it. But wait, the session's prompt might not be known here. The user just says to wait for the prompt,<|projection|> so maybe leaving expect as the default is better.
+
+  So the parameters would be: session_id="telnet-1", send="show running-config". The other parameters like timeout_sec aren't specified, so they'll use their defaults.
+
+  I need to make sure that the JSON structure is correct. The tool name is<|projection|> telnet_send, and the arguments are a JSON object with session_id, send, etc. No other parameters are needed unless required. Since the user didn't specify a timeout, the default of 30 seconds is acceptable.
+
+  Therefore, the correct tool call should be to telnet_send with the given session ID and<|projection|> command.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"session_id": "telnet-1", "send": "show running-config"}}
+  </tool_call><|projection|>
+- |-
+  send `enable` on telnet session telnet-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the command "enable" over a Telnet session. Let me check the tools available.
+
+  There's a tool called telnet_send. Its description says it sends text to an open Telnet session and reads until an expect regex matches. The parameters include 'send' for the<|projection|> text to send, 'session_id' which is required, and 'expect' which defaults to the prompt.
+
+  The user mentioned the session ID is telnet-1. So I need to use that in the session_id parameter. The command to send is "enable", so I'll put that in the 'send'<|projection|> field. Since the user didn't specify an expect pattern, the default should work, which is the device's prompt.
+
+  I should make sure the JSON structure is correct. The required fields are 'send' and 'session_id'. The timeout_sec is optional and defaults to 30. Since the user didn't<|projection|> mention a timeout, I can omit it.
+
+  So the tool call should be telnet_send with arguments {"send": "enable", "session_id": "telnet-1"}.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "enable", "session_id": "telnet-1"}}
+  </tool_call><|projection|>
+- |-
+  send `reload` to telnet session telnet-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the command "reload" to a Telnet session with the ID "telnet-2". Let me check the available tools.
+
+  There's a tool called telnet_send. Its parameters are expect, send, session_id, and timeout_sec. The required ones are send and<|projection|> session_id. The user provided the session ID "telnet-2" and the command "reload".
+
+  So I need to structure the tool call with the session_id as "telnet-2" and the send parameter as "reload". The other parameters like expect and timeout_sec are optional. Since the user didn't<|projection|> specify them, I'll omit them. The default for expect is the prompt, which should be okay here.
+
+  So the JSON should have the name "telnet_send" and the arguments with send and session_id. Let me double-check the required fields. Yes, send and session_id are required. Alright, that's<|projection|> all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "reload", "session_id": "telnet-2"}}
+  </tool_call><|projection|>
+- |-
+  issue `show version` on telnet session telnet-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to issue the "show version" command on a Telnet session called "telnet-1". Let me check the tools available.
+
+  There's a tool called telnet_send. Its description says it sends text to an open Telnet session and reads until an expect regex matches. The<|projection|> parameters needed are send, session_id, and others like expect, timeout_sec. The session_id is required, which the user provided as "telnet-1".
+
+  The user's command is "show version", so I need to set the send parameter to "show version". The session_id is "telnet-1<|projection|>". The expect parameter can be left as default, which is the prompt. Timeout is optional, but maybe 30 seconds as default.
+
+  So the tool call should be telnet_send with send="show version" and session_id="telnet-1". I don't need to include optional parameters unless necessary. Let<|projection|> me make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "show version", "session_id": "telnet-1"}}
+  </tool_call><|projection|>
+- |-
+  on telnet session telnet-3, type `configure terminal` and wait for the prompt<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to send "configure terminal" on a Telnet session called telnet-3 and wait for the prompt.
+
+  First, I need to check the available tools. There's a tool called telnet_send. Its description says it sends text<|projection|> to a Telnet session and waits for an expect regex, which defaults to the prompt. The parameters required are send, session_id, and optionally expect and timeout_sec.
+
+  The user's command is "configure terminal", so the send parameter should be that. The session_id is given as telnet-3. Since they<|projection|> want to wait for the prompt, which is the default for expect, I don't need to specify that unless the prompt is different. The timeout_sec isn't mentioned, so maybe use the default of 30 seconds.
+
+  So the tool call would be to telnet_send with send="configure terminal", session_id="<|projection|>telnet-3". The other parameters can be omitted since they have defaults. I should make sure the JSON is correctly formatted with the required fields.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "configure terminal", "session_id": "telnet-3"}}
+  </tool_call><|projection|>
+- |-
+  could you send `write memory` over telnet session telnet-2?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send "write memory" over a Telnet session with the ID "telnet-2". Let me check the available tools.
+
+  There's a tool called telnet_send. Its parameters are expect, send, session_id, and timeout_sec. The required ones are send and session<|projection|>_id. The user provided the session ID "telnet-2" and the command "write memory".
+
+  So I need to call telnet_send with send set to "write memory" and session_id as "telnet-2". The other parameters like expect and timeout_sec have defaults, so they can be omitted.<|projection|> Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "write memory", "session_id": "telnet-2"}}
+  </tool_call><|projection|>
+- |-
+  push the command `show ip interface brief` to telnet session telnet-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to push the command "show ip interface brief" to a Telnet session called "telnet-4".
+
+  First, I need to check the available tools. There's a tool called telnet_send, which sends text to an<|projection|> open Telnet session. The parameters required are send, session_id, and optionally expect and timeout_sec.
+
+  The user provided the session ID "telnet-4", so that's the session_id. The command to send is "show ip interface brief". Since the session is already open, I don't need to open<|projection|> it again. The tool requires the send parameter, which is the command, and the session_id. The other parameters like expect and timeout_sec are optional. Since the user didn't specify a different prompt, the default should work.
+
+  So, I'll structure the tool call with the name telnet_send, and the arguments<|projection|>: send is "show ip interface brief", session_id is "telnet-4". The other parameters can be omitted as they have defaults. That should send the command to the specified Telnet session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"send": "show ip interface brief", "session_id": "telnet-4"}}
+  </tool_call><|projection|>
+- |-
+  run `logout` on telnet session telnet-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the 'logout' command on a Telnet session called 'telnet-1'. Let me check the tools available.
+
+  There's a tool called telnet_send, which sends text to a Telnet session. The parameters needed are session_id, send, expect, and timeout<|projection|>_sec. The session_id should be 'telnet-1' here. The command to send is 'logout', but I need to make sure to add a newline at the end. The default prompt is usually the device's prompt, so maybe the expect parameter can be left as default.
+
+  Wait, the user didn't<|projection|> specify any specific prompt after sending logout. But the tool's description says that the default for 'expect' is the session's prompt_pattern. So maybe I don't need to set the 'expect' parameter. Also, the 'timeout_sec' isn't specified, so using the default of 30 seconds should be<|projection|> okay.
+
+  So the arguments would be: session_id 'telnet-1', send 'logout\r\n'. The other parameters can use their defaults. That should send the logout command and wait for the prompt again. I'll structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_send", "arguments": {"session_id": "telnet-1", "send": "logout\r\n"}}
+  </tool_call><|projection|>

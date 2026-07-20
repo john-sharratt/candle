@@ -1,0 +1,145 @@
+name: notes_search
+category: Notes
+description: Find stored notes by a content substring or tag match, returning ranked hits with text snippets. Use when the note's exact key is unknown; supply a query, tags, or both.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    max_results:
+      description: Maximum results to return (1–50). Defaults to 10.
+      format: uint32
+      maximum: 50.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+    query:
+      description: Content substring to search for. Defaults to "" (no text filter); at least one of query or tags must be supplied.
+      type:
+      - string
+      - 'null'
+    tags:
+      description: Tags that returned notes must include. Defaults to none; at least one of query or tags must be supplied.
+      items:
+        type: string
+      type:
+      - array
+      - 'null'
+  title: SearchRequest
+  type: object
+examples:
+- |-
+  search my notes for anything about kubernetes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to search their notes for anything related to Kubernetes. Let me see how to approach this.
+
+  First, I need to use the provided tool called notes_search. The goal is to find notes that have the word "Kubernetes" in them. The tool allows searching by a query string or<|projection|> tags. Since the user didn't mention any specific tags, I'll focus on the query parameter.
+
+  The parameters for notes_search include 'query' and 'tags'. Since the user is looking for anything about Kubernetes, setting the query to "Kubernetes" makes sense. Also, the default maximum results are 10<|projection|>, which should be fine unless the user has a lot of notes. But since they didn't specify, sticking with the default is safe.
+
+  I need to make sure that at least one of the parameters is provided. Since the user is explicitly asking for Kubernetes, the query parameter is definitely needed. No need to include tags<|projection|> here.
+
+  So, the tool call should have the name "notes_search" and the arguments with "query": "Kubernetes". That should retrieve all the notes containing that term.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "Kubernetes"}}
+  </tool_call><|projection|>
+- |-
+  find notes mentioning the payment gateway<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to find notes that mention a payment gateway. Let me see. The available tool is notes_search. The parameters are query, tags, and max_results. Since they're looking for mentions of "payment gateway," that's a text search, not tags. So I should set the query<|projection|> parameter to "payment gateway". The tags parameter isn't needed here. Max_results defaults to 10, which is fine unless the user specified otherwise, but they didn't. So the tool call should be notes_search with query="payment gateway".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "payment gateway"}}
+  </tool_call><|projection|>
+- |-
+  look through my notes for the wifi setup<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to look through their notes for something related to "wifi setup". Let me see how to approach this.
+
+  First, I need to use the available tool, which is notes_search. The goal is to find notes that have either the text "wifi setup" or are tagged with something related<|projection|>. But the user didn't specify any tags, so maybe just the query part.
+
+  The parameters for notes_search include 'query' and 'tags'. Since the user mentioned "wifi setup", I should set the query parameter to "wifi setup". The tags parameter can be left as default, which is no tags. Also<|projection|>, the max_results defaults to 10, which should be fine unless the user wants more, but they didn't specify.
+
+  So the tool call would be to notes_search with the query set to "wifi setup". That should retrieve the relevant notes. Let me make sure I'm not missing any required parameters. The<|projection|> 'tags' are optional, and since the user didn't mention any specific tags, it's safe to omit them. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "wifi setup"}}
+  </tool_call><|projection|>
+- |-
+  search notes for 'release checklist'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to search their notes for something called 'release checklist'. Let me see how to do that.
+
+  Looking at the tools provided, there's a function called notes_search. Its purpose is to find notes by content substring or tags. The user isn't specifying any tags, just a text query<|projection|>.
+
+  The parameters for notes_search include 'query' which is the content substring. The user's query is 'release checklist', so I should put that in the 'query' field. Since they didn't mention tags, I don't need to include the 'tags' parameter. Also, the default for max_results<|projection|> is 10, which is probably fine unless they want more, but they didn't specify.
+
+  So the correct tool call would be to use notes_search with the query set to 'release checklist'. That should retrieve all notes containing that exact phrase. I need to make sure the JSON is correctly formatted with the name<|projection|> and arguments. No other parameters are needed here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "release checklist"}}
+  </tool_call><|projection|>
+- |-
+  do I have any notes tagged 'urgent'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if they have any notes tagged 'urgent'. Let me see how to approach this.
+
+  First, I need to use the available tool, which is notes_search. The purpose of this tool is to find notes based on a query or tags. Since the user is checking for a specific<|projection|> tag, 'urgent', I should focus on the tags parameter.
+
+  The parameters for notes_search include 'tags' as an array. So I need to pass ["urgent"] in the tags field. The other parameters like 'query' are optional, but since the user isn't searching by content, I can leave that out<|projection|>. The max_results defaults to 10, which is fine unless the user wants more, but they didn't specify.
+
+  I should structure the tool call with the tags parameter set to ["urgent"]. That should retrieve all notes tagged with 'urgent'. Let me make sure the JSON is correctly formatted with the tags as an<|projection|> array. Yes, that's correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"tags": ["urgent"]}}
+  </tool_call><|projection|>
+- |-
+  which of my notes talk about the database migration<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which of their notes discuss database migration. I need to use the notes_search tool here. Let me check the parameters. The tool requires either a query or tags. Since the user mentioned "database migration," that's the query term. I'll set the query to "database migration<|projection|>." The max_results can stay at the default of 10 unless specified otherwise. No tags are mentioned, so I'll leave that out. Alright, the JSON should have the name as notes_search and the arguments with the query.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "database migration"}}
+  </tool_call><|projection|>
+- |-
+  hunt through my notes for anything referencing Postgres<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to search their notes for anything related to Postgres. Let me check the available tools. There's a function called notes_search. The parameters include query, tags, and max_results. The user didn't mention tags, so I'll focus on the query parameter. They want notes referencing<|projection|> Postgres, so I'll set the query to "Postgres". The max_results defaults to 10, which is fine unless they specified otherwise. Since the tool requires at least one of query or tags, and here we have the query, it should work. I'll structure the tool call with the query parameter<|projection|>.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "Postgres"}}
+  </tool_call><|projection|>
+- |-
+  find the note where I wrote down the office door code<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is looking for a note where they wrote down the office door code. Let me think about how to approach this.
+
+  First, I need to use the notes_search tool. The goal is to find the specific note, so I should consider what the note might contain. Since it's the office<|projection|> door code, maybe there are keywords like "door code" or "office code" in the content.
+
+  But the user didn't provide any specific tags, so maybe the tags parameter isn't helpful here. However, the query parameter could be useful. I should set the query to something like "door code" or<|projection|> "office code" to narrow down the results. Wait, but the user might have used different phrasing. Maybe "door" or "code" alone could work. But since the query is a substring match, maybe "door" would capture "door code" as well.
+
+  Alternatively, if the note was tagged with<|projection|> something like "security" or "access", but since the user hasn't specified any tags, it's safer to rely on the query parameter.
+
+  Wait, the tool requires either a query or tags. Since the user didn't mention any tags, I should use the query. So, setting the query to "door<|projection|> code" makes sense. Also, the max_results can be set to 10, which is the default. Let me check the parameters again: max_results defaults to 10, so even if I don't specify it, it's okay. But including it might make it clearer.
+
+  So, the tool call<|projection|> would have name "notes_search", with arguments {"query": "door code", "max_results": 10}. That should retrieve notes containing "door code" in their content. If there are multiple results, the user might need to look through them, but this should get the right note.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_search", "arguments": {"query": "door code", "max_results": 10}}
+  </tool_call><|projection|>

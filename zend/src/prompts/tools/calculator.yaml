@@ -1,0 +1,136 @@
+name: calculator
+category: Utilities & web
+description: 'Evaluate an arithmetic or scientific expression and return the exact result. Use for: arithmetic the model would otherwise compute mentally and get wrong, multi-digit multiplication or division, percentage calculations, square roots, trigonometry, evaluating formulas with parentheses and standard functions. Supports +, -, *, /, %, ^, sqrt, sin, cos, tan, ln, log (base 10), log2, exp, abs, min, max, floor, ceil, round. Triggered by "calculate", "compute", "what is X times Y", "how much is", "what''s the square root of", or any explicit math problem. Returns the numeric result, plus a `result_display` rendering (digit-grouped, with magnitude) for large or tiny values — quote `result_display` when reporting such a result. Use unit_convert for unit conversions; use random for generating random values.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    expression:
+      description: Arithmetic/scientific expression to evaluate (e.g. "2 + 2", "sqrt(16)", "sin(0) * 3"). Supports +, -, *, /, %, ^, sqrt, sin, cos, tan, ln, log (base 10), log2, exp, abs, min, max, floor, ceil, round. Required; length 1–1024 characters.
+      maxLength: 1024
+      minLength: 1
+      type: string
+  required:
+  - expression
+  title: Request
+  type: object
+examples:
+- |-
+  what is 37% of 84193<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for 37% of 84193. Let me think about how to approach this.
+
+  First, I need to convert the percentage into a decimal. So 37% divided by 100 equals 0.37. Then, I<|projection|> have to multiply that by 84193. The calculation would be 0.37 * 84193.
+
+  Wait, I should make sure I'm doing the multiplication correctly. Let me check if there's any chance I might have messed up the decimal places. But since the user<|projection|> just wants the result, I can use the calculator tool here.
+
+  The tool requires the expression as a string. So the expression would be "0.37 * 84193". I'll pass that into the calculator function. That should give the correct answer.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "0.37 * 84193"}}
+  </tool_call><|projection|>
+- |-
+  evaluate (128 + 47) * 2^7 - 913<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants me to evaluate the expression (128 + 47) multiplied by 2 raised to the 7th power, and then subtract 913. Alright, let me break this down step by step.
+
+  First, I need to handle the operations<|projection|> inside the parentheses first. So 128 plus 47. Let me add those together. 128 + 47... 128 + 40 is 168, and then +7 more is 175. So that part simplifies to 17<|projection|>5.
+
+  Next, the exponentiation: 2^7. Hmm, 2^7 is 2 multiplied by itself seven times. 2*2=4, *2=8, *2=16, *2=32, *2=64, *2=128<|projection|>. Wait, no, wait. Let's count again. 2^1=2, ^2=4, ^3=8, ^4=16, ^5=32, ^6=64, ^7=128. Yes, so 2^7 is 1<|projection|>28.
+
+  So now the expression becomes 175 multiplied by 128, and then subtract 913. Let me compute 175 * 128. Hmm, how to do that. Maybe break it down. 175 * 100 = 1<|projection|>7,500. 175 * 28 = ? Let's see, 175*20=3,500, and 175*8=1,400. So 3,500 + 1,400 = <|projection|>4,900. Then total is 17,500 + 4,900 = 22,400? Wait, no. Wait, 175*128 is 175*(100+28) = 175<|projection|>*100 + 175*28. Which is 17,500 + (175*28). Let me calculate 175*28. 175 * 28 can be 175*(20 + 8) =<|projection|> 175*20 + 175*8. 175*20 is 3,500. 175*8 is 1,400. So 3,500 + 1,400 = 4,90<|projection|>0. Then add that to 17,500: 17,500 + 4,900 = 22,400. Wait, but 175*128 equals 22,400? Let me check with another method.<|projection|> Alternatively, 128 * 175. Since 128 is 2^7, and 175 is 175. Alternatively, maybe use calculator steps. But since I can't use a calculator, I need to verify.
+
+  Alternatively, 175 * 1<|projection|>28: 175 * 128 = (170 + 5) * 128 = 170*128 + 5*128. 170*128: 170*100=17,<|projection|>000; 170*28=4,760. So 17,000 + 4,760 = 21,760. Then 5*128=640. Adding to 21,760 gives<|projection|> 21,760 + 640 = 22,400. Yes, that's correct. So 175 * 128 is indeed 22,400.
+
+  Now subtract 913 from that result. So 22,40<|projection|>0 - 913. Let me compute that. 22,400 minus 900 is 21,500. Then subtract 13 more: 21,500 - 13 = 21,487. Wait, wait,<|projection|> no. Wait, 22,400 - 913. Let me do it step by step. 22,400 - 900 = 21,500. Then subtract 13 more (since 900 +13=91<|projection|>3). So 21,500 -13 = 21,487. Yes.
+
+  So the final result should be 21,487. But to make sure I didn't make a mistake in any of the steps, let me verify each part again.
+
+  First, <|projection|>128 + 47: 128+47. 128 + 47 is indeed 175. Correct.
+
+  Then 2^7 is 128. Correct.
+
+  175 * 128: As calculated, 22,40<|projection|>0. Then subtract 913 gives 21,487. So the answer is 21,487. Therefore, using the calculator tool, I can input the entire expression as (128 + 47) * 2^7 - 913 to get<|projection|> the result.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "(128 + 47) * 2^7 - 913"}}
+  </tool_call><|projection|>
+- |-
+  compute the square root of 74183<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to compute the square root of 74183. Let me check if I have the right tool for this. The available tool is the calculator, which can handle square roots using the sqrt function. So I need to call the calculator with the expression "sqrt(7<|projection|>4183)". I should make sure the input is correctly formatted as a JSON object inside the tool_call tags. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "sqrt(74183)"}}
+  </tool_call><|projection|>
+- |-
+  what is 1234 multiplied by 5678<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the product of 1234 and 5678. Let me check if I can use the calculator tool here. The tools provided include a calculator that handles arithmetic operations. The expression they need is straightforward multiplication. So, I should call the calculator with the<|projection|> expression "1234 * 5678". That should compute the correct result. I don't see any complications here. Let's make sure the parameters are correctly formatted as per the tool's requirements. Yep, the expression is a valid string. Alright, time to return the tool call.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "1234 * 5678"}}
+  </tool_call><|projection|>
+- |-
+  what is 76234 multiplied by 88911<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the product of 76234 and 88911. Let me check if I can use the calculator tool here. The tools provided include a calculator that handles arithmetic expressions. The parameters allow an expression string up to 1024 characters.<|projection|> The multiplication of two five-digit numbers should be within the calculator's capacity. I need to format the request as a JSON object inside the tool_call tags. The expression would be "76234 * 88911". I should make sure there are no typos. Alright, that should do<|projection|> it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "76234 * 88911"}}
+  </tool_call><|projection|>
+- |-
+  log base 2 of 95443<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the logarithm base 2 of 95443. Let me think about how to approach this.
+
+  First, I need to recall that log base 2 of a number x is the exponent you'd raise 2 to get x. But calculating this manually would<|projection|> be time-consuming. Since the user provided a calculator tool, I should use that.
+
+  Looking at the tools available, there's a calculator with a function that supports log base 2. The parameters require an expression. The user's query is "log base 2 of 95443", which translates to<|projection|> log2(95443).
+
+  Wait, the calculator's description mentions supporting log (base 10), log2, and others. So the expression should be written as log2(95443). I need to make sure the syntax is correct. The tool's parameters accept the expression<|projection|> as a string.
+
+  So the JSON call would have the name "calculator" and the arguments with the expression "log2(95443)". That should trigger the calculator to compute the result. I don't see any issues here. Let me double-check the function names. Yes, log2 is a<|projection|> valid function in the tool. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "log2(95443)"}}
+  </tool_call><|projection|>
+- |-
+  what's the square root of 2750000<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to solve this. The user is asking for the square root of 2,750,000. I need to use the calculator tool provided. The tool requires an expression as a string. The expression here is "sqrt(275000<|projection|>0)". I should make sure the number is correctly formatted without any commas. So, I'll input "sqrt(2750000)" as the expression. That should return the correct square root.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "sqrt(2750000)"}}
+  </tool_call><|projection|>
+- |-
+  how much is 918273 divided by 4657, to four decimal places<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to divide 918273 by 4657 and get the result to four decimal places. Let me think about how to approach this.
+
+  First, I need to perform the division of 918273 by 4657.<|projection|> Since the user wants four decimal places, I need to make sure the calculation is precise. Using a calculator or a computational tool would be the way to go here. But since I'm supposed to use the provided tools, I should check if the 'calculator' tool can handle this.
+
+  Looking at the available tools, there<|projection|>'s a 'calculator' function that can evaluate expressions. The parameters allow for an expression string, which can include division. So, I can construct the expression as "918273 / 4657" and pass it to the calculator. The tool should return the result, which I can then<|projection|> format to four decimal places.
+
+  Wait, but the user specifically mentioned four decimal places. Does the calculator tool automatically handle rounding, or do I need to perform additional steps? The description says it returns the exact result, so maybe I need to ensure that the division is carried out accurately. However, since the tool is designed<|projection|> for such calculations, I can rely on its output.
+
+  So, the steps are: call the calculator with the expression "918273 / 4657", get the result, then round it to four decimal places. But the user might expect the answer directly. Since the tool's response will<|projection|> be the numeric value, I can present that as the final answer after the calculation.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "calculator", "arguments": {"expression": "918273 / 4657"}}
+  </tool_call><|projection|>

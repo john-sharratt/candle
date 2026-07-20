@@ -5,11 +5,10 @@
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Sections** — prefill the projection schema's pinned sections.
-//! 4. **RepoScan** — *(future)* index the workspace's code into the substrate.
-//! 5. **CodeRead** — *(future)* run the first per-file prefill pass.
-//!
-//! Steps 4 and 5 currently have no work to do — they transition through
-//! instantly. Wiring them up is left for the integrations that own them.
+//! 4. **Ingesting** — run the schema-declared ingest passes (one per projection
+//!    layer that carries an `ingest:` descriptor — folder scans, per-file reads).
+//!    Each layer's human label rides the `detail` sub-status; a schema with no
+//!    ingest layers transitions through this step instantly.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -29,8 +28,12 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
-    RepoScan,
-    CodeRead,
+    /// The schema-driven ingest phase: every projection layer that declares an
+    /// `ingest:` descriptor is populated here, in schema order. The specific
+    /// layer's display label ("Scanning repository", "Reading code", …) is
+    /// surfaced through the `detail` sub-status, so this one step covers an
+    /// arbitrary number of ingest layers.
+    Ingesting,
 }
 
 impl LoadStep {
@@ -42,8 +45,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
-        LoadStep::RepoScan,
-        LoadStep::CodeRead,
+        LoadStep::Ingesting,
     ];
 
     /// Human-readable label rendered in the loading overlay.
@@ -54,8 +56,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
-            LoadStep::RepoScan => "Scanning repository",
-            LoadStep::CodeRead => "Reading code",
+            LoadStep::Ingesting => "Ingesting workspace",
         }
     }
 }

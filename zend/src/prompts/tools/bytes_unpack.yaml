@@ -1,0 +1,196 @@
+name: bytes_unpack
+category: Byte encoding
+description: Decode a raw byte buffer back into structured values — fixed-width integers, floats, and strings — using a struct-style format string. The inverse of bytes_pack. Always call this tool to decode the bytes; never work them out by hand.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    BytesEncoding:
+      description: Byte encoding format.
+      enum:
+      - hex
+      - base64
+      - base64url
+      - utf8
+      type: string
+  properties:
+    data:
+      description: The byte buffer to decode, interpreted according to `data_encoding`. Required.
+      minLength: 1
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/BytesEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.'
+    format:
+      description: 'Python struct-style format string: optional endianness prefix (`<` little-endian, `>` big-endian) then type chars B/H/I/L/Q/b/h/i/l/q/f/d and `Ns` for an N-byte string. Required.'
+      minLength: 1
+      type: string
+  required:
+  - data
+  - format
+  title: UnpackRequest
+  type: object
+examples:
+- |-
+  unpack the hex-encoded bytes 3ac91f7e5b2048d1 as two little-endian u32s, format '<II'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to unpack the hex string "3ac91f7e5b2048d1" into two little-endian unsigned 32-bit integers using the format '<II'.
+
+  First, I need to check the parameters. The data is given<|projection|> in hex, so the data_encoding should be 'hex'. The format string is '<II', which specifies little-endian for both values.
+
+  Wait, the tool requires the data parameter as a string. The hex string is already provided, so that's straightforward. The format is given, so I just need to pass<|projection|> those parameters.
+
+  I should make sure that the JSON structure is correct. The name of the tool is bytes_unpack, and the arguments include data, data_encoding, and format. Since the data is hex, data_encoding is 'hex'. The format is '<II'.
+
+  So the JSON call should be:
+
+  {
+    "name<|projection|>": "bytes_unpack",
+    "arguments": {
+      "data": "3ac91f7e5b2048d1",
+      "data_encoding": "hex",
+      "format": "<II"
+    }
+  }
+
+  I think that's all. Let me double-check the parameters. The data<|projection|> is correct, encoding is hex, format is as specified. Yep, that should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "3ac91f7e5b2048d1", "data_encoding": "hex", "format": "<II"}}
+  </tool_call><|projection|>
+- |-
+  unpack the hex-encoded bytes a83f5c19 as two big-endian u16s, format '>HH'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to solve this. The user wants to unpack the hex-encoded bytes 'a83f5c19' into two big-endian unsigned 16-bit integers using the format '>HH'.
+
+  First, I remember that the tool bytes_unpack is needed here<|projection|>. The parameters required are data, data_encoding, and format. The data is the hex string provided, which is 'a83f5c19'. The data_encoding should be 'hex' because the input is hex-encoded. The format is '>HH', which specifies big-endian and two unsigned short integers<|projection|>.
+
+  Wait, I need to make sure that the format string is correctly formatted. The '>' is the endianness, and 'H' is for unsigned short (u16). So the format parameter should be '>HH'.
+
+  So putting it all together, the arguments for the tool call would be: data is<|projection|> 'a83f5c19', data_encoding is 'hex', and format is '>HH'. That should correctly decode the bytes into the two u16 values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "a83f5c19", "data_encoding": "hex", "format": ">HH"}}
+  </tool_call><|projection|>
+- |-
+  unpack the hex-encoded bytes 6f12833e as a little-endian float, format '<f'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to unpack the hex string '6f12833e' as a little-endian float using the format '<f'.
+
+  First, I need to recall how the bytes_unpack tool works. The tool requires the data, the data encoding, and the<|projection|> format. The data here is '6f12833e', which is hex-encoded. So the data_encoding should be 'hex'. The format is given as '<f', which specifies little-endian float.
+
+  Wait, the parameters for the tool: the 'data' is the hex string, 'data<|projection|>_encoding' is 'hex', and 'format' is '<f'. That should do it. Let me make sure there's no mistake here. The user specifically said to use the format '<f', so that's correct. The output should be the decoded float value.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "6f12833e", "data_encoding": "hex", "format": "<f"}}
+  </tool_call><|projection|>
+- |-
+  unpack the hex-encoded bytes 39d4a10800000000 as a signed 64-bit integer, format '<q'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to unpack the hex-encoded bytes 39d4a10800000000 as a signed 64-bit integer using the format '<q'.
+
+  First, I need to recall how the bytes_unpack tool works. The tool<|projection|> decodes raw bytes into structured values using a format string. The format string here is '<q', which specifies little-endian (since < is the endianness) and a long integer (q).
+
+  The input data is given in hexadecimal, so the data_encoding should be 'hex'. The parameters for the tool<|projection|> call should include the data, data_encoding, and the format.
+
+  Wait, the user provided the hex string "39d4a10800000000". Let me check if that's correct. The format is 64 bits, which is 8 bytes. The hex<|projection|> string has 16 characters, which is 8 bytes, so that's correct.
+
+  So the arguments for bytes_unpack would be:
+  - data: "39d4a10800000000"
+  - data_encoding: "hex"
+  - format: "<q"
+
+  I need to<|projection|> make sure that the JSON structure is correct. The required parameters are data and format. Data_encoding is optional but needed here.
+
+  Yes, that should do it. The tool will process the bytes, interpret them as a little-endian 64-bit integer, and return the decoded value.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "39d4a10800000000", "data_encoding": "hex", "format": "<q"}}
+  </tool_call><|projection|>
+- |-
+  unpack the hex bytes 401921fb54442d18 as a big-endian double, format '>d'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to unpack the hex bytes 401921fb54442d18 as a big-endian double using the format '>d'.
+
+  First, I need to recall how the bytes_unpack tool works. The tool requires the data,<|projection|> data_encoding, and format. The data is the hex string provided. The data_encoding should be 'hex' since the input is in hex. The format is given as '>d', which specifies big-endian double.
+
+  Wait, the user specified the format as '>d', which is correct for a big-endian double<|projection|>. The bytes should be 8 bytes long. Let me check the input: 401921fb54442d18 has 16 characters, which is 8 bytes. That's correct.
+
+  So, I need to call bytes_unpack with data="40192<|projection|>1fb54442d18", data_encoding="hex", and format=">d". That should decode the bytes into a double-precision float.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "401921fb54442d18", "data_encoding": "hex", "format": ">d"}}
+  </tool_call><|projection|>
+- |-
+  read the hex 9c2f04e7 as four unsigned bytes, format '>BBBB'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to read the hex value 9c2f04e7 as four unsigned bytes using the format '>BBBB'.
+
+  First, I need to understand what the hex string represents. Each pair of characters is a byte. So 9c, 2f<|projection|>, 04, e7. But wait, the format is '>BBBB', which means big-endian (since the '>' is the endianness prefix). But since we're unpacking into four bytes, each byte is treated as an unsigned char.
+
+  Wait, the format string is '>BBBB'. The '>' here<|projection|> is the endianness, but for bytes, the order might not matter because each element is a single byte. However, the format string's endianness affects how multi-byte types are interpreted. But for 'B' (unsigned char), the endianness doesn't matter because it's a single byte. So<|projection|> the '>' here might be redundant, but it's part of the format.
+
+  So the user wants to take the hex string, which is 8 characters long (4 bytes), and split it into four bytes. Wait, wait: 9c2f04e7 is 8 hex digits, which is <|projection|>4 bytes. So the hex string is 8 characters, which is 4 bytes. So when decoding, each pair is a byte. But the format is '>BBBB', which expects four unsigned chars (bytes).
+
+  But the problem says "decode the raw byte buffer back into structured values" using the format. So<|projection|> the tool 'bytes_unpack' should be called with the data as the hex string, data_encoding as 'hex', and the format as '>BBBB'.
+
+  So the parameters would be:
+
+  data: "9c2f04e7"
+  data_encoding: "hex"
+  format: ">BBBB"
+
+  Then, the tool will<|projection|> process it. The result should be four unsigned integers, each representing the byte value of each pair. Let me check: 9c is 156 in decimal, 2f is 47, 04 is 4, e7 is 231. So the output should be [<|projection|>156, 47, 4, 231].
+
+  But I need to make sure that the tool call is correctly formatted. The user's instruction was to call bytes_unpack with those parameters. So the correct JSON would have the name as 'bytes_unpack' and the arguments as the data, data<|projection|>_encoding, and format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "9c2f04e7", "data_encoding": "hex", "format": ">BBBB"}}
+  </tool_call><|projection|>
+- |-
+  decode the hex-encoded bytes b3f10a4c as a big-endian u32, format '>I'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decode the hex string 'b3f10a4c' as a big-endian unsigned 32-bit integer using the format '>I'.
+
+  First, I need to use the bytes_unpack tool. The parameters required are 'data', 'data<|projection|>_encoding', and 'format'. The 'data' is the hex string provided. Since the input is in hex, 'data_encoding' should be 'hex'. The 'format' is given as '>I', which specifies big-endian and unsigned int.
+
+  Wait, the user mentioned 'bytes_unpack' is the correct tool<|projection|>. So I need to structure the JSON with the right parameters. The 'data' is 'b3f10a4c', 'data_encoding' is 'hex', and 'format' is '>I'.
+
+  Let me double-check. The format string '>I' uses '>' for big-endian and '<|projection|>I' for unsigned int. The data is a 4-byte hex string, which matches. So the call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "b3f10a4c", "data_encoding": "hex", "format": ">I"}}
+  </tool_call><|projection|>
+- |-
+  unpack the hex 7b19c4a891e3f5a2c47d1b60 into a u32 and an i64, format '<Iq'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to unpack the hex value 7b19c4a891e3f5a2c47d1b60 into a u32 and an i64 using the format '<Iq'.
+
+  First, I need to<|projection|> recall how the bytes_unpack tool works. The format string '<Iq' specifies little-endian (since it starts with <), followed by 'I' for unsigned int (u32) and 'q' for signed long (i64).
+
+  The input is a hexadecimal string. So the data_encoding should<|projection|> be 'hex'. The parameters for the tool call would be data as the hex string, data_encoding as 'hex', and the format as '<Iq'.
+
+  Wait, the user specified the format as '<Iq', which matches the required format. So the tool call should include these parameters correctly. I need to make<|projection|> sure that the JSON structure is correct, with the name of the tool and the arguments as a JSON object.
+
+  So the final tool call should have the name "bytes_unpack" and the arguments with data, data_encoding, and format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_unpack", "arguments": {"data": "7b19c4a891e3f5a2c47d1b60", "data_encoding": "hex", "format": "<Iq"}}
+  </tool_call><|projection|>

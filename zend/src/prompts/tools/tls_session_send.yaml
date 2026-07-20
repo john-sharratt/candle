@@ -1,0 +1,164 @@
+name: tls_session_send
+category: TLS sessions
+description: Transmit application data over an open TLS channel; the payload is encrypted on the wire automatically.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    data:
+      description: Payload as UTF-8 text. Mutually exclusive with data_hex — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    data_hex:
+      description: Payload as hex-encoded bytes. Mutually exclusive with data — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    session_id:
+      description: The session id returned by tls_session_open.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: SendRequest
+  type: object
+examples:
+- |-
+  send the IMAP `a1 LOGIN user pass` command to TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the IMAP command "a1 LOGIN user pass" over a TLS session named "tls-1".
+
+  First, I need to recall how the tools provided work. There's a tool called tls_session_send, which transmits data over an open TLS<|projection|> channel. The parameters required are session_id, and either data or data_hex. Since the command is text, I should use the 'data' parameter.
+
+  The session_id should be "tls-1" as specified. The data to send is "a1 LOGIN user pass". I need to make sure that the JSON<|projection|> structure for the tool call is correct, with the session_id and data fields. No hex encoding is needed here since the data is plain text.
+
+  I should check if there are any other parameters or constraints. The session_id is required, and data is mutually exclusive with data_hex. Since the user provided a clear text command<|projection|>, using data is correct.
+
+  So the tool call should have the name "tls_session_send" and the arguments with session_id "tls-1" and data "a1 LOGIN user pass".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"session_id": "tls-1", "data": "a1 LOGIN user pass"}}
+  </tool_call><|projection|>
+- |-
+  send the hex bytes 300c020101600702010304008000 to TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send some hex bytes over a TLS session. The command is "send the hex bytes 300c020101600702010304008000 to TLS session tls-1<|projection|>".
+
+  First, I need to figure out which tool to use. The available tool is tls_session_send. The description says it transmits data over an open TLS channel. The parameters are data (as UTF-8 text) or data_hex (hex-encoded bytes), and the session_id.
+
+  The user provided the hex<|projection|> string "300c020101600702010304008000" and the session name "tls-1". Since the data is in hex, I should use the data_hex parameter. The session_id is "tls-1".
+
+  <|projection|>I need to make sure that either data or data_hex is provided, not both. The user didn't mention any other data, so just the hex is enough. The session ID is given, so that's straightforward.
+
+  So the JSON object for the tool call should have the name "tls_session_send", and the arguments<|projection|> with data_hex set to the provided hex string and session_id as "tls-1". Let me double-check the parameters. Yes, that's correct. No other parameters are needed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"data_hex": "300c020101600702010304008000", "session_id": "tls-1"}}
+  </tool_call><|projection|>
+- |-
+  send `EHLO example.com` to TLS session tls-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the command "EHLO example.com" over a TLS session identified by "tls-2". Let me check the tools available.
+
+  The provided tool is called tls_session_send. It requires the session_id, which in this case is "tls-2". The data to send<|projection|> can be either a UTF-8 string or hex. Since "EHLO example.com" is plain text, I should use the data parameter.
+
+  Wait, the user specified the session as "tls-2", so the session_id in the tool call should be "tls-2". The data is "EHLO<|projection|> example.com". I need to make sure that the JSON structure for the tool call includes these parameters correctly. Also, the tool's parameters require that only data or data_hex is provided. Since we're using plain text, data is the right choice here.
+
+  So the tool call should have name "tls_session_send" with<|projection|> arguments {"session_id": "tls-2", "data": "EHLO example.com"}. That should send the command over the specified TLS session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"session_id": "tls-2", "data": "EHLO example.com"}}
+  </tool_call><|projection|>
+- |-
+  send the hex bytes 101000044d51545404020000 to TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to send some hex bytes over a TLS session. The command is to send the hex value 101000044d51545404020000 through the TLS session named<|projection|> 'tls-1'.
+
+  First, I need to check the available tools. There's a tool called tls_session_send. Let me look at its parameters. The description says it transmits data over an open TLS channel, encrypting the payload. The parameters include data (as UTF-8 text) and data_hex (<|projection|>as hex-encoded bytes). They're mutually exclusive. Also, there's a session_id which is required.
+
+  The user provided the hex string, so I should use the data_hex parameter. The session ID is given as 'tls-1'. So, I need to structure the tool call with session_id set to 'tls<|projection|>-1' and data_hex set to the provided hex value.
+
+  I need to make sure that the JSON is correctly formatted. The keys should be "session_id" and "data_hex", with the appropriate values. No other parameters are needed here since the user didn't provide any other data. Alright, that should do<|projection|> it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"session_id": "tls-1", "data_hex": "101000044d51545404020000"}}
+  </tool_call><|projection|>
+- |-
+  over TLS session tls-3, send the POP3 command `USER alice\r\n`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to send the POP3 command "USER alice\r\n" over a TLS session with the session ID "tls-3".
+
+  First, I need to recall the available tool. The tool provided is tls_session_send, which transmits data<|projection|> over an open TLS channel. The parameters required are session_id, and either data (as UTF-8 text) or data_hex.
+
+  The user's command is "USER alice\r\n". This is a string, so I should use the data parameter. The session ID is given as "tls-3".
+
+  I<|projection|> need to make sure that only one of data or data_hex is provided. Since the data is a plain string, I'll set data to "USER alice\r\n" and leave data_hex as null.
+
+  Double-checking the required parameters: session_id is required, and it's provided. The data is correctly formatted<|projection|>. Looks good. So the tool call should be tls_session_send with the specified arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"data": "USER alice\r\n", "session_id": "tls-3"}}
+  </tool_call><|projection|>
+- |-
+  write the hex bytes 820100 to TLS session tls-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the hex bytes 820100 via a TLS session called tls-4. Hmm, the tool available is tls_session_send. Let me check the parameters.
+
+  The function requires session_id, which should be the session ID from tls_session_open<|projection|>. The user mentioned "tls-4", so maybe that's the session ID. Then, the data can be sent as hex. The data_hex parameter is for hex-encoded bytes. The user provided 820100, which is already in hex. So I need to set data_hex to "8<|projection|>20100".
+
+  Wait, the parameters say that data and data_hex are mutually exclusive. Since the user provided hex, data_hex is the right choice. The session_id is "tls-4" as per the user's instruction. So the arguments should be session_id: "tls-4", data<|projection|>_hex: "820100". That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"session_id": "tls-4", "data_hex": "820100"}}
+  </tool_call><|projection|>
+- |-
+  push `CAPABILITY\r\n` down TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this. The user wants to push the command "CAPABILITY\r\n" over a TLS session named "tls-1".
+
+  First, I need to recall the available tools. There's the tls_session_send function. The description says it transmits data<|projection|> over an open TLS channel, encrypting the payload. The parameters include data (as UTF-8 text) or data_hex (hex-encoded bytes), and the session_id.
+
+  The user is sending "CAPABILITY\r\n", which is a string with a CRLF ending. Since the data is text, I should use<|projection|> the 'data' parameter. The session ID is given as "tls-1".
+
+  I need to make sure that either data or data_hex is provided, not both. Since the user's input is a string, I'll put that into the data field. The session_id is "tls-1".
+
+  So the JSON<|projection|> for the tool call should have name "tls_session_send", and arguments with data set to "CAPABILITY\r\n" and session_id "tls-1". I should check if there are any other parameters, but the required ones are session_id, which is provided.
+
+  Wait, the parameters require session_id, which is<|projection|> present. The data is provided as a string. This should work. I think that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"data": "CAPABILITY\r\n", "session_id": "tls-1"}}
+  </tool_call><|projection|>
+- |-
+  can you send the LDAP unbind hex 30050201034200 to TLS session tls-2?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. They want to send an LDAP unbind message with the hex value 30050201034200 over a TLS session named "tls-2".
+
+  First, I need to recall the<|projection|> available tools. The user mentioned using the tls_session_send tool. Looking at the parameters, it requires the session_id and either data or data_hex. Since the user provided a hex string, I should use data_hex.
+
+  The LDAP unbind message is represented as the hex string 30050201<|projection|>034200. I need to make sure that this is correctly formatted as a hexadecimal value. The session ID given is "tls-2", which should be the session_id parameter.
+
+  I need to structure the JSON call with the session_id set to "tls-2" and data_hex set to "<|projection|>30050201034200". I should double-check that there are no typos in the hex value. Also, ensure that only data_hex is provided, not the regular data field. Since the user specified the hex directly, using data_hex is correct here.
+
+  So the tool<|projection|> call should be tls_session_send with those parameters. I think that's all. Let me put that into the required JSON format inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_send", "arguments": {"session_id": "tls-2", "data_hex": "30050201034200"}}
+  </tool_call><|projection|>

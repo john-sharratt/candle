@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mind.local/schema/tool.schema.json",
+  "title": "Tool definition",
+  "description": "One callable tool: the definition surfaced into the `tools` collection plus the user-prompt seeds that train its selection. One file per tool under tools/. Execution is bound separately (a Rust handler for built-ins, or a game/stub handler for pluggable tools) keyed by `name`.",
+  "type": "object",
+  "required": ["name", "description", "parameters", "examples"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+$",
+      "description": "Tool name; must match the filename stem and the executor binding the model calls."
+    },
+    "category": {
+      "type": "string",
+      "description": "Grouping used by the tool-catalog summary (e.g. \"Files\", \"Network diagnostics\"). Optional."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the tool does; read by the model to decide when to call it."
+    },
+    "high_risk": {
+      "type": "boolean",
+      "default": false,
+      "description": "Side-effecting or outward-facing (mutation, code execution, remote/network access, credentials). Omitted in the Restricted tools mode."
+    },
+    "parameters": {
+      "type": "object",
+      "description": "JSON Schema for the call arguments (the tool's Request type). Rendered into the `{name,description,parameters}` line the model reads, and used to build the constrained-decode stencil that forces valid call JSON."
+    },
+    "examples": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Selection-calibration examples in ChatML: each is the user prompt, then `<|im_end|><|im_start|>assistant`, then the recorded think→call trajectory (the `<think>…</think>` reasoning and the `<tool_call>{json}</tool_call>`), annotated with `<|projection|>` markers at each wide-Q capture point. Prefilled verbatim during calibration — the loader splits on the assistant header for the user turn vs the prefill body, and the markers are stripped with their token offsets recorded so a projection fires at each. A freshly-authored tool may give just the bare prompt (no assistant part) and let calibration generate the trajectory. Target 8 per tool, authored to be genuinely varied so a held-out example still tests generalization.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

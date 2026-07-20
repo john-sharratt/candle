@@ -1,0 +1,138 @@
+name: file_edit
+category: Files
+description: 'Make a targeted edit to an existing VFS file by replacing a unique substring. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line without rewriting the whole file, applying small surgical changes. The old_str must appear exactly once — if it appears multiple times the call returns ambiguous and asks for more surrounding context. Triggered by "change X to Y in the file", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites use write.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    new_str:
+      description: Replacement text for old_str; an empty string deletes the matched substring. Required.
+      type: string
+    old_str:
+      description: Substring to replace; must match exactly once in the file (multiple matches are rejected as ambiguous). Required.
+      type: string
+    path:
+      description: VFS path of the file to edit (session-relative, e.g. `src/main.rs`). Required.
+      minLength: 1
+      type: string
+  required:
+  - new_str
+  - old_str
+  - path
+  title: EditRequest
+  type: object
+examples:
+- |-
+  in /workspace/Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to change the version in Cargo.toml from 0.1.0 to 0.2.0. I need to use the file_edit tool. The old_str should be 'version = "0.1.0"' and the new_str is '<|projection|>version = "0.2.0"'. The path is Cargo.toml. Wait, the user didn't specify the exact path, but since it's the root, maybe just 'Cargo.toml' is enough. I'll check if the parameters are correct. Oh right, the path needs to be a string<|projection|>. So the JSON should have the name as 'file_edit' and the arguments with new_str, old_str, and path. Let me make sure there are no typos. Yeah, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "version = \"0.2.0\"", "old_str": "version = \"0.1.0\"", "path": "Cargo.toml"}}
+  </tool_call><|projection|>
+- |-
+  in /workspace/src/config.rs replace the string `localhost` with `0.0.0.0`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to replace the string "localhost" with "0.0.0.0" in the file /workspace/src/config.rs. They mentioned using the file_edit tool.
+
+  First, I need to check if the tool's parameters match the request. The tool requires old<|projection|>_str, new_str, and path. The user provided all three: old_str is "localhost", new_str is "0.0.0.0", and the path is "/workspace/src/config.rs".
+
+  I should make sure that the old_str exists exactly once in the file. But since the tool handles that by<|projection|> rejecting if there are multiple matches, I don't need to check it here. Just structure the JSON call correctly.
+
+  So the JSON object should have the name as "file_edit" and the arguments with the required parameters. Let me format that properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "0.0.0.0", "old_str": "localhost", "path": "/workspace/src/config.rs"}}
+  </tool_call><|projection|>
+- |-
+  update the port from 8080 to 9090 in /workspace/config.toml<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to update the port from 8080 to 9090 in the file /workspace/config.toml. Let me check the tools available. There's a tool called file_edit which is meant for replacing a specific substring. The parameters required are old_str, new_str<|projection|>, and path.
+
+  So, the old string should be "8080" and the new one "9090". The path is given as /workspace/config.toml. I need to make sure that the old_str exists exactly once in the file. Since the user is asking to change the port<|projection|>, it's likely that the config file has a line like "port = 8080" which would be replaced.
+
+  I should structure the JSON call with these parameters. Let me double-check the required fields: yes, all three (new_str, old_str, path) are required. Alright, the tool<|projection|> call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "9090", "old_str": "8080", "path": "/workspace/config.toml"}}
+  </tool_call><|projection|>
+- |-
+  rename the function foo to bar in /workspace/src/utils.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to rename the function foo to bar in the file /workspace/src/utils.rs. Let me check the available tools. There's a tool called file_edit which allows replacing a substring. The parameters needed are old_str, new_str, and path.
+
+  The old_str should be "foo<|projection|>" and the new_str should be "bar". The path is given as /workspace/src/utils.rs. I need to make sure that the old_str exists exactly once in the file. Since the user is asking to rename the function, it's likely that "foo" appears once.
+
+  I should structure the tool call<|projection|> with these parameters. Let me double-check the required fields: new_str, old_str, path are all required. The path needs to be a string. Everything seems in order. So the JSON object for the tool call should have the name "file_edit" and the arguments with the correct values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "bar", "old_str": "foo", "path": "/workspace/src/utils.rs"}}
+  </tool_call><|projection|>
+- |-
+  in /workspace/.env swap DEBUG=true for DEBUG=false<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to change the DEBUG value in the .env file from true to false. Let me check the tools available. There's the file_edit tool which replaces a substring. The parameters needed are old_str, new_str, and path.
+
+  So the old string is "DEBUG=true" and the<|projection|> new one should be "DEBUG=false". The path is .env. I need to make sure that the old string exists exactly once. Since the user is asking to replace that specific line, it should work. I'll structure the tool call with these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"old_str": "DEBUG=true", "new_str": "DEBUG=false", "path": ".env"}}
+  </tool_call><|projection|>
+- |-
+  change the log level from "info" to "debug" in /workspace/logging.yaml<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me see. The user wants to change the log level from "info" to "debug" in the file /workspace/logging.yaml. I need to use the file_edit tool for this.
+
+  First, I'll check the parameters required for file_edit. The parameters are new_str, old_str,<|projection|> and path. The old_str should be exactly "info" and the new_str should be "debug". The path is given as /workspace/logging.yaml.
+
+  I need to make sure that "info" appears exactly once in the file. Since the user is asking to change it, I assume that's the case. If<|projection|> there were multiple instances, the tool would flag it as ambiguous, but I have to proceed with the information given.
+
+  So, I'll structure the JSON call with the correct arguments. The name of the tool is file_edit, and the arguments are the new_str, old_str, and path. Let me double-check the<|projection|> parameters to ensure I didn't mix up any fields. Yes, that's correct.
+
+  Alright, I think that's all. The user should get the response indicating the edit was successful.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "debug", "old_str": "info", "path": "/workspace/logging.yaml"}}
+  </tool_call><|projection|>
+- |-
+  in /workspace/docker-compose.yml bump the image tag from :1.2 to :1.3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me see. The user wants to bump the image tag from :1.2 to :1.3 in the docker-compose.yml file. So, I need to use the file_edit tool for this change.
+
+  First, I should check the parameters required for the file_edit function. The parameters are<|projection|> new_str, old_str, and path. The old_str would be ":1.2" and the new_str should be ":1.3". The path is "/workspace/docker-compose.yml".
+
+  Wait, the user mentioned the file is at /workspace/docker-compose.yml. So the path parameter should be exactly that. I<|projection|> need to make sure that the old_str exists exactly once in the file. But since the user is asking to replace the tag, it's likely that the old_str is present once. However, if there are multiple occurrences, the tool will return ambiguous. But since the user is specifically asking for this change, I'll<|projection|> proceed with the given info.
+
+  So, constructing the JSON call for the tool. The name of the tool is file_edit. The arguments are new_str as ":1.3", old_str as ":1.2", and path as "/workspace/docker-compose.yml".
+
+  I need to make sure that the JSON is correctly formatted<|projection|>. Let me double-check the syntax. The keys should be in quotes, and the values as well. No trailing commas. Yes, that looks right.
+
+  Alright, I think that's all. The tool should handle the rest.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": ":1.3", "old_str": ":1.2", "path": "/workspace/docker-compose.yml"}}
+  </tool_call><|projection|>
+- |-
+  fix the typo `recieve` to `receive` in /workspace/src/handlers/mod.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to fix the typo 'recieve' to 'receive' in the file /workspace/src/handlers/mod.rs. So, I need to use the file_edit tool. The parameters required are new_str, old_str, and path. The old_str is '<|projection|>recieve', the new_str is 'receive', and the path is given as /workspace/src/handlers/mod.rs. I should make sure that the JSON is correctly formatted with these values. Let me double-check the parameters to ensure there are no mistakes. Once that's done, the tool call should be accurate.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"new_str": "receive", "old_str": "recieve", "path": "/workspace/src/handlers/mod.rs"}}
+  </tool_call><|projection|>

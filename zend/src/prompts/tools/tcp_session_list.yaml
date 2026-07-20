@@ -1,0 +1,107 @@
+name: tcp_session_list
+category: TCP sessions
+description: Enumerate the raw TCP stream sockets currently open in this conversation, with each peer address and idle state.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open TCP connections<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open TCP connections. Let me check the tools available. There's a tool called tcp_session_list that enumerates raw TCP stream sockets, showing peer addresses and idle states. The parameters are defined in a JSON schema, but the request doesn't require any arguments. So<|projection|> I need to call tcp_session_list with an empty arguments object. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which TCP sockets are open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about which TCP sockets are open. I need to figure out which tool to use here. Looking at the available tools, there's one called tcp_session_list. The description says it enumerates raw TCP stream sockets, listing each peer address and idle state. That sounds exactly like what<|projection|> the user needs.
+
+  The parameters for tcp_session_list are straightforward; there's no required input other than the method itself. Since the user is asking for a list of open TCP sockets, calling this tool should retrieve that information. I don't see any other tools provided that would be relevant here. So, the correct action<|projection|> is to invoke tcp_session_list without any arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the active TCP sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the active TCP sessions. Let me check the available tools. There's a tool called tcp_session_list that enumerates raw TCP stream sockets. The description says it lists each peer address and idle state. That's exactly what the user needs.
+
+  I need to call this tool<|projection|>. The parameters are straightforward; the tool doesn't require any arguments. So I'll generate a JSON object with the tool name and an empty arguments object. Make sure the JSON is properly formatted inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many TCP connections do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many TCP connections do I have?" I need to figure out which tool to use here. Looking at the available tools provided, there's one called tcp_session_list. The description says it enumerates raw TCP stream sockets, listing each peer address and idle state.
+
+  <|projection|>The user wants to know the number of TCP connections. The tcp_session_list tool seems relevant because it would list all the open TCP sessions. So, calling this tool should give the necessary data. The parameters for the tool are defined in the JSON schema, but the request doesn't require any arguments.
+
+  So, the<|projection|> correct action is to invoke the tcp_session_list function. Once that's called, the response should include the list of TCP connections, which the user can then count. Since the user just asked for the number, maybe the tool's response will have that information. But according to the instructions, I just need to make the<|projection|> tool call, not process the result. So the answer is to call tcp_session_list with no arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate the live TCP session ids<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to "enumerate the live TCP session ids." Let me check the available tools. There's a tool called tcp_session_list that lists raw TCP stream sockets with peer addresses and idle states. The parameters are empty, so I just need to call that function. I'll return the tool<|projection|> call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are any raw TCP sockets still connected?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any raw TCP sockets still connected. Let me think about how to approach this.
+
+  First, I need to recall what tools are available. The provided tools include a function called tcp_session_list, which enumerates raw TCP stream sockets, showing each peer address and idle state<|projection|>. That seems exactly what's needed here.
+
+  The user isn't asking for anything beyond the list of connected TCP sockets. The tcp_session_list tool should return the necessary information. Since the question is straightforward, there's no need for additional steps. I should call the tcp_session_list function without any parameters, as per the<|projection|> tool's definition.
+
+  I should make sure the JSON structure is correct, with the name of the tool and an empty arguments object since the parameters are not required. No other functions are relevant here. So the correct tool call is to invoke tcp_session_list with no arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me a list of every open TCP session<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of every open TCP session. Let me check the available tools. There's a tool called tcp_session_list that enumerates raw TCP stream sockets, including peer addresses and idle states. The parameters are defined in the provided JSON schema. Since the user wants all open sessions<|projection|>, I should call this tool. The function doesn't require any arguments, so I'll generate the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what TCP connections am I currently holding?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the TCP connections they're currently holding. Let me see which tool to use here. The available tool is tcp_session_list, which enumerates raw TCP stream sockets with peer addresses and idle states. That sounds exactly like what's needed here.
+
+  The user's question is straightforward:<|projection|> they want to know the current TCP connections. The tool tcp_session_list is designed to list these sessions. So I need to call that tool. There are no parameters required for the tool, as per the parameters definition which is an empty object.
+
+  So the correct action is to invoke the tcp_session_list function without any<|projection|> arguments. The response from this tool should provide the necessary information about the TCP connections. I don't need to perform any other actions here. Just make sure the tool call is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_list", "arguments": {}}
+  </tool_call><|projection|>

@@ -1,0 +1,137 @@
+name: ip_scan
+category: Network diagnostics
+description: Sweep an entire CIDR subnet for live hosts, probing TCP port 80 on each address in the range. Use for LAN discovery and network mapping; link-local 169.254.x.x ranges are blocked.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    subnet:
+      description: IPv4 subnet in CIDR notation (e.g. "192.168.1.0/24"). At most 254 hosts are probed; only TCP port 80 is tested per address. 169.254.x.x link-local is blocked.
+      minLength: 1
+      type: string
+    timeout_ms:
+      description: 'Per-host TCP connect timeout in milliseconds. Default: 200.'
+      format: uint64
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - subnet
+  title: IpScanRequest
+  type: object
+examples:
+- |-
+  scan the subnet 192.168.1.0/24 for live hosts<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to scan the 192.168.1.0/24 subnet for live hosts. Let me check the available tools. There's the ip_scan tool which does exactly that. The parameters required are the subnet in CIDR notation and an optional timeout.
+
+  The<|projection|> user specified the subnet as 192.168.1.0/24, which is valid. The tool's documentation says it probes TCP port 80 on each address. The timeout is optional, with a default of 200ms. Since the user didn't specify a timeout<|projection|>, I'll use the default.
+
+  I need to make sure the subnet isn't a link-local range. 192.168.x.x is private but not link-local, so it's allowed. The tool will handle the rest. So the correct function call is ip_scan with the subnet parameter set to<|projection|> "192.168.1.0/24".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "192.168.1.0/24"}}
+  </tool_call><|projection|>
+- |-
+  find which hosts are up on 10.0.0.0/24<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to find out which hosts are up on the 10.0.0.0/24 subnet. Let me check the available tools. There's the ip_scan tool that sweeps a CIDR subnet. The parameters required are the subnet in CIDR notation and an optional timeout<|projection|>.
+
+  The user specified 10.0.0.0/24, which is a valid subnet. The tool requires the subnet parameter, so I need to set that. The timeout is optional, and the default is 200ms. Since the user didn't specify, I'll use the default<|projection|>.
+
+  I should make sure that the subnet isn't a link-local range. 10.0.0.0/24 isn't a link-local range, so it's allowed. The tool will probe each IP in the subnet, checking TCP port 80. The output will list the live hosts<|projection|>.
+
+  So the correct tool call is ip_scan with the subnet set to 10.0.0.0/24. No need to include the timeout since it's optional and the default is acceptable.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "10.0.0.0/24"}}
+  </tool_call><|projection|>
+- |-
+  sweep the 172.16.0.0/24 network for active machines<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to sweep the 172.16.0.0/24 network for active machines. Let me check the available tools. There's the ip_scan tool which does exactly that. The parameters needed are the subnet in CIDR notation and an optional timeout.
+
+  The subnet<|projection|> provided is 172.16.0.0/24, which fits the required format. The timeout defaults to 200ms if not specified. Since the user didn't mention a different timeout, I'll use the default. I need to make sure that the tool call includes the subnet<|projection|> correctly. No other parameters are needed here. So the tool call should be straightforward.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "172.16.0.0/24"}}
+  </tool_call><|projection|>
+- |-
+  discover live hosts on 192.168.0.0/24<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to discover live hosts on the 192.168.0.0/24 subnet. Let me check the available tools. There's the ip_scan tool which sweeps a CIDR subnet, checking TCP port 80. The parameters require the subnet in CID<|projection|>R notation and an optional timeout.
+
+  The user specified 192.168.0.0/24, which is a common private network. The tool's description mentions blocking link-local ranges, but 192.168.x.x is fine. The default timeout is 20<|projection|>0ms, which is acceptable unless the user has specific needs. Since they didn't mention a different timeout, I'll use the default.
+
+  So, I need to call ip_scan with the subnet parameter set to "192.168.0.0/24". No need to include the timeout<|projection|> since it's optional and the default is suitable. The required parameter is the subnet, so that's all I need.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "192.168.0.0/24"}}
+  </tool_call><|projection|>
+- |-
+  which addresses respond in the 10.10.5.0/25 range?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which addresses in the 10.10.5.0/25 range are responding. Let me think about how to approach this.
+
+  First, I remember that the available tool is ip_scan, which scans a CIDR subnet for live hosts by checking TCP port <|projection|>80. The user's query is about discovering active IPs in a specific subnet. The 10.10.5.0/25 is a valid CIDR notation, so that should work.
+
+  Wait, the tool's parameters require the subnet parameter, which is a string in CIDR notation. The<|projection|> user provided "10.10.5.0/25", which fits. The tool also has a timeout parameter, but the user didn't specify one, so using the default of 200ms is fine. Also, the tool blocks link-local ranges, but 10.10<|projection|>.5.0/25 isn't a private range, so it's allowed.
+
+  So I need to call ip_scan with subnet set to "10.10.5.0/25". The timeout can be omitted since it's optional and the default is acceptable. That should initiate the scan,<|projection|> and the results will show which addresses are responding on port 80.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "10.10.5.0/25"}}
+  </tool_call><|projection|>
+- |-
+  do a host sweep of 192.168.100.0/24 and list everything alive<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to perform a host sweep on the 192.168.100.0/24 subnet. Let me check the available tools. There's the ip_scan tool which scans a CIDR block, checking TCP port 80. The parameters require the<|projection|> subnet and an optional timeout.
+
+  The user specified 192.168.100.0/24, which is a valid CIDR. The tool's description mentions blocking link-local ranges, but 192.168.x.x is fine. Since the default timeout is <|projection|>200ms, maybe I don't need to specify it unless the user wants a different value. The user didn't mention a timeout, so just pass the subnet.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "192.168.100.0/24"}}
+  </tool_call><|projection|>
+- |-
+  scan the subnet 172.20.5.0/24 for reachable hosts<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to scan the subnet 172.20.5.0/24 for live hosts. Let me check the available tools. There's the ip_scan tool which does exactly that. The parameters required are the subnet in CIDR notation and an optional timeout.
+
+  The user<|projection|> specified the subnet as 172.20.5.0/24, which is a valid CIDR notation. The tool requires the subnet parameter, so I need to include that. The timeout is optional, and since the user didn't specify a value, I'll use the default of 2<|projection|>00ms as mentioned in the tool's description.
+
+  I should make sure that the subnet isn't a link-local address. 172.20.5.0/24 isn't a link-local range (which are 169.254.0.0/16),<|projection|> so it's allowed.
+
+  So the tool call should be ip_scan with the subnet parameter set to "172.20.5.0/24" and timeout_ms set to 200. I need to format this as a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "172.20.5.0/24", "timeout_ms": 200}}
+  </tool_call><|projection|>
+- |-
+  map out active machines across the 10.0.42.0/24 subnet<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to map active machines on the 10.0.42.0/24 subnet. Let me check the available tools. There's the ip_scan tool which sweeps a CIDR subnet, checking TCP port 80. The parameters needed are the subnet and an optional<|projection|> timeout.
+
+  The user's request is straightforward: scan the given subnet. The subnet is 10.0.42.0/24. The tool requires the subnet parameter. The timeout has a default, so I don't need to specify it unless necessary. Since the user didn't mention a timeout,<|projection|> I'll omit it.
+
+  I should structure the tool call with the subnet as "10.0.42.0/24". Let me make sure the JSON is correctly formatted. The required field is subnet, which is provided. No other parameters are needed. That's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ip_scan", "arguments": {"subnet": "10.0.42.0/24"}}
+  </tool_call><|projection|>

@@ -1,0 +1,170 @@
+name: tcp_session_send
+category: TCP sessions
+description: 'Write bytes to an open TCP stream. Accepts text via data or arbitrary bytes via data_hex (hex-encoded, whitespace allowed — ''16 03 01 00 ff'' and ''160301 00ff'' both parse). Use for: sending a protocol message, writing a command to a custom service, transmitting a binary payload. Triggered by "send bytes to the connection", "write to the socket", "transmit", "send this packet", "send these hex bytes". Returns bytes_written. Every send requires user confirmation. For the response use tcp_session_recv. For TLS-protected streams use tls_session_send instead.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    data:
+      description: Payload as UTF-8 text. Mutually exclusive with data_hex — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    data_hex:
+      description: Payload as hex-encoded bytes (whitespace allowed). Mutually exclusive with data — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    session_id:
+      description: The session id returned by tcp_session_open.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: SendRequest
+  type: object
+examples:
+- |-
+  send `PING\r\n` to TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send "PING\r\n" to a TCP session called tcp-1. Let me check the tools available.
+
+  There's a tool called tcp_session_send. The description says it's for writing bytes to an open TCP stream. The parameters include data as UTF-8 text or data<|projection|>_hex for hex. The session_id is required.
+
+  The user's command is to send "PING\r\n". Since this is plain text, I should use the data parameter. The session ID is tcp-1.
+
+  Wait, the session ID is probably a UUID or some unique identifier. But the user mentioned "tcp<|projection|>-1", which might be the session ID they're using. So I'll use that in the session_id field.
+
+  So the JSON arguments would be: data is "PING\r\n" and session_id is "tcp-1". I need to make sure that data_hex isn't included since we're using data.<|projection|> Also, check that the parameters are correctly formatted as per the schema.
+
+  Yes, that should work. The tool will handle sending the bytes over the TCP session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"data": "PING\r\n", "session_id": "tcp-1"}}
+  </tool_call><|projection|>
+- |-
+  write the raw bytes deadbeef to TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the raw bytes deadbeef to a TCP session called tcp-1. Hmm, I need to use the tool provided, which is tcp_session_send.
+
+  Wait, the parameters for that tool require either data (as UTF-8 text) or data<|projection|>_hex (as hex). Since the user specified "raw bytes" and gave a hex string, I should use data_hex. The session_id would be tcp-1.
+
+  But wait, the session ID from the example was something like "session-123", but the user wrote "tcp-1". Maybe in<|projection|> this context, "tcp-1" is the correct session ID. So I'll use that as the session_id parameter.
+
+  So, the arguments should be data_hex: "deadbeef". Let me check if there's any whitespace allowed. The tool says whitespace is allowed in data_hex, but the example uses "<|projection|>16 03 01 00 ff" which becomes 16030100ff. But here, the input is "deadbeef" without spaces, so it's straightforward.
+
+  Therefore, the JSON call should be name: tcp_session_send, arguments: {"data_hex":<|projection|> "deadbeef", "session_id": "tcp-1"}.
+
+  Wait, the required parameters are session_id. Data and data_hex are mutually exclusive. Since the user wants to send raw bytes, data_hex is the right choice. Yep, that's correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"data_hex": "deadbeef", "session_id": "tcp-1"}}
+  </tool_call><|projection|>
+- |-
+  send `GET / HTTP/1.0\r\n\r\n` to TCP session tcp-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the HTTP GET request "GET / HTTP/1.0\r\n\r\n" through a TCP session named "tcp-2". Let me check the available tools.
+
+  The tool provided is tcp_session_send, which requires the session_id and either data or data_hex. The<|projection|> user's command uses a string, so I should use the 'data' parameter.
+
+  Wait, the user's input is a string, not hex. So I need to pass the string directly in the 'data' field. The session ID is "tcp-2" as given.
+
+  I need to make sure<|projection|> that the JSON structure is correct, with the session_id, and the data parameter containing the HTTP request. No hex here since it's a direct string.
+
+  So the tool call should have name "tcp_session_send", arguments with session_id "tcp-2" and data set to "GET / HTTP/1.<|projection|>0\r\n\r\n". That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"session_id": "tcp-2", "data": "GET / HTTP/1.0\r\n\r\n"}}
+  </tool_call><|projection|>
+- |-
+  transmit `INFO\r\n` to TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the string "INFO\r\n" to a TCP session called tcp-1. Let me check the tools available.
+
+  There's a tool called tcp_session_send. The parameters are data (as UTF-8 text) or data_hex (hex-encoded bytes). Since the user is<|projection|> sending a string, not hex, I should use the data parameter.
+
+  The session ID is tcp-1. So I need to call tcp_session_send with data set to "INFO\r\n" and session_id as "tcp-1".
+
+  Wait, the parameters require session_id, which is required. The user specified<|projection|> "tcp-1" as the session, so that's correct.
+
+  I should make sure that the JSON is properly formatted. The arguments should be a JSON object with data and session_id. No hex here since it's a plain string.
+
+  Yes, that's all. The tool call should be correct.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"data": "INFO\r\n", "session_id": "tcp-1"}}
+  </tool_call><|projection|>
+- |-
+  write the hex bytes 0badf00d to TCP session tcp-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the hex bytes 0badf00d to a TCP session called tcp-3. Wait, but the tool's parameters mention session_id, not the TCP session name. Oh right, the session_id is the one returned by tcp_session_open.<|projection|> But the user mentioned "TCP session tcp-3", so maybe the session_id is "tcp-3".
+
+  So the tool is tcp_session_send. The parameters are data or data_hex, and session_id. The user provided the hex bytes as 0badf00d. So I need to pass data<|projection|>_hex as "0badf00d". Also, the session_id is "tcp-3" based on the user's input.
+
+  Wait, but the example in the tool's description uses a session ID. The user said "TCP session tcp-3", so the session_id should be "tcp-3".<|projection|>
+
+  So the JSON arguments would be: data_hex set to "0badf00d" and session_id "tcp-3". The data parameter isn't used here since data_hex is provided. That should send the hex bytes correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"data_hex": "0badf00d", "session_id": "tcp-3"}}
+  </tool_call><|projection|>
+- |-
+  push `QUIT\r\n` down TCP session tcp-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send a "QUIT\r\n" command over a TCP session. Let me check the available tools. There's a tool called tcp_session_send which sends bytes through an open TCP connection. The parameters required are session_id, data, or data_hex. Since the user is sending text<|projection|>, I should use the data parameter. The session ID is given as tcp-2, so I'll use that. I need to make sure to format the JSON correctly with the session_id and the data as "QUIT\r\n". No hex needed here. Let me double-check the parameters: yes, data is for<|projection|> UTF-8 text. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"session_id": "tcp-2", "data": "QUIT\r\n"}}
+  </tool_call><|projection|>
+- |-
+  can you send `EHLO zen\r\n` over TCP session tcp-4?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send the command "EHLO zen\r\n" over a TCP session called "tcp-4". Let me check the tools available.
+
+  Looking at the tools provided, there's a function called tcp_session_send. The description says it's for writing bytes to an open TCP stream.<|projection|> The parameters include data (as UTF-8 text), data_hex (hex-encoded bytes), and session_id. The session_id is required, which should be from a previous open session.
+
+  The user mentioned "TCP session tcp-4", so the session_id should be "tcp-4". The command "EHLO zen<|projection|>\r\n" is text, so I should use the data parameter. Since the user didn't specify hex, I don't need data_hex.
+
+  I need to make sure that the JSON structure is correct. The tool call should have the name "tcp_session_send" and the arguments with data and session_id. Let<|projection|> me double-check the parameters: data is "EHLO zen\r\n" and session_id is "tcp-4".
+
+  Wait, the user wrote "tcp-4" as the session name. The session_id is a string, so that's fine. The function requires session_id, which is provided. The data<|projection|> is the EHLO command with CRLF, which is correct for SMTP.
+
+  I think that's all. The tool call should be correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"data": "EHLO zen\r\n", "session_id": "tcp-4"}}
+  </tool_call><|projection|>
+- |-
+  send the raw bytes cafebabe00ff to TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the raw bytes "cafebabe00ff" to a TCP session called "tcp-1".
+
+  First, I need to check the available tools. There's the tcp_session_send function. The parameters required are session_id, data, and<|projection|> data_hex. The session_id is given as "tcp-1".
+
+  The data can be sent either as text or hex. Since the user provided hex bytes, I should use data_hex. The value is "cafebabe00ff". But wait, the format allows whitespace, so maybe it's better to<|projection|> pass it as is. Also, the tool's description says that data_hex is for arbitrary bytes, which fits here.
+
+  So, the arguments would be:
+  - session_id: "tcp-1"
+  - data_hex: "cafebabe00ff"
+
+  I need to make sure that the JSON is correctly formatted<|projection|>. No other parameters are needed. The user didn't mention any other details, so this should be sufficient.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_send", "arguments": {"session_id": "tcp-1", "data_hex": "cafebabe00ff"}}
+  </tool_call><|projection|>
