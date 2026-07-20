@@ -307,12 +307,21 @@
   // scroll is left completely free; we only pin to the bottom when they're
   // already there. Falls back to a full render if the message isn't in the DOM
   // yet (first paint of the turn) or the target conversation isn't on screen.
-  let _livePending = false;
+  let _livePending = false, _liveLast = 0, _liveTimer = null;
+  // The live re-parse cost grows with the message length (it re-parses the whole
+  // message-so-far), so at 60fps a long reply is quadratic. Cap the full re-parse
+  // to ~12fps while streaming — tokens still appear smoothly, at a fraction of the
+  // CPU. A trailing timer guarantees the final state renders; onDone re-renders too.
+  const LIVE_MIN_MS = 80;
+  function _now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
   function scheduleLiveUpdate(convId) {
     if (convId !== S.activeId) return;   // off-screen conversation: state is enough
     if (_livePending) return;
     _livePending = true;
-    requestAnimationFrame(() => { _livePending = false; liveUpdateStreaming(); });
+    const run = () => { _livePending = false; _liveLast = _now(); liveUpdateStreaming(); };
+    const wait = LIVE_MIN_MS - (_now() - _liveLast);
+    if (wait <= 0) requestAnimationFrame(run);
+    else { clearTimeout(_liveTimer); _liveTimer = setTimeout(() => requestAnimationFrame(run), wait); }
   }
   function liveUpdateStreaming() {
     // Never rebuild the message DOM out from under an active text selection in
@@ -578,6 +587,25 @@
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
   }
+  // Memoized `nodeHtml` for FINISHED messages: a full render re-parses the whole
+  // transcript's markdown otherwise, so a menu toggle or a 5s sync re-parses every
+  // message. A finished message's `content` is a stable string ref → `===` is O(1),
+  // so all unchanged bubbles are cache hits and only the changed/streaming one is
+  // re-parsed. Streaming messages are never cached (they change every frame).
+  function nodeHtmlMemo(msg, open, toolOutputs) {
+    if (msg.streaming) return nodeHtml(msg, open, toolOutputs);
+    const to = toolOutputs || msg.toolOutputs || null;
+    // `toolOut[idx]` is rebuilt each render, so key by value. Join the outputs
+    // exactly (NUL-separated — never in text) rather than a lossy length sum, so
+    // two different output sets can't collide into a stale cache hit. Tool outputs
+    // are small, so the compare is cheap.
+    const toKey = to ? to.join('\u0000') : '';
+    const c = msg._htmlCache;
+    if (c && c.content === msg.content && c.open === open && c.toKey === toKey) return c.html;
+    const html = nodeHtml(msg, open, toolOutputs);
+    msg._htmlCache = { content: msg.content, open: open, toKey: toKey, html: html };
+    return html;
+  }
 
   // ── projection display derivation (raw core -> display) ─────────────────
   // The timeline dot's color (by span id). Bar-map colors are derived per
@@ -612,8 +640,23 @@
   };
 
   // ── logs state buffer ────────────────────────────────────────────────────
+  const MAX_LOGS = 600;
   let logs = API.seedLogs();
-  function addLog(line) { if (!line) return; logs = logs.concat([line]).slice(-600); renderLogsOnly(); }
+  function addLog(line) {
+    if (!line) return;
+    // Ring buffer, mutated in place (no per-line copy of the 600-element array).
+    logs.push(line);
+    if (logs.length > MAX_LOGS) logs.splice(0, logs.length - MAX_LOGS);
+    // Incremental DOM: append ONE row to the live list and trim the head, instead
+    // of rebuilding all ~600 rows per line — that per-line full rebuild is what
+    // made a running stream with the Logs pane open sluggish.
+    if (S.logsOpen && logEl && logEl.isConnected) {
+      const atBottom = nearBottom(logEl);
+      logEl.appendChild(logRow(line));
+      while (logEl.childElementCount > MAX_LOGS) logEl.removeChild(logEl.firstChild);
+      if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    }
+  }
 
   // ── actions ──────────────────────────────────────────────────────────────
   function selectConv(id) { writeHashConv(id); setState({ activeId: id, sidebarDrawer: false }, () => { hydrateIfNeeded(id); scrollChat(); if (!S.narrow) focusPrompt(); }); }
@@ -723,47 +766,54 @@
   }
 
   function patchStream(convId, fn) {
-    S.conversations = S.conversations.map((c) => {
-      if (c.id !== convId) return c;
-      const history = c.history.slice();
-      // Patch the STREAMING message, not blindly the tail: an inline
-      // `role:"upload"` tile (or any event) can land on the tail mid-response
-      // — writing tokens into history[last] would then corrupt that event and
-      // freeze the visible stream. Fall back to the tail if none is streaming.
-      let idx = history.length - 1;
-      for (let i = history.length - 1; i >= 0; i--) { if (history[i] && history[i].streaming) { idx = i; break; } }
-      if (idx < 0) idx = history.length - 1;
-      const last = Object.assign({}, history[idx]);
-      fn(last);
-      history[idx] = last;
-      return Object.assign({}, c, { history });
-    });
+    // Mutate the streaming message IN PLACE — the previous version copied the whole
+    // conversations array + sliced the full history + Object.assign'd a message on
+    // EVERY token (O(history) allocation per token). The render is coalesced to a
+    // frame and reads current state, and the streaming bubble is never memoized, so
+    // in-place mutation is safe and O(1) per token.
+    const c = S.conversations.find((c) => c.id === convId);
+    if (!c) return;
+    // Patch the STREAMING message, not blindly the tail: an inline `role:"upload"`
+    // tile (or any event) can land on the tail mid-response — writing tokens into
+    // history[last] would corrupt that event and freeze the visible stream. Fall
+    // back to the tail if none is streaming.
+    let idx = c.history.length - 1;
+    for (let i = c.history.length - 1; i >= 0; i--) { if (c.history[i] && c.history[i].streaming) { idx = i; break; } }
+    if (idx < 0) idx = c.history.length - 1;
+    if (c.history[idx]) fn(c.history[idx]);
     scheduleLiveUpdate(convId);
   }
+  // Cache the block-count parse by content, so several projections (or a
+  // projection + the display render) at the same content don't each re-parse the
+  // whole message just to count top-level blocks.
+  let _blockCountCache = { content: null, count: 0 };
+  function blockCountFor(content) {
+    content = content || '';
+    if (_blockCountCache.content !== content) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = renderContent(content, true, false);
+      _blockCountCache = { content: content, count: tmp.children.length };
+    }
+    return _blockCountCache.count;
+  }
   function appendProjection(convId, span) {
-    S.conversations = S.conversations.map((c) => {
-      if (c.id !== convId) return c;
-      const history = c.history.slice();
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i].role === 'assistant') {
-          const m = Object.assign({}, history[i]);
-          // Freeze the content-block COUNT at this projection's boundary,
-          // computed by rendering the current content into a DETACHED node so
-          // it's layout-free. The bar wraps whole blocks [prev._blockEnd,
-          // this._blockEnd) — coarse but stable.
-          const tmp = document.createElement('div');
-          tmp.innerHTML = renderContent(m.content || '', true, false);
-          span._blockEnd = tmp.children.length;
-          // Also freeze the raw char offset, so a COMPLETED block that several
-          // projections fired inside (a finished think block) can split its bar
-          // into proportional sub-bars by char fraction (see applyProjSegments).
-          span._charEnd = (m.content || '').length;
-          m.spans = (m.spans || []).concat([span]);
-          history[i] = m; break;
-        }
+    // Mutate the streaming assistant message in place (see `patchStream`).
+    const c = S.conversations.find((c) => c.id === convId);
+    if (!c) return;
+    for (let i = c.history.length - 1; i >= 0; i--) {
+      if (c.history[i].role === 'assistant') {
+        const m = c.history[i];
+        // Freeze the content-block COUNT at this projection's boundary. The bar
+        // wraps whole blocks [prev._blockEnd, this._blockEnd) — coarse but stable.
+        span._blockEnd = blockCountFor(m.content);
+        // Also freeze the raw char offset, so a COMPLETED block that several
+        // projections fired inside (a finished think block) can split its bar into
+        // proportional sub-bars by char fraction (see applyProjSegments).
+        span._charEnd = (m.content || '').length;
+        m.spans = (m.spans || []).concat([span]);
+        break;
       }
-      return Object.assign({}, c, { history });
-    });
+    }
     scheduleLiveUpdate(convId);
   }
   // Cancel the in-flight response stream. Aborts the underlying fetch, which
@@ -968,7 +1018,10 @@
       hist = conv.history.slice(0, uk >= 0 ? uk : (i >= 0 ? i : 0));
     }
     savedSubstrateScroll = null;   // a fresh open starts at the top, not last session's offset
-    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
+    // Snapshot the bubble (shallow copy) so the panel is a point-in-time view: the
+    // streaming message is now mutated in place (see `patchStream`), so holding a
+    // live ref would let the panel's content/spans drift as more tokens arrive.
+    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg ? Object.assign({}, msg) : null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
     // Fallback: if a panel opens before any conversation hydrated (e.g. a brand
     // new chat), pull the workspace-wide glue + content via the main GET.
     if (S.substrateContent == null) {
@@ -996,8 +1049,18 @@
     const invert = which === 'r';
     const min = which === 'l' ? 120 : 160, max = which === 'l' ? 420 : 560;
     setState({ dragging: which });
-    const move = (mv) => { const dx = (mv.clientX - startX) * (invert ? -1 : 1); const w = Math.max(min, Math.min(max, startW + dx)); setState(which === 'l' ? { sidebarW: w } : { logW: w }); };
-    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.body.style.cursor = ''; document.body.style.userSelect = ''; setState({ dragging: null }); };
+    const sel = which === 'l' ? '.z-sb' : '.z-logs';
+    let lastW = startW;
+    // Resize the live node directly during the drag — a `setState` per mousemove
+    // would re-render the whole app (re-parsing the transcript) on every pixel.
+    const move = (mv) => {
+      const dx = (mv.clientX - startX) * (invert ? -1 : 1);
+      lastW = Math.max(min, Math.min(max, startW + dx));
+      const el = document.querySelector(sel);
+      if (el) el.style.width = lastW + 'px';
+    };
+    // Commit the final width to state (a single render), clearing the drag flag.
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.body.style.cursor = ''; document.body.style.userSelect = ''; setState(which === 'l' ? { sidebarW: lastW, dragging: null } : { logW: lastW, dragging: null }); };
     document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
   }
@@ -1287,7 +1350,7 @@
           turnCopyBtn(m, 'right:0;')));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
-        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open, toolOut[idx]) });
+        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtmlMemo(m, open, toolOut[idx]) });
         // Draw the projection bars by measuring the inline anchors — deferred to
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect
@@ -1511,6 +1574,7 @@
     files: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:12px;"><path d="M3 1.2h4.4l3 3v8.6H3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M7.2 1.4v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>',
     perf: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.5 1.5v11h11M4 9l2.5-3 2 2L12 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     substrate: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M7 1.2 12.5 4 7 6.8 1.5 4 7 1.2ZM1.5 7 7 9.8 12.5 7M1.5 10 7 12.8 12.5 10" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>',
+    project: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.8 7h6.4M6.2 4.2 9 7l-2.8 2.8M10.5 2.5v9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     menu: '<svg viewBox="0 0 16 16" fill="none" style="width:15px;height:15px;"><circle cx="8" cy="3" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="13" r="1.4" fill="currentColor"/></svg>',
   };
 
@@ -1524,6 +1588,7 @@
       { key: 'files', label: 'Files', icon: ICON.files, active: S.filesOpen, badge: filesCount || null, title: 'Conversation files', onClick: () => setState({ filesOpen: !S.filesOpen, topMenuOpen: false }) },
       { key: 'perf', label: 'Perf', icon: ICON.perf, href: '/perf', title: 'Wave & pressure telemetry' },
       { key: 'substrate', label: 'Substrate', icon: ICON.substrate, href: '/substrate', title: 'Substrate inspector' },
+      { key: 'project', label: 'Project', icon: ICON.project, href: '/project', title: 'Project a query against the substrate' },
     ].filter(Boolean);
   }
 
@@ -2461,15 +2526,17 @@
   }
 
   // ── logs pane ────────────────────────────────────────────────────────────
+  // One log row — extracted so `addLog` can append a single row incrementally.
+  function logRow(l) {
+    const cc = logColors(l.level);
+    return h('div', { style: 'display:grid; grid-template-columns:54px 42px 1fr; gap:0 0.4rem; padding:0.12rem 0.65rem; align-items:center; min-width:0;' },
+      h('span', { style: 'color:#4a4540; white-space:nowrap; overflow:hidden; user-select:none; font-size:10px;' }, l.ts),
+      h('span', { style: 'font-size:9px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; white-space:nowrap; padding:0.15em 0.4em; border-radius:3px; text-align:center; color:' + cc[0] + '; background:' + cc[1] + ';' }, l.level),
+      h('span', { style: 'min-width:0; word-break:break-word; white-space:pre-wrap;', html: '<span style="color:#56504a;">' + esc(l.target) + '</span><span style="color:#2a2724;"> › </span><span style="color:#c0bbb6;">' + esc(l.msg) + '</span>' }));
+  }
   function buildLogs() {
     const listEl = h('div', { class: 'zscroll-log', ref: (el) => { logEl = el; }, style: "flex:1; min-height:0; overflow-y:auto; font-family:'Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace; font-size:11px; line-height:1.55; padding:0.3rem 0;" });
-    logs.forEach((l) => {
-      const cc = logColors(l.level);
-      listEl.appendChild(h('div', { style: 'display:grid; grid-template-columns:54px 42px 1fr; gap:0 0.4rem; padding:0.12rem 0.65rem; align-items:center; min-width:0;' },
-        h('span', { style: 'color:#4a4540; white-space:nowrap; overflow:hidden; user-select:none; font-size:10px;' }, l.ts),
-        h('span', { style: 'font-size:9px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; white-space:nowrap; padding:0.15em 0.4em; border-radius:3px; text-align:center; color:' + cc[0] + '; background:' + cc[1] + ';' }, l.level),
-        h('span', { style: 'min-width:0; word-break:break-word; white-space:pre-wrap;', html: '<span style="color:#56504a;">' + esc(l.target) + '</span><span style="color:#2a2724;"> › </span><span style="color:#c0bbb6;">' + esc(l.msg) + '</span>' })));
-    });
+    logs.forEach((l) => listEl.appendChild(logRow(l)));
     return h('div', { class: 'z-logs', style: 'flex-shrink:0; width:' + S.logW + 'px; height:100%; display:flex; flex-direction:column; background:#0f0e0d; overflow:hidden;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:0.9rem 0.75rem 0.75rem; border-bottom:1px solid #252220; background:#0f0e0d;' },
         h('span', { style: 'font-size:0.78rem; font-weight:650; color:#5a5450; letter-spacing:0.06em; text-transform:uppercase;' }, 'Logs'),

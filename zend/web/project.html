@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zend · project</title>
+<link rel="icon" href="favicon.svg">
+<script>
+  // Mirror the app's theme dropdown (dark-native + CSS filter for light/vivid). Pre-paint.
+  (function(){ try {
+    var t = localStorage.getItem('zend.theme') || 'dark';
+    document.documentElement.style.filter =
+      t === 'light' ? 'invert(1) hue-rotate(180deg)'
+      : t === 'vivid' ? 'saturate(1.75) contrast(1.06)'
+      : 'none';
+  } catch (e) {} })();
+</script>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#111820; --panel2:#0e141b; --line:#1e2a37; --line2:#28384a;
+    --ink:#e6edf3; --ink-dim:#8aa0b4; --ink-faint:#5b7186;
+    --accent:#38bdf8; --ok:#34d399; --warn:#fbbf24; --crit:#f87171;
+    --c-user:#a99cd6; --c-asst:#7fc6a4; --c-glue:#6a6258; --c-think:#c9a14a; --c-sum:#d8a23a; --c-sys:#6f9ed8;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","Cascadia Mono",Consolas,"Roboto Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  html{background:var(--bg)}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:24px 20px 72px}
+
+  header.top{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:16px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em;font-size:16px}
+  .brand svg{width:26px;height:26px;color:var(--accent)}
+  .brand .sub{color:var(--ink-faint);font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+  .spacer{flex:1}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;letter-spacing:.05em;
+    border:1px solid var(--line2);border-radius:999px;padding:5px 11px;color:var(--ink-dim)}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ink-faint)}
+  .pill.busy{color:var(--accent);border-color:#1e3a4a}.pill.busy .dot{background:var(--accent)}
+  .pill.ok{color:var(--ok);border-color:#1f4a3c}.pill.ok .dot{background:var(--ok)}
+  .pill.err{color:var(--crit);border-color:#4a2626}.pill.err .dot{background:var(--crit)}
+  .back{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12px;color:var(--ink-dim);
+    text-decoration:none;border:1px solid var(--line2);border-radius:9px;padding:7px 12px}
+  .back:hover{color:var(--ink);border-color:var(--accent)}
+
+  .hint{color:var(--ink-dim);font-size:13px;line-height:1.55;max-width:80ch;margin:0 0 14px}
+  textarea.input{width:100%;resize:vertical;min-height:66px;background:var(--panel);color:var(--ink);
+    border:1px solid var(--line2);border-radius:12px;padding:13px 15px;font-family:var(--mono);font-size:14px;
+    line-height:1.6;outline:none;white-space:pre-wrap;overflow-wrap:anywhere}
+  textarea.input:focus{border-color:var(--accent)}
+  .metaline{color:var(--ink-faint);font-family:var(--mono);font-size:11.5px;margin:10px 2px 4px;min-height:15px}
+
+  .badge{font-family:var(--mono);font-size:10px;letter-spacing:.04em;text-transform:uppercase;border-radius:5px;
+    padding:2px 6px;border:1px solid var(--line2);color:var(--ink-dim);white-space:nowrap}
+  .badge.sot,.badge.sos{color:var(--c-sum);border-color:#4a3d1f}
+  .badge.section{color:var(--c-sys);border-color:#22384a}
+  .badge.norm{color:var(--c-asst);border-color:#204035}
+  .badge.unsel{color:var(--ink-faint)}
+
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:11px;margin-top:8px}
+  .tile{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--line2);border-radius:11px;
+    padding:12px 13px;cursor:pointer;display:flex;flex-direction:column;gap:8px;min-width:0}
+  .tile:hover{border-color:var(--line2)}
+  .tile.k-sot,.tile.k-sos{border-left-color:var(--c-sum)}
+  .tile.k-section{border-left-color:var(--c-sys)}
+  .tile.k-normal{border-left-color:var(--c-asst)}
+  .tile.unsel{opacity:.5}
+  .tile .thead{display:flex;align-items:center;gap:8px}
+  .tile .score{font-size:19px;font-weight:680;letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--ink-dim)}
+  .tile .score.hi{color:var(--ok)}.tile .score.mid{color:var(--accent)}
+  .tile .tk{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+  .tile .nm{font-family:var(--mono);font-size:12.5px;font-weight:600;overflow-wrap:anywhere;
+    display:-webkit-box;-webkit-line-clamp:2;line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .tile .sub{color:var(--ink-faint);font-family:var(--mono);font-size:10.5px}
+  .tile .prev{font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);line-height:1.5;
+    display:-webkit-box;-webkit-line-clamp:4;line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;
+    background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:8px 9px;white-space:pre-wrap;overflow-wrap:anywhere}
+  .empty{color:var(--ink-faint);font-style:italic;font-size:13px;padding:26px 2px;text-align:center}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line2);border-top-color:var(--accent);
+    border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* Expanded tile → modal */
+  .ov{position:fixed;inset:0;z-index:60;background:rgba(3,6,10,.72);display:flex;align-items:center;justify-content:center;padding:20px}
+  .modal{background:var(--panel);border:1px solid var(--line2);border-radius:14px;max-width:840px;width:100%;
+    max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal .mhdr{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .modal .mhdr .nm{font-family:var(--mono);font-size:13px;font-weight:600;overflow-wrap:anywhere;min-width:0}
+  .modal .mhdr .x{margin-left:auto;cursor:pointer;color:var(--ink-dim);border:1px solid var(--line2);border-radius:8px;
+    padding:5px 10px;font-family:var(--mono);font-size:12px;background:transparent}
+  .modal .mhdr .x:hover{color:var(--ink);border-color:var(--accent)}
+  .modal .mbody{padding:14px 16px;overflow:auto}
+  pre.body{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--mono);font-size:12.5px;line-height:1.55;
+    background:#0a0e13;border:1px solid var(--line);border-radius:8px;padding:11px 12px}
+  .note{color:var(--ink-faint);font-family:var(--mono);font-size:11px;margin-top:26px;text-align:center}
+
+  @media (max-width:640px){
+    .wrap{padding:16px 13px 60px}
+    .spacer{display:none}
+    header.top{gap:8px}
+    .tiles{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7 24h22M23 15l10 9-10 9M37 9v30"/>
+      </svg>
+      <span>project</span><span class="sub">live retrieval</span>
+    </div>
+    <span class="pill" id="status"><span class="dot"></span><span id="statustxt">idle</span></span>
+    <div class="spacer"></div>
+    <a class="back" href="/substrate" onclick="if(history.length>1){history.back();return false;}">&larr; back</a>
+  </header>
+
+  <p class="hint">Type a hypothetical message. As you type it is prefilled under the current system prompt
+    and projected against the substrate — the tiles below are the turns and sections the model would
+    retrieve for it, sorted by belief score. Click a tile to read the whole thing.</p>
+  <textarea id="input" class="input" rows="3" spellcheck="false"
+    placeholder="e.g. how does the redo log get replayed on boot?"></textarea>
+  <div class="metaline" id="metaline"></div>
+  <div class="tiles" id="tiles"></div>
+
+  <div class="note" id="foot">zend project · /project</div>
+</div>
+
+<script>
+"use strict";
+const MOCK = new URLSearchParams(location.search).has('mock');
+// Safety net only — a projection should take well under a second; this just keeps
+// a genuinely hung request from freezing the box forever.
+const REQUEST_TIMEOUT_MS = 45000;
+
+function h(tag, attrs, children){
+  const e=document.createElement(tag);
+  if(attrs) for(const k in attrs){
+    if(k==='class') e.className=attrs[k];
+    else if(k==='text') e.textContent=attrs[k];
+    else if(k.slice(0,2)==='on') e.addEventListener(k.slice(2), attrs[k]);
+    else if(attrs[k]!=null) e.setAttribute(k, attrs[k]);
+  }
+  if(children!=null){ (Array.isArray(children)?children:[children]).forEach(c=>{
+    if(c==null) return; e.appendChild(typeof c==='string'?document.createTextNode(c):c);
+  });}
+  return e;
+}
+function badge(cls, txt){ return h('span',{class:'badge '+cls,text:txt}); }
+function fmtTok(n){ n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+'k' : ''+n; }
+function fmtScore(n){ n=n||0; const a=Math.abs(n);
+  return a>=1000 ? (n/1000).toFixed(1)+'k' : a>=100 ? Math.round(n)+'' : n.toFixed(a>=10?0:1); }
+function kindLabel(k){ return k==='sot'?'summary of turns':k==='sos'?'summary of summaries':k==='section'?'section':'turn'; }
+
+function setStatus(cls, txt){
+  document.getElementById('status').className='pill '+cls;
+  document.getElementById('statustxt').textContent=txt;
+}
+
+// ── single-flight coalescing controller ─────────────────────────────────────
+// Each keystroke dirties state and kicks immediately. At most one projection is
+// in flight; while one runs, further edits just set `pending`, and the LATEST
+// text is re-projected the moment it finishes. Single-flight is the throttle —
+// no debounce — so continuous typing keeps updating (one projection per
+// projection, always with the current text) instead of stalling until a pause.
+const P = { inflight:false, pending:false };
+function onInput(){
+  P.pending=true;
+  kick();
+}
+async function kick(){
+  if(P.inflight) return;                    // one in flight — it will relaunch on finish
+  const text=document.getElementById('input').value;
+  if(!text.trim()){
+    P.pending=false;
+    document.getElementById('tiles').replaceChildren();
+    document.getElementById('metaline').textContent='';
+    setStatus('', 'idle');
+    return;
+  }
+  P.inflight=true; P.pending=false;
+  setStatus('busy', 'projecting…');
+  try{
+    const res = MOCK ? mockProject(text) : await postJSON('/v1/substrate/project', { text }, REQUEST_TIMEOUT_MS);
+    render(res);
+    setStatus('ok', 'ready');
+  }catch(e){
+    const msg = (''+e).includes('abort') ? 'timed out' : (''+e).includes('503') ? 'model loading…' : 'error';
+    setStatus('err', msg);
+    document.getElementById('metaline').textContent = 'projection failed: '+e;
+  }finally{
+    P.inflight=false;
+    if(P.pending) kick();                    // trailing: re-project the latest text
+  }
+}
+
+async function postJSON(path, body, timeoutMs){
+  const ctl=new AbortController();
+  const t=timeoutMs?setTimeout(()=>ctl.abort(), timeoutMs):null;
+  try{
+    const r=await fetch(path,{method:'POST',cache:'no-store',signal:ctl.signal,
+      headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(body)});
+    if(!r.ok) throw new Error(r.status);
+    return await r.json();
+  } finally { if(t) clearTimeout(t); }
+}
+
+// ── render ──────────────────────────────────────────────────────────────────
+function render(res){
+  const tiles=(res.tiles||[]).slice().sort((a,b)=> b.score-a.score);
+  const host=document.getElementById('tiles');
+  const sel=tiles.filter(t=>t.selected).length;
+  document.getElementById('metaline').textContent =
+    (res.query_tokens!=null ? res.query_tokens+' query tokens · ' : '') +
+    tiles.length+' candidate'+(tiles.length===1?'':'s')+' · '+sel+' selected';
+  if(!tiles.length){ host.replaceChildren(h('div',{class:'empty',text:'No candidates retrieved for this query.'})); return; }
+  const maxScore=tiles.reduce((m,t)=>Math.max(m,t.score),0)||1;
+  host.replaceChildren(...tiles.map(t=>tileEl(t, maxScore)));
+}
+function tileEl(t, maxScore){
+  const ratio = maxScore>0 ? t.score/maxScore : 0;
+  const scoreCls = ratio>=0.66 ? 'hi' : ratio>=0.33 ? 'mid' : '';
+  const kindCls = t.kind==='section' ? 'section' : t.kind==='sot' ? 'sot' : t.kind==='sos' ? 'sos' : 'norm';
+  const el=h('div',{class:'tile k-'+t.kind+(t.selected?'':' unsel'), onclick:()=>openModal(t)},[
+    h('div',{class:'thead'},[
+      h('span',{class:'score '+scoreCls,text:fmtScore(t.score)}),
+      h('div',{class:'tk'},[
+        t.selected?null:badge('unsel','skipped'),
+        badge(kindCls, kindLabel(t.kind)),
+        badge('', fmtTok(t.tokens)+' tok'),
+      ].filter(Boolean)),
+    ]),
+    h('div',{class:'nm',text:t.label||'(unnamed)'}),
+    (t.layer||t.group)?h('div',{class:'sub',text:[t.layer,t.group].filter(Boolean).join(' / ')}):null,
+    (t.text&&t.text.trim())?h('div',{class:'prev',text:t.text}):null,
+  ].filter(Boolean));
+  return el;
+}
+
+// ── expanded tile modal ─────────────────────────────────────────────────────
+let modalEsc=null;
+function openModal(t){
+  closeModal();
+  const ov=h('div',{class:'ov',onclick:(e)=>{ if(e.target===ov) closeModal(); }},[
+    h('div',{class:'modal'},[
+      h('div',{class:'mhdr'},[
+        h('div',{class:'nm',text:t.label||'(unnamed)'}),
+        badge('', kindLabel(t.kind)),
+        badge('', fmtScore(t.score)+' score'),
+        badge('', fmtTok(t.tokens)+' tok'),
+        h('button',{class:'x',text:'× close',onclick:closeModal}),
+      ]),
+      h('div',{class:'mbody'},[
+        (t.layer||t.group)?h('div',{class:'metaline',text:[t.layer,t.group].filter(Boolean).join(' / ')}):null,
+        (t.text&&t.text.trim())
+          ? h('pre',{class:'body',text:t.text})
+          : h('div',{class:'empty',text:'(no content resolved for this item)'}),
+      ].filter(Boolean)),
+    ]),
+  ]);
+  ov.id='tile-modal';
+  document.body.appendChild(ov);
+  modalEsc=(e)=>{ if(e.key==='Escape') closeModal(); };
+  document.addEventListener('keydown', modalEsc);
+}
+function closeModal(){
+  const m=document.getElementById('tile-modal'); if(m) m.remove();
+  if(modalEsc){ document.removeEventListener('keydown', modalEsc); modalEsc=null; }
+}
+
+// ── boot ────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded',()=>{
+  if(MOCK){ document.getElementById('foot').textContent='zend project · /project · mock preview'; }
+  document.getElementById('input').addEventListener('input', onInput);
+  document.getElementById('input').focus();
+  setInterval(pollBuild, 5000);
+});
+
+// Force-reload when the daemon is rebuilt (embedded UI hash changes).
+let BUILD=null;
+async function pollBuild(){
+  if(MOCK) return;
+  try{
+    const r=await fetch('/v1/status',{cache:'no-store'}); if(!r.ok) return;
+    const st=await r.json();
+    if(st && st.build){ if(!BUILD) BUILD=st.build; else if(st.build!==BUILD) location.reload(); }
+  }catch(_){}
+}
+
+// ── mock (?mock=1) ──────────────────────────────────────────────────────────
+function mockProject(text){
+  const q=(text||'').trim();
+  const clip=q.length>60?q.slice(0,60)+'…':q;
+  return { query_tokens: Math.max(1, Math.round(q.length/4)), tiles:[
+    {kind:'normal',score:1840,selected:true,layer:'dialogue',group:'primary_conversation',
+      label:'Trace the substrate redo log replay',tokens:340,timeline:'8421990033112233445',index:5,
+      text:'user: '+clip+'\nassistant: On boot the daemon opens .substrate, enumerates seg-*.log files, and runs a single walker pass driving every record into the in-RAM Substrate; torn tail frames are skipped.'},
+    {kind:'sot',score:1120,selected:true,layer:'dialogue',group:'primary_conversation',
+      label:'summary #8 (compresses turn 0)',tokens:96,timeline:'8421990033112233445',index:8,
+      text:'Explained boot-time replay: enumerate segments, single walker pass populates the in-RAM Substrate; torn tail frames skipped.'},
+    {kind:'section',score:940,selected:true,layer:'dialogue',group:'tools',
+      label:'read_file',tokens:64,text:'{"name":"read_file","description":"Read a file (or a line range) from the workspace.","parameters":{...}}'},
+    {kind:'normal',score:610,selected:true,layer:'code_reading',group:'scopes',
+      label:'candle-conversation/src/substrate.rs',tokens:512,timeline:'2200110099887766554',index:2,
+      text:'Source excerpt — substrate.rs lines 3343-3392:\npub fn total_token_count(&self, timeline: TimelineId) -> usize { ... }'},
+    {kind:'section',score:280,selected:false,layer:'dialogue',group:'tools',
+      label:'run_shell',tokens:71,text:'{"name":"run_shell","description":"Execute a shell command in the workspace.","parameters":{...}}'},
+    {kind:'sos',score:150,selected:false,layer:'dialogue',group:'primary_conversation',
+      label:'summary #21 (compresses 8 summaries)',tokens:180,timeline:'8421990033112233445',index:21,
+      text:'Higher-level roll-up spanning the session: substrate persistence, segmented log, compaction design.'},
+  ]};
+}
+</script>
+</body>
+</html>

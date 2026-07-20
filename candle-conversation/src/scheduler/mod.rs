@@ -90,6 +90,18 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     },
 
+    /// Allocate a slot for the interactive projection PROBE. It is bound to
+    /// `target` so `apply_projection` materializes the full warm system prompt
+    /// exactly like a real turn — but the slot is marked ephemeral, so its turn
+    /// resolves to `SealAction::None` (nothing is written to the substrate) and
+    /// its query wide-Q window is gathered at completion and stashed for a
+    /// following `ProbeWideSigs` to drain. Used by `Sequence::probe`.
+    NewEphemeralSequence {
+        conversation: Conversation,
+        target: ProjectionTarget,
+        response_tx: Sender<Result<SequenceId, ConversationError>>,
+    },
+
     /// Allocate a fresh GPU slot bound to an **existing** timeline.
     ///
     /// The substrate is expected to already have `timeline` registered
@@ -367,6 +379,17 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<
             Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>, ConversationError>,
         >,
+    },
+
+    /// Drain the query wide-Q window that an ephemeral probe slot
+    /// ([`Self::NewEphemeralSequence`]) gathered at its turn's completion — the
+    /// interactive projection probe (`POST /v1/substrate/project`). Fire after the
+    /// probe turn's `Done`; returns the belief-domain [`WideQSig`] window
+    /// `score_beliefs` consumes (empty if the turn produced none). Nothing was
+    /// written to the substrate.
+    ProbeWideSigs {
+        sequence_id: SequenceId,
+        response_tx: Sender<Result<Vec<WideQSig>, ConversationError>>,
     },
 
     /// Run a §6 summary probe over a list of child substrate turns.
@@ -2156,6 +2179,19 @@ pub(crate) struct Scheduler {
     /// threading: callers no longer pass the target on every submit.
     slot_targets: HashMap<SequenceId, ProjectionTarget>,
 
+    /// Slots created ephemeral ([`SchedulerRequest::NewEphemeralSequence`]) — the
+    /// interactive projection probe. They project (materialize the full warm
+    /// system prompt) exactly like a real turn, but resolve to `SealAction::None`
+    /// so nothing is written to the substrate. At turn completion the query's
+    /// warm wide-Q window is gathered off the parent slot and stashed in
+    /// [`Self::ephemeral_sigs`] for the caller to retrieve via `ProbeWideSigs`.
+    ephemeral_slots: std::collections::HashSet<SequenceId>,
+
+    /// Wide-Q window gathered for each ephemeral slot's turn at completion, keyed
+    /// by the parent slot. Drained by the `ProbeWideSigs` request; dropped on
+    /// `FreeSequence`.
+    ephemeral_sigs: HashMap<SequenceId, Vec<WideQSig>>,
+
     /// **Diagnostic**: per-slot record of every token that has been
     /// committed to the slot's K/V — in the exact order it landed
     /// in the kernel's view.  Updated by every write path:
@@ -2410,6 +2446,8 @@ impl Scheduler {
             max_prefill_pass_tokens,
             slot_conversations: HashMap::new(),
             slot_targets: HashMap::new(),
+            ephemeral_slots: std::collections::HashSet::new(),
+            ephemeral_sigs: HashMap::new(),
             turn_views: HashMap::new(),
             carried_beliefs: HashMap::new(),
             pending_reprojections: Vec::new(),
@@ -2521,6 +2559,21 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::NewEphemeralSequence {
+                conversation,
+                target,
+                response_tx,
+            } => {
+                // Bind the target (so `apply_projection` runs → warm system
+                // prompt), then mark ephemeral so the turn never seals.
+                let result = self.create_sequence(conversation, Some(target));
+                if let Ok(slot) = &result {
+                    self.ephemeral_slots.insert(*slot);
+                }
+                let _ = response_tx.send(result);
+                true
+            }
+
             SchedulerRequest::ResumeSequence {
                 conversation,
                 timeline,
@@ -2590,9 +2643,15 @@ impl Scheduler {
                     self.workspace_projection
                         .get_or_insert_with(|| inputs.projection.clone());
                 }
-                let seal_action = match (&projection_inputs, slot_target) {
-                    (Some(_), Some(_)) => SealAction::Turn,
-                    _ => SealAction::None,
+                let seal_action = if self.ephemeral_slots.contains(&parent_id) {
+                    // Ephemeral probe: project (warm) but NEVER write back — the
+                    // query's wide-Q is gathered at completion instead of sealed.
+                    SealAction::None
+                } else {
+                    match (&projection_inputs, slot_target) {
+                        (Some(_), Some(_)) => SealAction::Turn,
+                        _ => SealAction::None,
+                    }
                 };
                 // Append-only ingests (e.g. code_reading) opt out of the
                 // per-turn projection rebuild once their slot is seeded:
@@ -2871,9 +2930,13 @@ impl Scheduler {
                 // exited; now safe to take a write guard for the
                 // diagnostic side-channel.  No-op when projection used
                 // the rule-based path (no tree on the target timeline).
+                // Ephemeral probe slots write NOTHING to the substrate — not even
+                // this diagnostic side-channel on the (shared) target timeline.
                 if let Some((timeline, diag)) = diag_to_write {
-                    if let Some(conv) = self.slot_conversations.get(&parent_id) {
-                        conv.write().set_last_selection(timeline, diag);
+                    if !self.ephemeral_slots.contains(&parent_id) {
+                        if let Some(conv) = self.slot_conversations.get(&parent_id) {
+                            conv.write().set_last_selection(timeline, diag);
+                        }
                     }
                 }
 
@@ -3038,6 +3101,8 @@ impl Scheduler {
                 // bound to this slot.
                 self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
+                self.ephemeral_slots.remove(&sequence_id);
+                self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.slot_projection_state.remove(&sequence_id);
@@ -3295,6 +3360,18 @@ impl Scheduler {
                 let result =
                     self.handle_extract_raw_kvq(sequence_id.0, &layer_indices, block_range);
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::ProbeWideSigs {
+                sequence_id,
+                response_tx,
+            } => {
+                // Hand back the warm query wide-Q the ephemeral probe turn stashed
+                // at its completion; drain it so a re-probe of a recycled slot id
+                // can't read a stale window.
+                let sigs = self.ephemeral_sigs.remove(&sequence_id).unwrap_or_default();
+                let _ = response_tx.send(Ok(sigs));
                 true
             }
 
@@ -5972,6 +6049,18 @@ impl Scheduler {
                     // and seal from offset 0.
                     (seq_id, 0)
                 };
+
+                // Ephemeral probe: the parent slot now holds the full warm KV —
+                // system prompt at `[0, seal_block_from)`, the query (+ the single
+                // decoded token) at `[seal_block_from, end)`. Gather the query's
+                // warm wide-Q here, where the blocks are guaranteed present (the
+                // same point a real seal gathers), and stash it for the probe's
+                // `ProbeWideSigs` to drain. The turn seals nothing (`SealAction::None`).
+                if self.ephemeral_slots.contains(&seal_slot) {
+                    let bc = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
+                    let sigs = self.gather_wide_sigs(seal_slot, (seal_block_from, bc));
+                    self.ephemeral_sigs.insert(seal_slot, sigs);
+                }
 
                 // Harvest the turn's final belief onto the conversation's parent
                 // slot: the NEXT turn's submit-time projection seeds from it, so
