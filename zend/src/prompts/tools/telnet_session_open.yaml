@@ -1,0 +1,132 @@
+name: telnet_session_open
+category: Telnet sessions
+description: Open a Telnet session to a network device or host. Use for legacy network equipment, serial consoles, or any TCP text protocol. Returns session_id for subsequent sends.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    credential_name:
+      description: Name of a stored credential to log in with. Defaults to none (no auto-login).
+      type:
+      - string
+      - 'null'
+    host:
+      description: 'Remote host to connect to: a HOSTNAME or IP address ONLY — do NOT include a username.'
+      minLength: 1
+      type: string
+    port:
+      description: TCP port. Defaults to 23.
+      format: uint16
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    prompt_pattern:
+      description: Regex matching the device prompt, used to know when output is complete. Defaults to "[$#>] *$".
+      type:
+      - string
+      - 'null'
+    timeout_sec:
+      description: Seconds to wait for the TCP connection. Defaults to 10.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - host
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open a telnet connection to the router at 192.168.0.1 port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a Telnet session to a router at 192.168.0.1 on port 23. Let me check the available tools. There's a tool called telnet_session_open. The parameters required are host, port, credential_name, prompt<|projection|>_pattern, and timeout_sec. The user didn't specify a username or password, so maybe they expect to handle authentication later or use default credentials. The host is 192.168.0.1, port 23. The default port is already 23, but it's safe to<|projection|> include it. I'll set the host and port, leave other parameters as defaults unless specified. So the tool call should have name telnet_session_open with host 192.168.0.1 and port 23.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "192.168.0.1", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  connect via telnet to the switch console at 10.0.0.30 port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to connect via Telnet to a switch console at 10.0.0.30 on port 23. Let me check the available tools. There's a tool called telnet_session_open. Let me look at its parameters. The required parameter is 'host',<|projection|> which should be the IP address. The port is optional, defaulting to 23. Since the user specified port 23, I can include that. I need to make sure the arguments are correctly formatted. So the host is "10.0.0.30" and port 23<|projection|>. The other parameters like credential_name, prompt_pattern, timeout_sec are optional and have defaults. So the tool call should include host and port. Alright, that should establish the Telnet session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "10.0.0.30", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  start a telnet session to the device at 172.16.0.5 port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start a Telnet session to the device at 172.16.0.5 on port 23. Let me check the available tools. There's a tool called telnet_session_open. Let me look at its parameters.
+
+  The parameters include host, port<|projection|>, credential_name, prompt_pattern, timeout_sec. The host is required, and the default port is 23. Since the user specified port 23, I should include that. But wait, the default is already 23, so maybe it's optional. However, the user explicitly mentioned port 2<|projection|>3, so including it would be better for clarity.
+
+  The host is 172.16.0.5. The tool requires the host parameter, which is provided. The other parameters like credential_name aren't mentioned, so they can be omitted. The prompt_pattern and timeout_sec have defaults, so no<|projection|> need to set them unless necessary.
+
+  So the correct call should be telnet_session_open with host 172.16.0.5 and port 23. Even though the port is the default, specifying it ensures it's correct. The other parameters are optional and not needed here. Alright, that<|projection|> should open the Telnet session as requested.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "172.16.0.5", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  telnet to the serial console at 192.168.1.100 port 2000<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to telnet to a serial console at 192.168.1.100 port 2000. Let me check the available tools. There's a tool called telnet_session_open. The parameters required are host and port. The host is<|projection|> 192.168.1.100, and the port is 2000. The other parameters like credential_name, prompt_pattern, timeout_sec have defaults, so I don't need to specify them unless needed. So I should call the telnet_session_open with host=1<|projection|>92.168.1.100 and port=2000.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "192.168.1.100", "port": 2000}}
+  </tool_call><|projection|>
+- |-
+  open a telnet session to the firewall at 10.10.10.1 on port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a Telnet session to a firewall at 10.10.10.1 on port 23. Let me check the available tools. There's a tool called telnet_session_open. Let me look at its parameters. The host parameter is required,<|projection|> which they provided as 10.10.10.1. The port is 23, which is the default for Telnet. The other parameters like credential_name, prompt_pattern, and timeout_sec have defaults, so I don't need to specify them unless necessary. Since the user didn't mention<|projection|> any specific credentials or prompts, I can omit those. So the correct function call should be telnet_session_open with host set to 10.10.10.1 and port 23. Wait, the port in the tool's parameters is an integer, so it should be 23 as<|projection|> an integer. Let me make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "10.10.10.1", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  I need a telnet session opened to bbs.example.net port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a Telnet session to bbs.example.net on port 23. Let me check the available tools. There's a tool called telnet_session_open. The parameters required are host, port, and others like credential_name, prompt_pattern, timeout_sec. The user didn<|projection|>'t mention credentials, so I'll leave that out. The port is 23, which is the default for Telnet. The host is bbs.example.net. I should structure the JSON call with those parameters. Let me make sure the JSON is correctly formatted with the host and port.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "bbs.example.net", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  spin up a telnet connection to the PDU at 172.16.4.9 port 23<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to spin up a Telnet session to a PDU at 172.16.4.9 on port 23. Let me check the available tools. There's a tool called telnet_session_open. Let me look at its parameters.
+
+  The parameters are host<|projection|>, port, credential_name, prompt_pattern, timeout_sec. The host is required, which the user provided as 172.16.4.9. The port is 23, which is the default for Telnet. Since the user didn't mention any credentials, I shouldn't assume any.<|projection|> The prompt pattern and timeout are optional and have defaults. So I just need to call telnet_session_open with host=172.16.4.9 and port=23. That should establish the connection.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "172.16.4.9", "port": 23}}
+  </tool_call><|projection|>
+- |-
+  establish a telnet link to the mainframe host at 10.20.30.40 port 992<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to establish a Telnet session to a mainframe at 10.20.30.40 on port 992. Let me check the available tools. There's a tool called telnet_session_open. Let me look at its parameters.
+
+  The parameters are<|projection|> host, port, credential_name, prompt_pattern, timeout_sec. The host is required, and the default port is 23. The user specified port 992, so I need to set that. The host is 10.20.30.40. The port should be <|projection|>992. The other parameters like credential_name aren't mentioned, so maybe leave them as defaults. The prompt_pattern and timeout_sec also have defaults, so no need to change them unless necessary.
+
+  So the function call should be telnet_session_open with host=10.20.30.4<|projection|>0 and port=992. I should return this in the specified JSON format inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "telnet_session_open", "arguments": {"host": "10.20.30.40", "port": 992}}
+  </tool_call><|projection|>

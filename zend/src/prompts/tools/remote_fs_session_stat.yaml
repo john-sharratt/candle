@@ -1,0 +1,159 @@
+name: remote_fs_session_stat
+category: Remote filesystem
+description: Retrieve metadata — size, type, permissions, timestamps — for one file or directory on a remote host over SFTP, without transferring contents.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    path:
+      description: Remote file or directory path to stat.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - path
+  - session_id
+  title: StatRequest
+  type: object
+examples:
+- |-
+  stat /etc/nginx/nginx.conf on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to stat the file /etc/nginx/nginx.conf on a remote filesystem session with the ID rfs-1. Let me check the tools available.
+
+  There's a tool called remote_fs_session_stat that retrieves metadata. The parameters needed are path and session_id. The user provided both: the<|projection|> path is /etc/nginx/nginx.conf and the session ID is rfs-1.
+
+  I need to make sure the parameters match the required format. The path should be a non-empty string, which it is. The session ID is also non-empty.
+
+  So the correct tool call would be to use remote_fs_session<|projection|>_stat with those arguments. I'll structure the JSON accordingly inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/etc/nginx/nginx.conf", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  get the size and permissions of /var/log/syslog on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants the size and permissions of /var/log/syslog on a remote filesystem session called rfs-1.
+
+  First, I remember that the available tool is remote_fs_session_stat. This tool retrieves metadata like size, type, permissions, and<|projection|> timestamps without transferring the file contents. That's exactly what's needed here.
+
+  The parameters required for the tool are 'path' and 'session_id'. The path here is /var/log/syslog, and the session ID is rfs-1. So I need to call the tool with these values.
+
+  I should make<|projection|> sure the JSON structure is correct. The name of the tool is remote_fs_session_stat, and the arguments should include both the path and session_id. Let me double-check the required fields. Yes, both are required. Alright, everything seems in order.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/var/log/syslog", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  check the metadata of /opt/app/config.yaml on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to check the metadata of the file /opt/app/config.yaml on a remote filesystem session called rfs-2.
+
+  First, I need to recall the available tools. There's the remote_fs_session_stat tool, which retrieves metadata like size, type, permissions,<|projection|> and timestamps. The parameters required are 'path' and 'session_id'.
+
+  The user provided the path as /opt/app/config.yaml and the session ID as rfs-2. So I should structure the tool call with these values. I need to make sure the JSON is correctly formatted, with the right keys: "<|projection|>path" and "session_id".
+
+  Wait, the session_id parameter's description says it's the session id returned by remote_fs_session_open. But the user mentioned "remote-fs session rfs-2". I assume that rfs-2 is the session ID. So using "rfs-2" as<|projection|> the session_id is correct here.
+
+  No other tools are needed here. The user isn't asking for a file transfer, just metadata. So the correct tool is remote_fs_session_stat with the provided parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/opt/app/config.yaml", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  is /tmp/lock a directory on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if "/tmp/lock" is a directory on the remote filesystem session "rfs-1". Let me see.
+
+  First, I need to check the tools available. There's the "remote_fs_session_stat" tool which retrieves metadata like size, type, etc., without transferring<|projection|> content. The parameters required are "path" and "session_id".
+
+  The user provided the path "/tmp/lock" and the session ID "rfs-1". So, I should call the "remote_fs_session_stat" tool with these arguments. The tool will return information about that path, including whether it's<|projection|> a directory.
+
+  I don't need to do anything else because the user just wants to know if it's a directory. The answer will come from the tool's response. So the correct action is to make that tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/tmp/lock", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  when was /srv/data/dump.sql last modified on remote-fs session rfs-3?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking when the file /srv/data/dump.sql was last modified on a remote filesystem session with the ID rfs-3. Let me think about how to approach this.
+
+  First, I remember that the user has access to a tool called remote_fs_session_stat. The description says it<|projection|> retrieves metadata like size, type, permissions, and timestamps for a file or directory over SFTP. That's exactly what's needed here.
+
+  The parameters required for this tool are "path" and "session_id". The user provided both: the path is /srv/data/dump.sql, and the session ID is r<|projection|>fs-3. So I need to call the remote_fs_session_stat function with these arguments.
+
+  Wait, I should make sure that the session ID is correctly formatted. The user wrote "rfs-3", which seems like a valid session ID as per the tool's requirements. No issues there.
+
+  The tool's parameters<|projection|> require the session_id to be a string, which it is. The path is also a valid string. So the JSON object should have "path": "/srv/data/dump.sql" and "session_id": "rfs-3".
+
+  I need to structure the tool call correctly. The name of the tool is remote<|projection|>_fs_session_stat, and the arguments are the JSON object with those key-value pairs. So the final answer should be a JSON object inside the tool_call tags as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/srv/data/dump.sql", "session_id": "rfs-3"}}
+  </tool_call><|projection|>
+- |-
+  show the ownership and mode of /usr/local/bin/deploy.sh on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the ownership and mode of the file /usr/local/bin/deploy.sh on a remote FS session called rfs-2. Let me think about how to approach this.
+
+  First, I remember that the user mentioned using the remote_fs_session_stat tool. That tool is for<|projection|> retrieving metadata like size, type, permissions, etc., which includes ownership (user and group) and mode (permissions). So, the stat command is the right one here.
+
+  The parameters needed for the remote_fs_session_stat are 'path' and 'session_id'. The path in this case is /usr/local/bin/de<|projection|>ploy.sh, and the session ID is rfs-2.
+
+  Wait, the user specified "remote-fs session rfs-2", so the session_id should be rfs-2. I need to make sure that the session ID is correctly passed as a string. Also, the path must be a valid<|projection|> string.
+
+  I should check if there are any other required parameters or constraints. The tool's required fields are path and session_id, both are strings. The path needs to be non-empty, which it is. So, constructing the JSON object with these values should work.
+
+  No other tools seem necessary here. The user<|projection|> isn't asking for a listing of a directory, just the metadata of a specific file. Therefore, calling remote_fs_session_stat with the provided parameters should retrieve the required ownership and mode information.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/usr/local/bin/deploy.sh", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  how big is /var/lib/mysql/ibdata1 on remote-fs session rfs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the size of the file /var/lib/mysql/ibdata1 on a remote filesystem session called rfs-4. Let me see how to approach this.
+
+  First, I remember that the user has a tool called remote_fs_session_stat, which retrieves metadata like size, type<|projection|>, permissions, etc., without transferring the content. That's exactly what's needed here.
+
+  The parameters required for the stat command are 'path' and 'session_id'. The user provided the path as /var/lib/mysql/ibdata1 and the session ID as rfs-4. So I need to call the<|projection|> remote_fs_session_stat tool with these arguments.
+
+  I should make sure that the path is correctly formatted and that the session ID matches the one given. Since the user mentioned "remote-fs session rfs-4", the session_id parameter should be "rfs-4".
+
+  Putting it all together, the JSON object for<|projection|> the tool call should have the name "remote_fs_session_stat" and the arguments with the path and session_id. I need to check that the JSON structure is correct, with proper quotes and commas. Once that's done, the tool should execute and return the metadata, including the file size.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/var/lib/mysql/ibdata1", "session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  does /home/deploy/.ssh/authorized_keys exist on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if the file /home/deploy/.ssh/authorized_keys exists on the remote filesystem session rfs-1. Let me see.
+
+  First, I need to use the tool provided, which is remote_fs_session_stat. This tool retrieves metadata for a file or directory over SFTP<|projection|>. The parameters required are 'path' and 'session_id'.
+
+  The user specified the path as /home/deploy/.ssh/authorized_keys and the session ID as rfs-1. So I should structure the tool call with these values. I need to make sure the JSON is correctly formatted with the right keys.<|projection|> Let me double-check the parameters: path is the remote file path, session_id is the given session identifier. Everything seems in order. Time to output the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_stat", "arguments": {"path": "/home/deploy/.ssh/authorized_keys", "session_id": "rfs-1"}}
+  </tool_call><|projection|>

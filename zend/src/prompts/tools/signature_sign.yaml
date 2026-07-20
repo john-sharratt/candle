@@ -1,0 +1,182 @@
+name: signature_sign
+category: Cryptography
+description: Produce a digital signature over a message using a private signing key from the credential store (ed25519 or p256_sha256). Proves authorship; the counterpart signature_verify checks it.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    SignatureAlgorithm:
+      description: Digital-signature scheme.
+      enum:
+      - ed25519
+      - p256_sha256
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/SignatureAlgorithm'
+      description: 'Signature scheme. One of: ed25519, p256_sha256.'
+      minItems: 1
+      minLength: 1
+    credential_name:
+      description: Name of a stored `signing_key` credential holding the PEM private key.
+      minLength: 1
+      type: string
+    data:
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+  required:
+  - algorithm
+  - credential_name
+  - data
+  title: SigSignRequest
+  type: object
+examples:
+- |-
+  sign the message 'release v1.2.0' with the ed25519 credential release-signing-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to sign the message 'release v1.2.0' using the Ed25519 algorithm with the credential named 'release-signing-key'.
+
+  First, I need to check the available tools. There's the signature_sign tool. The parameters required<|projection|> are algorithm, credential_name, data, and data_encoding. The data_encoding is optional, defaulting to text.
+
+  The message is 'release v1.2.0', which is a string. The algorithm is ed25519. The credential name is 'release-signing-key'. Since the data is<|projection|> a text, no encoding is needed. So I can call the tool with these parameters.
+
+  I should make sure all required fields are present: algorithm, credential_name, and data. All are provided here. So the JSON call should include these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "ed25519", "credential_name": "release-signing-key", "data": "release v1.2.0"}}
+  </tool_call><|projection|>
+- |-
+  produce an ed25519 signature over 'deploy approved' using credential deploy-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to produce an ED25519 signature for the message "deploy approved" using a credential called "deploy-key".
+
+  First, I need to check the available tools. There's the signature_sign tool. The parameters required are algorithm, credential_name, data<|projection|>, and optionally data_encoding.
+
+  The user specified ED25519, which is one of the allowed algorithms. The credential name is "deploy-key", as given. The data is "deploy approved". Since the data is a text string, the data_encoding can be left as default, which is 'text'.<|projection|>
+
+  I should make sure all required parameters are included. The required fields are algorithm, credential_name, and data. All are present here.
+
+  So the tool call should be signature_sign with those arguments. No need to include data_encoding since it's optional and defaults to 'text'. That should do it.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "ed25519", "credential_name": "deploy-key", "data": "deploy approved"}}
+  </tool_call><|projection|>
+- |-
+  sign the data 'order#42 confirmed' using the p256_sha256 algorithm with credential 'signing-key'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to sign the data 'order#42 confirmed' using the p256_sha256 algorithm and the credential 'signing-key'.
+
+  First, I need to check the available tools. The tool provided is signature_sign. The parameters required are algorithm<|projection|>, credential_name, data, and optionally data_encoding.
+
+  The user specified the algorithm as p256_sha256, which is one of the allowed values. The credential name is 'signing-key', which they mentioned. The data is 'order#42 confirmed'.
+
+  Wait, the data encoding isn<|projection|>'t specified. The default is text, which should be fine here. So I don't need to include data_encoding unless it's different.
+
+  So putting it all together: the algorithm is p256_sha256, credential_name is 'signing-key', and data is 'order#42 confirmed<|projection|>'. That should cover the required parameters. Let me double-check the required fields. Yes, those are all required. Alright, that's the correct tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "p256_sha256", "credential_name": "signing-key", "data": "order#42 confirmed"}}
+  </tool_call><|projection|>
+- |-
+  create an ed25519 signature for the message 'audit entry 7' using credential audit-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to create an ED25519 signature for the message 'audit entry 7' using the credential named 'audit-key'.
+
+  First, I need to check the available tools. There's the signature_sign tool. The parameters required are algorithm, credential_name<|projection|>, data, and optionally data_encoding.
+
+  The algorithm here is ed25519. The credential name is 'audit-key'. The data is 'audit entry 7'. The data encoding isn't specified, so it defaults to text.
+
+  I should make sure all required parameters are included. The required fields are<|projection|> algorithm, credential_name, and data. All are present here.
+
+  So the tool call should be signature_sign with those arguments. No need for data_encoding since it's defaulting to text, which matches the input format. Everything looks good.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "ed25519", "credential_name": "audit-key", "data": "audit entry 7"}}
+  </tool_call><|projection|>
+- |-
+  sign 'firmware image v9 checksum ok' with the p256_sha256 credential firmware-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to sign the message "firmware image v9 checksum ok" using the p256_sha256 algorithm with the credential named "firmware-key".
+
+  First, I need to check the available tools. The signature_sign function is there. The parameters<|projection|> required are algorithm, credential_name, data, and optionally data_encoding.
+
+  The algorithm should be p256_sha256 as specified. The credential_name is "firmware-key". The data is the given string. Since the data is provided in text, the data_encoding can default to "text", but the<|projection|> user didn't specify, so maybe it's safe to include it or let the tool handle the default. But the parameters require data_encoding as optional. Wait, in the tool's parameters, data_encoding is optional with a null default. But the user hasn't mentioned encoding, so perhaps we should assume it's text.<|projection|> However, the tool might require it. Wait, looking at the parameters: data_encoding has an enum of text, hex, base64, and is optional. The required fields are algorithm, credential_name, and data. So data_encoding is not required. So, in this case, since the user provided the data<|projection|> as plain text, we can omit data_encoding, or set it to "text". But the tool might handle the default. But according to the schema, data_encoding is part of the properties but not in the required list. So, including it might be better to ensure the correct encoding. However, the user hasn't<|projection|> specified, so maybe it's safer to include it. Wait, the user wrote the data as a string, so it's likely text. Therefore, setting data_encoding to "text" makes sense.
+
+  So, putting it all together: the tool call would have name "signature_sign", and arguments with algorithm "p2<|projection|>56_sha256", credential_name "firmware-key", data "firmware image v9 checksum ok", and data_encoding "text".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "p256_sha256", "credential_name": "firmware-key", "data": "firmware image v9 checksum ok", "data_encoding": "text"}}
+  </tool_call><|projection|>
+- |-
+  can you ed25519-sign the message 'ceasefire at dawn' using credential ops-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to sign the message "ceasefire at dawn" using ED25519 with the credential named "ops-key".
+
+  First, I need to check the available tools. There's the signature_sign function. The parameters required are algorithm, credential_name,<|projection|> data, and optionally data_encoding.
+
+  The user specified ED25519, which is one of the allowed algorithms. The credential name is "ops-key". The data is "ceasefire at dawn". Since the data is a plain string, the data_encoding can be default, which is text. So I<|projection|> don't need to specify data_encoding unless it's different.
+
+  So the arguments should be: algorithm "ed25519", credential_name "ops-key", data "ceasefire at dawn". The data_encoding isn't needed here because it's the default.
+
+  I need to structure this into a JSON object<|projection|> inside the tool_call tags. Make sure the keys match the parameters exactly. No typos in the parameter names. Let me double-check the required fields: algorithm, credential_name, data. All are present.
+
+  Yes, that's all. The user didn't mention any other details, so proceed with this.
+  </think>
+
+  <|projection|><tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "ed25519", "credential_name": "ops-key", "data": "ceasefire at dawn"}}
+  </tool_call><|projection|>
+- |-
+  generate a p256_sha256 signature over 'ledger close 2026-07' with credential 'ledger-key'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to generate a P256 SHA-256 signature for the message "ledger close 2026-07" using the credential named 'ledger-key'.
+
+  First, I need to check the available tools. The tool provided is signature_sign<|projection|>. The parameters required are algorithm, credential_name, data, and data_encoding. The algorithm can be p256_sha256. The credential_name is given as 'ledger-key'. The data is the message provided.
+
+  Wait, the data_encoding defaults to text, which is fine here since the data is<|projection|> a string. So I don't need to specify data_encoding unless it's different.
+
+  So putting it all together: the algorithm is p256_sha256, credential_name is 'ledger-key', data is 'ledger close 2026-07'. That should cover the required parameters.<|projection|> Let me double-check the required fields. Yes, algorithm, credential_name, and data are all required. Looks good.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "p256_sha256", "credential_name": "ledger-key", "data": "ledger close 2026-07"}}
+  </tool_call><|projection|>
+- |-
+  sign the string 'grant admin token' using the ed25519 credential admin-issuer-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to sign the string "grant admin token" using the Ed25519 algorithm with the credential named "admin-issuer-key".
+
+  First, I need to check the available tools. There's a tool called signature_sign.<|projection|> Let me look at its parameters. The required parameters are algorithm, credential_name, and data. The algorithm can be ed25519 or p256_sha256. The credential_name is the name of the stored key, which here is "admin-issuer-key". The data is the string<|projection|> to sign, which is "grant admin token".
+
+  The data_encoding is optional, defaulting to text. Since the user provided the data as a text string, no need to encode it. So, all required parameters are present.
+
+  I should structure the tool call with these values. Make sure the JSON is correctly formatted.<|projection|> Let me double-check the parameters: algorithm is "ed25519", credential_name is "admin-issuer-key", and data is "grant admin token". Everything looks good. Time to return the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_sign", "arguments": {"algorithm": "ed25519", "credential_name": "admin-issuer-key", "data": "grant admin token"}}
+  </tool_call><|projection|>

@@ -1,0 +1,172 @@
+name: remote_fs_session_get
+category: Remote filesystem
+description: Download a file from the remote SFTP filesystem into the session VFS. Returns the VFS path where content was written.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    local_vfs_path:
+      description: VFS path to write the downloaded content to. Defaults to the basename of `remote_path`.
+      type:
+      - string
+      - 'null'
+    remote_path:
+      description: Path of the file to download on the remote host.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - remote_path
+  - session_id
+  title: GetRequest
+  type: object
+examples:
+- |-
+  download /var/log/app.log from remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to download the file /var/log/app.log from the remote filesystem using the session rfs-1. Let me check the available tools.
+
+  There's a tool called remote_fs_session_get. The parameters required are local_vfs_path, remote_path, and session_id. The remote_path<|projection|> is given as /var/log/app.log, and the session ID is rfs-1. The local_vfs_path isn't specified, so I should use the default, which is the basename of the remote path. That would be app.log. So the local path would be ./app.log.
+
+  Wait, the<|projection|> user didn't specify where to save it locally. The tool's description says the local_vfs_path defaults to the basename of the remote path. So I don't need to include local_vfs_path in the arguments. The required parameters are remote_path and session_id. So the arguments should be remote_path: "/var<|projection|>/log/app.log", session_id: "rfs-1".
+
+  I need to make sure that the JSON is correctly formatted with those parameters. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/var/log/app.log", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  fetch /etc/hosts from remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to fetch the /etc/hosts file from a remote filesystem using the SFTP session. Let me check the available tools.
+
+  There's a tool called remote_fs_session_get. Its description says it downloads a file from the remote SFTP filesystem into the session VFS. The parameters needed<|projection|> are local_vfs_path, remote_path, and session_id.
+
+  The user provided the remote path as /etc/hosts and the session ID is rfs-1. The local_vfs_path isn't specified, so I should use the default, which is the basename of the remote path. The basename of /etc<|projection|>/hosts is just hosts. So the local path would be something like /path/to/vfs/hosts, but the exact path might be handled by the system.
+
+  So the arguments should be: remote_path="/etc/hosts", session_id="rfs-1". Since local_vfs_path is optional and defaults to<|projection|> the basename, I don't need to include it unless there's a specific path. Therefore, the tool call should have those parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/etc/hosts", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  pull /opt/app/config.yaml from remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to pull a file called config.yaml from the remote filesystem. The command they're using is "pull /opt/app/config.yaml from remote-fs session rfs-2". Let me break this down.
+
+  First, I need to figure out which tool to use. The available tool here<|projection|> is remote_fs_session_get. The description says it downloads a file from the remote SFTP into the session VFS. That matches the user's request.
+
+  Looking at the parameters for the tool:
+  - remote_path is required, which should be the path on the remote host. The user provided /opt/app/config.yaml<|projection|>, so that's the remote_path.
+  - session_id is also required. The user specified the session rfs-2, so that's the session_id.
+  - local_vfs_path is optional and defaults to the basename of the remote path if not provided. Since the user didn't specify a local path, I can<|projection|> omit this parameter.
+
+  So the arguments should be:
+  remote_path: "/opt/app/config.yaml"
+  session_id: "rfs-2"
+
+  I don't need to include local_vfs_path because it's optional and the default will work. The tool will handle writing it to the VFS with the correct name.
+
+  Now<|projection|>, I'll structure the JSON call as per the instructions. The name is remote_fs_session_get, and the arguments are the parameters listed. That should correctly trigger the file download.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/opt/app/config.yaml", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  get /backups/latest.sql from remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to get the file /backups/latest.sql from the remote-fs session with ID rfs-1. I need to use the remote_fs_session_get tool.
+
+  First, check the parameters required for that tool. The required parameters are remote_path and session_id.<|projection|> The local_vfs_path is optional and defaults to the basename of the remote path if not provided.
+
+  The remote_path here is /backups/latest.sql, and the session_id is rfs-1. Since the user didn't specify a local path, I'll omit the local_vfs_path parameter.
+
+  So the<|projection|> arguments should be {"remote_path": "/backups/latest.sql", "session_id": "rfs-1"}. That should trigger the tool call correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/backups/latest.sql", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  grab /var/log/nginx/error.log off remote-fs session rfs-3 for me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to download the file /var/log/nginx/error.log from a remote filesystem using the SFTP session with ID rfs-3. Let me check the available tools.
+
+  The tool provided is remote_fs_session_get. It requires the session_id, remote_path, and optionally local_vfs_path<|projection|>. The user didn't specify a local path, so I'll use the default, which is the basename of the remote path. The remote path is /var/log/nginx/error.log, so the local path would be error.log in the current directory.
+
+  So the parameters should be:
+  - session_id: rfs-3<|projection|>
+  - remote_path: /var/log/nginx/error.log
+  - local_vfs_path: error.log (default)
+
+  I need to structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"session_id": "rfs-3", "remote_path": "/var/log/nginx/error.log"}}
+  </tool_call><|projection|>
+- |-
+  can you retrieve /srv/certs/fullchain.pem from remote-fs session rfs-2?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to retrieve the file /srv/certs/fullchain.pem from the remote filesystem using the session rfs-2. Let me check the available tools.
+
+  There's a tool called remote_fs_session_get. Its parameters are local_vfs_path, remote_path, and session_id. The required<|projection|> ones are remote_path and session_id. The user provided the remote path as /srv/certs/fullchain.pem and the session ID rfs-2.
+
+  The local_vfs_path is optional and defaults to the basename of the remote path. Since the user didn't specify a local path, I should use the default.<|projection|> So the arguments should be remote_path: "/srv/certs/fullchain.pem", session_id: "rfs-2".
+
+  I need to make sure the JSON is correctly formatted. The tool name is remote_fs_session_get. The arguments should be a JSON object with those parameters. That's all.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "remote_fs_session_get", "arguments": {"remote_path": "/srv/certs/fullchain.pem", "session_id": "rfs-2"}}
+  </tool_call><|projection|>
+- |-
+  download /home/ci/artifacts/build-42.tar.gz from remote-fs session rfs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to download a file from the remote filesystem using the provided tool. The command given is "download /home/ci/artifacts/build-42.tar.gz from remote-fs session rfs-4".
+
+  First, I need to<|projection|> parse the command. The key parts are the local path, the remote path, and the session ID. The user mentioned "remote-fs session rfs-4", so the session_id should be "rfs-4".
+
+  The tool's parameters require "remote_path" and "session_id". The "local_v<|projection|>fs_path" is optional and defaults to the basename of the remote path if not provided. Since the user didn't specify a different local path, I should use the default.
+
+  So, the remote_path is "/home/ci/artifacts/build-42.tar.gz", and the session_id is "rfs-4<|projection|>". The local_vfs_path will be automatically set to the same filename as the remote file, which is "build-42.tar.gz".
+
+  I need to structure the JSON call with these parameters. Let me check the required fields: "remote_path" and "session_id" are required. The tool's parameters look<|projection|> correct.
+
+  I think that's all. The tool call should be made with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/home/ci/artifacts/build-42.tar.gz", "session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  copy /etc/systemd/system/zend.service down from remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to copy the file /etc/systemd/system/zend.service from the remote filesystem using the session rfs-1. Let me check the tools available.
+
+  There's a tool called remote_fs_session_get. The description says it downloads a file from the remote SFTP into the session V<|projection|>FS. The parameters needed are local_vfs_path, remote_path, and session_id.
+
+  The user provided the remote path as /etc/systemd/system/zend.service and the session ID is rfs-1. The local_vfs_path isn't specified, so I should use the default, which is the basename of<|projection|> the remote path. That would be zend.service.
+
+  So I need to call remote_fs_session_get with remote_path set to /etc/systemd/system/zend.service, session_id as rfs-1, and local_vfs_path as zend.service. Let me make sure all required parameters are included. The required ones are<|projection|> remote_path and session_id, which are present. The local_vfs_path is optional, but specifying it makes sense here.
+
+  I think that's all. The tool will handle downloading the file.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_get", "arguments": {"remote_path": "/etc/systemd/system/zend.service", "session_id": "rfs-1", "local_vfs_path": "zend.service"}}
+  </tool_call><|projection|>

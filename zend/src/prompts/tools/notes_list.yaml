@@ -1,0 +1,129 @@
+name: notes_list
+category: Notes
+description: Browse stored notes by key prefix or tag, returning each note's key, tags, and timestamps — metadata only, not the body text. Use to discover which notes exist before reading one.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    max_results:
+      description: Maximum notes to return (1–200). Defaults to 50.
+      format: uint32
+      maximum: 200.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+    prefix:
+      description: Key prefix to filter notes (e.g. `infra/`). Defaults to "" (lists all notes).
+      type:
+      - string
+      - 'null'
+    tags:
+      description: Tags that returned notes must include. Defaults to none (no tag filter).
+      items:
+        type: string
+      type:
+      - array
+      - 'null'
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list all my notes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list all their notes. Let me check the available tools. There's a tool called notes_list that browses stored notes by key prefix or tag. The parameters include max_results, prefix, and tags. The user just said "list all my notes," so I need to call<|projection|> notes_list with appropriate parameters.
+
+  Since they didn't specify a prefix or tags, the default for those would be empty. The max_results defaults to 50, which is acceptable unless the user has more than 50 notes. But since the tool's maximum is 200, maybe setting max_results to<|projection|> 200 would be better. Wait, the user didn't specify, so perhaps stick to the default of 50 unless told otherwise. Or maybe check if the user wants more. But the user just wants to list all, so maybe set max_results to the maximum allowed, which is 200<|projection|>. But the tool's parameters say the default is 50. Hmm.
+
+  Wait, the tool's parameters: max_results has a default of 50. So if I don't include it, it'll use 50. But the user might have more than 50 notes. However, the tool<|projection|> doesn't support pagination in this case. The user might need to specify a prefix or tags to narrow down. But the user hasn't provided that info. So the best approach is to call notes_list with the default parameters, which would return up to 50 notes. If the user needs more, they can adjust<|projection|> the parameters. So the correct tool call is notes_list with no arguments, relying on defaults.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what notes do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking "what notes do I have?" So I need to figure out which tool to use here. The available tool is notes_list, which allows browsing stored notes by key prefix or tag. The user isn't specifying any particular tags or prefixes, so I should probably use the default parameters<|projection|>.
+
+  The notes_list tool has parameters like max_results, prefix, and tags. Since the user didn't specify a prefix or tags, I'll leave those as defaults. The default for prefix is an empty string, which means it will list all notes. The max_results defaults to 50, which should be fine<|projection|> unless the user has more than 50 notes. But since the user hasn't specified, I should go with the default.
+
+  So the function call would be to notes_list with the default parameters. No need to include optional parameters unless they're specified. So the JSON object should have the name "notes_list" and<|projection|> an empty arguments object, or just omit the arguments since they're optional.
+
+  Wait, looking back at the tool definition, the parameters are $schema, properties, etc. The required parameters are none, as they all have defaults. So calling notes_list without any arguments is valid. Therefore, the correct tool call is to<|projection|> notes_list with no arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me every note I've saved<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see every note they've saved. I need to use the notes_list tool for this. Let me check the parameters. The tool allows filtering by prefix, tags, and max results. Since the user wants all notes, I should set max_results to the maximum allowed, which<|projection|> is 200. But wait, the default for max_results is 50. If the user has more than 50 notes, I might need to paginate. However, the user didn't specify a number, so maybe just return the first 50. Wait, the tool's max_results parameter<|projection|> can be set up to 200. To get as many as possible in one call, setting max_results to 200 makes sense. Also, the prefix is empty by default, which lists all notes. So the parameters would be {"max_results": 200, "prefix": ""}.<|projection|> That should fetch up to 200 notes. I'll structure the tool call with these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {"max_results": 200, "prefix": ""}}
+  </tool_call><|projection|>
+- |-
+  give me an index of my notes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for an index of their notes. Let me see what tools I have available. Oh right, there's the notes_list function. That's used to browse stored notes by key prefix or tag. The user probably wants a list of their existing notes, maybe to see what's available<|projection|> before reading them.
+
+  The notes_list function returns metadata like key, tags, and timestamps. The user didn't specify any particular tags or prefixes, so I should use the default parameters. The max_results defaults to 50, which is probably okay. Unless the user has more than 50 notes, but they<|projection|> didn't mention that. So I'll call notes_list with the default parameters. No need for tags or prefix since they didn't specify any. Alright, that should give them the index they're looking for.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {"max_results": 50, "prefix": "", "tags": null}}
+  </tool_call><|projection|>
+- |-
+  which notes start with the prefix 'meeting-'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which notes start with the prefix 'meeting-'. Let me check the available tools. There's a tool called notes_list that can browse stored notes by key prefix. The parameters include 'prefix' which is exactly what the user is asking for. The function requires the prefix parameter,<|projection|> so I should set that to 'meeting-'. The other parameters like max_results and tags are optional. Since the user didn't specify a number, I'll default max_results to 50. No need to include the tags parameter since there's no mention of tags in the query. So the tool call should be<|projection|> notes_list with prefix 'meeting-' and max_results 50.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {"prefix": "meeting-", "max_results": 50}}
+  </tool_call><|projection|>
+- |-
+  show me the notes tagged 'work' along with their timestamps<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to see notes tagged 'work' along with their timestamps. Let me check the available tools. There's the notes_list function. It allows filtering by tags and prefixes. The parameters include 'tags' as an array, so I should pass ['work'] there. The prefix is optional<|projection|>, but since the user didn't specify, I'll leave it as default. Also, the max_results defaults to 50, which is fine unless the user needs more. So the tool call should have the tags parameter set to ['work']. That should fetch all notes with the 'work' tag and their metadata<|projection|>, including timestamps.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {"tags": ["work"]}}
+  </tool_call><|projection|>
+- |-
+  catalog my notes so I can see what exists before opening one<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to catalog their notes to see what exists before opening one. The available tool is notes_list. Let me check the parameters.
+
+  The tool allows filtering by prefix, tags, and limits results. The user hasn't specified any filters, so I should use default parameters. The max_results defaults<|projection|> to 50, which is reasonable. Since they want to list all notes, maybe just call notes_list without any arguments. Wait, the prefix is an empty string by default, which lists all notes. So the correct call is to invoke notes_list with no arguments. That should return the metadata for all notes,<|projection|> allowing the user to see what's available.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many notes have I stored and what are their keys<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many notes they've stored and what the keys are. Let me check the tools available.
+
+  There's a tool called notes_list. Its description says it browses stored notes by key prefix or tag, returning metadata like key, tags, and timestamps. The parameters include max_results<|projection|>, prefix, and tags. The user wants to know the count and the keys, so this tool should work.
+
+  The user isn't specifying a prefix or tags, so the default values for those parameters would be used. The max_results defaults to 50. But the user might have more than 50 notes<|projection|>. Wait, but the tool's maximum is 200. Should I set max_results to 200 to get as many as possible? However, the user didn't specify, so maybe stick with the default. But the user wants all notes. Hmm, but the tool doesn't have a 'get<|projection|> all' option. So the user might need to make multiple calls if there are more than 200. But the user hasn't specified, so proceed with the default.
+
+  So the call would be to notes_list with max_results=50 (default), prefix=null, tags=null. The response will list up<|projection|> to 50 notes. If the user has more, they might need to adjust the parameters. But according to the problem, I should generate the tool call as per the user's request. So the answer is to call notes_list with the default parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_list", "arguments": {"max_results": 50, "prefix": null, "tags": null}}
+  </tool_call><|projection|>

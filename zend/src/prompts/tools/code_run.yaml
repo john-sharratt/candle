@@ -1,0 +1,396 @@
+name: code_run
+category: Code execution
+description: Execute a JavaScript snippet in an embedded, sandboxed engine (no filesystem, network, or process access). Runs in-process on a pure-Rust VM — no Node or external interpreter required. Use for arithmetic/logic the model would get wrong, data transformation, string processing, JSON manipulation, and quick algorithms. `console.log` output is returned in stdout; the final expression's value in result. Returns stdout, stderr, exit_code (0 on success, 1 if the script throws), duration, and result.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    code:
+      description: JavaScript source to execute. `console.log`/`console.error` output is captured; the value of the final expression is returned in `result`.
+      minLength: 1
+      type: string
+    env:
+      additionalProperties:
+        type: string
+      description: Optional key/value map exposed to the script as the global object `env`. Omit for none.
+      type:
+      - object
+      - 'null'
+    language:
+      description: 'Language to run. Only JavaScript is supported (aliases: javascript, js, node). The field is kept explicit so the model states intent.'
+      minLength: 1
+      type: string
+    stdin:
+      description: Optional string exposed to the script as the global `stdin`. Omit for none.
+      type:
+      - string
+      - 'null'
+    timeout_sec:
+      description: Advisory wall-clock hint (1–300s). The VM cannot interrupt a synchronous eval, so runaway scripts are bounded by loop/recursion limits instead.
+      format: uint32
+      maximum: 300.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - code
+  - language
+  title: RunRequest
+  type: object
+examples:
+- |-
+  run some JavaScript that prints the first 10 Fibonacci numbers<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to run some JavaScript that prints the first 10 Fibonacci numbers. Let me think about how to approach this.
+
+  First, I need to use the code_run tool provided. The tool executes JavaScript code in a sandboxed environment. The user's request is straightforward: generate and print<|projection|> the first 10 Fibonacci numbers.
+
+  I'll start by writing a JavaScript snippet that calculates the Fibonacci sequence. The Fibonacci sequence starts with 0 and 1, and each subsequent number is the sum of the previous two. So, the first 10 numbers would be 0, 1, 1,<|projection|> 2, 3, 5, 8, 13, 21, 34.
+
+  I need to make sure the code runs correctly. Let me outline the steps:
+  1. Initialize an array with the first two numbers (0 and 1).
+  2. Loop from 2 to <|projection|>9 (since we need 10 elements total), appending the sum of the last two elements each time.
+  3. Print each element in the array.
+
+  Wait, wait. Wait, if I start with [0, 1], then the third element is 0+1=1, then 1+1<|projection|>=2, etc. So the first 10 elements would be indices 0-9. So the loop should run 8 times (since we already have 2 elements). Let me check:
+
+  Start with [0, 1] (elements 0 and 1). Then for i from 2 to<|projection|> 9 (total of 8 iterations), calculate fib[i] = fib[i-1] + fib[i-2]. That would give 10 elements in total.
+
+  So the code could look like this:
+
+  let fib = [0, 1];
+  for (let i = 2; i < 1<|projection|>0; i++) {
+      fib[i] = fib[i-1] + fib[i-2];
+  }
+  console.log(fib);
+
+  But wait, the loop condition is i < 10. Since starting at 2, the loop runs for i=2 up to i=9, which is 8 iterations<|projection|>. So the array grows from 2 elements to 10 elements. Yes, that's correct.
+
+  Alternatively, maybe using a loop that runs 8 times. But the code above should work.
+
+  Another approach is to use a loop that runs 10 times, but that might be less efficient. But for <|projection|>10 numbers, it's negligible.
+
+  Once the array is generated, console.log will output the array. The user wants the first 10 numbers, so this should work.
+
+  Now, I need to structure this into the code_run tool call. The parameters required are 'code' and 'language'. The 'language<|projection|>' is JavaScript, so I'll set that. The 'code' parameter will contain the JavaScript code.
+
+  So the JSON for the tool call would be:
+
+  {
+    "name": "code_run",
+    "arguments": {
+      "code": "let fib = [0, 1]; for (let i =<|projection|> 2; i < 10; i++) { fib[i] = fib[i-1] + fib[i-2]; } console.log(fib);",
+      "language": "javascript"
+    }
+  }
+
+  Wait, but in JavaScript, when you log an array, it outputs the elements separated by commas.<|projection|> So the output should be "0,1,1,2,3,5,8,13,21,34".
+
+  But I need to make sure that the code is correct. Let me test this code mentally.
+
+  Start with [0, 1]. Then:
+
+  i=2: fib[<|projection|>2] = 0+1=1 → [0,1,1]
+  i=3: 1+1=2 → [0,1,1,2]
+  i=4: 1+2=3 → [0,1,1,2,3]
+  i=5: <|projection|>2+3=5 → [0,1,1,2,3,5]
+  i=6: 3+5=8 → ... and so on until i=9.
+
+  Yes, the array will have 10 elements. So the code is correct.
+
+  Another thing to consider: the loop runs<|projection|> for i from 2 to 9 (since i < 10). That's 8 iterations, which adds 8 elements, making the total 2 + 8 = 10 elements. Correct.
+
+  Therefore, the code should work as intended.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "let fib = [0, 1]; for (let i = 2; i < 10; i++) { fib[i] = fib[i-1] + fib[i-2]; } console.log(fib);", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  evaluate this JavaScript expression that sums an array of numbers<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to evaluate a JavaScript expression that sums an array of numbers. Let me think about how to approach this.
+
+  First, I need to create a JavaScript snippet that takes an array and returns the sum. The user didn't specify the array, so maybe I can use a sample array or<|projection|> make it a function. But since the user just said "sums an array of numbers," perhaps the code should be a general solution.
+
+  Wait, the user's request is to "evaluate this JavaScript expression." So they might have an existing expression in mind. But they haven't provided the actual code. Hmm, maybe<|projection|> there's a misunderstanding here. Wait, looking back at the tools provided, there's a code_run tool that executes JS snippets.
+
+  So the user might want me to generate the correct JavaScript code to sum an array and then use the tool to run it. But the user's message is "evaluate this JavaScript expression that sums<|projection|> an array of numbers." But there's no specific code provided. Maybe the user expects me to provide the code and then execute it using the tool.
+
+  Wait, the initial instructions say that I should call the tool when necessary. So if the user asks for evaluating an expression, I need to generate the appropriate code. However<|projection|>, in this case, the user hasn't provided the actual code they want evaluated. They're asking for help to write the code and then evaluate it.
+
+  But looking at the tools again, the code_run tool requires the 'code' parameter, which is the JavaScript source to execute. So perhaps the user expects me to<|projection|> generate the code, then use the tool to run it. But since the user hasn't provided the specific code, maybe the assistant needs to ask for more details. However, the current setup might require the assistant to proceed with a sample or assume a scenario.
+
+  Wait, maybe the user's message is part of a conversation<|projection|> where the previous messages included the code. But in this context, there's only the current query. Given that, I need to make an assumption here. Since the user mentioned "sums an array of numbers," I can create a sample array and write the code to sum it.
+
+  For example, the JavaScript code could<|projection|> be:
+
+  const arr = [1, 2, 3, 4, 5];
+  const sum = arr.reduce((acc, curr) => acc + curr, 0);
+  sum;
+
+  Then, using the code_run tool with this code. However, since the user might have their own array, but without<|projection|> more info, this is a safe approach.
+
+  So, the next step is to generate the code and then call the code_run tool with that code. The response would include the result of the execution.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "const arr = [1, 2, 3, 4, 5]; const sum = arr.reduce((a, b) => a + b, 0); sum;", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  write and run JS that parses the JSON {"name":"Ada","age":36,"admin":true} and prints its keys<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to write a JavaScript snippet that parses the given JSON object and prints its keys. Let me think about how to do this.
+
+  First, the JSON is {"name":"Ada","age":36,"admin":true}. I need to parse this into a JavaScript object. Using JSON.parse()<|projection|> should work. Then, I need to get the keys of this object. The Object.keys() method returns an array of the object's own enumerable property names.
+
+  So putting it all together: parse the JSON string, then call Object.keys on the resulting object. Then, log the result. But wait, the user wants<|projection|> the keys printed. So maybe console.log(Object.keys(parsedJson)).
+
+  Wait, the user said "prints its keys". So the script should output the keys. Let me make sure that the code does that.
+
+  Let me test this in my mind. If I have the JSON string, parse it, then get the keys<|projection|>. For the given example, the keys are "name", "age", "admin". So the output should be those three strings.
+
+  I think that's correct. Now, I need to write this as a JavaScript snippet. The code would be:
+
+  const obj = JSON.parse('{"name":"Ada","age":3<|projection|>6,"admin":true}');
+  console.log(Object.keys(obj));
+
+  But wait, the user might want to handle possible errors, but the problem doesn't mention error handling, so it's okay to keep it simple.
+
+  So the code is straightforward. Then, when this script runs, it will print the keys. The tool will<|projection|> capture the stdout, which should contain the keys.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "const obj = JSON.parse('{\"name\":\"Ada\",\"age\":36,\"admin\":true}'); console.log(Object.keys(obj));", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  execute a JavaScript snippet that reverses the string 'hello world'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to reverse the string 'hello world' using JavaScript. Let me think about how to do that.
+
+  First, I need to write a JavaScript snippet that takes the string 'hello world' and reverses it. The simplest way is to split the string into an array of characters, reverse<|projection|> the array, and then join them back into a string. So something like 'hello world'.split('').reverse().join('').
+
+  Wait, but maybe there's a more efficient way? Well, for the scope of this problem, the split-reverse-join method is straightforward and works correctly. I should use that<|projection|>.
+
+  Now, I need to make sure that the code is properly formatted as a JSON object with the 'code' parameter. The user's tool requires the 'code' field, which contains the JavaScript source. Also, the 'language' should be set to 'javascript' as per the tool's requirements.
+
+  Let me<|projection|> check the parameters again. The tool's parameters include 'code', 'language', and others like 'env', 'stdin', etc. Since the user didn't specify any environment variables or stdin, those can be omitted. The 'language' must be 'javascript' to ensure it runs in the correct context.
+
+  So the<|projection|> JSON object should look like:
+  {
+    "name": "code_run",
+    "arguments": {
+      "code": "'hello world'.split('').reverse().join('')",
+      "language": "javascript"
+    }
+  }
+
+  Wait, but the code is a string, so I need to make sure that the quotes<|projection|> are properly escaped. In JavaScript, if the code is a string, then the single quotes around the string would be okay. But when writing the JSON, the entire code is a string, so the inner quotes need to be escaped or use double quotes.
+
+  Wait, no. The 'code' parameter in the tool's<|projection|> parameters is a string. So in the JSON object, the value of 'code' should be the actual JavaScript code as a string. So for example, if the code is 'hello world'.split..., then the code parameter should be "'hello world'.split...".
+
+  But in JSON, strings are enclosed in double quotes<|projection|>. So inside the JSON, the code should have the JavaScript code with proper escaping. For example:
+
+  "code": "console.log('Hello');"
+
+  So in this case, the code is a string that contains the JavaScript snippet. Therefore, the code to reverse the string would be written as:
+
+  "'hello world'.split<|projection|>('').reverse().join('')"
+
+  Because when the code is executed, it will take the string, split into an array, reverse, and join back.
+
+  Therefore, the correct JSON object is:
+
+  {
+    "name": "code_run",
+    "arguments": {
+      "code": "'hello world'.split('').reverse<|projection|>().join('')",
+      "language": "javascript"
+    }
+  }
+
+  I think that's correct. The code is a string that, when evaluated, will perform the reversal. The language is set to 'javascript' as required. This should return the reversed string as the result.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "'hello world'.split('').reverse().join('')", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  run JS to compute the factorial of 12<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to run JavaScript code to compute the factorial of 12. Let me think about how to approach this.
+
+  First, I need to use the provided tool called 'code_run'. The parameters required are code, language, and others like env, stdin, timeout_sec. Since the<|projection|> user specified JavaScript, I'll set the language to 'javascript'.
+
+  The main part is writing the JavaScript code that calculates the factorial. A simple loop or a recursive function could work. For efficiency, a loop is better here. Let me draft something like:
+
+  function factorial(n) {
+      let result = 1;
+     <|projection|> for (let i = 2; i <= n; i++) {
+          result *= i;
+      }
+      return result;
+  }
+  console.log(factorial(12));
+
+  But wait, the code needs to be a string in the 'code' parameter. Also, the script should output the result via console.log so<|projection|> it's captured. The user probably wants the output, which will be in the stdout of the tool's response.
+
+  I need to make sure there are no syntax errors. Let me check the code again. The function is correctly defined, and the loop starts from 2 since 1! is 1. Testing with<|projection|> n=12 should give 479001600.
+
+  The language is set to 'javascript', and the code is properly enclosed in quotes. No environment variables or stdin are needed here. The timeout_sec isn't specified, but the default might be okay. Since the calculation is simple, it<|projection|> shouldn't take long.
+
+  So the final step is to structure the JSON call with the name as 'code_run' and the arguments including the code and language. Double-checking the parameters to ensure all required fields are present.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "function factorial(n) { let result = 1; for (let i = 2; i <= n; i++) { result *= i; } return result; } console.log(factorial(12));", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  use JavaScript to filter the array [3, 8, 11, 14, 5, 20, 7] down to just the even numbers<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to filter an array and get only the even numbers. Let me think about how to do that in JavaScript.
+
+  The array given is [3, 8, 11, 14, 5, 20, 7]. Even numbers are those divisible by <|projection|>2 with no remainder. So I can use the modulo operator % to check each number.
+
+  In JavaScript, the array method filter() is perfect for this. The filter() method creates a new array with all elements that pass the test implemented by the provided function.
+
+  So the plan is: iterate over each element in the array<|projection|>, check if the element is even (element % 2 === 0), and collect those elements into a new array.
+
+  Let me write the code. The original array is [3, 8, 11, 14, 5, 20, 7]. Applying the filter:
+
+  const<|projection|> original = [3, 8, 11, 14, 5, 20, 7];
+  const evens = original.filter(num => num % 2 === 0);
+
+  The resulting evens array should be [8, 14, 20].
+
+  Wait, let me<|projection|> double-check. 8 divided by 2 is 4, no remainder. 14/2 is 7, and 20/2 is 10. Yes, those are even. The other numbers: 3, 11, 5, 7 are odd. So the filtered<|projection|> array is correct.
+
+  So the JavaScript code would correctly filter the array as required. I need to make sure that the code is written properly, with the correct syntax for the filter method and the arrow function.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "const arr = [3, 8, 11, 14, 5, 20, 7];\nconst evens = arr.filter(num => num % 2 === 0);\nevans;", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  run a quick JavaScript to format a Unix timestamp as an ISO date string<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to convert a Unix timestamp to an ISO date string using JavaScript. Let me think about how to do that.
+
+  First, a Unix timestamp is in seconds, but JavaScript's Date object uses milliseconds. So I need to multiply the timestamp by 1000. Then, creating a<|projection|> new Date object with that value.
+
+  Wait, if the timestamp is in seconds, like 1625788800 (which is July 1, 2021), multiplying by 1000 gives 1625788800000<|projection|>, which is the correct milliseconds since the epoch.
+
+  Once the Date object is created, I can use the toISOString() method. But wait, that returns the date in UTC. If the user wants the local time, maybe they should use toLocaleString or other methods. But the question says "ISO date string,"<|projection|> which typically refers to the ISO 8601 format, which is what toISOString() provides.
+
+  So putting it all together: take the timestamp, multiply by 1000, create a Date object, then call toISOString().
+
+  But the user might pass the timestamp as a string, so I should<|projection|> parse it first. Let me write a function that takes the timestamp as a parameter. For example:
+
+  function formatDate(timestamp) {
+    const date = new Date(parseInt(timestamp) * 1000);
+    return date.toISOString();
+  }
+
+  Wait, but if the input is a string, parseInt will convert it. But<|projection|> if the input is a number, this still works. So in the code, maybe the timestamp is passed as a variable.
+
+  In the tool's context, the JavaScript code can be written as:
+
+  const timestamp = 1625788800; // Example timestamp
+  <|projection|>const date = new Date(timestamp<|projection|> * 1000);
+  console.log(date.toISOString());
+
+  But since the user might provide the timestamp, perhaps the code should accept it as an argument. However, the tool's code execution doesn't have variables unless they're defined in the code. So the code needs to include the logic, possibly with a sample<|projection|> value.
+
+  Alternatively, the code could use a function that's called with the timestamp. But for simplicity, maybe the example uses a hard-coded value. The user can replace it with their own.
+
+  So the final JavaScript code would be:
+
+  const timestamp = 1625788800; // Example<|projection|> Unix timestamp
+  const date = new Date(timestamp * 1000);
+  console.log(date.toISOString());
+
+  This should output "2021-07-01T00:00:00.000Z" which is the ISO string.
+
+  I need to make sure that the<|projection|> code is correct. Let me test it in my head. The timestamp 1625788800 seconds is July 1, 2021 at 00:00:00 UTC. Multiplying by 1000 gives milliseconds, so the Date object is<|projection|> correctly created. toISOString() returns the date in UTC, which matches the ISO format.
+
+  So the code should work. Now, the tool call would execute this code and return the output.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "const timestamp = 1625788800; // Example Unix timestamp\nconst date = new Date(timestamp * 1000);\nconsole.log(date.toISOString());", "language": "javascript"}}
+  </tool_call><|projection|>
+- |-
+  evaluate JavaScript that counts the vowels in 'sandbox engine'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to evaluate a JavaScript snippet that counts the vowels in the string 'sandbox engine'. Let me think about how to approach this.
+
+  First, the string given is 'sandbox engine'. I need to count all the vowels, which are 'a', 'e', 'i', 'o', '<|projection|>u', both lowercase and uppercase. But since the string is in lowercase except for maybe the first letter, but in this case, 'sandbox' starts with 's', so the entire string is lowercase except 'engine' which is also lowercase. Wait, 'sandbox engine' is all lowercase. So I can check each<|projection|> character and see if it's a vowel.
+
+  So the plan is: iterate over each character in the string, check if it's a vowel, and increment a counter each time.
+
+  But how to do this in JavaScript? Let me think. The string is 'sandbox engine'. So:
+
+  let str = 'sandbox engine';
+  <|projection|>let count = 0;
+  for (let char of str) {
+      if ('aeiou'.includes(char)) {
+          count++;
+      }
+  }
+  console.log(count);
+
+  That should work. Then, the result would be the number of vowels. Let me count manually to verify. 'sandbox engine' has a, o<|projection|>, e, e. Wait:
+
+  s a n d b o x   e n g i n e
+
+  Wait, let's write each character:
+
+  s, a, n, d, b, o, x,  (space), e, n, g, i, n, e.
+
+  So vowels are a<|projection|>, o, e, i, e. That's 5 vowels. So the code should output 5.
+
+  But wait, the string is 'sandbox engine'. Let me check again:
+
+  "sandbox engine"
+
+  Breaking it down:
+
+  s a n d b o x  e n g i n e
+
+  So the spaces<|projection|> are between 'sandbox' and 'engine'. So the letters are:
+
+  s, a, n, d, b, o, x, (space), e, n, g, i, n, e.
+
+  So the vowels are a, o, e, i, e. That's 5 vowels. So<|projection|> the code should return 5.
+
+  Therefore, the JavaScript code should log 5. So when I run this code in the tool, the result should be 5.
+
+  Now, I need to structure the tool call correctly. The tool is called 'code_run', and the parameters include the code, language, etc.
+
+  <|projection|>The code parameter is the JavaScript code. The language is 'javascript' or 'js'. The tool requires the code and language. So the JSON would be:
+
+  {
+    "name": "code_run",
+    "arguments": {
+      "code": "let str = 'sandbox engine'; let count = 0;<|projection|> for (let char of str) { if ('aeiou'.includes(char)) { count++; } } console.log(count);",
+      "language": "javascript"
+    }
+  }
+
+  Wait, but in the code, the string is 'sandbox engine', which includes the space. The code correctly processes that.
+
+  So this should<|projection|> work. Then, the output would be 5, which is the correct count.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_run", "arguments": {"code": "let str = 'sandbox engine'; let count = 0; for (let char of str) { if ('aeiou'.includes(char)) { count++; } } console.log(count);", "language": "javascript"}}
+  </tool_call><|projection|>

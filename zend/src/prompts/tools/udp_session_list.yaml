@@ -1,0 +1,121 @@
+name: udp_session_list
+category: UDP sessions
+description: Enumerate the UDP datagram sockets currently bound in this conversation, with each default peer.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open UDP sockets<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open UDP sockets. Let me check the tools available. There's a tool called udp_session_list that enumerates UDP datagram sockets bound in the conversation with each default peer. The parameters are a JSON object with $schema and title. Since the user wants to list<|projection|> their open UDP sockets, I should call this tool. The parameters don't require any arguments, so I'll just trigger the tool call. I need to make sure the JSON is correctly formatted with the name and empty arguments as per the tool's definition.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which UDP sessions are active<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about active UDP sessions. I need to check the tools available. There's a tool called udp_session_list that lists UDP datagram sockets bound in the conversation with each default peer. So, the correct action is to call this tool. The parameters are defined in the schema, but<|projection|> since it's a list request, there might not be any arguments needed. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the open UDP connections<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the open UDP connections. Let me think about how to approach this.
+
+  First, I remember that UDP is a connectionless protocol, so there aren't "connections" in the same way as TCP. But maybe the user means existing sockets that are bound and listening for incoming<|projection|> packets.
+
+  Looking at the tools provided, there's a tool called udp_session_list. The description says it enumerates UDP datagram sockets currently bound in the conversation, with each default peer. That sounds like what the user needs.
+
+  The parameters for udp_session_list are specified in a JSON schema. The tool doesn't require<|projection|> any arguments, so the request is straightforward. I just need to call udp_session_list without any parameters.
+
+  I should check if there's any possibility of error, but since the user is asking for the list, and the tool is designed for this purpose, proceeding with the tool call makes sense.
+
+  So, the correct action<|projection|> is to invoke the udp_session_list function. No arguments are needed, so the JSON object will have an empty arguments field.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many UDP sockets do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many UDP sockets do I have?" Let me think about how to approach this.
+
+  First, I need to understand what the user is referring to. They're asking about UDP sockets, which are used for sending and receiving UDP packets. The user might be trying to debug<|projection|> network issues or monitor their application's network activity.
+
+  The tools available include the 'udp_session_list' function. Looking at its description, it enumerates UDP datagram sockets currently bound in the conversation, with each default peer. That sounds like it would list all the UDP sockets that are active.
+
+  So, to answer the<|projection|> user's question, I should call the 'udp_session_list' tool. The parameters for this tool are defined in the JSON schema provided. However, the parameters object is empty, meaning no arguments are needed. Therefore, I can invoke the tool without any arguments.
+
+  I need to make sure that the tool call is correctly<|projection|> formatted. The response should be a JSON object inside XML tags as specified. The name of the tool is 'udp_session_list', and there are no arguments, so the arguments field is an empty object.
+
+  Double-checking everything: the tool exists, the parameters are correct, and the formatting matches the required structure. Everything<|projection|> seems in order. Time to generate the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me a rundown of every bound UDP datagram socket and its default peer<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of all bound UDP datagram sockets along with their default peers. Let me check the tools available.
+
+  Looking at the provided tools, there's a function called udp_session_list. The description says it enumerates UDP datagram sockets currently bound in the conversation, each with<|projection|> their default peer. That's exactly what the user needs.
+
+  The parameters for udp_session_list are specified as a JSON object with a $schema. But the user hasn't provided any specific parameters, just a request for the list. Since the tool doesn't require any arguments (the parameters are empty), I can call it<|projection|> without any arguments.
+
+  So the correct action is to invoke the udp_session_list tool. The response should be the tool's output, which will contain the list of UDP sockets and their default peers.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what UDP sessions are currently open right now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the current UDP sessions that are open. Let me check the tools available. Oh, there's a tool called udp_session_list which lists all the UDP datagram sockets that are bound with their default peers. The user wants to know what's currently open, so this tool should<|projection|> provide the necessary information. I need to call this tool. The parameters for the tool are defined in the schema, but since it's an empty object, I just need to invoke it without any arguments. So the correct JSON would be {"name": "udp_session_list", "arguments": {}}. That should do<|projection|> it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate the active UDP sockets in this conversation<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to enumerate the active UDP datagram sockets in the current conversation. Let me check the tools available.
+
+  Looking at the provided tools, there's a function called udp_session_list. The description says it enumerates UDP datagram sockets currently bound in the conversation, each with their default peer<|projection|>. That sounds exactly like what the user needs.
+
+  The parameters for udp_session_list are specified as a JSON object with a $schema reference. But the actual parameters are straightforward here since the tool doesn't require any arguments. The user just wants a list of active UDP sockets.
+
+  So I should call the udp_session_list<|projection|> function without any arguments. The response from this tool should give the necessary information about the active UDP sockets. No other tools are relevant here, so no need to consider others.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are there any UDP sessions still open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any UDP sessions still open. I need to check the current UDP datagram sockets that are bound. The available tool here is udp_session_list, which enumerates those sessions. Since the user wants to know about open sessions, I should call this tool. The parameters<|projection|> for the tool are defined in the JSON schema provided. The tool doesn't require any arguments, so the request is straightforward. I'll generate the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_list", "arguments": {}}
+  </tool_call><|projection|>

@@ -1,0 +1,174 @@
+name: udp_session_send
+category: UDP sessions
+description: Transmit one fire-and-forget UDP datagram to a peer, payload as text or hex. No delivery acknowledgement.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    data:
+      description: Payload as UTF-8 text. Mutually exclusive with data_hex — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    data_hex:
+      description: Payload as hex-encoded bytes. Mutually exclusive with data — provide exactly one. If both are sent, data_hex wins.
+      type:
+      - string
+      - 'null'
+    peer:
+      description: Destination peer as "host:port", overriding the session default_peer. Required if the session was opened without a default_peer.
+      type:
+      - string
+      - 'null'
+    session_id:
+      description: The session id returned by udp_session_open.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: SendRequest
+  type: object
+examples:
+- |-
+  send the bytes cafebabe to UDP session udp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the bytes "cafebab" over a UDP session called "udp-1". Wait, but the tool they provided is called udp_session_send. Let me check the parameters.
+
+  The tool requires the session_id, which is the ID from udp_session_open<|projection|>. The user mentioned "UDP session udp-1", so maybe "udp-1" is the session ID. But I need to confirm. The parameters for udp_session_send include session_id, data, data_hex, and peer. The user is sending bytes, so data_hex would be "cafeba" (<|projection|>but wait, "cafebabe" is 8 hex digits, which is 4 bytes. Wait, "cafebabe" is 8 characters, so 4 bytes. So the hex should be "cafeba" if it's 6 characters? Wait, no. Each byte is two<|projection|> hex digits. So "cafebabe" is 8 hex digits, which is 4 bytes. So the user said "send the bytes cafebabe", which is 8 hex chars. So data_hex should be "cafebab" — wait, no. Let me check: "cafeb<|projection|>abe" is 8 hex digits. So the correct hex string would be "cafebab"? No, wait, "cafebabe" is 8 characters. So the user probably meant "cafebabe" as the hex. But the user wrote "cafebabe". So I need to<|projection|> pass that as data_hex.
+
+  So the session_id is "udp-1"? Or is "udp-1" the peer? Wait, the user says "UDP session udp-1", which might mean that the session ID is "udp-1". The tool requires session_id, which is the ID from udp_session<|projection|>_open. So assuming that "udp-1" is the correct session ID.
+
+  So the call would be:
+
+  name: udp_session_send
+  <|projection|>arguments: {
+    "session_id": "udp-1",
+    "data_hex": "cafebab"
+  }
+
+  Wait, but the user wrote "cafebabe".<|projection|> Let me check again. The user said "send the bytes cafebabe to UDP session udp-1". So the hex is "cafebabe", which is 8 characters. So data_hex should be "cafebab"? No, wait, "cafebabe" is 8 characters. So<|projection|> the correct hex string is "cafebabe".
+
+  But maybe the user made a typo. But I have to go with what they provided. So the data_hex is "cafebabe".
+
+  So the arguments would be:
+
+  {
+    "session_id": "udp-1",
+    "data_hex": "ca<|projection|>febabe"
+  }
+
+  That's the correct call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-1", "data_hex": "cafebabe"}}
+  </tool_call><|projection|>
+- |-
+  send the text `ping` to UDP session udp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the text "ping" to a UDP session called "udp-1". Hmm, I need to use the tool provided, which is udp_session_send. Let me check the parameters.
+
+  The tool requires session_id, which in this case is "udp-<|projection|>1". Then, the data can be either data or data_hex. Since the user specified "ping" as text, I should put that in the data field. The data_hex is optional and would be for hex values. So here, data_hex isn't needed. Also, the peer is optional if the session has<|projection|> a default, but since the user didn't specify, maybe it's okay to omit it.
+
+  So the arguments should be session_id: "udp-1", data: "ping". Let me make sure there are no typos. Yeah, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-1", "data": "ping"}}
+  </tool_call><|projection|>
+- |-
+  send the bytes 0102030405 to UDP session udp-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the bytes 0102030405 via a UDP session called udp-2. But wait, the tool provided is udp_session_send. Let me check the parameters.
+
+  The tool requires session_id, and optionally data or data_hex<|projection|>. The user mentioned "bytes 0102030405", which is hex-encoded. So I should use data_hex with the value "0102030405". The session_id would be "udp-2" as per the user's request. Also, the<|projection|> peer isn't specified, but the tool says if the session was opened without a default_peer, then peer is required. But since the user didn't mention it, maybe it's handled elsewhere. So the call should be to udp_session_send with session_id "udp-2" and data_hex "0102<|projection|>030405".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-2", "data_hex": "0102030405"}}
+  </tool_call><|projection|>
+- |-
+  send the heartbeat string `hb` to UDP session udp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the heartbeat string "hb" to a UDP session called "udp-1". I need to use the tool provided, which is udp_session_send.
+
+  First, I check the parameters required for the tool. The required parameter is session_id, which in this<|projection|> case should be "udp-1". Then, the data can be either data or data_hex. Since the user specified the string "hb", I should put that into the data field. The data_hex is optional and would be used if there's hex data, but here it's not needed.
+
+  I also need to<|projection|> make sure that the peer is set correctly. But the user didn't mention a specific peer, so maybe the session already has a default peer. If not, the session might have been opened without a default, but the user hasn't mentioned that. So I'll proceed with the given session ID and the data.
+
+  So<|projection|> the JSON call should have the name "udp_session_send", with arguments: session_id "udp-1" and data "hb". No need for data_hex or peer here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-1", "data": "hb"}}
+  </tool_call><|projection|>
+- |-
+  fire the hex datagram deadbeef00ff over UDP session udp-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to send a UDP datagram with the hex data "deadbeef00ff" using an existing session called "udp-3".
+
+  First, I need to check the available tools. There's the udp_session_send function.<|projection|> The parameters required are session_id, data, and data_hex. But wait, the parameters say that data and data_hex are mutually exclusive. The user provided hex data, so I should use data_hex.
+
+  Wait, the user specified "fire the hex datagram deadbeef00ff", so the data is in<|projection|> hex. So I should put that into data_hex. The session ID is given as "udp-3".
+
+  Wait, the parameters for the tool: the session_id is required. The user mentioned "UDP session udp-3", so the session_id is "udp-3". The data_hex is "deadbe<|projection|>ef00ff".
+
+  So the tool call should be to udp_session_send with session_id="udp-3" and data_hex="deadbeef00ff". I need to make sure that the JSON structure is correct. Also, check if any other parameters are needed. The peer is optional, but since<|projection|> the session might have a default, we don't need to include it unless necessary.
+
+  So the final JSON should have the name as "udp_session_send" and the arguments with session_id and data_hex. That's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-3", "data_hex": "deadbeef00ff"}}
+  </tool_call><|projection|>
+- |-
+  can you push the text `DISCOVER` out on UDP session udp-2?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the text "DISCOVER" over aUDP session called udp-2. But wait, the tools provided are for sending UDP datagrams using the udp_session_send function. Let me check the parameters.
+
+  The tool requires session_id, which is the ID from<|projection|> udp_session_open. The user mentioned "udp-2" as the session, so I need to use that as the session_id. The data can be the string "DISCOVER". Since the user didn't specify hex, I'll use the data parameter. Also, the peer might be optional if the session has a<|projection|> default, but since the user didn't specify, maybe it's okay. So the call should be to udp_session_send with session_id "udp-2" and data "DISCOVER".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-2", "data": "DISCOVER"}}
+  </tool_call><|projection|>
+- |-
+  transmit the bytes 1b0000000000000000 as a UDP datagram on udp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. The user wants to transmit the bytes 1b0000000000000000 as a UDP datagram using the udp_session_send tool.
+
+  First, I need to recall how<|projection|> the tool works. The tool requires parameters like session_id, data, data_hex, and peer. The user mentioned "udp-1" which I assume is the session ID. But wait, the user didn't mention the session ID explicitly. Hmm, maybe "udp-1" is the session ID they're referring<|projection|> to.
+
+  Next, the payload is given in hex: 1b0000000000000000. Since the tool accepts both data (as UTF-8) and data_hex (as hex), I should use data_hex here because the payload is in hexadecimal. The<|projection|> user specified "bytes", so using data_hex makes sense.
+
+  Wait, the user wrote "transmit the bytes 1b0000000000000000 as a UDP datagram". So the actual bytes are 1b followed by 16 zeros. But in<|projection|> hex, each pair represents a byte. So 1b is one byte, then 00, etc. So the hex string is correct as given.
+
+  Now, the tool's parameters: session_id is required. The user didn't mention a session ID, but maybe "udp-1" is the session ID<|projection|> they're using. So I should use session_id="udp-1".
+
+  Also, the peer parameter is optional if the session has a default peer. Since the user didn't specify a peer, perhaps it's already set in the session. So I don't need to include the peer parameter unless necessary.
+
+  Putting it all<|projection|> together: call udp_session_send with session_id="udp-1", data_hex="1b0000000000000000". That should send the hex bytes as a UDP datagram.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-1", "data_hex": "1b0000000000000000"}}
+  </tool_call><|projection|>
+- |-
+  blast the string `STATUS?` to UDP session udp-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to send the string "STATUS?" via UDP using the provided tool. The session is called udp-4.
+
+  First, I need to check the available tools. There's a function called udp_session_send. The parameters required are session_id, data, data_hex,<|projection|> and peer. The session_id is given as "udp-4". The data is "STATUS?", which is a string. Since data_hex is optional and not provided, I should use the data parameter. The peer is not mentioned, so maybe the session has a default. But the tool requires session_id, which is<|projection|> provided. So the correct call is to udp_session_send with session_id "udp-4" and data "STATUS?".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_send", "arguments": {"session_id": "udp-4", "data": "STATUS?"}}
+  </tool_call><|projection|>

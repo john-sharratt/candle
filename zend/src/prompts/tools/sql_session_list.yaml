@@ -1,0 +1,109 @@
+name: sql_session_list
+category: SQL sessions
+description: Enumerate the database sessions currently open in this conversation, with each database path and connection state.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open SQL sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open SQL sessions. Let me check the tools available. There's a tool called sql_session_list that enumerates database sessions. The parameters are a JSON object with $schema and title. But the user just wants to list the sessions. Since the tool doesn't require<|projection|> any arguments, I can call it without any parameters. So the correct call is to use sql_session_list with an empty arguments object. That should retrieve the open sessions for the user.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which database sessions are active<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about active database sessions. Let me check the tools available. There's a tool called sql_session_list that enumerates open database sessions. The parameters are a JSON object with $schema and title. I need to call this tool. The response should be a JSON object inside XML tags<|projection|>. So the correct call is to use sql_session_list with an empty arguments object since the parameters don't require any values. That should retrieve the session list.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the open SQL connections<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the open SQL connections. Let me check the tools available. There's a tool called sql_session_list that enumerates database sessions. The description says it lists each database path and connection state. That's exactly what the user needs.
+
+  I need to call this tool. The<|projection|> parameters are specified in the tool's definition. The parameters are an object with a $schema and title, but the actual parameters for the request are empty. Wait, looking at the tool's parameters, it's an object with a $schema and title, but no properties. So maybe the request doesn't require any arguments<|projection|>.
+
+  So, to invoke sql_session_list, I just need to call it without any arguments. The user wants the list of open connections, and this tool should handle that. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many SQL sessions do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many SQL sessions do I have?" I need to figure out which tool to use here. Looking at the provided tools, there's one called sql_session_list. The description says it enumerates the database sessions currently open in the conversation, including each database path and connection<|projection|> state. That sounds exactly like what the user needs.
+
+  The user isn't asking for a specific session but rather the count of all active sessions. The sql_session_list tool should return a list of all sessions. Once I get that data, I can count them and provide the number to the user.
+
+  I should check if<|projection|> there are any parameters required for the sql_session_list tool. The parameters section in the tool definition shows an empty object {} with a schema, which means no additional arguments are needed. So, I can call the tool without any arguments.
+
+  So, the plan is to invoke the sql_session_list tool, retrieve the list of<|projection|> sessions, count them, and then inform the user how many SQL sessions they have open.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me every SQL session with its database path and connection state<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see every SQL session along with the database path and connection state. Let me check the available tools.
+
+  There's a tool called sql_session_list that enumerates the database sessions. The parameters are straightforward; it's a simple request without any arguments needed. The description says it returns<|projection|> each database path and connection state, which matches the user's request.
+
+  So I need to call sql_session_list. Since there are no parameters required, the JSON object will have an empty arguments object. I'll structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what database sessions are currently open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the current database sessions. Let me check the tools available. There's a tool called sql_session_list that enumerates the database sessions. The parameters are a JSON object with a schema, but the parameters don't require any arguments. So I just need to call sql_session_list<|projection|> with an empty object. I'll return the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate the active SQL connections in this conversation<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to enumerate the active SQL connections in this conversation. Let me check the tools available.
+
+  Looking at the provided tools, there's a function called sql_session_list. The description says it enumerates database sessions currently open in the conversation, listing each database path and connection state. That's<|projection|> exactly what the user needs.
+
+  The parameters for sql_session_list are defined with a JSON schema, but the parameters object is empty. So, no arguments are needed when calling this function.
+
+  So, I should generate a tool call for sql_session_list with an empty arguments object. The user's request is straightforward, and<|projection|> the correct tool is available. No other functions are necessary here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  do I still have any SQL sessions open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if they still have any SQL sessions open. I need to check the current database sessions. The available tool is sql_session_list, which lists all open sessions with their paths and states. I should call that tool. The parameters are straightforward, no arguments needed. Just invoke the tool<|projection|> and return the response.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_list", "arguments": {}}
+  </tool_call><|projection|>

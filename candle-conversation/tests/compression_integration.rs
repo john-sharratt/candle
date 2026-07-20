@@ -320,14 +320,12 @@ fn compression_over_zend_schema() -> candle_conversation::Result<()> {
     // section` injects a tool's JSON as the compression prompt and the decode
     // degenerates. This is the conditions the live daemon hit.
     let tools_coll = proj_builder
-        .id_for_collection_in(dialogue_layer, "tools")
+        .id_for_system_collection("tools")
         .expect("dialogue layer must declare a 'tools' collection");
     let mut tool_ids: Vec<u32> = Vec::new();
     for t in 0..8 {
         let id = proj_builder
-            .add_section_to_collection(
-                dialogue_layer,
-                tools_coll,
+            .add_section_to_collection(tools_coll,
                 format!("tool_{t}"),
                 format!(
                     "{{\"name\":\"tool_{t}\",\"description\":\"does thing {t}\",\"parameters\":{{}}}}"

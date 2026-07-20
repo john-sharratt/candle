@@ -1,0 +1,215 @@
+name: ssh_session_exec_async
+category: SSH sessions
+description: Start a long-running command on a remote SSH session without blocking. Returns process_id; use ssh_session_poll to check status and read output.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    command:
+      description: The shell command to start on the remote host.
+      minLength: 1
+      type: string
+    cwd:
+      description: Working directory to run the command in. Defaults to the session's current directory.
+      type:
+      - string
+      - 'null'
+    env:
+      additionalProperties:
+        type: string
+      description: Environment variables to set for the command, as name→value pairs. Defaults to none (inherits the session environment).
+      type:
+      - object
+      - 'null'
+    session_id:
+      description: The session id returned by the corresponding ssh_open tool.
+      minLength: 1
+      type: string
+    timeout_sec:
+      description: Maximum seconds to let the command run. No default is applied.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - command
+  - session_id
+  title: ExecAsyncRequest
+  type: object
+examples:
+- |-
+  run `pg_dump mydb > /backups/db.sql` on SSH session ssh-7f3a in the background<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to run the command `pg_dump mydb > /backups/db.sql` on an SSH session with the ID ssh-7f3a in the background.
+
+  First, I need to recall the available tools. There's the<|projection|> `ssh_session_exec_async` tool which starts a long-running command asynchronously. That seems right because the user wants it to run in the background without blocking.
+
+  Looking at the parameters for `ssh_session_exec_async`, the required fields are `command` and `session_id`. The user provided the session ID as ssh-7<|projection|>f3a, so that's straightforward. The command they want to execute is `pg_dump mydb > /backups/db.sql`.
+
+  Wait, the command includes a shell redirection (`> /backups/db.sql`). Since this is a shell command, I should make sure it's passed correctly. The `command<|projection|>` parameter of the tool expects a string, so I can just pass the entire command as is. The SSH session will handle the redirection.
+
+  Other parameters like `cwd`, `env`, and `timeout_sec` are optional. The user didn't specify a working directory, so I can omit that. Similarly, there's<|projection|> no mention of environment variables, so that's not needed. The timeout isn't specified either, so I'll leave it out as well.
+
+  Putting it all together, the tool call should have the name `ssh_session_exec_async` with arguments `command="pg_dump mydb > /backups/db.sql"` and `<|projection|>session_id="ssh-7f3a"`.
+
+  I need to ensure the JSON structure is correct. The keys should be in quotes, and the values properly escaped if necessary. Since the command doesn't contain any special characters that need escaping, it should be fine.
+
+  Double-checking the required parameters: both<|projection|> `command` and `session_id` are present. All other parameters are optional and omitted as per the user's request.
+
+  Yes, this should start the command asynchronously on the specified SSH session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "pg_dump mydb > /backups/db.sql", "session_id": "ssh-7f3a"}}
+  </tool_call><|projection|>
+- |-
+  run `make -j8 release` on SSH session ssh-2b1c without waiting<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to run the command `make -j8 release` on an SSH session called ssh-2b1c without waiting. So, I need to use the tool provided, which is ssh_session_exec_async.
+
+  First, I check the parameters required for that tool.<|projection|> The required parameters are "command" and "session_id". The user provided the command as `make -j8 release` and the session ID as ssh-2b1c.
+
+  Wait, the session_id in the tool's parameters is a string, so "ssh-2b1c" should be correct<|projection|>. The other parameters like cwd, env, and timeout_sec are optional. Since the user didn't specify any of those, I can omit them.
+
+  So the JSON object should have "command" set to "make -j8 release" and "session_id" set to "ssh-2b1c".<|projection|> The other parameters like cwd, env, and timeout_sec aren't needed here.
+
+  I need to make sure that the JSON is correctly formatted. Let me double-check the syntax. The keys should be in quotes, and the values as well. No trailing commas.
+
+  Yes, that looks right. So the tool call<|projection|> will be the ssh_session_exec_async with those arguments. The user doesn't need to wait, so the async execution is appropriate here. The process ID will be returned, but the user didn't ask for it, so just executing the command is sufficient.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "make -j8 release", "session_id": "ssh-2b1c"}}
+  </tool_call><|projection|>
+- |-
+  run `./migrate.sh --all` asynchronously on SSH session ssh-9d4e<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the command `./migrate.sh --all` asynchronously on an SSH session with the ID ssh-9d4e. Let me check the tools available.
+
+  There's a tool called ssh_session_exec_async. Its description says it starts a long-running command on a remote SSH<|projection|> session without blocking. The parameters required are command, session_id, and others like cwd, env, timeout_sec. The user provided the session ID ssh-9d4e, so that's the session_id parameter.
+
+  The command to execute is `./migrate.sh --all`. I need to make sure that's<|projection|> passed as the command parameter. The other parameters like cwd, env, and timeout_sec are optional. Since the user didn't specify them, I can omit them or set them to default values. The required parameters are command and session_id, which are both provided.
+
+  So the tool call should be ssh_session_exec_async with<|projection|> command "./migrate.sh --all" and session_id "ssh-9d4e". No need to include optional parameters unless specified. That should start the command asynchronously as requested.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "./migrate.sh --all", "session_id": "ssh-9d4e"}}
+  </tool_call><|projection|>
+- |-
+  run `stress-ng --cpu 4 --timeout 60s` on SSH session ssh-7f3a and don't block<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to run the command `stress-ng --cpu 4 --timeout 60s` on an SSH session with the ID ssh-7f3a, and they don't want to block while it's running.
+
+  First,<|projection|> I remember that there's a tool called ssh_session_exec_async. The description says it starts a long-running command on a remote SSH session without blocking. That sounds exactly like what's needed here.
+
+  Looking at the parameters for ssh_session_exec_async, the required ones are "command" and "session_id". The user provided<|projection|> the command and the session ID is given as ssh-7f3a. So I need to plug those into the arguments.
+
+  Wait, the session_id parameter in the tool's parameters is a string, and the example uses "ssh-7f3a" as the session ID. So that should be straightforward.<|projection|>
+
+  The other parameters like cwd, env, and timeout_sec are optional. The user didn't specify a working directory, so I can omit that. Similarly, there's no mention of environment variables, so that can be left out. The timeout_sec is mentioned as 60 seconds in the command, but the tool<|projection|>'s timeout_sec is an integer. However, the command's --timeout 60s might be handled by the tool's timeout_sec. But since the user specified it in the command, maybe we need to set timeout_sec to 60. Wait, the command's timeout is part of the command itself, but<|projection|> the tool's timeout_sec is a separate parameter. The user might want the SSH session to not time out before the command finishes. But the user's instruction says to run the command and not block, so perhaps the tool's timeout_sec is optional. Since the user didn't specify, maybe we can leave it as default<|projection|> or set it to the same as the command's timeout. However, the tool's parameters show that timeout_sec is an integer, and the user's command has --timeout 60s, which is 60 seconds. So I should include timeout_sec=60.
+
+  Wait, but the tool's description says<|projection|> "timeout_sec: Maximum seconds to let the command run." So if we set that to 60, then the command will be terminated if it runs longer than 60 seconds. But the command itself also has a timeout of 60 seconds. That might be redundant, but perhaps the user wants both.<|projection|> Or maybe the tool's timeout is different. But since the user specified it in the command, I should include it in the tool call.
+
+  So putting it all together, the arguments would be:
+
+  {
+    "command": "stress-ng --cpu 4 --timeout 60s",
+    "session_id": "<|projection|>ssh-7f3a",
+    "timeout_sec": 60
+  }
+
+  The other parameters like cwd and env are not provided, so they are omitted. The required fields are present.
+
+  I need to make sure that the JSON is correctly formatted. The keys are in quotes, the values are correct. Also<|projection|>, the session_id is a string.
+
+  Yes, this should work. So the tool call will be ssh_session_exec_async with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "stress-ng --cpu 4 --timeout 60s", "session_id": "ssh-7f3a", "timeout_sec": 60}}
+  </tool_call><|projection|>
+- |-
+  kick off `rsync -avz /data/ remote:/data/` on SSH session ssh-5b3c in the background<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to start the command `rsync -avz /data/ remote:/data/` on an existing SSH session called "ssh-5b3c" in the background.
+
+  First, I need to check the available tools.<|projection|> There's the `ssh_session_exec_async` tool, which is for starting long-running commands on a remote SSH session without blocking. The parameters required are command, session_id, and others like cwd, env, timeout_sec.
+
+  The user provided the session ID "ssh-5b3c", so that's the session<|projection|>_id parameter. The command is `rsync -avz /data/ remote:/data/`. Since the user wants it to run in the background, this tool should handle that by returning a process ID.
+
+  I should make sure all required parameters are included. The required fields are command and session_id. The user<|projection|> didn't mention any specific working directory or environment variables, so those can be omitted. The timeout_sec isn't specified either, so maybe it's optional.
+
+  So the JSON call should have the name "ssh_session_exec_async" with the command and session_id. Let me structure that correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "rsync -avz /data/ remote:/data/", "session_id": "ssh-5b3c"}}
+  </tool_call><|projection|>
+- |-
+  fire off `apt-get -y dist-upgrade` on SSH session ssh-0e1d and don't wait for it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to run `apt-get -y dist-upgrade` on an SSH session with the ID ssh-0e1d, and they don't want to wait for it to finish.
+
+  First, I remember that there's a tool called<|projection|> ssh_session_exec_async. The description says it starts a long-running command without blocking. That fits because the user doesn't want to wait.
+
+  Looking at the parameters needed for ssh_session_exec_async: the command, session_id, and optional things like cwd, env, timeout. The required ones are command and session_id.<|projection|>
+
+  The user provided the command as `apt-get -y dist-upgrade`, which should be the command parameter. The session ID is given as ssh-0e1d. So I need to structure the arguments with those values.
+
+  Wait, the session_id in the tool's parameters is a string, so "<|projection|>ssh-0e1d" is correct. The command is the apt-get command. The other parameters like cwd, env, and timeout aren't specified, so they can be omitted since they're optional.
+
+  The user didn't mention a timeout, so we don't include that. The tool's required fields are<|projection|> covered: command and session_id.
+
+  So the JSON object should have "name": "ssh_session_exec_async" and the arguments with command and session_id. That's all. I think that's it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "apt-get -y dist-upgrade", "session_id": "ssh-0e1d"}}
+  </tool_call><|projection|>
+- |-
+  start `find / -name '*.core' -delete` async on SSH session ssh-8f2a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to start the command `find / -name '*.core' -delete` asynchronously on an SSH session with the ID ssh-8f2a.
+
+  First, I need to check the available tools. There's the `ssh_session_exec_async` tool. Its<|projection|> parameters are command, cwd, env, session_id, and timeout_sec. The required ones are command and session_id.
+
+  The user provided the session ID as ssh-8f2a, so that's the session_id. The command is `find / -name '*.core' -delete`. I don't see any<|projection|> environment variables or working directory specified, so those can be omitted. The timeout isn't mentioned, so maybe leave it out unless required.
+
+  So the JSON should have the name as ssh_session_exec_async, arguments with command and session_id. Let me structure that.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "find / -name '*.core' -delete", "session_id": "ssh-8f2a"}}
+  </tool_call><|projection|>
+- |-
+  launch `ffmpeg -i in.mov out.mp4` on SSH session ssh-c4d7 without blocking<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the command `ffmpeg -i in.mov out.mp4` on an SSH session called "ssh-c4d7" without blocking. Let me check the tools available.
+
+  There's a tool called ssh_session_exec_async. Its description says it starts a long-running command on a<|projection|> remote SSH session without blocking. It returns a process ID, and they can use ssh_session_poll to check the status. That sounds exactly like what's needed here.
+
+  Looking at the parameters for ssh_session_exec_async: it requires "command" and "session_id". The user provided the session name as "ssh-c4<|projection|>d7", so that's the session_id. The command is "ffmpeg -i in.mov out.mp4".
+
+  Wait, the parameters also have optional fields like cwd, env, timeout_sec. But the user didn't mention any of those, so I don't need to include them. The required fields are command and<|projection|> session_id. So the arguments should be:
+
+  {
+    "command": "ffmpeg -i in.mov out.mp4",
+    "session_id": "ssh-c4d7"
+  }
+
+  I need to make sure that the JSON is correctly formatted. No extra parameters. The user didn't specify a timeout, so we omit<|projection|> that. The cwd and env aren't mentioned either. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_exec_async", "arguments": {"command": "ffmpeg -i in.mov out.mp4", "session_id": "ssh-c4d7"}}
+  </tool_call><|projection|>

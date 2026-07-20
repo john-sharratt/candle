@@ -1,0 +1,212 @@
+name: hmac_compute
+category: Cryptography
+description: Compute a keyed HMAC authentication tag over a message (sha256, sha512, or sha1). Use to sign API requests or to confirm a message arrived unaltered from a party holding the shared secret key.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    HmacAlgorithm:
+      description: HMAC hash function.
+      enum:
+      - sha256
+      - sha512
+      - sha1
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/HmacAlgorithm'
+      description: 'HMAC hash function. One of: sha256, sha512, sha1.'
+      minItems: 1
+      minLength: 1
+    data:
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+    key:
+      minLength: 1
+      type: string
+    key_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `key` is encoded. One of: text, hex, base64. Defaults to text.'
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned MAC. One of: text, hex, base64. Defaults to hex.'
+  required:
+  - algorithm
+  - data
+  - key
+  title: HmacRequest
+  type: object
+examples:
+- |-
+  compute the HMAC-SHA256 of the message 'transfer 500 to alice' with key s3cr3t-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants me to compute the HMAC-SHA256 for the message "transfer 500 to alice" with the key "s3cr3t-key".
+
+  First, I need to check the available tools. There's a tool called hmac_compute. Let<|projection|> me look at its parameters. The required parameters are algorithm, data, and key. The algorithm can be sha256, sha512, or sha1. The user specified HMAC-SHA256, so the algorithm should be "sha256".
+
+  The data is "transfer 5<|projection|>00 to alice". The key is "s3cr3t-key". The tool also allows optional parameters like data_encoding, key_encoding, and output_encoding. But since the user didn't specify any encoding, I should use the defaults. The default for data_encoding is "text", same for key_encoding. The<|projection|> output_encoding's default is "hex", which is fine.
+
+  So, I need to call hmac_compute with algorithm "sha256", data as "transfer 500 to alice", and key as "s3cr3t-key". No need to include the optional parameters unless necessary. Let me make sure<|projection|> there are no typos in the JSON structure. The required fields are present. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha256", "data": "transfer 500 to alice", "key": "s3cr3t-key"}}
+  </tool_call><|projection|>
+- |-
+  generate an HMAC-SHA256 tag for the data 'order#42' with key my-signing-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to generate an HMAC-SHA256 tag for the data 'order#42' using the key 'my-signing-key'.
+
+  First, I need to recall how the HMAC function works. HMAC requires a hash function, which in this case is SHA<|projection|>-256. The parameters needed are the algorithm, the data, the key, and optionally the encodings.
+
+  The user specified the algorithm as SHA-256, so I'll set the 'algorithm' parameter to 'sha256'. The data is 'order#42', and the key<|projection|> is 'my-signing-key'.
+
+  Now, about the encoding. The data and key are both strings. The default encoding for data and key is 'text', which is correct here since they're plain text. The output encoding defaults to 'hex', which is standard for HMAC tags. So I don't need to<|projection|> specify the encoding parameters unless the user wants something different.
+
+  So, putting it all together: the function call should include the algorithm, data, and key. The other parameters can use their defaults. That should generate the HMAC-SHA256 tag correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha256", "data": "order#42", "key": "my-signing-key"}}
+  </tool_call><|projection|>
+- |-
+  what's the HMAC-SHA1 of the string 'payload' with key topsecret<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to compute the HMAC-SHA1 of the string 'payload' with the key 'topsecret'.
+
+  First, I need to use the hmac_compute tool. The parameters required are algorithm, data, key, and optionally encoding types. The user specified HMAC-SHA1,<|projection|> so the algorithm is 'sha1'. The data is 'payload', and the key is 'topsecret'.
+
+  The data_encoding and key_encoding aren't specified, so they default to 'text'. The output_encoding isn't mentioned, so it should default to 'hex' as per the tool's defaults.
+
+  So,<|projection|> I'll structure the tool call with these parameters. Make sure all required fields are included: algorithm, data, key. The other parameters can be omitted or set to their defaults. Let me double-check the JSON structure to ensure there are no syntax errors.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha1", "data": "payload", "key": "topsecret"}}
+  </tool_call><|projection|>
+- |-
+  compute the HMAC-SHA512 of the message 'hello' with key abc123def456<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants me to compute the HMAC-SHA512 of the message 'hello' with the key 'abc123def456'. Alright, so I need to use the hmac_compute tool they provided.
+
+  First, I should check the parameters required for the<|projection|> hmac_compute function. The parameters are algorithm, data, key, and optional ones like data_encoding, key_encoding, and output_encoding. The required ones are algorithm, data, and key.
+
+  The user specified the algorithm as SHA512, so I'll set the algorithm parameter to "sha512". The<|projection|> data is the message 'hello', and the key is 'abc123def456'.
+
+  Now, the data_encoding and key_encoding default to 'text' if not provided, which should be fine here since the inputs are text. Similarly, the output_encoding defaults to 'hex', which is what the<|projection|> user probably expects, but the problem doesn't specify, so we can stick with the default.
+
+  So putting it all together, the tool call should have the name "hmac_compute" and the arguments with the algorithm, data, and key. I need to make sure the JSON is correctly formatted. Let me double-check<|projection|> the parameters:
+
+  - algorithm: "sha512"
+  - data: "hello"
+  - key: "abc123def456"
+
+  Yes, that's all. No need for the optional parameters unless specified, which they aren't. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha512", "data": "hello", "key": "abc123def456"}}
+  </tool_call><|projection|>
+- |-
+  give me the HMAC-SHA256 of 'GET /api/v2/balance' keyed with webhook-secret-9f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking for the HMAC-SHA256 of the string 'GET /api/v2/balance' using the key 'webhook-secret-9f'.
+
+  First, I need to make sure I understand the parameters. The message data is 'GET /api<|projection|>/v2/balance', the key is 'webhook-secret-9f', and the algorithm is SHA256. The output should be in hex, which is the default, so maybe I don't need to specify that.
+
+  Looking at the tool's parameters, the required fields are algorithm, data, and key<|projection|>. The data_encoding and key_encoding default to text, which is what we want here. Since the user didn't specify an output encoding, the default of hex will be used.
+
+  So, I'll structure the tool call with the algorithm as 'sha256', data as 'GET /api/v2/balance<|projection|>', and key as 'webhook-secret-9f'. No need to include the optional parameters unless necessary. Let me double-check the parameters to ensure I'm not missing anything. Yep, that's all. The tool should handle the rest.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha256", "data": "GET /api/v2/balance", "key": "webhook-secret-9f"}}
+  </tool_call><|projection|>
+- |-
+  HMAC-SHA512 the message 'nonce=8823;amount=1000' using the key hunter2-rotated<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to compute an HMAC-SHA512 of the message 'nonce=8823;amount=1000' using the key 'hunter2-rotated'.
+
+  First, I need to check the available tools. There's a function called<|projection|> hmac_compute. The parameters required are algorithm, data, key, and optional ones like data_encoding, key_encoding, and output_encoding.
+
+  The user specified SHA512, so the algorithm is 'sha512'. The data is the string 'nonce=8823;amount=1000<|projection|>'. The key is 'hunter2-rotated'.
+
+  The default encodings for data, key, and output are text, unless specified otherwise. Since the user didn't mention any encoding, I can assume they want the default. So, no need to include data_encoding, key_encoding, or output_encoding unless needed<|projection|>.
+
+  So the arguments should be: algorithm 'sha512', data as the message, key as the given key. The rest can be omitted since they use defaults.
+
+  I need to structure this into a JSON object inside the tool_call tags. Make sure the JSON keys match the parameters defined in the tool's schema<|projection|>. Let me double-check the required fields: algorithm, data, key are required. Yes, that's covered.
+
+  Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha512", "data": "nonce=8823;amount=1000", "key": "hunter2-rotated"}}
+  </tool_call><|projection|>
+- |-
+  what HMAC-SHA1 tag does 'cookie=session42' produce with key legacy-mac-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking for the HMAC-SHA1 tag of the string 'cookie=session42' using the key 'legacy-mac-key'.
+
+  First, I need to use the hmac_compute tool. The parameters required are algorithm, data, key, and optionally encoding settings.<|projection|> The algorithm here is SHA1, so I should set "algorithm": "sha1".
+
+  The data is 'cookie=session42', and the key is 'legacy-mac-key'. The default encodings are text, which is correct here since both the data and key are plain text. So I don't need to<|projection|> specify data_encoding, key_encoding, or output_encoding unless there's a different requirement. The output will be in hex by default, which is standard for HMAC tags.
+
+  I need to make sure all required parameters are included. The required fields are algorithm, data, and key. Checking the tool's parameters, yes, those<|projection|> are covered.
+
+  So the JSON call should have name "hmac_compute" with arguments: algorithm as "sha1", data as "cookie=session42", and key as "legacy-mac-key". No need to add encoding parameters since they're optional and defaults apply.
+
+  Double-checking the example. The user<|projection|> didn't mention any specific encoding, so default text encoding is correct. The output will be the HMAC-SHA1 in hex, which is what the user wants.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha1", "data": "cookie=session42", "key": "legacy-mac-key"}}
+  </tool_call><|projection|>
+- |-
+  authenticate 'invoice-2026-0714' with HMAC-SHA256 under the key billing-hmac-key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this. The user wants to authenticate a request using HMAC-SHA256 with the key "billing-hmac-key".
+
+  First, I need to recall what the hmac_compute tool does. From the description, it computes an HMAC authentication tag. The<|projection|> parameters required are algorithm, data, key, and various encoding options.
+
+  The user mentioned "authenticate 'invoice-2026-0714' with HMAC-SHA256" so the data is "invoice-2026-0714", the key is "billing-hmac<|projection|>-key", and the algorithm is SHA256.
+
+  I should check the parameters. The required fields are algorithm, data, and key. The data_encoding and key_encoding default to text if not provided. Since the user didn't specify any encoding, I'll assume they're using text. The output_encoding defaults to<|projection|> hex, which is standard for HMAC outputs.
+
+  So, the tool call should include:
+  - name: hmac_compute
+  <|projection|>- arguments: {
+      "algorithm": "sha256",
+      "data": "invoice-2026-0714",
+      "key": "billing-hmac-key"
+  <|projection|>}
+
+  I don't see any other parameters needed here. The user didn't mention different encodings, so sticking with defaults makes sense. That should generate the correct HMAC-SHA256 signature.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hmac_compute", "arguments": {"algorithm": "sha256", "data": "invoice-2026-0714", "key": "billing-hmac-key"}}
+  </tool_call><|projection|>

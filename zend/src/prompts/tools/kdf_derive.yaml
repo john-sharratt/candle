@@ -1,0 +1,288 @@
+name: kdf_derive
+category: Cryptography
+description: Stretch a low-entropy password into a cryptographic key with a slow, memory-hard KDF — argon2id, pbkdf2_sha256, or scrypt. Use for password hashing and brute-force-resistant key derivation.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    KdfAlgorithm:
+      description: Password-based key-derivation function.
+      enum:
+      - argon2id
+      - pbkdf2_sha256
+      - scrypt
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/KdfAlgorithm'
+      description: 'KDF algorithm. One of: argon2id, pbkdf2_sha256, scrypt.'
+      minItems: 1
+      minLength: 1
+    iterations:
+      description: Iteration count. Honored by argon2id (default 3) and pbkdf2_sha256 (default 100000); ignored by scrypt.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    length:
+      description: Derived-key length in bytes (1–64). Defaults to 32.
+      format: uint32
+      maximum: 64.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+    memory_kib:
+      description: Memory cost in KiB. Honored by argon2id only (default 65536); ignored by pbkdf2_sha256 and scrypt.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned derived key. One of: text, hex, base64. Defaults to hex.'
+    password:
+      minLength: 1
+      type: string
+    salt:
+      minLength: 1
+      type: string
+    salt_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `salt` is encoded. One of: text, hex, base64. Defaults to text.'
+  required:
+  - algorithm
+  - password
+  - salt
+  title: KdfRequest
+  type: object
+examples:
+- |-
+  derive a 32-byte key from the password 'hunter2' with PBKDF2-HMAC-SHA256, hex salt 00112233445566778899aabbccddeeff<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to derive a 32-byte key from the password 'hunter2' using PBKDF2-HMAC-SHA256. The salt is given in hex as 00112233445566778<|projection|>899aabbccddeeff.
+
+  First, I need to check the available tools. The kdf_derive function supports PBKDF2-HMAC-SHA256. The parameters required are algorithm, password, salt, and others like iterations, length, etc.
+
+  The user specified the salt in hex<|projection|>, so I should set the salt_encoding to 'hex'. The output length is 32 bytes. For PBKDF2, the number of iterations isn't specified here. The default for iterations in the tool might be 100000, but since the user didn't specify, maybe we should<|projection|> leave it as default. Wait, the tool's parameters say that iterations is an integer, and the default for pbkdf2_sha256 is 100000. So if the user doesn't provide it, we can omit it, or set it to 100000<|projection|>. But the user didn't mention it, so perhaps we should use the default.
+
+  So the parameters would be:
+  - algorithm: 'pbkdf2_sha256'
+  - password: 'hunter2'
+  - salt: '00112233445566778<|projection|>899aabbccddeeff' (hex)
+  - salt_encoding: 'hex'
+  - length: 32
+
+  Other parameters like iterations and output_encoding are optional. The output_encoding defaults to hex, which is fine.
+
+  Wait, the user didn't specify the output encoding, so we can leave it as<|projection|> default. So the tool call should include the above parameters. Let me structure that into a JSON object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "pbkdf2_sha256", "password": "hunter2", "salt": "00112233445566778899aabbccddeeff", "salt_encoding": "hex", "length": 32}}
+  </tool_call><|projection|>
+- |-
+  derive a 32-byte key from the passphrase 'correct horse battery' with scrypt, hex salt a1b2c3d4e5f60718<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to derive a 32-byte key from the password 'correct horse battery' using scrypt. They also provided a salt in hex: a1b2c3d4e5f60718.
+
+  First, I need to check the available<|projection|> tools. The kdf_derive function supports scrypt as one of the KDF algorithms. The parameters required are algorithm, password, salt, and others like length, which defaults to 32 bytes. Since the user specified 32 bytes, that's already the default, so maybe I don't need to<|projection|> specify it. But to be safe, I'll include it.
+
+  The salt is given in hex, so the salt_encoding should be 'hex'. The output encoding isn't mentioned, so I'll stick with the default, which is hex. The other parameters like memory_kib aren't applicable for scrypt here.<|projection|> The iterations and memory parameters might have defaults, but since the user didn't specify, I'll omit them.
+
+  Wait, the tool's required fields are algorithm, password, and salt. So as long as those are there, others are optional. So the call should include algorithm: 'scrypt', password: '<|projection|>correct horse battery', salt: 'a1b2c3d4e5f60718', and length: 32. The rest can be omitted. Let me double-check the parameters in the tool definition. Yes, length is a parameter with a default of 32, so including<|projection|> it ensures it's set correctly. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "scrypt", "password": "correct horse battery", "salt": "a1b2c3d4e5f60718", "length": 32}}
+  </tool_call><|projection|>
+- |-
+  derive a 32-byte key from the password 's3cr3t' with Argon2id, hex salt deadbeefcafebabe<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to derive a 32-byte key from the password 's3cr3t' using Argon2id, with a hex salt of 'deadbeefcafebabe'.
+
+  First, I need to check the available tool, which is kdf_der<|projection|>ive. The parameters required are algorithm, password, salt, and others like iterations, length, memory_kib, etc.
+
+  The user specified Argon2id, so the algorithm is set to "argon2id". The password is 's3cr3t', and the salt is given as a hex string<|projection|>. Since the salt is in hex, the salt_encoding should be 'hex'.
+
+  The output length is 32 bytes. The default for length is 32, but maybe it's better to specify it to be safe. The other parameters like memory_kib and iterations aren't mentioned, so I'll use<|projection|> their defaults. For Argon2id, the default memory_kib is 65536, and iterations (which is called 'iterations' in the tool) default to 3. But since the user didn't specify, we can leave them as defaults.
+
+  So the parameters would be:
+  - algorithm:<|projection|> "argon2id"
+  - password: "s3cr3t"
+  - salt: "deadbeefcafebabe"
+  - salt_encoding: "hex"
+  - length: 32
+  <|projection|>- output_encoding: maybe default to hex, which is the default.
+
+  Wait, the output_encoding isn't specified by the<|projection|> user. The tool's default is hex, so unless the user says otherwise, we don't need to include it. So the call should include the required parameters and any optional ones the user specified. Since the user provided the salt in hex, salt_encoding is set to 'hex'. The rest are defaults.
+
+  So the<|projection|> JSON for the tool call would be:
+
+  {
+    "name": "kdf_derive",
+    "arguments": {
+      "algorithm": "argon2id",
+      "password": "s3cr3t",
+      "salt": "deadbeefcafebabe",
+      "salt_encoding": "hex",
+  <|projection|>    "length": 32
+    }
+  }
+
+  I think that's all. Let me double-check the parameters. The user didn't mention memory_kib or iterations, so they're left as default. The output_encoding isn't specified, so it's defaulting to hex. Yep, that should work.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "argon2id", "password": "s3cr3t", "salt": "deadbeefcafebabe", "salt_encoding": "hex", "length": 32}}
+  </tool_call><|projection|>
+- |-
+  derive a 64-byte key from the password 'p@ssw0rd' with PBKDF2-HMAC-SHA256, hex salt 0f1e2d3c4b5a6978<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to derive a 64-byte key from the password 'p@ssw0rd' using PBKDF2-HMAC-SHA256 with a hex salt 0f1e2d3c4b5a6978.
+
+  <|projection|>First, I need to check the available tools. The kdf_derive function is there. Let me look at its parameters. The algorithm can be pbkdf2_sha256. The parameters include password, salt, and others. The user provided a hex salt, so I need to set salt_encoding to<|projection|> 'hex'. The output length should be 64 bytes. Wait, the default for length is 32, so I need to set it to 64. Also, the iterations parameter is optional. For PBKDF2, the default iterations are 100000, but the user<|projection|> didn't specify, so maybe we leave it as default.
+
+  Wait, the user didn't mention iterations, so we don't include it. The required parameters are algorithm, password, and salt. The user provided all three. The output encoding defaults to hex, which is fine. So the arguments would be: algorithm<|projection|> "pbkdf2_sha256", password "p@ssw0rd", salt "0f1e2d3c4b5a6978", salt_encoding "hex", length 64. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "pbkdf2_sha256", "password": "p@ssw0rd", "salt": "0f1e2d3c4b5a6978", "salt_encoding": "hex", "length": 64}}
+  </tool_call><|projection|>
+- |-
+  stretch the passphrase 'summer sky lantern' into a 16-byte key using scrypt with hex salt 5a5a5a5a12345678<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to stretch the passphrase "summer sky lantern" into a 16-byte key using scrypt with the hex salt 5a5a5a5a12345678.
+
+  First, I need to check the available tools. The<|projection|> kdf_derive tool can handle this. The parameters required are algorithm, password, salt, and others like length, iterations, etc.
+
+  The user specified scrypt as the KDF algorithm. The salt is given in hex, so I should set the salt_encoding to 'hex' because the input is in hex<|projection|>. The password is the passphrase provided.
+
+  The output length needs to be 16 bytes. Scrypt's parameters include N (cost), r (block size), and p (parallelism). But wait, the tool's parameters don't have N, r, p directly. Wait, looking back at the tool<|projection|>'s parameters: the tool's parameters for scrypt might not expose those. Wait, the tool's parameters for scrypt might not have those options. Let me check the tool definition again.
+
+  Looking at the tool's parameters, the parameters are algorithm, iterations, length, memory_kib, etc. Oh, wait,<|projection|> the tool's parameters for scrypt might not allow specifying the scrypt parameters like N, r, p. Wait, the tool's parameters for scrypt might not be configurable beyond what's listed. Wait, the tool's parameters for scrypt might only take the standard parameters. But in the tool's parameters, there<|projection|>'s no mention of scrypt-specific parameters. Hmm, maybe the tool uses default values for scrypt.
+
+  Wait, the user is asking to use scrypt, but the tool's parameters for scrypt might not have options for the parameters that scrypt usually requires. However, the user hasn't specified those parameters,<|projection|> so perhaps the tool uses defaults. So, I need to call kdf_derive with algorithm 'scrypt', password as 'summer sky lantern', salt as '5a5a5a5a12345678' and salt_encoding as 'hex', and length 16. The<|projection|> other parameters like memory_kib or iterations aren't specified by the user, so they can be omitted or set to default.
+
+  Wait, the tool's required parameters are algorithm, password, and salt. So, the other parameters like length, memory_kib, etc., are optional. So in this case, the<|projection|> required parameters are covered. The output encoding isn't specified, so it will default to hex.
+
+  So the correct call is to use kdf_derive with algorithm scrypt, password "summer sky lantern", salt "5a5a5a5a12345678", salt_encoding "<|projection|>hex", and length 16. The other parameters like memory_kib aren't needed here since the user didn't specify them.
+
+  Therefore, the JSON for the tool call should include those parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "scrypt", "password": "summer sky lantern", "salt": "5a5a5a5a12345678", "salt_encoding": "hex", "length": 16}}
+  </tool_call><|projection|>
+- |-
+  give me a 32-byte Argon2id key from the password 'Tr0ub4dour&3' with hex salt 99887766554433221100ffee<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to generate a 32-byte Argon2id key from the password 'Tr0ub4dour&3' with the hex salt 99887766554433221100ffee.
+
+  <|projection|>First, I need to use the kdf_derive tool. The parameters required are algorithm, password, salt, and others like iterations, length, memory_kib, output_encoding, and salt_encoding.
+
+  The algorithm is definitely argon2id. The password is given as 'Tr0ub4dour&3<|projection|>'. The salt is in hex, so I should set salt_encoding to 'hex' because the input is a hex string.
+
+  The user specified a 32-byte key, so the length parameter should be 32. For Argon2id, the default memory cost (memory_kib) is 6<|projection|>5536, which is 64 KiB. But the user didn't specify, so maybe we can leave it as default. However, the tool might require it. Wait, the parameters for the tool have memory_kib as an optional parameter. Since the user didn't specify, perhaps we can omit<|projection|> it, but the tool might need it. Wait, looking at the tool's parameters: memory_kib is part of the parameters, but in the required fields, it's not listed. The required are algorithm, password, salt. So maybe it's optional. But for Argon2id, the memory_kib<|projection|> is important. However, the user hasn't specified it, so maybe we should use the default value of 65536 (64 KiB). But how to represent that? The tool's parameters allow memory_kib as a uint32. So I should include it.
+
+  Wait, but the user<|projection|> didn't mention anything about memory cost, iterations, etc. So perhaps we should use the defaults. For Argon2id, the default is 3 iterations and 64KiB memory. Wait, the tool's description says: "defaults to 3" for iterations, and "default 655<|projection|>36" for memory_kib. So if the user doesn't specify, those are the values. However, in the parameters, the tool may require them. Wait, no. The parameters have 'iterations' as an optional parameter with a default of 100000 for pbkdf2_sha<|projection|>256, but for argon2id, it's not clear. Wait, looking at the tool's parameters: the 'iterations' field has a default of 100000 for pbkdf2, but for argon2id, the default is 3. But how is that<|projection|> handled? The tool's description says "defaults to 3" for iterations for argon2id. So when using argon2id, if we don't specify iterations, it uses 3. Similarly, memory_kib defaults to 65536.
+
+  But in the tool's parameters, the '<|projection|>iterations' and 'memory_kib' are optional. Therefore, to generate the key, I need to set the algorithm, password, salt, and possibly other parameters. However, since the user didn't specify, we can rely on the defaults. However, the user did specify a 32-byte key, so<|projection|> the length is 32.
+
+  So putting it all together:
+
+  algorithm: "argon2id"
+  password: "Tr0ub4dour&3"
+  salt: "99887766554433221100ffee"
+  salt_encoding: "hex"<|projection|> (since the input is hex)
+  length: 32
+  output_encoding: default is hex, which is fine.
+
+  Other parameters like memory_kib and iterations are optional and will use their defaults.
+
+  Therefore, the tool call should include these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "argon2id", "password": "Tr0ub4dour&3", "salt": "99887766554433221100ffee", "salt_encoding": "hex", "length": 32}}
+  </tool_call><|projection|>
+- |-
+  derive a 48-byte key with PBKDF2-HMAC-SHA256 from the password 'letmein-2026' and hex salt cafef00dbaadf00d<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to derive a 48-byte key using PBKDF2-HMAC-SHA256 with the password 'letmein-2026' and a hex salt 'cafef00dbaadf00d'.
+
+  First, I<|projection|> need to check the available tools. The kdf_derive function is there. The parameters required are algorithm, password, salt, and others like iterations, length, etc.
+
+  The algorithm should be 'pbkdf2_sha256' as per the enum in the tool's definitions. The password is given as<|projection|> a string. The salt is provided in hex, so the salt_encoding should be 'hex'.
+
+  The output length needs to be 48 bytes. The default for length is 32, so that needs to be set explicitly. The other parameters like iterations and memory_kib aren't applicable here since it's<|projection|> PBKDF2.
+
+  Wait, the user didn't specify the number of iterations. The tool's parameters have defaults, but maybe I should check if the user wants a specific value. But since they didn't mention it, using the default should be okay. However, the tool's parameters show that iterations are optional<|projection|> and the default for PBKDF2 is 100000. So I can leave that out.
+
+  So putting it all together: algorithm is 'pbkdf2_sha256', password is 'letmein-2026', salt is 'cafef00dbaadf<|projection|>00d', salt_encoding is 'hex', length is 48. The output encoding isn't specified, so it will default to hex.
+
+  I need to make sure all required fields are included. The required fields are algorithm, password, and salt. All are present. Other parameters like output_encoding aren't<|projection|> necessary unless the user wants a different format. Since they didn't specify, we can omit it, and the tool's default (hex) will be used.
+
+  So the JSON call should include those parameters. Let me structure that.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "pbkdf2_sha256", "password": "letmein-2026", "salt": "cafef00dbaadf00d", "salt_encoding": "hex", "length": 48}}
+  </tool_call><|projection|>
+- |-
+  turn the passphrase 'north star river' into a 64-byte scrypt key using hex salt 0123456789abcdeffedcba98<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to turn the passphrase 'north star river' into a 64-byte scrypt key using hex salt 0123456789abcdeffedcba98. Hmm.
+
+  First, I need to check the available tools. There<|projection|>'s the kdf_derive function. Let me look at its parameters. The KDF algorithm can be scrypt. The parameters include password, salt, algorithm, length, and others. The user specified scrypt, so that's the algorithm. The password is 'north star river'. The salt is given as a<|projection|> hex string, so I should set the salt_encoding to 'hex' because the input is in hex. The length needs to be 64 bytes. Wait, the maximum allowed by the tool is 64, so that's okay.
+
+  Wait, the parameters for the tool: the 'length' parameter has<|projection|> a maximum of 64, which matches the user's request. So I need to set length to 64. Also, the output_encoding isn't specified, but the default is hex, which is fine.
+
+  But wait, the user mentioned using scrypt. The kdf_derive tool does support sc<|projection|>rypt. Let me check the parameters again. Yes, the algorithm can be scrypt. So the parameters are:
+
+  algorithm: 'scrypt'
+  password: 'north star river'
+  salt: '0123456789abcdeffedcba98' (but since it's hex,<|projection|> maybe we need to encode it as bytes? But the tool's salt parameter expects a string, and the salt_encoding is set to 'hex', so the tool should handle converting the hex string into bytes.)
+
+  So the salt is provided as a hex string, so the salt_encoding should be 'hex'. The length is <|projection|>64.
+
+  So the tool call would have:
+
+  name: kdf_derive
+  arguments: {
+    "algorithm": "scrypt",
+    "password": "north star river",
+    "salt": "0123456789abcdeffedcba98",
+    "length":<|projection|> 64,
+    "salt_encoding": "hex"
+  }
+
+  Wait, but the user specified the salt as a hex value. So the salt parameter is the hex string, and we need to tell the tool that the salt is in hex. So yes, setting salt_encoding to 'hex' is correct.
+
+  I think<|projection|> that's all. Let me double-check. The user wants scrypt, which is supported. The parameters are correctly set. The length is 64, which is allowed. The salt is provided as a hex string, so the encoding is set to 'hex'. Looks good.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "kdf_derive", "arguments": {"algorithm": "scrypt", "password": "north star river", "salt": "0123456789abcdeffedcba98", "length": 64, "salt_encoding": "hex"}}
+  </tool_call><|projection|>

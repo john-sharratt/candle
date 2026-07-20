@@ -1,0 +1,110 @@
+name: tcp_session_close
+category: TCP sessions
+description: Close a raw TCP stream socket, dropping the connection and freeing its buffers. Use when a custom-protocol or non-HTTP byte-stream exchange is finished.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: The session id returned by tcp_session_open.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: CloseRequest
+  type: object
+examples:
+- |-
+  close TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session with the ID "tcp-1". Let me check the available tools. There's a function called tcp_session_close that takes a session_id. The parameters require a session_id string. Since the user provided "tcp-1", I should call the tool with<|projection|> that ID. I need to make sure the JSON is correctly formatted with the session_id field. No other parameters are needed. Alright, the tool call should be properly structured.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-1"}}
+  </tool_call><|projection|>
+- |-
+  shut down TCP session tcp-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to shut down a TCP session with the ID "tcp-2". Let me check the available tools. There's a function called tcp_session_close that takes a session_id. The required parameter is session_id, which should be a string. The user provided "tcp-2" as<|projection|> the session ID. So I need to call tcp_session_close with session_id set to "tcp-2". I'll format that into a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-2"}}
+  </tool_call><|projection|>
+- |-
+  end TCP session tcp-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session using the provided tool. Let me check the tools available. There's a function called tcp_session_close which requires a session_id. The user mentioned "tcp-1" as the session ID. I need to structure the tool call correctly.
+
+  The parameters for tcp<|projection|>_session_close require a session_id as a string. The user provided "tcp-1", so I should pass that as the argument. I'll format the JSON accordingly, ensuring the session_id is correctly enclosed in quotes. No other parameters are needed since the tool only requires the session_id. Let me double-check the JSON<|projection|> syntax to avoid any errors.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-1"}}
+  </tool_call><|projection|>
+- |-
+  tear down TCP session tcp-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session using the provided tool. Let me check the tools available.
+
+  There's a tool called tcp_session_close, which requires a session_id. The description says it's for closing a raw TCP stream socket. The user mentioned "tcp-3", so I assume that<|projection|>'s the session ID.
+
+  I need to call tcp_session_close with session_id set to "tcp-3". Let me make sure the parameters are correct. The required parameter is session_id, and it's a string. The user didn't provide any other details, so this should be sufficient.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-3"}}
+  </tool_call><|projection|>
+- |-
+  drop the TCP socket tcp-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drop a TCP socket with the ID "tcp-4". Let me check the tools available. There's a function called tcp_session_close that takes a session_id. The user provided "tcp-4" as the session ID. I need to call that function with that ID.<|projection|> Make sure the JSON is correctly formatted with the session_id parameter.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-4"}}
+  </tool_call><|projection|>
+- |-
+  I'm done with TCP session tcp-5, close it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session. They mentioned "tcp-5" and said "close it". I need to use the tcp_session_close tool.
+
+  First, check the available tools. The tool called tcp_session_close has a parameter called session_id. The description says it's the session ID<|projection|> from tcp_session_open.
+
+  The user provided "tcp-5" as the session ID. So I should pass that as the session_id in the arguments.
+
+  Make sure the JSON is correctly formatted. The key is "session_id" and the value is "tcp-5". No other parameters are needed since the<|projection|> tool only requires the session_id.
+
+  Double-check the syntax for the tool call. It should be a JSON object inside the tool_call tags. No mistakes there. Alright, ready to output the correct tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-5"}}
+  </tool_call><|projection|>
+- |-
+  kill TCP session tcp-2 now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session with the ID "tcp-2". Let me check the available tools. There's a function called tcp_session_close that takes a session_id. The parameters require a session_id as a string. The user provided "tcp-2" as the session ID.<|projection|> So I need to call tcp_session_close with session_id set to "tcp-2". I should structure the tool call correctly in JSON inside the XML tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-2"}}
+  </tool_call><|projection|>
+- |-
+  close the TCP session whose id is tcp-6<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TCP session with the ID "tcp-6". Let me check the available tools. There's a function called tcp_session_close which takes a session_id. The required parameter is session_id, which should be a string. The user provided "tcp-6" as the<|projection|> session ID. So I need to call tcp_session_close with session_id set to "tcp-6". I should make sure the JSON is correctly formatted with the right parameters. No other tools are needed here. Just call that one function.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_close", "arguments": {"session_id": "tcp-6"}}
+  </tool_call><|projection|>

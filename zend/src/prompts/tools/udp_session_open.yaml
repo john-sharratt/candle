@@ -1,0 +1,138 @@
+name: udp_session_open
+category: UDP sessions
+description: Open a UDP socket for datagrams. Optionally connect to a default peer. Returns session_id for subsequent sends/receives.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bind_addr:
+      description: Local bind address as "host:port". Default "0.0.0.0:0" (all interfaces, OS-chosen ephemeral port).
+      type:
+      - string
+      - 'null'
+    default_peer:
+      description: 'Default peer as "host:port". When set, the socket is connected to it so later sends need no explicit peer. No datagram is sent on open. Default: none (no default peer).'
+      type:
+      - string
+      - 'null'
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open a UDP socket to 8.8.8.8 port 53<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a UDP socket to 8.8.8.8 on port 53. Let me check the available tools. There's the udp_session_open function. The parameters are bind_addr and default_peer. The default_peer should be "8.8.8.8<|projection|>:53". The bind_addr can be left as default, which is 0.0.0.0:0. So I need to call udp_session_open with default_peer set to "8.8.8.8:53". That should create a connected socket, so sends don't need a<|projection|> peer each time. I think that's all. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "8.8.8.8:53"}}
+  </tool_call><|projection|>
+- |-
+  open a UDP session to the syslog server at 10.0.0.50 port 514<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a UDP session to a syslog server at 10.0.0.50 on port 514. Let me check the available tools.
+
+  The tool provided is udp_session_open. Its parameters are bind_addr and default_peer. The default_peer is the peer<|projection|> we connect to, which in this case is 10.0.0.50:514. The bind_addr defaults to 0.0.0.0:0 if not specified. Since the user didn't specify a local address, I should leave it as default. So the arguments should<|projection|> be {"default_peer": "10.0.0.50:514"}.
+
+  I need to make sure that the JSON is correctly formatted. No other parameters are needed. The session_id will be returned, but the user just needs the tool call. So the correct tool call is udp_session_open<|projection|> with the default_peer set.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "10.0.0.50:514"}}
+  </tool_call><|projection|>
+- |-
+  open a UDP socket to send datagrams to 10.0.0.9 port 5000<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a UDP socket to send datagrams to 10.0.0.9 port 5000. Let me check the available tools.
+
+  There's the udp_session_open tool. Its parameters are bind_addr and default_peer. The bind_addr is the local address<|projection|> to bind to, defaulting to all interfaces with an ephemeral port. The default_peer is the peer to connect to, which would be 10.0.0.9:5000 here.
+
+  Since the user wants to send to that specific IP and port, setting default_peer makes sense. That<|projection|> way, when sending, they don't need to specify the peer each time. The bind_addr can stay as the default unless there's a specific need to bind to a certain interface.
+
+  So the tool call should be udp_session_open with default_peer set to "10.0.0.9:500<|projection|>0". No need to include bind_addr unless specified, which it isn't. That should open the socket connected to the desired destination.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "10.0.0.9:5000"}}
+  </tool_call><|projection|>
+- |-
+  open a UDP session to the NTP server at 192.168.1.1 port 123<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a UDP session to an NTP server at 192.168.1.1 on port 123. Let me check the available tools.
+
+  The tool provided is udp_session_open. Its parameters are bind_addr and default_peer. The bind_addr<|projection|> is for the local address, defaulting to 0.0.0.0:0. The default_peer is the peer to connect to, which would be 192.168.1.1:123 here.
+
+  Since the user wants to connect to that specific IP and port,<|projection|> I should set the default_peer parameter to "192.168.1.1:123". The bind_addr can be left as the default, so I don't need to specify it. That way, the socket is created and connected to the NTP server automatically. So the tool call<|projection|> should have the default_peer set correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "192.168.1.1:123"}}
+  </tool_call><|projection|>
+- |-
+  can you open a UDP socket bound to the DHCP server 172.16.0.1 on port 67?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this request. The user is asking to open a UDP socket bound to the DHCP server at 172.16.0.1 on port 67.
+
+  First, I need to recall what the available tool can do. The tool<|projection|> provided is for opening a UDP session. The parameters are bind_addr and default_peer. The bind_addr is the local address to bind to, which in this case should be 172.16.0.1. But wait, the default for bind_addr is "0.0.0.0:<|projection|>0", which means all interfaces. However, the user specifically wants it bound to 172.16.0.1. So I need to set bind_addr to "172.16.0.1:67" because port 67 is the DHCP server's port.
+
+  Wait<|projection|>, but the DHCP server typically listens on port 67. So binding the socket to that IP and port would allow receiving messages. The default_peer isn't needed here since the user isn't mentioning connecting to a specific peer. The tool's default_peer is for when you want to send without specifying the peer each time<|projection|>. Since the user just wants to receive, maybe default_peer isn't necessary here.
+
+  So the correct parameters would be bind_addr set to "172.16.0.1:67". That should create a UDP socket bound to that specific IP and port. I need to make sure that the JSON<|projection|> structure is correct. The tool's parameters are in a JSON object with bind_addr as a string. So the arguments should be {"bind_addr": "172.16.0.1:67"}.
+
+  Wait, but DHCP servers usually have multiple interfaces, but the user might want to listen on a<|projection|> specific one. The user's request is clear about the IP and port. So this should be the correct call. I think that's all. Let me check if there's any mistake here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"bind_addr": "172.16.0.1:67"}}
+  </tool_call><|projection|>
+- |-
+  I need a UDP session to the game server at game.example.com:27015<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user needs to open a UDP session to the game server at game.example.com:27015. Let me check the available tools. There's the udp_session_open function. The parameters are bind_addr and default_peer. The user wants to connect to the server, so the default_peer<|projection|> should be set to "game.example.com:27015". The bind_addr can be left as the default, which is 0.0.0.0:0, allowing the OS to choose the local address and port. So the tool call should have the default_peer parameter set. I need to<|projection|> make sure the JSON is correctly formatted with the name of the tool and the arguments as a JSON object. Let me structure that.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "game.example.com:27015"}}
+  </tool_call><|projection|>
+- |-
+  spin up a UDP datagram socket pointed at 203.0.113.7 port 1194 for the VPN<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to spin up a UDP socket directed at 203.0.113.7 port 1194 for a VPN. Let me check the available tools.
+
+  The tool provided is udp_session_open. It allows opening a UDP socket with optional binding and a default<|projection|> peer. The parameters are bind_addr and default_peer.
+
+  The user's request is to create a UDP socket pointing to a specific IP and port. Since the VPN is mentioned, maybe the socket needs to send packets to that address. However, the tool's default_peer parameter can set the default peer, so the socket<|projection|> is connected, allowing sends without specifying the peer each time.
+
+  But wait, the user might just need the socket to be bound to a specific interface or address. But the question doesn't mention binding, only pointing to the given IP and port. So perhaps setting the default_peer to "203.0.1<|projection|>13.7:1194" would make the socket connect to that peer, making it the default destination.
+
+  However, if the intention is to receive packets from that IP and port, the socket needs to be bound to the local address. But the tool's bind_addr parameter allows specifying the local address.<|projection|> However, the user hasn't specified a local address, so maybe using the default (0.0.0.0:0) which binds to all interfaces.
+
+  So putting it all together, the tool call should set the default_peer to "203.0.113.7:119<|projection|>4". That way, when sending data, it goes to that IP and port by default. The bind_addr can remain as the default unless specified otherwise.
+
+  Therefore, the correct function call is udp_session_open with default_peer set to "203.0.113.7:1194".
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "203.0.113.7:1194"}}
+  </tool_call><|projection|>
+- |-
+  open UDP to the StatsD collector at 10.10.5.5 port 8125<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a UDP socket for sending statsd data to 10.10.5.5 on port 8125. Let me check the tools available.
+
+  The provided tool is udp_session_open. The parameters are bind_addr and default_peer. Bind_addr is the<|projection|> local address to bind to, defaulting to 0.0.0.0:0. The default_peer is the peer to connect to, which in this case is 10.10.5.5:8125.
+
+  Since the user wants to send packets to 10.1<|projection|>0.5.5:8125, setting default_peer to that address makes sense. The bind_addr can be left as the default unless there's a specific need to bind to a different interface. So the tool call should have default_peer set to "10.10.5.5:8<|projection|>125". No need to specify bind_addr unless necessary. That should configure the socket to send packets to the specified IP and port.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "udp_session_open", "arguments": {"default_peer": "10.10.5.5:8125"}}
+  </tool_call><|projection|>

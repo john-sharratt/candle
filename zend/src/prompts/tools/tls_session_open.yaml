@@ -1,0 +1,169 @@
+name: tls_session_open
+category: TLS sessions
+description: Open a TLS-encrypted TCP connection. Use for LDAPS, IMAPS, SMTPS, MQTTS, or any TLS service. For HTTP over TLS, prefer http_session_open. Returns session_id for subsequent sends/receives.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    accept_invalid_certs:
+      description: If true, skip certificate validation (accept invalid/self-signed certs). Default false.
+      type:
+      - boolean
+      - 'null'
+    credential_name:
+      description: Name of a stored client credential to present. Default none.
+      type:
+      - string
+      - 'null'
+    host:
+      description: Target hostname (also used for TLS certificate verification / SNI).
+      minLength: 1
+      type: string
+    port:
+      description: Target TCP port (0–65535).
+      format: uint16
+      minimum: 0.0
+      type: integer
+    timeout_ms:
+      description: Connection timeout in milliseconds. Default 5000.
+      format: uint64
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - host
+  - port
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open a TLS connection to imaps://mail.example.com:993<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a TLS connection to imaps://mail.example.com:993. Let me check the tools available. There's the tls_session_open tool. The parameters needed are host, port, and others like accept_invalid_certs, credential_name, timeout_ms.
+
+  The host is<|projection|> mail.example.com, port 993. The tool requires host and port as mandatory. The user didn't mention anything about certificates, so maybe default values for accept_invalid_certs. Since it's IMAPS, maybe the server uses a valid cert, but the tool might need to accept invalid ones if necessary.<|projection|> But since the user didn't specify, I should use the default, which is false. No credential name provided either. Timeout is optional, default is 5000 ms.
+
+  So the call should be tls_session_open with host: "mail.example.com", port: 993. The other parameters can<|projection|> be omitted since they have defaults. Let me make sure the port is an integer. Yes, 993 is within 0-65535. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "mail.example.com", "port": 993}}
+  </tool_call><|projection|>
+- |-
+  start a TLS session to ldaps://ldap.example.com:636<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start a TLS session for LDAPS on ldap.example.com port 636. Let me check the tools available. There's the tls_session_open function. The parameters needed are host, port, and others like accept_invalid_certs, credential_name, timeout_ms.
+
+  The user<|projection|> didn't mention anything about certificate validation, so maybe default is fine. But sometimes LDAPS might use a self-signed cert, so maybe the user needs to accept invalid certs. But since the tool's default is false, unless specified, it would fail. Wait, but the user hasn't mentioned that. Hmm. But<|projection|> the tool requires the host and port. So I should call tls_session_open with host "ldap.example.com" and port 636. The other parameters can be left as default unless specified. So the JSON should have "host": "ldap.example.com", "port": 636. The rest like<|projection|> accept_invalid_certs is optional and defaults to false. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "ldap.example.com", "port": 636}}
+  </tool_call><|projection|>
+- |-
+  connect over TLS to smtps://smtp.example.com:465<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to connect over TLS to smtps://smtp.example.com:465. Let me check the tools available.
+
+  There's a tool called tls_session_open. The description says it's for opening a TLS-encrypted TCP connection, which fits since SMTPS uses TLS. The parameters needed<|projection|> are host, port, and others like accept_invalid_certs, credential_name, timeout_ms.
+
+  The user provided the URL smtps://smtp.example.com:465. So the host is smtp.example.com, port 465. Since the URL uses TLS, the tool should be used. The other parameters<|projection|> like accept_invalid_certs aren't mentioned, so default values apply. The timeout_ms isn't specified, so the default of 5000 ms will be used.
+
+  I need to structure the tool call with the host and port. The other parameters can be omitted as they have defaults. So the JSON arguments should<|projection|> be {"host": "smtp.example.com", "port": 465}.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "smtp.example.com", "port": 465}}
+  </tool_call><|projection|>
+- |-
+  open a TLS connection to mqtts://broker.example.com:8883<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a TLS connection to mqtts://broker.example.com:8883. Let me check the tools available. There's the tls_session_open tool. The parameters needed are host, port, and others like accept_invalid_certs, credential_name, timeout_ms.
+
+  The<|projection|> user didn't mention anything about certificate validation, so I should default to false. No credential name provided either. The port is 8883. I should make sure the port is an integer. The host is broker.example.com. The timeout is optional, defaulting to 5000 ms. So<|projection|> the arguments would be host: "broker.example.com", port: 8883. The other parameters can be omitted or set to their defaults. Let me structure the JSON call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "broker.example.com", "port": 8883}}
+  </tool_call><|projection|>
+- |-
+  establish a TLS session to pop3s://pop.example.org:995<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to establish a TLS session to pop3s://pop.example.org:995. Let me check the tools available. There's the tls_session_open function. The parameters needed are host, port, and others like accept_invalid_certs, credential_name, timeout_ms.
+
+  The host<|projection|> is pop.example.org, port 995. The tool requires host and port as required. The other parameters have defaults, so unless the user specifies, I should use default. So the call would be tls_session_open with host: "pop.example.org", port: 995. No need for the<|projection|> other parameters unless specified. So the JSON should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "pop.example.org", "port": 995}}
+  </tool_call><|projection|>
+- |-
+  can you open TLS to the FTPS control channel at ftps://files.example.net:990?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to open a TLS connection for the FTPS control channel at ftps://files.example.net:990. Let me think about how to approach this.
+
+  First, I need to check the available tools. The user provided a tool called tls_session_open. The description says it<|projection|>'s for opening a TLS-encrypted TCP connection, which fits because FTPS uses TLS. The parameters include host, port, and others like accept_invalid_certs, credential_name, and timeout_ms.
+
+  The user's request specifies the FTPS address as ftps://files.example.net:990. So the host<|projection|> should be files.example.net, and the port is 990. I need to make sure the port is correctly set to 990. The tool's parameters require host and port as required.
+
+  I should check if there are any other parameters needed. The user didn't mention anything about certificate validation or<|projection|> credentials, so the default values for accept_invalid_certs and credential_name can be used. The timeout_ms isn't specified, so the default of 5000 ms will be used.
+
+  So, the function call to tls_session_open should have host: "files.example.net", port: 990.<|projection|> The other parameters can be omitted since they have defaults. I need to structure the JSON arguments correctly as per the tool's schema.
+
+  Wait, the port in the example is 990, which is correct for FTPS. The tool's parameters allow ports from 0-65535, so <|projection|>990 is valid. No issues there.
+
+  I think that's all. The tool call should be made with the specified host and port.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "files.example.net", "port": 990}}
+  </tool_call><|projection|>
+- |-
+  start an encrypted TLS connection to the NNTPS server nntps://news.example.com:563<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start an encrypted TLS connection to an NNTPS server at nntps://news.example.com:563. Let me think about how to approach this.
+
+  First, I need to check the available tools. The provided tool is tls_session_open. The description says it's<|projection|> for opening a TLS-encrypted TCP connection, which fits since NNTPS uses TLS. The parameters required are host, port, and some optional ones like accept_invalid_certs, credential_name, and timeout_ms.
+
+  The user's input has the URL nntps://news.example.com:563. I need<|projection|> to extract the hostname and port. The hostname is news.example.com, and the port is 563. The protocol part (nntps) indicates that TLS is used, so the tool should be configured accordingly.
+
+  Looking at the tool's parameters, the 'host' parameter requires the target hostname, which is<|projection|> correct here. The 'port' is 563. The other parameters are optional. Since the user didn't mention anything about certificate validation or credentials, I shouldn't assume any values. So, accept_invalid_certs should default to false unless specified. The timeout_ms isn't mentioned, so the default of <|projection|>5000 ms will be used.
+
+  I need to make sure that the parameters are correctly formatted. The host is a string, port is an integer. The required parameters are host and port, which are both provided. No other parameters are necessary unless the user specifies them.
+
+  So the tool call should be tls_session<|projection|>_open with host: "news.example.com" and port: 563. Other parameters like accept_invalid_certs, credential_name, and timeout_ms are not needed here since they have defaults or aren't specified by the user.
+
+  Wait, the user might be using a non-standard port (563), but<|projection|> the tool allows ports between 0-65535, so 563 is valid. No issues there.
+
+  In conclusion, the correct function call is to use tls_session_open with the extracted host and port.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "news.example.com", "port": 563}}
+  </tool_call><|projection|>
+- |-
+  open a TLS session to the syslog-tls endpoint at logs.example.com:6514<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a TLS session to a syslog-tls endpoint at logs.example.com:6514. Let me check the tools available.
+
+  The provided tool is tls_session_open. The parameters needed are host, port, and optional ones like accept_invalid_certs, credential_name, timeout<|projection|>_ms.
+
+  The user didn't mention anything about certificate validation, so I should default that to false. The port is 6514, which is standard for syslog over TLS. The host is logs.example.com.
+
+  I need to make sure the JSON structure is correct, with host and port required. The<|projection|> other parameters can be omitted or set to their defaults. So the call should include "host": "logs.example.com", "port": 6514.
+
+  No need to include optional fields unless specified. So the tool call should be tls_session_open with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_open", "arguments": {"host": "logs.example.com", "port": 6514}}
+  </tool_call><|projection|>

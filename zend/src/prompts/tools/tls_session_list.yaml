@@ -1,0 +1,117 @@
+name: tls_session_list
+category: TLS sessions
+description: Enumerate the TLS-encrypted connections currently open in this conversation, with each peer host and certificate identity.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open TLS sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open TLS sessions. Let me check the available tools. There's a tool called tls_session_list that enumerates TLS-encrypted connections, showing each peer host and certificate identity. The parameters are specified in a JSON schema, but the request doesn't require any arguments.<|projection|> So I need to call tls_session_list with an empty arguments object. Just make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which TLS connections are active<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about active TLS connections. Let me check the tools available. Oh, there's a tool called tls_session_list that lists open TLS connections with peer hosts and certificate identities. The user probably wants to know which secure connections are currently established. I should call that tool. The parameters are<|projection|> empty since the schema doesn't require any arguments. So I'll generate the tool call with the name tls_session_list and an empty arguments object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the open TLS sockets<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to "show the open TLS sockets." Let me think about how to approach this.
+
+  First, I need to recall what tools are available. The provided tools include a function called tls_session_list, which enumerates TLS-encrypted connections, listing each peer host and certificate identity. The<|projection|> description says it returns the open TLS sessions, which aligns with the user's request.
+
+  The user might be looking for information on active secure connections, possibly for monitoring or troubleshooting purposes. They might want to know which hosts they're connected to via TLS and the associated certificate identities.
+
+  I should check if there are any<|projection|> parameters required for the tls_session_list function. Looking at the tool definition, the parameters are defined as an empty object ({"type": "object"}), meaning no arguments are needed. So, calling the function without any arguments should work.
+
+  There's no mention of authentication or authorization in the tool's description, so I<|projection|> assume it's accessible without additional steps.
+
+  Therefore, the correct action is to invoke the tls_session_list function. This will retrieve the necessary information, which the user can then view as a list of peer hosts and certificate identities.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many TLS sessions do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many TLS sessions do I have?" I need to figure out which tool to use here. Looking at the available tools provided, there's one called tls_session_list. The description says it enumerates the TLS-encrypted connections currently open in the conversation, listing each peer<|projection|> host and certificate identity.
+
+  So the user wants to know the number of TLS sessions. The tls_session_list tool seems appropriate here. The parameters for that tool are defined as a JSON object with a $schema, title, type, etc., but the parameters themselves are empty. Wait, looking at the tool definition, the<|projection|> parameters property is an object with a $schema, title, type, and properties. But in this case, the parameters are empty. Wait, no, let me check again.
+
+  The tool's parameters are: {"$schema":"http://json-schema.org/draft-07/schema#","title":"ListRequest","<|projection|>type":"object"}. So the parameters are an object with no additional properties. So when calling the tool, the arguments should be an empty object? Or maybe the tool doesn't require any parameters. So to list the TLS sessions, the tool doesn't need any arguments. Therefore, I can call tls_session_list with<|projection|> an empty arguments object.
+
+  So the correct tool call would be to invoke tls_session_list with an empty JSON object as the arguments. The user is asking for the number of TLS sessions, and this tool should return that information. Therefore, the answer should be the result of calling that tool.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me every TLS channel and its peer certificate identity<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see every TLS channel and its peer certificate identity. Let me check the available tools.
+
+  Looking at the tools provided, there's a function called tls_session_list. The description says it enumerates TLS-encrypted connections, listing each peer host and certificate identity. That's exactly what<|projection|> the user needs.
+
+  The parameters for tls_session_list are straightforward. The schema is an empty object, so no arguments are needed. I just need to call this function without any parameters.
+
+  So the correct tool call is to invoke tls_session_list with an empty arguments object. That should retrieve the required information for the user.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what encrypted TLS sessions are open at the moment<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the current TLS-encrypted sessions that are open. Let me check the tools available. Oh, there's a tool called tls_session_list that lists all the TLS sessions, including peer hosts and certificate identities. The user wants to know what encrypted TLS sessions are open right now.<|projection|> So I should call that tool. The parameters for the tool are specified in the JSON schema provided. Since the tool doesn't require any arguments, I can just invoke it. I'll generate the appropriate JSON object inside the tool_call tags as instructed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate the active TLS connections and their hosts<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to enumerate active TLS connections and their hosts. Let me check the available tools.
+
+  Looking at the provided tools, there's a function called tls_session_list. The description says it enumerates TLS-encrypted connections, listing each peer host and certificate identity. That's exactly what the user<|projection|> needs.
+
+  The parameters for tls_session_list are specified in a JSON schema. The request doesn't require any arguments, as the parameters object is empty. So, I just need to call this function without any arguments.
+
+  I should return the tool call in the specified XML format. The name is "tls_session_list" and<|projection|> the arguments are an empty object. Making sure the JSON is correctly formatted without any syntax errors.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are any TLS sessions still connected<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any TLS sessions still connected. I need to check the current TLS sessions. The available tool is tls_session_list, which enumerates the open TLS connections. Since the user is asking about active sessions, I should call that tool. The parameters for the tool are empty<|projection|> because the request doesn't require any arguments. So I'll generate the tool call with the name "tls_session_list" and an empty arguments object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_list", "arguments": {}}
+  </tool_call><|projection|>

@@ -1,0 +1,153 @@
+name: http_session_open
+category: HTTP sessions
+description: Open a persistent HTTP client session with optional base URL, default headers, and authentication credentials applied to every request. Use before making API calls that need cookies or auth across multiple requests, when the user mentions a specific API or service to interact with, or when setting up a workflow hitting the same endpoint multiple times. Triggered by "connect to the API", "set up a session for", "use this base URL", "open an HTTP client for", "I want to call the X API". Returns session_id and base_url. Subsequent requests use http_request. For one-shot retrieval of a public page use web_fetch — no session needed.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    base_url:
+      description: Base URL prepended to relative request paths (e.g. "https://api.example.com"). Omit to require absolute URLs on each request.
+      type:
+      - string
+      - 'null'
+    credential_name:
+      description: Name of a stored credential to apply as auth on every request. Prefer this over putting raw tokens in `headers`. Omit for no authentication.
+      type:
+      - string
+      - 'null'
+    follow_redirects:
+      description: 'Whether to follow HTTP redirects. Default: true.'
+      type:
+      - boolean
+      - 'null'
+    headers:
+      additionalProperties:
+        type: string
+      description: Default headers applied to every request in the session. Omit for none.
+      type:
+      - object
+      - 'null'
+    timeout_sec:
+      description: 'Per-request timeout in seconds. Default: 30.'
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open an HTTP session with base URL https://api.example.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an HTTP session with the base URL https://api.example.com. Let me check the available tools. There's the http_session_open function. The parameters include base_url, credential_name, follow_redirects, headers, and timeout_sec. The user specified the base URL, so<|projection|> I'll set that. They didn't mention authentication, so I'll leave credential_name as null. Default values for others like follow_redirects (true) and timeout_sec (30) are okay. So the tool call should have the base_url parameter set.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://api.example.com"}}
+  </tool_call><|projection|>
+- |-
+  open an HTTP session for https://api.github.com with an Authorization header of `Bearer ghp_abc123`<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an HTTP session for GitHub's API with a Bearer token. Let me check the tools available.
+
+  The tool http_session_open is meant for this. The parameters include base_url, credential_name, headers, etc. The user provided the base URL as https://api.github.com<|projection|> and the Authorization header as Bearer ghp_abc123.
+
+  Wait, the headers should be a JSON object. So the Authorization header should be part of the headers. The user didn't mention other headers, so just include that one. Also, the credential_name isn't needed here since the token is directly<|projection|> in the headers.
+
+  So, the base_url is https://api.github.com, headers are {"Authorization": "Bearer ghp_abc123"}. Other parameters like follow_redirects or timeout aren't specified, so use defaults.
+
+  I need to structure the tool call with these parameters. Make sure the<|projection|> JSON is correctly formatted. Let me double-check the required fields. The base_url is required, and headers are optional but necessary here. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://api.github.com", "headers": {"Authorization": "Bearer ghp_abc123"}}}
+  </tool_call><|projection|>
+- |-
+  create an HTTP session for https://api.stripe.com with a default JSON content-type header<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to create an HTTP session for https://api.stripe.com with a default JSON content-type header. Let me check the available tools.
+
+  The tool provided is http_session_open. The parameters include base_url, credential_name, follow_redirects, headers, and timeout_sec.
+
+  The user<|projection|> specified the base URL as https://api.stripe.com. For the headers, they want a default JSON content-type, so I should set "Content-Type": "application/json" in the headers.
+
+  I don't think the user mentioned any credentials, so credential_name can be omitted. The other parameters like follow_redirect<|projection|>s and timeout_sec have defaults, so I can leave them out unless needed.
+
+  So the tool call should include base_url and headers. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://api.stripe.com", "headers": {"Content-Type": "application/json"}}}
+  </tool_call><|projection|>
+- |-
+  open an HTTP session with base URL https://httpbin.org<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open an HTTP session with the base URL https://httpbin.org. Let me check the tools available. There's the http_session_open function. The parameters include base_url, which they specified. The other parameters are optional. Since they didn't mention authentication or headers, I'll<|projection|> leave those out. So the call should be http_session_open with base_url set to https://httpbin.org. I need to format that as a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://httpbin.org"}}
+  </tool_call><|projection|>
+- |-
+  start an HTTP session pointed at https://api.openweathermap.org for me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start an HTTP session pointing to https://api.openweathermap.org. Let me check the tools available. There's the http_session_open tool. The parameters needed are base_url, credential_name, follow_redirects, headers, and timeout_sec.
+
+  The user specified the base URL as https<|projection|>://api.openweathermap.org, so I'll set base_url to that. They didn't mention any authentication credentials, so maybe leave credential_name as null. Follow redirects default is true, which is probably okay. No headers mentioned, so omit that. Timeout is 30 by default, which is fine. So the<|projection|> tool call should have the base_url set. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://api.openweathermap.org"}}
+  </tool_call><|projection|>
+- |-
+  can you open an HTTP client session to https://gitlab.com/api/v4 with header `PRIVATE-TOKEN: glpat-xyz789`?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to open an HTTP client session to https://gitlab.com/api/v4 with a specific header. Let me check the tools available.
+
+  The tool provided is http_session_open. The parameters include base_url, credential_name, headers, etc. The user specified the base URL as https<|projection|>://gitlab.com/api/v4. The header given is PRIVATE-TOKEN: glpat-xyz789.
+
+  Wait, the headers parameter in the tool expects an object where each key is a header name. So I need to format the headers as {"PRIVATE-TOKEN": "glpat-xyz78<|projection|>9"}.
+
+  The user didn't mention a credential name, so that can be omitted. Also, other parameters like timeout or follow_redirects have defaults, so they can be left out unless needed.
+
+  So the tool call should be http_session_open with base_url set to the provided URL and headers including the token.<|projection|> That should set up the session as required.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://gitlab.com/api/v4", "headers": {"PRIVATE-TOKEN": "glpat-xyz789"}}}
+  </tool_call><|projection|>
+- |-
+  set up an HTTP session for https://jsonplaceholder.typicode.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to set up an HTTP session for https://jsonplaceholder.typicode.com. Let me check the tools available. There's the http_session_open tool. The parameters include base_url, credential_name, follow_redirects, headers, and timeout_sec.
+
+  The user didn't mention any specific credentials<|projection|> or headers, so I'll leave those out. The base URL is provided as https://jsonplaceholder.typicode.com. I should set that. The other parameters can use their defaults unless specified. So the call should be to http_session_open with the base_url set to the given URL. That's all the necessary info<|projection|> for the session setup.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://jsonplaceholder.typicode.com"}}
+  </tool_call><|projection|>
+- |-
+  spin up an HTTP session against https://api.twilio.com with an `Accept: application/json` default header<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to set up an HTTP session with the Twilio API and add a default header. Let me check the tools available.
+
+  The tool provided is http_session_open. The parameters include base_url, headers, and others. The user mentioned the base URL as https://api.twilio.com.<|projection|> They also want the Accept header set to application/json.
+
+  So I need to structure the headers parameter as a JSON object with "Accept": "application/json". The base_url is straightforward. The other parameters like credential_name or timeout aren't specified, so I'll omit them.
+
+  Wait, the headers are an object<|projection|> with additionalProperties as strings. So the headers should be {"Accept": "application/json"}. That should be included in the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_open", "arguments": {"base_url": "https://api.twilio.com", "headers": {"Accept": "application/json"}}}
+  </tool_call><|projection|>

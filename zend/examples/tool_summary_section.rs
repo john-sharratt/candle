@@ -51,19 +51,13 @@ fn build_projection(
     let group = proj
         .id_for_group("primary_conversation")
         .ok_or_else(|| anyhow::anyhow!("no primary_conversation group"))?;
-    install_tool_catalog(&mut proj, dialogue)?;
+    install_tool_catalog(&mut proj)?;
 
     // Prelude text (sections before the tools collection) + the non-template
     // section ids that make up the seal prefix.
-    let layer = proj
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.id == dialogue)
-        .ok_or_else(|| anyhow::anyhow!("dialogue layer vanished"))?;
     let mut prelude_text = String::new();
     let mut prelude_ids = Vec::new();
-    for item in &layer.system_prompt.items {
+    for item in &proj.schema().system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => {
                 prelude_text.push_str(&s.content);

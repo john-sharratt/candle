@@ -1,0 +1,149 @@
+name: cred_list
+category: Credentials
+description: List all credentials available to the current user, returning metadata only — names, types, usernames, default hosts, creation dates — never the secret material itself. Use to discover what credentials exist before opening a session, to find a credential name by its friendly name, to check what's been saved, or to verify a credential is still present. Triggered by "what credentials do I have", "list saved logins", "show my keys", "do I have a credential for", "what's stored". An optional type filter narrows to a specific kind (e.g. ssh_key, http_bearer).
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    CredType:
+      description: Credential type.
+      enum:
+      - ssh_key
+      - ssh_password
+      - telnet_password
+      - http_bearer
+      - http_basic
+      - http_header
+      - totp_secret
+      - sql_password
+      - remote_fs_password
+      - tls_client_cert
+      - signing_key
+      type: string
+  properties:
+    type:
+      anyOf:
+      - $ref: '#/definitions/CredType'
+      - type: 'null'
+      description: Optional type filter (e.g. ssh_key, http_bearer). An "API key" may be stored under more than one type, so prefer omitting the filter and scanning the full list rather than guessing a single type.
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list all my saved credentials<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list all their saved credentials. Let me check the tools available. There's a tool called cred_list that does exactly that. The description says it lists all credentials with metadata like names, types, usernames, etc., but not the secret material. That fits the user's request.
+
+  <|projection|>The parameters for cred_list include an optional type filter. But the user didn't specify a particular type, so I should call the tool without any type argument. The example mentions using "what credentials do I have" which is similar to the user's query.
+
+  I need to make sure the JSON structure is correct.<|projection|> The tool name is "cred_list" and the arguments are an empty object since no type is provided. Let me verify the schema again. The parameters have a type "object" with properties, but if the type is omitted, it's allowed. So the correct call is to use the cred_list with no arguments.<|projection|> That should retrieve all saved credentials.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what credentials do I have stored<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "what credentials do I have stored." I need to figure out which tool to use here. Looking at the available tools, there's a function called cred_list that lists all credentials. The description says it returns metadata like names, types, usernames, etc., but not the<|projection|> actual secrets. That matches the user's request.
+
+  The parameters for cred_list include an optional type filter. But the user didn't specify a particular type, so I shouldn't add a type parameter. The example queries in the tool's description include phrases like "list saved logins" and "show my keys," which<|projection|> are similar to the user's question.
+
+  So, I should call the cred_list function without any type argument. That will return all credentials, and the user can see what's stored. I need to make sure the JSON structure is correct, with the name as "cred_list" and arguments as an empty object since<|projection|> there's no type specified. Double-checking the schema, the parameters allow for a null type, but since the user isn't filtering, it's better to omit it.
+
+  Yes, the correct call is to use the cred_list tool with no arguments. That should retrieve all the credentials the user has stored.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me the names of my saved API keys<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the names of their saved API keys. Let me check the tools available.
+
+  There's a tool called cred_list that lists credentials. The description says it returns metadata like names, types, usernames, etc. The parameters include an optional type filter. The user is specifically asking for<|projection|> API keys, so I should use the type filter.
+
+  Looking at the enum in the tool's parameters, the possible types include http_bearer and http_basic. Wait, the user mentioned "API keys," which are often represented as HTTP Bearer tokens. So the type would be "http_bearer".
+
+  I need<|projection|> to make sure I'm using the correct type name. The tool's CredType enum includes "http_bearer" and "http_basic", but not "api_key" or something else. So the right parameter is "type": "http_bearer".
+
+  So the tool call should be cred_list with the type set<|projection|> to http_bearer. That should fetch the saved API keys. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {"type": "http_bearer"}}
+  </tool_call><|projection|>
+- |-
+  which credentials are available for this session<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "which credentials are available for this session." I need to figure out which tool to use here. Looking at the tools provided, there's one called cred_list. The description says it lists all credentials available to the current user, showing metadata like names, types, usernames,<|projection|> etc. That matches what the user is asking for.
+
+  The parameters for cred_list include an optional type filter, but the user didn't specify a particular type. So I should call cred_list without any type argument. The JSON schema for the tool's parameters shows that the type can be null or one of the enum values<|projection|>. But since the user isn't specifying a type, I'll omit it.
+
+  So the correct tool call is to use cred_list with no arguments. That should retrieve all credentials available, and the response will include all the metadata the user wants to see.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  do I already have a credential saved for the staging database?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there's a credential saved for the staging database. Let me think about how to approach this.
+
+  First, I need to use the available tool called "cred_list" which lists all credentials. The user wants to check for a specific target, which here is the staging database.<|projection|> But the tool's description mentions that it returns metadata like names, types, usernames, etc., but not the actual secrets.
+
+  The tool's parameters include an optional 'type' filter. However, the user isn't specifying a credential type, just asking about a database. But the tool's parameters don't have a way<|projection|> to filter by the target database name or hostname. Hmm, that's a problem. The tool might not support filtering by the target database directly.
+
+  Wait, maybe the credentials stored might have information about the host or database they're associated with. For example, if the credential has a default host set. But the tool's<|projection|> response includes "default hosts" as part of the metadata. So, perhaps the user is expecting that the tool can check if any saved credential's host matches the staging database's host.
+
+  But the tool's current parameters don't allow for querying based on the host or database name. The 'type' parameter only filters by<|projection|> the credential type (like ssh_key, http_bearer, etc.). Since the user is asking about a database, maybe the credential could be of type 'sql_password', which is one of the possible types in the enum.
+
+  So, to check for a SQL password credential, I can call the 'cred_list' tool<|projection|> with the type set to 'sql_password'. That would list all credentials of that type, and the user can see if there's one saved for the staging database. However, the tool doesn't allow filtering by the specific database host or name, only the type.
+
+  Therefore, the best approach is to inform the user that<|projection|> while we can list all SQL password credentials, we can't filter by the specific database host. Alternatively, if the user knows the exact credential name, they could look it up. But given the current tool's limitations, the answer should be based on what the tool can do.
+
+  So, the correct step is to call<|projection|> the 'cred_list' tool with the type set to 'sql_password' to check for any SQL-related credentials. That way, the user can see if there's a saved credential for the staging database, assuming it's stored as an SQL password.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {"type": "sql_password"}}
+  </tool_call><|projection|>
+- |-
+  give me a rundown of every secret name in the credential store<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of every secret name in the credential store. Let me check the tools available. There's the cred_list function which lists all credentials, returning metadata like names, types, usernames, etc. The user wants the names of all secrets, so this tool should work.
+
+  <|projection|>The parameters for cred_list include an optional type filter, but the user didn't specify a type, so I should omit that. Just call cred_list without any arguments. The response will include all credentials' metadata, including their names. That's exactly what the user needs. I'll generate the tool call accordingly.
+  </think><|projection|>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  before I connect, remind me what login credentials are on file<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to know what login credentials are stored before they connect. Let me check the tools available. There's a tool called cred_list that lists all credentials, showing metadata like names, types, usernames, and creation dates. The user isn't asking for secret info, just what's saved.<|projection|> The tool can take an optional type filter, but since the user didn't specify a type, I should call cred_list without any arguments. That way, it'll return all existing credentials. I need to make sure the JSON is correctly formatted. So the tool call should be to cred_list with empty parameters. That should<|projection|> do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate the credential entries I've set up so far<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to list all the credentials they've saved. Let me check the available tools. There's a function called cred_list that does exactly that. The parameters include an optional type filter, but the user didn't specify any particular type. So I should call cred_list without any type argument.<|projection|> Just need to make sure the JSON is correctly formatted. Alright, that should retrieve all the credential entries.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cred_list", "arguments": {}}
+  </tool_call><|projection|>

@@ -1,0 +1,134 @@
+name: weather
+category: Utilities & web
+description: 'Get current weather conditions and a short-term forecast for a city or location. Use for: "is it raining", "what''s the weather like", "do I need a jacket", "will it rain tomorrow", "temperature in [city]", "weather forecast for the weekend", "how hot is it", "is there snow expected". Returns current temperature, feels_like, humidity, wind_kph, conditions text, and optional daily forecast (high/low/conditions/precipitation) for up to 7 days. Resolves city names automatically. Use web_search for weather articles, not live data. Backed by Open-Meteo (no API key needed).'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    forecast_days:
+      description: 'Number of forecast days to return (0-7); 0 returns current conditions only. Default: 0.'
+      format: uint8
+      maximum: 7.0
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    location:
+      description: City name or location to look up; resolved via geocoding.
+      minLength: 1
+      type: string
+    units:
+      description: 'Unit system: "metric" (Celsius, km/h) or "imperial" (Fahrenheit, mph). Default: "metric".'
+      type:
+      - string
+      - 'null'
+  required:
+  - location
+  title: Request
+  type: object
+examples:
+- |-
+  what's the weather in London today<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the weather in London today. Let me check which tool to use. Oh right, there's the weather tool available. The parameters needed are location, and optionally forecast_days and units. Since they asked for today's weather, I should set forecast_days to 0. The<|projection|> location is London. I'll default to metric units unless specified otherwise. So the tool call should include location: "London", forecast_days: 0. Let me make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "London", "forecast_days": 0}}
+  </tool_call><|projection|>
+- |-
+  will it rain in Seattle tomorrow<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if it will rain in Seattle tomorrow. Let me figure out how to use the weather tool for this.
+
+  First, the tool requires a location, which is Seattle here. The parameters include 'location' as a required field. Then, the 'forecast_days' parameter determines how many<|projection|> days ahead to check. Since the user is asking about tomorrow, that's 1 day. So I should set forecast_days to 1.
+
+  Wait, the default for forecast_days is 0, which returns current conditions. But the user wants tomorrow's forecast. So setting forecast_days to 1 should get the<|projection|> next day's data.
+
+  Also, the units aren't specified, so I'll leave it as the default, which is metric. The tool will handle the rest.
+
+  So the arguments would be location: "Seattle" and forecast_days: 1. Let me make sure there are no typos. Yep,<|projection|> that looks right. Time to call the tool with these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Seattle", "forecast_days": 1}}
+  </tool_call><|projection|>
+- |-
+  give me the 5-day forecast for Denver<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a 5-day forecast for Denver. Let me check the tools available. There's the weather tool which can get the forecast. The parameters include location and forecast_days. The user specified 5 days, so I need to set forecast_days to 5. The location is<|projection|> Denver. The units aren't mentioned, so I'll default to metric as per the tool's default. Let me make sure the JSON is correctly formatted with these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"forecast_days": 5, "location": "Denver", "units": "metric"}}
+  </tool_call><|projection|>
+- |-
+  how hot is it in Phoenix right now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking "how hot is it in Phoenix right now". Let me see. The available tool is the weather tool. The parameters needed are location, and optional forecast_days and units. The user wants the current temperature, so forecast_days should be 0. The location is Phoenix. The<|projection|> units aren't specified, so maybe default to metric as per the tool's default. So I need to call the weather tool with location: "Phoenix", forecast_days: 0. The response should include the current temperature. Let me make sure I'm not missing any required parameters. The 'location' is required,<|projection|> which is provided. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Phoenix", "forecast_days": 0}}
+  </tool_call><|projection|>
+- |-
+  do I need a jacket in Paris this evening<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if they need a jacket in Paris this evening. To figure that out, I need to check the weather forecast for Paris. Specifically, I should look at the temperature and maybe the chance of rain.
+
+  First, I'll use the weather tool to get the current conditions and the forecast<|projection|>. The user mentioned "this evening," so I should check if there's a forecast available for tonight. The tool allows specifying the number of forecast days. Since the user is asking about the evening, which is within the same day, maybe the current conditions are sufficient. But sometimes the forecast might have more accurate data for<|projection|> the evening.
+
+  Wait, the tool's parameters include 'forecast_days', which is the number of days to return. If I set that to 1, it might give a 24-hour forecast. However, the exact time (like evening) might not be covered. Alternatively, the current conditions might be enough.<|projection|> But since the user is asking about the evening, it's better to check if there's a forecast available for that time.
+
+  But the tool's description says it returns current conditions and a short-term forecast. So maybe the current conditions are already considering the upcoming hours. Hmm. Alternatively, maybe the tool can provide an hourly<|projection|> forecast. Wait, the tool's description mentions "short-term forecast," but the parameters only have 'forecast_days' which is in days. That's a bit unclear. If the tool can't get the hourly forecast, then relying on the current temperature and conditions might be the best approach.
+
+  In any case, I should<|projection|> call the weather tool with the location set to Paris. The user didn't specify the units, so defaulting to metric is safe. Let's set the forecast_days to 0 to get the current conditions. If there's a chance of rain or low temperatures, that would indicate needing a jacket. Alternatively, if the<|projection|> forecast for the day includes rain or cold temps, that's important too. But since the tool's parameters don't allow specifying hours, maybe the current data is sufficient.
+
+  So, the plan is to call the weather tool with location as Paris, forecast_days as 0 (current conditions), and units as metric.<|projection|> Then, based on the response, determine if a jacket is needed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Paris", "forecast_days": 0, "units": "metric"}}
+  </tool_call><|projection|>
+- |-
+  what's the humidity like in Singapore<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the humidity in Singapore. Let me check the tools available. There's a weather tool that can get current conditions, including humidity. The parameters needed are location, and optionally forecast_days and units. Since they just asked for humidity, maybe we need to call the weather tool with<|projection|> location set to Singapore. The response should include the humidity value. I'll structure the tool call with the location as "Singapore" and default parameters for the others. That should fetch the current conditions, including humidity.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Singapore"}}
+  </tool_call><|projection|>
+- |-
+  is it snowing in Reykjavik<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if it's snowing in Reykjavik. Let me figure out how to get that information.
+
+  First, I need to use the weather tool provided. The tool can fetch current conditions and forecasts. Since the user is asking about snow, I should check the current weather for<|projection|> Reykjavik.
+
+  The parameters required are location, forecast_days, and units. The location is clearly Reykjavik. The forecast_days should be 0 to get the current conditions. Units aren't specified, so I'll default to metric as per the tool's default.
+
+  So, I'll call the weather<|projection|> function with location set to "Reykjavik", forecast_days as 0, and units as "metric". That should return the current weather details, including precipitation type if it's snowing.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Reykjavik", "forecast_days": 0, "units": "metric"}}
+  </tool_call><|projection|>
+- |-
+  what's the wind speed at the coast in Cape Town<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the wind speed at the coast in Cape Town. Let me see. The available tool is the weather tool, which can get current conditions and forecasts. The parameters needed are location, forecast_days, and units. The user specifically mentioned wind speed, so I need to make sure<|projection|> the response includes that.
+
+  The location is clearly Cape Town. The forecast_days should be 0 since they're asking for current conditions. The units weren't specified, so I'll default to metric as that's standard in South Africa. So the tool call would be with location set to "Cape Town", forecast_days<|projection|> 0, and units "metric". That should retrieve the current wind speed among other details.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "weather", "arguments": {"location": "Cape Town", "forecast_days": 0, "units": "metric"}}
+  </tool_call><|projection|>

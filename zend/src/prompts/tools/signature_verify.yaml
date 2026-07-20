@@ -1,0 +1,234 @@
+name: signature_verify
+category: Cryptography
+description: Check whether a digital signature over a message was genuinely produced by the holder of a given public key (ed25519 or p256_sha256). Returns whether the signature is authentic.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+    SignatureAlgorithm:
+      description: Digital-signature scheme.
+      enum:
+      - ed25519
+      - p256_sha256
+      type: string
+  properties:
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/SignatureAlgorithm'
+      description: 'Signature scheme. One of: ed25519, p256_sha256.'
+      minItems: 1
+      minLength: 1
+    data:
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+    public_key_pem:
+      description: The signer's public key in PEM form, including the `-----BEGIN PUBLIC KEY-----`/`-----END PUBLIC KEY-----` armor lines.
+      minLength: 1
+      type: string
+    signature_hex:
+      description: The signature to check, as hex.
+      minLength: 1
+      type: string
+  required:
+  - algorithm
+  - data
+  - public_key_pem
+  - signature_hex
+  title: SigVerifyRequest
+  type: object
+examples:
+- |-
+  verify the ed25519 signature 3a7f9c2e1b8d4f60a5e8c1d2b3f4a69708172635445566778899aabbccddeeff over the message 'release v1.2' with public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to verify an Ed25519 signature. The signature is given as a hex string, the message is "release v1.2", and there's a public key provided.
+
+  First, I need to check the parameters. The algorithm is ed25<|projection|>519, which is supported. The data is the message, which is text. The public key is in PEM format, which the tool expects. The signature is in hex, so I need to make sure that's correctly formatted.
+
+  Wait, the public key here is in PEM format. But looking at the PEM<|projection|> content, it's actually a raw public key, not the standard format. Normally, PEM for Ed25519 would have specific headers. But the user provided it that way, so the tool should handle it as long as it's correctly formatted.
+
+  The data_encoding is text since the message is plain text.<|projection|> The signature_hex is given as a hex string. All required parameters are present: algorithm, data, public_key_pem, and signature_hex.
+
+  I think all the parameters are correctly set. So the tool call should be made with these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "release v1.2", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "3a7f9c2e1b8d4f60a5e8c1d2b3f4a69708172635445566778899aabbccddeeff"}}
+  </tool_call><|projection|>
+- |-
+  check whether the ed25519 signature 9f8e7d6c5b4a392817063a4b5c6d7e8f0091a2b3c4d5e6f708192a3b4c5d6e7f over 'deploy approved' is valid with public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to approach this. The user wants to check if an Ed25519 signature is valid for a given message using a specific public key.
+
+  First, I need to recall the parameters. The signature provided is 9f8e7d6c<|projection|>5b4a392817063a4b5c6d7e8f0091a2b3c4d5e6f708192a3b4c5d6e7f. Wait, but wait, the user<|projection|> wrote "signature 9f8e7d6c5b4a392817063a4b5c6d7e8f0091a2b3c4d5e6f708192a3b4c5d<|projection|>6e7f" — so that's a 64-byte hex string, which is correct for Ed25519.
+
+  The message is 'deploy approved'. The public key is given in PEM format, but it's actually a raw public key, not the standard PEM. Wait, the user provided:
+
+  <|projection|>-----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----
+
+  Wait, but this is a base6<|projection|>4-encoded X.509 SubjectPublicKeyInfo. For Ed25519, the public key is typically 32 bytes. Let me check the length. The base64 string here is 44 characters long. Since base64 encodes 3 bytes into 4 chars, 4<|projection|>4 * 3 /4 = 33 bytes. That's not a multiple of 32, which is odd. Wait, maybe I miscalculated. Let me count: "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ<|projection|>9w7lshQhqowtrbLDFw4rXAxZuE=" — let me count the letters. But perhaps it's easier to note that the actual public key in PEM is likely a raw Ed25519 key, but the format here might be incorrect. However,<|projection|> the tool should handle it.
+
+  The user's question is to check if the signature is valid. The tool 'signature_verify' requires parameters: algorithm (ed25519), data ('deploy approved'), data_encoding (text, default), public_key_pem (the given PEM), and signature_hex (the hex<|projection|> string).
+
+  So I need to structure the tool call with these parameters. The signature is in hex, so the 'signature_hex' parameter is set to "9f8e7d6c5b4a392817063a4b5c6d7e8f0<|projection|>091a2b3c4d5e6f708192a3b4c5d6e7f".
+
+  Wait, but wait: the user's input has a long hex string. Let me check if it's 64 bytes. Each pair of hex chars is<|projection|> one byte. The length of the signature is 128 characters (since 64 bytes * 2 = 128). Let me count: "9f8e7d6c5b4a392817063a4b5c6d7e<|projection|>8f0091a2b3c4d5e6f708192a3b4c5d6e7f" — that's 128 characters, so 64 bytes. Correct.
+
+  So the parameters are:
+
+  algorithm: ed2551<|projection|>9
+  data: 'deploy approved'
+  public_key_pem: the given PEM
+  signature_hex: the hex string
+
+  The data_encoding is not specified, so it defaults to 'text'.
+
+  Therefore, the tool call should be made with these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "deploy approved", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "9f8e7d6c5b4a392817063a4b5c6d7e8f0091a2b3c4d5e6f708192a3b4c5d6e7f"}}
+  </tool_call><|projection|>
+- |-
+  verify the ed25519 signature c0ffee11d00dfeedbaadf00d1234567890abcdef00112233445566778899aabb over 'contract terms' with public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to verify an Ed25519 signature. The parameters given are the signature hex c0ffee11d00dfeedbaadf00d1234567890abcdef001122334<|projection|>45566778899aabb, the data is 'contract terms', and the public key provided.
+
+  First, I need to check if all required parameters are present. The tool requires algorithm, data, public_key_pem, and signature_hex. The user provided all of these. The<|projection|> data encoding isn't specified, so it defaults to text. The public key is in PEM format, which is correct. The signature is in hex, which matches the requirements.
+
+  I should structure the tool call with these parameters. Make sure the JSON keys match the tool's expected schema. The algorithm is ed255<|projection|>19, data is 'contract terms', public_key_pem is the given PEM string, and signature_hex is the hex value. No need to include data_encoding since it's defaulting to text. That should cover everything needed for the verification.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "contract terms", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "c0ffee11d00dfeedbaadf00d1234567890abcdef00112233445566778899aabb"}}
+  </tool_call><|projection|>
+- |-
+  confirm the ed25519 signature feedface8badf00dcafebabe0123456789abcdef112233445566778899aabbcc over 'audit log' with public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. They want to verify an ED25519 signature using a given public key. The tools available include the signature_verify function. Let me check the parameters needed for that.
+
+  The user provided the signature as "feedface8<|projection|>badf00dcafebabe0123456789abcdef112233445566778899aabbcc", the data is "audit log", and the public key in PEM format. Wait, the public key they provided is<|projection|> a base64-encoded string, but the tool expects the actual PEM with the headers. Oh, the user's input has the public key correctly formatted as PEM, including the BEGIN and END lines. So I need to make sure that's included in the parameters.
+
+  The algorithm is ED25519, so<|projection|> the 'algorithm' parameter should be "ed25519". The data is "audit log", which is plain text, so the data_encoding can be left as default (text). The signature is given in hex, so the 'signature_hex' parameter should be the provided hex string.
+
+  Wait, the<|projection|> user's signature is a long hexadecimal string. The tool expects the signature_hex parameter as a string. So all the required parameters are present: algorithm, data, public_key_pem, and signature_hex.
+
+  I need to structure the JSON call correctly. Let me double-check each field:
+
+  - algorithm: "ed2<|projection|>5519" (correct)
+  - data: "audit log" (the message)
+  - public_key_pem: the PEM string provided, which includes the BEGIN and END lines.
+  - signature_hex: the hex string given.
+
+  Yes, that's all there. So the tool call should be made with these arguments<|projection|>. I think that's all. Let me format the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "audit log", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "feedface8badf00dcafebabe0123456789abcdef112233445566778899aabbcc"}}
+  </tool_call><|projection|>
+- |-
+  is the ed25519 signature 0011223344556677889900aabbccddeeff112233445566778899aabbccddeeff0 over 'firmware image v9' authentic given public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking if a specific ED25519 signature is valid for a given message using a provided public key. The signature is given as a hex string, and the data is "firmware image v9". The public key is provided in PEM format.
+
+  First<|projection|>, I need to use the signature_verify tool. The parameters required are algorithm, data, public_key_pem, and signature_hex. The algorithm here is ed25519. The data is "firmware image v9", which should be passed as-is. The public_key_pem is the given PEM<|projection|> key. The signature_hex is the provided hex string.
+
+  Wait, the user mentioned the signature is 0011223344556677889900aabbccddeeff11223344556677889<|projection|>9aabbccddeeff0. I need to make sure that's correctly formatted as a hex string. Also, check if the data encoding is text, which it is by default. So the parameters are all set. Just need to structure the JSON call with these values.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "firmware image v9", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "0011223344556677889900aabbccddeeff112233445566778899aabbccddeeff0"}}
+  </tool_call><|projection|>
+- |-
+  validate the ed25519 signature a5b4c3d2e1f00918273645546372819aabbccddee0011223344556677889900ab on the message 'grant admin token' using public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to verify an ED25519 signature for the message "grant admin token" using a given public key. The signature provided is a hex string, and the public key is in PEM format.
+
+  First, I need to check the parameters. The algorithm is<|projection|> ed25519, which is supported. The data is the message "grant admin token", which should be passed as is. The data encoding isn't specified, so I'll default to text. The public key is given in PEM, including the headers. The signature is a hex string, which needs to<|projection|> be converted to bytes.
+
+  Wait, the tool's parameters require the signature_hex as a string. Since the input is a hex string, I can pass it directly. The tool will handle converting it to bytes. Similarly, the public key is in PEM, which the tool expects. The data is the message, and since<|projection|> the data_encoding is not specified, it defaults to text.
+
+  So the correct call would include all required parameters: algorithm as "ed25519", data as "grant admin token", public_key_pem with the provided key, and signature_hex as the given hex string. That should cover all necessary inputs for<|projection|> the signature verification.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "grant admin token", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "a5b4c3d2e1f00918273645546372819aabbccddee0011223344556677889900ab"}}
+  </tool_call><|projection|>
+- |-
+  verify signature 7788990011223344556677889900aabbccddeeff00112233445566778899aabb over 'ceasefire at dawn' with the ed25519 public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to approach this. The user wants to verify a signature using the provided tool. Let me look at the details.
+
+  The signature given is "7788990011223344556677889<|projection|>900aabbccddeeff00112233445566778899aabb". The data is "ceasefire at dawn". The public key is provided in PEM format. The algorithm is ed25519, as per the tool<|projection|>'s parameters.
+
+  Wait, the tool requires the parameters: algorithm, data, public_key_pem, and signature_hex. The data is 'ceasefire at dawn', which needs to be passed as a string. The public key is given with the PEM format, including the BEGIN and END lines. The signature is in<|projection|> hex, so that's straightforward.
+
+  I need to make sure all required fields are included. The data_encoding isn't specified, so it defaults to text. Since the data is a string, no encoding is needed. So the call should include all the parameters correctly formatted as JSON.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "ceasefire at dawn", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "7788990011223344556677889900aabbccddeeff00112233445566778899aabb"}}
+  </tool_call><|projection|>
+- |-
+  tell me if the ed25519 signature 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809 matches 'ledger close 2026-07' under public key -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+  -----END PUBLIC KEY-----<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking if a specific ED25519 signature matches the message "ledger close 2026-07" using a given public key. I need to use the signature_verify tool for this.
+
+  First, I'll check the parameters required. The<|projection|> tool needs the algorithm, data, data encoding (optional), public key in PEM, and the signature in hex.
+
+  The user provided the signature as "1a2b3c4d5e6f708192a3b4c5d6e7f8091<|projection|>a2b3c4d5e6f708192a3b4c5d6e7f809". Wait, but ED25519 signatures are typically 64 bytes, which would be 128 hex chars. The given signature is <|projection|>128 characters long, so that's correct.
+
+  The message is "ledger close 2026-07". The public key is provided in PEM format. I need to make sure the PEM is correctly formatted. The user's public key starts with-----BEGIN PUBLIC KEY----- and ends with -----END PUBLIC<|projection|> KEY-----, so that's good.
+
+  The data encoding is not specified, so default to text. The algorithm is ed25519.
+
+  So, assembling all these into the tool call. The parameters should be:
+
+  algorithm: "ed25519"
+  data: "ledger close 20<|projection|>26-07"
+  public_key_pem: the given PEM string
+  signature_hex: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f<|projection|>708192a3b4c5d6e7f809"
+
+  I need to make sure there are no typos in the JSON structure. Also, check that all required fields are present. The data_encoding is optional, so it's okay to omit it.
+
+  So the tool call<|projection|> should be correct. The user will get whether the signature is valid based on the provided parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "signature_verify", "arguments": {"algorithm": "ed25519", "data": "ledger close 2026-07", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----", "signature_hex": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"}}
+  </tool_call><|projection|>

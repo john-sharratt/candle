@@ -20,14 +20,18 @@ mod config;
 mod conv_file_store;
 mod conv_files;
 mod download;
+mod ingest;
 mod loading;
 mod log_broadcast;
 mod log_file;
 mod log_line;
 mod projection_event;
+mod raw_read;
 mod refresh_ctx;
 mod repo_scan;
+mod response_section;
 mod session;
+mod tool_def;
 mod tool_summary;
 mod tools;
 mod turn_sink;
@@ -58,6 +62,15 @@ struct Cli {
     #[arg(default_value = ".")]
     workspace: PathBuf,
 
+    /// Override the daemon's working directory — where `.substrate` and an
+    /// optional `projection.yaml` live. The daemon operates against this dir
+    /// WITHOUT changing the terminal's cwd (paths are config-scoped, not a
+    /// process `chdir`). Created if it doesn't exist. Takes precedence over the
+    /// positional workspace. Use it to run a separate, uncommitted "mind" with
+    /// its own substrate + tuned projection schema, e.g. `--working-dir ../mind`.
+    #[arg(long)]
+    working_dir: Option<PathBuf>,
+
     /// TCP port to listen on.
     #[arg(long, default_value_t = 8080)]
     port: u16,
@@ -66,16 +79,15 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Skip the startup code-reading ingest pass. Brings the daemon up fast
-    /// (model + substrate + sections only) so you can test conversations
-    /// without the per-file prefill sweep.
-    #[arg(long)]
-    skip_code_read: bool,
-
-    /// Skip the startup repository scan. Brings the daemon up fast
-    /// (model + substrate + sections only) so you can test conversations
-    #[arg(long)]
-    skip_repo_scan: bool,
+    /// Suppress a projection sink's startup population — a turn-sink **layer**
+    /// (e.g. `repo_map`, `code_reading`) or a section **collection** (e.g.
+    /// `response`, `mood`), by its schema name. Repeatable (e.g. `--disable-layer
+    /// repo_map --disable-layer code_reading`). The layer/collection still exists
+    /// in the schema; it is just not populated at boot, and is skipped by the
+    /// watcher refresh and uploads. Brings the daemon up fast without the ingest
+    /// sweep.
+    #[arg(long = "disable-layer", value_name = "NAME")]
+    disable_layer: Vec<String>,
 
     /// Do not run the background summariser thread (no AVL summary-forest
     /// extension, no per-conversation summarisation registration). Brings the
@@ -121,10 +133,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let workspace = cli
-        .workspace
-        .canonicalize()
-        .unwrap_or_else(|_| cli.workspace.clone());
+    // `--working-dir` (if given) is the workspace; otherwise the positional path.
+    // Create it first so a fresh mind directory has somewhere for `.substrate` and
+    // `projection.yaml` to land, then canonicalize to an absolute path.
+    let ws_arg = cli.working_dir.clone().unwrap_or_else(|| cli.workspace.clone());
+    if let Err(e) = std::fs::create_dir_all(&ws_arg) {
+        eprintln!("warning: could not create working dir {}: {e}", ws_arg.display());
+    }
+    let workspace = ws_arg.canonicalize().unwrap_or(ws_arg);
 
     // ── Logging ───────────────────────────────────────────────────────────────
     //
@@ -167,20 +183,24 @@ async fn main() -> anyhow::Result<()> {
         .with(file_layer)
         .init();
 
+    let disabled_layers: std::collections::HashSet<String> =
+        cli.disable_layer.iter().cloned().collect();
+
     let config = DaemonConfig {
         workspace: workspace.clone(),
         port: cli.port,
-        skip_code_read: cli.skip_code_read,
-        skip_repo_scan: cli.skip_repo_scan,
+        disabled_layers: disabled_layers.clone(),
         disable_summariser: cli.disable_summariser,
         compact_substrate: cli.compact_substrate,
     };
 
-    if cli.skip_code_read {
-        tracing::info!("--skip-code-read: startup code-reading ingest is disabled");
-    }
-    if cli.skip_repo_scan {
-        tracing::info!("--skip-repo-scan: startup repository scan is disabled");
+    if !disabled_layers.is_empty() {
+        let mut names: Vec<&str> = disabled_layers.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        tracing::info!(
+            layers = %names.join(", "),
+            "--disable-layer: startup ingest suppressed for these projection layers",
+        );
     }
     if cli.disable_summariser {
         tracing::info!("--disable-summariser: background summariser thread is disabled");

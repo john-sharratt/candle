@@ -1,0 +1,109 @@
+name: ssh_session_list
+category: SSH sessions
+description: Enumerate the secure shell sessions currently logged in to remote servers, with each host and connection status.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open SSH sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open SSH sessions. Let me check the tools available. There's a tool called ssh_session_list that enumerates secure shell sessions. The parameters are straightforward, just a JSON object. Since the user wants their own sessions, I don't need any arguments. I'll<|projection|> call that tool.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which SSH connections do I currently have open<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking which SSH connections they currently have open. Let me think about how to approach this.
+
+  First, I remember that the user has provided a tool called ssh_session_list. The description says it enumerates the secure shell sessions currently logged in to remote servers, listing each host and connection status<|projection|>. That's exactly what the user needs.
+
+  So, the next step is to check if there are any parameters required for the ssh_session_list tool. Looking at the parameters section, the JSON schema shows an empty object {} under "parameters". That means no arguments are needed when calling this tool.
+
+  Therefore, the correct<|projection|> action is to call the ssh_session_list tool without any arguments. The response from this tool should give the user the information they're looking for.
+
+  I need to make sure that the tool call is formatted correctly. The name of the tool is "ssh_session_list" and there are no arguments. So the JSON object<|projection|> inside the tool_call tags should be {"name": "ssh_session_list", "arguments": {}}.
+
+  I should double-check everything once more. The user's question matches the tool's purpose, no parameters are required, and the syntax for the tool call is correct. Everything seems in order.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me the active SSH sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see the active SSH sessions. Let me check the tools available. Oh, there's a tool called ssh_session_list that enumerates the secure shell sessions. The parameters are straightforward, just an empty object since the schema doesn't require any properties. I need to call that tool<|projection|>. So the JSON should have the name as "ssh_session_list" and the arguments as an empty object. Let me make sure I'm not missing any required fields. Yep, looks good. Time to format the response correctly inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many SSH sessions are running<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "how many SSH sessions are running?" I need to figure out which tool to use here. Looking at the available tools, there's one called ssh_session_list. The description says it enumerates secure shell sessions currently logged in to remote servers, listing each host and connection status<|projection|>. That sounds exactly like what's needed here.
+
+  The user isn't asking for a specific host or detailed info, just the count. But the tool's purpose is to list all sessions. So, calling this tool will provide the necessary data. The parameters for the tool don't require any arguments, as per the JSON<|projection|> schema provided. So, I can directly invoke the ssh_session_list tool without any parameters.
+
+  Once the tool is called, the response should include the list of sessions. Then, I can count them and relay the number back to the user. But since the user only asked for the number, the answer will be straightforward once<|projection|> the tool's response is received.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me the ids of every SSH session I've opened<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the IDs of every SSH session they've opened. Let me check the tools available. There's a tool called ssh_session_list that enumerates secure shell sessions, listing each host and connection status. The parameters are straightforward, just an empty object since there are no arguments needed.<|projection|> So, I need to call this tool. The response should be a JSON object with the tool name and an empty arguments object. Let me make sure I'm using the correct syntax as specified. Yep, that's right. Alright, time to put it all together.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are there any SSH sessions still connected right now?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any SSH sessions still connected right now. I need to figure out which tool to use here. Looking at the available tools provided, there's one called ssh_session_list. The description says it enumerates the secure shell sessions currently logged in to remote servers, listing each<|projection|> host and connection status.
+
+  So, the user wants to know if there are any active connections. The ssh_session_list tool seems perfect for this. The parameters for the tool don't require any arguments, as per the JSON schema provided. The $schema is set up for a list request, but the actual parameters object is<|projection|> empty.
+
+  Wait, let me check again. The parameters section has a $schema link, but the actual properties are empty. That means when calling the tool, I don't need to pass any arguments. So the tool call would just be the name "ssh_session_list" with an empty arguments object.
+
+  I should<|projection|> make sure there's no mistake here. The user isn't asking for a specific host or anything else; they just want to know if there are any active sessions. The tool's purpose matches exactly. Therefore, invoking ssh_session_list without any arguments should retrieve the list of SSH sessions. That's the correct approach here.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate my current SSH remote sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to enumerate their current SSH remote sessions. Let me check the tools available. There's a tool called ssh_session_list that lists secure shell sessions with each host and connection status. The parameters are defined in a JSON schema. Since the user wants to know their current sessions, I should<|projection|> call this tool. The function doesn't require any arguments, so I'll just trigger the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what SSH sessions are on the books at the moment<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about the current SSH sessions. Let me check the tools available. Oh right, there's the ssh_session_list tool. It doesn't need any parameters. So I just need to call that function. The response will list all the active sessions. I should make sure to present that<|projection|> info clearly once I get it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_list", "arguments": {}}
+  </tool_call><|projection|>

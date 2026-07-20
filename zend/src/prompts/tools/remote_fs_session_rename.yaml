@@ -1,0 +1,164 @@
+name: remote_fs_session_rename
+category: Remote filesystem
+description: Rename or move a file or directory on a remote host's filesystem over SFTP.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    from:
+      description: Existing remote path to rename or move.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the remote_fs_session_open tool.
+      minLength: 1
+      type: string
+    to:
+      description: New remote path.
+      minLength: 1
+      type: string
+  required:
+  - from
+  - session_id
+  - to
+  title: RenameRequest
+  type: object
+examples:
+- |-
+  rename /opt/app/current to /opt/app/previous on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me see. The user wants to rename or move a file or directory on a remote host's filesystem using SFTP. The specific command they're asking for is to rename "/opt/app/current" to "/opt/app/previous" using the remote FS session with ID "rfs-1".
+
+  <|projection|>First, I need to check the available tools. There's a tool called "remote_fs_session_rename" which seems exactly what's needed. The parameters required are "from", "session_id", and "to".
+
+  The "from" parameter should be the existing path, which is "/opt/app/current". The "<|projection|>to" parameter is the new path, "/opt/app/previous". The "session_id" is given as "rfs-1".
+
+  I need to make sure all required parameters are included. The tool requires "from", "session_id", and "to", which are all provided. No optional parameters here.<|projection|>
+
+  So the JSON object for the tool call should have the name "remote_fs_session_rename" and the arguments with the correct values. I'll structure it properly, ensuring the JSON is valid. Let me double-check the paths and session ID for any typos. Everything looks good. Time to present the tool call.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/opt/app/current", "session_id": "rfs-1", "to": "/opt/app/previous"}}
+  </tool_call><|projection|>
+- |-
+  move /tmp/upload.bin to /data/final.bin on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to move the file /tmp/upload.bin to /data/final.bin on a remote filesystem using an existing session called rfs-1.
+
+  First, I need to check the available tools. There's a tool called remote_fs_session_rename<|projection|>, which is for renaming or moving files over SFTP. The parameters required are 'from', 'to', and 'session_id'.
+
+  The user provided the session ID as rfs-1, so that's the session_id. The source path is /tmp/upload.bin, and the destination is /data/final<|projection|>.bin.
+
+  I should make sure all required parameters are included. The 'from' parameter is the current path, 'to' is the new path, and 'session_id' is the session they're using.
+
+  I don't see any issues here. All required fields are present. So, I'll structure the<|projection|> tool call with these arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/tmp/upload.bin", "to": "/data/final.bin", "session_id": "rfs-1"}}
+  </tool_call><|projection|>
+- |-
+  rename /var/www/index.html.new to /var/www/index.html on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to rename or move a file on a remote filesystem using SFTP. The specific command is to rename /var/www/index.html.new to /var/www/index.html. They mentioned using the remote_fs_session_rename tool.
+
+  First, I need to check the parameters required for<|projection|> that tool. The parameters are 'from', 'session_id', and 'to'. The 'from' is the existing path, 'to' is the new path, and 'session_id' comes from the remote_fs_session_open tool.
+
+  The user provided the session ID as 'rfs-2'. So I need<|projection|> to structure the JSON with 'from' as '/var/www/index.html.new', 'to' as '/var/www/index.html', and 'session_id' as 'rfs-2'.
+
+  I should make sure all required fields are included. The 'session_id' is mandatory, so that's there. The 'from<|projection|>' and 'to' paths are correctly specified. No extra parameters are needed. This should correctly call the remote_fs_session_rename tool with the given arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/var/www/index.html.new", "session_id": "rfs-2", "to": "/var/www/index.html"}}
+  </tool_call><|projection|>
+- |-
+  move /home/deploy/draft.md to /home/deploy/final.md on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to move a file called draft.md to final.md on a remote server using SFTP. They mentioned using the remote-fs session rfs-1.
+
+  First, I need to check the available tools. There's a tool called remote_fs_session_rename. The description<|projection|> says it's for renaming or moving files via SFTP. The parameters required are 'from', 'session_id', and 'to'.
+
+  The user provided the session ID 'rfs-1', so that's the session_id. The original path is /home/deploy/draft.md, and the new path is<|projection|> /home/deploy/final.md.
+
+  I should structure the JSON arguments with 'from' as the original path, 'to' as the new path, and 'session_id' as 'rfs-1'. Let me make sure all required fields are included. Yes, 'from', 'session_id', and<|projection|> 'to' are all there.
+
+  I think that's all. The tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/home/deploy/draft.md", "session_id": "rfs-1", "to": "/home/deploy/final.md"}}
+  </tool_call><|projection|>
+- |-
+  can you rename /srv/data/dump.sql.tmp to /srv/data/dump.sql on remote-fs session rfs-3?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to rename a file on a remote filesystem using SFTP. The specific command they're asking for is to move or rename the file from /srv/data/dump.sql.tmp to /srv/data/dump.sql.
+
+  First, I need<|projection|> to check if there's a tool available for this. Looking at the provided tools, there's one called remote_fs_session_rename. The description says it's for renaming or moving a file or directory over SFTP. That's exactly what's needed here.
+
+  The parameters required for this tool are 'from', 'session_id<|projection|>', and 'to'. The user provided the paths, so 'from' would be '/srv/data/dump.sql.tmp' and 'to' would be '/srv/data/dump.sql'. But wait, the session ID isn't mentioned in the user's message. Oh right, the session ID is supposed to come from<|projection|> a previous call to remote_fs_session_open. Since the user mentioned "remote-fs session rfs-3", I should use that session ID, which is 'rfs-3'.
+
+  So putting it all together: the 'session_id' is 'rfs-3', 'from' is the original path,<|projection|> and 'to' is the new path. I need to make sure all required parameters are included. The tool requires 'from', 'session_id', and 'to', which are all present here.
+
+  I should double-check that there are no typos in the JSON structure. Also, ensure that the keys match exactly what<|projection|> the tool expects. Once that's confirmed, the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/srv/data/dump.sql.tmp", "session_id": "rfs-3", "to": "/srv/data/dump.sql"}}
+  </tool_call><|projection|>
+- |-
+  relocate /tmp/build.tar.gz to /var/www/releases/build.tar.gz on remote-fs session rfs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to rename or move a file via SFTP using the provided tool. The command given is "relocate /tmp/build.tar.gz to /var/www/releases/build.tar.gz on remote-fs session rfs-4".
+
+  First,<|projection|> I need to parse the command. The source path is /tmp/build.tar.gz, and the destination is /var/www/releases/build.tar.gz. The session ID mentioned is rfs-4.
+
+  Looking at the available tools, there's a function called remote_fs_session_rename. The parameters required are 'from', 'to<|projection|>', and 'session_id'. The 'from' is the current path, 'to' is the new path, and 'session_id' is the session identifier.
+
+  So, substituting the values: 'from' should be "/tmp/build.tar.gz", 'to' is "/var/www/releases/build.tar.gz", and<|projection|> 'session_id' is "rfs-4". I need to make sure all required fields are included. The tool's parameters require 'from', 'session_id', and 'to', which are all provided here.
+
+  I should check if there are any potential issues. The paths look valid, and the session ID is<|projection|> given. No additional parameters are needed. Therefore, constructing the JSON object with these values should correctly invoke the remote_fs_session_rename tool.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/tmp/build.tar.gz", "to": "/var/www/releases/build.tar.gz", "session_id": "rfs-4"}}
+  </tool_call><|projection|>
+- |-
+  swap /etc/nginx/nginx.conf over to /etc/nginx/nginx.conf.bak on remote-fs session rfs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to rename or move the file /etc/nginx/nginx.conf to /etc/nginx/nginx.conf.bak on a remote filesystem using an existing session.
+
+  First, I need to check the available tools. There's the remote_fs_session_rename tool<|projection|>. Its parameters are 'from', 'session_id', and 'to'. The 'from' is the current path, 'to' is the new path, and 'session_id' is from the open session.
+
+  The user provided the session ID 'rfs-2'. So I need to call the rename function with<|projection|> 'from' as '/etc/nginx/nginx.conf', 'to' as '/etc/nginx/nginx.conf.bak', and the session ID 'rfs-2'.
+
+  I should make sure all required parameters are included. The 'from' and 'to' paths are required, and the session ID is necessary. It looks<|projection|> like everything is in place. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/etc/nginx/nginx.conf", "session_id": "rfs-2", "to": "/etc/nginx/nginx.conf.bak"}}
+  </tool_call><|projection|>
+- |-
+  move /home/ci/artifacts/staging to /home/ci/artifacts/archived on remote-fs session rfs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to move a directory from /home/ci/artifacts/staging to /home/ci/artifacts/archived using an SFTP session.
+
+  First, I need to check the available tools. There's a tool called remote_fs_session_rename<|projection|> which is for renaming or moving files/directories over SFTP. The parameters required are 'from', 'to', and 'session_id'.
+
+  The user provided the session ID as 'rfs-1'. So I'll need to use that. The 'from' path is /home/ci/artifacts/staging<|projection|>, and the 'to' path is /home/ci/artifacts/archived.
+
+  I should make sure all required parameters are included. The 'session_id', 'from', and 'to' are all required. It looks like everything is here. So the tool call should be straightforward.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "remote_fs_session_rename", "arguments": {"from": "/home/ci/artifacts/staging", "to": "/home/ci/artifacts/archived", "session_id": "rfs-1"}}
+  </tool_call><|projection|>

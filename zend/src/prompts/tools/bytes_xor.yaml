@@ -1,0 +1,172 @@
+name: bytes_xor
+category: Byte encoding
+description: Combine two byte sequences with a bitwise XOR, zero-padding the shorter one. Use for one-time-pad analysis, keystream masking, and computing bitwise differences between binary blobs. Always call this tool to perform the XOR; never compute the result yourself.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    BytesEncoding:
+      description: Byte encoding format.
+      enum:
+      - hex
+      - base64
+      - base64url
+      - utf8
+      type: string
+  properties:
+    a:
+      description: First operand, interpreted according to `a_encoding`. Required.
+      minLength: 1
+      type: string
+    a_encoding:
+      anyOf:
+      - $ref: '#/definitions/BytesEncoding'
+      - type: 'null'
+      description: 'How `a` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.'
+    b:
+      description: Second operand, interpreted according to `b_encoding`. Required.
+      minLength: 1
+      type: string
+    b_encoding:
+      anyOf:
+      - $ref: '#/definitions/BytesEncoding'
+      - type: 'null'
+      description: 'How `b` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.'
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/BytesEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned XOR result. One of: hex, base64, base64url, utf8. Defaults to hex.'
+  required:
+  - a
+  - b
+  title: XorRequest
+  type: object
+examples:
+- |-
+  xor the hex a1b2c3d4e5f60718293a4b5c6d7e8f90 and 0f1e2d3c4b5a69788796a5b4c3d2e1f0<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to XOR these two hex values. Let me make sure I do this right. The first value is a1b2c3d4e5f60718293a4b5c6d7e8f90 and the second is 0<|projection|>f1e2d3c4b5a69788796a5b4c3d2e1f0. Wait, but the tool requires the parameters as specified. Let me check the parameters again.
+
+  The user provided two hex strings. The tool's parameters are a and<|projection|> b, both required. The encoding for both should be 'hex' since they're given in hex. The output encoding can default to hex. So I need to call bytes_xor with a as the first hex string, a_encoding as 'hex', b as the second hex string, and b_encoding as 'hex'.<|projection|> The output_encoding can be omitted, so it defaults to hex. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "a_encoding": "hex", "b": "0f1e2d3c4b5a69788796a5b4c3d2e1f0", "b_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  xor the hex blocks 3c8f1ad57e29b0c46f81d2a3905e7bc191e4072db8a6f53c1d4e8b09a7f26d3e and 5f4e3d2c1b0a998877665544332211009988776655443322110ffeeddccbbaa9<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to XOR these two hex strings. Let me check the tools available. There's a bytes_xor function that takes two byte sequences and returns their XOR. The parameters are a and b, which are the hex values here. Both are required, so I'll input the given hex blocks. The<|projection|> output encoding defaults to hex, which is what I need. I should structure the tool call with the correct arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "3c8f1ad57e29b0c46f81d2a3905e7bc191e4072db8a6f53c1d4e8b09a7f26d3e", "b": "5f4e3d2c1b0a998877665544332211009988776655443322110ffeeddccbbaa9"}}
+  </tool_call><|projection|>
+- |-
+  xor the keystream 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d with the ciphertext deadbeefcafebabe0011223344556677<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants me to XOR the keystream "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d" with the ciphertext "deadbeefcafebabe001<|projection|>1223344556677".
+
+  First, I need to make sure both values are in the correct format. The keystream is given as a hex string, and the ciphertext is also a hex string. Since the tool parameters mention that the default encoding is hex if not specified,<|projection|> I can proceed without changing the encodings.
+
+  Wait, but the tool's parameters have fields for a_encoding and b_encoding. Since both inputs are hex, I should specify that. But the problem statement says to use the tool, so I need to structure the call correctly.
+
+  So, the 'a' parameter is the<|projection|> keystream, which is "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d", and 'a_encoding' should be 'hex'. Similarly, 'b' is the ciphertext "deadbeefcafebabe<|projection|>0011223344556677" with 'b_encoding' as 'hex'. The output encoding can be left as default, which is hex, or maybe set it to 'hex' explicitly. But since the user didn't specify, perhaps it's safer to leave it<|projection|> out.
+
+  Wait, looking at the tool's parameters: the output_encoding is optional. So I can omit it. The tool will return the result in hex by default.
+
+  So the JSON call would be:
+
+  {
+    "name": "bytes_xor",
+    "arguments": {
+      "a": "1a2b<|projection|>3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+      "a_encoding": "hex",
+      "b": "deadbeefcafebabe0011223344556677<|projection|>",
+      "b_encoding": "hex"
+    }
+  }
+
+  I think that's all. The output will be the XOR of the two hex strings, which is the decrypted plaintext if this is a one-time pad scenario.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d", "a_encoding": "hex", "b": "deadbeefcafebabe0011223344556677", "b_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  xor the hex cafebabedeadbeef0123456789abcdef and fedcba9876543210ffeeddccbbaa9988<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to XOR these two hex strings: "cafebabedeadbeef0123456789abcdef" and "fedcba9876543210ffeeddccbbaa9988". Let me check the tool's<|projection|> parameters. The tool is bytes_xor, which takes a and b as strings, with their encodings. The default for a_encoding and b_encoding is hex, so I don't need to specify them here. The output encoding defaults to hex as well, which is what I want.
+
+  So I just need to pass the<|projection|> two hex strings as 'a' and 'b'. Wait, let me make sure the hex strings are correctly formatted. The first one is cafebabedeadbeef0123456789abcdef, and the second is fedcba9876543210ffeed<|projection|>dccbbaa9988. They look like valid hex, each byte is two characters. The tool will handle the XOR, zero-padding if needed. Since both are same length, no padding required. So the call should be straightforward.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "cafebabedeadbeef0123456789abcdef", "b": "fedcba9876543210ffeeddccbbaa9988"}}
+  </tool_call><|projection|>
+- |-
+  xor 7d3f9a02c815be64f0a19d3c5e82740b against 2b6ef1c40953a7d8e14c60ba39f5127e<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to XOR two hex strings: 7d3f9a02c815be64f0a19d3c5e82740b and 2b6ef1c40953a7<|projection|>d8e14c60ba39f5127e. Both are hexadecimal, so I need to use the bytes_xor tool.
+
+  First, I'll check the parameters. The tool requires 'a' and 'b' as the two byte sequences. Since both are in hex, I don<|projection|>'t need to specify the encoding unless it's different. The output encoding defaults to hex, which is what the user probably wants.
+
+  So, I'll structure the tool call with the two hex strings as 'a' and 'b'. No need to set a_encoding or b_encoding because they're both hex. The output<|projection|> will be in hex by default. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "7d3f9a02c815be64f0a19d3c5e82740b", "b": "2b6ef1c40953a7d8e14c60ba39f5127e"}}
+  </tool_call><|projection|>
+- |-
+  what do you get when you XOR 1234567890abcdef and c73e91a45db8206f<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user is asking to XOR two hexadecimal values: 1234567890abcdef and c73e91a45db8206f. I need to use the bytes_xor tool for this.
+
+  First, I should check the<|projection|> parameters. Both inputs are hex-encoded since they're given in hex. The tool requires a and b as strings, along with their encodings. Since both are hex, I'll set a_encoding and b_encoding to "hex". The output should also be in hex by default, so output_encoding can be omitted or set<|projection|> to "hex".
+
+  Wait, the user didn't specify an output encoding, so the tool will default to hex. So the call should include a, a_encoding, b, b_encoding. Let me structure the JSON accordingly. Make sure the JSON is correctly formatted with the right keys. No other parameters needed. That's<|projection|> it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "1234567890abcdef", "a_encoding": "hex", "b": "c73e91a45db8206f", "b_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  mask the hex 5e6f7a8b9c0d1e2f with the one-time pad a5b4c3d2e1f00918<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to mask the hex value 5e6f7a8b9c0d1e2f using a one-time pad of a5b4c3d2e1f00918. Hmm, right, so the tool they<|projection|> mentioned is bytes_xor. I need to call that.
+
+  First, I should check the parameters. The function requires 'a' and 'b', which are the two byte sequences. Here, 'a' is the hex string 5e6f7a8b9c0d1e2f, and<|projection|> 'b' is a5b4c3d2e1f00918. Wait, but the user wrote "mask the hex... with the one-time pad...", so the hex values are the operands.
+
+  Wait, the tool's parameters are 'a' and 'b', each with their<|projection|> encoding. Since both are given as hex strings, their encodings (a_encoding and b_encoding) should be set to 'hex'. The output encoding can be left as default, which is hex. But maybe I should specify it just in case.
+
+  So, the JSON arguments would be: a is "5e6<|projection|>f7a8b9c0d1e2f", a_encoding "hex", b is "a5b4c3d2e1f00918", b_encoding "hex". Output_encoding can be "hex" or omitted. But the tool's required parameters are a and b<|projection|>, which are provided. So the tool call should be correct.
+
+  I need to make sure that the JSON structure is correct. Let me double-check the parameters. The 'a' and 'b' are strings, and their encodings are set to 'hex'. The output encoding isn't required, so it's optional<|projection|>. Therefore, the tool call should work.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "5e6f7a8b9c0d1e2f", "a_encoding": "hex", "b": "a5b4c3d2e1f00918", "b_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  xor the 32-byte hex 00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f and ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to perform a bitwise XOR on two 32-byte hexadecimal strings. Let me make sure I understand the problem correctly. The user provided two hex strings: the first is "00112233445566778899aabbcc<|projection|>ddeeff102132435465768798a9bacbdcedfe0f" and the second is "ffeeddccbbaa998877665544332211000f1e<|projection|>2d3c4b5a69788796a5b4c3d2e1f0". Wait, but wait—wait, the second one looks like it might be 32 bytes as well. Let me check the lengths.
+
+  The first string: let's count<|projection|> the characters. Each pair of hex digits represents a byte. The first string has 64 characters (since 32 bytes * 2 = 64). Let me confirm: "00112233445566778899aabbccddeeff<|projection|>102132435465768798a9bacbdcedfe0f" — yes, that's 64 characters. The second one is "ffeeddccbbaa9988776655443322<|projection|>11000f1e2d3c4b5a69788796a5b4c3d2e1f0". Let me count: 64 characters as well. So both are 32 bytes each.
+
+  The task is to XOR them.<|projection|> But the user mentioned "xor the 32-byte hex..." so I need to use the bytes_xor tool. The parameters for the tool require a, b, and optionally their encodings and output encoding. Since the inputs are in hex, the default encoding is already hex, so I can just pass the strings as<|projection|> is. The output should also be in hex unless specified otherwise, but the user didn't specify, so the default is fine.
+
+  So the JSON call would have "a" as the first hex string, "b" as the second, and the rest defaulting to hex. So the tool call should be correct.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "bytes_xor", "arguments": {"a": "00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f", "b": "ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0"}}
+  </tool_call><|projection|>

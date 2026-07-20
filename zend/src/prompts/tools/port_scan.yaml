@@ -1,0 +1,147 @@
+name: port_scan
+category: Network diagnostics
+description: 'Check whether specific TCP ports are open on a host by attempting connections. Use for: verifying a service is listening, checking whether a firewall is blocking a port, service discovery on known-candidate ports, confirming a deployment started correctly. Triggered by "is port X open on", "check if the service is running on", "scan these ports", "is SSH/HTTP/database accessible on". Returns open/closed status per port with a configurable timeout per attempt. Provide up to 100 ports per call. Use ping_icmp first to confirm the host is reachable.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: Hostname or IP address to scan.
+      minLength: 1
+      type: string
+    ports:
+      description: TCP ports to check (1-100 ports per call).
+      items:
+        format: uint16
+        minimum: 0.0
+        type: integer
+      maxItems: 100
+      minItems: 1
+      type: array
+    timeout_ms:
+      description: 'Per-port TCP connect timeout in milliseconds. Default: 500.'
+      format: uint64
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - host
+  - ports
+  title: PortScanRequest
+  type: object
+examples:
+- |-
+  check if port 22 is open on 10.0.0.5<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check if port 22 is open on 10.0.0.5. Let me see. The available tool is port_scan. The parameters needed are host, ports, and timeout_ms. The host is 10.0.0.5. The<|projection|> port is 22. The timeout has a default of 500 ms, which is okay unless specified otherwise. So I need to call port_scan with those arguments. Make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "10.0.0.5", "ports": [22], "timeout_ms": 500}}
+  </tool_call><|projection|>
+- |-
+  scan ports 80, 443, and 8080 on example.com<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to scan ports 80, 443, and 8080 on example.com. Let me check the available tools. There's a port_scan tool that checks if TCP ports are open. The parameters needed are host, ports, and timeout_ms.
+
+  The host<|projection|> is clearly example.com. The ports are 80, 443, and 8080. The tool allows up to 100 ports, so this is within the limit. The timeout defaults to 500ms if not provided. Since the user didn't specify a timeout,<|projection|> I'll omit it.
+
+  I need to structure the JSON call with the host and ports array. No other parameters are required. Let me make sure the JSON is correctly formatted with the right syntax. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "example.com", "ports": [80, 443, 8080]}}
+  </tool_call><|projection|>
+- |-
+  is the SSH port open on 192.168.1.20<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if the SSH port is open on 192.168.1.20. Let me think. SSH typically uses port 22. So I need to check if port 22 is open on that IP.
+
+  The available tool is port_scan.<|projection|> The parameters required are host, ports, and timeout_ms. The host is 192.168.1.20. The ports should be an array containing 22. The timeout has a default of 500 ms, so I can omit it unless specified. Since the user didn<|projection|>'t mention a timeout, using the default is fine.
+
+  I need to structure the JSON call correctly. The name of the tool is port_scan. The arguments should be a JSON object with "host" as the IP, "ports" as [22], and maybe "timeout_ms" if needed. Wait, the<|projection|> timeout is optional. So the JSON would be:
+
+  {
+    "name": "port_scan",
+    "arguments": {
+      "host": "192.168.1.20",
+      "ports": [22]
+    }
+  }
+
+  That's all. I don't need to include the<|projection|> timeout since it's optional and the user didn't specify. This should trigger the port scan for SSH on that host.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "192.168.1.20", "ports": [22]}}
+  </tool_call><|projection|>
+- |-
+  scan ports 22, 80, and 443 on 10.0.0.8<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to scan ports 22, 80, and 443 on the IP address 10.0.0.8. Let me check the available tools. There's a port_scan tool that takes a host and an array of ports. The parameters require the<|projection|> host as a string and ports as an array of integers. The user specified three ports, which is within the 100-port limit. I need to structure the JSON call with the host set to "10.0.0.8" and ports as [22, 80, 4<|projection|>43]. The timeout is optional, so I can omit it or use the default. Let me make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "10.0.0.8", "ports": [22, 80, 443]}}
+  </tool_call><|projection|>
+- |-
+  scan ports 21, 25, 110, and 143 on 172.16.0.9<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to scan ports 21, 25, 110, and 143 on the IP address 172.16.0.9. Let me check the available tools. There's a port_scan tool that checks if specific TCP ports are<|projection|> open. The parameters required are the host and ports. The ports need to be an array of integers, up to 100 ports per call. The user is asking for four ports, which is within the limit.
+
+  I should structure the tool call with the host as "172.16.0<|projection|>.9" and the ports as [21, 25, 110, 143]. The timeout is optional, but since the user didn't specify, I'll omit it, allowing the default value to be used. Let me make sure the JSON is correctly formatted with the right syntax<|projection|>. No other tools are needed here. Alright, ready to generate the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "172.16.0.9", "ports": [21, 25, 110, 143]}}
+  </tool_call><|projection|>
+- |-
+  is the Postgres port 5432 listening on db.internal?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if PostgreSQL is listening on port 5432 for db.internal. Let me think.
+
+  First, I need to check if the port is open. The tool available is port_scan. The parameters required are host, ports, and optional timeout. The user mentioned "db.internal<|projection|>" as the host and port 5432.
+
+  Wait, the port is 5432, which is correct for PostgreSQL. So I should call the port_scan with host "db.internal" and ports [5432]. The timeout has a default, so maybe it's okay to omit<|projection|> it. But the user might want a reasonable timeout. However, the default is 500ms, which is acceptable.
+
+  I need to make sure that the JSON structure is correct. The ports should be an array of integers. So the arguments would be {"host": "db.internal", "ports": [5<|projection|>432]}.
+
+  No other parameters are needed. The tool will return if the port is open or closed. That should answer the user's question.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "db.internal", "ports": [5432]}}
+  </tool_call><|projection|>
+- |-
+  check whether 3389 is reachable on 192.168.1.100<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check if port 3389 is open on 192.168.1.100. Let me see. The tool available is port_scan. The parameters needed are host, ports, and timeout_ms. The host is 192<|projection|>.168.1.100. The port is 3389. The timeout defaults to 500 ms if not provided. Since the user didn't specify a timeout, I'll use the default. So the JSON should have "host": "192.168<|projection|>.1.100", "ports": [3389], and maybe omit timeout_ms. Wait, the parameters require "host" and "ports" as required. The timeout is optional. So the call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "192.168.1.100", "ports": [3389]}}
+  </tool_call><|projection|>
+- |-
+  probe ports 25, 465, and 587 on mail.example.org<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to check if ports 25, 465, and 587 are open on mail.example.org. Let me see. The available tool is port_scan, which checks TCP ports. The parameters needed are host, ports, and timeout_ms.
+
+  First, the host<|projection|> is clearly mail.example.org. The ports are 25, 465, and 587. I need to make sure they're in an array. The timeout defaults to 500ms if not provided. Since the user didn't specify, I'll omit it.
+
+  Wait, the<|projection|> tool requires the ports as a JSON array of integers. So the arguments should be "host": "mail.example.org", "ports": [25, 465, 587].
+
+  I should structure the tool call correctly. The name is port_scan, and the arguments are the JSON object.<|projection|> Let me double-check the parameters. Yes, that's right. Alright, time to put it all together.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "port_scan", "arguments": {"host": "mail.example.org", "ports": [25, 465, 587]}}
+  </tool_call><|projection|>

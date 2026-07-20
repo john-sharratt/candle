@@ -42,11 +42,7 @@ use zend_tools::{registry, ToolContext};
 /// [`zend_tools::registry`]); "None" mode projects no tools, "Comprehensive"
 /// projects all of them.
 pub fn safe_tool_names() -> HashSet<String> {
-    registry::all_tools()
-        .iter()
-        .filter(|t| !t.high_risk)
-        .map(|t| t.name.to_string())
-        .collect()
+    crate::tool_def::safe_names()
 }
 
 /// One Hermes tool-call block parsed from a model response.
@@ -95,29 +91,20 @@ pub struct ToolResult {
 /// `TopK { k: 3 }`) is what filters the tool list.
 pub fn install_tool_catalog(
     builder: &mut ProjectionBuilder,
-    dialogue_layer: LayerId,
 ) -> anyhow::Result<Vec<(String, SectionId, String)>> {
-    let collection_id = builder
-        .id_for_collection_in(dialogue_layer, "tools")
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "projection schema: dialogue layer must declare a 'tools' collection — \
-                 add `kind: collection, name: tools` to its system_prompt items",
-            )
-        })?;
+    // A system prompt without a `tools` collection is a deliberately tool-free
+    // projection (e.g. a conversational mind): install nothing rather than error.
+    let Some(collection_id) = builder.id_for_system_collection("tools") else {
+        tracing::info!("system prompt declares no 'tools' collection — tools disabled");
+        return Ok(Vec::new());
+    };
     let mut out: Vec<(String, SectionId, String)> = Vec::new();
-    for tool in registry::all_tools() {
-        let json_line = render_tool_json_line(tool);
+    for def in crate::tool_def::all() {
+        let json_line = def.json_line();
         let id = builder
-            .add_section_to_collection(
-                dialogue_layer,
-                collection_id,
-                tool.name.to_string(),
-                &json_line,
-                100.0,
-            )
-            .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
-        out.push((tool.name.to_string(), id, json_line));
+            .add_section_to_collection(collection_id, def.name.clone(), &json_line, 100.0)
+            .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", def.name, e))?;
+        out.push((def.name.clone(), id, json_line));
     }
     // This function only lays down the per-tool sections. The tool-catalog
     // *overview* is sealed separately into the `ToolSummary` /
@@ -126,29 +113,6 @@ pub fn install_tool_catalog(
     // `set_collection_summary_section`), so projection emits the full name listing
     // ahead of the provenance-selected subset.
     Ok(out)
-}
-
-/// Render one tool's metadata as the JSON line that goes inside
-/// `<tools>...</tools>`.
-///
-/// Flat shape — `{"name":"...","description":"...","parameters":{...}}` —
-/// deliberately mirrors the tool-*call* shape the model must emit
-/// (`{"name":...,"arguments":...}`).  The canonical Qwen3
-/// `{"type":"function","function":{...}}` wrapper is dropped on purpose:
-/// with `"function"` as a prominent definition key, Qwen3-30B-A3B echoed it
-/// into calls (`{"function":"calculate",...}`) instead of using `"name"`.
-/// Flattening also saves ~10 tokens per tool across the 90+ tool catalog.
-fn render_tool_json_line(tool: &registry::RegisteredTool) -> String {
-    let schema = (tool.schema)();
-    let blob = serde_json::json!({
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": schema,
-    });
-    // No trailing newline: the separator between tools is real structural glue
-    // (`member_glue` on the `tools` collection), injected between selected members
-    // at projection so it is independent of which tools provenance surfaces.
-    serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// The selector id the calibration projection's `tools` collection reads
@@ -204,7 +168,6 @@ pub fn build_calibration_projection(
 
     let collection = builder
         .add_collection(
-            layer,
             "tools",
             SelectionRule::Named {
                 selector: CALIB_TOOL_SELECTOR.to_string(),
@@ -212,16 +175,10 @@ pub fn build_calibration_projection(
             0.0,
         )
         .map_err(|e| anyhow::anyhow!("calibration add_collection: {e}"))?;
-    for tool in registry::all_tools() {
+    for def in crate::tool_def::all() {
         builder
-            .add_section_to_collection(
-                layer,
-                collection,
-                tool.name.to_string(),
-                render_tool_json_line(tool),
-                100.0,
-            )
-            .map_err(|e| anyhow::anyhow!("calibration add tool {}: {e}", tool.name))?;
+            .add_section_to_collection(collection, def.name.clone(), def.json_line(), 100.0)
+            .map_err(|e| anyhow::anyhow!("calibration add tool {}: {e}", def.name))?;
     }
 
     // Outro: close the `<tools>` block, give the call instruction, and emit the
@@ -232,7 +189,7 @@ pub fn build_calibration_projection(
         sys_end = dialect.system_end,
     );
     builder
-        .add_section(layer, "tools_outro", outro, 50.0)
+        .add_section("tools_outro", outro, 50.0)
         .map_err(|e| anyhow::anyhow!("calibration add outro: {e}"))?;
 
     Ok((builder, layer, group))
@@ -851,16 +808,12 @@ I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_cal
     }
 
     #[test]
-    fn render_tool_json_line_is_valid_hermes_format() {
-        // The catalog deliberately emits a flat
-        // `{"name", "description", "parameters"}` shape — see
-        // `render_tool_json_line`'s doc comment for the rationale
-        // (Qwen3-A3B echoes the canonical wrapper's `"function"` key
-        // back into tool calls, and the flat shape saves ~10 tokens
-        // per tool across the 90+ tool catalog).
-        let tool = registry::find("datetime").expect("datetime tool registered");
-        let line = render_tool_json_line(tool);
-        let parsed: Value = serde_json::from_str(line.trim_end()).expect("must parse");
+    fn tool_def_json_line_is_valid_hermes_format() {
+        // The catalog deliberately emits a flat `{"name","description",
+        // "parameters"}` shape (Qwen3-A3B echoes the canonical `"function"`
+        // wrapper key back into calls; flattening also saves ~10 tokens/tool).
+        let def = crate::tool_def::find("datetime").expect("datetime tool defined");
+        let parsed: Value = serde_json::from_str(def.json_line().trim_end()).expect("must parse");
         assert_eq!(parsed["name"], "datetime");
         assert!(parsed["description"].is_string());
         assert!(parsed["parameters"].is_object());

@@ -1,0 +1,113 @@
+name: tcp_session_open
+category: TCP sessions
+description: 'Open a raw TCP connection. Use for: custom protocols, debugging, non-HTTP services. Use tls_session_open for TLS. Returns session_id.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: Target hostname or IP address to connect to.
+      minLength: 1
+      type: string
+    port:
+      description: Target TCP port (0–65535).
+      format: uint16
+      minimum: 0.0
+      type: integer
+    timeout_ms:
+      description: Connection timeout in milliseconds. Default 5000.
+      format: uint64
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+  required:
+  - host
+  - port
+  title: OpenRequest
+  type: object
+examples:
+- |-
+  open a raw TCP connection to 10.0.0.8 on port 6379<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a raw TCP connection to 10.0.0.8 on port 6379. Let me check the available tools. There's the tcp_session_open function. The parameters required are host, port, and optional timeout_ms. The host is 1<|projection|>0.0.0.8, port is 6379. The timeout defaults to 5000 if not provided. So I need to call tcp_session_open with those values. No TLS here, so no need for the tls_session_open tool. Just make sure the arguments are correctly formatted as<|projection|> JSON.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "10.0.0.8", "port": 6379}}
+  </tool_call><|projection|>
+- |-
+  connect over TCP to example.com:8080<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to connect over TCP to example.com port 8080. Let me check the available tools. There's a tool called tcp_session_open. The parameters needed are host, port, and optional timeout. The host is example.com, port is 8080. The<|projection|> timeout has a default of 5000, so maybe it's not required. I need to structure the JSON with those values. Make sure the JSON is correctly formatted with the right keys. Let me double-check the parameters. Yep, host and port are required. So the call should be to tcp_session_open<|projection|> with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "example.com", "port": 8080}}
+  </tool_call><|projection|>
+- |-
+  start a TCP session to 10.0.0.20 on port 5432<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to start a TCP session to 10.0.0.20 on port 5432. Let me check the available tools. There's the tcp_session_open function. The parameters needed are host, port, and optional timeout. The host is 10<|projection|>.0.0.20, port is 5432. The timeout isn't specified, so I'll use the default of 5000 ms. I need to make sure the JSON is correctly formatted with the required fields. Alright, the tool call should include the name "tcp_session_open<|projection|>" and the arguments as a JSON object with host and port.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "10.0.0.20", "port": 5432}}
+  </tool_call><|projection|>
+- |-
+  open a TCP socket to 192.168.1.50 port 9000<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a TCP socket to 192.168.1.50 on port 9000. Let me check the available tools. There's the tcp_session_open function. The parameters required are host, port, and optional timeout. The host is<|projection|> 192.168.1.50, port 9000. The timeout is optional, default is 5000 ms. Since the user didn't specify, I'll use the default. So I need to call tcp_session_open with those values. No TLS here,<|projection|> just raw TCP. The response should be the session ID. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "192.168.1.50", "port": 9000}}
+  </tool_call><|projection|>
+- |-
+  can you open a TCP connection to db.internal:27017?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking me to open a TCP connection to db.internal on port 27017. Let me check the tools available. There's a tool called tcp_session_open which is meant for opening raw TCP connections. The parameters required are host, port, and an optional timeout.
+
+  The<|projection|> user provided the hostname as db.internal and the port as 27017. The tool requires the host and port, so I need to plug those in. The timeout is optional, and since the user didn't specify one, I can use the default of 5000 milliseconds.
+
+  I should structure<|projection|> the tool call with the name "tcp_session_open" and include the host and port in the arguments. I don't need to include the timeout since it's optional and the default is acceptable. Let me double-check the parameters: host is a string, port is an integer between 0 and 6553<|projection|>5. 27017 is within that range. Alright, everything looks good. Time to format the JSON correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "db.internal", "port": 27017}}
+  </tool_call><|projection|>
+- |-
+  establish a raw TCP session to 172.16.9.4 on port 11211<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to establish a raw TCP session to 172.16.9.4 on port 11211. Let me check the available tools. There's the tcp_session_open function. It requires host and port parameters. The host is 172.<|projection|>16.9.4, port 11211. The timeout is optional, defaulting to 5000 ms. Since the user didn't specify a timeout, I'll omit it. So the tool call should have name "tcp_session_open" with those arguments. I need to format<|projection|> it as JSON inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "172.16.9.4", "port": 11211}}
+  </tool_call><|projection|>
+- |-
+  dial a TCP socket out to smtp.mailgun.org port 587<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to dial a TCP socket to smtp.mailgun.org on port 587. Let me check the available tools. There's the tcp_session_open tool. The parameters needed are host, port, and optional timeout. The host is smtp.mailgun.org, port 587<|projection|>. The timeout defaults to 5000 ms if not provided. So I need to call tcp_session_open with those values. Let me structure the JSON object as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "smtp.mailgun.org", "port": 587}}
+  </tool_call><|projection|>
+- |-
+  open a TCP connection to 10.4.4.4 port 4444<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a TCP connection to 10.4.4.4 on port 4444. Let me check the available tools. There's the tcp_session_open function. The parameters needed are host, port, and optional timeout. The host is 10.<|projection|>4.4.4, port 4444. The timeout is optional, default is 5000 ms. Since the user didn't specify, I'll use the default. So the tool call should be tcp_session_open with those arguments. I need to format it as JSON inside the tool_call<|projection|> tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tcp_session_open", "arguments": {"host": "10.4.4.4", "port": 4444}}
+  </tool_call><|projection|>

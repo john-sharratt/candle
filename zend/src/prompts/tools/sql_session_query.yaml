@@ -1,0 +1,159 @@
+name: sql_session_query
+category: SQL sessions
+description: Execute a SQL statement in an open session. Returns rows and columns for SELECT; rows_affected and last_insert_rowid for INSERT/UPDATE/DELETE. Supports positional parameters via the params array (? placeholders).
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    params:
+      description: Values bound to positional `?` placeholders in `query`, in order. JSON null/bool/number/string map to the corresponding SQLite type. Defaults to an empty array (no parameters).
+      items: true
+      type:
+      - array
+      - 'null'
+    query:
+      description: A single SQL statement to execute (SQLite dialect). SELECT/WITH return rows and columns; INSERT/UPDATE/DELETE return rows_affected and last_insert_rowid.
+      minLength: 1
+      type: string
+    session_id:
+      description: The session id returned by the sql_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - query
+  - session_id
+  title: QueryRequest
+  type: object
+examples:
+- |-
+  run `SELECT * FROM users LIMIT 10` on SQL session sql-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the SQL query "SELECT * FROM users LIMIT 10" on the SQL session with ID 'sql-1'. Let me check the tools available.
+
+  There's a tool called sql_session_query. Its parameters are query, session_id, and params. The query is the<|projection|> SQL statement, session_id is the session identifier. The user provided both: the query is "SELECT * FROM users LIMIT 10" and the session ID is 'sql-1'.
+
+  I need to structure the tool call correctly. The params array is optional and defaults to an empty array if not provided. Since<|projection|> the user didn't mention any parameters, I'll omit the params field.
+
+  So the JSON object should have "name" as "sql_session_query" and "arguments" with "query" set to the SQL statement and "session_id" as 'sql-1'. Let me double-check the required fields: query and<|projection|> session_id are both required. Looks good. No other parameters needed here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "SELECT * FROM users LIMIT 10", "session_id": "sql-1"}}
+  </tool_call><|projection|>
+- |-
+  run `SELECT * FROM orders WHERE date = date('now')` on SQL session sql-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run a SQL query on an existing session. Let me check the tools available. There's the sql_session_query tool. The parameters needed are query, session_id, and params. The user provided the query "SELECT * FROM orders WHERE date = date('now')", but they<|projection|> mentioned the session id is sql-1.
+
+  Wait, the session_id is required. The user said "on SQL session sql-1", so the session_id should be "sql-1". The query is straightforward. I need to structure the JSON call with the query and session_id. The params are optional and not<|projection|> needed here since the query doesn't have placeholders. So the tool call should include the query and the session_id. Let me make sure I'm not missing any required fields. Yes, the required fields are query and session_id. Alright, that's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "SELECT * FROM orders WHERE date = date('now')", "session_id": "sql-1"}}
+  </tool_call><|projection|>
+- |-
+  execute `UPDATE settings SET value = 'on' WHERE key = 'feature'` on SQL session sql-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to execute an UPDATE SQL statement on a specific SQL session. Let me check the tools available.
+
+  The tool provided is sql_session_query, which requires the session_id, the query, and optional parameters. The user's command is an UPDATE statement: "UPDATE settings SET value = 'on<|projection|>' WHERE key = 'feature'".
+
+  I need to structure the tool call with the correct parameters. The session ID given is "sql-2". The query is the UPDATE statement. There are no positional parameters here, so params can be an empty array.
+
+  Wait, the parameters are for placeholders in the query<|projection|>. Since the query uses string literals directly (like 'on' and 'feature'), there's no need for parameter substitution here. So the params array can be empty.
+
+  So the tool call should have name sql_session_query, arguments with session_id "sql-2", query as the UPDATE statement, and params as an<|projection|> empty array. That should execute the update correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"session_id": "sql-2", "query": "UPDATE settings SET value = 'on' WHERE key = 'feature'", "params": []}}
+  </tool_call><|projection|>
+- |-
+  run `SELECT COUNT(*) FROM events` on SQL session sql-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run the SQL query "SELECT COUNT(*) FROM events" using the SQL session with ID 'sql-1'. Let me check the available tools.
+
+  There's a tool called sql_session_query. Its parameters are query, session_id, and params. The query is the SQL statement they<|projection|> want to execute. The session_id is given as 'sql-1'. The params are optional, but in this case, the query doesn't have any placeholders, so I can omit params.
+
+  So I need to structure the tool call with the correct name, arguments, and ensure the JSON is properly formatted. Let me<|projection|> make sure the keys are correct: "query" and "session_id". No other parameters needed here.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "SELECT COUNT(*) FROM events", "session_id": "sql-1"}}
+  </tool_call><|projection|>
+- |-
+  execute `INSERT INTO logs (level, msg) VALUES ('warn', 'disk low')` on SQL session sql-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to execute an INSERT SQL statement into the logs table with the values 'warn' and 'disk low'. They mentioned using the SQL session sql-3.
+
+  First, I need to check the available tools. There's a tool called sql_session_query which takes parameters like query, session<|projection|>_id, and params. The query is the SQL statement, and the session_id is given as sql-3.
+
+  The INSERT statement they provided is "INSERT INTO logs (level, msg) VALUES ('warn', 'disk low')". I need to structure this as the query parameter. Since there are no placeholders (?) in<|projection|> the query, the params array can be empty.
+
+  Wait, the user didn't use any parameters, so the params array should be empty. The session ID is sql-3 as specified. So the tool call should have the query as the INSERT statement, session_id as sql-3, and params as an empty<|projection|> array.
+
+  I need to make sure the JSON is correctly formatted. The required fields are query and session_id. The params are optional and default to an empty array. So the tool_call should include "query": "INSERT INTO logs (level, msg) VALUES ('warn', 'disk low')", "session_id":<|projection|> "sql-3", and "params": [].
+
+  I think that's all. Let me double-check the parameters. Yes, no placeholders mean no params. The session ID is correct. The query is properly enclosed in quotes. Alright, ready to output the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "INSERT INTO logs (level, msg) VALUES ('warn', 'disk low')", "session_id": "sql-3", "params": []}}
+  </tool_call><|projection|>
+- |-
+  run `SELECT name FROM sqlite_master WHERE type = 'table'` on SQL session sql-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to run a specific SQL query using the provided tool. Let me check the tools available.
+
+  The tool given is sql_session_query. Its parameters are query, session_id, and params. The user's command is to execute "SELECT name FROM sqlite_master WHERE type = 'table'"<|projection|> on the SQL session named sql-1.
+
+  So, I need to structure the tool call correctly. The session_id should be "sql-1". The query is the SQL statement they provided. There are no parameters here, so params can be an empty array or omitted. But according to the tool's parameters, params<|projection|> is an array, so I'll include it as an empty array.
+
+  Putting it all together, the JSON object should have the name as sql_session_query, with the arguments containing the query and session_id. Let me double-check the required fields: query and session_id are required. Params is optional. So the call should<|projection|> be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "SELECT name FROM sqlite_master WHERE type = 'table'", "session_id": "sql-1"}}
+  </tool_call><|projection|>
+- |-
+  delete stale rows with `DELETE FROM sessions WHERE expires_at < date('now')` on SQL session sql-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delete stale rows from the sessions table where the expires_at is older than the current time. The SQL command they provided is DELETE FROM sessions WHERE expires_at < date('now'). They mentioned using the SQL session sql-2.
+
+  First, I need to make sure that the SQL statement<|projection|> is correctly formatted. The date('now') function in SQLite returns the current date and time, so this should work. The table name is sessions, and the column is expires_at. The condition checks if expires_at is earlier than the current time.
+
+  Next, I need to use the tool sql_session_query. The parameters<|projection|> required are query and session_id. The query is the DELETE statement provided. The session_id is given as sql-2.
+
+  Wait, the user said "on SQL session sql-2", which I think means the session ID is sql-2. So the session_id parameter should be "sql-2".
+
+  <|projection|>I should check if there are any parameters needed for the query. In this case, the DELETE statement doesn't have any placeholders, so the params array can be empty. But according to the tool's description, the params are for positional parameters using ?. Since there are no ? in the query, it's safe to omit<|projection|> the params or set it as an empty array.
+
+  Putting it all together, the tool call should have the name sql_session_query, with arguments {"query": "DELETE FROM sessions WHERE expires_at < date('now')", "session_id": "sql-2"}.
+
+  I need to make sure that the JSON is<|projection|> correctly formatted, with proper quotes and structure. Also, ensure that the session_id matches exactly what was provided, which is sql-2. No other parameters are needed here since there are no placeholders in the SQL statement.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"query": "DELETE FROM sessions WHERE expires_at < date('now')", "session_id": "sql-2"}}
+  </tool_call><|projection|>
+- |-
+  run `SELECT user_id, SUM(amount) FROM payments GROUP BY user_id` on SQL session sql-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to run a specific SQL query on an existing SQL session. Let me check the tools available.
+
+  The tool provided is sql_session_query. It requires the session ID, the query, and optional parameters. The user's command is a SELECT statement that groups by user_id and sums the amount<|projection|>. They mentioned the session ID is sql-4.
+
+  So I need to structure the tool call with the session_id as "sql-4", the query as the given SQL string, and no parameters since there are no placeholders. The response should be in the specified JSON format inside the tool_call tags. Let me make<|projection|> sure all required fields are included and the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sql_session_query", "arguments": {"session_id": "sql-4", "query": "SELECT user_id, SUM(amount) FROM payments GROUP BY user_id"}}
+  </tool_call><|projection|>

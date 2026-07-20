@@ -1,0 +1,177 @@
+name: hash_state_update
+category: Hash streaming
+description: Absorb another chunk of data into an in-progress streaming hash computation. Call repeatedly to feed a large input piece by piece before hash_state_finalize emits the digest.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+  properties:
+    data:
+      description: The chunk of data to absorb, interpreted according to `data_encoding`. Required.
+      minLength: 1
+      type: string
+    data_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'How `data` is encoded. One of: text, hex, base64. Defaults to text.'
+    id:
+      description: State id returned by hash_state_init. Required.
+      minLength: 1
+      type: string
+  required:
+  - data
+  - id
+  title: UpdateRequest
+  type: object
+examples:
+- |-
+  feed the hex 48656c6c6f into hash state hs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me see. The user wants to feed the hex value "48656c6c6f" into a hash state called "hs-1".
+
+  First, I need to recall how the tool works. The tool's function is hash_state_update, which takes data, data<|projection|>_encoding, and id. The data here is the hex string, and the encoding should be set to "hex" because the data is in hexadecimal format. The id is "hs-1" as specified.
+
+  Wait, the parameters for the tool call require "data", "data_encoding", and "id". The data<|projection|> is "48656c6c6f", and the encoding is "hex". The id is "hs-1". So the JSON object should include these values. I need to make sure that the keys are correct and the values are properly formatted. Also, check if any fields are required. The<|projection|> required fields are "data" and "id", which are provided here. The data_encoding is optional but necessary here because the data is in hex.
+
+  So the tool call should be hash_state_update with arguments data: "48656c6c6f", data_encoding: "hex", id:<|projection|> "hs-1". That should correctly feed the hex value into the hash state.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "48656c6c6f", "data_encoding": "hex", "id": "hs-1"}}
+  </tool_call><|projection|>
+- |-
+  update hash state hs-1 with the string 'more data'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to update a hash state with the string 'more data'. They mentioned the state ID is hs-1.
+
+  First, I need to check the available tools. There's the hash_state_update function. Its parameters are data, data_encoding,<|projection|> and id. The data is required, as well as the id from the initial state.
+
+  The user provided the state ID hs-1, so that's the id parameter. The data is 'more data'. The encoding isn't specified, so I should default to 'text' as per the tool's documentation.
+
+  I<|projection|> should structure the JSON call with these values. Make sure the keys match the parameters: data, data_encoding, and id. Since data_encoding isn't mandatory, but the default is text, maybe it's optional. But the tool might require it. Wait, looking at the tool's parameters, data_encoding has a default<|projection|> of 'text' in the schema? Let me check.
+
+  In the tool definition, the data_encoding has an enum of text, hex, base64. The description says defaults to text. So if not provided, it uses text. So in the arguments, I can omit data_encoding, or include it as '<|projection|>text'.
+
+  But the tool's required fields are data and id. So data_encoding is optional. So the call should have "data": "more data", "id": "hs-1". Maybe include data_encoding as "text" to be explicit, but it's not necessary.
+
+  So the JSON would be:
+
+  {
+  <|projection|>  "name": "hash_state_update",
+    "arguments": {
+      "data": "more data",
+      "id": "hs-1"
+    }
+  }
+
+  That should do it. Let me double-check the parameters. Yes, data and id are required. The encoding is optional and defaults to text. Perfect<|projection|>.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "more data", "id": "hs-1"}}
+  </tool_call><|projection|>
+- |-
+  absorb the bytes deadbeef into hash state hs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to absorb the bytes deadbeef into a hash state called hs-2. First, I need to check the available tools. There's a function called hash_state_update. The parameters required are data, data_encoding, and id.
+
+  The data here is deadbe<|projection|>ef. Since it's in hex format, I should set data_encoding to "hex". The id is given as hs-2. I need to make sure all required parameters are included. Data is required, so that's covered. Alright, the JSON object should have these three keys. Let me structure that properly.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "deadbeef", "data_encoding": "hex", "id": "hs-2"}}
+  </tool_call><|projection|>
+- |-
+  add the chunk 'final part' to hash state hs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me see. The user wants to add the chunk 'final part' to the hash state with ID 'hs-1'.
+
+  First, I need to check the available tools. There's the hash_state_update function. Its parameters are data, data_encoding, and id. The data is '<|projection|>final part', and the id is 'hs-1'. The data_encoding is optional, defaulting to text. Since the user didn't specify an encoding, I'll use 'text'.
+
+  So the tool call should be hash_state_update with those arguments. Let me make sure I included all required parameters. Data and id<|projection|> are required, and they're both there. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "final part", "id": "hs-1", "data_encoding": "text"}}
+  </tool_call><|projection|>
+- |-
+  push the hex cafebabe0011 into hash state hs-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to push the hex value "cafebabe0011" into a hash state called "hs-4".
+
+  First, I need to check the available tools. There's the hash_state_update function. Its parameters are data, data_encoding, and id<|projection|>. The data is the chunk to absorb, data_encoding specifies if it's text, hex, or base64, and id is the state ID.
+
+  The user provided the hex string "cafebabe0011", so the data_encoding should be "hex". The id is "hs-4" as<|projection|> mentioned.
+
+  I need to make sure that the data is correctly formatted. Since it's a hex value, the encoding must be set to "hex". The id is straightforward.
+
+  So the tool call would be hash_state_update with arguments: data="cafebabe0011", data_encoding="hex",<|projection|> id="hs-4". That should update the hash state correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "cafebabe0011", "data_encoding": "hex", "id": "hs-4"}}
+  </tool_call><|projection|>
+- |-
+  append the string 'row 2048 of the export' to hash state hs-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to append the string 'row 2048 of the export' to a hash state with the ID 'hs-3'.
+
+  First, I need to check the available tools. There's the hash_state_update function. Its parameters<|projection|> are data, data_encoding, and id. The data is the chunk to add, which in this case is 'row 2048 of the export'. The id is given as 'hs-3'.
+
+  The data_encoding defaults to text, which should be correct here since the data is a plain string.<|projection|> So I don't need to specify that unless there's a reason to use a different encoding. Since the user didn't mention any specific encoding, sticking with the default makes sense.
+
+  So the arguments for hash_state_update would be data: 'row 2048 of the export', id: 'hs-3<|projection|>'. No need to include data_encoding. I should structure the JSON accordingly. Make sure the keys are correct and the values are properly quoted. Let me double-check the parameters: yes, data and id are required. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "row 2048 of the export", "id": "hs-3"}}
+  </tool_call><|projection|>
+- |-
+  feed the next block 9988776655443322 into hash state hs-5<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to feed the next block of data into the hash state. The data given is 9988776655443322. The hash state ID is hs-5.
+
+  First, I need to<|projection|> check the available tools. There's the hash_state_update function. Its parameters are data, data_encoding, and id. The data is required, and the id is the state ID.
+
+  The data here is 9988776655443322. Since it's a hexadecimal<|projection|> string, I should set the data_encoding to "hex". The id is hs-5.
+
+  Wait, the data is in hex, so I need to make sure that the encoding is specified as "hex" in the arguments. The function requires the data to be passed with the correct encoding. So the arguments would<|projection|> be data: "9988776655443322", data_encoding: "hex", and id: "hs-5".
+
+  I need to structure this into a JSON object inside the tool_call tags. The name of the tool is hash_state_update. The arguments are the<|projection|> parameters we discussed. Let me double-check the required fields: data and id are required. Data_encoding is optional but necessary here.
+
+  Yes, that's all. So the tool call should be correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "9988776655443322", "data_encoding": "hex", "id": "hs-5"}}
+  </tool_call><|projection|>
+- |-
+  keep hashing — add 'appended log line' to hash state hs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to add the string 'appended log line' to an existing hash state with ID 'hs-2'.
+
+  First, I need to check the available tools. There's a function called hash_state_update. Its parameters are data, data_encoding, and id.<|projection|> The data is the chunk to add, encoding can be text, hex, or base64. The id is the state ID from before.
+
+  The user provided the log line as a string, so data is 'appended log line'. Since it's a text string, data_encoding should be 'text'. The state<|projection|> ID is given as 'hs-2'.
+
+  I need to make sure all required parameters are present. The required ones are data and id. Both are here. So the tool call should be hash_state_update with those arguments. No other parameters are needed here. That's all.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_update", "arguments": {"data": "appended log line", "data_encoding": "text", "id": "hs-2"}}
+  </tool_call><|projection|>

@@ -615,148 +615,143 @@ fn build_selection(
     // summary the prompt didn't — no need to re-derive that gate here.
     let mut pending_summaries: std::collections::HashMap<CollectionId, (String, u32)> =
         std::collections::HashMap::new();
-    for layer in &schema.layers {
-        for item in &layer.system_prompt.items {
-            if let SystemPromptItem::Collection(c) = item {
-                if let Some(sum) = c.summary_section {
-                    if selected.contains(&sum) {
-                        pending_summaries.insert(
-                            c.id,
-                            (
-                                format!("{} summary", c.name),
-                                resolver.section_token_count(sum) as u32,
-                            ),
-                        );
-                    }
+    for item in &schema.system_prompt.items {
+        if let SystemPromptItem::Collection(c) = item {
+            if let Some(sum) = c.summary_section {
+                if selected.contains(&sum) {
+                    pending_summaries.insert(
+                        c.id,
+                        (
+                            format!("{} summary", c.name),
+                            resolver.section_token_count(sum) as u32,
+                        ),
+                    );
                 }
             }
         }
     }
-    for layer in &schema.layers {
-        for item in &layer.system_prompt.items {
-            match item {
-                SystemPromptItem::Section(s) if s.is_template => {
-                    if let Some(&tokens) = emitted_glue.get(s.name.as_str()) {
-                        // Emit the collection's summary just before its opening
-                        // marker (e.g. `<tools>`), so it sits OUTSIDE the block —
-                        // mirroring the projection.
-                        if let Some(cid) = s.depends_on {
-                            if let Some((name, sum_tokens)) = pending_summaries.remove(&cid) {
-                                system.push(SystemItem::Section {
-                                    name,
-                                    tokens: sum_tokens,
-                                });
-                            }
+    for item in &schema.system_prompt.items {
+        match item {
+            SystemPromptItem::Section(s) if s.is_template => {
+                if let Some(&tokens) = emitted_glue.get(s.name.as_str()) {
+                    // Emit the collection's summary just before its opening
+                    // marker (e.g. `<tools>`), so it sits OUTSIDE the block —
+                    // mirroring the projection.
+                    if let Some(cid) = s.depends_on {
+                        if let Some((name, sum_tokens)) = pending_summaries.remove(&cid) {
+                            system.push(SystemItem::Section {
+                                name,
+                                tokens: sum_tokens,
+                            });
                         }
-                        system.push(SystemItem::Glue {
-                            name: s.name.clone(),
-                            content: s.content.clone(),
-                            tokens,
-                        });
                     }
-                }
-                SystemPromptItem::Section(s) if selected.contains(&s.id) => {
-                    system.push(SystemItem::Section {
+                    system.push(SystemItem::Glue {
                         name: s.name.clone(),
-                        tokens: resolver.section_token_count(s.id) as u32,
+                        content: s.content.clone(),
+                        tokens,
                     });
                 }
-                SystemPromptItem::Section(_) => {}
-                SystemPromptItem::Collection(c) => {
-                    // The runtime summary section (a reserved section, not a schema
-                    // item) shows just before the collection's opening marker, so
-                    // it was already drained above. This is the fallback for a
-                    // collection with no opening marker — show it before members.
-                    // Named `"<collection> summary"`; the daemon serves its text
-                    // under the same key.
-                    if let Some((name, tokens)) = pending_summaries.remove(&c.id) {
-                        system.push(SystemItem::Section { name, tokens });
-                    }
-                    if c.sections.iter().any(|s| selected.contains(&s.id)) {
-                        system.push(SystemItem::Collection {
-                            name: c.name.clone(),
-                            sections: c
-                                .sections
-                                .iter()
-                                .map(|s| SelectedSection {
-                                    name: s.name.clone(),
-                                    tokens: resolver.section_token_count(s.id) as u32,
-                                    selected: selected.contains(&s.id),
-                                    score: scores.section(s.id),
-                                })
-                                .collect(),
-                        });
-                    }
+            }
+            SystemPromptItem::Section(s) if selected.contains(&s.id) => {
+                system.push(SystemItem::Section {
+                    name: s.name.clone(),
+                    tokens: resolver.section_token_count(s.id) as u32,
+                });
+            }
+            SystemPromptItem::Section(_) => {}
+            SystemPromptItem::Collection(c) => {
+                // The runtime summary section (a reserved section, not a schema
+                // item) shows just before the collection's opening marker, so
+                // it was already drained above. This is the fallback for a
+                // collection with no opening marker — show it before members.
+                // Named `"<collection> summary"`; the daemon serves its text
+                // under the same key.
+                if let Some((name, tokens)) = pending_summaries.remove(&c.id) {
+                    system.push(SystemItem::Section { name, tokens });
                 }
-                SystemPromptItem::SectionTree(t) => {
-                    // A node emitted exactly one option's branch variant; show
-                    // the node (and chosen option, for selectors) with its tokens.
-                    for n in &t.nodes {
-                        // A live-prefilled structural marker (`<tools>` etc.): if it
-                        // fired this projection (its Generated run is in
-                        // `emitted_glue`), surface it as a real glue row.
-                        if n.glue.is_some() {
-                            if let Some(&tokens) = emitted_glue.get(n.name.as_str()) {
-                                system.push(SystemItem::Glue {
-                                    name: n.name.clone(),
-                                    content: n
-                                        .options
-                                        .first()
-                                        .map_or(String::new(), |o| o.content.clone()),
-                                    tokens,
-                                });
-                            }
-                            continue;
+                if c.sections.iter().any(|s| selected.contains(&s.id)) {
+                    system.push(SystemItem::Collection {
+                        name: c.name.clone(),
+                        sections: c
+                            .sections
+                            .iter()
+                            .map(|s| SelectedSection {
+                                name: s.name.clone(),
+                                tokens: resolver.section_token_count(s.id) as u32,
+                                selected: selected.contains(&s.id),
+                                score: scores.section(s.id),
+                            })
+                            .collect(),
+                    });
+                }
+            }
+            SystemPromptItem::SectionTree(t) => {
+                // A node emitted exactly one option's branch variant; show
+                // the node (and chosen option, for selectors) with its tokens.
+                for n in &t.nodes {
+                    // A live-prefilled structural marker (`<tools>` etc.): if it
+                    // fired this projection (its Generated run is in
+                    // `emitted_glue`), surface it as a real glue row.
+                    if n.glue.is_some() {
+                        if let Some(&tokens) = emitted_glue.get(n.name.as_str()) {
+                            system.push(SystemItem::Glue {
+                                name: n.name.clone(),
+                                content: n
+                                    .options
+                                    .first()
+                                    .map_or(String::new(), |o| o.content.clone()),
+                                tokens,
+                            });
                         }
-                        for o in &n.options {
-                            if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
-                                let name = if n.options.len() > 1 {
-                                    format!("{}:{}", n.name, o.id)
-                                } else {
-                                    n.name.clone()
-                                };
-                                system.push(SystemItem::Section {
-                                    name,
-                                    tokens: resolver.section_token_count(v.id) as u32,
-                                });
-                            }
+                        continue;
+                    }
+                    for o in &n.options {
+                        if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
+                            let name = if n.options.len() > 1 {
+                                format!("{}:{}", n.name, o.id)
+                            } else {
+                                n.name.clone()
+                            };
+                            system.push(SystemItem::Section {
+                                name,
+                                tokens: resolver.section_token_count(v.id) as u32,
+                            });
                         }
-                        // An embedded collection node: show each selected member
-                        // (its active-branch variant landed in `selected`),
-                        // interleaving the collection's `member_glue` as a real
-                        // structural glue row BETWEEN consecutive members —
-                        // mirroring the `Generated` glue token the projection emits
-                        // (and NOT baked into any member's seal), so the panel and
-                        // its copy-all reproduce the exact materialized bytes.
-                        if let Some(tc) = &n.collection {
-                            let glue = &tc.collection.member_glue;
-                            // Mirror the projection EXACTLY: it interleaves member
-                            // glue only when the tokens exist (`member_glue_tokens`),
-                            // so gate the panel row on the same condition (not just
-                            // the non-empty string) or the panel would show a 0-token
-                            // glue row the materialized prompt never contained.
-                            let glue_tokens = tc
-                                .collection
-                                .member_glue_tokens
-                                .as_ref()
-                                .map(|t| t.len() as u32);
-                            let mut emitted_member = false;
-                            for (s, member) in tc.collection.sections.iter().zip(tc.variants.iter())
-                            {
-                                if let Some(v) = member.iter().find(|v| selected.contains(&v.id)) {
-                                    if let (true, Some(toks)) = (emitted_member, glue_tokens) {
-                                        system.push(SystemItem::Glue {
-                                            name: format!("{}__member_glue", tc.collection.name),
-                                            content: glue.clone(),
-                                            tokens: toks,
-                                        });
-                                    }
-                                    emitted_member = true;
-                                    system.push(SystemItem::Section {
-                                        name: s.name.clone(),
-                                        tokens: resolver.section_token_count(v.id) as u32,
+                    }
+                    // An embedded collection node: show each selected member
+                    // (its active-branch variant landed in `selected`),
+                    // interleaving the collection's `member_glue` as a real
+                    // structural glue row BETWEEN consecutive members —
+                    // mirroring the `Generated` glue token the projection emits
+                    // (and NOT baked into any member's seal), so the panel and
+                    // its copy-all reproduce the exact materialized bytes.
+                    if let Some(tc) = &n.collection {
+                        let glue = &tc.collection.member_glue;
+                        // Mirror the projection EXACTLY: it interleaves member
+                        // glue only when the tokens exist (`member_glue_tokens`),
+                        // so gate the panel row on the same condition (not just
+                        // the non-empty string) or the panel would show a 0-token
+                        // glue row the materialized prompt never contained.
+                        let glue_tokens = tc
+                            .collection
+                            .member_glue_tokens
+                            .as_ref()
+                            .map(|t| t.len() as u32);
+                        let mut emitted_member = false;
+                        for (s, member) in tc.collection.sections.iter().zip(tc.variants.iter()) {
+                            if let Some(v) = member.iter().find(|v| selected.contains(&v.id)) {
+                                if let (true, Some(toks)) = (emitted_member, glue_tokens) {
+                                    system.push(SystemItem::Glue {
+                                        name: format!("{}__member_glue", tc.collection.name),
+                                        content: glue.clone(),
+                                        tokens: toks,
                                     });
                                 }
+                                emitted_member = true;
+                                system.push(SystemItem::Section {
+                                    name: s.name.clone(),
+                                    tokens: resolver.section_token_count(v.id) as u32,
+                                });
                             }
                         }
                     }
@@ -794,14 +789,16 @@ pub fn decode_events(payload: &[u8]) -> Vec<ProjectionEvent> {
 /// when the section is a bare top-level item (i.e. part of the system prompt
 /// proper, not a named group).
 fn collection_name_of(schema: &Schema, id: SectionId) -> Option<&str> {
-    schema.layers.iter().find_map(|l| {
-        l.system_prompt.items.iter().find_map(|item| match item {
+    schema
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
             SystemPromptItem::Collection(c) if c.sections.iter().any(|s| s.id == id) => {
                 Some(c.name.as_str())
             }
             _ => None,
         })
-    })
 }
 
 /// The name of the collection whose *runtime summary section* is `id`. Unlike
@@ -809,14 +806,16 @@ fn collection_name_of(schema: &Schema, id: SectionId) -> Option<&str> {
 /// reserved summary section a collection injects before its members on partial
 /// selection — that section is not a schema item, so it is classified here.
 fn collection_of_summary(schema: &Schema, id: SectionId) -> Option<&str> {
-    schema.layers.iter().find_map(|l| {
-        l.system_prompt.items.iter().find_map(|item| match item {
+    schema
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
             SystemPromptItem::Collection(c) if c.summary_section == Some(id) => {
                 Some(c.name.as_str())
             }
             _ => None,
         })
-    })
 }
 
 /// The YAML name of a group by its globally-unique id.
@@ -946,6 +945,29 @@ mod tests {
     // ── from_projection (schema + resolver classification) ───────────────────
 
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: frame
+      content: "You are Zen-Code."
+    - kind: collection
+      name: code_read
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose categories.
+          user_prompt: Propose categories.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign by number.
+          user_prompt: Assign by number.
+      selection: { kind: top_k, k: 3 }
+      sections:
+        - id: file_a
+          content: "fn a() {}"
+        - id: file_b
+          content: "fn b() {}"
 layers:
   - name: dialogue
     window: 8000
@@ -961,29 +983,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section
-          id: frame
-          content: "You are Zen-Code."
-        - kind: collection
-          name: code_read
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose categories.
-              user_prompt: Propose categories.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign by number.
-              user_prompt: Assign by number.
-          selection: { kind: top_k, k: 3 }
-          sections:
-            - id: file_a
-              content: "fn a() {}"
-            - id: file_b
-              content: "fn b() {}"
     groups:
       - id: conversation
         selection:
@@ -1020,9 +1019,9 @@ layers:
         let schema = b.schema();
         let dialogue = b.id_for_layer("dialogue").unwrap();
         let conv = b.id_for_group("conversation").unwrap();
-        let frame = b.id_for_section_in(dialogue, "frame").unwrap();
-        let file_a = b.id_for_section_in(dialogue, "file_a").unwrap();
-        let file_b = b.id_for_section_in(dialogue, "file_b").unwrap();
+        let frame = b.id_for_system_section("frame").unwrap();
+        let file_a = b.id_for_system_section("file_a").unwrap();
+        let file_b = b.id_for_system_section("file_b").unwrap();
 
         let mut res = TokResolver::default();
         res.section_tokens.insert(frame.raw(), 64); // bare → system
@@ -1099,6 +1098,29 @@ layers:
     }
 
     const TREE_GLUE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 3 }
+          member_glue: "\n"
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: cat
+              user_prompt: cat
+            assign:
+              max_tokens: 128
+              system_prompt: assign
+              user_prompt: assign
+          sections:
+            - id: tool_a
+              content: "a"
+            - id: tool_b
+              content: "b"
 layers:
   - name: dialogue
     window: 8000
@@ -1114,29 +1136,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: collection
-              name: tools
-              selection: { kind: top_k, k: 3 }
-              member_glue: "\n"
-              summary:
-                chunk: 4
-                categorize:
-                  max_tokens: 256
-                  system_prompt: cat
-                  user_prompt: cat
-                assign:
-                  max_tokens: 128
-                  system_prompt: assign
-                  user_prompt: assign
-              sections:
-                - id: tool_a
-                  content: "a"
-                - id: tool_b
-                  content: "b"
     groups:
       - id: conversation
         selection:
@@ -1153,14 +1152,9 @@ layers:
         b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
             .unwrap();
         let schema = b.schema();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
 
         // The tools tree-collection node + its (single-branch) member variants.
         let tc = schema
-            .layers
-            .iter()
-            .find(|l| l.id == dialogue)
-            .unwrap()
             .system_prompt
             .items
             .iter()
@@ -1222,9 +1216,9 @@ layers:
         let schema = b.schema();
         let dialogue = b.id_for_layer("dialogue").unwrap();
         let conv = b.id_for_group("conversation").unwrap();
-        let frame = b.id_for_section_in(dialogue, "frame").unwrap();
-        let file_a = b.id_for_section_in(dialogue, "file_a").unwrap();
-        let file_b = b.id_for_section_in(dialogue, "file_b").unwrap();
+        let frame = b.id_for_system_section("frame").unwrap();
+        let file_a = b.id_for_system_section("file_a").unwrap();
+        let file_b = b.id_for_system_section("file_b").unwrap();
 
         let mut res = TokResolver::default();
         res.section_tokens.insert(frame.raw(), 64);
@@ -1294,6 +1288,17 @@ layers:
     fn from_projection_surfaces_emitted_template_glue_in_order() {
         use candle_transformers::models::dialect::Dialect;
         const YAML_T: &str = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: system_open
+      dialect: system_start
+    - kind: section
+      id: frame
+      content: "You are Zen-Code."
+    - kind: template
+      id: system_close
+      dialect: system_end
 layers:
   - name: dialogue
     window: 1000
@@ -1306,17 +1311,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: system_open
-          dialect: system_start
-        - kind: section
-          id: frame
-          content: "You are Zen-Code."
-        - kind: template
-          id: system_close
-          dialect: system_end
     groups:
       - id: conversation
         selection: { kind: always_visible }
@@ -1325,7 +1319,7 @@ layers:
         let b = Builder::from_yaml_with_vars_and_dialect(YAML_T, &[], Some(&dlct)).unwrap();
         let schema = b.schema();
         let dialogue = b.id_for_layer("dialogue").unwrap();
-        let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+        let frame = b.id_for_system_section("frame").unwrap();
 
         let mut res = TokResolver::default();
         res.section_tokens.insert(frame.raw(), 64);
@@ -1400,6 +1394,32 @@ layers:
     fn from_projection_summary_shows_outside_tools_markers() {
         use candle_transformers::models::dialect::Dialect;
         const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: tools
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 1 }
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: x
+          user_prompt: x
+        assign:
+          max_tokens: 128
+          system_prompt: x
+          user_prompt: x
+      sections:
+        - id: t1
+          content: "tool"
+    - kind: template
+      id: tools_close
+      dialect: tool_block_close
+      depends_on: tools
 layers:
   - name: dialogue
     window: 1000
@@ -1412,32 +1432,6 @@ layers:
         assistant:
           system_prompt: c
           user_prompt: c
-    system_prompt:
-      items:
-        - kind: template
-          id: tools_open
-          dialect: tool_block_open
-          depends_on: tools
-        - kind: collection
-          name: tools
-          selection: { kind: top_k, k: 1 }
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: x
-              user_prompt: x
-            assign:
-              max_tokens: 128
-              system_prompt: x
-              user_prompt: x
-          sections:
-            - id: t1
-              content: "tool"
-        - kind: template
-          id: tools_close
-          dialect: tool_block_close
-          depends_on: tools
     groups:
       - id: conversation
         selection: { kind: always_visible }
@@ -1445,11 +1439,10 @@ layers:
         let dlct = Dialect::chat_ml();
         let mut b = Builder::from_yaml_with_vars_and_dialect(YAML, &[], Some(&dlct)).unwrap();
         let dialogue = b.id_for_layer("dialogue").unwrap();
-        let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+        let tools = b.id_for_system_collection("tools").unwrap();
         let summary = SectionId::reserved(Reserved::ToolSummary);
-        b.set_collection_summary_section(dialogue, tools, summary)
-            .unwrap();
-        let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+        b.set_collection_summary_section(tools, summary).unwrap();
+        let t1 = b.id_for_system_section("t1").unwrap();
         let schema = b.schema();
 
         let mut res = TokResolver::default();

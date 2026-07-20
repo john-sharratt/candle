@@ -1,0 +1,96 @@
+name: ssh_session_close
+category: SSH sessions
+description: End a secure shell session on a remote server, terminating the encrypted login and freeing its working state.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: The session id returned by the corresponding ssh_open tool.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: CloseRequest
+  type: object
+examples:
+- |-
+  close SSH session ssh-7f3a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close an SSH session with the ID ssh-7f3a. Let me check the available tools. There's a tool called ssh_session_close that takes a session_id. The parameters require the session_id as a string. The user provided "ssh-7f3a"<|projection|> which should be the session ID. So I need to call ssh_session_close with that ID. Make sure the JSON is correctly formatted with the session_id in the arguments. No other tools are needed here. Just call the close function with the provided ID.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-7f3a"}}
+  </tool_call><|projection|>
+- |-
+  disconnect SSH session ssh-2b1c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to disconnect an SSH session with the ID ssh-2b1c. Let me check the tools available. There's a tool called ssh_session_close that ends a session. It requires a session_id parameter. The user provided "ssh-2b1c" as the session ID<|projection|>. So I need to call the ssh_session_close tool with that ID. I should make sure the JSON is correctly formatted with the session_id in the arguments. Let me structure the tool call properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-2b1c"}}
+  </tool_call><|projection|>
+- |-
+  tear down SSH session ssh-9d4e<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to tear down an SSH session with the ID ssh-9d4e. Let me check the available tools. There's a tool called ssh_session_close that ends a secure shell session. The parameters require a session_id, which the user provided. I need to make sure the session<|projection|>_id is correctly formatted as a string. The required field is there, so I'll structure the JSON accordingly. Just need to input the session ID into the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-9d4e"}}
+  </tool_call><|projection|>
+- |-
+  end SSH session ssh-7f3a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end an SSH session with the ID ssh-7f3a. Let me check the tools available. There's a tool called ssh_session_close that's meant for this. The parameters require a session_id. The user provided "ssh-7f3a" as the session<|projection|> ID. So I need to call the ssh_session_close tool with that session ID. Let me make sure the JSON is formatted correctly. The required parameter is session_id, and it's a string. Everything looks good. Time to structure the response.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-7f3a"}}
+  </tool_call><|projection|>
+- |-
+  hang up the SSH session ssh-5f1a, I'm done with it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end an SSH session with the ID ssh-5f1a. Let me check the tools available. There's a tool called ssh_session_close that's meant for this. The parameters require a session_id. The user provided "ssh-5f1a" as the session<|projection|> ID. So I need to call the ssh_session_close tool with that ID. I should make sure the JSON is correctly formatted with the session_id field. No other parameters are needed since the schema only requires that one. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-5f1a"}}
+  </tool_call><|projection|>
+- |-
+  please shut down SSH session ssh-b3c8<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to shut down an SSH session with the ID ssh-b3c8. Let me check the available tools. There's a tool called ssh_session_close that ends a session. The parameters require a session_id. The user provided ssh-b3c8, so I need to call the<|projection|> tool with that ID. Make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-b3c8"}}
+  </tool_call><|projection|>
+- |-
+  drop the SSH connection ssh-0d2e<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drop the SSH connection with the ID ssh-0d2e. Let me check the available tools. There's a tool called ssh_session_close that terminates an SSH session. The required parameter is the session_id, which should be a string. The user provided "ssh-0<|projection|>d2e" as the session ID. I need to call the ssh_session_close tool with that ID. I'll make sure the JSON is correctly formatted with the session_id in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-0d2e"}}
+  </tool_call><|projection|>
+- |-
+  terminate SSH session ssh-e7a4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to terminate an SSH session with the ID "ssh-e7a4". Let me check the available tools. There's a tool called ssh_session_close that ends a secure shell session. The parameters require a session_id, which the user provided. I need to make sure the session_id<|projection|> is correctly formatted as a string. The required field is session_id, so I'll structure the JSON accordingly. Just call the tool with the given ID. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "ssh_session_close", "arguments": {"session_id": "ssh-e7a4"}}
+  </tool_call><|projection|>

@@ -80,8 +80,8 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
         .id_for_group("primary_conversation")
         .expect("primary group");
 
-    let tool_sections = zend::tools::install_tool_catalog(&mut proj_builder, dialogue_layer)
-        .expect("install tool catalog");
+    let tool_sections =
+        zend::tools::install_tool_catalog(&mut proj_builder).expect("install tool catalog");
     eprintln!(
         "installed {} tool sections into projection schema",
         tool_sections.len()

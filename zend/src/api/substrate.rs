@@ -145,8 +145,9 @@ pub struct LayerView {
     pub priority: f32,
     /// Declared turn groups (name + selection rule), in declaration order.
     pub groups: Vec<GroupView>,
-    /// System-prompt items framing this layer (labels, in declaration order).
-    pub system_prompt: Vec<String>,
+    /// This layer's dial overrides for the shared system prompt, as
+    /// `"<selector> = <option>"` labels. Empty inherits the section-tree defaults.
+    pub dials: Vec<String>,
     /// Number of conversations targeting this layer.
     pub conv_count: usize,
     /// Total sealed tokens across every conversation in this layer.
@@ -182,10 +183,12 @@ pub struct ConvView {
     pub summary_nodes: usize,
 }
 
-/// `GET /v1/substrate/system-prompt` — the target layer's framing. Fetched when
-/// the "system prompt" card expands.
+/// `GET /v1/substrate/system-prompt` — the single shared system prompt. Fetched
+/// when the "system prompt" card expands.
 #[derive(Serialize)]
 pub struct SystemPromptView {
+    /// The layer currently targeted — whose dials pick the active section-tree
+    /// branch of this shared prompt.
     pub target_layer: String,
     /// Ordered system-prompt item labels (sections / collection / tree).
     pub items: Vec<String>,

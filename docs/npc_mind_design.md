@@ -35,21 +35,21 @@ The naming is deliberate. The Cortex sits over the deeper structures, reads acro
 The attention stack runs bottom to top — immutable core at the base, substrate above it, Cortex above that, interaction at the surface — which is the order the KV cache is actually assembled in: everything is read *upward* through the fixed lens at the bottom.
 
 ```
-                  ┌────────────────────────────────────────────────┐
-   operator ◀────▶│  INTERACTION — the surface                     │
-   / player       │  injects events downward (player speaks → inbox│
-                  │  narrates acts upward · never fabricates output│
-                  └───────────────────────┬────────────────────────┘
+                   ┌─────────────────────────────────────────────────┐
+   operator ◀────▶│  INTERACTION — the surface                      │
+   / player        │  injects events downward (player speaks → inbox)│
+                   │  narrates acts upward · never fabricates output │
+                   └───────────────────────┬─────────────────────────┘
                           inject ▼  ▲ narrate
   ────────────────────────────────────────────────────────────────────────
                   ┌────────────────────────────────────────────────┐
                   │  CORTEX — the heart of the mind                │
-   ┌───────────┐  │  gathers across the layers under budget B,     │  ┌───────────┐
-   │MODULATION │  │  attends, decides, acts · one async loop       │  │ MONITOR   │
+   ┌───────────┐  │  gathers across the layers under budget B,     │    ┌───────────┐
+   │MODULATION │  │  attends, decides, acts · one async loop       │    │ MONITOR   │
    │affect ·   │─▶│  ticking at world tempo · acts fan out to the  │◀▶│ metacog · │
-   │threat ·   │  │  world (speak · move · world-mutation)         │  │ leak /    │
-   │curiosity  │  │                                                │  │ runaway   │
-   └───────────┘  └───────────────────────┬────────────────────────┘  └───────────┘
+   │threat ·   │  │  world (speak · move · world-mutation)         │    │ leak /    │
+   │curiosity  │  │                                                │    │ runaway   │
+   └───────────┘  └───────────────────────┬────────────────────────┘    └───────────┘
       bias ─────────────┘      gather ▲  ▼ write back
                   ┌────────────────────────────────────────────────┐
                   │  SUBSTRATE — the mutable conversation-layers   │
@@ -307,9 +307,9 @@ Each NPC is a loop, and the only question each iteration is whether there is any
       └───────────┬────────────┘
                   │
            empty? ├──── yes ───▶ ┌────────────────────────┐
-                  │              │ BLOCK                  │
-              no  │              │ 0 decode, not batched  │
-                  │              └───────────┬────────────┘
+                  │               │ BLOCK                  │
+              no  │               │ 0 decode, not batched  │
+                  │               └───────────┬────────────┘
                   ▼◀──── event arrives ──────┘
       ┌────────────────────────┐
       │ DRAIN inbox            │
@@ -506,10 +506,10 @@ The architecture's strength is also its characteristic failure mode. Gather prom
 
       world ──┐                                world ··┐  drowned out
               ▼                                        ▼
-        ┌─────────┐                              ┌─────────┐
+        ┌─────────┐                               ┌─────────┐
         │ GATHER  │◀────┐                         │ GATHER  │◀────┐
-        └────┬────┘     │                         └────┬────┘     │
-             ▼          │ writes                       ▼          │ writes back
+        └────┬────┘     │                         └────┬────┘      │
+             ▼          │ writes                       ▼           │ writes back
         ┌─────────┐     │ back —                   ┌─────────┐     │ louder each
         │ DECODE  │     │ one voice                │ DECODE  │     │ cycle (own
         └────┬────┘     │ among many               └────┬────┘     │ reasoning read

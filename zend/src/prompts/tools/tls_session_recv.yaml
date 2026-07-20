@@ -1,0 +1,172 @@
+name: tls_session_recv
+category: TLS sessions
+description: Read decrypted application data from an open TLS channel; decryption and certificate handling are transparent.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RecvEncoding:
+      description: Encoding format for received session bytes.
+      enum:
+      - auto
+      - hex
+      type: string
+  properties:
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/RecvEncoding'
+      - type: 'null'
+      description: Encoding for the returned bytes. "hex" forces hex; "auto" (default) returns UTF-8 text when valid, else hex.
+    recv_amt:
+      description: Maximum number of bytes to read in one call (capped at 65536).
+      format: uint
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    recv_wait:
+      description: 'Seconds to wait for data before returning with `timed_out: true`. Defaults to 30.'
+      format: double
+      type:
+      - number
+      - 'null'
+    session_id:
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: RecvRequest
+  type: object
+examples:
+- |-
+  receive 512 bytes from TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to receive 512 bytes from a TLS session called "tls-1". Let me check the available tools. There's the tls_session_recv function. The parameters needed are session_id, recv_amt, recv_wait, and output_encoding.
+
+  The session_id is given as "tls<|projection|>-1". The user specified 512 bytes, so recv_amt should be 512. The default for recv_wait is 30 seconds, which is okay unless the user specified otherwise. Since they didn't mention it, I'll stick with the default. Output encoding isn't mentioned, so maybe<|projection|> use the default "auto".
+
+  Putting it all together, the tool call should have name "tls_session_recv" with the session_id, recv_amt set to 512, and the other parameters as defaults. Let me double-check the required fields. The only required parameter is session_id, others are optional. So<|projection|> the JSON should include session_id and recv_amt. The rest can be omitted or set to their defaults.
+
+  Yes, that should work. Let me format the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-1", "recv_amt": 512}}
+  </tool_call><|projection|>
+- |-
+  read for up to 3 seconds from TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to read from a TLS session called "tls-1" and wait up to 3 seconds. Let me check the available tools.
+
+  The tool provided is tls_session_recv. The parameters include session_id, recv_wait, and others. The user specified a 3-second timeout, so<|projection|> I need to set recv_wait to 3. The session ID is "tls-1".
+
+  Wait, the parameters for the tool: the session_id is required. The user's command says "read for up to 3 seconds from TLS session tls-1". So the session_id is "tls-1",<|projection|> recv_wait is 3. The other parameters like output_encoding and recv_amt are optional. Since the user didn't specify them, I can omit them or use defaults.
+
+  So the tool call should be tls_session_recv with session_id="tls-1" and recv_wait=3. That should handle the request.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-1", "recv_wait": 3}}
+  </tool_call><|projection|>
+- |-
+  receive 1024 bytes from TLS session tls-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to receive 1024 bytes from a TLS session called "tls-2". Let me check the available tools.
+
+  There's a tool called tls_session_recv. The parameters include session_id, which is required. The user provided "tls-2" as the session ID.<|projection|>
+
+  The parameters also have recv_amt, which is the maximum number of bytes to read. The user specified 1024 bytes. So I need to set recv_amt to 1024.
+
+  The other parameters are optional. The output_encoding can be left as default, which is "auto". The<|projection|> recv_wait is the timeout, which defaults to 30 seconds. Since the user didn't specify, we can omit it.
+
+  So the tool call should have session_id "tls-2" and recv_amt 1024. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-2", "recv_amt": 1024}}
+  </tool_call><|projection|>
+- |-
+  drain TLS session tls-1 for 2 seconds<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drain a TLS session called "tls-1" for 2 seconds. Let me check the available tools. There's the tls_session_recv function. The parameters include session_id, which is required. The user specified 2 seconds, so I need to set recv_wait to <|projection|>2.0. The other parameters like output_encoding and recv_amt can be left as defaults unless specified. The tool call should have the session_id as "tls-1", recv_wait as 2.0. I'll structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-1", "recv_wait": 2.0}}
+  </tool_call><|projection|>
+- |-
+  read up to 4096 bytes of decrypted data from TLS session tls-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to read up to 4096 bytes of decrypted data from a TLS session called tls-3. Hmm, the tool available is tls_session_recv. Let me check the parameters.
+
+  The function requires session_id, which is given as tls-3. Then<|projection|> there's recv_amt, which is the maximum bytes to read. The user specified 4096, so I should set recv_amt to 4096. The default for recv_wait is 30 seconds, which is probably fine. Also, output_encoding isn't mentioned, so maybe leave it as<|projection|> default.
+
+  Wait, the parameters for the tool: the required field is session_id. The other parameters are optional. So the call should include session_id and recv_amt. Let me structure the JSON accordingly. The name of the tool is tls_session_recv. So the tool_call should have name as "tls_session_recv<|projection|>" and arguments with session_id="tls-3" and recv_amt=4096. That should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-3", "recv_amt": 4096}}
+  </tool_call><|projection|>
+- |-
+  wait 5 seconds for the TLS server greeting on session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this user's request. The user wrote: "wait 5 seconds for the TLS server greeting on session tls-1".
+
+  First, I need to understand what they're asking. They want to wait for 5 seconds while trying to receive a TLS<|projection|> server greeting on a specific session called "tls-1".
+
+  Looking at the tools provided, there's a function called tls_session_recv. The description says it reads decrypted application data from an open TLS channel. The parameters include session_id, which is required. There's also recv_wait, which is the time to wait<|projection|> for data before timing out. The default is 30 seconds, but the user wants 5 seconds here.
+
+  So, the user's request maps to the tls_session_recv tool. The parameters needed are session_id set to "tls-1" and recv_wait set to 5. The other parameters like output_encoding<|projection|> and recv_amt aren't specified, so they can be omitted or set to their defaults.
+
+  I need to make sure that the JSON structure is correct. The required parameter is session_id, which is provided. The recv_wait is an optional parameter, so including it should be fine.
+
+  Wait, the user said "<|projection|>wait 5 seconds", which corresponds to the recv_wait parameter. So the arguments should be {"session_id": "tls-1", "recv_wait": 5}.
+
+  I think that's all. The tool call should be made with those arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-1", "recv_wait": 5}}
+  </tool_call><|projection|>
+- |-
+  grab the next 256 bytes off TLS session tls-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this request. The user wants to grab the next 256 bytes from a TLS session with the ID "tls-4".
+
+  First, I need to check the available tools. There's the tls_session_recv function. Let me look at its parameters.<|projection|> The required parameter is session_id, which the user provided as "tls-4".
+
+  The user specified 256 bytes, so I need to set recv_amt to 256. The default for recv_wait is 30 seconds, which is okay unless the user specified otherwise. The output encoding isn<|projection|>'t mentioned, so I'll leave it as the default, which is "auto".
+
+  Wait, the parameters for the tool call: the session_id is "tls-4", recv_amt is 256, and others are optional. So the JSON should include those values. I need to make sure the JSON structure<|projection|> matches the tool's requirements.
+
+  So the tool call will be tls_session_recv with arguments session_id="tls-4", recv_amt=256. The other parameters like recv_wait and output_encoding can be omitted since they have defaults.
+
+  I think that's all. Let me format the JSON correctly.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "tls_session_recv", "arguments": {"session_id": "tls-4", "recv_amt": 256}}
+  </tool_call><|projection|>
+- |-
+  can you read the TLS response on session tls-2 for up to 1 second?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me try to figure out how to handle this. The user is asking to read the TLS response on session "tls-2" for up to 1 second.
+
+  First, I need to check the available tools. There's a tool called tls_session_recv. Let me look at its parameters<|projection|>. The parameters include session_id, recv_amt, recv_wait, and output_encoding.
+
+  The user wants to read the TLS response, so the session ID should be "tls-2". The timeout is 1 second, so the recv_wait parameter should be 1.0. The other parameters like recv_amt and output<|projection|>_encoding aren't specified, so maybe they can use default values. The tool's required parameter is session_id, which is provided.
+
+  So the function call would be to tls_session_recv with session_id="tls-2" and recv_wait=1.0. I need to make sure the JSON is correctly formatted with those<|projection|> arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_recv", "arguments": {"session_id": "tls-2", "recv_wait": 1.0}}
+  </tool_call><|projection|>

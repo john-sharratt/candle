@@ -1,0 +1,101 @@
+name: http_session_list
+category: HTTP sessions
+description: List active HTTP sessions for the current conversation — session_id, base_url, credential name, opened_at, last_activity. Use to find session_ids by base URL or to see which APIs are currently configured. Triggered by "list HTTP sessions", "what API connections are open", "show my API sessions".
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  title: ListRequest
+  type: object
+examples:
+- |-
+  list my open HTTP sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to list their open HTTP sessions. Let me check the tools available. There's a tool called http_session_list that does exactly that. The parameters are straightforward; it doesn't need any arguments. So I just need to call that function. I'll make sure the JSON is correctly<|projection|> formatted and send it over.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  which HTTP sessions do I have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "which HTTP sessions do I have?" I need to figure out which tool to use here. Let me check the available tools.
+
+  Looking at the tools provided, there's one called http_session_list. The description says it lists active HTTP sessions for the current conversation, including details<|projection|> like session_id, base_url, credential name, etc. The triggers mentioned are things like "list HTTP sessions" or "what API connections are open". The user's question fits here.
+
+  So, the correct tool to call is http_session_list. The parameters for this tool are defined in the JSON schema, but the<|projection|> parameters object is empty. That probably means no arguments are needed. So I just need to make a tool call with the name http_session_list and an empty arguments object.
+
+  I should structure the response as a JSON object inside the tool_call tags. Let me double-check the syntax. The example shows {"name": <tool<|projection|>-name>, "arguments": <args-json-object>}. Since there are no arguments, it should be {"name": "http_session_list", "arguments": {}}.
+
+  Alright, that's all. I think that's the correct response.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show the active HTTP client sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to show the active HTTP client sessions. Let me check the tools available. There's a tool called http_session_list that lists active HTTP sessions. The parameters are straightforward, just a JSON object. Since the user wants to see the active sessions, I need to call this tool.<|projection|> No specific parameters are needed beyond what's required by the tool. So I'll generate the tool call with the appropriate name and an empty arguments object.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what HTTP sessions are open right now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "what HTTP sessions are open right now." I need to figure out which tool to use here. Let me check the available tools.
+
+  Looking at the tools provided, there's one called http_session_list. The description says it lists active HTTP sessions, including session_id, base<|projection|>_url, credential name, and more. The parameters are a JSON object with a $schema. The user's question is exactly about listing open sessions, so this tool is the right choice.
+
+  The user might be trying to see which API connections are currently active. The tool requires no arguments, as the parameters are an empty<|projection|> object. So I just need to call http_session_list with an empty arguments object. I should return the tool call in the specified XML format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  enumerate every open HTTP session id<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to "enumerate every open HTTP session id". Let me check the available tools. There's a tool called http_session_list that lists active HTTP sessions. The description says it shows session_id, base_url, credential name, etc. So using this tool should give the list of session<|projection|> IDs. The user just needs the session IDs, so calling this tool is the right step. I'll generate the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  are there any HTTP client sessions still around?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if there are any HTTP client sessions still active. Let me check the tools available. Oh, there's the http_session_list tool that lists all active sessions. The parameters are straightforward—no arguments needed. So I should call that tool to get the list of sessions. The user<|projection|> probably wants to know which APIs are connected or if there are any lingering sessions. Alright, triggering the http_session_list should give the necessary info.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  give me the list of live HTTP sessions<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for a list of live HTTP sessions. Let me check the tools available. There's the http_session_list tool which lists active sessions. The parameters are straightforward, just a JSON object. I need to call that tool. The user might want details like session IDs, base URLs,<|projection|> and credentials. I'll make sure to structure the tool call correctly. No other tools are needed here. Let's generate the response.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  how many HTTP sessions am I holding open?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking how many HTTP sessions they have open. Let me check the tools available. There's a tool called http_session_list that lists active HTTP sessions. The parameters are straightforward—just a JSON object with type "object". Since the user wants to know the count, I need to call<|projection|> this tool. The response from the tool will give the necessary data. So, I'll generate the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_list", "arguments": {"type": "object"}}
+  </tool_call><|projection|>

@@ -1,0 +1,133 @@
+name: hash_state_finalize
+category: Hash streaming
+description: Conclude a streaming hash computation and emit the final digest over everything absorbed so far, discarding the accumulated state by default.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    DataEncoding:
+      description: Encoding format for crypto/hash byte inputs and outputs.
+      enum:
+      - text
+      - hex
+      - base64
+      type: string
+  properties:
+    id:
+      description: State id returned by hash_state_init. Required.
+      minLength: 1
+      type: string
+    keep:
+      description: Whether to retain the state after finalizing instead of discarding it. Defaults to false.
+      type:
+      - boolean
+      - 'null'
+    output_encoding:
+      anyOf:
+      - $ref: '#/definitions/DataEncoding'
+      - type: 'null'
+      description: 'Encoding for the returned digest. One of: text, hex, base64. Defaults to hex.'
+  required:
+  - id
+  title: FinalizeRequest
+  type: object
+examples:
+- |-
+  finalize hash state hs-1 and give me the digest<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to finalize a hash state with ID "hs-1" and get the digest. I need to use the hash_state_finalize tool.
+
+  First, check the required parameters. The 'id' is mandatory, which the user provided as "hs-1". The other<|projection|> parameters like 'keep' and 'output_encoding' are optional. Since the user didn't specify them, I'll use their defaults. 'keep' defaults to false, so the state will be discarded after finalizing. The output encoding isn't specified, so maybe it defaults to hex as mentioned in the tool description.
+
+  <|projection|>So the arguments should be {"id": "hs-1"}. No need to include 'keep' or 'output_encoding' unless the user wants different values. The tool will handle the rest. Let me make sure there's no mistake here. Yep, that's correct. The response should be a JSON object inside<|projection|> the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-1"}}
+  </tool_call><|projection|>
+- |-
+  conclude hash state hs-2 and emit the result<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to conclude a hash state with the ID "hs-2" and emit the result. The tool available is hash_state_finalize. The parameters needed are id, keep, and output_encoding. The required parameter is id, which the user provided as "hs-2<|projection|>". The other parameters are optional. Since the user didn't specify any specific encoding, I'll default to hex. Also, keep is not mentioned, so I'll set it to false. So the arguments should be {"id": "hs-2", "output_encoding": "hex"}. Let me make sure I<|projection|> didn't miss any required fields. All looks good.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-2", "output_encoding": "hex"}}
+  </tool_call><|projection|>
+- |-
+  finish hash state hs-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to finish a hash state with the ID "hs-1". Let me check the available tools. There's the hash_state_finalize function. The parameters needed are id, keep, and output_encoding. The user didn't specify whether to keep the state or the encoding. So I should<|projection|> use the defaults: keep is false, which means the state will be discarded, and output_encoding defaults to hex. So the call should be hash_state_finalize with id "hs-1" and the default parameters. I don't need to include keep or output_encoding since they're optional and have defaults.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "hash_state_finalize", "arguments": {"id": "hs-1"}}
+  </tool_call><|projection|>
+- |-
+  give me the final digest of hash state hs-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the final digest of a hash state called "hs-3". Let me check the tools available.
+
+  There's a tool called hash_state_finalize. Its description says it concludes a streaming hash computation and emits the final digest. The parameters include the state id, whether to keep the<|projection|> state, and the output encoding. The required parameter is the id.
+
+  The user didn't mention anything about keeping the state, so the default (false) should be fine. They also didn't specify an encoding, so the default (hex) will be used.
+
+  So I need to call hash_state_finalize with the<|projection|> id "hs-3". The other parameters can be omitted since they have defaults. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-3"}}
+  </tool_call><|projection|>
+- |-
+  close out hash state hs-4 and return the hash<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let me figure out how to handle this. The user wants to close out a hash state called "hs-4" and get the hash. Looking at the tools provided, there's a function called hash_state_finalize. The parameters needed are the id, which should be "hs-4", and<|projection|> optionally keep and output_encoding. The user didn't mention keeping the state, so keep defaults to false. Output encoding wasn't specified, so it'll default to hex. So I need to call hash_state_finalize with id "hs-4". The response should be the JSON object inside tool_call tags.
+  </think>
+
+  <tool_call><|projection|>
+  {"name": "hash_state_finalize", "arguments": {"id": "hs-4"}}
+  </tool_call><|projection|>
+- |-
+  wrap up hash state hs-5 and show me the hex digest<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to finalize a hash state with the ID "hs-5" and get the hex digest. Let me check the available tools.
+
+  There's the hash_state_finalize tool. The parameters needed are id, keep, and output_encoding. The user specified the id as "hs-5".<|projection|> They didn't mention keeping the state, so I should default 'keep' to false. The output encoding is hex, which is the default, so I can omit that.
+
+  So the tool call should have name "hash_state_finalize" with arguments {"id": "hs-5"}. That should compute the digest and<|projection|> return it in hex as required.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-5"}}
+  </tool_call><|projection|>
+- |-
+  I'm done streaming — finalize hash state hs-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to finalize a hash state. Let me check the tools available.
+
+  There's a tool called hash_state_finalize. The description says it concludes a streaming hash computation and emits the final digest. The parameters include id, keep, and output_encoding. The id is required, which the user provided<|projection|> as "hs-2". The user mentioned "finalize hash state hs-2", so the id is definitely "hs-2".
+
+  The other parameters: keep defaults to false, which is fine unless the user specified otherwise. They didn't, so we can omit keep. Output_encoding defaults to hex, which is acceptable<|projection|> unless the user wanted something else. Since they didn't specify, stick with the default.
+
+  So the tool call should be hash_state_finalize with id "hs-2". No need to include optional parameters unless the user specified them. The response should be a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-2"}}
+  </tool_call><|projection|>
+- |-
+  seal hash state hs-6 and hand me the checksum<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to seal a hash state with ID "hs-6" and get the checksum. The tool available is hash_state_finalize. The parameters needed are id, keep, and output_encoding. The user didn't mention keeping the state, so keep should be false. Output<|projection|> encoding wasn't specified, so default to hex. So the call should be hash_state_finalize with id "hs-6", keep false, and output_encoding "hex".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "hash_state_finalize", "arguments": {"id": "hs-6", "keep": false, "output_encoding": "hex"}}
+  </tool_call><|projection|>

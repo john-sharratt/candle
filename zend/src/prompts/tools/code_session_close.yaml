@@ -1,0 +1,100 @@
+name: code_session_close
+category: Code execution
+description: Close a JavaScript code session, discarding its accumulated state. Use when finished with a coding workflow, when the session state has become corrupted and needs a fresh start, or when freeing up session slots. Triggered by "close the code session", "end the sandbox", "reset the interpreter". Idempotent — closing an already-closed session returns success.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: The session id returned by the code_session_open tool.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: SessionCloseReq
+  type: object
+examples:
+- |-
+  close code session sess_3f9a2c<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a code session with the ID sess_3f9a2c. Let me check the available tools. There's a tool called code_session_close that takes a session_id. The parameters require the session_id, which the user provided. So I need to call code_session<|projection|>_close with session_id set to sess_3f9a2c. I'll make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "sess_3f9a2c"}}
+  </tool_call><|projection|>
+- |-
+  terminate the JavaScript session js-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to terminate the JavaScript session with ID "js-1". Let me check the available tools. There's a tool called code_session_close which requires the session_id. The parameters need the session_id as a string. Since the user provided "js-1", I should call the code<|projection|>_session_close tool with that ID. Make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "js-1"}}
+  </tool_call><|projection|>
+- |-
+  end code execution session build-7<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end the code execution session named "build-7". Let me check the available tools. There's a function called code_session_close which requires a session_id. The user provided "build-7" as the session name. I need to call the code_session_close tool with session<|projection|>_id set to "build-7". I should make sure the JSON is correctly formatted with the session ID. That's all, right? No other parameters are needed since the tool only requires the session_id.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "build-7"}}
+  </tool_call><|projection|>
+- |-
+  shut down the code sandbox, session id abc123<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to shut down the code sandbox with session ID abc123. Let me check the available tools. There's a function called code_session_close that takes a session_id. The parameters require the session_id as a string. The user provided "abc123" as the session<|projection|> ID. So I need to call code_session_close with that ID. I should make sure the JSON is correctly formatted with the session_id in the arguments. No other parameters are needed. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "abc123"}}
+  </tool_call><|projection|>
+- |-
+  drop code session js-4, I'm done with it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a code session. The command they used is "drop code session js-4". Let me check the tools available.
+
+  Looking at the tools provided, there's a function called code_session_close. Its description says it's for closing a JavaScript code session, discarding the state<|projection|>. The parameters require a session_id, which is a string. The user mentioned "js-4" as the session ID.
+
+  So, I need to call code_session_close with the session_id set to "js-4". The tool call should be in the specified JSON format inside the XML tags. Let me structure<|projection|> that correctly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "js-4"}}
+  </tool_call><|projection|>
+- |-
+  please close out code session sess_9d2e1a<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a code session with the ID sess_9d2e1a. Let me check the available tools. There's a tool called code_session_close that's meant for this. The parameters require the session_id. The user provided the ID, so I just need to call<|projection|> that tool with the given ID. Make sure the JSON is correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "sess_9d2e1a"}}
+  </tool_call><|projection|>
+- |-
+  discard the state and end code session js-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close the code session. The command given is "discard the state and end code session js-2". Looking at the tools provided, there's a function called code_session_close. The parameters require a session_id. But wait, the user mentioned "js-2" which might<|projection|> be the session ID. However, the problem is that the session_id is required, but in the user's message, they didn't explicitly provide it. Wait, maybe "js-2" is the session ID. But according to the tool's parameters, the session_id is a string with minLength 1. So<|projection|>, perhaps the user is referring to a specific session, but the actual session ID isn't provided here. Hmm, this is confusing. Wait, the user might have made a mistake. Since the tool requires the session_id, but the user hasn't provided it. However, looking back at the tools, there's a<|projection|> code_session_open tool that returns a session ID. But in this case, the user is trying to close a session. If the user is referring to a specific session, like "js-2", maybe that's the session ID. But without knowing if that's valid, I should proceed with the information given. Alternatively<|projection|>, maybe the user intended to provide the session ID but forgot. However, since the user mentioned "js-2", perhaps that's the session ID. So, I'll use "js-2" as the session_id in the parameters. Therefore, the correct tool call would be code_session_close with session_id set<|projection|> to "js-2".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "js-2"}}
+  </tool_call><|projection|>
+- |-
+  kill the code session with id run-42<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to kill the code session with the ID "run-42". Let me check the available tools. There's a function called code_session_close which requires the session_id. The parameters need the session_id as a string. Since the user provided "run-42", I should<|projection|> call the tool with that ID. Make sure the JSON is correctly formatted with the session_id key.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "code_session_close", "arguments": {"session_id": "run-42"}}
+  </tool_call><|projection|>

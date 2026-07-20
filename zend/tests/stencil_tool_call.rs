@@ -18,9 +18,9 @@ use candle_conversation::stencil::{
 // ── Building the tree from the live registry ────────────────────────────────
 
 fn catalog() -> Vec<ToolSpec> {
-    zend_tools::registry::all_tools()
+    zend::tool_def::all()
         .iter()
-        .map(|t| ToolSpec::from_json_schema(t.name, &(t.schema)()))
+        .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
         .collect()
 }
 

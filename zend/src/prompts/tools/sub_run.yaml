@@ -1,0 +1,191 @@
+name: sub_run
+category: Subagent
+description: 'Spawn a nested agent loop with its own context, message history, and tool subset. Use for: decomposing complex multi-step tasks, parallelising subtasks with different expertise, delegating to a specialised model. Requires the host process to inject a SubagentRunner into ToolContext. Returns the agent''s final result text, turn count, and tool calls made. Triggered by: ''have a subagent'', ''run this as a sub-task'', ''delegate to another agent'', ''use a nested agent''. Not for simple tool calls — use the direct tools for those.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    endpoint:
+      description: Endpoint override for the subagent's model. Omit to use the host default.
+      type:
+      - string
+      - 'null'
+    instruction:
+      description: The task/prompt for the nested agent. Must be non-empty.
+      minLength: 1
+      type: string
+    max_turns:
+      description: 'Maximum agent-loop turns (1-50). Default: 10.'
+      format: uint32
+      maximum: 50.0
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
+    model:
+      description: Model identifier for the subagent. Omit to use the host default.
+      type:
+      - string
+      - 'null'
+    tools:
+      description: Names of REGISTERED tools to grant the subagent. Omit to inherit the parent's tools.
+      items:
+        type: string
+      type:
+      - array
+      - 'null'
+  required:
+  - instruction
+  title: Request
+  type: object
+examples:
+- |-
+  spawn a subagent to research the best Rust logging crate and report back<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to handle the user's request to spawn a subagent to research the best Rust logging crate. Let me start by understanding what's required.
+
+  The user wants a subagent that will look into Rust logging crates. The tools available include the 'sub_run' function. So I need to structure<|projection|> the tool call correctly.
+
+  First, the 'sub_run' requires an instruction. The instruction here would be "Research and recommend the best Rust logging crate." That's clear and direct.
+
+  Next, I should check if any other parameters are needed. The user didn't specify a model or endpoint, so I can omit those<|projection|>. The tools parameter is for listing specific tools, but since the subagent might need to use standard tools, maybe just include the necessary ones. Wait, the user hasn't specified any particular tools, so maybe leave it out unless required. The 'tools' parameter is optional, so it's okay to omit it.
+
+  <|projection|>Max_turns isn't specified, so the default of 10 will be used. That's acceptable.
+
+  So putting it all together, the JSON should have the instruction, and the rest as defaults. Let me double-check the parameters. The 'instruction' is mandatory, which is provided. The other fields are optional<|projection|>. So the tool call should be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Research and recommend the best Rust logging crate by evaluating popularity, maintenance status, performance, and ecosystem integration."}}
+  </tool_call><|projection|>
+- |-
+  delegate the task of finding every TODO comment under the src directory to a subagent<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to figure out how to delegate the task of finding every TODO comment in the src directory to a subagent. Let me start by recalling what tools I have available. The user mentioned using the sub_run tool, which spawns a nested agent loop.
+
+  First, I should check the parameters of the<|projection|> sub_run function. The required parameter is "instruction", which is the task prompt for the subagent. The user's request is to find all TODO comments under the src directory. So the instruction should be something like "Find every TODO comment under the src directory."
+
+  I also need to consider other optional parameters. The user<|projection|> didn't specify an endpoint or model, so I can omit those. The max_turns might default to 10, but since the task seems straightforward, maybe 1 or 2 turns would suffice. However, since the user didn't specify, it's safer to leave it out, allowing the system to handle<|projection|> the default.
+
+  The tools parameter allows specifying which tools the subagent can use. Since the task is about searching for TODOs, perhaps a file search tool is needed. But the user hasn't mentioned any specific tools, so maybe the subagent can infer the necessary tools. If the system requires tools, but the user<|projection|> didn't provide them, I should check if there's a default set. Since the problem doesn't mention it, I'll proceed without specifying the tools parameter.
+
+  Putting this together, the sub_run call would have the instruction as "Find every TODO comment under the src directory." The other parameters like endpoint, model, and<|projection|> tools are omitted unless required. The user might expect the subagent to handle this with available tools, so no need to include them unless necessary.
+
+  Wait, the user's instruction says to use the available tool, which is sub_run. So the correct approach is to structure the tool_call with the instruction as the task.<|projection|> The final answer should be the JSON object inside tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Find every TODO comment under the src directory", "max_turns": 5}}
+  </tool_call><|projection|>
+- |-
+  have a subagent investigate why the build is failing<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to delegate the task of investigating a failed build to a subagent. Let me check the available tools. There's the sub_run tool which spawns a nested agent. The parameters include instruction, which is mandatory. The instruction here would be "Investigate why the build is failing." I<|projection|> should make sure to include that. Other parameters like model and endpoint can be omitted to use defaults. The subagent will handle the rest. I need to structure the tool call correctly with the name as "sub_run" and the arguments as a JSON object with the instruction.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Investigate why the build is failing"}}
+  </tool_call><|projection|>
+- |-
+  launch a nested agent to draft the migration plan<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to figure out how to launch a nested agent to draft a migration plan. The user mentioned using the 'sub_run' tool. Let me check the parameters required for that.
+
+  The 'sub_run' function requires an 'instruction' which is the task prompt. The user wants to draft a<|projection|> migration plan, so the instruction should be something like "Draft a detailed migration plan."
+
+  Next, the parameters include 'endpoint', 'model', 'max_turns', 'tools', etc. But the user didn't specify any of these, so I can leave them as defaults. The 'max_turns' has<|projection|> a default value, but since the user didn't mention it, maybe set it to the default of 10. However, the tool's description says the default is 10, so maybe it's okay to omit it.
+
+  The 'tools' parameter allows specifying which tools the subagent can use. Since the<|projection|> user didn't specify, perhaps inherit the parent's tools. So, I don't need to include 'tools' in the arguments.
+
+  So the main argument is the 'instruction' which is "Draft a detailed migration plan."
+
+  I should structure the JSON call with the name as "sub_run" and the arguments including<|projection|> the instruction. Let me make sure all required parameters are included. The 'instruction' is required, and that's covered. Other parameters are optional and can be omitted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Draft a detailed migration plan including timelines, resource allocation, and risk mitigation strategies."}}
+  </tool_call><|projection|>
+- |-
+  kick off a subagent to audit the codebase for unwrap() calls and list them<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to audit the codebase for unwrap() calls and list them. Let me think about how to approach this.
+
+  First, I need to use the sub_run tool to spawn a nested agent. The subagent will handle the specific task of searching for unwrap() calls.
+
+  The parameters for<|projection|> sub_run include the instruction, which should be the task description. The instruction needs to be clear, so I'll phrase it as "Audit the codebase for unwrap() calls and list them."
+
+  I should set max_turns to a reasonable number, maybe 5, to allow the agent enough time without waiting too<|projection|> long. Since the user didn't specify a model or endpoint, I'll leave those as defaults. The tools parameter can be omitted to inherit the parent's tools, but since the task is straightforward, maybe no additional tools are needed.
+
+  Wait, the subagent might need specific tools to interact with the codebase. But<|projection|> the user hasn't mentioned any specific tools, so I'll proceed without specifying any tools.
+
+  So the JSON call would have the name "sub_run" with the instruction and max_turns. Let me double-check the required parameters. The only required field is instruction, which is provided. Alright, that should work.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Audit the codebase for unwrap() calls and list them", "max_turns": 5}}
+  </tool_call><|projection|>
+- |-
+  delegate writing the unit tests for the parser module to a subagent<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, I need to delegate the task of writing unit tests for the parser module to a subagent. Let me check the tools available. There's a sub_run tool that spawns a nested agent. The parameters include instruction, model, endpoint, max_turns, and tools.
+
+  The user's request is to<|projection|> delegate writing unit tests. So the instruction for the subagent should be "Write unit tests for the parser module." I should make sure the instruction is clear. The subagent might need specific tools, but since it's not specified, maybe default tools are okay. The max_turns could be set to a reasonable number<|projection|> like 5. Also, the model and endpoint can be left as defaults unless specified. I need to structure the JSON call with these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Write unit tests for the parser module. Create test cases for normal operation, edge cases, and error scenarios. Use assertions to validate expected outcomes.", "max_turns": 5}}
+  </tool_call><|projection|>
+- |-
+  have a subagent research the top three Rust web frameworks and recommend one for a REST API<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants me to use a subagent to research the top three Rust web frameworks and recommend one for a REST API. Let me think about how to approach this.
+
+  First, I need to trigger the subagent function. The tool provided is called 'sub_run', which starts a nested agent loop<|projection|>. The parameters required are instruction, endpoint, max_turns, model, and tools. Since the user didn't specify any specific model or endpoint, I'll use the defaults.
+
+  The main task is the instruction for the subagent. The instruction should be clear: "Research the top three Rust web frameworks and recommend one<|projection|> for a REST API." That's straightforward.
+
+  I should check if there are any other parameters needed. The user didn't mention the number of turns, so the default should be fine. Also, the tools aren't specified, so the subagent will use the default tools available.
+
+  Wait, the 'tools' parameter in<|projection|> the sub_run function allows specifying which tools the subagent can use. But since the user hasn't mentioned any specific tools, it's safe to omit this parameter. The subagent will inherit the parent's tools, which should include necessary ones for research.
+
+  So putting it all together, the JSON call should have the name<|projection|> "sub_run" and the arguments with the instruction. Let me make sure the JSON is correctly formatted. No other parameters are required unless the user specified them, which they didn't.
+
+  I think that's all. The subagent will handle the research and return the result. The final answer will be the recommendation from the<|projection|> subagent.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Research the top three Rust web frameworks and recommend one for a REST API."}}
+  </tool_call><|projection|>
+- |-
+  spawn an agent to trace where this config value is read across the repo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to trace where a specific config value is read in the repository. Let me think about how to approach this.
+
+  First, the user mentioned "trace where this config value is read across the repo." That sounds like a code search problem. The assistant needs to search through the codebase for<|projection|> references to the config value.
+
+  But wait, the available tools include the sub_run tool, which can spawn a nested agent. Maybe the assistant can use that to run a command-line search inside the repository. However, the sub_run tool's description mentions it's for decomposing tasks, not directly for running shell commands.<|projection|> But perhaps the subagent can execute commands if the environment allows.
+
+  Alternatively, the assistant might need to instruct the user to run a specific command, like grep or find, but the user might be expecting an automated approach via the tool.
+
+  Wait, the tools provided don't include a 'search' or 'grep' tool<|projection|>. The only tool is sub_run. So the assistant has to use sub_run to create a subagent that performs the search. But how?
+
+  The sub_run tool requires an instruction. So the assistant could generate a subagent with the instruction to "Search the repository for references to the config value [value] and list<|projection|> all files where it's used." Then, the subagent would execute this task.
+
+  But the actual implementation of the subagent's capabilities isn't specified here. Assuming the subagent can perform code searches, this would work. However, without a specific tool for searching, the assistant might need to simulate this by generating a<|projection|> fake response.
+
+  In the absence of real tools, the assistant might have to provide a hypothetical answer. For example, using the sub_run tool to create a subagent that performs the search and returns the results.
+
+  So, the correct approach is to call the sub_run tool with an instruction to search the repo for the config<|projection|> value's references.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"instruction": "Search the repository for references to the config value and list all files where it's used", "tools": ["search_repo"]}}
+  </tool_call><|projection|>

@@ -1,0 +1,108 @@
+name: http_session_close
+category: HTTP sessions
+description: Release the cookie jar and connection pool for an HTTP session. Idempotent. Use when finished with an API workflow or before starting a fresh session with different auth. Triggered by "close the HTTP session", "disconnect from the API", "end the session", "log out of the API".
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: ID of the session to close (from http_session_open). Must be non-empty. Idempotent.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: CloseRequest
+  type: object
+examples:
+- |-
+  close HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close an HTTP session. The available tool is http_session_close. The parameters require a session_id. But the user mentioned "http-1" as the session ID. So I need to call http_session_close with session_id "http-1". Let me check if the parameters<|projection|> are correct. The required field is session_id, and it's a string. Yep, that's all. So the tool call should be http_session_close with session_id set to "http-1".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-1"}}
+  </tool_call><|projection|>
+- |-
+  release HTTP session http-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to release the HTTP session, specifically mentioning "http-2". Looking at the tools provided, there's a function called http_session_close. The description says it's for releasing the cookie jar and connection pool, which matches the user's request. The parameters require a session_id, which<|projection|> the user mentioned as "http-2". I need to make sure the arguments are correctly formatted. The session_id is a string, so I'll put "http-2" in quotes. No other parameters are needed since the tool only requires session_id. I should structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-2"}}
+  </tool_call><|projection|>
+- |-
+  end HTTP session http-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end an HTTP session. Let me check the tools available. There's a tool called http_session_close. The description says it releases the cookie jar and connection pool, which makes sense for closing a session. The parameters require a session_id, which is needed to identify the specific session<|projection|> to close.
+
+  The user's command is "end HTTP session http-1". The session ID here is probably "http-1". I need to make sure the session_id in the tool call matches what the user provided. Since the tool requires the session_id, I should structure the JSON with that value.
+
+  I should<|projection|> verify if there are any other parameters, but the required field is just session_id. So the arguments should be {"session_id": "http-1"}. That's all needed for the tool call. Let me put that into the correct XML format as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-1"}}
+  </tool_call><|projection|>
+- |-
+  tear down HTTP session http-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to tear down an HTTP session called "http-3". Let me check the tools available. There's a function called http_session_close which requires a session_id. The parameters need the session ID, which in this case is "http-3". I need to make sure the JSON<|projection|> is correctly formatted with the session_id as a string. No other parameters are needed. Just call the tool with that ID.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-3"}}
+  </tool_call><|projection|>
+- |-
+  shut down HTTP session http-4 please<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to shut down an HTTP session with the ID "http-4". Let me check the available tools. There's a function called http_session_close which requires a session_id. The parameters need the session_id, which the user provided. I need to make sure the session_id is<|projection|> non-empty. Since the user specified "http-4", I'll use that as the argument. The tool call should be in the correct JSON format inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-4"}}
+  </tool_call><|projection|>
+- |-
+  I'm finished with HTTP session http-5, close it out<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is saying they're done with the HTTP session "http-5" and want to close it. Let me check the tools available.
+
+  Looking at the tools provided, there's a function called http_session_close. The description says it releases the cookie jar and connection pool for an HTTP session.<|projection|> It requires a session_id parameter, which should be non-empty. Also, it's idempotent, so calling it multiple times with the same ID shouldn't be a problem.
+
+  The user mentioned "close it out," which aligns with the purpose of this tool. The session ID they provided is "http-5<|projection|>". I need to make sure to pass that as the session_id in the arguments.
+
+  I should structure the tool call correctly. The name of the tool is http_session_close, and the arguments should be a JSON object with the session_id key. Let me double-check the parameters: yes, session_id is required and must<|projection|> be a string. Since the user specified "http-5", that's the value to use.
+
+  No other tools are needed here. The other functions don't apply to closing a session. So the correct response is to invoke http_session_close with the given session ID.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-5"}}
+  </tool_call><|projection|>
+- |-
+  drop the HTTP session http-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drop the HTTP session called "http-2". Let me check the tools available. There's a tool called http_session_close which requires a session_id. The user provided "http-2" as the session ID. I need to make sure the parameters are correct. The session<|projection|>_id must be a non-empty string, which it is. So I'll call http_session_close with session_id "http-2".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-2"}}
+  </tool_call><|projection|>
+- |-
+  dispose of HTTP session http-6<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to dispose of an HTTP session with the ID "http-6". Let me check the available tools. There's a function called http_session_close that's meant for releasing the cookie jar and connection pool for an API session. The parameters require a session_id, which should be non-empty<|projection|>. Since the user provided "http-6", I should use that as the session_id. I need to make sure the JSON is correctly formatted with the session_id in the arguments. Alright, the tool call should look like this.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "http_session_close", "arguments": {"session_id": "http-6"}}
+  </tool_call><|projection|>

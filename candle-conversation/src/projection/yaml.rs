@@ -67,7 +67,7 @@ use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
     Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
-    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
+    LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
     SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
@@ -136,6 +136,9 @@ pub fn from_yaml(
 #[derive(Deserialize)]
 struct YamlSchema {
     layers: Vec<YamlLayer>,
+    /// The single system prompt shared by every projection target. Required —
+    /// must contain at least one section.
+    system_prompt: YamlSystemPrompt,
     /// Schema-wide default selection policy, inherited by any layer/collection/
     /// group that declares none. Absent → [`SelectionPolicy::default_policy`].
     #[serde(default)]
@@ -492,9 +495,14 @@ struct YamlLayer {
     score_threshold: f32,
     #[serde(default)]
     budget: YamlBudget,
-    /// Required system prompt — every layer must declare its framing.
-    /// Validated to contain at least one section at construction time.
-    system_prompt: YamlSystemPrompt,
+    /// Per-layer overrides of the unified `system_prompt`'s section-tree
+    /// selectors, applied when this layer is the projection target. A map of
+    /// `<selector_id>: <option_id>` (e.g. `thinking_effort: exhaustive`). Keys
+    /// are the section-tree node names verbatim; a key matching no selector is
+    /// inert at projection time and available to the host. Omitted → inherit the
+    /// section-tree defaults.
+    #[serde(default)]
+    dials: std::collections::BTreeMap<String, String>,
     /// Required — how this layer's turns are compressed across the summary tree
     /// (`turns` + optional `summaries`, each with question/answer halves).
     summary: YamlLayerSummary,
@@ -693,6 +701,18 @@ fn build(
         &SelectionPolicy::default_policy(),
     )?;
 
+    // The single shared system prompt — built once, framed by every layer's
+    // dials at projection time. Its sections/collections register under the
+    // reserved system-prompt id, not any layer.
+    let system_prompt = build_system_prompt(
+        &raw.system_prompt,
+        dialect,
+        &schema_default,
+        &mut section_alloc,
+        &mut collection_alloc,
+        &mut maps,
+    )?;
+
     for (li, yl) in raw.layers.iter().enumerate() {
         let lid = LayerId::new(li as u32 + 1);
         maps.layer_names.insert(yl.name.clone(), lid);
@@ -700,275 +720,15 @@ fn build(
         let layer_budget = parse_budget(&yl.name, &yl.budget)?;
         let layer_policy = parse_policy(&yl.name, yl.policy.as_ref(), &schema_default)?;
 
-        // ── this layer's system_prompt items ─────────────────────────────────
-        // Build the ordered Vec<SystemPromptItem> from the YAML.  Two
-        // input forms are accepted:
-        //   1. Legacy `sections:` — flat list of always-emit sections.
-        //      Translated into a sequence of `SystemPromptItem::Section`
-        //      entries at the head of `items`.
-        //   2. Modern `items:` — interleaved list of `Section` and
-        //      `Collection` entries.  Authored when ordering matters
-        //      (e.g. tools_intro, then a `tools` collection, then
-        //      tools_outro).
-        // Section names must be unique across the whole layer, regardless
-        // of whether they're top-level or inside a collection.  Collection
-        // names must also be unique per layer.
-        let mut items: Vec<SystemPromptItem> = Vec::new();
-        let mut layer_section_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut layer_collection_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        // Legacy `sections:` shortcut — emit before any items.
-        for s in &yl.system_prompt.sections {
-            if !layer_section_names.insert(s.id.clone()) {
-                return Err(ConstructionError::DuplicateSectionName(s.id.clone()));
-            }
-            let sid = section_alloc.next();
-            maps.section_names.insert((lid, s.id.clone()), sid);
-            let priority = s.priority.unwrap_or(50.0);
-            validate_priority(&format!("{}/{}", yl.name, s.id), priority)?;
-            items.push(SystemPromptItem::Section(SectionSchema {
-                id: sid,
-                name: s.id.clone(),
-                content: s.content.clone(),
-                priority,
-                depends_on: None,
-                depends_on_absent: None,
-                is_template: false,
-                template_tokens: None,
-            }));
-        }
-
-        // Two-pass over `items:` so a Section's `depends_on: <collection>`
-        // can reference a Collection declared later in the same layer.
-        //
-        // First pass — pre-allocate every Collection's id and stash its
-        // name in `layer_collections` so the second pass can resolve
-        // forward references. Duplicates are caught here.
-        let mut layer_collections: std::collections::HashMap<String, super::ids::CollectionId> =
-            std::collections::HashMap::new();
-        for entry in &yl.system_prompt.items {
-            match entry {
-                YamlSystemPromptItem::Collection { name, .. } => {
-                    register_collection_id(
-                        name,
-                        lid,
-                        &mut layer_collection_names,
-                        &mut layer_collections,
-                        &mut maps,
-                        &mut collection_alloc,
-                    )?;
-                }
-                // Collections embedded as section-tree nodes also need their id
-                // pre-allocated so `depends_on` references resolve.
-                YamlSystemPromptItem::SectionTree { nodes } => {
-                    register_tree_collection_ids(
-                        nodes,
-                        lid,
-                        &mut layer_collection_names,
-                        &mut layer_collections,
-                        &mut maps,
-                        &mut collection_alloc,
-                    )?;
-                }
-                _ => {}
-            }
-        }
-
-        // Second pass — actually build the schema items, resolving
-        // every `depends_on` string against the pre-allocated
-        // collection-name map.
-        for entry in &yl.system_prompt.items {
-            match entry {
-                YamlSystemPromptItem::Section {
-                    id,
-                    content,
-                    priority,
-                    depends_on,
-                    depends_on_absent,
-                } => {
-                    if !layer_section_names.insert(id.clone()) {
-                        return Err(ConstructionError::DuplicateSectionName(id.clone()));
-                    }
-                    let sid = section_alloc.next();
-                    maps.section_names.insert((lid, id.clone()), sid);
-                    let pri = priority.unwrap_or(50.0);
-                    validate_priority(&format!("{}/{}", yl.name, id), pri)?;
-                    let resolve_dep = |name: &Option<String>| -> Result<_, ConstructionError> {
-                        match name {
-                            Some(name) => {
-                                Ok(Some(*layer_collections.get(name).ok_or_else(|| {
-                                    ConstructionError::UnknownCollection(format!(
-                                        "{}: section '{}' depends_on unknown collection '{}'",
-                                        yl.name, id, name,
-                                    ))
-                                })?))
-                            }
-                            None => Ok(None),
-                        }
-                    };
-                    let depends_on_cid = resolve_dep(depends_on)?;
-                    let depends_on_absent_cid = resolve_dep(depends_on_absent)?;
-                    items.push(SystemPromptItem::Section(SectionSchema {
-                        id: sid,
-                        name: id.clone(),
-                        content: content.clone(),
-                        priority: pri,
-                        depends_on: depends_on_cid,
-                        depends_on_absent: depends_on_absent_cid,
-                        is_template: false,
-                        template_tokens: None,
-                    }));
-                }
-                YamlSystemPromptItem::Template {
-                    id,
-                    dialect: dialect_name,
-                    depends_on,
-                } => {
-                    // Dialect required; cannot resolve template content
-                    // without one. Surface a schema-locatable error.
-                    let dlct = dialect.ok_or_else(|| ConstructionError::DialectRequired {
-                        item: format!("{}/{}", yl.name, id),
-                    })?;
-                    let template =
-                        DialectTemplate::from_yaml_name(dialect_name).ok_or_else(|| {
-                            ConstructionError::UnknownDialectTemplate {
-                                item: format!("{}/{}", yl.name, id),
-                                name: dialect_name.clone(),
-                            }
-                        })?;
-                    let content = dlct.template(template);
-                    // Empty-string templates (e.g. NoThinkPrefix for a
-                    // dialect that doesn't suppress thinking) are dropped
-                    // at build time — projection never sees a no-op
-                    // segment.
-                    if content.is_empty() {
-                        continue;
-                    }
-                    if !layer_section_names.insert(id.clone()) {
-                        return Err(ConstructionError::DuplicateSectionName(id.clone()));
-                    }
-                    let sid = section_alloc.next();
-                    maps.section_names.insert((lid, id.clone()), sid);
-                    let depends_on_cid = match depends_on {
-                        Some(name) => Some(*layer_collections.get(name).ok_or_else(|| {
-                            ConstructionError::UnknownCollection(format!(
-                                "{}: template '{}' depends_on unknown collection '{}'",
-                                yl.name, id, name,
-                            ))
-                        })?),
-                        None => None,
-                    };
-                    items.push(SystemPromptItem::Section(SectionSchema {
-                        id: sid,
-                        name: id.clone(),
-                        content: content.to_string(),
-                        priority: 50.0,
-                        depends_on: depends_on_cid,
-                        depends_on_absent: None,
-                        is_template: true,
-                        template_tokens: None,
-                    }));
-                }
-                YamlSystemPromptItem::Collection {
-                    name,
-                    selection,
-                    score_threshold,
-                    policy: coll_policy_yaml,
-                    summary,
-                    sections,
-                    member_glue,
-                    default: coll_default,
-                } => {
-                    let cid = *layer_collections
-                        .get(name)
-                        .expect("first-pass pre-allocated every collection id");
-                    let label = format!("{}/{}", yl.name, name);
-                    let coll_selection = parse_selection(&label, selection)?;
-                    if *score_threshold < 0.0 {
-                        return Err(ConstructionError::NegativeScoreThreshold {
-                            name: label.clone(),
-                            value: *score_threshold,
-                        });
-                    }
-
-                    let mut sec_schemas = Vec::with_capacity(sections.len());
-                    for s in sections {
-                        if !layer_section_names.insert(s.id.clone()) {
-                            return Err(ConstructionError::DuplicateSectionName(s.id.clone()));
-                        }
-                        let sid = section_alloc.next();
-                        maps.section_names.insert((lid, s.id.clone()), sid);
-                        let pri = s.priority.unwrap_or(50.0);
-                        validate_priority(&format!("{}/{}", yl.name, s.id), pri)?;
-                        sec_schemas.push(SectionSchema {
-                            id: sid,
-                            name: s.id.clone(),
-                            content: s.content.clone(),
-                            priority: pri,
-                            depends_on: None,
-                            depends_on_absent: None,
-                            is_template: false,
-                            template_tokens: None,
-                        });
-                    }
-
-                    // A collection with no explicit `policy:` but a `top_k`
-                    // selection derives its belief budget from that rule — the
-                    // count `k` becomes the budget max and `score_threshold` the
-                    // min/evict floor, so it selects exactly like the old top_k.
-                    // An explicit `policy:` (e.g. the production `tools`
-                    // collection) always wins.
-                    let coll_policy = match (coll_policy_yaml.as_ref(), &coll_selection) {
-                        (None, SelectionRule::TopK { k }) => {
-                            let mut config = layer_policy.config;
-                            config.min_score = *score_threshold;
-                            config.evict_score = *score_threshold;
-                            config.budget_min = 0;
-                            config.budget_max = *k;
-                            SelectionPolicy {
-                                config,
-                                tags: layer_policy.tags.clone(),
-                                layer_weights: layer_policy.layer_weights.clone(),
-                            }
-                        }
-                        _ => parse_policy(&label, coll_policy_yaml.as_ref(), &layer_policy)?,
-                    };
-                    let coll_summary = build_group_summary(
-                        &label,
-                        summary,
-                        format!("__summary__{name}"),
-                        &mut section_alloc,
-                    )?;
-                    items.push(SystemPromptItem::Collection(SectionCollection {
-                        id: cid,
-                        name: name.clone(),
-                        sections: sec_schemas,
-                        selection: coll_selection,
-                        score_threshold: *score_threshold,
-                        policy: coll_policy,
-                        summary: coll_summary,
-                        summary_section: None,
-                        member_glue: member_glue.clone().unwrap_or_default(),
-                        member_glue_tokens: None,
-                        default: parse_default(coll_default.as_ref()),
-                    }));
-                }
-                YamlSystemPromptItem::SectionTree { nodes } => {
-                    items.push(build_section_tree(
-                        &yl.name,
-                        lid,
-                        nodes,
-                        dialect,
-                        &mut section_alloc,
-                        &mut maps,
-                        &mut layer_section_names,
-                        &layer_collections,
-                    )?);
-                }
-            }
-        }
+        // Per-layer dial overrides for the shared system prompt (applied when
+        // this layer is the projection target). Empty inherits the section-tree
+        // defaults.
+        let dials = LayerDials::from_pairs(
+            yl.dials
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
 
         // ── this layer's groups ──────────────────────────────────────────────
         let mut groups = Vec::with_capacity(yl.groups.len());
@@ -1018,7 +778,7 @@ fn build(
             score_threshold: yl.score_threshold,
             window: yl.window,
             budget: layer_budget,
-            system_prompt: SystemPromptSchema { items },
+            dials,
             summary: layer_summary,
             groups,
             policy: layer_policy,
@@ -1026,8 +786,272 @@ fn build(
         });
     }
 
-    let schema = Schema { layers };
+    let schema = Schema {
+        layers,
+        system_prompt,
+    };
     Ok((schema, maps))
+}
+
+/// Build the single shared [`SystemPromptSchema`] from the top-level
+/// `system_prompt:` block. Section and collection names register under
+/// [`LayerId::system_prompt`] (not any real layer, since the prompt is shared).
+/// Two input forms are accepted, exactly as the former per-layer prompt: a legacy
+/// flat `sections:` list (always-emit, head of the stream) and the modern
+/// interleaved `items:` list (sections / templates / collections / section-trees,
+/// where ordering matters). Collections with no explicit `policy:` inherit
+/// `base_policy` (the schema default).
+#[allow(clippy::too_many_arguments)]
+fn build_system_prompt(
+    raw_sp: &YamlSystemPrompt,
+    dialect: Option<&Dialect>,
+    base_policy: &SelectionPolicy,
+    section_alloc: &mut SectionIdAlloc,
+    collection_alloc: &mut CollectionIdAlloc,
+    maps: &mut NameMaps,
+) -> Result<SystemPromptSchema, ConstructionError> {
+    let lid = LayerId::system_prompt();
+    let owner = "system_prompt";
+    let mut items: Vec<SystemPromptItem> = Vec::new();
+    let mut section_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut collection_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Legacy `sections:` shortcut — emit before any items.
+    for s in &raw_sp.sections {
+        if !section_names.insert(s.id.clone()) {
+            return Err(ConstructionError::DuplicateSectionName(s.id.clone()));
+        }
+        let sid = section_alloc.next();
+        maps.section_names.insert((lid, s.id.clone()), sid);
+        let priority = s.priority.unwrap_or(50.0);
+        validate_priority(&format!("{}/{}", owner, s.id), priority)?;
+        items.push(SystemPromptItem::Section(SectionSchema {
+            id: sid,
+            name: s.id.clone(),
+            content: s.content.clone(),
+            priority,
+            depends_on: None,
+            depends_on_absent: None,
+            is_template: false,
+            template_tokens: None,
+        }));
+    }
+
+    // First pass — pre-allocate every Collection's id (including tree-embedded
+    // ones) so a Section's `depends_on: <collection>` can reference a collection
+    // declared later.
+    let mut collections: std::collections::HashMap<String, super::ids::CollectionId> =
+        std::collections::HashMap::new();
+    for entry in &raw_sp.items {
+        match entry {
+            YamlSystemPromptItem::Collection { name, .. } => {
+                register_collection_id(
+                    name,
+                    lid,
+                    &mut collection_names,
+                    &mut collections,
+                    maps,
+                    collection_alloc,
+                )?;
+            }
+            YamlSystemPromptItem::SectionTree { nodes } => {
+                register_tree_collection_ids(
+                    nodes,
+                    lid,
+                    &mut collection_names,
+                    &mut collections,
+                    maps,
+                    collection_alloc,
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass — build the schema items, resolving `depends_on` against the
+    // pre-allocated collection-name map.
+    for entry in &raw_sp.items {
+        match entry {
+            YamlSystemPromptItem::Section {
+                id,
+                content,
+                priority,
+                depends_on,
+                depends_on_absent,
+            } => {
+                if !section_names.insert(id.clone()) {
+                    return Err(ConstructionError::DuplicateSectionName(id.clone()));
+                }
+                let sid = section_alloc.next();
+                maps.section_names.insert((lid, id.clone()), sid);
+                let pri = priority.unwrap_or(50.0);
+                validate_priority(&format!("{}/{}", owner, id), pri)?;
+                let resolve_dep = |name: &Option<String>| -> Result<_, ConstructionError> {
+                    match name {
+                        Some(name) => Ok(Some(*collections.get(name).ok_or_else(|| {
+                            ConstructionError::UnknownCollection(format!(
+                                "{}: section '{}' depends_on unknown collection '{}'",
+                                owner, id, name,
+                            ))
+                        })?)),
+                        None => Ok(None),
+                    }
+                };
+                let depends_on_cid = resolve_dep(depends_on)?;
+                let depends_on_absent_cid = resolve_dep(depends_on_absent)?;
+                items.push(SystemPromptItem::Section(SectionSchema {
+                    id: sid,
+                    name: id.clone(),
+                    content: content.clone(),
+                    priority: pri,
+                    depends_on: depends_on_cid,
+                    depends_on_absent: depends_on_absent_cid,
+                    is_template: false,
+                    template_tokens: None,
+                }));
+            }
+            YamlSystemPromptItem::Template {
+                id,
+                dialect: dialect_name,
+                depends_on,
+            } => {
+                let dlct = dialect.ok_or_else(|| ConstructionError::DialectRequired {
+                    item: format!("{}/{}", owner, id),
+                })?;
+                let template = DialectTemplate::from_yaml_name(dialect_name).ok_or_else(|| {
+                    ConstructionError::UnknownDialectTemplate {
+                        item: format!("{}/{}", owner, id),
+                        name: dialect_name.clone(),
+                    }
+                })?;
+                let content = dlct.template(template);
+                // Empty-string templates (e.g. NoThinkPrefix for a dialect that
+                // doesn't suppress thinking) are dropped at build time.
+                if content.is_empty() {
+                    continue;
+                }
+                if !section_names.insert(id.clone()) {
+                    return Err(ConstructionError::DuplicateSectionName(id.clone()));
+                }
+                let sid = section_alloc.next();
+                maps.section_names.insert((lid, id.clone()), sid);
+                let depends_on_cid = match depends_on {
+                    Some(name) => Some(*collections.get(name).ok_or_else(|| {
+                        ConstructionError::UnknownCollection(format!(
+                            "{}: template '{}' depends_on unknown collection '{}'",
+                            owner, id, name,
+                        ))
+                    })?),
+                    None => None,
+                };
+                items.push(SystemPromptItem::Section(SectionSchema {
+                    id: sid,
+                    name: id.clone(),
+                    content: content.to_string(),
+                    priority: 50.0,
+                    depends_on: depends_on_cid,
+                    depends_on_absent: None,
+                    is_template: true,
+                    template_tokens: None,
+                }));
+            }
+            YamlSystemPromptItem::Collection {
+                name,
+                selection,
+                score_threshold,
+                policy: coll_policy_yaml,
+                summary,
+                sections,
+                member_glue,
+                default: coll_default,
+            } => {
+                let cid = *collections
+                    .get(name)
+                    .expect("first-pass pre-allocated every collection id");
+                let label = format!("{}/{}", owner, name);
+                let coll_selection = parse_selection(&label, selection)?;
+                if *score_threshold < 0.0 {
+                    return Err(ConstructionError::NegativeScoreThreshold {
+                        name: label.clone(),
+                        value: *score_threshold,
+                    });
+                }
+
+                let mut sec_schemas = Vec::with_capacity(sections.len());
+                for s in sections {
+                    if !section_names.insert(s.id.clone()) {
+                        return Err(ConstructionError::DuplicateSectionName(s.id.clone()));
+                    }
+                    let sid = section_alloc.next();
+                    maps.section_names.insert((lid, s.id.clone()), sid);
+                    let pri = s.priority.unwrap_or(50.0);
+                    validate_priority(&format!("{}/{}", owner, s.id), pri)?;
+                    sec_schemas.push(SectionSchema {
+                        id: sid,
+                        name: s.id.clone(),
+                        content: s.content.clone(),
+                        priority: pri,
+                        depends_on: None,
+                        depends_on_absent: None,
+                        is_template: false,
+                        template_tokens: None,
+                    });
+                }
+
+                // A collection with no explicit `policy:` but a `top_k` selection
+                // derives its belief budget from that rule (k → budget max,
+                // score_threshold → min/evict floor). An explicit `policy:` wins.
+                let coll_policy = match (coll_policy_yaml.as_ref(), &coll_selection) {
+                    (None, SelectionRule::TopK { k }) => {
+                        let mut config = base_policy.config;
+                        config.min_score = *score_threshold;
+                        config.evict_score = *score_threshold;
+                        config.budget_min = 0;
+                        config.budget_max = *k;
+                        SelectionPolicy {
+                            config,
+                            tags: base_policy.tags.clone(),
+                            layer_weights: base_policy.layer_weights.clone(),
+                        }
+                    }
+                    _ => parse_policy(&label, coll_policy_yaml.as_ref(), base_policy)?,
+                };
+                let coll_summary = build_group_summary(
+                    &label,
+                    summary,
+                    format!("__summary__{name}"),
+                    section_alloc,
+                )?;
+                items.push(SystemPromptItem::Collection(SectionCollection {
+                    id: cid,
+                    name: name.clone(),
+                    sections: sec_schemas,
+                    selection: coll_selection,
+                    score_threshold: *score_threshold,
+                    policy: coll_policy,
+                    summary: coll_summary,
+                    summary_section: None,
+                    member_glue: member_glue.clone().unwrap_or_default(),
+                    member_glue_tokens: None,
+                    default: parse_default(coll_default.as_ref()),
+                }));
+            }
+            YamlSystemPromptItem::SectionTree { nodes } => {
+                items.push(build_section_tree(
+                    owner,
+                    lid,
+                    nodes,
+                    dialect,
+                    section_alloc,
+                    maps,
+                    &mut section_names,
+                    &collections,
+                )?);
+            }
+        }
+    }
+
+    Ok(SystemPromptSchema { items })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

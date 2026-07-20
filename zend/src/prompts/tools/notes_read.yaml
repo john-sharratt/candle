@@ -1,0 +1,107 @@
+name: notes_read
+category: Notes
+description: Retrieve the full body content of one stored note by its exact key. Notes persist across conversations.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    key:
+      description: Exact key of the note to read. Required.
+      minLength: 1
+      type: string
+  required:
+  - key
+  title: ReadRequest
+  type: object
+examples:
+- |-
+  read the note titled deployment-runbook<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to read a note titled "deployment-runbook". Let me check the tools available. There's a function called notes_read that retrieves a note by its exact key. The parameters require a 'key' which is a string. The user provided the title, so I should use that as<|projection|> the key. I need to make sure the JSON is correctly formatted with the key inside a "notes_read" object. Let me structure the tool call accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "deployment-runbook"}}
+  </tool_call><|projection|>
+- |-
+  show me the note titled todo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to see a note titled "todo". Let me check the tools available. There's a function called notes_read that retrieves a note by its exact key. The parameters require a 'key' which is a string. Since the user mentioned the title is "todo", I should use<|projection|> that as the key. I need to make sure the JSON is correctly formatted with the key parameter. Alright, the tool call should be notes_read with the argument {"key": "todo"}.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "todo"}}
+  </tool_call><|projection|>
+- |-
+  read the note titled standup-2026-06-15<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to read a note titled "standup-2026-06-15". Let me check the available tools. There's a tool called notes_read that retrieves a note by its exact key. The parameters require a 'key' which is the exact key of the<|projection|> note. Since the user provided the title, I should use that as the key. So I need to call notes_read with the key set to "standup-2026-06-15". I should make sure the JSON is correctly formatted with the key in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "standup-2026-06-15"}}
+  </tool_call><|projection|>
+- |-
+  open the note titled database-schema<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to open a note titled "database-schema". Let me check the available tools. There's a function called notes_read that retrieves a note by its exact key. The parameters require a 'key' which is the exact key of the note. Since the user mentioned the title is "database<|projection|>-schema", I should use that as the key. I need to make sure to format the tool call correctly with the name and arguments in JSON. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "database-schema"}}
+  </tool_call><|projection|>
+- |-
+  pull up my note called onboarding-checklist<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to pull up their note called "onboarding-checklist". Let me check the tools available. There's a function called notes_read that retrieves a note by its exact key. The parameters require the key, which in this case is "onboarding-checklist". I need to make sure<|projection|> the JSON structure is correct with the key parameter. Alright, that's all I need to call the tool.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "onboarding-checklist"}}
+  </tool_call><|projection|>
+- |-
+  what did I write in the note titled retro-notes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking about a note they wrote titled "retro-notes". They want to know what's in it. Let me check the tools available.
+
+  Looking at the tools provided, there's a function called notes_read. Its purpose is to retrieve the full body content of a stored note using its<|projection|> exact key. The parameters require a key, which is the exact title or identifier of the note.
+
+  The user mentioned the title "retro-notes", so I should use that as the key. The function requires the key to be a string with at least one character, which "retro-notes" satisfies.
+
+  <|projection|>Since the user is asking for the contents of the note titled "retro-notes", calling notes_read with the key "retro-notes" makes sense. There's no mention of other notes or additional parameters needed.
+
+  I need to structure the tool call correctly. The name of the tool is "notes_read" and<|projection|> the arguments should be a JSON object with the key "key" set to "retro-notes".
+
+  Double-checking the required parameters: the key is required, and the schema is correct. No other tools are available, so this is the right approach. I'll format the response as specified, enclosing the tool call<|projection|> in the XML tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "retro-notes"}}
+  </tool_call><|projection|>
+- |-
+  fetch the contents of the note keyed vacation-plans<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to fetch the contents of a note keyed "vacation-plans". Let me check the available tools. There's a tool called notes_read which retrieves the full body content of a note by its exact key. The parameters require a "key" which is a string and required.
+
+  So<|projection|>, I need to call notes_read with the key set to "vacation-plans". The user didn't mention any other parameters, so I don't need to include anything else. Just make sure the JSON is correctly formatted with the key in the arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "vacation-plans"}}
+  </tool_call><|projection|>
+- |-
+  let me see the note titled 'ssl-cert-renewal'<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to read a note titled 'ssl-cert-renewal'. I need to use the notes_read tool. The parameters require the exact key. So I'll call the tool with the key 'ssl-cert-renewal'.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "notes_read", "arguments": {"key": "ssl-cert-renewal"}}
+  </tool_call><|projection|>

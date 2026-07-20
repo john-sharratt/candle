@@ -143,6 +143,16 @@ impl LayerId {
     pub fn from_raw(n: u32) -> Option<Self> {
         NonZeroU32::new(n).map(Self)
     }
+
+    /// The name-scoping id for the schema's single [`super::Schema::system_prompt`].
+    /// Its sections and collections register under this id in [`super::NameMaps`];
+    /// it is distinct from every real layer (`1..n`) and sits below the engine's
+    /// reserved band, so it is never mistaken for a real or reserved layer. Not a
+    /// real layer — only a stable map key so runtime section lookups (e.g. zend's
+    /// tool-catalog install) resolve the shared prompt.
+    pub(super) fn system_prompt() -> Self {
+        Self::new(u32::MAX / 2)
+    }
 }
 
 /// Opaque identifier for a group. **Globally unique** across all layers in a

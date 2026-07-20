@@ -86,7 +86,8 @@ fn datetime_invalid_timezone() {
 }
 
 #[test]
-fn datetime_schema_registered() {
-    let schema = harness::schema("datetime");
-    assert!(schema["properties"].is_object());
+fn datetime_registered() {
+    // Execution registration (the definition + its `parameters` schema now live
+    // in the bundled tool file, validated in the `zend` crate).
+    assert!(zend_tools::registry::find("datetime").is_some());
 }

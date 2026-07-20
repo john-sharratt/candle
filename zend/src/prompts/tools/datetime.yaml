@@ -1,0 +1,123 @@
+name: datetime
+category: Utilities & web
+description: 'Return the current date and time in a specified IANA timezone. Use for: getting today''s date, current time in a particular city or zone, what day of the week it is, the current ISO timestamp for logging, checking the time in another part of the world. Triggered by "what time is it", "what''s the date", "what day is today", "current time in [city]", "time in Tokyo right now", "what''s today''s date". Returns ISO 8601 timestamp, unix epoch, weekday name, and timezone. Stateless and instant — anchors the model when it would otherwise hallucinate dates.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    timezone:
+      description: IANA timezone name (e.g. "America/New_York", "Europe/London", "Asia/Tokyo"). Defaults to "UTC" if omitted.
+      type:
+      - string
+      - 'null'
+  title: Request
+  type: object
+examples:
+- |-
+  what time is it in Tokyo right now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current time in Tokyo. Let me check the tools available. There's a datetime tool that returns the current date and time in a specified IANA timezone. The parameters require a timezone, which defaults to UTC if omitted. Since the user mentioned Tokyo, I need to use<|projection|> the correct IANA timezone name for Tokyo. I think it's "Asia/Tokyo". I should call the datetime tool with that timezone parameter. Let me make sure there are no typos. Alright, the tool will handle the rest and return the current time in Tokyo.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "Asia/Tokyo"}}
+  </tool_call><|projection|>
+- |-
+  what's today's date<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for today's date. I need to use the datetime tool for that. The tool requires a timezone, but the user didn't specify one. The default is UTC, so I'll go with that. Let me check the parameters again. The timezone parameter is optional, and if<|projection|> omitted, it defaults to UTC. So I can call the datetime function without any arguments. Wait, the tool's parameters show that the timezone is a string or null, with a default of "UTC" if omitted. So I don't need to include the timezone in the request. The response will include the current date<|projection|> and time in UTC. Alright, I'll make the tool call without specifying the timezone.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what's the current time in America/New_York<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current time in America/New_York. I need to use the datetime tool for this. The tool requires a timezone parameter, which in this case is "America/New_York". I'll structure the tool call with that timezone. Let me double-check the parameters to make<|projection|> sure I'm not missing anything. Everything looks good. Time to send the tool call.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "America/New_York"}}
+  </tool_call><|projection|>
+- |-
+  give me the current UTC date and time<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current UTC date and time. Let me check the tools available. There's a datetime tool that returns the current time in a specified IANA timezone. The default is UTC if not specified. So I need to call the datetime function with the timezone set to UTC. Wait<|projection|>, the parameters say that the timezone is optional, and the default is UTC. So even if I don't specify it, it should return UTC. But maybe it's better to explicitly set it to ensure. Hmm, but the user specifically mentioned UTC, so including it makes sense. Alright, I'll structure the tool<|projection|> call with the timezone parameter as "UTC". Then the tool will handle the rest. Let me make sure the JSON is correctly formatted. The name is "datetime" and the arguments are {"timezone": "UTC"}. Yep, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "UTC"}}
+  </tool_call><|projection|>
+- |-
+  what day of the week is it today<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking, "what day of the week is it today." I need to figure out how to respond using the available tools. Let me check the tools provided.
+
+  Looking at the tools section, there's a tool called "datetime" that returns the current date and time in a specified I<|projection|>ANA timezone. The parameters include a timezone, which defaults to UTC if not provided. The tool returns details like the ISO timestamp, Unix epoch, weekday name, and timezone.
+
+  Since the user is asking for the current day of the week, I should use this datetime tool. The default timezone is UTC, but maybe<|projection|> the user expects their local time. However, since the user didn't specify a timezone, maybe I should use the default. Wait, the tool's description says it can handle different timezones, but the user hasn't mentioned any specific location.
+
+  Wait, the user just asks for "today's day of the week."<|projection|> Without a specified timezone, the tool will use UTC. But perhaps the user's system timezone is different. However, since the tool requires an explicit timezone, and the user hasn't provided one, maybe the assistant should default to UTC. Alternatively, maybe the tool has a way to detect the user's timezone, but according<|projection|> to the tool's parameters, it's required as a parameter.
+
+  Wait, looking at the parameters: the timezone is a string or null, with a default of "UTC" if omitted. Wait, the JSON schema says "default": "UTC" for the timezone? Let me check the tool definition again.
+
+  The<|projection|> tool's parameters have "timezone" with a description that says "defaults to 'UTC' if omitted." So, if the user doesn't specify a timezone, it uses UTC. Therefore, when I call the datetime tool without a timezone, it will return the current time in UTC. Then, the response will include the<|projection|> weekday name.
+
+  So, the correct action here is to invoke the datetime tool with no arguments, allowing it to use the default UTC timezone. Then, the response will include the current day of the week.
+
+  Therefore, the assistant should make the tool call as specified.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what's the current local time in Asia/Dubai<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current local time in Asia/Dubai. Let me check the tools available. There's a datetime tool that returns the current date and time in a specified IANA timezone. The parameters require a timezone, which defaults to UTC if omitted. Since the user specified Asia/D<|projection|>ubai, I need to call the datetime function with that timezone. I'll make sure to format the JSON correctly with the timezone parameter set to "Asia/Dubai". No other parameters are needed. Let me structure the tool call properly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "Asia/Dubai"}}
+  </tool_call><|projection|>
+- |-
+  tell me the current Unix timestamp<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking for the current Unix timestamp. Let me check the tools available. There's a tool called 'datetime' that returns the current date and time in a specified IANA timezone. The parameters include a timezone, which defaults to UTC if not provided. Since the user didn't specify a<|projection|> timezone, I should use the default.
+
+  The datetime tool's description mentions it returns the ISO 8601 timestamp, Unix epoch, weekday name, and timezone. So calling this tool without any arguments should give the current time in UTC. The Unix timestamp is the number of seconds since January 1, 1<|projection|>970, UTC.
+
+  I need to make sure that the tool is called correctly. The parameters are optional, so I can just call the datetime function without any arguments. The response from the tool will include the Unix timestamp, which is what the user is asking for. Alright, let's proceed with that.
+  <|projection|></think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  if it's 3pm here in Berlin, what time is it in Sydney<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking if it's 3 PM here in Berlin, what time is it in Sydney. Alright, I need to figure out the current time in Berlin and then add the time difference to get Sydney's time. But wait, I don't have access to real-time data. Oh right<|projection|>, there's a tool called datetime that can get the current time based on the timezone. So I should use that.
+
+  First, I'll check the current time in Berlin. The IANA timezone for Berlin is Europe/Berlin. Then, I need to determine the current time in Sydney, which is in the A<|projection|>US timezone, specifically Australia/Sydney. But wait, daylight saving might affect the UTC offset. However, the datetime tool should handle that automatically by using the correct timezone names.
+
+  So, I should make two separate calls to the datetime tool: one for Berlin and another for Sydney. Wait, but the user is asking<|projection|> for the current time in Sydney when it's 3 PM in Berlin. But since the current time is dynamic, I need to fetch both times simultaneously. However, the tool allows me to specify a single timezone per call. So perhaps I can first get the current time in Berlin, then calculate the difference. Alternatively,<|projection|> just get both times at once.
+
+  Wait, the user isn't asking for the current time, but rather a hypothetical scenario: if it's 3 PM in Berlin, what's the time in Sydney. But that's not how time zones work. The actual time in Sydney depends on the current time in Berlin. But<|projection|> since the user might be looking for the current time in both places, I should provide the current time in both cities. But the user's question is phrased as "if it's 3pm here in Berlin, what time is it in Sydney." So they want to know the current time in Sydney when it<|projection|>'s 3 PM in Berlin. However, the actual current time in Berlin and Sydney would depend on the current UTC time.
+
+  But since I can't access real-time data, I need to use the datetime tool to get the current time in both locations. Therefore, I'll call the datetime tool twice: once with the<|projection|> timezone set to Europe/Berlin and another for Australia/Sydney. Then, I can present both times to answer the user's question accurately.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "Europe/Berlin"}}
+  </tool_call>
+  <|projection|><tool_call>
+  <|projection|>{"name": "datetime", "arguments": {"timezone": "Australia/Sydney"}}
+  </tool_call><|projection|>

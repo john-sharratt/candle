@@ -1,0 +1,345 @@
+name: aead_decrypt
+category: Cryptography
+description: Decrypt and authenticate AEAD ciphertext — aes128gcm, aes256gcm, or chacha20poly1305 — verifying the integrity tag and rejecting any tampered input. Returns recovered plaintext as text when valid UTF-8, otherwise hex.
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    AeadAlgorithm:
+      description: AEAD cipher.
+      enum:
+      - aes128gcm
+      - aes256gcm
+      - chacha20poly1305
+      type: string
+  properties:
+    aad:
+      description: Optional additional authenticated data (UTF-8 text) — must match what was used to encrypt.
+      type:
+      - string
+      - 'null'
+    algorithm:
+      allOf:
+      - $ref: '#/definitions/AeadAlgorithm'
+      description: 'AEAD cipher. One of: aes128gcm, aes256gcm, chacha20poly1305.'
+      minItems: 1
+      minLength: 1
+    ciphertext_hex:
+      description: Ciphertext-with-tag as hex, exactly as returned by aead_encrypt.
+      minLength: 1
+      type: string
+    key_hex:
+      description: 'Secret key as hex: 32 hex chars (16 bytes) for aes128gcm; 64 hex chars (32 bytes) for aes256gcm and chacha20poly1305.'
+      maxLength: 64
+      minLength: 32
+      type: string
+    nonce_hex:
+      description: The 12-byte nonce as 24 hex chars (the `nonce_hex` aead_encrypt returned).
+      maxLength: 24
+      minLength: 24
+      type: string
+  required:
+  - algorithm
+  - ciphertext_hex
+  - key_hex
+  - nonce_hex
+  title: AeadDecryptRequest
+  type: object
+examples:
+- |-
+  decrypt the AES-128-GCM ciphertext 3a7f9c2e1b8d with key 000102030405060708090a0b0c0d0e0f, nonce 0102030405060708090a0b0c, and no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt a ciphertext using AES-128-GCM. The ciphertext is 3a7f9c2e1b8d, the key is 0001020304050607080<|projection|>90a0b0c0d0e0f, and the nonce is 0102030405060708090a0b0c. They mentioned no AAD.
+
+  First, I need to check the parameters. The algorithm is AES-<|projection|>128-GCM, which corresponds to the 'aes128gcm' in the tool. The key hex should be 32 characters (16 bytes), which the provided key is. The nonce is 24 hex chars (12 bytes), which matches. The ciphertext is given as a<|projection|> hex string.
+
+  Since there's no AAD, the 'aad' parameter can be null. So, I'll structure the tool call with these values. Make sure all required fields are included: algorithm, ciphertext_hex, key_hex, nonce_hex. The aad is optional and can be omitted or set to null.
+
+  <|projection|>Wait, the tool's parameters require 'aad' as a string or null. Since the user says no AAD, I should include it as null. But looking at the tool's required fields, 'aad' isn't in the required list. So maybe it's okay to omit it. But to be safe,<|projection|> include it as null.
+
+  So the JSON arguments would be:
+
+  {
+    "algorithm": "aes128gcm",
+    "ciphertext_hex": "3a7f9c2e1b8d",
+    "key_hex": "0001020304050<|projection|>60708090a0b0c0d0e0f",
+    "nonce_hex": "0102030405060708090a0b0c",
+    "aad": null
+  <|projection|>}
+
+  I think that's all.<|projection|> The tool will handle the decryption if the parameters are correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes128gcm", "ciphertext_hex": "3a7f9c2e1b8d", "key_hex": "000102030405060708090a0b0c0d0e0f", "nonce_hex": "0102030405060708090a0b0c", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  decrypt the ChaCha20-Poly1305 ciphertext 9f3c7a2e with key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 000102030405060708090a0b, no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt a ciphertext using ChaCha20-Poly1305. The ciphertext is 9f3c7a2e. The key provided is 0011223344556677889<|projection|>900aabbccddeeff00112233445566778899aabbccddee. The nonce is 000102030405060708090a0b. They mentioned<|projection|> no AAD.
+
+  First, I need to check if the parameters are correct. The algorithm is ChaCha20-Poly1305, which is supported. The key length for ChaCha20 is 32 bytes (64 hex chars). The given key is 64 characters long, so<|projection|> that's good. The nonce should be 12 bytes (24 hex chars), and the provided nonce is 24 chars. The ciphertext is 8 hex chars, which is 4 bytes. Wait, but ChaCha20-Poly1305 typically has a tag of 16 bytes<|projection|>, so the ciphertext should include the tag. But the user provided 9f3c7a2e, which is 8 bytes. That might be an issue. However, maybe it's a shortened example.
+
+  But according to the tool's description, the ciphertext_hex is exactly as returned by aead_encrypt.<|projection|> So I need to pass it as given. The tool will handle the decryption. So the parameters are:
+
+  algorithm: chacha20poly1305
+  <|projection|>ciphertext_hex: 9f3c7a2e
+  key_hex: 0011223344556<|projection|>677889900aabbccddeeff00112233445566778899aabbccddee
+  <|projection|>nonce_hex: 000102030405060708090<|projection|>a0b
+  aad: null (since no AAD)
+
+  So I should call aead_decrypt with these parameters. The user didn't mention any AAD, so that's set to null. The tool will handle the rest.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "chacha20poly1305", "ciphertext_hex": "9f3c7a2e", "key_hex": "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee", "nonce_hex": "000102030405060708090a0b", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  decrypt the AES-256-GCM ciphertext 5e1a3f9c with key 0011223344556677889900aabbccddeeff00112233445566778899aabbccddee, nonce 0102030405060708090a0b0c, and no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt a ciphertext using AES-256-GCM. The ciphertext is 5e1a3f9c. The key provided is 0011223344556677889900<|projection|>aabbccddeeff00112233445566778899aabbccddee. The nonce is 0102030405060708090a0b0c. Also, there's no<|projection|> AAD.
+
+  First, I need to check if the tool supports this. The available tool is aead_decrypt. The parameters required are algorithm, ciphertext_hex, key_hex, nonce_hex, and optional aad.
+
+  The algorithm should be "aes256gcm" since it's AES-256-G<|projection|>CM. The ciphertext is given as hex, so that's straightforward. The key is 32 bytes (64 hex chars), which matches AES-256. The nonce is 12 bytes (24 hex chars), which is correct. The user mentioned no AAD, so aad can be<|projection|> null or omitted.
+
+  Wait, the key in the example has 32 bytes: 0011...ee. Let me count the hex characters. The key is 0011223344556677889900aabbccddeeff0<|projection|>0112233445566778899aabbccddee. Let's see: each pair is 2 hex digits. Let's count:
+
+  00 11 22 33 44 55 66 77 <|projection|>88 99 00 aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee. That's 32 bytes (since 64 hex chars).<|projection|> So that's correct for AES-256.
+
+  The nonce is 0102030405060708090a0b0c, which is 12 bytes (24 hex chars). Correct.
+
+  So the parameters would be:
+
+  algorithm: "aes<|projection|>256gcm"
+  ciphertext_hex: "5e1a3f9c"
+  key_hex: "0011223344556677889900aabbccddeeff0011223344556<|projection|>6778899aabbccddee"
+  nonce_hex: "0102030405060708090a0b0c"
+  aad: null
+
+  Wait, but the user said "no AAD", so aad should be omitted or set<|projection|> to null. The tool's parameters say aad is optional, type string or null. So including aad: null would be safe.
+
+  But looking at the tool's required parameters, only algorithm, ciphertext_hex, key_hex, and nonce_hex are required. So maybe aad can be omitted. But to be precise<|projection|>, since the user specified no AAD, it's better to include aad: null.
+
+  So the JSON arguments would be:
+
+  {
+    "algorithm": "aes256gcm",
+    "ciphertext_hex": "5e1a3f9c",
+    "key_hex": "001<|projection|>1223344556677889900aabbccddeeff00112233445566778899aabbccddee",
+    "nonce_hex": "010203040<|projection|>5060708090a0b0c",
+    "aad": null
+  <|projection|>}
+
+  But wait, the ciphertext is 5e1a3f9c. Let me check if that's valid. The ciphertext includes the tag. For AES-GCM, the ciphertext length should be len<|projection|>(plaintext) + 16 (tag). But since the user provided it, we just pass it.
+
+  So the tool call would be correct.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes256gcm", "ciphertext_hex": "5e1a3f9c", "key_hex": "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee", "nonce_hex": "0102030405060708090a0b0c", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  decrypt the AES-128-GCM ciphertext c0ffee11 with key aabbccddeeff00112233445566778899, nonce 00112233445566778899aabb, no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt an AES-128-GCM ciphertext. The ciphertext is given as c0ffee11. The key is aabbccddeeff00112233445566778899, and<|projection|> the nonce is 00112233445566778899aabb. They mentioned no AAD.
+
+  First, I need to check if the tool 'aead_decrypt' can handle this. Looking at the parameters: the algorithm should be 'aes12<|projection|>8gcm', which is in the enum. The ciphertext_hex is c0ffee11. The key_hex is the provided key, which is 32 hex chars (16 bytes), correct for AES-128. The nonce_hex is 00112233445<|projection|>566778899aabb, which is 24 hex chars (12 bytes). The AAD is not provided, so set to null.
+
+  Wait, the user said "no AAD", so the 'aad' parameter should be null. The required parameters are all there: algorithm<|projection|>, ciphertext_hex, key_hex, nonce_hex. So the tool call should include all these parameters. Let me structure the JSON accordingly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes128gcm", "ciphertext_hex": "c0ffee11", "key_hex": "aabbccddeeff00112233445566778899", "nonce_hex": "00112233445566778899aabb", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  open the AES-256-GCM ciphertext 7b2d4e6f8a0c with key 1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100, nonce a1b2c3d4e5f60718293a4b5c, no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt some AES-256-GCM ciphertext. The ciphertext is given as 7b2d4e6f8a0c. The key is 1f1e1d1c1b1a191817<|projection|>161514131211100f0e0d0c0b0a09080706050403020100. The nonce is a1b2c3d4e5f607<|projection|>18293a4b5c. They mentioned no AAD.
+
+  First, I need to check if the tool 'aead_decrypt' can handle this. The parameters required are algorithm, ciphertext_hex, key_hex, nonce_hex, and optional aad. The algorithm here is aes256g<|projection|>cm. The ciphertext is 7b2d4e6f8a0c, which is 12 bytes. Wait, but AES-GCM typically has a tag, so the ciphertext should include the 16-byte tag. But the user provided 12 bytes. Maybe it's a typo?<|projection|> Or maybe the example is simplified. Well, the tool will handle that.
+
+  The key is 1f1e...00, which is 32 hex chars (16 bytes), but for AES-256, the key should be 32 bytes (64 hex). Wait, no:<|projection|> 32 bytes would be 64 hex characters. The given key is 1f1e...00, let me count. Let's see: 1f1e1d1c1b1a191817161514131211<|projection|>100f0e0d0c0b0a09080706050403020100 — that's 64 characters, which is 32 bytes. Oh right, because each byte is two hex digits. So 32<|projection|> bytes is 64 hex chars. So the key is correct for AES-256.
+
+  The nonce is a1b2c3d4e5f60718293a4b5c. Let's check the length. It's 24 hex chars (each pair<|projection|> is a byte), so 12 bytes. That's correct for AES-GCM's nonce, which is typically 12 bytes.
+
+  So all parameters are present. The AAD is not provided, so we can omit it or set to null.
+
+  So the tool call should have:
+
+  algorithm: "aes25<|projection|>6gcm"
+  ciphertext_hex: "7b2d4e6f8a0c"
+  key_hex: "1f1e1d1c1b1a191817161514131211100f0e0d<|projection|>0c0b0a09080706050403020100"
+  nonce_hex: "a1b2c3d4e5f60718293a4b5c"
+  aad: null (or omit it,<|projection|> but the tool's schema says it's optional)
+
+  Wait, the tool's parameters say that 'aad' is a string or null. So including "aad": null might be better.
+
+  So the JSON should be:
+
+  {
+    "algorithm": "aes256gcm",
+    "ciphertext_hex": "7<|projection|>b2d4e6f8a0c",
+    "key_hex": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09<|projection|>080706050403020100",
+    "nonce_hex": "a1b2c3d4e5f60718293a4b5c",
+    "aad": null
+  <|projection|>}
+
+  That's the correct call. The<|projection|> user didn't mention AAD, so it's set to null.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes256gcm", "ciphertext_hex": "7b2d4e6f8a0c", "key_hex": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100", "nonce_hex": "a1b2c3d4e5f60718293a4b5c", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  can you decrypt ChaCha20-Poly1305 blob feedface90ab using key ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100 and nonce 0b0a090807060504030201ff with no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt a ChaCha20-Poly1305 ciphertext. The ciphertext is given as a hex string: feedface90ab. Wait, but the user mentioned "blob feedface90ab", so maybe the actual ciphertext is longer? But<|projection|> the example might be simplified.
+
+  The key provided is ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100. Let<|projection|> me check the length. Each hex character is 4 bits, so 64 hex chars would be 32 bytes, which is correct for ChaCha20's 256-bit key. Wait, but the key for ChaCha20 is 32 bytes (256 bits), right<|projection|>? So this key is 64 hex characters, which is 32 bytes. That's correct.
+
+  The nonce is 0b0a090807060504030201ff. Wait, the user wrote "nonce 0b0a09<|projection|>0807060504030201ff". But the nonce for ChaCha20-Poly1305 should be 12 bytes. Let me check the length of the nonce. The given nonce is 0b0a0908070<|projection|>60504030201ff. Let's count the hex digits: 0b is two characters, then each pair is a byte. Wait, no, the entire string is "0b0a09080706050403020<|projection|>1ff". Let me count the characters: 0b is two, then each pair is a byte. Let me count:
+
+  "0b0a090807060504030201ff" has 2 (for 0b) + 2*<|projection|>11 = 24? Wait, let's write it out:
+
+  0b 0a 09 08 07 06 05 04 03 02 01 ff → that's 12 bytes (each pair is a byte). So the<|projection|> nonce is 12 bytes, which is correct for ChaCha20-Poly1305.
+
+  The user says "using key ... and nonce ..." and "no AAD". So the parameters are: algorithm is chacha20poly1305, ciphertext_hex is the given hex, key_hex<|projection|> as provided, nonce_hex as given. The AAD is not present, so the tool's 'aad' parameter can be omitted or set to null.
+
+  So the tool call should include:
+
+  - algorithm: chacha20poly1305
+  <|projection|>- ciphertext_hex: feedface90ab (but wait,<|projection|> the user wrote "blob feedface90ab" — maybe the actual ciphertext is longer? But the example might have a typo. Assuming that the ciphertext_hex is "feedface90ab", but I need to check if that's 12 bytes. Wait, 12 bytes would be 24<|projection|> hex chars. "feedface90ab" is 12 characters? Let me count: 'f','e','e','d','f','a','c','e','9','0','a','b' → 12 characters. So that's 6 bytes? No, each hex char is<|projection|> 4 bits, so 12 hex chars = 6 bytes. Wait, no, 1 byte is 2 hex chars. So 12 hex chars is 6 bytes. But the ciphertext for ChaCha20-Poly1305 includes the nonce and the encrypted data plus the tag.<|projection|> Wait, no — the ciphertext is the encrypted data plus the authentication tag. The nonce is separate. The user provided the nonce as part of the parameters.
+
+  But in this case, the ciphertext_hex is "feedface90ab", which is 12 hex characters (6 bytes). That seems too short. Maybe<|projection|> there's a mistake here. However, since the user provided that value, I'll use it as given.
+
+  So the tool call would be:
+
+  {
+    "name": "aead_decrypt",
+    "arguments": {
+      "algorithm": "chacha20poly1305",
+      "ciphertext_hex<|projection|>": "feedface90ab",
+      "key_hex": "ffeeddccbbaa99887766554433221100ffeeddccbbaa998877665544332211<|projection|>00",
+      "nonce_hex": "0b0a090807060504030201ff"
+    }
+  }
+
+  Wait, the key is "ffeeddccbbaa9988776655443322<|projection|>1100ffeeddccbbaa99887766554433221100". Let me check the length. Each pair is a byte. The key should be 32 bytes (256 bits) for ChaCha20. Let<|projection|>'s count the hex characters: "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100" — let's see<|projection|>, that's two copies of "ffeeddccbbaa99887766554433221100", which is 32 bytes (each part is 16 bytes). Wait, no, each 'ffeeddccbbaa998<|projection|>87766554433221100' is 32 hex characters (16 bytes), so the entire key is 32 * 2 = 64 hex chars, which is 32 bytes. That's correct for ChaCha20.
+
+  So<|projection|> the tool call should be as above. The AAD is not provided, so it's omitted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "chacha20poly1305", "ciphertext_hex": "feedface90ab", "key_hex": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100", "nonce_hex": "0b0a090807060504030201ff"}}
+  </tool_call><|projection|>
+- |-
+  recover the plaintext from AES-128-GCM ciphertext 1234abcd5678 with key 112233445566778899aabbccddeeff00, nonce ffeeddccbbaa99887766554433, and no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt some AES-128-GCM ciphertext. The ciphertext is given as 1234abcd5678. The key is 112233445566778899aabbcc<|projection|>ddeeff00. The nonce is ffeeddccbbaa99887766554433. They mentioned no AAD.
+
+  First, I need to check the parameters. The algorithm here is AES-128-GCM, which corresponds to the 'aes12<|projection|>8gcm' in the tool's enum. The ciphertext is provided as a hex string. The key needs to be in hex, and the user provided that. The nonce is also given as a hex string. Since there's no AAD, the 'aad' parameter can be null.
+
+  Wait, the key length<|projection|>: for AES-128-GCM, the key should be 16 bytes (32 hex chars). The user's key is 32 hex characters: 112233445566778899aabbccddeeff00. Let me<|projection|> count: 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff 00. That's 16 bytes. Wait, no, wait. Each pair is a byte. So 32 hex chars<|projection|> make 16 bytes. Yes. So that's correct for AES-128-GCM.
+
+  The nonce is 24 hex chars (12 bytes), which matches the requirement for AES-128-GCM. The user provided 'ffeeddccbbaa9988776<|projection|>6554433'—let me count: ffee ddcc bbaa 9988 7766 5544 33. Wait, that's 24 characters? Let me check: f f e e d d c c b b a a<|projection|> 9 9 8 8 7 7 6 6 5 5 4 4 3 3. Hmm, no, wait. The user wrote "ffeeddccbbaa99887766554433". Let me count each<|projection|> character:
+
+  f f e e d d c c b b a a 9 9 8 8 7 7 6 6 5 5 4 4 3 3. That's 26 characters? Wait, no. Let me write them all out:
+
+  1: f<|projection|>
+  2: f
+  3: e
+  4: e
+  5: d
+  6: d
+  7: c
+  <|projection|>8: c
+  9: b
+  10: b
+  11: a
+  12: a
+  <|projection|>13: 9
+  14: 9
+  15: <|projection|>8
+  16: 8
+  17: 7
+  18: 7
+  19: 6
+  <|projection|>20: 6
+  21: 5
+  22: 5
+  23: 4
+  <|projection|>24: 4
+  25: 3
+  26<|projection|>: 3
+
+  Wait, that's 26 characters. Oh no, the user provided a nonce of 26 hex chars, but the tool requires exactly 24 (12 bytes). That's an error. But the user says "nonce ffeeddccbbaa998877<|projection|>66554433". Wait, maybe there's a typo here. Let me check again. Maybe I'm miscounting.
+
+  Let me write the nonce as given by the user: "ffeeddccbbaa99887766554433".
+
+  Breaking<|projection|> it down:
+
+  f f e e d d c c b b a a 9 9 8 8 7 7 6 6 5 5 4 4 3 3
+
+  Wait, that's 26 characters? Or is there a mistake in the input?
+
+  Alternatively,<|projection|> maybe the user made a typo and meant to put 24 hex chars. For example, perhaps the correct nonce is "ffeeddccbbaa998877665544" (24 characters). But as per the user's input, it's "ffeeddccb<|projection|>baa99887766554433", which is 26 characters.
+
+  But the tool requires exactly 24 for AES-128-GCM. So this would be invalid. However, perhaps the user intended a different value. But since I have to proceed with<|projection|> the given data, even if it's incorrect.
+
+  Wait, maybe I'm miscounting. Let me count again:
+
+  The nonce is: f f e e d d c c b b a a 9 9 8 8 7 7 6 6 5 5 4 4<|projection|> 3 3
+
+  That's 26 characters. So that's an error. The tool will reject this because the nonce must be exactly 24 hex chars (12 bytes). But the user provided 26, which is invalid. However, perhaps there's a typo here. For example, maybe<|projection|> the actual nonce is "ffeeddccbbaa998877665544" (24 characters).
+
+  But as per the user's input, I have to use what they provided. But in reality, this would cause the decryption to fail.
+
+  But since the user asked for the<|projection|> call, I need to generate the tool call with the given parameters, even if they are invalid. So proceed.
+
+  So the parameters are:
+
+  algorithm: aes128gcm
+
+  ciphertext_hex: 1234abcd5678
+
+  key_hex: 11223344<|projection|>5566778899aabbccddeeff00
+
+  nonce_hex: ffeeddccbbaa99887766554433
+
+  aad: null (since no AAD)
+
+  Wait, but the ciphertext is 1234abcd5<|projection|>678. Let me check the length. The ciphertext in AES-GCM includes the tag. For AES-GCM, the tag is 12 bytes (96 bits), so the ciphertext length should be the plaintext length plus 12. But the user provided a 12-byte ciphertext. That's<|projection|> only 96 bits, which would be the tag alone, which isn't possible. So this suggests that the ciphertext provided by the user is invalid. However, the user might have made an error here.
+
+  But again, the task is to generate the tool call based on the given parameters, even if they are incorrect<|projection|>.
+
+  So, the final step is to structure the JSON for the aead_decrypt tool with these parameters.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes128gcm", "ciphertext_hex": "1234abcd5678", "key_hex": "112233445566778899aabbccddeeff00", "nonce_hex": "ffeeddccbbaa99887766554433", "aad": null}}
+  </tool_call><|projection|>
+- |-
+  decrypt the AES-256-GCM ciphertext 9a8b7c6d5e4f302112034455667788990a1b2c3d4e5f60718293a4b5c6d7e8f90 with key cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677, nonce 00112233445566778899aabb, no AAD<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, let's see. The user wants to decrypt a ciphertext using AES-256-GCM. The tools available include the aead_decrypt function. First, I need to check the parameters required for that function.
+
+  The ciphertext is given as a hex string: 9a8b7c6<|projection|>d5e4f302112034455667788990a1b2c3d4e5f60718293a4b5c6d7e8f90. The key is cafebab<|projection|>edeadbeef0011223344556677cafebabedeadbeef0011223344556677. Wait, but for AES-256-GCM, the key should be 32 bytes<|projection|> (64 hex chars). Let me check the key length. The provided key is 64 characters long, which is correct.
+
+  The nonce is 00112233445566778899aabb, which is 24 hex chars (12<|projection|> bytes), correct for a nonce. The AAD is not mentioned, so it's null.
+
+  So the parameters would be: algorithm set to aes256gcm, ciphertext_hex as the given value, key_hex as the provided key, nonce_hex as the given nonce. No AAD, so aad<|projection|> is null.
+
+  I need to structure this into the tool call. Make sure all required fields are present. The function requires algorithm, ciphertext_hex, key_hex, and nonce_hex. All are provided here. So the tool call should include these parameters correctly formatted.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "aead_decrypt", "arguments": {"algorithm": "aes256gcm", "ciphertext_hex": "9a8b7c6d5e4f302112034455667788990a1b2c3d4e5f60718293a4b5c6d7e8f90", "key_hex": "cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677", "nonce_hex": "00112233445566778899aabb", "aad": null}}
+  </tool_call><|projection|>

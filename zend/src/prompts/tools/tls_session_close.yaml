@@ -1,0 +1,106 @@
+name: tls_session_close
+category: TLS sessions
+description: Shut a TLS-encrypted connection, sending close-notify and freeing the certificate-verified channel.
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    session_id:
+      description: The session id returned by tls_session_open.
+      minLength: 1
+      type: string
+  required:
+  - session_id
+  title: CloseRequest
+  type: object
+examples:
+- |-
+  close TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TLS session with the ID "tls-1". Let me check the available tools. There's a function called tls_session_close which requires the session_id. The parameters need to be a JSON object with the session_id. So I should call that function with "session_id<|projection|>": "tls-1". I need to make sure the JSON is correctly formatted inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-1"}}
+  </tool_call><|projection|>
+- |-
+  end TLS session tls-2<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to end a TLS session with the ID "tls-2". Let me check the available tools. There's a function called tls_session_close which requires the session_id. The parameters need to have the session_id as a string. Since the user provided "tls-2", I should<|projection|> structure the tool call with that ID. Just make sure the JSON is correctly formatted with the session_id in the arguments. No other parameters are needed here. Alright, that should do it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-2"}}
+  </tool_call><|projection|>
+- |-
+  tear down TLS session tls-1<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to tear down a TLS session named "tls-1". Let me check the available tools. There's a function called tls_session_close which requires a session_id. The session_id should be the one returned by tls_session_open. Since the user mentioned "tls-1", I guess<|projection|> that's the session ID. I need to call tls_session_close with session_id set to "tls-1". Let me make sure I'm using the right parameters. Yep, that's it. So the tool call should have the name "tls_session_close" and the arguments with session_id as "tls-1<|projection|>".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-1"}}
+  </tool_call><|projection|>
+- |-
+  shut down TLS session tls-3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to shut down a TLS session with the ID "tls-3". Let me check the available tools. There's a function called tls_session_close that takes a session_id. The parameters require a session_id which is a string. The user provided "tls-3" as the session<|projection|> ID. So I need to call tls_session_close with session_id set to "tls-3". I should format that into a JSON object inside the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-3"}}
+  </tool_call><|projection|>
+- |-
+  send close-notify and shut TLS session tls-4<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to send a close-notify and shut down the TLS session with the ID "tls-4". Let me check the available tools.
+
+  There's a tool called tls_session_close. Its description says it shuts a TLS-encrypted connection by sending a close-notify and freeing the certificate-<|projection|>verified channel. The parameter required is session_id, which should be the session ID from tls_session_open.
+
+  The user provided the session ID "tls-4". So I need to call tls_session_close with session_id set to "tls-4".
+
+  I need to make sure the JSON structure is correct. The tool's<|projection|> parameters are in a JSON schema. The required field is session_id, and it's a string. The example given in the tools section shows the session_id as a string.
+
+  So the JSON object should be {"session_id": "tls-4"}.
+
+  Therefore, the tool call should be tls_session_close with that argument<|projection|>. I need to present this in the specified XML tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-4"}}
+  </tool_call><|projection|>
+- |-
+  we're finished with TLS session tls-2, please close it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to close a TLS session called "tls-2". Let me check the tools available. There's a function called tls_session_close which requires a session_id. The user provided "tls-2" as the session ID. I need to make sure that the session_id parameter is correctly<|projection|> set to "tls-2". The tool call should include the name of the tool and the arguments as a JSON object. So the correct call would be to use tls_session_close with the session_id set to "tls-2". I should present that in the specified XML format.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-2"}}
+  </tool_call><|projection|>
+- |-
+  drop the encrypted TLS channel tls-5<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to drop an encrypted TLS channel with the session ID "tls-5". Let me check the available tools. There's a function called tls_session_close which requires a session_id. The parameters need to be a JSON object with the session_id field. The user provided "tls-5<|projection|>" as the session ID. So I should call tls_session_close with {"session_id": "tls-5"}. I need to make sure the JSON is correctly formatted and enclosed in the tool_call tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-5"}}
+  </tool_call><|projection|>
+- |-
+  can you close out TLS session tls-6?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user is asking to close a TLS session with the ID "tls-6". Let me check the available tools. There's a function called tls_session_close which requires a session_id. The parameters need to be a JSON object with the session_id key. So I should generate a tool call with<|projection|> that ID. Make sure the JSON is correctly formatted and enclosed in the XML tags.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "tls_session_close", "arguments": {"session_id": "tls-6"}}
+  </tool_call><|projection|>
