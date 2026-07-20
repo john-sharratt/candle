@@ -13,16 +13,16 @@ use crate::projection::{
     from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
-use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
 use crate::provenance::WideQSig;
+use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
-use crate::TurnEvent;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
+use crate::TurnEvent;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 
@@ -367,14 +367,8 @@ impl Sequence {
         // composed from these schema items — no separate monolithic
         // "system_section_id" pre-pinning, which used to double the
         // system content with an unwrapped fragment copy.
-        let layer_items: Vec<SystemPromptItem> = conv
-            .projection
-            .schema()
-            .layers
-            .iter()
-            .find(|l| l.id == target.layer)
-            .map(|l| l.system_prompt.items.clone())
-            .unwrap_or_default();
+        let layer_items: Vec<SystemPromptItem> =
+            conv.projection.schema().system_prompt.items.clone();
 
         // Cumulative-prefix ingest builds each content section's K/V
         // conditioned on the chain of previously-ingested content
@@ -813,13 +807,9 @@ impl Sequence {
             let view = self.substrate.read();
             let schema = self.projection.schema();
             for &pid in prefix_section_ids {
-                // Skip collection members from any layer's prompt —
-                // they don't advance the content chain.
-                if schema
-                    .layers
-                    .iter()
-                    .any(|l| l.system_prompt.is_collection_member(pid))
-                {
+                // Skip collection members of the shared prompt — they don't
+                // advance the content chain.
+                if schema.system_prompt.is_collection_member(pid) {
                     continue;
                 }
                 let pre_tokens = view.section_tokens_of(pid);
@@ -1073,11 +1063,9 @@ impl Sequence {
     /// formatted `section_<raw>` string when the section isn't found
     /// in any layer (e.g. throwaway sigs-probe sections).
     fn section_debug_name(&self, section_id: SectionId) -> String {
-        for layer in &self.projection.schema().layers {
-            for s in layer.system_prompt.all_sections() {
-                if s.id == section_id {
-                    return s.name.clone();
-                }
+        for s in self.projection.schema().system_prompt.all_sections() {
+            if s.id == section_id {
+                return s.name.clone();
             }
         }
         format!("section_{}", section_id.raw())
@@ -1974,15 +1962,13 @@ impl Sequence {
             // The trunk's fixed system sections — utility-layer system
             // prompts are fixed-only, so this is the complete composition.
             let mut system: Vec<SystemItem> = Vec::new();
-            if let Some(layer) = layer {
-                for item in &layer.system_prompt.items {
-                    if let SystemPromptItem::Section(s) = item {
-                        let tokens = ContentResolver::section_token_count(&read, s.id) as u32;
-                        system.push(SystemItem::Section {
-                            name: s.name.clone(),
-                            tokens,
-                        });
-                    }
+            for item in &schema.system_prompt.items {
+                if let SystemPromptItem::Section(s) = item {
+                    let tokens = ContentResolver::section_token_count(&read, s.id) as u32;
+                    system.push(SystemItem::Section {
+                        name: s.name.clone(),
+                        tokens,
+                    });
                 }
             }
             let count = crate::substrate::Substrate::turn_count(&read, timeline);
@@ -2178,34 +2164,32 @@ impl Sequence {
     /// projection event.
     pub fn section_contents(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for layer in &self.projection.schema().layers {
-            for item in &layer.system_prompt.items {
-                match item {
-                    crate::projection::SystemPromptItem::Section(s) => {
+        for item in &self.projection.schema().system_prompt.items {
+            match item {
+                crate::projection::SystemPromptItem::Section(s) => {
+                    out.push((s.name.clone(), s.content.clone()));
+                }
+                crate::projection::SystemPromptItem::Collection(c) => {
+                    for s in &c.sections {
                         out.push((s.name.clone(), s.content.clone()));
                     }
-                    crate::projection::SystemPromptItem::Collection(c) => {
-                        for s in &c.sections {
-                            out.push((s.name.clone(), s.content.clone()));
+                }
+                crate::projection::SystemPromptItem::SectionTree(t) => {
+                    // One entry per (node, option): name `node` or `node:option`
+                    // for selector options, so the panel can resolve each.
+                    for n in &t.nodes {
+                        for o in &n.options {
+                            let name = if n.options.len() > 1 {
+                                format!("{}:{}", n.name, o.id)
+                            } else {
+                                n.name.clone()
+                            };
+                            out.push((name, o.content.clone()));
                         }
-                    }
-                    crate::projection::SystemPromptItem::SectionTree(t) => {
-                        // One entry per (node, option): name `node` or `node:option`
-                        // for selector options, so the panel can resolve each.
-                        for n in &t.nodes {
-                            for o in &n.options {
-                                let name = if n.options.len() > 1 {
-                                    format!("{}:{}", n.name, o.id)
-                                } else {
-                                    n.name.clone()
-                                };
-                                out.push((name, o.content.clone()));
-                            }
-                            // An embedded collection node lists its members.
-                            if let Some(tc) = &n.collection {
-                                for s in &tc.collection.sections {
-                                    out.push((s.name.clone(), s.content.clone()));
-                                }
+                        // An embedded collection node lists its members.
+                        if let Some(tc) = &n.collection {
+                            for s in &tc.collection.sections {
+                                out.push((s.name.clone(), s.content.clone()));
                             }
                         }
                     }

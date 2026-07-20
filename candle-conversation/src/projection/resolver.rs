@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{LayerSchema, Schema, SystemPromptItem};
+use super::schema::{LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -360,8 +360,8 @@ impl Conversation {
         (windows, slots)
     }
 
-    /// Score every belief-driven collection in `layer` against its tag-scoped
-    /// gallery, using `probe` as the query window, into per-section
+    /// Score every belief-driven collection in the shared system prompt against
+    /// its tag-scoped gallery, using `probe` as the query window, into per-section
     /// [`ProjectionScores`].
     ///
     /// Shared by the two probes that drive selection: the scheduler's live
@@ -371,14 +371,14 @@ impl Conversation {
     /// nothing — its sections read `0.0`.
     pub fn score_belief_collections(
         &self,
-        layer: &LayerSchema,
+        sp: &SystemPromptSchema,
         probe: &[WideQSig],
     ) -> ProjectionScores {
         let mut scores = ProjectionScores::new();
         if probe.is_empty() {
             return scores;
         }
-        for item in &layer.system_prompt.items {
+        for item in &sp.items {
             let SystemPromptItem::Collection(coll) = item else {
                 continue;
             };
@@ -483,10 +483,8 @@ impl Conversation {
             return (scores, candidates);
         }
         self.ensure_normalization_warm(schema, target);
-        // Collections live in the target layer (the tool catalog).
-        if let Some(layer) = schema.layers.iter().find(|l| l.id == target.layer) {
-            scores = self.score_belief_collections(layer, probe);
-        }
+        // Collections (the tool catalog) live in the shared system prompt.
+        scores = self.score_belief_collections(&schema.system_prompt, probe);
         // Belief-driven turn groups live across every layer.
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(layer, target, probe, &mut scores, observe));

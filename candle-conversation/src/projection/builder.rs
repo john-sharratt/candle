@@ -45,9 +45,9 @@ use super::project::{
     run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
 };
 use super::schema::{
-    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, LayerSchema,
-    LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule, SystemPromptItem,
-    SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
+    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, LayerDials,
+    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
+    SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
@@ -76,21 +76,16 @@ fn validate(schema: &Schema) -> Result<(), ConstructionError> {
         });
     }
 
+    // The single shared system prompt must render at least one section, so every
+    // layer is usable as a projection target.
+    if schema.system_prompt.items.is_empty()
+        || schema.system_prompt.all_section_ids().next().is_none()
+    {
+        return Err(ConstructionError::EmptySystemPrompt);
+    }
+
     for layer in &schema.layers {
         validate_budget_bounds(&layer.name, &layer.budget)?;
-
-        // Every layer must declare at least one system-prompt item
-        // (top-level section or collection).  Collections with zero
-        // sections are tolerated only if the layer also has a real
-        // top-level section — otherwise the layer can't render any
-        // system prompt at all.
-        if layer.system_prompt.items.is_empty()
-            || layer.system_prompt.all_section_ids().next().is_none()
-        {
-            return Err(ConstructionError::EmptyLayerSystemPrompt {
-                layer: layer.name.clone(),
-            });
-        }
 
         // Group sibling mins within this layer.
         let group_min_sum: f32 = layer
@@ -341,44 +336,40 @@ impl Builder {
     where
         F: FnMut(&str) -> Result<Vec<u32>, E>,
     {
-        for layer in self.schema.layers.iter_mut() {
-            for item in layer.system_prompt.items.iter_mut() {
-                match item {
-                    SystemPromptItem::Section(s) => {
+        for item in self.schema.system_prompt.items.iter_mut() {
+            match item {
+                SystemPromptItem::Section(s) => {
+                    if s.is_template && s.template_tokens.is_none() {
+                        s.template_tokens = Some(std::sync::Arc::new(tokenize(&s.content)?));
+                    }
+                }
+                SystemPromptItem::Collection(c) => {
+                    for s in c.sections.iter_mut() {
                         if s.is_template && s.template_tokens.is_none() {
                             s.template_tokens = Some(std::sync::Arc::new(tokenize(&s.content)?));
                         }
                     }
-                    SystemPromptItem::Collection(c) => {
-                        for s in c.sections.iter_mut() {
-                            if s.is_template && s.template_tokens.is_none() {
-                                s.template_tokens =
-                                    Some(std::sync::Arc::new(tokenize(&s.content)?));
-                            }
-                        }
-                        if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
-                            c.member_glue_tokens =
-                                Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
-                        }
+                    if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
+                        c.member_glue_tokens = Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
                     }
-                    // Tree-node sections are sealed content, but a `glue` node
-                    // (e.g. `<tools>`) is a live-prefilled structural marker, and
-                    // an embedded collection's `member_glue` is one too — pre-tokenise
-                    // both here.
-                    SystemPromptItem::SectionTree(tree) => {
-                        for node in tree.nodes.iter_mut() {
-                            let need_glue = node.glue.as_ref().is_some_and(|g| g.tokens.is_none());
-                            if need_glue {
-                                let content = node.options[0].content.clone();
-                                let toks = std::sync::Arc::new(tokenize(&content)?);
-                                node.glue.as_mut().unwrap().tokens = Some(toks);
-                            }
-                            if let Some(tc) = node.collection.as_mut() {
-                                let c = &mut tc.collection;
-                                if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
-                                    c.member_glue_tokens =
-                                        Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
-                                }
+                }
+                // Tree-node sections are sealed content, but a `glue` node
+                // (e.g. `<tools>`) is a live-prefilled structural marker, and
+                // an embedded collection's `member_glue` is one too — pre-tokenise
+                // both here.
+                SystemPromptItem::SectionTree(tree) => {
+                    for node in tree.nodes.iter_mut() {
+                        let need_glue = node.glue.as_ref().is_some_and(|g| g.tokens.is_none());
+                        if need_glue {
+                            let content = node.options[0].content.clone();
+                            let toks = std::sync::Arc::new(tokenize(&content)?);
+                            node.glue.as_mut().unwrap().tokens = Some(toks);
+                        }
+                        if let Some(tc) = node.collection.as_mut() {
+                            let c = &mut tc.collection;
+                            if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
+                                c.member_glue_tokens =
+                                    Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
                             }
                         }
                     }
@@ -431,16 +422,12 @@ impl Builder {
             .find(|g| g.id == id)
     }
 
-    /// Look up a system-prompt section by id.
-    ///
-    /// Sections are scoped to a layer; this walks every layer's
-    /// system-prompt items (top-level sections + sections nested in
-    /// collections) to find the matching id.
+    /// Look up a system-prompt section by id (top-level sections + sections
+    /// nested in collections of the shared prompt).
     pub fn section(&self, id: SectionId) -> Option<&SectionSchema> {
         self.schema
-            .layers
-            .iter()
-            .flat_map(|l| l.system_prompt.all_sections())
+            .system_prompt
+            .all_sections()
             .find(|s| s.id == id)
     }
 
@@ -458,22 +445,19 @@ impl Builder {
         self.name_maps.group_names.get(name).copied()
     }
 
-    /// Resolve a section's YAML `id:` string to its id, within a specific
-    /// layer. Section names are layer-scoped — the same name may appear in
-    /// multiple layers.
-    pub fn id_for_section_in(&self, layer: LayerId, name: &str) -> Option<SectionId> {
+    /// Resolve a shared system-prompt section's YAML `id:` string to its id.
+    pub fn id_for_system_section(&self, name: &str) -> Option<SectionId> {
         self.name_maps
             .section_names
-            .get(&(layer, name.to_string()))
+            .get(&(LayerId::system_prompt(), name.to_string()))
             .copied()
     }
 
-    /// Resolve a collection's name within a layer to its id.
-    /// Collections are layer-scoped (analogous to sections).
-    pub fn id_for_collection_in(&self, layer: LayerId, name: &str) -> Option<CollectionId> {
+    /// Resolve a shared system-prompt collection's name to its id.
+    pub fn id_for_system_collection(&self, name: &str) -> Option<CollectionId> {
         self.name_maps
             .collection_names
-            .get(&(layer, name.to_string()))
+            .get(&(LayerId::system_prompt(), name.to_string()))
             .copied()
     }
 
@@ -486,13 +470,11 @@ impl Builder {
     /// sequences.
     pub fn set_collection_selection(
         &mut self,
-        layer: LayerId,
         name: &str,
         selection: SelectionRule,
     ) -> Result<(), ConstructionError> {
         validate_selection(name, &selection)?;
-        let layer_idx = self.layer_idx(layer)?;
-        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let items = &mut self.schema.system_prompt.items;
         match locate_collection(items, |c| c.name == name) {
             Some(CollLoc::TopLevel(ii)) => {
                 if let SystemPromptItem::Collection(coll) = &mut items[ii] {
@@ -520,14 +502,12 @@ impl Builder {
     /// they are simply not projected for this conversation.
     pub fn set_collection_single_section(
         &mut self,
-        layer: LayerId,
         collection: &str,
         section: &str,
     ) -> Result<(), ConstructionError> {
-        let layer_idx = self.layer_idx(layer)?;
         let keep: std::collections::HashSet<String> =
             std::iter::once(section.to_string()).collect();
-        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let items = &mut self.schema.system_prompt.items;
         match locate_collection(items, |c| c.name == collection) {
             Some(CollLoc::TopLevel(ii)) => {
                 let SystemPromptItem::Collection(coll) = &mut items[ii] else {
@@ -567,12 +547,10 @@ impl Builder {
     /// sealed K/V in the substrate; they are simply not projected.
     pub fn retain_collection_sections(
         &mut self,
-        layer: LayerId,
         collection: &str,
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), ConstructionError> {
-        let layer_idx = self.layer_idx(layer)?;
-        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let items = &mut self.schema.system_prompt.items;
         match locate_collection(items, |c| c.name == collection) {
             Some(CollLoc::TopLevel(ii)) => {
                 if let SystemPromptItem::Collection(coll) = &mut items[ii] {
@@ -616,7 +594,6 @@ impl Builder {
     /// - `priority` must be `> 0`.
     pub fn add_section(
         &mut self,
-        layer: LayerId,
         name: impl Into<String>,
         content: impl Into<String>,
         priority: f32,
@@ -629,10 +606,9 @@ impl Builder {
                 value: priority,
             });
         }
-        let layer_idx = self.layer_idx(layer)?;
-        self.assert_section_name_free(layer_idx, &name)?;
+        self.assert_section_name_free(&name)?;
         let new_id = SectionId::new(self.next_section_id_raw());
-        self.schema.layers[layer_idx]
+        self.schema
             .system_prompt
             .items
             .push(SystemPromptItem::Section(SectionSchema {
@@ -645,7 +621,9 @@ impl Builder {
                 is_template: false,
                 template_tokens: None,
             }));
-        self.name_maps.section_names.insert((layer, name), new_id);
+        self.name_maps
+            .section_names
+            .insert((LayerId::system_prompt(), name), new_id);
         Ok(new_id)
     }
 
@@ -659,17 +637,15 @@ impl Builder {
     /// `Single` keeps the one highest, `AlwaysVisible` keeps all.
     pub fn add_collection(
         &mut self,
-        layer: LayerId,
         name: impl Into<String>,
         selection: SelectionRule,
         score_threshold: f32,
     ) -> Result<CollectionId, ConstructionError> {
         let name: String = name.into();
-        let layer_idx = self.layer_idx(layer)?;
         if self
             .name_maps
             .collection_names
-            .contains_key(&(layer, name.clone()))
+            .contains_key(&(LayerId::system_prompt(), name.clone()))
         {
             return Err(ConstructionError::DuplicateCollectionName(name));
         }
@@ -698,7 +674,7 @@ impl Builder {
             }
             _ => SelectionPolicy::default_policy(),
         };
-        self.schema.layers[layer_idx]
+        self.schema
             .system_prompt
             .items
             .push(SystemPromptItem::Collection(SectionCollection {
@@ -718,7 +694,7 @@ impl Builder {
             }));
         self.name_maps
             .collection_names
-            .insert((layer, name), new_id);
+            .insert((LayerId::system_prompt(), name), new_id);
         Ok(new_id)
     }
 
@@ -732,7 +708,6 @@ impl Builder {
     /// downstream prefill captures sigs by section id.
     pub fn add_section_to_collection(
         &mut self,
-        layer: LayerId,
         collection: CollectionId,
         name: impl Into<String>,
         content: impl Into<String>,
@@ -746,10 +721,9 @@ impl Builder {
                 value: priority,
             });
         }
-        let layer_idx = self.layer_idx(layer)?;
-        self.assert_section_name_free(layer_idx, &name)?;
+        self.assert_section_name_free(&name)?;
         // Locate the collection (top-level OR tree-embedded) before any mutation.
-        let items = &self.schema.layers[layer_idx].system_prompt.items;
+        let items = &self.schema.system_prompt.items;
         let loc = locate_collection(items, |c| c.id == collection).ok_or_else(|| {
             ConstructionError::UnknownCollection(format!("CollectionId({collection:?})"))
         })?;
@@ -757,7 +731,7 @@ impl Builder {
         // collection seals each member ×branch, so it takes one CONTIGUOUS id per
         // branch (above the current max — guaranteed disjoint).
         let base = self.next_section_id_raw();
-        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let items = &mut self.schema.system_prompt.items;
         let new_id = match loc {
             CollLoc::TopLevel(ii) => {
                 let SystemPromptItem::Collection(coll) = &mut items[ii] else {
@@ -816,7 +790,9 @@ impl Builder {
                 canonical
             }
         };
-        self.name_maps.section_names.insert((layer, name), new_id);
+        self.name_maps
+            .section_names
+            .insert((LayerId::system_prompt(), name), new_id);
         Ok(new_id)
     }
 
@@ -827,12 +803,10 @@ impl Builder {
     /// [`SectionCollection::summary_section`].
     pub fn set_collection_summary_section(
         &mut self,
-        layer: LayerId,
         collection: CollectionId,
         section: SectionId,
     ) -> Result<(), ConstructionError> {
-        let layer_idx = self.layer_idx(layer)?;
-        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let items = &mut self.schema.system_prompt.items;
         match locate_collection(items, |c| c.id == collection) {
             Some(CollLoc::TopLevel(ii)) => {
                 if let SystemPromptItem::Collection(coll) = &mut items[ii] {
@@ -864,13 +838,11 @@ impl Builder {
     /// no such single-option tree section is found in the layer.
     pub fn set_tree_section_content(
         &mut self,
-        layer: LayerId,
         name: &str,
         content: impl Into<String>,
     ) -> Result<(), ConstructionError> {
-        let layer_idx = self.layer_idx(layer)?;
         let content = content.into();
-        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
+        for item in self.schema.system_prompt.items.iter_mut() {
             if let SystemPromptItem::SectionTree(t) = item {
                 for node in t.nodes.iter_mut() {
                     // A glue node also has `collection: None` + one option, but its
@@ -891,24 +863,10 @@ impl Builder {
         Err(ConstructionError::UnknownSection(name.to_string()))
     }
 
-    /// Look up a layer's index in `self.schema.layers` by id, returning
-    /// an error if unknown.
-    fn layer_idx(&self, layer: LayerId) -> Result<usize, ConstructionError> {
-        self.schema
-            .layers
-            .iter()
-            .position(|l| l.id == layer)
-            .ok_or_else(|| ConstructionError::UnknownLayer(format!("LayerId({:?})", layer)))
-    }
-
-    /// Reject duplicate section names within a layer (top-level OR nested).
-    fn assert_section_name_free(
-        &self,
-        layer_idx: usize,
-        name: &str,
-    ) -> Result<(), ConstructionError> {
-        let layer = &self.schema.layers[layer_idx];
-        for it in &layer.system_prompt.items {
+    /// Reject a duplicate section name in the shared system prompt (top-level OR
+    /// nested in a collection or section-tree).
+    fn assert_section_name_free(&self, name: &str) -> Result<(), ConstructionError> {
+        for it in &self.schema.system_prompt.items {
             match it {
                 SystemPromptItem::Section(s) if s.name == name => {
                     return Err(ConstructionError::DuplicateSectionName(name.to_string()));
@@ -935,21 +893,13 @@ impl Builder {
         Ok(())
     }
 
-    /// Highest currently-allocated section-id across the whole schema,
-    /// + 1.  Sections are globally unique even though names are per-
-    /// layer scoped.
+    /// Highest currently-allocated section-id across the whole schema, + 1.
     fn next_section_id_raw(&self) -> u32 {
         // Must cover EVERY allocated section id, including the compression-prompt
         // sections that live in `layer.summary` / collection summaries rather
         // than `system_prompt.items` — otherwise a runtime-added section aliases
         // a compression-prompt id and corrupts the compression frame.
-        let max_id = self
-            .schema
-            .layers
-            .iter()
-            .flat_map(|l| l.all_section_ids())
-            .max()
-            .unwrap_or(0);
+        let max_id = self.schema.all_section_ids().into_iter().max().unwrap_or(0);
         max_id + 1
     }
 
@@ -958,9 +908,9 @@ impl Builder {
     fn next_collection_id_raw(&self) -> u32 {
         let max_id = self
             .schema
-            .layers
+            .system_prompt
+            .items
             .iter()
-            .flat_map(|l| l.system_prompt.items.iter())
             .filter_map(|it| match it {
                 SystemPromptItem::Collection(c) => Some(c.id.raw()),
                 _ => None,
@@ -1150,6 +1100,18 @@ impl Builder {
             SectionId::new(section_id.raw() + 1)
         };
         let schema = Schema {
+            system_prompt: SystemPromptSchema {
+                items: vec![SystemPromptItem::Section(SectionSchema {
+                    id: section_id,
+                    name: "frame".to_string(),
+                    content: system_prompt_text.to_string(),
+                    priority: 50.0,
+                    depends_on: None,
+                    depends_on_absent: None,
+                    is_template: false,
+                    template_tokens: None,
+                })],
+            },
             layers: vec![LayerSchema {
                 id: layer_id,
                 name: "dialogue".to_string(),
@@ -1161,18 +1123,7 @@ impl Builder {
                     min_percent: None,
                     max_percent: None,
                 },
-                system_prompt: SystemPromptSchema {
-                    items: vec![SystemPromptItem::Section(SectionSchema {
-                        id: section_id,
-                        name: "frame".to_string(),
-                        content: system_prompt_text.to_string(),
-                        priority: 50.0,
-                        depends_on: None,
-                        depends_on_absent: None,
-                        is_template: false,
-                        template_tokens: None,
-                    })],
-                },
+                dials: LayerDials::default(),
                 // Template-less fallback summary so a plain-prompt conversation
                 // is still summarisable (the production path supplies its own
                 // tailored summary via the YAML template). Generic faithful
@@ -1237,7 +1188,7 @@ impl Builder {
             .insert("primary_conversation".to_string(), group_id);
         name_maps
             .section_names
-            .insert((layer_id, "frame".to_string()), section_id);
+            .insert((LayerId::system_prompt(), "frame".to_string()), section_id);
 
         // A synthetic single-section schema, not parsed from YAML.
         Self {

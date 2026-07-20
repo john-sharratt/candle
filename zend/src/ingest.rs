@@ -69,19 +69,14 @@ pub enum IngestConv {
     Files { state: CodeReadState },
     /// A raw-ChatML layer: the owning conversation (holding the prefilled record
     /// turns) plus the per-file content-hash record for refresh.
-    Raw {
-        sequence: Sequence,
-        state: RawState,
-    },
+    Raw { sequence: Sequence, state: RawState },
 }
 
 /// A section-collection sink: an empty collection to be filled with calibrated
 /// sections read from a content folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SectionSink {
-    /// Layer the collection lives in.
-    pub layer: String,
-    /// Collection name (e.g. `response`).
+    /// Collection name (e.g. `response`) in the shared system prompt.
     pub collection: String,
     /// Content folder relative to the workspace, derived by pluralising the
     /// collection name (e.g. `responses`).
@@ -137,7 +132,11 @@ pub fn ingest_layers(schema: &Schema, workspace: &Path) -> Vec<IngestLayer> {
                 if !is_mind || !workspace.join(other).is_dir() {
                     continue;
                 }
-                (IngestMode::Raw, other.to_string(), format!("Loading {other}"))
+                (
+                    IngestMode::Raw,
+                    other.to_string(),
+                    format!("Loading {other}"),
+                )
             }
         };
         out.push(IngestLayer {
@@ -152,24 +151,21 @@ pub fn ingest_layers(schema: &Schema, workspace: &Path) -> Vec<IngestLayer> {
 }
 
 /// Derive the section-collection sinks: empty collections (other than the
-/// registry-backed `tools`) across every layer's system prompt, in declaration
-/// order. Each is filled from `<collection-name>s/`.
+/// registry-backed `tools`) in the shared system prompt, in declaration order.
+/// Each is filled from `<collection-name>s/`.
 pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
     let mut out = Vec::new();
-    for layer in &schema.layers {
-        for item in &layer.system_prompt.items {
-            let SystemPromptItem::Collection(c) = item else {
-                continue;
-            };
-            if c.name == TOOLS_COLLECTION || !c.sections.is_empty() {
-                continue;
-            }
-            out.push(SectionSink {
-                layer: layer.name.clone(),
-                collection: c.name.clone(),
-                folder: pluralize(&c.name),
-            });
+    for item in &schema.system_prompt.items {
+        let SystemPromptItem::Collection(c) = item else {
+            continue;
+        };
+        if c.name == TOOLS_COLLECTION || !c.sections.is_empty() {
+            continue;
         }
+        out.push(SectionSink {
+            collection: c.name.clone(),
+            folder: pluralize(&c.name),
+        });
     }
     out
 }

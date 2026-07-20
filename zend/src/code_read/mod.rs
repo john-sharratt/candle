@@ -846,15 +846,15 @@ pub fn refresh_code_reading(
 }
 
 fn layer_system_prompt(builder: &Builder, layer_name: &str, config: &SequenceConfig) -> String {
-    let layer = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == layer_name)
-        .unwrap_or_else(|| panic!("projection schema missing '{layer_name}' layer"));
-
+    debug_assert!(
+        builder.schema().layers.iter().any(|l| l.name == layer_name),
+        "projection schema missing '{layer_name}' layer"
+    );
+    // Every ingest conversation frames on the single shared system prompt (bare
+    // sections only — the section tree and tool catalog are not part of the
+    // ingest framing).
     let mut body = String::new();
-    for item in &layer.system_prompt.items {
+    for item in &builder.schema().system_prompt.items {
         if let SystemPromptItem::Section(s) = item {
             body.push_str(&s.content);
         }

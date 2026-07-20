@@ -9,19 +9,22 @@
 //!
 //! ```text
 //!  Schema
+//!  ├── system_prompt: SystemPromptSchema { items: [SystemPromptItem] }
+//!  │   └── (the ONE shared prompt every projection emits)
 //!  └── layers: Vec<LayerSchema>
 //!      └── LayerSchema { name, window, score_threshold,
-//!                        budget, system_prompt, groups: Vec<GroupSchema> }
-//!          ├── system_prompt: SystemPromptSchema  { sections: [SectionSchema] }
-//!          │   └── (used when THIS layer is the projection target)
+//!                        budget, dials, groups: Vec<GroupSchema> }
+//!          ├── dials: LayerDials  (section-tree selector overrides)
+//!          │   └── (frames the shared prompt when THIS layer is the target)
 //!          └── GroupSchema { name, selection, score_threshold, budget }
 //! ```
 //!
-//! Each layer carries its own system prompt because each cognitive layer
-//! (dialogue, bug analysis, dream exploration, daily convergence …) is a
-//! genuinely different conversation with its own framing. The system
-//! prompt emitted by [`super::Builder::project`] is the **target** layer's
-//! sections.
+//! There is one system prompt, shared by every projection target, so its sealed
+//! K/V is reused across all layers. A cognitive layer (dialogue, bug analysis,
+//! dream exploration …) differs only by the section-tree branch its
+//! [`LayerDials`] select — thinking depth, answer length, tool access — not by a
+//! prompt of its own. The prompt emitted by [`super::Builder::project`] is always
+//! [`Schema::system_prompt`], resolved against the target layer's dials.
 //!
 //! # Budget model
 //!
@@ -785,11 +788,12 @@ pub struct LayerSchema {
     /// this layer is visible (lower than the target). Determines how much
     /// of the target's `window` this layer receives.
     pub budget: Budget,
-    /// System-prompt sections framing the cognitive activity for which
-    /// this layer is the projection target. **Required** at construction
-    /// — every layer must declare at least one section so the layer is
-    /// always usable as a projection target.
-    pub system_prompt: SystemPromptSchema,
+    /// Per-layer overrides of the unified [`Schema::system_prompt`]'s
+    /// section-tree selectors, applied when this layer is the projection target.
+    /// Empty inherits the section-tree defaults. The layer does NOT carry its own
+    /// system prompt — the framing is shared so its sealed K/V is reused across
+    /// every layer; a layer differs only by which pre-sealed branch it selects.
+    pub dials: LayerDials,
     /// How this layer's turns are compressed across the summary tree — the
     /// `turns`/`summaries` tree-levels, each splitting the question and answer
     /// halves into their own framing + instruction, with a per-level decode cap.
@@ -807,46 +811,54 @@ pub struct LayerSchema {
 }
 
 impl LayerSchema {
-    /// Every `SectionId` (as raw `u32`) this layer allocates: the system-prompt
-    /// sections and collection member sections (via
-    /// [`SystemPromptSchema::all_sections`]), every collection's compression
-    /// summary, and the layer's own `turns`/`summaries` × `question`/`answer`
-    /// compression prompts.
-    ///
-    /// Runtime section-id allocation ([`super::Builder::add_section_to_collection`])
-    /// must stay disjoint from all of these. The compression-prompt sections
-    /// never appear in `system_prompt.items`, so a max over only the *visible*
-    /// sections would alias them — a runtime-added section would reuse a
-    /// compression-prompt id, and `ensure_summary_section` would then inject that
-    /// section's content (e.g. a tool's JSON) as the compression prompt.
+    /// Every `SectionId` (as raw `u32`) this layer allocates for its own content:
+    /// the `turns`/`summaries` × `question`/`answer` compression prompts. The
+    /// unified system-prompt sections belong to the schema, not the layer — see
+    /// [`Schema::all_section_ids`].
     pub fn all_section_ids(&self) -> Vec<u32> {
-        // `system_prompt.all_section_ids()` (not `all_sections()`) so section-tree
-        // variant ids are counted too — `all_sections()` skips them.
-        let mut ids: Vec<u32> = self
-            .system_prompt
-            .all_section_ids()
-            .map(|id| id.raw())
-            .collect();
-        let push_summary = |c: &SectionCollection, ids: &mut Vec<u32>| {
-            ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
-            ids.push(c.summary.assign.prompt.system_prompt.id.raw());
-        };
-        for item in &self.system_prompt.items {
-            match item {
-                SystemPromptItem::Collection(c) => push_summary(c, &mut ids),
-                // Tree-embedded collections carry their own summary prompts.
-                SystemPromptItem::SectionTree(t) => {
-                    for n in &t.nodes {
-                        if let Some(tc) = &n.collection {
-                            push_summary(&tc.collection, &mut ids);
-                        }
-                    }
-                }
-                SystemPromptItem::Section(_) => {}
-            }
-        }
+        let mut ids: Vec<u32> = Vec::new();
         self.summary.push_section_ids(&mut ids);
         ids
+    }
+}
+
+/// Per-layer overrides for the unified [`Schema::system_prompt`]'s section-tree
+/// selectors, applied when THIS layer is the projection target and *beneath* any
+/// per-turn override the caller supplies.
+///
+/// Each entry is `(selector_id, option_id)`. The selector ids are exactly the
+/// section-tree node names in the unified system prompt (e.g. `thinking_effort`,
+/// `response_length`), so the set is data-driven — the engine hardcodes no dial
+/// names. A key that matches no tree selector is inert at projection time and is
+/// available to the host (e.g. zend reads a `tools` catalog dial here) via
+/// [`Self::get`]. An empty set inherits the section-tree's authored defaults.
+#[derive(Debug, Clone, Default)]
+pub struct LayerDials {
+    dials: Vec<(String, String)>,
+}
+
+impl LayerDials {
+    /// Build from `(selector_id, option_id)` pairs in declaration order.
+    pub fn from_pairs(dials: Vec<(String, String)>) -> Self {
+        Self { dials }
+    }
+
+    /// The option chosen for `selector`, if this layer overrides it.
+    pub fn get(&self, selector: &str) -> Option<&str> {
+        self.dials
+            .iter()
+            .find(|(k, _)| k == selector)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `(selector_id, option_id)` pairs in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.dials.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// No overrides — every selector falls back to its section-tree default.
+    pub fn is_empty(&self) -> bool {
+        self.dials.is_empty()
     }
 }
 
@@ -1062,10 +1074,12 @@ pub enum ScoreFormula {
 
 /// The complete parsed, validated schema. Immutable after construction.
 ///
-/// All structural state lives on individual layers — there is no top-level
-/// system prompt and no top-level token budget. Each layer carries its own
-/// `window` (per-target turn budget) and `system_prompt` (framing for when
-/// it is the target).
+/// The **single** [`system_prompt`](Self::system_prompt) is shared by every
+/// projection target — its framing, tool catalog, and section-tree dials are
+/// declared once, so the sealed system-prompt K/V is reused across all layers.
+/// A layer differs only by the section-tree branch it selects via its
+/// [`LayerSchema::dials`]. Each layer still carries its own `window` (per-target
+/// turn budget) and turn groups.
 ///
 /// The schema does **not** carry dialect-specific structural tokens
 /// (turn-boundary markers, role openers/closers).  Those are runtime
@@ -1075,4 +1089,50 @@ pub enum ScoreFormula {
 pub struct Schema {
     /// Ordered: layer 0 first. Order is meaningful for masking and emission.
     pub layers: Vec<LayerSchema>,
+    /// The one system prompt every projection emits, framed by the target
+    /// layer's [`dials`](LayerSchema::dials).
+    pub system_prompt: SystemPromptSchema,
+}
+
+impl Schema {
+    /// Every `SectionId` (as raw `u32`) the schema allocates: the unified
+    /// system-prompt sections and section-tree variants, every system-prompt
+    /// collection's compression-summary prompts, and each layer's own
+    /// `turns`/`summaries` compression prompts.
+    ///
+    /// Runtime section-id allocation
+    /// ([`super::Builder::add_section_to_system_collection`]) must stay disjoint
+    /// from all of these — the compression-prompt sections never appear in
+    /// `system_prompt.items`, so a max over only the *visible* sections would
+    /// alias them.
+    pub fn all_section_ids(&self) -> Vec<u32> {
+        // `all_section_ids()` (not `all_sections()`) so section-tree variant ids
+        // are counted too — `all_sections()` skips them.
+        let mut ids: Vec<u32> = self
+            .system_prompt
+            .all_section_ids()
+            .map(|id| id.raw())
+            .collect();
+        let push_summary = |c: &SectionCollection, ids: &mut Vec<u32>| {
+            ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
+            ids.push(c.summary.assign.prompt.system_prompt.id.raw());
+        };
+        for item in &self.system_prompt.items {
+            match item {
+                SystemPromptItem::Collection(c) => push_summary(c, &mut ids),
+                SystemPromptItem::SectionTree(t) => {
+                    for n in &t.nodes {
+                        if let Some(tc) = &n.collection {
+                            push_summary(&tc.collection, &mut ids);
+                        }
+                    }
+                }
+                SystemPromptItem::Section(_) => {}
+            }
+        }
+        for layer in &self.layers {
+            ids.extend(layer.all_section_ids());
+        }
+        ids
+    }
 }

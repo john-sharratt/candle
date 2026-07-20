@@ -12,34 +12,31 @@ fn main() -> anyhow::Result<()> {
     let mut b =
         Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "candle")], Some(&dialect))
             .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
-    let dlg = b
-        .id_for_layer("dialogue")
-        .ok_or_else(|| anyhow::anyhow!("no dialogue layer"))?;
-    install_tool_catalog(&mut b, dlg)?;
+    install_tool_catalog(&mut b)?;
 
-    for layer in &b.schema().layers {
-        for item in &layer.system_prompt.items {
+    {
+        for item in &b.schema().system_prompt.items {
             match item {
                 SystemPromptItem::Section(s) => {
                     let kind = if s.is_template { "tmpl" } else { "sect" };
-                    println!("{:?}\t{}\t{kind}\t{}", s.id, layer.name, s.name);
+                    println!("{:?}\tsystem_prompt\t{kind}\t{}", s.id, s.name);
                 }
                 SystemPromptItem::Collection(c) => {
                     println!(
                         "-- collection {} ({} members) in {} --",
                         c.name,
                         c.sections.len(),
-                        layer.name
+                        "system_prompt"
                     );
                     for s in &c.sections {
-                        println!("{:?}\t{}\tcoll\t{}", s.id, layer.name, s.name);
+                        println!("{:?}\tsystem_prompt\tcoll\t{}", s.id, s.name);
                     }
                 }
                 SystemPromptItem::SectionTree(t) => {
                     for n in &t.nodes {
                         for o in &n.options {
                             for v in &o.variants {
-                                println!("{:?}\t{}\ttree\t{}:{}", v.id, layer.name, n.name, o.id);
+                                println!("{:?}\tsystem_prompt\ttree\t{}:{}", v.id, n.name, o.id);
                             }
                         }
                     }

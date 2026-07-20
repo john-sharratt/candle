@@ -70,7 +70,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     let primary_group = proj_builder
         .id_for_group("primary_conversation")
         .expect("primary group");
-    let _ = zend::tools::install_tool_catalog(&mut proj_builder, dialogue_layer);
+    let _ = zend::tools::install_tool_catalog(&mut proj_builder);
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()

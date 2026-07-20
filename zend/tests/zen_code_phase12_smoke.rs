@@ -141,8 +141,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     .expect("parse projection.yaml");
     let dialogue_layer = proj_builder.id_for_layer("dialogue").unwrap();
     let primary_group = proj_builder.id_for_group("primary_conversation").unwrap();
-    let _ = zend::tools::install_tool_catalog(&mut proj_builder, dialogue_layer)
-        .expect("install tool catalog");
+    let _ = zend::tools::install_tool_catalog(&mut proj_builder).expect("install tool catalog");
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
@@ -184,13 +183,18 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     );
 
     let progress = Arc::new(LoadProgress::new());
+    // Both ingest passes lock the engine for their brief create/tombstone ops,
+    // so they take a `&Mutex<ConversationEngine>`. Mirror the daemon: wrap for
+    // the passes, then unwrap to hold on.
+    let engine = Mutex::new(engine);
     let (repo_map, walked, _cluster_state) = zend::repo_scan::ingest_repo_map(
         &engine,
         proj_builder_repo_map,
         workspace,
         conv_config.clone(),
         &progress,
-        false,
+        "repo_map",
+        "structure",
     )
     .expect("repo map ingest");
     eprintln!(
@@ -198,10 +202,6 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         start.elapsed().as_secs_f64(),
         walked.files.len()
     );
-    // The per-file code_reading pool locks the engine for its brief
-    // create/tombstone ops, so it takes a `&Mutex<ConversationEngine>`.
-    // Mirror the daemon: wrap for the pass, then unwrap to hold on.
-    let engine = Mutex::new(engine);
     let code_read_state = zend::code_read::ingest_code_reading(
         &engine,
         proj_builder_code_read,
@@ -209,6 +209,8 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         &walked,
         conv_config,
         &progress,
+        "code_reading",
+        "scopes",
     )
     .expect("code reading ingest");
     let engine = engine.into_inner().expect("engine mutex not poisoned");

@@ -433,15 +433,13 @@ fn layer_system_prompt(
     config: &SequenceConfig,
 ) -> String {
     use projection::SystemPromptItem;
-    let layer = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == layer_name)
-        .unwrap_or_else(|| panic!("projection schema missing '{layer_name}' layer"));
-
+    debug_assert!(
+        builder.schema().layers.iter().any(|l| l.name == layer_name),
+        "projection schema missing '{layer_name}' layer"
+    );
+    // Every ingest conversation frames on the single shared system prompt.
     let mut body = String::new();
-    for item in &layer.system_prompt.items {
+    for item in &builder.schema().system_prompt.items {
         if let SystemPromptItem::Section(s) = item {
             body.push_str(&s.content);
         }

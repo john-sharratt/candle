@@ -36,8 +36,7 @@ fn main() -> anyhow::Result<()> {
     let mut builder =
         Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "candle")], Some(&dialect))
             .expect("yaml parse");
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
-    let tool_sections = zend::tools::install_tool_catalog(&mut builder, dialogue)?;
+    let tool_sections = zend::tools::install_tool_catalog(&mut builder)?;
     println!("installed {} tool sections", tool_sections.len());
 
     // 2. Open the substrate exactly as the engine does.
@@ -62,14 +61,9 @@ fn main() -> anyhow::Result<()> {
     }
     println!("probe: {} wide-Q windows", probe.len());
 
-    // 4. Resolve the dialogue LayerSchema and report the tools collection state.
-    let layer = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.id == dialogue)
-        .expect("dialogue schema");
-    for item in &layer.system_prompt.items {
+    // 4. Report the shared system prompt's tools collection state.
+    let sp = &builder.schema().system_prompt;
+    for item in &sp.items {
         if let SystemPromptItem::Collection(coll) = item {
             println!(
                 "collection {:?}: {} sections, policy.tags={:?}",
@@ -81,11 +75,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 5. The LIVE call the reproject uses.
-    let scores = conv.score_belief_collections(layer, &probe);
+    let scores = conv.score_belief_collections(sp, &probe);
 
     // 6. Report the top scored tools.
     let mut ranked: Vec<(String, f32)> = Vec::new();
-    for item in &layer.system_prompt.items {
+    for item in &sp.items {
         if let SystemPromptItem::Collection(coll) = item {
             for s in &coll.sections {
                 ranked.push((s.name.clone(), scores.section(s.id)));

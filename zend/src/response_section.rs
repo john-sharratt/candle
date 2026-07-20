@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, SectionId};
+use candle_conversation::projection::{Builder as ProjectionBuilder, SectionId};
 use serde::Deserialize;
 
 /// A turn role in a lead-in example. The schema admits `user` / `assistant` only
@@ -120,7 +120,10 @@ pub fn validate(section: &ResponseSection, stem: &str) -> anyhow::Result<()> {
     }
     for (i, ex) in section.examples.iter().enumerate() {
         if ex.turns.len() < 2 {
-            anyhow::bail!("section {:?} example {i}: needs at least 2 turns", section.id);
+            anyhow::bail!(
+                "section {:?} example {i}: needs at least 2 turns",
+                section.id
+            );
         }
         for (j, t) in ex.turns.iter().enumerate() {
             if t.content.is_none() && t.thinking.is_none() {
@@ -143,7 +146,13 @@ pub fn validate(section: &ResponseSection, stem: &str) -> anyhow::Result<()> {
                 section.id
             );
         }
-        if last.thinking.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if last
+            .thinking
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             anyhow::bail!(
                 "section {:?} example {i}: final turn must carry `thinking`",
                 section.id
@@ -215,30 +224,25 @@ pub fn load_sections(dir: &Path, identity: &Identity) -> Vec<ResponseSection> {
     out
 }
 
-/// Install each section's `template` as a member of `collection` in `layer`,
-/// mirroring [`crate::tools::install_tool_catalog`]. The section id is the
-/// collection member name; the template is its content (its KV seals at base-conv
-/// build, giving the section baseline provenance from its own prefill). Returns
-/// the `(id, section_id)` pairs for the calibration pass to key on.
+/// Install each section's `template` as a member of `collection` in the shared
+/// system prompt, mirroring [`crate::tools::install_tool_catalog`]. The section id
+/// is the collection member name; the template is its content (its KV seals at
+/// base-conv build, giving the section baseline provenance from its own prefill).
+/// Returns the `(id, section_id)` pairs for the calibration pass to key on.
 pub fn install_sections(
     builder: &mut ProjectionBuilder,
-    layer: LayerId,
     collection: &str,
     sections: &[ResponseSection],
 ) -> anyhow::Result<Vec<(String, SectionId)>> {
     let collection_id = builder
-        .id_for_collection_in(layer, collection)
-        .ok_or_else(|| anyhow::anyhow!("layer missing '{collection}' collection for section install"))?;
+        .id_for_system_collection(collection)
+        .ok_or_else(|| {
+            anyhow::anyhow!("system prompt missing '{collection}' collection for section install")
+        })?;
     let mut out = Vec::with_capacity(sections.len());
     for section in sections {
         let id = builder
-            .add_section_to_collection(
-                layer,
-                collection_id,
-                section.id.clone(),
-                &section.template,
-                100.0,
-            )
+            .add_section_to_collection(collection_id, section.id.clone(), &section.template, 100.0)
             .map_err(|e| anyhow::anyhow!("install section {:?}: {e}", section.id))?;
         out.push((section.id.clone(), id));
     }

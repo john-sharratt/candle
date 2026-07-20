@@ -79,12 +79,11 @@ pub enum ConstructionError {
     #[error("score_threshold for {name:?} must be >= 0, got {value}")]
     NegativeScoreThreshold { name: String, value: f32 },
 
-    /// A layer declared a `system_prompt:` block with no sections. Every
-    /// layer must declare at least one section — even an analysis phase
-    /// that hasn't yet been wired up should have a stub frame so the
-    /// projection target is always usable.
-    #[error("layer {layer:?} must declare at least one system_prompt section")]
-    EmptyLayerSystemPrompt { layer: String },
+    /// The schema declared no top-level `system_prompt:` sections. The unified
+    /// system prompt is shared by every projection target, so it must contain at
+    /// least one section for any layer to be usable as a target.
+    #[error("schema must declare at least one top-level system_prompt section")]
+    EmptySystemPrompt,
 
     /// A `summary:` block (on a layer or a section group) had a non-positive
     /// `max_tokens`, or an empty `system_prompt` / `user_prompt`. Every layer

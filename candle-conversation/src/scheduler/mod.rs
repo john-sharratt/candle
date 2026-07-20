@@ -719,15 +719,10 @@ impl ReprojectionPolicy {
     pub(crate) fn has_belief_collections(&self) -> bool {
         self.projection
             .schema()
-            .layers
+            .system_prompt
+            .items
             .iter()
-            .find(|l| l.id == self.target.layer)
-            .is_some_and(|l| {
-                l.system_prompt
-                    .items
-                    .iter()
-                    .any(|i| matches!(i, SystemPromptItem::Collection(_)))
-            })
+            .any(|i| matches!(i, SystemPromptItem::Collection(_)))
     }
 }
 
@@ -7068,10 +7063,10 @@ impl Scheduler {
         // strong carried signals survive, and RelLeak decays the challenger back
         // out over the turn if its fresh score doesn't hold up.
         if is_turn_boundary {
-            // Collections (tool catalog) live in the target layer: challenge on
-            // section fresh scores.
-            if let Some(layer) = schema.layers.iter().find(|l| l.id == policy.target.layer) {
-                for item in &layer.system_prompt.items {
+            // Collections (tool catalog) live in the shared system prompt:
+            // challenge on section fresh scores.
+            {
+                for item in &schema.system_prompt.items {
                     if let SystemPromptItem::Collection(coll) = item {
                         let budget_max = coll.policy.config.budget_max;
                         if budget_max < 3 {
@@ -7772,12 +7767,18 @@ mod tests {
         let target = 8000;
 
         // Above target → shrink, regardless of window position.
-        assert_eq!(backlog_admit_action(8001, target, ceil, ceil, false), Shrink);
+        assert_eq!(
+            backlog_admit_action(8001, target, ceil, ceil, false),
+            Shrink
+        );
         assert_eq!(backlog_admit_action(20000, target, 1, ceil, false), Shrink);
 
         // Deadband [target/2, target] → hold — no flapping as the backlog jitters.
         assert_eq!(backlog_admit_action(target, target, 4, ceil, false), Hold);
-        assert_eq!(backlog_admit_action(target / 2, target, 4, ceil, false), Hold);
+        assert_eq!(
+            backlog_admit_action(target / 2, target, 4, ceil, false),
+            Hold
+        );
         assert_eq!(backlog_admit_action(5000, target, 4, ceil, false), Hold);
 
         // Below target/2 with headroom and no VRAM pressure → grow.

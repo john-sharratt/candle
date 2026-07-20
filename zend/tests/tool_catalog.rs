@@ -50,8 +50,7 @@ fn build_test_projection() -> projection::Builder {
 /// section-tree node (the catalog sits under the `no_think` selector, so it is
 /// a prefix-transparent tree-collection node rather than a top-level item).
 fn tools_collection(builder: &projection::Builder) -> Option<&projection::SectionCollection> {
-    let dialogue = builder.id_for_layer("dialogue")?;
-    for it in &builder.layer(dialogue).unwrap().system_prompt.items {
+    for it in &builder.schema().system_prompt.items {
         match it {
             SystemPromptItem::Collection(c) if c.name == "tools" => return Some(c),
             SystemPromptItem::SectionTree(t) => {
@@ -80,12 +79,12 @@ fn n_tools_in_collection(builder: &projection::Builder) -> usize {
 #[test]
 fn install_tool_catalog_adds_one_section_per_registered_tool() {
     let mut builder = build_test_projection();
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
+    let _dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
 
     let n_before = n_tools_in_collection(&builder);
     let n_tools_in_registry = registry::all_tools().len();
 
-    let installed = install_tool_catalog(&mut builder, dialogue).unwrap();
+    let installed = install_tool_catalog(&mut builder).unwrap();
 
     assert_eq!(
         installed.len(),
@@ -103,8 +102,8 @@ fn install_tool_catalog_uses_existing_yaml_collection_topk() {
     // After install, that selection rule must be unchanged — the catalog
     // is appended to the existing collection rather than redefining it.
     let mut builder = build_test_projection();
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
-    install_tool_catalog(&mut builder, dialogue).unwrap();
+    let _dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
+    install_tool_catalog(&mut builder).unwrap();
 
     let coll = tools_collection(&builder).expect("tools collection must exist");
     match coll.selection {
@@ -118,24 +117,30 @@ fn install_tool_catalog_uses_existing_yaml_collection_topk() {
 #[test]
 fn install_tool_catalog_returns_section_ids_in_registry_order() {
     let mut builder = build_test_projection();
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
+    let _dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
 
-    let installed = install_tool_catalog(&mut builder, dialogue).unwrap();
-    let registry_names: Vec<&str> = registry::all_tools().iter().map(|t| t.name).collect();
+    let installed = install_tool_catalog(&mut builder).unwrap();
+    // `install_tool_catalog` walks the resolved tool-definition catalog
+    // (`tool_def::all()`, sorted by name) and installs one section per tool in
+    // that order, so the returned triples must match the catalog iteration order.
+    let catalog_names: Vec<&str> = zend::tool_def::all()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
 
     let installed_names: Vec<String> = installed.iter().map(|(n, _, _)| n.clone()).collect();
 
     assert_eq!(
-        installed_names, registry_names,
-        "install order must match registry iteration order",
+        installed_names, catalog_names,
+        "install order must match tool-definition catalog iteration order",
     );
 }
 
 #[test]
 fn install_tool_catalog_emits_valid_hermes_json_lines() {
     let mut builder = build_test_projection();
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
-    let installed = install_tool_catalog(&mut builder, dialogue).unwrap();
+    let _dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
+    let installed = install_tool_catalog(&mut builder).unwrap();
 
     // The catalog deliberately emits a flat
     // `{"name", "description", "parameters"}` shape — see the doc on
@@ -162,19 +167,17 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // tools_outro) must remain top-level always-emit sections — outside
     // the `tools` collection.
     let mut builder = build_test_projection();
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
+    let _dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
     let n_top_before = builder
-        .layer(dialogue)
-        .unwrap()
+        .schema()
         .system_prompt
         .items
         .iter()
         .filter(|it| matches!(it, SystemPromptItem::Section(_)))
         .count();
-    install_tool_catalog(&mut builder, dialogue).unwrap();
+    install_tool_catalog(&mut builder).unwrap();
     let n_top_after = builder
-        .layer(dialogue)
-        .unwrap()
+        .schema()
         .system_prompt
         .items
         .iter()
@@ -191,7 +194,7 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
     for name in ["frame", "tools_overview"] {
         assert!(
-            builder.id_for_section_in(dialogue, name).is_some(),
+            builder.id_for_system_section(name).is_some(),
             "static section {name:?} must still resolve",
         );
     }

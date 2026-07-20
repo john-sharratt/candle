@@ -101,7 +101,7 @@ use super::ids::{
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem, TreeCollection,
+    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection,
 };
 use super::selection::{apply_selection, resolve_default_turn, trim_to_budget_low_score_first};
 use crate::substrate::ContentResolver;
@@ -1245,38 +1245,44 @@ pub fn run_with_sink<R: ContentResolver>(
         v
     };
 
-    // ── Step 8: System prompt — emit target layer's items ────────────────────
+    // ── Step 8: System prompt — emit the shared prompt, framed by the target ──
     //
-    // The target layer's `system_prompt.items` is an ordered list:
-    // each item is either a single section (always emits) or a
-    // [`SectionCollection`] (named bucket with its own selection rule).
-    // Items emit in declaration order; sections inside a collection
-    // also emit in their declaration order, but only the surviving
-    // subset of the collection's selection rule survives.
+    // The schema's single `system_prompt.items` is an ordered list: each item is
+    // a single section (always emits), a [`SectionCollection`] (named bucket with
+    // its own selection rule), or a section-tree (pre-sealed selector branches).
+    // It is shared by every projection target — the target layer contributes only
+    // its `dials`, which seed the section-tree selection so this layer picks its
+    // pre-sealed branch. The caller's per-turn `selection` overrides those dials;
+    // any selector neither the caller nor the layer sets falls back to the tree's
+    // authored default.
     //
-    // This separation — static framing as plain sections vs.
-    // selectable catalogs as collections — is what lets a layer's
-    // system prompt mix always-emit framing (role, grounding,
-    // dialect markers) with dynamic catalogs (tool definitions,
-    // retrieval candidates) at well-defined positions.
+    // This separation — static framing as plain sections vs. selectable catalogs
+    // as collections vs. dial-selected branches — is what lets one shared system
+    // prompt mix always-emit framing (role, grounding, dialect markers), dynamic
+    // catalogs (tool definitions), and per-layer thinking/length/tool dials while
+    // its sealed K/V is reused across all layers.
     let mut resolved_selections: Vec<ResolvedSelection> = Vec::new();
-    let system_prompt_segments: Vec<ProjectionSegment> = schema
-        .layers
-        .iter()
-        .find(|l| l.id == target.layer)
-        .map(|l| {
-            emit_system_prompt_items(
-                l,
-                resolver,
-                mode,
-                selection,
-                prior,
-                decode_pos,
-                &mut selection_scores,
-                &mut resolved_selections,
-            )
-        })
-        .unwrap_or_default();
+    let effective_selection = {
+        let mut eff = selection.clone();
+        if let Some(l) = schema.layers.iter().find(|l| l.id == target.layer) {
+            for (sel, opt) in l.dials.iter() {
+                if eff.get(sel).is_none() {
+                    eff.select(sel.to_string(), opt.to_string());
+                }
+            }
+        }
+        eff
+    };
+    let system_prompt_segments: Vec<ProjectionSegment> = emit_system_prompt_items(
+        &schema.system_prompt,
+        resolver,
+        mode,
+        &effective_selection,
+        prior,
+        decode_pos,
+        &mut selection_scores,
+        &mut resolved_selections,
+    );
 
     if group_states.is_empty() {
         return Projection {
@@ -1526,15 +1532,15 @@ pub fn run_with_sink<R: ContentResolver>(
     }
 }
 
-/// Walk a layer's `system_prompt.items` in declaration order, emitting
-/// either each plain section verbatim or each collection's surviving
-/// subset (after applying its selection rule).
+/// Walk the shared system prompt's `items` in declaration order, emitting each
+/// plain section verbatim or each collection's surviving subset (after applying
+/// its selection rule), with section-tree branches resolved from `selection_state`.
 ///
 /// A [`SectionSchema`] with `depends_on = Some(cid)` only emits if the
 /// named collection materialised ≥ 1 section in this same emission pass.
 #[allow(clippy::too_many_arguments)]
 fn emit_system_prompt_items<R: ContentResolver>(
-    layer: &LayerSchema,
+    sp: &SystemPromptSchema,
     resolver: &R,
     mode: ProjectionMode,
     selection_state: &SelectionState,
@@ -1565,7 +1571,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
         }
         collection_results.insert(coll.id, selected);
     };
-    for item in &layer.system_prompt.items {
+    for item in &sp.items {
         match item {
             SystemPromptItem::Collection(coll) => {
                 // Top-level collection (e.g. `tools`): belief-driven selection.
@@ -1612,7 +1618,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
     // Second pass: walk items in declaration order, applying the
     // `depends_on` predicate to Sections and using the cached
     // collection results for Collections.
-    for item in &layer.system_prompt.items {
+    for item in &sp.items {
         match item {
             SystemPromptItem::Section(s) => {
                 let should_emit = match (s.depends_on, s.depends_on_absent) {

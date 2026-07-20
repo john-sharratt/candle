@@ -49,10 +49,7 @@ impl RawState {
 #[allow(clippy::large_enum_variant)]
 pub enum RefreshOutcome {
     NoOp,
-    Replaced {
-        sequence: Sequence,
-        state: RawState,
-    },
+    Replaced { sequence: Sequence, state: RawState },
 }
 
 /// Parse ChatML records out of `content`.
@@ -197,14 +194,13 @@ fn layer_system_prompt(
     config: &SequenceConfig,
 ) -> String {
     use projection::SystemPromptItem;
-    let layer = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == layer_name)
-        .unwrap_or_else(|| panic!("projection schema missing '{layer_name}' layer"));
+    debug_assert!(
+        builder.schema().layers.iter().any(|l| l.name == layer_name),
+        "projection schema missing '{layer_name}' layer"
+    );
+    // Every ingest conversation frames on the single shared system prompt.
     let mut body = String::new();
-    for item in &layer.system_prompt.items {
+    for item in &builder.schema().system_prompt.items {
         if let SystemPromptItem::Section(s) = item {
             body.push_str(&s.content);
         }
@@ -411,7 +407,10 @@ mod tests {
         assert_eq!(sink.turns.len(), 2);
         assert_eq!(sink.turns[0].0, "ping");
         assert_eq!(sink.turns[0].1, "pong");
-        assert_eq!(sink.turns[0].2, vec!["raw".to_string(), "a.chatml".to_string()]);
+        assert_eq!(
+            sink.turns[0].2,
+            vec!["raw".to_string(), "a.chatml".to_string()]
+        );
         assert_eq!(sink.turns[1].0, "hi");
         assert_eq!(sink.turns[1].1, "yo");
         assert_eq!(state.file_hashes.len(), 2);

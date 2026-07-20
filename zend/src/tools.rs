@@ -91,25 +91,18 @@ pub struct ToolResult {
 /// `TopK { k: 3 }`) is what filters the tool list.
 pub fn install_tool_catalog(
     builder: &mut ProjectionBuilder,
-    dialogue_layer: LayerId,
 ) -> anyhow::Result<Vec<(String, SectionId, String)>> {
-    // A dialogue layer without a `tools` collection is a deliberately tool-free
+    // A system prompt without a `tools` collection is a deliberately tool-free
     // projection (e.g. a conversational mind): install nothing rather than error.
-    let Some(collection_id) = builder.id_for_collection_in(dialogue_layer, "tools") else {
-        tracing::info!("dialogue layer declares no 'tools' collection — tools disabled");
+    let Some(collection_id) = builder.id_for_system_collection("tools") else {
+        tracing::info!("system prompt declares no 'tools' collection — tools disabled");
         return Ok(Vec::new());
     };
     let mut out: Vec<(String, SectionId, String)> = Vec::new();
     for def in crate::tool_def::all() {
         let json_line = def.json_line();
         let id = builder
-            .add_section_to_collection(
-                dialogue_layer,
-                collection_id,
-                def.name.clone(),
-                &json_line,
-                100.0,
-            )
+            .add_section_to_collection(collection_id, def.name.clone(), &json_line, 100.0)
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", def.name, e))?;
         out.push((def.name.clone(), id, json_line));
     }
@@ -121,7 +114,6 @@ pub fn install_tool_catalog(
     // ahead of the provenance-selected subset.
     Ok(out)
 }
-
 
 /// The selector id the calibration projection's `tools` collection reads
 /// ([`SelectionRule::Named`]) to pin exactly one tool. The "Calibrating sections"
@@ -176,7 +168,6 @@ pub fn build_calibration_projection(
 
     let collection = builder
         .add_collection(
-            layer,
             "tools",
             SelectionRule::Named {
                 selector: CALIB_TOOL_SELECTOR.to_string(),
@@ -186,7 +177,7 @@ pub fn build_calibration_projection(
         .map_err(|e| anyhow::anyhow!("calibration add_collection: {e}"))?;
     for def in crate::tool_def::all() {
         builder
-            .add_section_to_collection(layer, collection, def.name.clone(), def.json_line(), 100.0)
+            .add_section_to_collection(collection, def.name.clone(), def.json_line(), 100.0)
             .map_err(|e| anyhow::anyhow!("calibration add tool {}: {e}", def.name))?;
     }
 
@@ -198,7 +189,7 @@ pub fn build_calibration_projection(
         sys_end = dialect.system_end,
     );
     builder
-        .add_section(layer, "tools_outro", outro, 50.0)
+        .add_section("tools_outro", outro, 50.0)
         .map_err(|e| anyhow::anyhow!("calibration add outro: {e}"))?;
 
     Ok((builder, layer, group))

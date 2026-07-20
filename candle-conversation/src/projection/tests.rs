@@ -228,12 +228,14 @@ fn groups_in_order<'a>(
 // —— YAML round-trip and id assignment —————————————————————————————————————————
 
 const SIMPLE_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "You are a helpful assistant."
+    - id: values
+      content: "Be honest."
 layers:
   - name: ground
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 8000
     summary:
       turns:
@@ -268,12 +270,6 @@ layers:
     budget:
       priority: 100
       min_percent: 50
-    system_prompt:
-      sections:
-        - id: frame
-          content: "You are a helpful assistant."
-        - id: values
-          content: "Be honest."
     groups:
       - id: conversation
         selection:
@@ -298,8 +294,8 @@ fn yaml_parses_and_assigns_ids() {
     assert!(facts.raw() < conv.raw());
 
     // Sections (per-layer scoped — both live under `dialogue` here).
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
-    let values = b.id_for_section_in(dialogue, "values").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
+    let values = b.id_for_system_section("values").unwrap();
     assert!(frame.raw() < values.raw());
 }
 
@@ -410,8 +406,8 @@ fn schema_accessors_work() {
     let group = b.group(facts).unwrap();
     assert_eq!(group.name, "facts");
 
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
     let section = b.section(frame).unwrap();
     assert_eq!(section.name, "frame");
 }
@@ -601,12 +597,12 @@ fn higher_layer_not_visible_for_lower_target() {
 #[test]
 fn sibling_group_in_target_layer_not_visible() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer_a
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -655,12 +651,12 @@ layers:
 #[test]
 fn turns_below_score_threshold_filtered() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -710,12 +706,14 @@ layers:
 #[test]
 fn layer_threshold_filters_whole_group() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: low
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -734,10 +732,6 @@ layers:
       - id: low_grp
         selection: { kind: top_k, k: 5 }
   - name: high
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 9000
     summary:
       turns:
@@ -788,12 +782,12 @@ layers:
 #[test]
 fn top_k_limits_turns() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -841,12 +835,12 @@ layers:
 #[test]
 fn single_selection_one_turn() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -890,12 +884,12 @@ layers:
 #[test]
 fn always_visible_selects_all_above_threshold() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -941,12 +935,12 @@ layers:
 /// Minimal single-layer schema whose one group ranks by raw provenance score
 /// (`top_k`), so summary forest nodes compete head-to-head with raw turns.
 const TOPK_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 8000
     summary:
       turns:
@@ -1088,12 +1082,12 @@ fn rule_based_dedup_prefers_the_finer_summary_over_its_ancestor() {
 #[test]
 fn score_density_summary_emitted_before_later_raw_turn() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: dialogue
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 1200
     summary:
       turns:
@@ -1154,12 +1148,12 @@ layers:
 #[test]
 fn conversation_recent_turns_always_included() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -1223,12 +1217,12 @@ layers:
 #[test]
 fn budget_overflow_drops_lowest_scored_turns() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 4500
     summary:
       turns:
@@ -1280,12 +1274,12 @@ layers:
 #[test]
 fn single_turn_overflow_drops_turn() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 900
     summary:
       turns:
@@ -1331,12 +1325,12 @@ layers:
 #[test]
 fn turns_emitted_in_insertion_order_within_group() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -1380,12 +1374,14 @@ fn higher_scored_group_emitted_last_within_layer() {
     // Doc Â§7: "Higher-scored groups appear *later* in the emitted list within
     // their layer — closer to the bottom of the LLM's input."
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: data_layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -1403,10 +1399,6 @@ layers:
       - id: high_grp
         selection: { kind: top_k, k: 5 }
   - name: target_layer
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 49000
     summary:
       turns:
@@ -1459,12 +1451,16 @@ layers:
 // —— Multi-layer projection ————————————————————————————————————————————————————
 
 const MULTI_LAYER_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "Frame content."
+    - id: values
+      content: "Values content."
+    - id: guidance
+      content: "Guidance content."
 layers:
   - name: perceptual_ground
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 95000
     summary:
       turns:
@@ -1487,10 +1483,6 @@ layers:
         selection: { kind: top_k, k: 3 }
 
   - name: motivational
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 95000
     summary:
       turns:
@@ -1528,14 +1520,6 @@ layers:
     budget:
       priority: 100
       min_percent: 50
-    system_prompt:
-      sections:
-        - id: frame
-          content: "Frame content."
-        - id: values
-          content: "Values content."
-        - id: guidance
-          content: "Guidance content."
     groups:
       - id: primary_conversation
         selection:
@@ -1671,14 +1655,14 @@ fn multi_layer_ground_target_sees_only_ground() {
 #[test]
 fn sections_always_emit_regardless_of_size() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: small
+      content: "Small."
+    - id: big
+      content: "Very large section content that would dwarf any turn budget."
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: small
-          content: "Small."
-        - id: big
-          content: "Very large section content that would dwarf any turn budget."
     window: 800
     summary:
       turns:
@@ -1697,8 +1681,8 @@ layers:
     let b = Builder::from_yaml(yaml).unwrap();
     let layer = b.id_for_layer("layer").unwrap();
     let grp = b.id_for_group("grp").unwrap();
-    let small = b.id_for_section_in(layer, "small").unwrap();
-    let big = b.id_for_section_in(layer, "big").unwrap();
+    let small = b.id_for_system_section("small").unwrap();
+    let big = b.id_for_system_section("big").unwrap();
 
     let resolver = MockResolver::new();
     let proj = b.project(
@@ -1718,9 +1702,9 @@ fn system_prompt_sections_in_declaration_order() {
     let b = Builder::from_yaml(MULTI_LAYER_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let pc = b.id_for_group("primary_conversation").unwrap();
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
-    let values = b.id_for_section_in(dialogue, "values").unwrap();
-    let guidance = b.id_for_section_in(dialogue, "guidance").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
+    let values = b.id_for_system_section("values").unwrap();
+    let guidance = b.id_for_system_section("guidance").unwrap();
 
     let resolver = MockResolver::new();
     let proj = b.project(
@@ -1742,12 +1726,14 @@ fn system_prompt_sections_in_declaration_order() {
 #[test]
 fn yaml_duplicate_group_name_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: layer1
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1763,10 +1749,6 @@ layers:
       - id: dup
         selection: { kind: always_visible }
   - name: layer2
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 9000
     summary:
       turns:
@@ -1793,14 +1775,14 @@ layers:
 #[test]
 fn yaml_duplicate_section_name_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "A"
+    - id: s1
+      content: "B"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "A"
-        - id: s1
-          content: "B"
     window: 9000
     summary:
       turns:
@@ -1826,12 +1808,12 @@ layers:
 #[test]
 fn yaml_unknown_selection_kind_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1857,12 +1839,12 @@ layers:
 #[test]
 fn yaml_invalid_priority_zero_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1889,12 +1871,12 @@ layers:
 #[test]
 fn yaml_invalid_percentage_over_100_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1923,12 +1905,12 @@ layers:
 #[test]
 fn construction_sibling_min_percent_exceeds_100_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1958,12 +1940,12 @@ layers:
 #[test]
 fn construction_max_less_than_min_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -1990,12 +1972,12 @@ layers:
 #[test]
 fn construction_top_k_zero_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2021,12 +2003,12 @@ layers:
 #[test]
 fn construction_conversation_both_zero_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2055,12 +2037,12 @@ layers:
 #[test]
 fn construction_negative_score_threshold_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2091,12 +2073,14 @@ fn score_formula_sum_determines_group_score() {
     // Two groups in a lower layer; project from upper so both are visible.
     // grp_low: sum=0.3; grp_high: sum=1.0 → grp_high emits last.
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: data_layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2114,10 +2098,6 @@ layers:
       - id: grp_high
         selection: { kind: always_visible }
   - name: upper_layer
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 49000
     summary:
       turns:
@@ -2170,12 +2150,14 @@ layers:
 #[test]
 fn score_formula_count_promotes_large_groups() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: data_layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2193,10 +2175,6 @@ layers:
       - id: large_grp
         selection: { kind: always_visible }
   - name: upper_layer
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 49000
     summary:
       turns:
@@ -2251,12 +2229,14 @@ layers:
 #[test]
 fn freed_budget_redistributes_to_other_layers() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: sparse
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9500
     summary:
       turns:
@@ -2274,10 +2254,6 @@ layers:
       - id: sparse_grp
         selection: { kind: always_visible }
   - name: dense
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 9500
     summary:
       turns:
@@ -2335,6 +2311,10 @@ layers:
 #[test]
 fn no_layers_in_schema_is_valid() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "x"
 layers: []
 "#;
     let b = Builder::from_yaml(yaml);
@@ -2344,12 +2324,12 @@ layers: []
 #[test]
 fn empty_group_does_not_consume_budget() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9500
     summary:
       turns:
@@ -2395,12 +2375,12 @@ layers:
 #[test]
 fn all_turns_below_threshold_leaves_no_turns() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2440,12 +2420,12 @@ layers:
 #[test]
 fn large_number_of_turns_respects_budget() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 4500
     summary:
       turns:
@@ -2493,12 +2473,12 @@ layers:
 #[test]
 fn min_percent_guarantees_minimum_budget() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2555,12 +2535,12 @@ layers:
 #[test]
 fn top_k_mean_formula_integration() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2620,12 +2600,12 @@ layers:
 #[test]
 fn max_percent_caps_allocation() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9500
     summary:
       turns:
@@ -2683,12 +2663,12 @@ layers:
 #[test]
 fn historical_top_k_zero_means_only_recent() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2734,12 +2714,12 @@ layers:
 #[test]
 fn recent_zero_means_only_historical() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2790,12 +2770,12 @@ layers:
 #[test]
 fn yaml_top_k_missing_k_is_error() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 9000
     summary:
       turns:
@@ -2819,7 +2799,9 @@ layers:
 }
 
 #[test]
-fn missing_layer_system_prompt_is_parse_error() {
+fn missing_system_prompt_is_parse_error() {
+    // The top-level system_prompt is a required field; omitting it entirely is a
+    // deserialization (parse) error before construction validation runs.
     let yaml = r#"
 layers:
   - name: layer
@@ -2843,8 +2825,12 @@ layers:
 }
 
 #[test]
-fn empty_layer_system_prompt_is_construction_error() {
+fn empty_system_prompt_is_construction_error() {
+    // The unified top-level system_prompt is required and must be non-empty;
+    // an empty section list fails construction with EmptySystemPrompt.
     let yaml = r#"
+system_prompt:
+  sections: []
 layers:
   - name: layer
     window: 9000
@@ -2858,8 +2844,6 @@ layers:
           system_prompt: compress
           user_prompt: compress
     score_formula: max
-    system_prompt:
-      sections: []
     groups:
       - id: grp
         selection: { kind: always_visible }
@@ -2867,7 +2851,7 @@ layers:
     let err = Builder::from_yaml(yaml).unwrap_err();
     assert!(matches!(
         err,
-        super::error::ConstructionError::EmptyLayerSystemPrompt { .. }
+        super::error::ConstructionError::EmptySystemPrompt
     ));
 }
 
@@ -2877,12 +2861,14 @@ fn empty_target_group_does_not_emit_target_layer() {
     // the target group. If the target group has no turns, its layer should not
     // emit any turns (lower-layer groups still appear).
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
 layers:
   - name: data
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -2898,10 +2884,6 @@ layers:
       - id: data_grp
         selection: { kind: always_visible }
   - name: target_layer
-    system_prompt:
-      sections:
-        - id: stub
-          content: "stub"
     window: 49000
     summary:
       turns:
@@ -2945,6 +2927,10 @@ layers:
 // —— Variable substitution ————————————————————————————————————————————————————
 
 const SUBST_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "Hello {name}, welcome to {project}."
 layers:
   - name: dialogue
     window: 8000
@@ -2959,10 +2945,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      sections:
-        - id: frame
-          content: "Hello {name}, welcome to {project}."
     groups:
       - id: chat
         selection: { kind: always_visible }
@@ -2972,8 +2954,8 @@ layers:
 fn substitution_replaces_placeholders() {
     let b = Builder::from_yaml_with_vars(SUBST_YAML, &[("name", "Alice"), ("project", "Candle")])
         .unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
     let section = b.section(frame).unwrap();
     assert_eq!(section.content, "Hello Alice, welcome to Candle.");
 }
@@ -2992,6 +2974,10 @@ fn substitution_missing_var_is_error() {
 #[test]
 fn substitution_catches_template_typo() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "Welcome to {wokrspace}."
 layers:
   - name: dialogue
     window: 8000
@@ -3006,10 +2992,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      sections:
-        - id: frame
-          content: "Welcome to {wokrspace}."
     groups:
       - id: chat
         selection: { kind: always_visible }
@@ -3026,6 +3008,10 @@ layers:
 #[test]
 fn substitution_leaves_non_identifier_braces_alone() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: 'Example JSON: {"tool": "search", "args": {}}'
 layers:
   - name: dialogue
     window: 8000
@@ -3040,17 +3026,13 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      sections:
-        - id: frame
-          content: 'Example JSON: {"tool": "search", "args": {}}'
     groups:
       - id: chat
         selection: { kind: always_visible }
 "#;
     let b = Builder::from_yaml_with_vars(yaml, &[]).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
     let section = b.section(frame).unwrap();
     assert_eq!(
         section.content,
@@ -3061,6 +3043,10 @@ layers:
 #[test]
 fn from_yaml_rejects_any_placeholder() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "Welcome to {workspace}."
 layers:
   - name: dialogue
     window: 8000
@@ -3075,10 +3061,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      sections:
-        - id: frame
-          content: "Welcome to {workspace}."
     groups:
       - id: chat
         selection: { kind: always_visible }
@@ -3093,8 +3075,8 @@ layers:
 #[test]
 fn substitution_baked_into_immutable_schema() {
     let b = Builder::from_yaml_with_vars(SUBST_YAML, &[("name", "A"), ("project", "B")]).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let frame = b.id_for_system_section("frame").unwrap();
     let content_first = b.section(frame).unwrap().content.clone();
     let content_second = b.section(frame).unwrap().content.clone();
     assert_eq!(content_first, content_second);
@@ -3172,12 +3154,12 @@ fn zend_projection_yaml_parses() {
 #[test]
 fn default_selection_is_always_visible() {
     let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
 layers:
   - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
     window: 49000
     summary:
       turns:
@@ -3225,6 +3207,14 @@ layers:
 // order; selection picks by salience (provenance-derived score).
 
 const SECTIONS_YAML_FLAT: &str = r#"
+system_prompt:
+  sections:
+    - id: alpha
+      content: "alpha"
+    - id: beta
+      content: "beta"
+    - id: gamma
+      content: "gamma"
 layers:
   - name: dialogue
     window: 4000
@@ -3240,14 +3230,6 @@ layers:
     score_formula: max
     budget:
       priority: 100
-    system_prompt:
-      sections:
-        - id: alpha
-          content: "alpha"
-        - id: beta
-          content: "beta"
-        - id: gamma
-          content: "gamma"
     groups:
       - id: convo
         selection:
@@ -3262,9 +3244,9 @@ fn flat_sections_yaml_emits_all_in_declaration_order() {
     let b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let alpha = b.id_for_section_in(dialogue, "alpha").unwrap();
-    let beta = b.id_for_section_in(dialogue, "beta").unwrap();
-    let gamma = b.id_for_section_in(dialogue, "gamma").unwrap();
+    let alpha = b.id_for_system_section("alpha").unwrap();
+    let beta = b.id_for_system_section("beta").unwrap();
+    let gamma = b.id_for_system_section("gamma").unwrap();
 
     let resolver = MockResolver::new();
     let p = b.project(
@@ -3283,6 +3265,39 @@ fn flat_sections_yaml_emits_all_in_declaration_order() {
 }
 
 const COLLECTION_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: framing
+      content: "framing"
+    - kind: section
+      id: tools_intro
+      content: "tools_intro"
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      sections:
+        - id: tool_a
+          content: "A"
+        - id: tool_b
+          content: "B"
+        - id: tool_c
+          content: "C"
+        - id: tool_d
+          content: "D"
+    - kind: section
+      id: tools_outro
+      content: "tools_outro"
 layers:
   - name: dialogue
     window: 4000
@@ -3297,39 +3312,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: section
-          id: framing
-          content: "framing"
-        - kind: section
-          id: tools_intro
-          content: "tools_intro"
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: top_k, k: 2 }
-          sections:
-            - id: tool_a
-              content: "A"
-            - id: tool_b
-              content: "B"
-            - id: tool_c
-              content: "C"
-            - id: tool_d
-              content: "D"
-        - kind: section
-          id: tools_outro
-          content: "tools_outro"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3338,6 +3320,29 @@ layers:
 /// Like `COLLECTION_YAML` but the collection's `top_k` (5) exceeds its member
 /// count (2), so every projection selects *all* tools — the all-selected case.
 const ALL_TOOLS_FIT_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: tools_intro
+      content: "tools_intro"
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose categories.
+          user_prompt: Propose categories.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign by number.
+          user_prompt: Assign by number.
+      name: tools
+      selection: { kind: top_k, k: 5 }
+      sections:
+        - id: tool_a
+          content: "A"
+        - id: tool_b
+          content: "B"
 layers:
   - name: dialogue
     window: 4000
@@ -3352,29 +3357,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: section
-          id: tools_intro
-          content: "tools_intro"
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose categories.
-              user_prompt: Propose categories.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign by number.
-              user_prompt: Assign by number.
-          name: tools
-          selection: { kind: top_k, k: 5 }
-          sections:
-            - id: tool_a
-              content: "A"
-            - id: tool_b
-              content: "B"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3387,13 +3369,12 @@ fn collection_partial_selection_emits_summary_before_members() {
     let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
     let summary = SectionId::reserved(Reserved::ToolSummary);
-    b.set_collection_summary_section(dialogue, tools, summary)
-        .unwrap();
-    let tools_intro = b.id_for_section_in(dialogue, "tools_intro").unwrap();
-    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
-    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
 
     let resolver = MockResolver::new()
         .with_section_score(tool_b, 0.9)
@@ -3430,12 +3411,11 @@ fn collection_all_selected_omits_summary() {
     let mut b = Builder::from_yaml(ALL_TOOLS_FIT_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
     let summary = SectionId::reserved(Reserved::ToolSummary);
-    b.set_collection_summary_section(dialogue, tools, summary)
-        .unwrap();
-    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
-    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
 
     let resolver = MockResolver::new()
         .with_section_score(tool_a, 0.9)
@@ -3465,12 +3445,11 @@ fn collection_partial_but_unsealed_summary_omitted() {
     let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
     let summary = SectionId::reserved(Reserved::ToolSummary);
-    b.set_collection_summary_section(dialogue, tools, summary)
-        .unwrap();
-    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
-    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
 
     // Partial, but no `with_section_tokens` → summary is unsealed.
     let resolver = MockResolver::new()
@@ -3501,6 +3480,40 @@ fn collection_summary_emits_outside_structural_markers() {
     use candle_transformers::models::dialect::Dialect;
 
     let yaml = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: tools_overview
+      depends_on: tools
+      content: "overview"
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: tools
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 1 }
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: x
+          user_prompt: x
+        assign:
+          max_tokens: 128
+          system_prompt: x
+          user_prompt: x
+      sections:
+        - id: tool_a
+          content: "A"
+        - id: tool_b
+          content: "B"
+        - id: tool_c
+          content: "C"
+    - kind: template
+      id: tools_close
+      dialect: tool_block_close
+      depends_on: tools
 layers:
   - name: dialogue
     window: 4000
@@ -3513,40 +3526,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section
-          id: tools_overview
-          depends_on: tools
-          content: "overview"
-        - kind: template
-          id: tools_open
-          dialect: tool_block_open
-          depends_on: tools
-        - kind: collection
-          name: tools
-          selection: { kind: top_k, k: 1 }
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: x
-              user_prompt: x
-            assign:
-              max_tokens: 128
-              system_prompt: x
-              user_prompt: x
-          sections:
-            - id: tool_a
-              content: "A"
-            - id: tool_b
-              content: "B"
-            - id: tool_c
-              content: "C"
-        - kind: template
-          id: tools_close
-          dialect: tool_block_close
-          depends_on: tools
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3557,11 +3536,10 @@ layers:
         .unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
     let summary = SectionId::reserved(Reserved::ToolSummary);
-    b.set_collection_summary_section(dialogue, tools, summary)
-        .unwrap();
-    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
 
     // top_k=1 over 3 members → partial; summary sealed.
     let resolver = MockResolver::new()
@@ -3609,6 +3587,33 @@ layers:
 #[test]
 fn depends_on_absent_emits_only_when_collection_empty() {
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: with_tools
+      depends_on: tools
+      content: "WITH"
+    - kind: section
+      id: no_tools
+      depends_on_absent: tools
+      content: "NO"
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      score_threshold: 0.5
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: x
+          user_prompt: x
+        assign:
+          max_tokens: 128
+          system_prompt: x
+          user_prompt: x
+      sections:
+        - id: t1
+          content: "tool one"
 layers:
   - name: dialogue
     window: 1000
@@ -3621,33 +3626,6 @@ layers:
         assistant:
           system_prompt: c
           user_prompt: c
-    system_prompt:
-      items:
-        - kind: section
-          id: with_tools
-          depends_on: tools
-          content: "WITH"
-        - kind: section
-          id: no_tools
-          depends_on_absent: tools
-          content: "NO"
-        - kind: collection
-          name: tools
-          selection: { kind: top_k, k: 2 }
-          score_threshold: 0.5
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: x
-              user_prompt: x
-            assign:
-              max_tokens: 128
-              system_prompt: x
-              user_prompt: x
-          sections:
-            - id: t1
-              content: "tool one"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3655,9 +3633,9 @@ layers:
     let b = Builder::from_yaml(YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let with = b.id_for_section_in(dialogue, "with_tools").unwrap();
-    let no = b.id_for_section_in(dialogue, "no_tools").unwrap();
-    let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+    let with = b.id_for_system_section("with_tools").unwrap();
+    let no = b.id_for_system_section("no_tools").unwrap();
+    let t1 = b.id_for_system_section("t1").unwrap();
     let target = ProjectionTarget {
         layer: dialogue,
         group: convo,
@@ -3694,13 +3672,13 @@ fn collection_top_k_keeps_highest_scored_in_declaration_order() {
     let b = Builder::from_yaml(COLLECTION_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let framing = b.id_for_section_in(dialogue, "framing").unwrap();
-    let tools_intro = b.id_for_section_in(dialogue, "tools_intro").unwrap();
-    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
-    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
-    let tool_c = b.id_for_section_in(dialogue, "tool_c").unwrap();
-    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
-    let tools_outro = b.id_for_section_in(dialogue, "tools_outro").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools_outro = b.id_for_system_section("tools_outro").unwrap();
 
     // tool_b and tool_d score highest → top-k=2 keeps them.  Emission is
     // in declaration order: framing → tools_intro → (tool_b → tool_d) →
@@ -3733,10 +3711,10 @@ fn collection_top_k_with_priority_tiebreak() {
     let b = Builder::from_yaml(COLLECTION_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
-    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
-    let tool_c = b.id_for_section_in(dialogue, "tool_c").unwrap();
-    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
 
     // All four tools tie on score → fall back to declaration order
     // (a, b, c, d) and pick the first two.
@@ -3763,6 +3741,29 @@ fn collection_top_k_with_priority_tiebreak() {
 }
 
 const COLLECTION_YAML_THRESHOLD: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: top_k, k: 5 }
+      score_threshold: 0.4
+      sections:
+        - id: low
+          content: "low"
+        - id: mid
+          content: "mid"
+        - id: high
+          content: "high"
 layers:
   - name: dialogue
     window: 4000
@@ -3777,29 +3778,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: top_k, k: 5 }
-          score_threshold: 0.4
-          sections:
-            - id: low
-              content: "low"
-            - id: mid
-              content: "mid"
-            - id: high
-              content: "high"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3810,11 +3788,11 @@ fn collection_score_threshold_filters_below_floor() {
     let b = Builder::from_yaml(COLLECTION_YAML_THRESHOLD).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let mid = b.id_for_section_in(dialogue, "mid").unwrap();
-    let high = b.id_for_section_in(dialogue, "high").unwrap();
+    let mid = b.id_for_system_section("mid").unwrap();
+    let high = b.id_for_system_section("high").unwrap();
 
     let resolver = MockResolver::new()
-        .with_section_score(b.id_for_section_in(dialogue, "low").unwrap(), 0.2)
+        .with_section_score(b.id_for_system_section("low").unwrap(), 0.2)
         .with_section_score(mid, 0.5)
         .with_section_score(high, 0.9);
 
@@ -3833,6 +3811,28 @@ fn collection_score_threshold_filters_below_floor() {
 #[test]
 fn collection_single_picks_max_only() {
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: choices
+      selection: { kind: single }
+      sections:
+        - id: a
+          content: "a"
+        - id: b
+          content: "b"
+        - id: c
+          content: "c"
 layers:
   - name: dialogue
     window: 4000
@@ -3847,28 +3847,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: choices
-          selection: { kind: single }
-          sections:
-            - id: a
-              content: "a"
-            - id: b
-              content: "b"
-            - id: c
-              content: "c"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3876,12 +3854,12 @@ layers:
     let b = Builder::from_yaml(YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let b_id = b.id_for_section_in(dialogue, "b").unwrap();
+    let b_id = b.id_for_system_section("b").unwrap();
 
     let resolver = MockResolver::new()
-        .with_section_score(b.id_for_section_in(dialogue, "a").unwrap(), 0.4)
+        .with_section_score(b.id_for_system_section("a").unwrap(), 0.4)
         .with_section_score(b_id, 0.9)
-        .with_section_score(b.id_for_section_in(dialogue, "c").unwrap(), 0.6);
+        .with_section_score(b.id_for_system_section("c").unwrap(), 0.6);
 
     let p = b.project(
         ProjectionTarget {
@@ -3899,6 +3877,28 @@ layers:
 fn collection_named_pins_member_by_runtime_selector() {
     use crate::projection::{ProjectionMode, SelectionState};
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: named, selector: tool }
+      sections:
+        - id: datetime
+          content: "datetime def"
+        - id: web_search
+          content: "web_search def"
+        - id: calc
+          content: "calc def"
 layers:
   - name: dialogue
     window: 4000
@@ -3913,28 +3913,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: named, selector: tool }
-          sections:
-            - id: datetime
-              content: "datetime def"
-            - id: web_search
-              content: "web_search def"
-            - id: calc
-              content: "calc def"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -3942,7 +3920,7 @@ layers:
     let b = Builder::from_yaml(YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let web_search = b.id_for_section_in(dialogue, "web_search").unwrap();
+    let web_search = b.id_for_system_section("web_search").unwrap();
     let target = ProjectionTarget {
         layer: dialogue,
         group: convo,
@@ -3951,9 +3929,9 @@ layers:
     // Scores are deliberately hostile (the two *unwanted* members rank highest):
     // Named must ignore them entirely and pin the named member.
     let resolver = MockResolver::new()
-        .with_section_score(b.id_for_section_in(dialogue, "datetime").unwrap(), 0.99)
+        .with_section_score(b.id_for_system_section("datetime").unwrap(), 0.99)
         .with_section_score(web_search, 0.01)
-        .with_section_score(b.id_for_section_in(dialogue, "calc").unwrap(), 0.99);
+        .with_section_score(b.id_for_system_section("calc").unwrap(), 0.99);
 
     // Pin web_search by name → exactly that one member, score notwithstanding.
     let mut sel = SelectionState::new();
@@ -3994,6 +3972,24 @@ layers:
 fn named_selection_rejects_empty_selector() {
     use crate::projection::ConstructionError;
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: named }
+      sections:
+        - id: datetime
+          content: "datetime def"
 layers:
   - name: dialogue
     window: 4000
@@ -4006,24 +4002,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: named }
-          sections:
-            - id: datetime
-              content: "datetime def"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4038,6 +4016,25 @@ layers:
 #[test]
 fn collection_always_visible_emits_every_section() {
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: all
+      sections:
+        - id: a
+          content: "a"
+        - id: b
+          content: "b"
 layers:
   - name: dialogue
     window: 4000
@@ -4052,25 +4049,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: all
-          sections:
-            - id: a
-              content: "a"
-            - id: b
-              content: "b"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4098,6 +4076,28 @@ layers:
 #[test]
 fn yaml_section_priority_field_parses() {
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: pick
+      selection: { kind: top_k, k: 1 }
+      sections:
+        - id: low_priority
+          content: "L"
+          priority: 10
+        - id: high_priority
+          content: "H"
+          priority: 1000
 layers:
   - name: dialogue
     window: 4000
@@ -4112,28 +4112,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: pick
-          selection: { kind: top_k, k: 1 }
-          sections:
-            - id: low_priority
-              content: "L"
-              priority: 10
-            - id: high_priority
-              content: "H"
-              priority: 1000
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4141,8 +4119,8 @@ layers:
     let b = Builder::from_yaml(YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let high = b.id_for_section_in(dialogue, "high_priority").unwrap();
-    let low = b.id_for_section_in(dialogue, "low_priority").unwrap();
+    let high = b.id_for_system_section("high_priority").unwrap();
+    let low = b.id_for_system_section("low_priority").unwrap();
 
     // The `priority:` field parses (the YAML built); selection is now
     // belief-driven by score, so the higher-scored section is the single pick.
@@ -4164,6 +4142,30 @@ layers:
 #[test]
 fn collection_with_no_qualifying_sections_yields_empty_subset() {
     const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: framing
+      content: "framing"
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      score_threshold: 0.5
+      sections:
+        - id: a
+          content: "a"
+        - id: b
+          content: "b"
 layers:
   - name: dialogue
     window: 4000
@@ -4178,30 +4180,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: section
-          id: framing
-          content: "framing"
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: top_k, k: 2 }
-          score_threshold: 0.5
-          sections:
-            - id: a
-              content: "a"
-            - id: b
-              content: "b"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4209,11 +4187,11 @@ layers:
     let b = Builder::from_yaml(YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let framing = b.id_for_section_in(dialogue, "framing").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
 
     let resolver = MockResolver::new()
-        .with_section_score(b.id_for_section_in(dialogue, "a").unwrap(), 0.1)
-        .with_section_score(b.id_for_section_in(dialogue, "b").unwrap(), 0.2);
+        .with_section_score(b.id_for_system_section("a").unwrap(), 0.1)
+        .with_section_score(b.id_for_system_section("b").unwrap(), 0.2);
 
     let p = b.project(
         ProjectionTarget {
@@ -4233,20 +4211,17 @@ layers:
 #[test]
 fn add_section_appends_at_end_with_unique_id() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let n_before = b.schema().layers[0].system_prompt.items.len();
-    let new_id = b
-        .add_section(dialogue, "newsec", "new content", 75.0)
-        .unwrap();
-    assert_eq!(b.schema().layers[0].system_prompt.items.len(), n_before + 1);
-    assert_eq!(b.id_for_section_in(dialogue, "newsec"), Some(new_id));
+    let n_before = b.schema().system_prompt.items.len();
+    let new_id = b.add_section("newsec", "new content", 75.0).unwrap();
+    assert_eq!(b.schema().system_prompt.items.len(), n_before + 1);
+    assert_eq!(b.id_for_system_section("newsec"), Some(new_id));
 }
 
 #[test]
 fn add_section_duplicate_name_fails() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let result = b.add_section(dialogue, "alpha", "dup", 50.0);
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let result = b.add_section("alpha", "dup", 50.0);
     assert!(matches!(
         result,
         Err(super::error::ConstructionError::DuplicateSectionName(ref n)) if n == "alpha"
@@ -4256,16 +4231,11 @@ fn add_section_duplicate_name_fails() {
 #[test]
 fn add_collection_appends_and_returns_id() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
     let cid = b
-        .add_collection(
-            dialogue,
-            "tools",
-            super::schema::SelectionRule::TopK { k: 3 },
-            0.0,
-        )
+        .add_collection("tools", super::schema::SelectionRule::TopK { k: 3 }, 0.0)
         .unwrap();
-    assert_eq!(b.id_for_collection_in(dialogue, "tools"), Some(cid));
+    assert_eq!(b.id_for_system_collection("tools"), Some(cid));
 }
 
 #[test]
@@ -4280,13 +4250,14 @@ fn runtime_section_ids_stay_disjoint_from_compression_prompts() {
     // a degenerate loop (the live-daemon bug this guards).
     let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
-    let cid = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let cid = b.id_for_system_collection("tools").unwrap();
 
     // The hidden (compression-prompt + collection-summary) section ids — those
     // in `all_section_ids` but not visible in `system_prompt.items`.
     let hidden: Vec<u32> = {
         let layer = b.schema().layers.iter().find(|l| l.id == dialogue).unwrap();
-        let visible: std::collections::HashSet<u32> = layer
+        let visible: std::collections::HashSet<u32> = b
+            .schema()
             .system_prompt
             .all_sections()
             .map(|s| s.id.raw())
@@ -4304,7 +4275,7 @@ fn runtime_section_ids_stay_disjoint_from_compression_prompts() {
 
     for t in 0..6 {
         let id = b
-            .add_section_to_collection(dialogue, cid, format!("rt_{t}"), "x", 50.0)
+            .add_section_to_collection(cid, format!("rt_{t}"), "x", 50.0)
             .unwrap();
         assert!(
             !hidden.contains(&id.raw()),
@@ -4321,27 +4292,22 @@ fn add_section_to_collection_appends_in_collection() {
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
     let cid = b
-        .add_collection(
-            dialogue,
-            "tools",
-            super::schema::SelectionRule::TopK { k: 2 },
-            0.0,
-        )
+        .add_collection("tools", super::schema::SelectionRule::TopK { k: 2 }, 0.0)
         .unwrap();
     let t1 = b
-        .add_section_to_collection(dialogue, cid, "t1", "tool1", 50.0)
+        .add_section_to_collection(cid, "t1", "tool1", 50.0)
         .unwrap();
     let t2 = b
-        .add_section_to_collection(dialogue, cid, "t2", "tool2", 50.0)
+        .add_section_to_collection(cid, "t2", "tool2", 50.0)
         .unwrap();
     let t3 = b
-        .add_section_to_collection(dialogue, cid, "t3", "tool3", 50.0)
+        .add_section_to_collection(cid, "t3", "tool3", 50.0)
         .unwrap();
     // Section names are layer-scoped: t1/t2/t3 are unique even though
     // they're nested in a collection.
-    assert_eq!(b.id_for_section_in(dialogue, "t1"), Some(t1));
-    assert_eq!(b.id_for_section_in(dialogue, "t2"), Some(t2));
-    assert_eq!(b.id_for_section_in(dialogue, "t3"), Some(t3));
+    assert_eq!(b.id_for_system_section("t1"), Some(t1));
+    assert_eq!(b.id_for_system_section("t2"), Some(t2));
+    assert_eq!(b.id_for_system_section("t3"), Some(t3));
 
     // Score them and verify projection top-k=2 picks the right two.
     let resolver = MockResolver::new()
@@ -4368,10 +4334,10 @@ fn add_section_to_collection_appends_in_collection() {
 #[test]
 fn add_section_to_unknown_collection_fails() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
     // Construct a CollectionId that no add_collection call has issued.
     let bogus = super::ids::CollectionId::new(9999);
-    let r = b.add_section_to_collection(dialogue, bogus, "x", "y", 50.0);
+    let r = b.add_section_to_collection(bogus, "x", "y", 50.0);
     assert!(matches!(
         r,
         Err(super::error::ConstructionError::UnknownCollection(_))
@@ -4381,20 +4347,10 @@ fn add_section_to_unknown_collection_fails() {
 #[test]
 fn duplicate_collection_name_fails() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    b.add_collection(
-        dialogue,
-        "tools",
-        super::schema::SelectionRule::AlwaysVisible,
-        0.0,
-    )
-    .unwrap();
-    let r = b.add_collection(
-        dialogue,
-        "tools",
-        super::schema::SelectionRule::AlwaysVisible,
-        0.0,
-    );
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    b.add_collection("tools", super::schema::SelectionRule::AlwaysVisible, 0.0)
+        .unwrap();
+    let r = b.add_collection("tools", super::schema::SelectionRule::AlwaysVisible, 0.0);
     assert!(matches!(
         r,
         Err(super::error::ConstructionError::DuplicateCollectionName(_))
@@ -4404,8 +4360,8 @@ fn duplicate_collection_name_fails() {
 #[test]
 fn add_section_invalid_priority_fails() {
     let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
-    let result = b.add_section(dialogue, "newsec", "content", 0.0);
+    let _dialogue = b.id_for_layer("dialogue").unwrap();
+    let result = b.add_section("newsec", "content", 0.0);
     assert!(matches!(
         result,
         Err(super::error::ConstructionError::InvalidPriority { .. })
@@ -4424,6 +4380,10 @@ fn add_section_invalid_priority_fails() {
 /// is injected so the group survives instead of vanishing at the empty-group
 /// retain.
 const DEFAULT_FALLBACK_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
 layers:
   - name: ground
     window: 8000
@@ -4439,10 +4399,6 @@ layers:
     score_formula: max
     budget:
       priority: 40
-    system_prompt:
-      sections:
-        - id: frame
-          content: "frame"
     groups:
       - id: structure
         selection: { kind: top_k, k: 2 }
@@ -4454,6 +4410,10 @@ layers:
 /// injection is what keeps the group alive — absent it, an all-below-threshold
 /// group emits nothing.
 const NO_DEFAULT_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
 layers:
   - name: ground
     window: 8000
@@ -4469,10 +4429,6 @@ layers:
     score_formula: max
     budget:
       priority: 40
-    system_prompt:
-      sections:
-        - id: frame
-          content: "frame"
     groups:
       - id: structure
         selection: { kind: top_k, k: 2 }
@@ -4578,6 +4534,32 @@ fn default_ignored_when_selection_non_empty() {
 /// threshold selects nothing, and the `default` (a section named by tag) is the
 /// floor so the collection still contributes one section.
 const COLLECTION_DEFAULT_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      score_threshold: 0.5
+      default: { tag: "tool_c" }
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose categories.
+          user_prompt: Propose categories.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign by number.
+          user_prompt: Assign by number.
+      sections:
+        - id: tool_a
+          content: "A"
+        - id: tool_b
+          content: "B"
+        - id: tool_c
+          content: "C"
+        - id: tool_d
+          content: "D"
 layers:
   - name: dialogue
     window: 4000
@@ -4592,32 +4574,6 @@ layers:
           user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
-    system_prompt:
-      items:
-        - kind: collection
-          name: tools
-          selection: { kind: top_k, k: 2 }
-          score_threshold: 0.5
-          default: { tag: "tool_c" }
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose categories.
-              user_prompt: Propose categories.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign by number.
-              user_prompt: Assign by number.
-          sections:
-            - id: tool_a
-              content: "A"
-            - id: tool_b
-              content: "B"
-            - id: tool_c
-              content: "C"
-            - id: tool_d
-              content: "D"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4626,10 +4582,8 @@ layers:
 #[test]
 fn collection_default_parses() {
     let b = Builder::from_yaml(COLLECTION_DEFAULT_YAML).unwrap();
-    let dialogue = b.id_for_layer("dialogue").unwrap();
     let coll = b
-        .layer(dialogue)
-        .unwrap()
+        .schema()
         .system_prompt
         .items
         .iter()
@@ -4649,7 +4603,7 @@ fn collection_default_injected_when_selection_empty() {
     let b = Builder::from_yaml(COLLECTION_DEFAULT_YAML).unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let convo = b.id_for_group("convo").unwrap();
-    let tool_c = b.id_for_section_in(dialogue, "tool_c").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
 
     // Every section scores 0.0 (MockResolver default) — below the collection's
     // 0.5 min_score — so the belief pass selects no tool. The default injects
@@ -4670,7 +4624,7 @@ fn collection_default_injected_when_selection_empty() {
         .collect();
     let tool_ids: HashSet<SectionId> = tool_names
         .iter()
-        .filter_map(|n| b.id_for_section_in(dialogue, n))
+        .filter_map(|n| b.id_for_system_section(n))
         .collect();
     let emitted_tools: Vec<SectionId> = proj
         .sealed_sections()
@@ -4765,6 +4719,17 @@ mod dialect_templates {
     use candle_transformers::models::dialect::Dialect;
 
     const TEMPLATE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: system_open
+      dialect: system_start
+    - kind: section
+      id: frame
+      content: "You are a senior engineer."
+    - kind: template
+      id: system_close
+      dialect: system_end
 layers:
   - name: dialogue
     window: 1000
@@ -4777,17 +4742,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: system_open
-          dialect: system_start
-        - kind: section
-          id: frame
-          content: "You are a senior engineer."
-        - kind: template
-          id: system_close
-          dialect: system_end
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4797,11 +4751,9 @@ layers:
     fn template_item_resolves_to_dialect_content() {
         let dlct = Dialect::chat_ml();
         let b = Builder::from_yaml_with_vars_and_dialect(TEMPLATE_YAML, &[], Some(&dlct)).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        let layer = b.layer(dialogue).unwrap();
 
         let mut found: Vec<(&str, &str, bool)> = Vec::new();
-        for it in &layer.system_prompt.items {
+        for it in &b.schema().system_prompt.items {
             if let SystemPromptItem::Section(s) = it {
                 found.push((s.name.as_str(), s.content.as_str(), s.is_template));
             }
@@ -4820,7 +4772,7 @@ layers:
     fn template_without_dialect_errors() {
         let err = Builder::from_yaml_with_vars_and_dialect(TEMPLATE_YAML, &[], None).unwrap_err();
         assert!(
-            matches!(err, ConstructionError::DialectRequired { ref item } if item == "dialogue/system_open"),
+            matches!(err, ConstructionError::DialectRequired { ref item } if item == "system_prompt/system_open"),
             "got {err:?}",
         );
     }
@@ -4828,6 +4780,14 @@ layers:
     #[test]
     fn template_unknown_dialect_name_errors() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: bogus
+      dialect: not_a_real_template
+    - kind: section
+      id: frame
+      content: "x"
 layers:
   - name: dialogue
     window: 1000
@@ -4840,14 +4800,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: bogus
-          dialect: not_a_real_template
-        - kind: section
-          id: frame
-          content: "x"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -4858,7 +4810,7 @@ layers:
             matches!(
                 err,
                 ConstructionError::UnknownDialectTemplate { ref item, ref name }
-                if item == "dialogue/bogus" && name == "not_a_real_template"
+                if item == "system_prompt/bogus" && name == "not_a_real_template"
             ),
             "got {err:?}",
         );
@@ -4870,6 +4822,14 @@ layers:
         // `kind: template` referencing it must be filtered at build time —
         // projection never sees an empty section.
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: maybe_no_think
+      dialect: no_think_prefix
+    - kind: section
+      id: frame
+      content: "x"
 layers:
   - name: dialogue
     window: 1000
@@ -4882,23 +4842,14 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: maybe_no_think
-          dialect: no_think_prefix
-        - kind: section
-          id: frame
-          content: "x"
     groups:
       - id: convo
         selection: { kind: always_visible }
 "#;
         let dlct = Dialect::llama3();
         let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        let layer = b.layer(dialogue).unwrap();
-        let names: Vec<&str> = layer
+        let names: Vec<&str> = b
+            .schema()
             .system_prompt
             .items
             .iter()
@@ -4909,12 +4860,38 @@ layers:
             .collect();
         assert_eq!(names, vec!["frame"]);
         // The dropped template item is also absent from the name map.
-        assert!(b.id_for_section_in(dialogue, "maybe_no_think").is_none());
+        assert!(b.id_for_system_section("maybe_no_think").is_none());
     }
 
     #[test]
     fn template_depends_on_resolves_to_collection_id() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: tools
+    - kind: collection
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose a few functional categories for the sections.
+          user_prompt: Propose categories for the content above.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign each section to a category by number.
+          user_prompt: Assign each section above to a category number.
+      name: tools
+      selection: { kind: top_k, k: 1 }
+      sections:
+        - id: t1
+          content: "tool one"
+    - kind: template
+      id: tools_close
+      dialect: tool_block_close
+      depends_on: tools
 layers:
   - name: dialogue
     window: 1000
@@ -4927,43 +4904,16 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: tools_open
-          dialect: tool_block_open
-          depends_on: tools
-        - kind: collection
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose a few functional categories for the sections.
-              user_prompt: Propose categories for the content above.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign each section to a category by number.
-              user_prompt: Assign each section above to a category number.
-          name: tools
-          selection: { kind: top_k, k: 1 }
-          sections:
-            - id: t1
-              content: "tool one"
-        - kind: template
-          id: tools_close
-          dialect: tool_block_close
-          depends_on: tools
     groups:
       - id: convo
         selection: { kind: always_visible }
 "#;
         let dlct = Dialect::chat_ml();
         let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        let tools_cid = b.id_for_collection_in(dialogue, "tools").unwrap();
-        let layer = b.layer(dialogue).unwrap();
+        let tools_cid = b.id_for_system_collection("tools").unwrap();
 
-        let template_deps: Vec<Option<super::super::ids::CollectionId>> = layer
+        let template_deps: Vec<Option<super::super::ids::CollectionId>> = b
+            .schema()
             .system_prompt
             .items
             .iter()
@@ -4985,6 +4935,32 @@ layers:
         // materialized context (an unclosed `<tools>` block reaches the model).
         use super::super::project::ProjectionSegment;
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: tools
+    - kind: collection
+      name: tools
+      summary:
+        chunk: 4
+        categorize:
+          max_tokens: 256
+          system_prompt: Propose categories.
+          user_prompt: Propose categories.
+        assign:
+          max_tokens: 128
+          system_prompt: Assign by number.
+          user_prompt: Assign by number.
+      selection: { kind: top_k, k: 1 }
+      sections:
+        - id: t1
+          content: "tool one"
+    - kind: template
+      id: tools_close
+      dialect: tool_block_close
+      depends_on: tools
 layers:
   - name: dialogue
     window: 1000
@@ -4997,32 +4973,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: tools_open
-          dialect: tool_block_open
-          depends_on: tools
-        - kind: collection
-          name: tools
-          summary:
-            chunk: 4
-            categorize:
-              max_tokens: 256
-              system_prompt: Propose categories.
-              user_prompt: Propose categories.
-            assign:
-              max_tokens: 128
-              system_prompt: Assign by number.
-              user_prompt: Assign by number.
-          selection: { kind: top_k, k: 1 }
-          sections:
-            - id: t1
-              content: "tool one"
-        - kind: template
-          id: tools_close
-          dialect: tool_block_close
-          depends_on: tools
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5035,7 +4985,7 @@ layers:
         .unwrap();
         let dialogue = b.id_for_layer("dialogue").unwrap();
         let convo = b.id_for_group("convo").unwrap();
-        let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+        let t1 = b.id_for_system_section("t1").unwrap();
 
         // Score t1 so the tools collection materialises (non-empty) — the
         // precondition for both `tools_open` and `tools_close` to emit.
@@ -5070,6 +5020,15 @@ layers:
     #[test]
     fn template_depends_on_unknown_collection_errors() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: nonexistent
+    - kind: section
+      id: frame
+      content: "x"
 layers:
   - name: dialogue
     window: 1000
@@ -5082,15 +5041,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: template
-          id: tools_open
-          dialect: tool_block_open
-          depends_on: nonexistent
-        - kind: section
-          id: frame
-          content: "x"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5106,6 +5056,14 @@ layers:
     #[test]
     fn template_id_collision_with_section_errors() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: dup
+      content: "x"
+    - kind: template
+      id: dup
+      dialect: system_start
 layers:
   - name: dialogue
     window: 1000
@@ -5118,14 +5076,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section
-          id: dup
-          content: "x"
-        - kind: template
-          id: dup
-          dialect: system_start
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5149,6 +5099,27 @@ layers:
     // —— Section tree (optional toggles + N-way selectors) ————————————————————————
 
     const TREE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: section
+          id: role
+          content: "You are an assistant."
+        - kind: selector
+          id: length
+          default: standard
+          options:
+            - id: terse
+              content: "Be terse."
+            - id: standard
+              content: "Be balanced."
+            - id: verbose
+              content: "Be verbose."
 layers:
   - name: dialogue
     window: 1000
@@ -5161,27 +5132,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: section
-              id: role
-              content: "You are an assistant."
-            - kind: selector
-              id: length
-              default: standard
-              options:
-                - id: terse
-                  content: "Be terse."
-                - id: standard
-                  content: "Be balanced."
-                - id: verbose
-                  content: "Be verbose."
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5196,9 +5146,7 @@ layers:
     }
 
     fn dialogue_tree(b: &Builder) -> &crate::projection::SectionTree {
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        b.layer(dialogue)
-            .unwrap()
+        b.schema()
             .system_prompt
             .items
             .iter()
@@ -5223,11 +5171,11 @@ layers:
     fn section_tree_default_emits_default_selection() {
         use crate::projection::{ProjectionMode, ResolvedSelection, SelectionState};
         let b = Builder::from_yaml(TREE_YAML).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let _dialogue = b.id_for_layer("dialogue").unwrap();
         // Declared names resolve to the default-selection variant.
-        let no_think = b.id_for_section_in(dialogue, "no_think").unwrap();
-        let role = b.id_for_section_in(dialogue, "role").unwrap();
-        let length = b.id_for_section_in(dialogue, "length").unwrap();
+        let no_think = b.id_for_system_section("no_think").unwrap();
+        let role = b.id_for_system_section("role").unwrap();
+        let length = b.id_for_system_section("length").unwrap();
         let resolver = MockResolver::new();
 
         // Empty state → defaults: no_think present, role, length=standard.
@@ -5353,6 +5301,30 @@ layers:
     /// a fake-tool anchor.  The point: content above the nested tree multiplies
     /// only by the OUTER selector (no_think), never the inner one (effort).
     const NESTED_TREE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: section
+          id: framing
+          content: "You are an assistant."
+        - kind: section
+          id: noop_tool
+          content: "noop anchor tool"
+        - kind: section_tree
+          nodes:
+            - kind: selector
+              id: effort
+              default: balanced
+              options:
+                - id: off
+                  content: "Answer directly."
+                - id: balanced
+                  content: "Reason."
 layers:
   - name: dialogue
     window: 1000
@@ -5365,30 +5337,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: section
-              id: framing
-              content: "You are an assistant."
-            - kind: section
-              id: noop_tool
-              content: "noop anchor tool"
-            - kind: section_tree
-              nodes:
-                - kind: selector
-                  id: effort
-                  default: balanced
-                  options:
-                    - id: off
-                      content: "Answer directly."
-                    - id: balanced
-                      content: "Reason."
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5489,6 +5437,48 @@ layers:
     /// and be prefix-transparent: the anchor + directives below seal as if the
     /// variable tool members were not there.
     const COLLECTION_TREE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: section
+          id: framing
+          content: "You are an assistant."
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 2 }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: cat
+              user_prompt: cat
+            assign:
+              max_tokens: 128
+              system_prompt: assign
+              user_prompt: assign
+          sections:
+            - id: tool_a
+              content: "tool a"
+            - id: tool_b
+              content: "tool b"
+        - kind: section
+          id: noop_tool
+          content: "noop anchor"
+        - kind: section_tree
+          nodes:
+            - kind: selector
+              id: effort
+              default: balanced
+              options:
+                - id: off
+                  content: "direct"
+                - id: balanced
+                  content: "reason"
 layers:
   - name: dialogue
     window: 1000
@@ -5501,48 +5491,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: section
-              id: framing
-              content: "You are an assistant."
-            - kind: collection
-              name: tools
-              selection: { kind: top_k, k: 2 }
-              summary:
-                chunk: 4
-                categorize:
-                  max_tokens: 256
-                  system_prompt: cat
-                  user_prompt: cat
-                assign:
-                  max_tokens: 128
-                  system_prompt: assign
-                  user_prompt: assign
-              sections:
-                - id: tool_a
-                  content: "tool a"
-                - id: tool_b
-                  content: "tool b"
-            - kind: section
-              id: noop_tool
-              content: "noop anchor"
-            - kind: section_tree
-              nodes:
-                - kind: selector
-                  id: effort
-                  default: balanced
-                  options:
-                    - id: off
-                      content: "direct"
-                    - id: balanced
-                      content: "reason"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5676,12 +5624,12 @@ layers:
         // between the selected tools (not baked into any tool's seal).
         let yaml = COLLECTION_TREE_YAML
             .replace(
-                "            - kind: section\n              id: noop_tool\n              content: \"noop anchor\"",
-                "            - kind: section\n              id: noop_tool\n              inject_collection: tools\n              content: \"noop anchor\"",
+                "        - kind: section\n          id: noop_tool\n          content: \"noop anchor\"",
+                "        - kind: section\n          id: noop_tool\n          inject_collection: tools\n          content: \"noop anchor\"",
             )
             .replace(
-                "              selection: { kind: top_k, k: 2 }",
-                "              selection: { kind: top_k, k: 2 }\n              member_glue: \"\\n\"",
+                "          selection: { kind: top_k, k: 2 }",
+                "          selection: { kind: top_k, k: 2 }\n          member_glue: \"\\n\"",
             );
         let mut b = Builder::from_yaml(&yaml).unwrap();
         // The glue is a live-prefilled structural token, so it must be tokenised
@@ -5691,9 +5639,7 @@ layers:
 
         // Wiring: the tools collection is marked deferred, and the noop node points
         // at it.
-        let cid = b
-            .id_for_collection_in(b.id_for_layer("dialogue").unwrap(), "tools")
-            .unwrap();
+        let cid = b.id_for_system_collection("tools").unwrap();
         let tree = dialogue_tree(&b);
         let tools = tree.nodes.iter().find(|n| n.name == "tools").unwrap();
         assert!(
@@ -5772,6 +5718,53 @@ layers:
     /// placeholder) on a binary dim: `absent` omits the entire block (markers
     /// included), and nodes BELOW it seal distinctly per (tools present/absent).
     const GROUP_TREE_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: section
+          id: framing
+          content: "You are an assistant."
+        - kind: optional_group
+          id: tools_on
+          default: present
+          nodes:
+            - kind: section
+              id: tools_open
+              content: "<tools>"
+            - kind: collection
+              name: tools
+              selection: { kind: top_k, k: 2 }
+              member_glue: "\n"
+              summary:
+                chunk: 4
+                categorize:
+                  max_tokens: 256
+                  system_prompt: cat
+                  user_prompt: cat
+                assign:
+                  max_tokens: 128
+                  system_prompt: assign
+                  user_prompt: assign
+              sections:
+                - id: tool_a
+                  content: "tool a"
+                - id: tool_b
+                  content: "tool b"
+            - kind: section
+              id: noop_tool
+              inject_collection: tools
+              content: "noop anchor"
+            - kind: section
+              id: tools_close
+              content: "</tools>"
+        - kind: section
+          id: directive
+          content: "Respond."
 layers:
   - name: dialogue
     window: 8000
@@ -5787,53 +5780,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: section
-              id: framing
-              content: "You are an assistant."
-            - kind: optional_group
-              id: tools_on
-              default: present
-              nodes:
-                - kind: section
-                  id: tools_open
-                  content: "<tools>"
-                - kind: collection
-                  name: tools
-                  selection: { kind: top_k, k: 2 }
-                  member_glue: "\n"
-                  summary:
-                    chunk: 4
-                    categorize:
-                      max_tokens: 256
-                      system_prompt: cat
-                      user_prompt: cat
-                    assign:
-                      max_tokens: 128
-                      system_prompt: assign
-                      user_prompt: assign
-                  sections:
-                    - id: tool_a
-                      content: "tool a"
-                    - id: tool_b
-                      content: "tool b"
-                - kind: section
-                  id: noop_tool
-                  inject_collection: tools
-                  content: "noop anchor"
-                - kind: section
-                  id: tools_close
-                  content: "</tools>"
-            - kind: section
-              id: directive
-              content: "Respond."
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -5921,6 +5867,29 @@ layers:
     fn selector_inside_optional_group_is_gated() {
         use crate::projection::{ProjectionMode, SelectionState};
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional_group
+          id: grp
+          default: present
+          nodes:
+            - kind: selector
+              id: inner
+              default: a
+              options:
+                - id: a
+                  content: "INNER-A"
+                - id: b
+                  content: "INNER-B"
+          absent:
+            - kind: section
+              id: alt
+              content: "ALT"
+        - kind: section
+          id: after
+          content: "AFTER"
 layers:
   - name: dialogue
     window: 8000
@@ -5936,29 +5905,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional_group
-              id: grp
-              default: present
-              nodes:
-                - kind: selector
-                  id: inner
-                  default: a
-                  options:
-                    - id: a
-                      content: "INNER-A"
-                    - id: b
-                      content: "INNER-B"
-              absent:
-                - kind: section
-                  id: alt
-                  content: "ALT"
-            - kind: section
-              id: after
-              content: "AFTER"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -6032,6 +5978,32 @@ layers:
     fn nested_optional_group_chains_gates() {
         use crate::projection::{ProjectionMode, SelectionState};
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional_group
+          id: outer
+          default: present
+          nodes:
+            - kind: optional_group
+              id: inner
+              default: present
+              nodes:
+                - kind: section
+                  id: deep
+                  content: "DEEP"
+              absent:
+                - kind: section
+                  id: inner_alt
+                  content: "INNER-ALT"
+          absent:
+            - kind: section
+              id: outer_alt
+              content: "OUTER-ALT"
+        - kind: section
+          id: tail
+          content: "TAIL"
 layers:
   - name: dialogue
     window: 8000
@@ -6047,32 +6019,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional_group
-              id: outer
-              default: present
-              nodes:
-                - kind: optional_group
-                  id: inner
-                  default: present
-                  nodes:
-                    - kind: section
-                      id: deep
-                      content: "DEEP"
-                  absent:
-                    - kind: section
-                      id: inner_alt
-                      content: "INNER-ALT"
-              absent:
-                - kind: section
-                  id: outer_alt
-                  content: "OUTER-ALT"
-            - kind: section
-              id: tail
-              content: "TAIL"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -6135,6 +6081,24 @@ layers:
         use crate::projection::{ProjectionMode, ProjectionSegment, SelectionState};
         use candle_transformers::models::dialect::Dialect;
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: optional_group
+          id: tools_on
+          default: present
+          nodes:
+            - kind: section
+              id: tools_open
+              dialect: tool_block_open
+            - kind: section
+              id: inner
+              content: "inner"
 layers:
   - name: dialogue
     window: 8000
@@ -6150,24 +6114,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: optional_group
-              id: tools_on
-              default: present
-              nodes:
-                - kind: section
-                  id: tools_open
-                  dialect: tool_block_open
-                - kind: section
-                  id: inner
-                  content: "inner"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -6268,6 +6214,34 @@ layers:
     fn optional_group_absent_branch_carries_alternative_grounding() {
         use crate::projection::{ProjectionMode, SelectionState};
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: no_think
+          content: "/no_think"
+          default: present
+        - kind: section
+          id: frame
+          content: "frame"
+        - kind: optional_group
+          id: tools_on
+          default: present
+          nodes:
+            - kind: section
+              id: tools_open
+              content: "<tools>"
+            - kind: section
+              id: grounding_tools
+              content: "fetch it with a tool"
+          absent:
+            - kind: section
+              id: grounding_no_tools
+              content: "say so rather than guessing"
+        - kind: section
+          id: directive
+          content: "respond"
 layers:
   - name: dialogue
     window: 8000
@@ -6283,34 +6257,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: no_think
-              content: "/no_think"
-              default: present
-            - kind: section
-              id: frame
-              content: "frame"
-            - kind: optional_group
-              id: tools_on
-              default: present
-              nodes:
-                - kind: section
-                  id: tools_open
-                  content: "<tools>"
-                - kind: section
-                  id: grounding_tools
-                  content: "fetch it with a tool"
-              absent:
-                - kind: section
-                  id: grounding_no_tools
-                  content: "say so rather than guessing"
-            - kind: section
-              id: directive
-              content: "respond"
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -6377,6 +6323,22 @@ layers:
     fn tool_summary_section_anchors_chain_and_content_is_settable() {
         use crate::projection::{ProjectionMode, SelectionState};
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: section
+          id: frame
+          content: "frame"
+        - kind: section
+          id: tool_summary
+          content: "placeholder"
+        - kind: section
+          id: tools_open
+          content: "<tools>"
+        - kind: section
+          id: directive
+          content: "respond"
 layers:
   - name: dialogue
     window: 8000
@@ -6392,28 +6354,12 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: section
-              id: frame
-              content: "frame"
-            - kind: section
-              id: tool_summary
-              content: "placeholder"
-            - kind: section
-              id: tools_open
-              content: "<tools>"
-            - kind: section
-              id: directive
-              content: "respond"
     groups:
       - id: convo
         selection: { kind: always_visible }
 "#;
         let mut b = Builder::from_yaml(yaml).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let _dialogue = b.id_for_layer("dialogue").unwrap();
 
         let var = |b: &Builder, name: &str| {
             dialogue_tree(b)
@@ -6446,12 +6392,8 @@ layers:
 
         // Rewriting the content pre-prefill keeps the SAME variant id (the chain
         // is unchanged; only the bytes the prefill seals differ).
-        b.set_tree_section_content(
-            dialogue,
-            "tool_summary",
-            "The tools are grouped by purpose.",
-        )
-        .unwrap();
+        b.set_tree_section_content("tool_summary", "The tools are grouped by purpose.")
+            .unwrap();
         assert_eq!(
             var(&b, "tool_summary"),
             summary_id,
@@ -6466,7 +6408,7 @@ layers:
         assert_eq!(node.options[0].content, "The tools are grouped by purpose.");
 
         // Setting an unknown section errors.
-        assert!(b.set_tree_section_content(dialogue, "nope", "x").is_err());
+        assert!(b.set_tree_section_content("nope", "x").is_err());
 
         // Projects in order: frame → tool_summary → <tools> → directive.
         let resolver = MockResolver::new();
@@ -6490,19 +6432,19 @@ layers:
         // Like COLLECTION_TREE_YAML but the tools collection starts empty — the
         // real catalog is installed at runtime (the daemon's install_tool_catalog).
         let yaml = COLLECTION_TREE_YAML.replace(
-            "              sections:\n                - id: tool_a\n                  content: \"tool a\"\n                - id: tool_b\n                  content: \"tool b\"",
-            "              sections: []",
+            "          sections:\n            - id: tool_a\n              content: \"tool a\"\n            - id: tool_b\n              content: \"tool b\"",
+            "          sections: []",
         );
         let mut b = Builder::from_yaml(&yaml).unwrap();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        let cid = b.id_for_collection_in(dialogue, "tools").unwrap();
+        let _dialogue = b.id_for_layer("dialogue").unwrap();
+        let cid = b.id_for_system_collection("tools").unwrap();
 
         // Runtime add, exactly as install_tool_catalog does (by CollectionId).
         let ws = b
-            .add_section_to_collection(dialogue, cid, "web_search", "ws def", 100.0)
+            .add_section_to_collection(cid, "web_search", "ws def", 100.0)
             .unwrap();
         let calc = b
-            .add_section_to_collection(dialogue, cid, "calc", "calc def", 100.0)
+            .add_section_to_collection(cid, "calc", "calc def", 100.0)
             .unwrap();
 
         let tree = dialogue_tree(&b);
@@ -6526,7 +6468,7 @@ layers:
             ws,
             tools.member_variant(0, tools.default_branch).unwrap().id
         );
-        assert_eq!(b.id_for_section_in(dialogue, "web_search").unwrap(), ws);
+        assert_eq!(b.id_for_system_section("web_search").unwrap(), ws);
 
         // No id aliasing: every sealed id across both members + both branches is
         // distinct (the ×branch block sits above the prior max each add).
@@ -6547,6 +6489,14 @@ layers:
     #[test]
     fn section_tree_invalid_optional_default_rejected() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: x
+          content: "x"
+          default: maybe
 layers:
   - name: dialogue
     window: 1000
@@ -6559,14 +6509,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: optional
-              id: x
-              content: "x"
-              default: maybe
     groups:
       - id: convo
         selection: { kind: always_visible }
@@ -6581,6 +6523,18 @@ layers:
     #[test]
     fn section_tree_unknown_selector_default_rejected() {
         let yaml = r#"
+system_prompt:
+  items:
+    - kind: section_tree
+      nodes:
+        - kind: selector
+          id: length
+          default: nope
+          options:
+            - id: terse
+              content: "a"
+            - id: standard
+              content: "b"
 layers:
   - name: dialogue
     window: 1000
@@ -6593,18 +6547,6 @@ layers:
         assistant:
           system_prompt: compress
           user_prompt: compress
-    system_prompt:
-      items:
-        - kind: section_tree
-          nodes:
-            - kind: selector
-              id: length
-              default: nope
-              options:
-                - id: terse
-                  content: "a"
-                - id: standard
-                  content: "b"
     groups:
       - id: convo
         selection: { kind: always_visible }

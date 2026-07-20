@@ -17,9 +17,9 @@ use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
     SystemPromptSchema, TimelineId, TurnIndex,
 };
+use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
-use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::{
     ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
     TurnEvent, TurnHandle, TurnResponse,
@@ -295,16 +295,8 @@ const THINK_CLOSER_PHRASE: &str = " — actually, I've reasoned enough and know 
 /// sealing the tool-summary section with the *same* prefix puts its KV exactly
 /// where "just before the tools" is.
 fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
-    let Some(layer) = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == "dialogue")
-    else {
-        return Vec::new();
-    };
     let mut ids = Vec::new();
-    for item in &layer.system_prompt.items {
+    for item in &builder.schema().system_prompt.items {
         match item {
             SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
             // Section-tree variants are sealed (not live templates), and
@@ -455,7 +447,7 @@ impl InferenceState {
         // `<workspace>/tools/` folder (a mind/game's own tools) overrides the
         // bundled built-ins; absent it, the built-in coding-assistant catalog.
         crate::tool_def::init(&workspace);
-        let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
+        let tool_sections = install_tool_catalog(&mut proj_builder)
             .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
         tracing::info!(
             n_tools = tool_sections.len(),
@@ -479,9 +471,6 @@ impl InferenceState {
                 tracing::info!(collection = %sink.collection, "--disable-layer: section collection suppressed");
                 continue;
             }
-            let Some(layer_id) = proj_builder.id_for_layer(&sink.layer) else {
-                continue;
-            };
             let sections =
                 crate::response_section::load_sections(&workspace.join(&sink.folder), &identity);
             if sections.is_empty() {
@@ -489,7 +478,6 @@ impl InferenceState {
             }
             let installed = crate::response_section::install_sections(
                 &mut proj_builder,
-                layer_id,
                 &sink.collection,
                 &sections,
             )
@@ -780,7 +768,11 @@ impl InferenceState {
             // The prefill path splits it on the assistant header (below).
             let cases: Vec<(&str, &str)> = defs
                 .iter()
-                .flat_map(|d| d.examples.iter().map(move |ex| (d.name.as_str(), ex.as_str())))
+                .flat_map(|d| {
+                    d.examples
+                        .iter()
+                        .map(move |ex| (d.name.as_str(), ex.as_str()))
+                })
                 .collect();
 
             // A calibration case is "done" only once its conversation is
@@ -1173,8 +1165,7 @@ impl InferenceState {
                     )?;
                     // Cache this folder's walk for a co-located per-file layer.
                     walk_cache.insert(il.folder.clone(), walked);
-                    ingest_convs
-                        .insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                    ingest_convs.insert(il.name.clone(), IngestConv::Folders { sequence, state });
                 }
                 IngestMode::Files => {
                     let map = walk_cache
@@ -1323,7 +1314,8 @@ impl InferenceState {
                         &il.name,
                         &il.group,
                     )?;
-                    if let crate::repo_scan::RefreshOutcome::Replaced { sequence, state } = outcome {
+                    if let crate::repo_scan::RefreshOutcome::Replaced { sequence, state } = outcome
+                    {
                         self.ingest_convs
                             .lock()
                             .unwrap()
@@ -1543,19 +1535,16 @@ fn build_mode_builder(
     mode: ToolMode,
 ) -> anyhow::Result<Arc<Builder>> {
     let mut b = base.clone();
-    let dialogue = b
-        .id_for_layer("dialogue")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'dialogue' layer"))?;
     match mode {
         ToolMode::Comprehensive => {}
         ToolMode::Restricted => {
             // Drop the high-risk tools; the summary association below points this
             // mode at the restricted catalog listing.
-            b.retain_collection_sections(dialogue, "tools", safe_tool_names)
+            b.retain_collection_sections("tools", safe_tool_names)
                 .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
         }
         ToolMode::None => {
-            b.retain_collection_sections(dialogue, "tools", &HashSet::new())
+            b.retain_collection_sections("tools", &HashSet::new())
                 .map_err(|e| anyhow::anyhow!("none tools projection: {e}"))?;
         }
     }
@@ -1574,10 +1563,10 @@ fn build_mode_builder(
         ToolMode::None => None,
     };
     if let Some(reserved) = summary {
-        let tools = b.id_for_collection_in(dialogue, "tools").ok_or_else(|| {
-            anyhow::anyhow!("projection schema missing 'tools' collection in dialogue layer")
-        })?;
-        b.set_collection_summary_section(dialogue, tools, SectionId::reserved(reserved))
+        let tools = b
+            .id_for_system_collection("tools")
+            .ok_or_else(|| anyhow::anyhow!("projection schema missing 'tools' collection"))?;
+        b.set_collection_summary_section(tools, SectionId::reserved(reserved))
             .map_err(|e| anyhow::anyhow!("tool summary association ({mode:?}): {e}"))?;
     }
     Ok(Arc::new(b))
@@ -1643,14 +1632,11 @@ impl ModeBuilders {
 /// already-sealed section KV is reused unchanged.
 fn build_hires_projection(state: &InferenceState, spec: &str) -> anyhow::Result<Arc<Builder>> {
     let mut b = state.refresh_builder.clone();
-    let dialogue = b
-        .id_for_layer("dialogue")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'dialogue' layer"))?;
     if let Some((collection, section)) = spec.split_once('/') {
-        b.set_collection_single_section(dialogue, collection, section)
+        b.set_collection_single_section(collection, section)
             .map_err(|e| anyhow::anyhow!("force-hires '{spec}': {e}"))?;
     } else {
-        b.set_collection_selection(dialogue, spec, SelectionRule::AlwaysVisible)
+        b.set_collection_selection(spec, SelectionRule::AlwaysVisible)
             .map_err(|e| anyhow::anyhow!("force-hires '{spec}': {e}"))?;
     }
     Ok(Arc::new(b))
@@ -2667,7 +2653,11 @@ impl ZendSession {
                             selection: fmt_selection(&g.selection),
                         })
                         .collect(),
-                    system_prompt: system_prompt_labels(&l.system_prompt),
+                    dials: l
+                        .dials
+                        .iter()
+                        .map(|(sel, opt)| format!("{sel} = {opt}"))
+                        .collect(),
                     conv_count,
                     tokens,
                 }
@@ -2719,15 +2709,13 @@ impl ZendSession {
             let base = state.base_conv.lock().unwrap();
             base.target_layer_name()
         };
-        let layer = schema.layers.iter().find(|l| l.name == target_layer)?;
-
         let conv = { state.engine.lock().unwrap().conversation() };
         let read = conv.read();
         let s = &*read;
 
-        // Always-emit framing sections (skips the tools collection and the
-        // section tree, which appear as labels in `items`).
-        let sections: Vec<SectionView> = layer
+        // Always-emit framing sections of the single shared prompt (skips the
+        // tools collection and the section tree, which appear as labels in `items`).
+        let sections: Vec<SectionView> = schema
             .system_prompt
             .items
             .iter()
@@ -2744,7 +2732,7 @@ impl ZendSession {
 
         Some(SystemPromptView {
             target_layer,
-            items: system_prompt_labels(&layer.system_prompt),
+            items: system_prompt_labels(&schema.system_prompt),
             sections,
             tool_count: crate::tool_def::all().len(),
         })
@@ -2987,7 +2975,10 @@ impl ZendSession {
         tracing::info!(
             query_tokens,
             tiles = tiles.len(),
-            scored = tiles.iter().filter(|t| t.score.abs() > f32::EPSILON).count(),
+            scored = tiles
+                .iter()
+                .filter(|t| t.score.abs() > f32::EPSILON)
+                .count(),
             max_score,
             "substrate_project"
         );
@@ -3446,9 +3437,7 @@ impl ZendSession {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!(
-                            "local tokio runtime for download failed: {e:#}; exiting"
-                        );
+                        tracing::error!("local tokio runtime for download failed: {e:#}; exiting");
                         status_tx.send(format!("Runtime build failed: {e}")).ok();
                         std::process::exit(1);
                     }
@@ -3875,7 +3864,9 @@ fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (u
         .iter()
         .flat_map(|g| s.timelines_for_group(g.id))
         .filter(|tl| *tl != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
-        .fold((0, 0), |(n, tok), tl| (n + 1, tok + s.total_token_count(tl)))
+        .fold((0, 0), |(n, tok), tl| {
+            (n + 1, tok + s.total_token_count(tl))
+        })
 }
 
 /// The conversations targeting a layer's groups, largest first. Enumerates
@@ -3909,7 +3900,10 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 .unwrap_or_default();
             let summary_nodes = s
                 .turn_indices(tl)
-                .filter(|idx| s.tree_meta_of(tl, *idx).is_some_and(|m| m.kind.is_summary()))
+                .filter(|idx| {
+                    s.tree_meta_of(tl, *idx)
+                        .is_some_and(|m| m.kind.is_summary())
+                })
                 .count();
             conversations.push(ConvView {
                 timeline: tl.raw().to_string(),
@@ -3995,15 +3989,8 @@ fn build_projection_builder(workspace: &Path) -> Builder {
 /// [`Sequence::preemptive_prefill`] (collection sections via
 /// fork-and-merge, post-collection sections via per-section prefill).
 fn pre_collection_prelude(builder: &Builder) -> String {
-    let layer = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == "dialogue")
-        .expect("projection schema must declare a 'dialogue' layer");
-
     let mut out = String::new();
-    for item in &layer.system_prompt.items {
+    for item in &builder.schema().system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => out.push_str(&s.content),
             SystemPromptItem::SectionTree(t) => {
@@ -4117,13 +4104,7 @@ mod projection_schema_tests {
     #[test]
     fn dialogue_system_prompt_labels_cover_sections_collection_and_tree() {
         let builder = build_projection_builder(Path::new("demo-project"));
-        let dialogue = builder
-            .schema()
-            .layers
-            .iter()
-            .find(|l| l.name == "dialogue")
-            .expect("dialogue layer present");
-        let labels = system_prompt_labels(&dialogue.system_prompt);
+        let labels = system_prompt_labels(&builder.schema().system_prompt);
 
         assert!(
             labels.iter().any(|l| l == "history_stance"),

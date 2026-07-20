@@ -308,10 +308,11 @@ function renderSegBar(st){
 function renderSysPrompt(d){
   const host=document.getElementById('sysprompt');
   const target = d.layers.find(l=>l.name===d.target_layer);
-  const items = target ? target.system_prompt.length : 0;
+  const dials = (target && target.dials) ? target.dials : [];
   const head=[
-    h('span',{class:'title'},[h('span',{class:'mono',text:d.target_layer||'—'}), document.createTextNode(' layer')]),
-    h('div',{class:'meta'},[ badge('', items+' items') ]),
+    h('span',{class:'title'},[document.createTextNode('shared system prompt')]),
+    h('div',{class:'meta'},[ badge('peak', 'target: '+(d.target_layer||'—')) ]
+      .concat(dials.map(x=>badge('', x)))),
   ];
   const card = group(head, async (body)=>{
     body.appendChild(spinner());
@@ -401,6 +402,10 @@ function layerCard(l, d){
   ];
   const card = group(head, async (body)=>{
     if(l.description) body.appendChild(h('div',{class:'desc',text:l.description}));
+    if(l.dials && l.dials.length){
+      body.appendChild(h('div',{class:'desc',text:'System-prompt dials (overrides of the shared prompt when this layer is the target):'}));
+      body.appendChild(h('div',{class:'chips'}, l.dials.map(x=>h('span',{class:'chip',text:x}))));
+    }
     if(l.groups && l.groups.length){
       body.appendChild(h('div',{class:'chips'}, l.groups.map(g=>
         h('span',{class:'chip',html:'<b>'+escapeHtml(g.name)+'</b> · '+escapeHtml(g.selection)}))));
@@ -611,13 +616,12 @@ function mockOverview(){
     target_layer:'dialogue',
     layers:[
       {name:'repo_map',description:'Structural shape of the repository: directory tree, file types, line counts.',
-        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],system_prompt:['frame'],conv_count:1,tokens:14880},
+        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conv_count:1,tokens:14880},
       {name:'code_reading',description:'Raw scope-aware code chunks. One turn per (file × scope) chunk.',
-        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],system_prompt:['frame'],conv_count:2,tokens:10430},
+        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conv_count:2,tokens:10430},
       {name:'dialogue',description:'The active developer conversation served to the VS Code extension or web chat.',
         window:16000,priority:100,groups:[{name:'primary_conversation',selection:'recent 16 + top 8'}],
-        system_prompt:['system open · template','section tree','history_stance','grounding','tools_overview',
-          'tools · collection','system close · template'],conv_count:3,tokens:35630},
+        dials:[],conv_count:3,tokens:35630},
     ],
   };
 }
