@@ -5824,16 +5824,18 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
-        // During a submission drain, defer no-deferred-user gap-fills into one
+        // During a submission drain, defer this slot's gap-fill into the one
         // batched forward at drain end (disjoint field borrow from the ctx below).
-        // NEVER defer a slot that already has a pending fire: a second projection
-        // would snapshot/truncate the reserved gaps before the batch fills them, so
-        // fire that one inline.
-        let already_pending = self
-            .deferred_glue_fires
-            .iter()
-            .any(|p| p.parent_id == parent_id);
-        let defer = if self.batch_drain_gap_fills && !already_pending {
+        // If this slot ALREADY has a deferred plan, that plan is now STALE: the
+        // `apply_segments_build` below snapshots + truncates the slot to zero and
+        // rebuilds it, so the old plan's reserved gaps — addressed by slot-relative
+        // block index — no longer exist. Firing it at drain end would scatter old
+        // glue K/V into whatever this rebuild placed at those indices. Drop the
+        // superseded plan and defer only this latest projection, so exactly one
+        // (current) plan fires against the slot as this call built it.
+        let defer = if self.batch_drain_gap_fills {
+            self.deferred_glue_fires
+                .retain(|p| p.parent_id != parent_id);
             Some(&mut self.deferred_glue_fires)
         } else {
             None
