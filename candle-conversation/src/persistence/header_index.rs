@@ -48,11 +48,21 @@ pub const INDEX_PAYLOAD_VERSION: u32 = 1;
 /// Byte size of one encoded digest entry.
 pub const INDEX_ENTRY_BYTES: usize = 38;
 
-/// Number of digests the writer accumulates before flushing a
-/// `HeaderIndex` record (≈ 152 KB of payload). Recovery forward-walks
-/// at most this many un-indexed tail records, so the constant bounds
-/// the slow part of a restart.
-pub const INDEX_FLUSH_ENTRIES: usize = 4096;
+/// Number of digests the writer accumulates before flushing a mid-segment
+/// `HeaderIndex` record.
+///
+/// Every segment ALSO flushes a final, complete index at rotation
+/// (`seal_active` → `flush_header_index`, and the compaction finalizer), so on
+/// a clean restart every sealed segment is fully indexed and never
+/// forward-walked. That makes the mid-segment flushes purely a crash-recovery
+/// bound: after an unclean shutdown the active segment forward-walks at most
+/// this many un-indexed tail records.
+///
+/// Because rotation guarantees the final index, this can be large: fewer,
+/// bigger index records mean a shorter chain to follow on recovery and far
+/// fewer commit/fsyncs during ingest, at the cost of a longer crash-recovery
+/// tail on the single active segment. 32 K digests ≈ 1.2 MB of index payload.
+pub const INDEX_FLUSH_ENTRIES: usize = 32768;
 
 /// One record's header digest — everything recovery needs to replay
 /// the record without touching it on disk.
