@@ -132,6 +132,28 @@ pub async fn phases() -> Json<Phases> {
     Json(body)
 }
 
+#[derive(Serialize, Clone)]
+struct Promote {
+    name: String,
+    count: u64,
+}
+#[derive(Serialize, Default, Clone)]
+pub struct Promotes {
+    items: Vec<Promote>,
+}
+
+/// `GET /v1/promotes` — cumulative promote (working-set elevate) counts by
+/// symbolic name, most-promoted first. The live "what's being re-elevated every
+/// turn" leaderboard on `perf.html`.
+pub async fn promotes() -> Json<Promotes> {
+    let mut items: Vec<Promote> = candle_conversation::phase_ring::snapshot_promotes()
+        .into_iter()
+        .map(|(name, count)| Promote { name, count })
+        .collect();
+    items.sort_by(|a, b| b.count.cmp(&a.count));
+    Json(Promotes { items })
+}
+
 /// `GET /v1/telemetry` — wave / pressure / arena / migration series, all from the
 /// instrumented rings. Host RAM is stamped fresh each call. The ring clones +
 /// `sysinfo` refresh are bounded blocking work, kept off the async workers.

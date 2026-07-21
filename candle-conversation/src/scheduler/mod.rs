@@ -1794,7 +1794,9 @@ impl WaveStats {
         // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
         // `reproj` rising ⇒ continuous-reproject (provenance scan/glue) growing;
         // `unaccounted` large ⇒ blocked off-thread (persistence thread / lock).
-        tracing::info!(
+        // Detailed per-wave breakdown — the live GUI panels carry the same numbers,
+        // so this stays at debug and the `wave {}s` heartbeat above is the info line.
+        tracing::debug!(
             target: "candle_conversation::scheduler::timing",
             drain_ms = self.drain_ms,
             promote_ms = self.promote_ms,
@@ -2354,6 +2356,18 @@ pub(crate) struct Scheduler {
     /// only a small rolling hot window resident during a bulk repo ingest.
     ingest_timelines: HashSet<TimelineId>,
 
+    /// Set while `drain_submissions` runs: `apply_projection` defers each
+    /// no-deferred-user gap-fill (ingest / compression) into `deferred_glue_fires`
+    /// instead of firing a single-slot forward, so they batch into ONE forward at
+    /// drain end (amortising the per-forward GPU launch floor across the whole
+    /// drain). See [`projection_assembler::apply_segments`].
+    batch_drain_gap_fills: bool,
+    deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
+
+    /// Cache of `SectionId` → symbolic `debug_name`, so the promote tracker's name
+    /// lookup is O(1) after the first sighting (sections are stable).
+    section_name_cache: HashMap<SectionId, String>,
+
     /// Per-slot live receiver for a compression pass's private event channel.
     /// A compression decode's `DecodeState::event_tx` reports through the job,
     /// not to a caller, so its `TurnEvent`s drain into this sink. Holding the
@@ -2472,6 +2486,9 @@ impl Scheduler {
             host_ram_probe: None,
             last_footprint_relief: None,
             ingest_timelines: HashSet::new(),
+            batch_drain_gap_fills: false,
+            deferred_glue_fires: Vec::new(),
+            section_name_cache: HashMap::new(),
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
             workspace_projection: None,
@@ -5807,6 +5824,20 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
+        // During a submission drain, defer no-deferred-user gap-fills into one
+        // batched forward at drain end (disjoint field borrow from the ctx below).
+        // NEVER defer a slot that already has a pending fire: a second projection
+        // would snapshot/truncate the reserved gaps before the batch fills them, so
+        // fire that one inline.
+        let already_pending = self
+            .deferred_glue_fires
+            .iter()
+            .any(|p| p.parent_id == parent_id);
+        let defer = if self.batch_drain_gap_fills && !already_pending {
+            Some(&mut self.deferred_glue_fires)
+        } else {
+            None
+        };
         let state = self.slot_projection_state.entry(parent_id).or_default();
         // Record the sealed working set this projection attends over, so relief
         // eviction can protect it (see `evict_cold_tail`).
@@ -5829,8 +5860,31 @@ impl Scheduler {
                 boundary_markers: &self.boundary_markers,
             },
             segments,
+            defer,
         );
         profile::report("apply_projection");
+        r
+    }
+
+    /// Fire all gap-fills deferred during a submission drain as ONE batched
+    /// forward, then clear the queue. Called at drain end, BEFORE the compute
+    /// phases that read the glue K/V. No-op when nothing was deferred.
+    fn flush_deferred_glue_fires(&mut self) -> Result<(), ConversationError> {
+        if self.deferred_glue_fires.is_empty() {
+            return Ok(());
+        }
+        let plans = std::mem::take(&mut self.deferred_glue_fires);
+        let t_glue = std::time::Instant::now();
+        let r = projection_assembler::fire_deferred_gap_fills(
+            &mut self.session,
+            &*self.model,
+            &self.device,
+            &plans,
+        );
+        DRAIN_GLUE_US.fetch_add(
+            t_glue.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         r
     }
 
@@ -7536,7 +7590,65 @@ impl Scheduler {
         turns: &[TurnKey],
         whence: &str,
     ) {
+        // A `section_<n>` fallback name (see `Conversation::section_debug_name`) —
+        // an unnamed content/probe section, not a schema-declared unit.
+        fn is_generic_section_name(name: &str) -> bool {
+            name.strip_prefix("section_")
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                || name.starts_with("section#")
+        }
         if sections.is_empty() && turns.is_empty() {
+            return;
+        }
+        // PER-ITEM SKIP: only lift the units NOT already hot. A unit already hot
+        // needs no work — and the machinery below (`snapshot_promotion_state`, run
+        // twice, + a `backings` clone) costs ~100 ms/turn for a fixed system prompt
+        // that never leaves hot. Cheap O(1) tier check per unit builds the actual
+        // lift-list. `evict_to_fit_incoming` still gets the FULL working set as its
+        // keep-list (it must protect the already-hot units from eviction), but only
+        // budgets for the non-hot bytes. The promote tracker records only ACTUAL
+        // lifts, so its leaderboard is a waste monitor — empty is good.
+        let (secs_lift, turns_lift) = {
+            let read = conversation.read();
+            let mut sl: Vec<SectionId> = Vec::new();
+            let mut tl: Vec<TurnKey> = Vec::new();
+            for &sid in sections {
+                if read.section_tier_state(sid).is_some_and(|t| t.hot) {
+                    continue;
+                }
+                let name = self
+                    .section_name_cache
+                    .entry(sid)
+                    .or_insert_with(|| {
+                        // Generic auto-names (`section_<n>`) are the content /
+                        // probe sections with no schema name — meaningless
+                        // per-id on a churn leaderboard, so bucket them together
+                        // and let the named always-hot units (system prompt,
+                        // tools) stand out.
+                        match read.section_debug_name(sid) {
+                            Some(n) if !is_generic_section_name(&n) => n,
+                            _ => "(content §)".to_string(),
+                        }
+                    })
+                    .clone();
+                phase_ring::record_promote(&name);
+                sl.push(sid);
+            }
+            for &t in turns {
+                if !read
+                    .turn_tier_state(t.timeline, t.index)
+                    .is_some_and(|ts| ts.hot)
+                {
+                    tl.push(t);
+                }
+            }
+            if !tl.is_empty() {
+                phase_ring::record_promote("(turns)");
+            }
+            (sl, tl)
+        };
+        // Everything already hot → nothing to evict or lift.
+        if secs_lift.is_empty() && turns_lift.is_empty() {
             return;
         }
         let backings = self.session.backings().to_vec();
@@ -7548,6 +7660,7 @@ impl Scheduler {
             Device::Cuda(d) => d.cuda_stream(),
             _ => panic!("scheduler: requires a CUDA device"),
         };
+        // Keep-list = FULL working set (protect the already-hot units too).
         let evicted = self.evict_to_fit_incoming(conversation, sections, turns);
         if evicted.count > 0 {
             tracing::trace!(
@@ -7556,6 +7669,7 @@ impl Scheduler {
                 "select-evict complete"
             );
         }
+        // Lift only the non-hot subset; already-hot units are left untouched.
         match elevate_to_hot(
             conversation,
             &backings,
@@ -7563,8 +7677,8 @@ impl Scheduler {
             &main_stream,
             &mut self.elevate_pinned_scratch,
             &mut self.cold_load_stager,
-            sections,
-            turns,
+            &secs_lift,
+            &turns_lift,
         ) {
             Ok(report) => {
                 if report.missing > 0 || report.failed > 0 {
@@ -8258,7 +8372,9 @@ impl Scheduler {
         // total instead of summed by eye.
         let total_ms = t_repro.elapsed().as_millis() as u64;
 
-        tracing::info!(
+        // Per-reproject timing breakdown — a diagnostic detail line, not a
+        // heartbeat; debug so a continuous-reproject run doesn't flood info.
+        tracing::debug!(
             target: "candle_conversation::scheduler::reproject",
             from_view = view_id.0,
             to_view = new_view_id.0,

@@ -136,9 +136,18 @@ impl Scheduler {
             // wall-clock that is NOT a forward, so time it.
             let t_drain = Instant::now();
             // Flag the drain so the assembler's shared sub-timers (inject / prefill
-            // / gap-fill, also used by reproject) attribute to the drain buckets.
+            // / gap-fill, also used by reproject) attribute to the drain buckets,
+            // and so `apply_projection` DEFERS its gap-fills into one batched forward.
             IN_DRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.batch_drain_gap_fills = true;
             let cont = self.drain_submissions();
+            // Fire the drain's deferred gap-fills as ONE forward (amortising the
+            // per-forward GPU launch floor across the whole drain) BEFORE the compute
+            // phases read the glue K/V.
+            if let Err(e) = self.flush_deferred_glue_fires() {
+                tracing::error!("deferred drain gap-fill batch failed: {e}");
+            }
+            self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
             self.wave_stats
                 .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);

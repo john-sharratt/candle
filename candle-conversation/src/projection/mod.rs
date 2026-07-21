@@ -230,7 +230,7 @@ pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,
-    SealedKind, SelectionState, NO_THINK_SELECTOR,
+    SealedKind, SelectionState, NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};

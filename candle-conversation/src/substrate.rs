@@ -3778,6 +3778,23 @@ impl Substrate {
     /// O(thousands) at most so this is fine.  Returns the first match
     /// when duplicate `debug_name`s exist (callers should keep names
     /// unique per workspace).
+    /// Reverse of [`Self::section_id_for_debug_name`]: the symbolic `debug_name`
+    /// for a `SectionId` (tool name, `system.frame`, …). `SectionId` → residence →
+    /// `stream_id` → `PromptSection.debug_name`. Used by the promote tracker.
+    pub fn section_debug_name(&self, id: SectionId) -> Option<String> {
+        let entry = self.sections.get(&id)?;
+        let stream_id = self.residence[entry.residence.0].stream_id;
+        self.all_streams().find_map(|(sid, entry)| {
+            if sid != stream_id {
+                return None;
+            }
+            match entry.decl.as_ref()? {
+                StreamDecl::PromptSection(s) => Some(s.debug_name.clone()),
+                _ => None,
+            }
+        })
+    }
+
     pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<SectionId> {
         // Find the stream id matching this debug_name from the
         // substrate's in-RAM stream index (the authoritative source

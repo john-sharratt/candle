@@ -15,9 +15,32 @@
 //! `candle-conversation`, the HTTP layer in `zend`, and both link this crate. It is
 //! capped by age (60 min — the widest phase graph) and by a hard length backstop.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+// ── Promote tracker ──────────────────────────────────────────────────────────
+// Cumulative count, keyed by symbolic name, of how many times each unit (system
+// section / tool / turn bucket) was handed to `elevate_projection_working_set`.
+// Fixed always-hot units (system prompt, tools) re-elevated every turn float to
+// the top — the live "what's being churned" leaderboard on `perf.html`.
+
+static PROMOTES: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// Record one promote of `name` (increment its cumulative count).
+pub fn record_promote(name: &str) {
+    let m = PROMOTES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap();
+    *g.entry(name.to_string()).or_insert(0) += 1;
+}
+
+/// Snapshot the promote counts as `(name, count)`, unsorted.
+pub fn snapshot_promotes() -> Vec<(String, u64)> {
+    let Some(m) = PROMOTES.get() else {
+        return Vec::new();
+    };
+    m.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
 
 /// One scheduler phase within a wave. `as_str` is the stable key the GUI colors by.
 #[derive(Clone, Copy, PartialEq, Eq)]

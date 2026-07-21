@@ -422,12 +422,55 @@ pub(super) fn apply_segments(
     state: &mut SlotState,
     mut ctx: ApplyContext<'_>,
     new_segments: &[ProjectionSegment],
+    defer: Option<&mut Vec<GapFillPlan>>,
 ) -> Result<(), ConversationError> {
     let plan = apply_segments_build(&mut ctx, new_segments)?;
+    // When the caller is batching drain gap-fills AND this projection has no
+    // deferred user message (ingest / compression — the content prefills through a
+    // separate unit), queue the fire and finish now (restore-tail only). The glue
+    // K/V isn't read until the caller fires the whole drain's batch as ONE forward
+    // at drain end — collapsing N launch-floor gap-fills into one. A projection
+    // WITH a deferred user must fire inline (the user prefill attends the glue).
+    if let Some(sink) = defer {
+        if plan.deferred_user.is_none() {
+            sink.push(fire_only(&plan));
+            return apply_segments_finish(state, &mut ctx, plan);
+        }
+    }
     let t_glue = std::time::Instant::now();
     fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan])?;
     super::drain_add_us(&super::DRAIN_GLUE_US, t_glue.elapsed().as_micros() as u64);
     apply_segments_finish(state, &mut ctx, plan)
+}
+
+/// A fire-only clone of a [`GapFillPlan`] (glue scatter inputs; no deferred user /
+/// tail), for deferring the gap-fill forward into a batched drain-end fire.
+fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
+    GapFillPlan {
+        parent_id: plan.parent_id,
+        glue_tokens: plan.glue_tokens.clone(),
+        glue_write_slice: plan.glue_write_slice.clone(),
+        glue_write_in_blk: plan.glue_write_in_blk.clone(),
+        fwd_ahead: plan.fwd_ahead.clone(),
+        deferred_user: None,
+        tail_per_layer: Vec::new(),
+        n_glue_tokens: plan.n_glue_tokens,
+    }
+}
+
+/// Fire a batch of deferred drain gap-fills as ONE forward (see [`apply_segments`]
+/// `defer`). No-op when empty.
+pub(super) fn fire_deferred_gap_fills(
+    session: &mut BatchedInferenceSession,
+    model: &(dyn ManagedBatchedModel + Send),
+    device: &Device,
+    plans: &[GapFillPlan],
+) -> Result<(), ConversationError> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&GapFillPlan> = plans.iter().collect();
+    fire_gap_fill_batch(session, model, device, &refs)
 }
 
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —

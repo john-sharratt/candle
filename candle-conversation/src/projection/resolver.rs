@@ -1052,33 +1052,31 @@ impl Conversation {
         device: &candle::Device,
         stager: &mut crate::persistence::cold_load::ColdLoadStager,
     ) -> Vec<(TurnKey, candle::Result<Option<(Vec<SealedSequence>, u64)>>)> {
-        use std::collections::HashMap;
-
         use crate::persistence::content_hash::turn_stream_id;
-        use crate::persistence::resume::recovered_turn_decls;
+        use crate::persistence::streams::StreamDecl;
         use crate::persistence::transfer::load_turn_into_hot;
 
         let mut p = self.persistence.lock().unwrap();
         let substrate = self.read();
-        // One scan + sort of the recovered decls for the whole batch.
-        let decls: HashMap<(u64, u32), TurnDecl> = recovered_turn_decls(&substrate)
-            .into_iter()
-            .map(|d| ((d.timeline_id, d.turn_index), d))
-            .collect();
         keys.iter()
             .map(|&key| {
-                let Some(decl) = decls.get(&(key.timeline.raw(), key.index.0)) else {
+                // Resolve each turn's decl by its deterministic stream id — an
+                // O(1) `streams` map hit — rather than scanning, cloning, and
+                // sorting every turn decl in the whole substrate. The stream that
+                // carries the decl is the same one whose chunks the load reads, so
+                // one `stream_of` serves both. This keeps the cold-load O(keys),
+                // not O(turns-ingested-so-far).
+                let stream_id = turn_stream_id(key.timeline.raw(), key.index.0);
+                let Some(stream) = substrate.stream_of(stream_id) else {
                     return (key, Ok(None));
                 };
+                let Some(StreamDecl::Turn(decl)) = &stream.decl else {
+                    return (key, Ok(None));
+                };
+                let kv_bytes_total: u64 =
+                    stream.chunks.values().map(|loc| loc.payload_len).sum();
                 let result = load_turn_into_hot(backings, device, &mut p, &substrate, decl, stager)
-                    .map(|sealed| {
-                        let stream_id = turn_stream_id(key.timeline.raw(), key.index.0);
-                        let kv_bytes_total: u64 = substrate
-                            .stream_of(stream_id)
-                            .map(|s| s.chunks.values().map(|loc| loc.payload_len).sum::<u64>())
-                            .unwrap_or(0);
-                        Some((sealed, kv_bytes_total))
-                    });
+                    .map(|sealed| Some((sealed, kv_bytes_total)));
                 (key, result)
             })
             .collect()

@@ -1705,6 +1705,16 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
     ) -> crate::Result<usize> {
+        // code_reading is a tools-OFF layer: gate the WHOLE tool block out of every
+        // projection this conversation runs, so the ingest never SELECTS (and thus
+        // never elevates) a tool section. Without this the tools collection selects
+        // 1-3 tools + the `<tools>` framing sections every turn — a pure waste for a
+        // file-summary ingest that never calls a tool. Set on `self.selection` so
+        // the staged Turn A (which projects through `self.selection`) inherits it.
+        self.selection.set_optional(
+            crate::projection::TOOLS_ENABLED_SELECTOR,
+            crate::projection::OptionalState::Absent,
+        );
         // Turn A — the call: prefill `[request][tool_call]` + staged provenance
         // (mirrors `insert_turn_staged`). `user_start` / `assistant_end` /
         // `/no_think` are live glue; only intra-turn `user_end` / `assistant_start`
@@ -1726,6 +1736,11 @@ impl Sequence {
         opts.selection.set_optional(
             crate::projection::NO_THINK_SELECTOR,
             crate::projection::OptionalState::Present,
+        );
+        // Tools off for the summary decode too (Turn B projects through `opts`).
+        opts.selection.set_optional(
+            crate::projection::TOOLS_ENABLED_SELECTOR,
+            crate::projection::OptionalState::Absent,
         );
         let handle = self.submit_turn_with_options(response_user, opts)?;
         let response = handle.wait()?;

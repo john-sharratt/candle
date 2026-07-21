@@ -90,6 +90,20 @@
   .legend i{width:11px;height:3px;border-radius:2px;display:inline-block}
   .legend i.dash{background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 7px)}
   canvas{width:100%;display:block}
+  /* promote leaderboard — single-line rows, share shown as a background fill */
+  .promo{display:flex;flex-direction:column;gap:1px;font-family:var(--mono);font-size:12px}
+  .prow{position:relative;display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:center;
+    padding:2px 9px;border-radius:5px;border:1px solid transparent;overflow:hidden}
+  .prow .bar{position:absolute;left:0;top:0;bottom:0;width:0;z-index:0;
+    background:color-mix(in srgb,var(--accent) 13%,transparent)}
+  .prow .pn,.prow .pc,.prow .pp{position:relative;z-index:1}
+  .prow .pn{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .prow .pc{color:var(--ink-dim);font-variant-numeric:tabular-nums;text-align:right}
+  .prow .pp{color:var(--accent);font-variant-numeric:tabular-nums;text-align:right;min-width:48px}
+  @keyframes promoflash{from{background:color-mix(in srgb,var(--accent) 30%,transparent);
+    border-color:color-mix(in srgb,var(--accent) 50%,transparent)}to{background:transparent;border-color:transparent}}
+  .prow.flash{animation:promoflash 1.3s ease-out}
+  @media(prefers-reduced-motion:reduce){.prow.flash{animation:none}}
   .foot{margin-top:26px;color:var(--ink-faint);font-size:11.5px;font-family:var(--mono);
     text-align:center;border-top:1px solid var(--line);padding-top:16px}
   .livebar{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:11.5px}
@@ -258,6 +272,12 @@
         <span style="color:var(--ph-section)"><i style="background:var(--ph-section)"></i>section</span>
       </div>
       <canvas id="c_slots" height="190"></canvas>
+    </div>
+
+    <div class="card wide">
+      <h3>Working-set promotes &mdash; what's re-elevated</h3>
+      <div class="cap">Cumulative count of each unit handed to the per-turn working-set elevate, by name, most-promoted first &mdash; each row <b>flashes</b> when it climbs and shows its share of all promotes. A fixed section (system prompt, a tool) near the top means it's being re-elevated every ingest turn (wasted work).</div>
+      <div class="promo" id="promotelist"></div>
     </div>
 
   </div>
@@ -692,6 +712,37 @@ function createCharts(){
 }
 function redraw(){ charts.forEach(c=>c&&c.refresh()); }
 
+// ---------- promote leaderboard (keyed rows; flash on climb) ----------
+const promoRows=new Map();   // name -> {el, nEl, cEl, pEl, barEl, count}
+function renderPromotes(items){
+  const box=document.getElementById('promotelist'); if(!box) return;
+  const total=items.reduce((a,x)=>a+x.count,0)||1;
+  const max=items.length?items[0].count:1;
+  const seen=new Set();
+  items.slice(0,40).forEach((it,rank)=>{
+    seen.add(it.name);
+    let row=promoRows.get(it.name);
+    if(!row){
+      const el=document.createElement('div'); el.className='prow';
+      el.innerHTML='<span class="bar"></span><span class="pn"></span><span class="pc"></span><span class="pp"></span>';
+      row={el, nEl:el.querySelector('.pn'), cEl:el.querySelector('.pc'), pEl:el.querySelector('.pp'), barEl:el.querySelector('.bar'), count:-1};
+      row.nEl.textContent=it.name; promoRows.set(it.name,row);
+    }
+    // Flash the row when its count climbs (a fresh promote landed).
+    if(it.count>row.count && row.count>=0){
+      row.el.classList.remove('flash'); void row.el.offsetWidth; row.el.classList.add('flash');
+    }
+    row.count=it.count;
+    row.cEl.textContent=fmtN(it.count);
+    row.pEl.textContent=(100*it.count/total).toFixed(1)+'%';
+    row.barEl.style.width=(100*it.count/max).toFixed(1)+'%';
+    // keep DOM order == sort order
+    if(box.children[rank]!==row.el) box.insertBefore(row.el, box.children[rank]||null);
+  });
+  // drop rows that fell out of the top list
+  for(const [name,row] of promoRows){ if(!seen.has(name)){ row.el.remove(); promoRows.delete(name); } }
+}
+
 function stateFor(f){ return f<0.72?'ok':f<0.9?'warn':'crit'; }
 function kpiCard(lab,val,unit,note,state,bar){ const s=state||'ok';
   return `<div class="kpi"><div class="rail bg-${s}"></div><div class="lab">${lab}</div>
@@ -744,13 +795,15 @@ function setLive(txt,ok){ const el=document.getElementById('live'); if(!el) retu
 async function refresh(){
   if(paused) return;
   try{
-    const [r,rp]=await Promise.all([
+    const [r,rp,rpr]=await Promise.all([
       fetch('/v1/telemetry',{cache:'no-store'}),
       fetch('/v1/phases',{cache:'no-store'}).catch(()=>null),
+      fetch('/v1/promotes',{cache:'no-store'}).catch(()=>null),
     ]);
     if(!r.ok) throw new Error(r.status);
     DATA=await r.json();
     if(rp&&rp.ok){ try{ PHDATA=await rp.json(); }catch(e){ PHDATA={points:[]}; } }
+    if(rpr&&rpr.ok){ try{ renderPromotes((await rpr.json()).items||[]); }catch(e){} }
     apply(); lastOk=Date.now();
     // Phase charts are fed by /v1/phases (the in-process ring) — independent of the
     // log-parsed wave series. Create + draw them ALWAYS, so the phase view is live

@@ -58,6 +58,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/status", get(status::status))
         .route("/v1/telemetry", get(telemetry::telemetry))
         .route("/v1/phases", get(telemetry::phases))
+        .route("/v1/promotes", get(telemetry::promotes))
         .route("/v1/substrate", get(substrate::overview))
         .route("/v1/substrate/system-prompt", get(substrate::system_prompt))
         .route("/v1/substrate/tools", get(substrate::tools))

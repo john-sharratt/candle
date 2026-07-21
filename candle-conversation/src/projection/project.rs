@@ -775,6 +775,13 @@ mod prior_belief_tests {
 /// [`Absent`]: OptionalState::Absent
 pub const NO_THINK_SELECTOR: &str = "no_think";
 
+/// Selector for the `tools_enabled` optional_group that gates the WHOLE tool block
+/// (overview, `<tools>` markers, catalog, summary). `Absent` omits it entirely —
+/// what a tools-off layer (e.g. `code_reading`) sets so the projection never
+/// selects (or elevates) any tool section. Kept here so the string can't drift
+/// between the schema, chat.rs, and the ingest path.
+pub const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
+
 /// The two states of an `optional` section-tree node: whether its content is
 /// projected (`Present`) or omitted (`Absent`).
 ///
