@@ -1269,6 +1269,55 @@ impl Scheduler {
         compressed
     }
 
+    /// Continuous-fair-wave prefill throttle: how many transformer layers a
+    /// background prefill/glue cohort advances **per wave**
+    /// (`docs/continuous_fair_waves.md`).
+    ///
+    /// `budget = ceil(N / R)`, where `R` is the decode-to-prefill airtime ratio
+    /// of the interactive work to protect:
+    /// - **No foreground decode active** → `R = 1` → `budget = N`: the prefill
+    ///   clears every layer in one wave (nothing to shield → full speed).
+    /// - **Decode active** → `R` = the max `decode_priority` ratio over the active
+    ///   foreground decodes (default `High` when a layer can't be resolved) → the
+    ///   prefill creeps `~N/R` layers per wave while decode keeps its experts hot.
+    pub(super) fn wave_prefill_layer_budget(&self) -> usize {
+        let n = self.model.num_layers().max(1);
+        if self.foreground_decode_width() == 0 {
+            return n;
+        }
+        let ratio = self
+            .active_decodes
+            .keys()
+            .filter_map(|sid| self.decode_layer_priority(*sid))
+            .map(|p| p.ratio())
+            .max()
+            .unwrap_or_else(|| crate::projection::DecodePriority::High.ratio());
+        n.div_ceil(ratio.max(1) as usize).max(1)
+    }
+
+    /// Resolve the `decode_priority` of a decode slot's target layer, or `None`
+    /// when the slot's target/timeline isn't resolvable (the caller then defaults
+    /// to the protective `High`).
+    fn decode_layer_priority(&self, sid: SequenceId) -> Option<crate::projection::DecodePriority> {
+        // A decode runs on a VIEW sequence, but the projection target (which
+        // carries the layer's decode_priority) is pinned on the view's PARENT
+        // slot. Resolve view → parent first, falling back to the sid itself for a
+        // slot that decodes directly (no view).
+        let slot = self
+            .turn_views
+            .get(&sid)
+            .map(|v| v.parent_id)
+            .unwrap_or(sid);
+        let target = self.slot_targets.get(&slot)?;
+        let builder = self.timeline_projections.get(&target.timeline)?;
+        builder
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == target.layer)
+            .map(|l| l.decode_priority)
+    }
+
     /// Number of in-flight prefills that still have tokens left to process
     /// and have not errored.
     pub(super) fn prefill_width(&self) -> usize {
@@ -1446,218 +1495,387 @@ impl Scheduler {
         }
     }
 
-    /// Run **one** prefill pass across every still-active in-flight prefill.
-    /// Each prefill advances by its own `min(remaining, max_prefill_pass_tokens)`
-    /// tokens; the varlen forward packs the ragged lengths flat into a single
-    /// batched call.
+    /// Advance the in-flight continuous-fair-wave prefill cohort by one wave's
+    /// worth of layers ([`Self::wave_prefill_layer_budget`]).
     ///
-    /// Sequences whose offset reaches `tokens.len()` after this pass have
-    /// their `final_logits` recorded; they will be promoted to decode by
-    /// `promote_finished_prefills_to_decodes`.
+    /// A cohort is a batch of prefills that flow through the transformer layers
+    /// together, in lockstep, over multiple waves — its inter-layer residual
+    /// stream is held on the scheduler between waves so decode sweeps every layer
+    /// in between. When the cohort reaches the final layer its sequences' offsets
+    /// are committed and their `final_logits` recorded; they are then promoted to
+    /// decode by `promote_finished_prefills_to_decodes`.
     pub(super) fn run_one_prefill_pass(&mut self) {
-        // Collect indices of still-active prefills.
-        let active: Vec<usize> = (0..self.active_prefills.len())
-            .filter(|&i| {
-                let p = &self.active_prefills[i];
-                p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
-            })
-            .collect();
-        if active.is_empty() {
+        // Skip only when the co-batched decode wave already advanced the cohort
+        // this wave (`decode_forward_cobatched` set the guard). Otherwise advance
+        // it here — as the interleaved path when decode co-batching was declined
+        // for a mid-sweep window, or as the sole path when no decode is active.
+        if self.wave_cohort_advanced {
+            return;
+        }
+        // Continuous-fair-wave prefill (`docs/continuous_fair_waves.md`): advance
+        // ONE prefill cohort by a bounded number of layers (the priority throttle),
+        // holding its inter-layer residual stream across waves so decode sweeps
+        // every layer in between and keeps its experts hot. The whole token set of
+        // each prefill flows through the layers gradually (the rolling-window
+        // ingest context bounds it) rather than being token-chunked through all
+        // layers at once.
+        let n_layers = self.model.num_layers().max(1);
+        let budget = self.wave_prefill_layer_budget();
+
+        // Resume the in-flight cohort, or form a fresh one from every ready
+        // prefill. Keyed by sequence id so promotion's `swap_remove` can't
+        // invalidate it between waves.
+        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
+            self.wave_prefill_seqs = (0..self.active_prefills.len())
+                .filter(|&i| {
+                    let p = &self.active_prefills[i];
+                    p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
+                })
+                .map(|i| self.active_prefills[i].work.sequence_id.0)
+                .collect();
+        }
+        let cohort = self.wave_prefill_seqs.clone();
+        if cohort.is_empty() {
+            self.reset_wave_prefill();
             return;
         }
 
-        // Ragged batch: each prefill advances by its OWN min(remaining, cap).
-        // The varlen forward packs the heterogeneous lengths flat, so a short
-        // scope no longer collapses the whole wave to the batch minimum.
-        let cap = self.max_prefill_pass_tokens;
-        let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
-        let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
-        let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
-        let mut advances: Vec<usize> = Vec::with_capacity(active.len());
-        for &i in &active {
-            let p = &mut self.active_prefills[i];
-            if p.prefill_start.is_none() {
-                p.prefill_start = Some(Instant::now());
+        // Build the batch: sequence ids + the FULL token tensor of each prefill.
+        // The wave supplies q_lens to the attention every layer; embedding happens
+        // once (at cursor 0), and the residual carries the rest.
+        let mut seq_ids: Vec<usize> = Vec::with_capacity(cohort.len());
+        let mut inputs: Vec<Tensor> = Vec::with_capacity(cohort.len());
+        let mut group_idxs: Vec<usize> = Vec::with_capacity(cohort.len());
+        for &sid in &cohort {
+            let Some(i) = self
+                .active_prefills
+                .iter()
+                .position(|p| p.work.sequence_id.0 == sid)
+            else {
+                continue;
+            };
+            if self.active_prefills[i].error.is_some()
+                || self.active_prefills[i].final_logits.is_some()
+            {
+                continue;
             }
-            let off = p.offset;
-            let mut advance = (p.work.tokens.len() - off).min(cap);
-            // Staged calibration prefill: don't advance past the next projection
-            // point, so the wave stops exactly on it and the advance loop below can
-            // emit that segment's projection. Normal prefills carry no offsets and
-            // advance by the full cap, co-batching in this same ragged forward.
-            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
-                let seg_remaining = (next_off as usize).saturating_sub(off);
-                if seg_remaining > 0 {
-                    advance = advance.min(seg_remaining);
-                }
+            if self.active_prefills[i].prefill_start.is_none() {
+                self.active_prefills[i].prefill_start = Some(Instant::now());
             }
-            let tokens = &p.work.tokens[off..off + advance];
-            match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
+            let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+            match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
-                    seq_ids.push(p.work.sequence_id.0);
+                    seq_ids.push(sid);
                     inputs.push(t);
                     group_idxs.push(i);
-                    advances.push(advance);
                 }
-                Err(e) => {
-                    p.error = Some(ConversationError::Model(e));
-                }
+                Err(e) => self.active_prefills[i].error = Some(ConversationError::Model(e)),
             }
         }
         if seq_ids.is_empty() {
+            self.reset_wave_prefill();
             return;
         }
 
-        let total_tokens: usize = advances.iter().sum();
-        tracing::debug!(
-            target: "sched",
-            "prefill batch={} tokens={} decode_active={} seq_ids={:?}",
-            seq_ids.len(),
-            total_tokens,
-            self.active_decodes.len(),
-            seq_ids
-        );
-
-        let n_seqs = seq_ids.len();
-        // Clear the per-op pipeline profile so the snapshot after the forward
-        // covers only THIS prefill pass (attn:core / ffn / qkv / out_proj / the
-        // paged-prefill kernel, summed over layers) — the code-read prefill is
-        // the dominant wave cost and this is the only place its internal split
-        // is exposed.
-        #[cfg(feature = "profile")]
-        let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
-        // Capture each sequence's attended context length (prefix + new tokens)
-        // BEFORE the forward advances it, so the breakdown can tie the
-        // attention-kernel time to the kv_len it actually sweeps — the deciding
-        // number for prefix-bound vs kernel-inefficiency.
-        #[cfg(feature = "profile")]
-        let kv_prefixes: Vec<usize> = seq_ids
-            .iter()
-            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
-            .collect();
-        // Total attended-KV length this prefill sweeps (prefix/context summed
-        // over the batch), captured before the forward advances the sequences.
-        // Surfaced on the wave line so a growing prefix (the prefill-slowing
-        // growth area) is visible vs. a flat paged-glue prefix.
+        let start = self.wave_prefill_cursor;
+        let end = (start + budget).min(n_layers);
+        let residual_in = self.wave_prefill_residual.take();
+        // Attended-KV length (prefix/context summed over the batch) — the prefill
+        // sequences are NOT advanced until the head, so this is stable across the
+        // cohort's layer advances.
         let kv_len: usize = seq_ids
             .iter()
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
             .sum();
+        let total_tokens: usize = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
+
         let t_fwd = Instant::now();
-        let logits_vec = match self
-            .model
-            .forward_batched(&mut self.session, &seq_ids, &inputs)
-        {
-            Ok(v) => v,
+        let step = match self.model.forward_batched_layers(
+            &mut self.session,
+            &seq_ids,
+            &inputs,
+            start,
+            end,
+            residual_in,
+        ) {
+            Ok(s) => s,
             Err(e) => {
                 if candle_nn::kv_cache::is_device_oom(&e) {
                     // The batch outgrew the card's VRAM. Narrow the admission
-                    // window so following waves run smaller forwards, and requeue
-                    // the batch's scope-ingest prefills rather than dropping their
-                    // content — a freed slot re-pumps them at the narrower width.
+                    // window and requeue the batch's scope-ingest prefills rather
+                    // than dropping their content; drop this cohort's residual so a
+                    // fresh (narrower) one forms next wave.
                     self.handle_prefill_oom(&group_idxs, &e);
                 } else {
-                    let msg = format!("batched prefill forward failed: {e}");
+                    let msg = format!("wave prefill forward failed: {e}");
                     for &i in &group_idxs {
                         self.active_prefills[i].error =
                             Some(ConversationError::Channel(msg.clone()));
                     }
                 }
+                self.reset_wave_prefill();
                 return;
             }
         };
-        // Prefill batch = n_seqs sequences, Σ advances tokens (ragged).
         let fwd_ms = t_fwd.elapsed().as_millis() as u64;
         self.wave_stats
-            .record(true, n_seqs, total_tokens, kv_len, fwd_ms);
-        #[cfg(feature = "profile")]
-        {
-            let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
-            let mut parts: Vec<String> = snap
-                .entries
-                .iter()
-                .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
-                .collect();
-            parts.sort_by(|a, b| b.cmp(a));
-            let max_prefix = kv_prefixes.iter().copied().max().unwrap_or(0);
-            let max_kv = kv_prefixes
-                .iter()
-                .zip(advances.iter())
-                .map(|(&p, &a)| p + a)
-                .max()
-                .unwrap_or(0);
-            let sum_kv: usize = kv_prefixes
-                .iter()
-                .zip(advances.iter())
-                .map(|(&p, &a)| p + a)
-                .sum();
-            tracing::info!(
-                target: "candle_conversation::scheduler::timing",
-                n_seqs,
-                total_tokens,
-                fwd_ms,
-                max_prefix,
-                max_kv,
-                sum_kv,
-                "code-read prefill forward op breakdown: {}",
-                parts.join("  ")
-            );
+            .record(true, seq_ids.len(), total_tokens, kv_len, fwd_ms);
+
+        if end < n_layers {
+            // Paused mid-stack: persist the residual and keep the cohort. Decode
+            // sweeps all layers before we resume here next wave.
+            self.wave_prefill_residual = step.residual;
+            self.wave_prefill_cursor = end;
+            self.wave_prefill_seqs = seq_ids;
+            return;
         }
 
-        for ((logits, &i), &advance) in logits_vec
-            .into_iter()
-            .zip(group_idxs.iter())
-            .zip(advances.iter())
-        {
-            let p = &mut self.active_prefills[i];
-            if let Err(e) = self.session.advance_sequence(p.work.sequence_id.0, advance) {
-                p.error = Some(ConversationError::Model(e));
+        // Reached the head: the cohort's tokens are now fully processed through
+        // every layer. Commit offsets + logits and hand them to the promotion path.
+        let logits = step.logits.unwrap_or_default();
+        self.complete_wave_cohort(&seq_ids, &logits);
+    }
+
+    /// Clear the in-flight continuous-fair-wave prefill cohort (residual, cursor,
+    /// sequences) so the next wave forms a fresh one.
+    fn reset_wave_prefill(&mut self) {
+        self.wave_prefill_residual = None;
+        self.wave_prefill_cursor = 0;
+        self.wave_prefill_seqs.clear();
+    }
+
+    /// Finish a prefill cohort that reached the final layer: for each sequence
+    /// (in `pf_seqs` order, aligned with `logits`), commit its offset, emit its
+    /// staged/progress events, record its `final_logits` for promotion, then clear
+    /// the cohort. Shared by the prefill-only wave and the co-batched decode wave.
+    fn complete_wave_cohort(&mut self, pf_seqs: &[usize], logits: &[Tensor]) {
+        for (k, &sid) in pf_seqs.iter().enumerate() {
+            let Some(i) = self
+                .active_prefills
+                .iter()
+                .position(|p| p.work.sequence_id.0 == sid)
+            else {
+                continue;
+            };
+            let total = self.active_prefills[i].work.tokens.len();
+            let seq_id = self.active_prefills[i].work.sequence_id;
+            if let Err(e) = self.session.advance_sequence(seq_id.0, total) {
+                self.active_prefills[i].error = Some(ConversationError::Model(e));
                 continue;
             }
-            // Mirror the just-prefilled tokens into the diagnostic
-            // log so the turn-complete dump can reconstruct the
-            // exact context the kernel saw — `run_one_prefill_pass`
-            // is the SubmitTurn prefill path, parallel to
-            // `run_prefill`'s synchronous path.
-            let seq_id = p.work.sequence_id;
-            let off = p.offset;
-            let advance_tokens = p.work.tokens[off..off + advance].to_vec();
-            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &advance_tokens);
-            p.offset += advance;
-            // Staged prefill: if this pass landed on the next projection point,
-            // emit that segment's projection (the pinned composition, spanned to
-            // this segment's generated tokens) and move to the next point. The
-            // client collects these `TurnEvent::Projection`s and persists them, so
-            // the sealed turn carries the same per-segment projection sequence a
-            // real decode produced.
-            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
-                if p.offset >= next_off as usize {
-                    if let Some(comp) = &p.work.staged_composition {
-                        let gen_start = p.work.assistant_content_start;
-                        let prev_off = if p.next_projection == 0 {
-                            gen_start
-                        } else {
-                            p.work.projection_offsets[p.next_projection - 1]
-                        };
-                        // A projection is a POINT: this segment's projection was
-                        // selected at `prev_off` and governs forward to `next_off`
-                        // (the next event's point). Emit it at its start position.
-                        let mut ev = comp.clone();
-                        ev.start_token = prev_off.saturating_sub(gen_start);
-                        let _ = p.work.event_tx.send(TurnEvent::Projection(ev));
-                    }
-                    p.next_projection += 1;
+            let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &all_tokens);
+            self.active_prefills[i].offset = total;
+            // Staged calibration prefill: emit every segment's pinned projection
+            // here at completion (a wave processes the whole token set at once).
+            if let Some(comp) = self.active_prefills[i].work.staged_composition.clone() {
+                let gen_start = self.active_prefills[i].work.assistant_content_start;
+                let offs = self.active_prefills[i].work.projection_offsets.clone();
+                for seg in 0..offs.len() {
+                    let prev_off = if seg == 0 { gen_start } else { offs[seg - 1] };
+                    let mut ev = comp.clone();
+                    ev.start_token = prev_off.saturating_sub(gen_start);
+                    let _ = self.active_prefills[i]
+                        .work
+                        .event_tx
+                        .send(TurnEvent::Projection(ev));
                 }
+                self.active_prefills[i].next_projection = offs.len();
             }
-            let total = p.work.tokens.len();
-            let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
-                tokens_done: p.offset,
-                tokens_total: total,
-            });
-            if p.offset >= total {
-                p.final_logits = Some(logits);
+            let _ = self.active_prefills[i]
+                .work
+                .event_tx
+                .send(TurnEvent::PrefillProgress {
+                    tokens_done: total,
+                    tokens_total: total,
+                });
+            if let Some(l) = logits.get(k) {
+                self.active_prefills[i].final_logits = Some(l.clone());
             }
         }
+        self.reset_wave_prefill();
+    }
+
+    /// Decode forward, **co-batching** the in-flight prefill cohort into decode's
+    /// sweep at the cohort's active layer window (`docs/continuous_fair_waves.md`).
+    ///
+    /// Decode sweeps all `N` layers; the prefill cohort shares the layer's grouped
+    /// GEMM (one expert load serves both) only in `[cursor, cursor+budget)`, then
+    /// its residual is persisted (or its logits promoted when it reaches `N`). The
+    /// sweep is segmented so decode runs alone before/after the window:
+    ///   `[0, cursor)` decode-only → `[cursor, win_end)` decode+prefill →
+    ///   `[win_end, N)` decode-only.
+    /// Only the FIRST decode step of a quantum folds the cohort in (guarded by
+    /// `wave_cohort_advanced`); the rest — and the no-cohort case — are plain
+    /// decode forwards.
+    pub(super) fn decode_forward_cobatched(
+        &mut self,
+        decode_seqs: &[usize],
+        decode_inputs: &[Tensor],
+    ) -> candle::Result<Vec<Tensor>> {
+        // Already folded the cohort into a decode step this wave → plain decode
+        // (only the first decode step of a quantum co-batches).
+        if self.wave_cohort_advanced {
+            return self
+                .model
+                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
+        }
+
+        let n = self.model.num_layers().max(1);
+        let budget = self.wave_prefill_layer_budget();
+        let cursor = self.wave_prefill_cursor;
+        let win_end = (cursor + budget).min(n);
+
+        // Co-batch ONLY when the prefill window sits at a sweep boundary — cursor 0
+        // (window at the start) or win_end == N (window at the end) — so decode's
+        // sweep splits into at most TWO segments and co-batching adds NO extra
+        // kernel launch over interleaving. A mid-sweep window (3 segments) is left
+        // to the interleaved prefill pass (`run_one_prefill_pass`, gated on
+        // `wave_cohort_advanced`), which advances the cohort in one separate forward
+        // while decode runs plain — so a small-budget (High-priority) throttle
+        // can't triple decode's launch cost (docs/continuous_fair_waves.md).
+        if cursor != 0 && win_end < n {
+            return self
+                .model
+                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
+        }
+
+        // Form a fresh cohort from ready prefills if none is in flight.
+        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
+            self.wave_prefill_seqs = (0..self.active_prefills.len())
+                .filter(|&i| {
+                    let p = &self.active_prefills[i];
+                    p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
+                })
+                .map(|i| self.active_prefills[i].work.sequence_id.0)
+                .collect();
+        }
+        if self.wave_prefill_seqs.is_empty() {
+            return self
+                .model
+                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
+        }
+
+        // Build the cohort's sequences + full-token inputs.
+        let cohort = self.wave_prefill_seqs.clone();
+        let mut pf_seqs: Vec<usize> = Vec::with_capacity(cohort.len());
+        let mut pf_inputs: Vec<Tensor> = Vec::with_capacity(cohort.len());
+        for &sid in &cohort {
+            let Some(i) = self
+                .active_prefills
+                .iter()
+                .position(|p| p.work.sequence_id.0 == sid)
+            else {
+                continue;
+            };
+            if self.active_prefills[i].error.is_some()
+                || self.active_prefills[i].final_logits.is_some()
+            {
+                continue;
+            }
+            if self.active_prefills[i].prefill_start.is_none() {
+                self.active_prefills[i].prefill_start = Some(Instant::now());
+            }
+            let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+            if let Ok(t) = Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
+                pf_seqs.push(sid);
+                pf_inputs.push(t);
+            }
+        }
+        if pf_seqs.is_empty() {
+            self.reset_wave_prefill();
+            return self
+                .model
+                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
+        }
+        self.wave_cohort_advanced = true;
+        let n_dec = decode_seqs.len();
+        let none_seqs: [usize; 0] = [];
+        let none_inputs: [Tensor; 0] = [];
+
+        // Segment 1 — decode-only [0, cursor).
+        let dec_res: Option<Tensor> = if cursor > 0 {
+            self.model
+                .forward_wave(
+                    &mut self.session,
+                    decode_seqs,
+                    decode_inputs,
+                    &none_seqs,
+                    &none_inputs,
+                    &none_seqs,
+                    &none_inputs,
+                    0,
+                    cursor,
+                    None,
+                )?
+                .residual
+        } else {
+            None
+        };
+
+        // Segment 2 — co-batch decode + prefill over [cursor, win_end). Resume
+        // each type from its layer-`cursor` residual (concatenated); at cursor 0
+        // both embed fresh (residual None).
+        let pf_res = self.wave_prefill_residual.take();
+        let seg2_in: Option<Tensor> = match (dec_res.as_ref(), pf_res.as_ref()) {
+            (Some(d), Some(p)) => Some(Tensor::cat(&[d, p], 1)?),
+            (Some(d), None) => Some(d.clone()),
+            (None, Some(p)) => Some(p.clone()),
+            (None, None) => None,
+        };
+        let seg2 = self.model.forward_wave(
+            &mut self.session,
+            decode_seqs,
+            decode_inputs,
+            &pf_seqs,
+            &pf_inputs,
+            &none_seqs,
+            &none_inputs,
+            cursor,
+            win_end,
+            seg2_in,
+        )?;
+
+        if win_end >= n {
+            // Reached the head inside the window: logits for [decode | prefill].
+            let logits = seg2.logits.unwrap_or_default();
+            let split = n_dec.min(logits.len());
+            let (dec_logits, pf_logits) = logits.split_at(split);
+            self.complete_wave_cohort(&pf_seqs, pf_logits);
+            return Ok(dec_logits.to_vec());
+        }
+
+        // Paused: split the combined residual back into decode + prefill parts.
+        let res = seg2
+            .residual
+            .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
+        let pf_rows: usize = pf_inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
+        let dec_part = res.narrow(1, 0, n_dec)?;
+        let pf_part = res.narrow(1, n_dec, pf_rows)?;
+        self.wave_prefill_residual = Some(pf_part);
+        self.wave_prefill_cursor = win_end;
+        self.wave_prefill_seqs = pf_seqs;
+
+        // Segment 3 — decode-only [win_end, N) → decode logits.
+        let seg3 = self.model.forward_wave(
+            &mut self.session,
+            decode_seqs,
+            decode_inputs,
+            &none_seqs,
+            &none_inputs,
+            &none_seqs,
+            &none_inputs,
+            win_end,
+            n,
+            Some(dec_part),
+        )?;
+        Ok(seg3.logits.unwrap_or_default())
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too

@@ -289,121 +289,107 @@ pub trait BatchedAttentionLayer {
 // Layer Processing Functions
 // ============================================================================
 
-/// Process a full transformer layer in batched mode.
+/// One row-type group of a mixed continuous-fair-wave layer
+/// (`docs/continuous_fair_waves.md`): the sequences of a single attention flavour
+/// (decode / prefill / glue), their per-layer caches + offsets, the attention
+/// metadata to run, and the shape of their slice of the combined residual buffer.
+pub struct WaveAttnGroup<'a, 'c> {
+    /// This group's sequences' caches for the current layer (disjoint sub-slice
+    /// of the wave's caches).
+    pub caches: &'c mut [&'a mut KvCache],
+    /// Per-sequence cached-token offsets.
+    pub offsets: &'c [usize],
+    /// The attention metadata for this group's kernel (decode `SlotHeader` /
+    /// prefill `cu_seqlens` / glue).
+    pub params: &'c BatchedAttentionParams<'c>,
+    /// Token-rows this group contributes to the combined buffer.
+    pub rows: usize,
+    /// Decode rows sit in the flat buffer as a `[1, rows, hidden]` slice but the
+    /// decode kernel wants `[rows, 1, hidden]`; prefill/glue stay `[1, rows, hidden]`.
+    pub decode_layout: bool,
+}
+
+/// Mixed-wave transformer layer — the co-batched form of
+/// `docs/continuous_fair_waves.md`.
 ///
-/// This function implements the standard pre-norm transformer layer:
-/// ```text
-/// h = attention_norm(x)
-/// x = x + attention(h)
-/// h = ffn_norm(x)
-/// x = x + ffn(h)
-/// ```
+/// Runs each row-type's attention kernel on its **own row-slice** of the combined
+/// residual buffer (no kernel changes — the existing decode / prefill / glue
+/// paths, each over its rows), concatenates the per-type attention outputs, then
+/// runs o_proj (already fused inside each attention call) + the residual +
+/// `ffn_norm` + the **single shared FFN/MoE grouped GEMM** over the whole buffer.
 ///
-/// It handles dtype conversions for mixed-precision training (e.g., FP8 activations
-/// with BF16 attention).
-///
-/// # Arguments
-/// * `act_dtype` - The activation dtype for MLP matmuls (e.g., F8E4M3 for FP8 mode).
-///   This should be the original embedding dtype, not the layer input dtype which
-///   may have been converted to higher precision by previous layers.
-pub fn forward_layer_batched<L: BatchedAttentionLayer>(
+/// Because o_proj is linear and the FFN/MoE is token-flat (per row), per-type
+/// attention followed by shared post-attention is bit-identical to a fused pass —
+/// and it is the "one expert load per layer serves decode + prefill + glue
+/// together" amortisation. A single group (`groups.len() == 1`) is the ordinary
+/// homogeneous forward: attention over the whole buffer with no slicing.
+pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     layer: &L,
-    caches: &mut [&mut KvCache],
+    groups: &mut [WaveAttnGroup<'_, '_>],
     x: &mut TensorCat,
-    offsets: &[usize],
-    params: &BatchedAttentionParams<'_>,
     act_dtype: DType,
     layer_idx: usize,
 ) -> Result<()> {
-    // Apply attention norm and compute attention
-    let stage_is_decode = x.dim(1)? == 1;
-    let attn_total_name = if stage_is_decode {
-        "decode:model:attn:total"
-    } else {
-        "prefill:model:attn:total"
-    };
-    let attn_norm_name = if stage_is_decode {
-        "decode:model:attn:norm"
-    } else {
-        "prefill:model:attn:norm"
-    };
-    let attn_core_name = if stage_is_decode {
-        "decode:model:attn:core"
-    } else {
-        "prefill:model:attn:core"
-    };
-    let attn_residual_name = if stage_is_decode {
-        "decode:model:attn:resid"
-    } else {
-        "prefill:model:attn:resid"
-    };
-
-    let t_attn_total = profile_now();
     let orig_dtype = x.dtype();
 
-    // B1: attention_norm (ln1) is fused into the attention via `attention_norm_dynamic` inside
-    // `forward_attn_batched`, so we hand it the PRE-norm `x` (same shape) and never materialize
-    // the FP normed activation on the int8 path. `attn_norm_name` timing folds into attn:core.
-    let _ = attn_norm_name;
-    let t_attn_core = profile_now();
-    let h_attn = forward_attn_batched(layer, caches, &*x, offsets, params, layer_idx)?.to_tensor();
-    profile_sync(h_attn.device());
-    pipeline_record(attn_core_name, t_attn_core);
+    // ── Attention: each row-group's kernel over its OWN slice, concatenated ──
+    // The combined buffer is flat `[1, total, hidden]` with each group a
+    // contiguous row-range; a decode group reshapes its slice to the kernel's
+    // `[rows, 1, hidden]` layout (`decode_layout`), prefill/glue stay flat. A
+    // single homogeneous group is the same loop with one iteration — it must
+    // ALSO honour `decode_layout` (a flat multi-decode group would otherwise be
+    // misrouted), so there is no shape-based fast path here. Routing decode vs
+    // prefill is by the group's declared headers (see `forward_attn_batched`),
+    // not by tensor shape, so a 1-token prefill or a multi-token decode is safe.
+    let hidden = x.dim(2)?;
+    let xt = x.to_tensor();
+    let mut parts: Vec<Tensor> = Vec::with_capacity(groups.len());
+    let mut row0 = 0usize;
+    for g in groups.iter_mut() {
+        if g.rows == 0 {
+            continue;
+        }
+        let slice = xt.narrow(1, row0, g.rows)?;
+        let x_g = if g.decode_layout {
+            TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
+        } else {
+            TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+        };
+        let h = forward_attn_batched(layer, g.caches, &x_g, g.offsets, g.params, layer_idx)?
+            .to_tensor();
+        let h = if g.decode_layout {
+            h.reshape((1, g.rows, hidden))?
+        } else {
+            h
+        };
+        parts.push(h);
+        row0 += g.rows;
+    }
+    let h_attn = if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        Tensor::cat(&parts, 1)?
+    };
 
-    // First residual: x = x + attention(h)
-    // Convert x to attention dtype and add in-place
-    let t_attn_residual = profile_now();
+    // First residual: x = x + attn(h).
     x.to_dtype_mut(h_attn.dtype())?;
     x.add_mut(&h_attn)?;
-    drop(h_attn); // Free attention output memory
-    profile_sync(x.as_cat_tensor().device());
-    pipeline_record(attn_residual_name, t_attn_residual);
-    pipeline_record(attn_total_name, t_attn_total);
+    drop(h_attn);
 
-    let mlp_total_name = if stage_is_decode {
-        "decode:model:mlp:total"
-    } else {
-        "prefill:model:mlp:total"
-    };
-    let mlp_ffn_name = if stage_is_decode {
-        "decode:model:ffn:total"
-    } else {
-        "prefill:model:ffn:total"
-    };
-    let mlp_residual_name = if stage_is_decode {
-        "decode:model:mlp:resid"
-    } else {
-        "prefill:model:mlp:resid"
-    };
-
-    let t_mlp_total = profile_now();
-    // FFN: h2 = ffn(ffn_norm(x)). B3 (CUDA): `ffn_norm_dynamic` fuses ln2→q8a128 for an int8 layer
-    // so the router and expert gather consume the quantized activation directly — no standalone
-    // quantize. FP keeps the F16→BF16 cast (MLP intermediates can exceed F16's ~65504 range).
+    // ── Shared FFN/MoE over the WHOLE combined buffer — one grouped GEMM whose
+    // per-layer expert load serves every row-type at once. ──
     let mlp_dtype = if act_dtype == DType::F16 {
         DType::BF16
     } else {
         act_dtype
     };
-
-    let t_mlp_ffn = profile_now();
     let mut h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode())?;
         layer.ffn_forward(acts, mlp_dtype)?
     };
-    profile_sync(h2.device());
-    pipeline_record(mlp_ffn_name, t_mlp_ffn);
-
-    // Second residual: x = x + ffn(h)
-    // Convert h2 to x's dtype and add in-place
-    let t_mlp_residual = profile_now();
     h2.to_dtype_mut(orig_dtype)?;
     x.to_dtype_mut(orig_dtype)?;
     x.add_mut(&h2)?;
-    profile_sync(x.as_cat_tensor().device());
-    pipeline_record(mlp_residual_name, t_mlp_residual);
-    pipeline_record(mlp_total_name, t_mlp_total);
-
     Ok(())
 }
 
@@ -418,9 +404,12 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
     params: &BatchedAttentionParams<'_>,
     layer_idx: usize,
 ) -> Result<TensorCat> {
-    let seq_len = x.dim(1)?;
-    // Use optimized batched implementation for single-token generation
-    if seq_len == 1 {
+    // Route by the batch's DECLARED flavour (its headers), not tensor shape: a
+    // mixed-wave group hands each type its own kernel, and a single-token prefill
+    // ([1,1,h]) or a multi-token decode group ([D,1,h]) must still take the
+    // correct path — a shape test (`dim(1)==1`) would misroute both.
+    let is_decode = matches!(params.decode_headers, DecodeHeaders::Decode { .. });
+    if is_decode {
         let ret = forward_attn_batched_single(
             layer,
             caches,

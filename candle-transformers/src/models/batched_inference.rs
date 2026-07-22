@@ -35,7 +35,8 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
 use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
-use super::batched_model::{BatchedInference, BatchedModelCore};
+use super::batched_model::{BatchedInference, BatchedModelCore, WavePhase};
+use super::tensor_cat::TensorCat;
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
 use crate::models::profile::{pipeline_record, profile_now};
@@ -2671,6 +2672,19 @@ pub struct ModelCoreProperties {
     pub v_low_error_threshold_factor: f32,
 }
 
+/// Result of a re-entrant [`ManagedBatchedModel::forward_batched_layers`] wave.
+///
+/// Exactly one of the two fields is populated: `residual` when the wave paused
+/// before the last layer (the packed inter-layer stream to persist and feed back
+/// next wave), or `logits` when it ran the head (one row per input sequence).
+pub struct WaveStep {
+    /// Packed residual stream to persist + resume, when the range stopped short
+    /// of the final layer.
+    pub residual: Option<Tensor>,
+    /// Per-sequence logits (in `seq_indices` order), when the range reached the head.
+    pub logits: Option<Vec<Tensor>>,
+}
+
 /// **You don't need to implement this trait manually.** Any type that implements
 /// [`BatchedModel`] automatically gets a `ManagedBatchedModel` implementation
 /// via the blanket impl.
@@ -2744,6 +2758,53 @@ pub trait ManagedBatchedModel {
         seq_indices: &[usize],
         inputs: &[Tensor],
     ) -> Result<Vec<Tensor>>;
+
+    /// Re-entrant, layer-range forward for the continuous-fair-wave engine
+    /// (`docs/continuous_fair_waves.md`). Runs layers `[layer_start, layer_end)`
+    /// over `seq_indices`, threading the inter-layer residual stream:
+    ///
+    /// - `residual_in = None` embeds `inputs` (entry into the first layer);
+    ///   `Some(packed)` resumes a paused batch from its persisted residual.
+    /// - The returned [`WaveStep`] carries `residual: Some(_)` when the range
+    ///   stopped short of the last layer (persist + resume next wave), or
+    ///   `logits: Some(_)` (one row per sequence) when it reached the head.
+    ///
+    /// The caller advances `SequenceState.offset` only when a prefill's residual
+    /// reaches the head — the tokens are not committed to the sequence until the
+    /// full stack has run.
+    fn forward_batched_layers(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq_indices: &[usize],
+        inputs: &[Tensor],
+        layer_start: usize,
+        layer_end: usize,
+        residual_in: Option<Tensor>,
+    ) -> Result<WaveStep>;
+
+    /// Co-batched continuous-fair-wave forward: run decode (q=1) + prefill (q=N) +
+    /// glue (q=G) rows through ONE forward (layer range `[layer_start, layer_end)`)
+    /// with the mixed attention dispatch and the single shared FFN/MoE
+    /// (`docs/continuous_fair_waves.md`). Glue rows are staged on the session via
+    /// `set_pending_glue` before the call, as for a plain glue forward.
+    ///
+    /// Returns a [`WaveStep`]: `residual` (persist + resume) when the range stops
+    /// short of the head, else `logits` for the **decode + prefill** rows only
+    /// (in `decode_seqs ++ prefill_seqs` order — glue rows carry no logits).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_wave(
+        &self,
+        session: &mut BatchedInferenceSession,
+        decode_seqs: &[usize],
+        decode_inputs: &[Tensor],
+        prefill_seqs: &[usize],
+        prefill_inputs: &[Tensor],
+        glue_seqs: &[usize],
+        glue_inputs: &[Tensor],
+        layer_start: usize,
+        layer_end: usize,
+        residual_in: Option<Tensor>,
+    ) -> Result<WaveStep>;
 
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
@@ -3008,6 +3069,236 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         }
 
         Ok(outputs)
+    }
+
+    fn forward_batched_layers(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq_indices: &[usize],
+        inputs: &[Tensor],
+        layer_start: usize,
+        layer_end: usize,
+        residual_in: Option<Tensor>,
+    ) -> Result<WaveStep> {
+        if inputs.len() != seq_indices.len() {
+            candle::bail!(
+                "Input count {} doesn't match sequence count {}",
+                inputs.len(),
+                seq_indices.len()
+            );
+        }
+        // Same generation guard + header build as `forward_batched`; the only
+        // differences are the layer range, the resumable residual, and that the
+        // head runs (logits) only when the range reaches the last layer.
+        let stager_generation = session.begin_stager_generation();
+        let max_input_len = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .max()
+            .unwrap_or(1);
+        let seq_offsets: Vec<usize> = seq_indices
+            .iter()
+            .map(|&i| session.sequence_offset(i).unwrap_or(0))
+            .collect();
+        let input_lens: Vec<usize> = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .collect();
+        #[cfg(feature = "cuda")]
+        let (_pm_guard, decode_headers) = if max_input_len == 1 {
+            let (pm_guard, buf, stride) =
+                session.build_decode_metadata(seq_indices, &stager_generation)?;
+            (pm_guard, DecodeHeaders::Decode { buf, stride })
+        } else {
+            let mut meta =
+                BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
+            if let Some(pending) = session.take_pending_glue() {
+                meta.glue = build_glue_meta(pending, &input_lens, self.device())?;
+            }
+            (None, DecodeHeaders::Prefill(meta))
+        };
+        #[cfg(not(feature = "cuda"))]
+        let decode_headers = if max_input_len == 1 {
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            }
+        } else {
+            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+                &seq_offsets,
+                &input_lens,
+                self.device(),
+            )?)
+        };
+
+        let mut caches_data = session.caches_for_sequences_mut(seq_indices);
+        let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(inputs.len());
+        for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
+            contexts.push(SequenceContext {
+                offset: *offset,
+                kv_caches: caches,
+                input_ids: &inputs[i],
+                input_len: input_lens[i],
+            });
+        }
+
+        // A resumed batch feeds its persisted residual back as the wave's `x`.
+        // Wave prefills are bounded (the rolling-window ingest context), so a
+        // single forward covers the batch — no `MAX_PREFILL_TOKENS` slicing here.
+        let x_in = residual_in
+            .map(|t| TensorCat::from_cat_tensor(t, 0))
+            .transpose()?;
+        let phase = self.forward_batch_layers(
+            &mut contexts,
+            &stager_generation,
+            decode_headers,
+            layer_start,
+            layer_end,
+            x_in,
+        )?;
+        let step = match phase {
+            WavePhase::Residual(x) => WaveStep {
+                residual: Some(x.to_tensor()),
+                logits: None,
+            },
+            WavePhase::Logits(l) => WaveStep {
+                residual: None,
+                logits: Some(l.into_vec()?),
+            },
+        };
+        if max_input_len > 1 && step.logits.is_some() {
+            let _ = session.compact_check()?;
+        }
+        Ok(step)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_wave(
+        &self,
+        session: &mut BatchedInferenceSession,
+        decode_seqs: &[usize],
+        decode_inputs: &[Tensor],
+        prefill_seqs: &[usize],
+        prefill_inputs: &[Tensor],
+        glue_seqs: &[usize],
+        glue_inputs: &[Tensor],
+        layer_start: usize,
+        layer_end: usize,
+        residual_in: Option<Tensor>,
+    ) -> Result<WaveStep> {
+        if decode_inputs.len() != decode_seqs.len()
+            || prefill_inputs.len() != prefill_seqs.len()
+            || glue_inputs.len() != glue_seqs.len()
+        {
+            candle::bail!("forward_wave: input/seq length mismatch");
+        }
+        let n_decode = decode_seqs.len();
+        let n_prefill = prefill_seqs.len();
+
+        let stager_generation = session.begin_stager_generation();
+
+        // Per-group offsets + query lengths.
+        let dev = self.device();
+        let seq_off = |ids: &[usize]| -> Vec<usize> {
+            ids.iter()
+                .map(|&i| session.sequence_offset(i).unwrap_or(0))
+                .collect()
+        };
+        let input_len = |ins: &[Tensor]| -> Vec<usize> {
+            ins.iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(1))
+                .collect()
+        };
+        let dec_off = seq_off(decode_seqs);
+        let pre_off = seq_off(prefill_seqs);
+        let glue_off = seq_off(glue_seqs);
+        let pre_lens = input_len(prefill_inputs);
+        let glue_lens = input_len(glue_inputs);
+        let _ = &dec_off;
+
+        // Build the three groups' attention headers. Decode gets its packed
+        // SlotHeader buffer; prefill/glue get ragged cu_seqlens; glue additionally
+        // carries the staged per-token scatter descriptors.
+        #[cfg(feature = "cuda")]
+        let (_pm_guard, decode_headers) = if n_decode > 0 {
+            let (pm_guard, buf, stride) =
+                session.build_decode_metadata(decode_seqs, &stager_generation)?;
+            (pm_guard, DecodeHeaders::Decode { buf, stride })
+        } else {
+            (
+                None,
+                DecodeHeaders::Decode {
+                    buf: None,
+                    stride: 0,
+                },
+            )
+        };
+        #[cfg(not(feature = "cuda"))]
+        let decode_headers = DecodeHeaders::Decode {
+            buf: None,
+            stride: 0,
+        };
+
+        let prefill_headers =
+            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(&pre_off, &pre_lens, dev)?);
+
+        let mut glue_meta = BatchedPrefillMeta::new_ragged(&glue_off, &glue_lens, dev)?;
+        #[cfg(feature = "cuda")]
+        if let Some(pending) = session.take_pending_glue() {
+            glue_meta.glue = build_glue_meta(pending, &glue_lens, dev)?;
+        }
+        let glue_headers = DecodeHeaders::Prefill(glue_meta);
+
+        // Assemble the combined context list in [decode | prefill | glue] order.
+        let mut all_seqs: Vec<usize> = Vec::with_capacity(n_decode + n_prefill + glue_seqs.len());
+        all_seqs.extend_from_slice(decode_seqs);
+        all_seqs.extend_from_slice(prefill_seqs);
+        all_seqs.extend_from_slice(glue_seqs);
+        let mut all_inputs: Vec<&Tensor> = Vec::with_capacity(all_seqs.len());
+        all_inputs.extend(decode_inputs.iter());
+        all_inputs.extend(prefill_inputs.iter());
+        all_inputs.extend(glue_inputs.iter());
+        let all_lens: Vec<usize> = all_inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .collect();
+
+        let mut caches_data = session.caches_for_sequences_mut(&all_seqs);
+        let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(all_seqs.len());
+        for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
+            contexts.push(SequenceContext {
+                offset: *offset,
+                kv_caches: caches,
+                input_ids: all_inputs[i],
+                input_len: all_lens[i],
+            });
+        }
+
+        let x_in = residual_in
+            .map(|t| TensorCat::from_cat_tensor(t, 0))
+            .transpose()?;
+        let phase = self.forward_wave_contexts(
+            &mut contexts,
+            n_decode,
+            n_prefill,
+            decode_headers,
+            prefill_headers,
+            glue_headers,
+            &stager_generation,
+            layer_start,
+            layer_end,
+            x_in,
+        )?;
+        Ok(match phase {
+            WavePhase::Residual(x) => WaveStep {
+                residual: Some(x.to_tensor()),
+                logits: None,
+            },
+            WavePhase::Logits(l) => WaveStep {
+                residual: None,
+                logits: Some(l.into_vec()?),
+            },
+        })
     }
 
     fn prune(&self) -> Result<()> {

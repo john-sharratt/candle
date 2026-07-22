@@ -1521,9 +1521,7 @@ impl ModelWeights {
                 Some(b) => (b as usize).min(total_expert_bytes),
                 None => {
                     const RESERVE_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GB
-                    let generous = free_vram
-                        .saturating_sub(RESERVE_BYTES)
-                        .max(free_vram / 2);
+                    let generous = free_vram.saturating_sub(RESERVE_BYTES).max(free_vram / 2);
                     generous.min(total_expert_bytes)
                 }
             };
@@ -2076,6 +2074,207 @@ mod tests {
         params.with_int8mode(int8mode).run(configs, load_model)?;
 
         Ok(())
+    }
+
+    /// Continuous-fair-wave equivalence gate (`docs/continuous_fair_waves.md`):
+    /// the co-batched `forward_wave` (decode + prefill through the mixed dispatch +
+    /// shared MoE) must produce the SAME logits as running decode and prefill as
+    /// separate forwards, and the re-entrant `forward_batched_layers` split sweep
+    /// must match a full sweep. GPU + a real model; ignored so it never runs in the
+    /// normal (fast) suite.
+    ///
+    /// Run with:
+    ///   cargo test -p candle-transformers --release --features cuda --lib \
+    ///     quantized_qwen3_moe::tests::wave_equivalence -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn wave_equivalence() -> Result<()> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            println!("⚠ wave_equivalence requires --features cuda");
+            Ok(())
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use crate::models::batch_test::test_helpers::hf_get;
+            use crate::models::batched_inference::{
+                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
+            };
+            use crate::models::batched_model::BatchedInference;
+
+            let device = match Device::new_cuda(0) {
+                Ok(d) => d,
+                Err(_) => {
+                    println!("skip: no CUDA device");
+                    return Ok(());
+                }
+            };
+            let model_path = hf_get(
+                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+                hf_hub::RepoType::Model,
+                "main",
+                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+            )
+            .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
+            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let inv_freq = raw
+                .rope_inv_freq()
+                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let mut session = model.create_batched_session(BatchedConfig::default())?;
+            let n = model.num_layers();
+
+            let mk = |t: &[u32]| -> Result<Tensor> { Tensor::new(t, &device)?.unsqueeze(0) };
+            // Cosine of two logit rows, robust to tiny per-kernel fp reordering.
+            let cos = |a: &Tensor, b: &Tensor| -> Result<f32> {
+                let a = a.flatten_all()?.to_dtype(DType::F32)?;
+                let b = b.flatten_all()?.to_dtype(DType::F32)?;
+                let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+                let na = (&a * &a)?.sum_all()?.to_scalar::<f32>()?.sqrt();
+                let nb = (&b * &b)?.sum_all()?.to_scalar::<f32>()?.sqrt();
+                Ok(dot / (na * nb + 1e-6))
+            };
+            // Prefill an identical `ctx` context into `s`, leaving offset at ctx.len().
+            let mut prep =
+                |session: &mut BatchedInferenceSession, s: usize, ctx: &[u32]| -> Result<()> {
+                    let _ = model.forward_batched(session, &[s], &[mk(ctx)?])?;
+                    session.advance_sequence(s, ctx.len())?;
+                    Ok(())
+                };
+
+            let ctx_d: Vec<u32> = (100..=115u32).collect();
+            let ctx_p: Vec<u32> = (200..=215u32).collect();
+            let dec_tok = [42u32];
+            let pre_tok = [51u32, 52, 53, 54, 55];
+
+            // ── Test 1: co-batch (forward_wave) == separate forwards ──────────
+            let d0 = session.create_sequence()?;
+            let d1 = session.create_sequence()?;
+            let p0 = session.create_sequence()?;
+            let p1 = session.create_sequence()?;
+            prep(&mut session, d0, &ctx_d)?;
+            prep(&mut session, d1, &ctx_d)?;
+            prep(&mut session, p0, &ctx_p)?;
+            prep(&mut session, p1, &ctx_p)?;
+
+            let sep_dec = model.forward_batched(&mut session, &[d0], &[mk(&dec_tok)?])?;
+            let sep_pre = model.forward_batched(&mut session, &[p0], &[mk(&pre_tok)?])?;
+            let wave = model
+                .forward_wave(
+                    &mut session,
+                    &[d1],
+                    &[mk(&dec_tok)?],
+                    &[p1],
+                    &[mk(&pre_tok)?],
+                    &[],
+                    &[],
+                    0,
+                    n,
+                    None,
+                )?
+                .logits
+                .expect("full-range wave must produce logits");
+            assert_eq!(wave.len(), 2, "wave logits = decode + prefill rows");
+            let c_dec = cos(&sep_dec[0], &wave[0])?;
+            let c_pre = cos(&sep_pre[0], &wave[1])?;
+            println!("forward_wave vs separate: decode cos={c_dec:.5} prefill cos={c_pre:.5}");
+            assert!(c_dec > 0.999, "decode logits diverged (cos={c_dec})");
+            assert!(c_pre > 0.999, "prefill logits diverged (cos={c_pre})");
+
+            // ── Test 2: re-entrant split sweep == full sweep ──────────────────
+            let a = session.create_sequence()?;
+            let b = session.create_sequence()?;
+            prep(&mut session, a, &ctx_p)?;
+            prep(&mut session, b, &ctx_p)?;
+            let full = model
+                .forward_batched_layers(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?
+                .logits
+                .expect("full sweep logits");
+            let k = n / 2;
+            let mid = model
+                .forward_batched_layers(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
+                .residual
+                .expect("paused sweep must return a residual");
+            let split = model
+                .forward_batched_layers(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?
+                .logits
+                .expect("resumed sweep logits");
+            let c_split = cos(&full[0], &split[0])?;
+            println!("split sweep [0,{k})+[{k},{n}) vs full: cos={c_split:.5}");
+            assert!(c_split > 0.999, "re-entrant sweep diverged (cos={c_split})");
+
+            // ── Test 3a: decode-only wave with D>1 (flat single decode group) ──
+            // Guards the mixed-dispatch fix: a >1-sequence decode wave packs flat
+            // [1,D,h] and must be reshaped to the decode kernel's [D,1,h] and
+            // routed by header type, not by dim(1). (D>1 wasn't covered by Test 1.)
+            let e0 = session.create_sequence()?;
+            let e1 = session.create_sequence()?;
+            let e2 = session.create_sequence()?;
+            let e3 = session.create_sequence()?;
+            for &s in &[e0, e1, e2, e3] {
+                prep(&mut session, s, &ctx_d)?;
+            }
+            let sep_d2 =
+                model.forward_batched(&mut session, &[e0, e1], &[mk(&dec_tok)?, mk(&dec_tok)?])?;
+            let wave_d2 = model
+                .forward_wave(
+                    &mut session,
+                    &[e2, e3],
+                    &[mk(&dec_tok)?, mk(&dec_tok)?],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    n,
+                    None,
+                )?
+                .logits
+                .expect("decode-only wave logits");
+            assert_eq!(wave_d2.len(), 2, "decode-only wave = 2 decode rows");
+            let c_d0 = cos(&sep_d2[0], &wave_d2[0])?;
+            let c_d1 = cos(&sep_d2[1], &wave_d2[1])?;
+            println!("multi-decode wave vs separate: cos={c_d0:.5},{c_d1:.5}");
+            assert!(c_d0 > 0.999 && c_d1 > 0.999, "multi-decode wave diverged");
+
+            // ── Test 3b: co-batch a 1-token PREFILL (routes by header, not shape) ──
+            // Guards that a Σq_len==1 prefill group takes the prefill kernel, not
+            // the decode kernel (dim(1)==1 would misroute it).
+            let g0 = session.create_sequence()?;
+            let g1 = session.create_sequence()?;
+            let dg = session.create_sequence()?;
+            let dg2 = session.create_sequence()?;
+            prep(&mut session, g0, &ctx_p)?;
+            prep(&mut session, g1, &ctx_p)?;
+            prep(&mut session, dg, &ctx_d)?;
+            prep(&mut session, dg2, &ctx_d)?;
+            let one_tok = [61u32];
+            let sep_dec1 = model.forward_batched(&mut session, &[dg], &[mk(&dec_tok)?])?;
+            let sep_pre1 = model.forward_batched(&mut session, &[g0], &[mk(&one_tok)?])?;
+            let wave_1 = model
+                .forward_wave(
+                    &mut session,
+                    &[dg2],
+                    &[mk(&dec_tok)?],
+                    &[g1],
+                    &[mk(&one_tok)?],
+                    &[],
+                    &[],
+                    0,
+                    n,
+                    None,
+                )?
+                .logits
+                .expect("co-batch wave logits");
+            assert_eq!(wave_1.len(), 2, "co-batch = decode + 1-token prefill");
+            let c_1d = cos(&sep_dec1[0], &wave_1[0])?;
+            let c_1p = cos(&sep_pre1[0], &wave_1[1])?;
+            println!("1-token-prefill co-batch vs separate: decode={c_1d:.5} prefill={c_1p:.5}");
+            assert!(c_1d > 0.999, "co-batch decode diverged (cos={c_1d})");
+            assert!(c_1p > 0.999, "1-token prefill misrouted (cos={c_1p})");
+
+            Ok(())
+        }
     }
 
     /// Capture a real MoE routing trace for offline predictor evaluation.

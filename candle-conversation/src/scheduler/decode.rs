@@ -245,12 +245,11 @@ impl Scheduler {
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
             .sum();
 
-        // Forward pass: all active sequences, 1 token each.
+        // Forward pass: all active sequences, 1 token each — co-batching the
+        // in-flight prefill cohort into decode's sweep at its active layer window
+        // (docs/continuous_fair_waves.md) so one expert load per layer serves both.
         let t_fwd = std::time::Instant::now();
-        let logits_vec = match self
-            .model
-            .forward_batched(&mut self.session, &seq_ids_raw, &inputs)
-        {
+        let logits_vec = match self.decode_forward_cobatched(&seq_ids_raw, &inputs) {
             Ok(l) => l,
             Err(e) => {
                 self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));

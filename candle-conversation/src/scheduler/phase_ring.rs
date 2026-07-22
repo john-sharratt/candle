@@ -39,7 +39,11 @@ pub fn snapshot_promotes() -> Vec<(String, u64)> {
     let Some(m) = PROMOTES.get() else {
         return Vec::new();
     };
-    m.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    m.lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
 }
 
 /// One scheduler phase within a wave. `as_str` is the stable key the GUI colors by.

@@ -2364,6 +2364,20 @@ pub(crate) struct Scheduler {
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
 
+    /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
+    /// packed inter-layer residual stream of the in-flight prefill batch, the next
+    /// layer it resumes at, and the sequences in the cohort. One cohort advances
+    /// in lockstep — held across waves so decode sweeps every layer between the
+    /// cohort's throttled layer advances, keeping the decode expert set hot.
+    /// `cursor == 0` with no residual means no cohort is in flight.
+    wave_prefill_residual: Option<Tensor>,
+    wave_prefill_cursor: usize,
+    wave_prefill_seqs: Vec<usize>,
+    /// Set once per decode quantum after the co-batched decode wave advances the
+    /// prefill cohort, so only the FIRST decode step of the quantum folds the
+    /// cohort in (one budget-sized layer advance per wave, not per decode step).
+    wave_cohort_advanced: bool,
+
     /// Cache of `SectionId` → symbolic `debug_name`, so the promote tracker's name
     /// lookup is O(1) after the first sighting (sections are stable).
     section_name_cache: HashMap<SectionId, String>,
@@ -2488,6 +2502,10 @@ impl Scheduler {
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
+            wave_prefill_residual: None,
+            wave_prefill_cursor: 0,
+            wave_prefill_seqs: Vec::new(),
+            wave_cohort_advanced: false,
             section_name_cache: HashMap::new(),
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
@@ -8666,6 +8684,61 @@ mod tests {
             _inputs: &[Tensor],
         ) -> candle::Result<Vec<Tensor>> {
             self.dummy_logits(seq_indices.len())
+        }
+
+        fn forward_batched_layers(
+            &self,
+            _session: &mut BatchedInferenceSession,
+            seq_indices: &[usize],
+            _inputs: &[Tensor],
+            _layer_start: usize,
+            layer_end: usize,
+            _residual_in: Option<Tensor>,
+        ) -> candle::Result<candle_transformers::models::batched_inference::WaveStep> {
+            use candle_transformers::models::batched_inference::WaveStep;
+            // One-layer dummy: a range that reaches the (single) final layer runs
+            // the head; otherwise it would hand back a residual — but with
+            // num_layers()==1 the only valid full range is [0,1), so emit logits.
+            if layer_end >= self.num_layers() {
+                Ok(WaveStep {
+                    residual: None,
+                    logits: Some(self.dummy_logits(seq_indices.len())?),
+                })
+            } else {
+                // A zero-width dummy residual placeholder (never exercised with 1 layer).
+                Ok(WaveStep {
+                    residual: Some(Tensor::zeros((1, 1, 1), DType::F32, &self.device)?),
+                    logits: None,
+                })
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            _session: &mut BatchedInferenceSession,
+            decode_seqs: &[usize],
+            _decode_inputs: &[Tensor],
+            prefill_seqs: &[usize],
+            _prefill_inputs: &[Tensor],
+            _glue_seqs: &[usize],
+            _glue_inputs: &[Tensor],
+            _layer_start: usize,
+            layer_end: usize,
+            _residual_in: Option<Tensor>,
+        ) -> candle::Result<candle_transformers::models::batched_inference::WaveStep> {
+            use candle_transformers::models::batched_inference::WaveStep;
+            if layer_end >= self.num_layers() {
+                Ok(WaveStep {
+                    residual: None,
+                    logits: Some(self.dummy_logits(decode_seqs.len() + prefill_seqs.len())?),
+                })
+            } else {
+                Ok(WaveStep {
+                    residual: Some(Tensor::zeros((1, 1, 1), DType::F32, &self.device)?),
+                    logits: None,
+                })
+            }
         }
 
         fn prune(&self) -> candle::Result<()> {

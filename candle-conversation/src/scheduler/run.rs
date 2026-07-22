@@ -23,7 +23,7 @@ impl Scheduler {
     /// excluded here so they never hold the loop in decode-first mode at the
     /// expense of dialogue prefills (both are off the critical path — a scope
     /// summary is background ingest work that co-batches opportunistically).
-    fn foreground_decode_width(&self) -> usize {
+    pub(super) fn foreground_decode_width(&self) -> usize {
         self.active_decodes
             .iter()
             .filter(|(_, s)| {
@@ -206,6 +206,12 @@ impl Scheduler {
             // 4. Always run all quanta each iteration; order by current width.
             // Summary decodes are excluded from the flip count so they never
             // hold the loop in decode-first mode at the expense of prefills.
+            // Fresh per wave: the prefill cohort is advanced ONCE — folded into the
+            // first co-batched decode step if decode runs and the window is at a
+            // sweep boundary, else by the interleaved prefill pass. The guard is
+            // reset here (before both quanta) so its meaning is per-wave regardless
+            // of the width-ordered dispatch below.
+            self.wave_cohort_advanced = false;
             let dw = self.foreground_decode_width();
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();
