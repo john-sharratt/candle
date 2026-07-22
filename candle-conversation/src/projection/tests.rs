@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{Content, GatherScope};
+use super::schema::{Content, DecodePriority, GatherScope};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
@@ -393,6 +393,64 @@ fn gather_scope_defaults_to_shared_and_parses_conversation() {
 fn unknown_layer_name_returns_none() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
     assert!(b.id_for_layer("nonexistent").is_none());
+}
+
+#[test]
+fn decode_priority_defaults_to_low_and_parses_normal_and_high() {
+    // Unset → Low.
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert_eq!(
+        b.layer(dialogue).unwrap().decode_priority,
+        DecodePriority::Low
+    );
+
+    // `normal` and `high` parse to their variants.
+    for (word, want) in [
+        ("normal", DecodePriority::Normal),
+        ("high", DecodePriority::High),
+        ("low", DecodePriority::Low),
+    ] {
+        let yaml = SIMPLE_YAML.replace(
+            "  - name: dialogue\n    window: 8000",
+            &format!("  - name: dialogue\n    decode_priority: {word}\n    window: 8000"),
+        );
+        let b = Builder::from_yaml(&yaml).unwrap();
+        let d = b.id_for_layer("dialogue").unwrap();
+        assert_eq!(
+            b.layer(d).unwrap().decode_priority,
+            want,
+            "decode_priority: {word}"
+        );
+    }
+}
+
+#[test]
+fn decode_priority_ratio_is_decode_tokens_per_prefill() {
+    // The airtime ratio R the continuous-fair-wave throttle keys on.
+    assert_eq!(DecodePriority::Low.ratio(), 1);
+    assert_eq!(DecodePriority::Normal.ratio(), 16);
+    assert_eq!(DecodePriority::High.ratio(), 64);
+    // Always >= 1 so a prefill can never be fully starved.
+    for p in [
+        DecodePriority::Low,
+        DecodePriority::Normal,
+        DecodePriority::High,
+    ] {
+        assert!(p.ratio() >= 1);
+    }
+}
+
+#[test]
+fn builder_fallback_dialogue_layer_is_high_priority() {
+    // The template-less fallback IS the dialogue layer, so it inherits the
+    // interactive priority even without a YAML declaration.
+    let b = Builder::for_plain_prompt("You are a helpful assistant.");
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert_eq!(
+        b.layer(dialogue).unwrap().decode_priority,
+        DecodePriority::High
+    );
 }
 
 #[test]

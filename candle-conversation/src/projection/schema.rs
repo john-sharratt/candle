@@ -770,6 +770,14 @@ pub enum GatherScope {
 /// just with a smaller pie to slice. The flex priorities on layers and
 /// groups still control the relative cuts; only the absolute size of the
 /// pie changes.
+///
+/// # Decode priority
+///
+/// `decode_priority` sets how strongly the continuous-fair-wave scheduler
+/// favours this layer's *decode* over a co-running background prefill — see
+/// `docs/continuous_fair_waves.md`. It is the decode-to-prefill airtime ratio
+/// `R`: the number of decode tokens produced for each prefill forward that
+/// completes. A conversation inherits its target layer's priority.
 #[derive(Debug, Clone)]
 pub struct LayerSchema {
     /// Crate-assigned id, used by [`super::ProjectionTarget::layer`].
@@ -808,6 +816,41 @@ pub struct LayerSchema {
     /// Gather-tree scoping for this layer's turns (`gather_scope:` in YAML).
     /// Default [`GatherScope::Shared`].
     pub gather_scope: GatherScope,
+    /// Continuous-fair-wave decode priority (`decode_priority:` in YAML).
+    /// Default [`DecodePriority::Low`]. The dialogue layer is `High`.
+    pub decode_priority: DecodePriority,
+}
+
+/// How strongly a layer's decode is favoured over a co-running background
+/// prefill in the continuous-fair-wave scheduler (`docs/continuous_fair_waves.md`).
+///
+/// The variant maps to the **decode-to-prefill airtime ratio** `R`
+/// ([`Self::ratio`]) — decode tokens produced per completed prefill forward.
+/// Higher priority ⇒ larger `R` ⇒ the prefill is throttled to creep further in
+/// the background while more decode tokens land, protecting interactive latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodePriority {
+    /// `R = 1`: prefill drains at full speed, least decode protection. Default —
+    /// the right choice for bulk-ingest / background layers.
+    #[default]
+    Low,
+    /// `R = 16`: prefill stretched ~16× while 16 decode tokens land.
+    Normal,
+    /// `R = 64`: prefill heavily throttled; decode latency maximally protected.
+    /// The dialogue layer.
+    High,
+}
+
+impl DecodePriority {
+    /// The decode-to-prefill airtime ratio `R`: how many decode tokens are
+    /// produced for each prefill forward that completes. Always `>= 1`.
+    pub fn ratio(self) -> u32 {
+        match self {
+            DecodePriority::Low => 1,
+            DecodePriority::Normal => 16,
+            DecodePriority::High => 64,
+        }
+    }
 }
 
 impl LayerSchema {

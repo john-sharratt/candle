@@ -66,10 +66,10 @@ use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, Content, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
-    LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
-    SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
-    TreeNode, TreeOption, TreeVariant, TurnSummary,
+    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, GroupSummary,
+    GroupSummaryStage, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection,
+    SectionSchema, SectionTree, SelectionDefault, SelectionRule, SystemPromptItem,
+    SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
 use crate::summary_tree::scope::Scope;
 
@@ -516,6 +516,11 @@ struct YamlLayer {
     /// (the dialogue layer).
     #[serde(default)]
     gather_scope: YamlGatherScope,
+    /// Continuous-fair-wave decode priority. `low` (default) → prefill drains at
+    /// full speed; `normal` / `high` throttle a co-running prefill so more decode
+    /// tokens land per completed prefill (the dialogue layer is `high`).
+    #[serde(default)]
+    decode_priority: YamlDecodePriority,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -524,6 +529,25 @@ enum YamlGatherScope {
     #[default]
     Shared,
     Conversation,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum YamlDecodePriority {
+    #[default]
+    Low,
+    Normal,
+    High,
+}
+
+impl From<YamlDecodePriority> for DecodePriority {
+    fn from(y: YamlDecodePriority) -> Self {
+        match y {
+            YamlDecodePriority::Low => DecodePriority::Low,
+            YamlDecodePriority::Normal => DecodePriority::Normal,
+            YamlDecodePriority::High => DecodePriority::High,
+        }
+    }
 }
 
 impl From<YamlGatherScope> for GatherScope {
@@ -783,6 +807,7 @@ fn build(
             groups,
             policy: layer_policy,
             gather_scope: yl.gather_scope.into(),
+            decode_priority: yl.decode_priority.into(),
         });
     }
 

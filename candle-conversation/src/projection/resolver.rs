@@ -1073,8 +1073,7 @@ impl Conversation {
                 let Some(StreamDecl::Turn(decl)) = &stream.decl else {
                     return (key, Ok(None));
                 };
-                let kv_bytes_total: u64 =
-                    stream.chunks.values().map(|loc| loc.payload_len).sum();
+                let kv_bytes_total: u64 = stream.chunks.values().map(|loc| loc.payload_len).sum();
                 let result = load_turn_into_hot(backings, device, &mut p, &substrate, decl, stager)
                     .map(|sealed| Some((sealed, kv_bytes_total)));
                 (key, result)
