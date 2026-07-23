@@ -59,8 +59,8 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
-    GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex,
-    TurnKey,
+    decode_events, GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
+    TurnIndex, TurnKey,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -102,6 +102,10 @@ use crate::turn_layout::TurnLayout;
 /// doesn't churn the whole gallery. `None` value = decoded to nothing (absent or
 /// empty window), cached so repeated misses don't re-parse.
 type SigCache = HashMap<StreamId, Option<Arc<Vec<WideQSig>>>>;
+
+/// Per-stream memo of a turn's self-referencing sub-window seam offsets (sorted,
+/// deduped). See [`Substrate::decoded_seams`].
+type SeamCache = HashMap<StreamId, Arc<Vec<usize>>>;
 
 #[derive(Debug, Default)]
 pub struct Substrate {
@@ -176,6 +180,12 @@ pub struct Substrate {
     /// per-stream on a blob write so one turn seal doesn't churn the whole
     /// gallery. See [`Self::decoded_wide_sig`].
     sig_cache: Mutex<SigCache>,
+
+    /// Interior-mutable per-stream memo of a turn's self-referencing sub-window
+    /// seam offsets, decoded from the (JSON) projection-events blob once per
+    /// session instead of re-parsing it on every belief scan. Invalidated
+    /// per-stream on an events-blob write. See [`Self::decoded_seams`].
+    seam_cache: Mutex<SeamCache>,
 
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
@@ -2429,6 +2439,44 @@ impl Substrate {
             .remove(&stream_id);
     }
 
+    /// A turn's self-referencing sub-window seam offsets (the `start_token`s of
+    /// its `self_reference` projection events), **sorted and deduped** — decoded
+    /// from the events JSON blob once per session and memoized, so the belief
+    /// scan reads them without re-parsing JSON for every gallery turn on every
+    /// reprojection. Returns an empty (shared) list when the stream has no events
+    /// or no self-referencing seams (the common case for a code-read scope, which
+    /// scores as one whole-turn window). See [`Self::score_belief_groups`].
+    pub fn decoded_seams(&self, stream_id: StreamId) -> Arc<Vec<usize>> {
+        {
+            let cache = self.seam_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(&stream_id) {
+                return hit.clone();
+            }
+        }
+        // Decode OUTSIDE the lock (mirrors `decoded_wide_sig`): a concurrent miss
+        // on the same stream just decodes twice — harmless, the value is identical.
+        let mut seams: Vec<usize> = self
+            .streams
+            .get(&stream_id)
+            .and_then(|e| e.projection_events.as_deref())
+            .map(decode_events)
+            .map(|evs| {
+                evs.iter()
+                    .filter(|e| e.self_reference)
+                    .map(|e| e.start_token as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        seams.sort_unstable();
+        seams.dedup();
+        let arc = Arc::new(seams);
+        self.seam_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(stream_id, arc.clone());
+        arc
+    }
+
     /// True iff the substrate has any record of `stream_id`.
     pub fn has_stream(&self, stream_id: StreamId) -> bool {
         self.streams.contains_key(&stream_id)
@@ -2881,6 +2929,12 @@ impl Substrate {
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
+                // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
+                // replay/apply after the seam cache warmed can't serve stale seams.
+                self.seam_cache
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&stream_id);
             }
             RecordType::WideQSig => {
                 // Opaque wide-Q window bytes (provenance::wide_sig), last-writer-wins
@@ -3629,6 +3683,12 @@ impl Substrate {
     /// and on redo-log replay.
     pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+        // Incremental invalidation: evict only this stream's decoded seams so a
+        // single seal doesn't force a full-gallery JSON re-parse on the next scan.
+        self.seam_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&stream_id);
     }
 
     /// The stored projection-event record payload for a turn, if any.

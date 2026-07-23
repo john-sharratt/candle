@@ -38,6 +38,10 @@ layers:
     groups:
       - id: clusters
         selection: { kind: top_k, k: 2 }
+system_prompt:
+  sections:
+    - id: sys
+      content: "sys"
 "#;
 
 /// A folded `WideQSig`: 12 heads (3 layer-groups × 4 kv-heads), head_dim 128 →
@@ -120,6 +124,86 @@ fn score_belief_groups_self_matches_the_probed_turn() {
     );
 }
 
+/// A coupled tool round-trip (a code-read scope) must be scored as ONE exchange:
+/// the call turn and its response turn share a single normalized score, so
+/// provenance selecting either half brings in the whole pair. Turn 0 is coupled
+/// to turn 1 (its response); a probe matching turn 0 must lift BOTH to the same
+/// score, above the uncoupled turn 2.
+#[test]
+fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
+    use candle_conversation::projection::TurnIndex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+
+    let builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    let timeline = candle_conversation::projection::TimelineId::from_raw(13).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+
+    // Turn 0 = the call (0xAAAA…), turn 1 = its response (0x5555…, the bitwise
+    // complement — so it does NOT self-match the probe on its own), turn 2 = an
+    // uncoupled turn (0xFFFF…).
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xFFFF_FFFF_FFFF_FFFFu64,
+    ];
+    for fill in fills {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec!["repo_map".to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        let stream_id = turn_stream_id(timeline.raw(), idx.0);
+        conv.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&[sig(fill)]))
+            .expect("persist sigs");
+    }
+    // Couple turn 0 → turn 1: they are the two halves of one round-trip.
+    conv.write().couple_turn(timeline, 0);
+
+    // Probe = the CALL turn's window. Its response (turn 1) is the complement, so
+    // pre-exchange it would score near zero; grouping must lift it to turn 0's.
+    let probe = vec![sig(fills[0])];
+    let mut scores = ProjectionScores::new();
+    let target = ProjectionTarget {
+        layer,
+        group,
+        timeline,
+    };
+    let candidates = conv.score_belief_groups(
+        &builder.schema().layers[0],
+        target,
+        &probe,
+        &mut scores,
+        false,
+    );
+
+    // Every member turn is still reported (both halves + the singleton).
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].1.len(), 3, "both halves + the uncoupled turn");
+
+    let s0 = scores.turn(timeline, TurnIndex(0));
+    let s1 = scores.turn(timeline, TurnIndex(1));
+    let s2 = scores.turn(timeline, TurnIndex(2));
+    assert_eq!(
+        s0, s1,
+        "the coupled call and response share one exchange score: s0={s0}, s1={s1}"
+    );
+    assert!(
+        s0 > s2 && s0 > 0.0,
+        "the matched exchange must outscore the uncoupled turn: s0={s0}, s2={s2}"
+    );
+}
+
 const TWO_LAYER_YAML: &str = r#"
 layers:
   - name: mem
@@ -164,6 +248,10 @@ layers:
     groups:
       - id: convo
         selection: { kind: conversation, recent: 4, historical_top_k: 8 }
+system_prompt:
+  sections:
+    - id: sys
+      content: "sys"
 "#;
 
 /// Regression: `score_beliefs` must score belief-driven turn groups in EVERY
