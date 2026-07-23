@@ -2237,9 +2237,11 @@ mod tests {
             println!("multi-decode wave vs separate: cos={c_d0:.5},{c_d1:.5}");
             assert!(c_d0 > 0.999 && c_d1 > 0.999, "multi-decode wave diverged");
 
-            // ── Test 3b: co-batch a 1-token PREFILL (routes by header, not shape) ──
-            // Guards that a Σq_len==1 prefill group takes the prefill kernel, not
-            // the decode kernel (dim(1)==1 would misroute it).
+            // ── Test 3b: co-batch a 1-token PREFILL ───────────────────────────
+            // A single-token prefill is operationally a decode; the wave routes it
+            // through the DECODE kernel (the canonical single-token path — the paged
+            // prefill kernel diverges for q_len==1), so it must match the separate
+            // 1-token forward, which `forward_batched` also decodes.
             let g0 = session.create_sequence()?;
             let g1 = session.create_sequence()?;
             let dg = session.create_sequence()?;
@@ -2272,6 +2274,79 @@ mod tests {
             println!("1-token-prefill co-batch vs separate: decode={c_1d:.5} prefill={c_1p:.5}");
             assert!(c_1d > 0.999, "co-batch decode diverged (cos={c_1d})");
             assert!(c_1p > 0.999, "1-token prefill misrouted (cos={c_1p})");
+
+            // ── Test 3c: a RAGGED forward_batched batch mixing a multi-token and a
+            // 1-token sequence. `max_input_len>1` would route the whole batch as a
+            // prefill, sending the 1-token row through the divergent prefill kernel;
+            // the mixed-batch delegation must route it through the decode kernel so
+            // each row matches its homogeneous single-sequence reference.
+            let r0 = session.create_sequence()?;
+            let r1 = session.create_sequence()?;
+            let r0s = session.create_sequence()?;
+            let r1s = session.create_sequence()?;
+            prep(&mut session, r0, &ctx_p)?;
+            prep(&mut session, r1, &ctx_d)?;
+            prep(&mut session, r0s, &ctx_p)?;
+            prep(&mut session, r1s, &ctx_d)?;
+            // References: each row run alone (r0s = multi-token prefill kernel, r1s
+            // = 1-token → decode kernel via `max_input_len==1`).
+            let ref_multi = model.forward_batched(&mut session, &[r0s], &[mk(&pre_tok)?])?;
+            let ref_one = model.forward_batched(&mut session, &[r1s], &[mk(&one_tok)?])?;
+            // Mixed ragged batch [5-token, 1-token] in ONE forward_batched call.
+            let mixed =
+                model.forward_batched(&mut session, &[r0, r1], &[mk(&pre_tok)?, mk(&one_tok)?])?;
+            assert_eq!(mixed.len(), 2, "ragged batch = one logit row per sequence");
+            let c_m = cos(&ref_multi[0], &mixed[0])?;
+            let c_s = cos(&ref_one[0], &mixed[1])?;
+            println!("ragged mixed-batch vs separate: multi={c_m:.5} single={c_s:.5}");
+            assert!(c_m > 0.999, "ragged multi-token row diverged (cos={c_m})");
+            assert!(c_s > 0.999, "ragged 1-token row misrouted (cos={c_s})");
+
+            // ── Test 3d: a MIXED cohort split across TWO layer windows. This is the
+            // re-entrant residual path with reclassification: single-token prefills
+            // are folded into the decode group, so the intermediate residual is in
+            // internal order and must be re-fed verbatim. A resume that mis-orders it
+            // would corrupt the whole cohort. Split-sweep logits must equal the
+            // full-sweep of the same mixed batch (and each row its solo reference).
+            let w0 = session.create_sequence()?;
+            let w1 = session.create_sequence()?;
+            prep(&mut session, w0, &ctx_p)?;
+            prep(&mut session, w1, &ctx_d)?;
+            let kk = n / 2;
+            let mixed_res = model
+                .forward_batched_layers(
+                    &mut session,
+                    &[w0, w1],
+                    &[mk(&pre_tok)?, mk(&one_tok)?],
+                    0,
+                    kk,
+                    None,
+                )?
+                .residual
+                .expect("paused mixed cohort must return a residual");
+            let mixed_split = model
+                .forward_batched_layers(
+                    &mut session,
+                    &[w0, w1],
+                    &[mk(&pre_tok)?, mk(&one_tok)?],
+                    kk,
+                    n,
+                    Some(mixed_res),
+                )?
+                .logits
+                .expect("resumed mixed cohort must produce logits");
+            assert_eq!(mixed_split.len(), 2, "split cohort = one logit row per seq");
+            let c_sm = cos(&ref_multi[0], &mixed_split[0])?;
+            let c_ss = cos(&ref_one[0], &mixed_split[1])?;
+            println!("mixed cohort split-sweep vs separate: multi={c_sm:.5} single={c_ss:.5}");
+            assert!(
+                c_sm > 0.999,
+                "split mixed multi-token row diverged (cos={c_sm})"
+            );
+            assert!(
+                c_ss > 0.999,
+                "split mixed 1-token row corrupted on resume (cos={c_ss})"
+            );
 
             Ok(())
         }

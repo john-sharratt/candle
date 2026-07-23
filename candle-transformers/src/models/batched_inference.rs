@@ -2948,6 +2948,40 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             );
         }
 
+        // A ragged batch that MIXES single- and multi-token sequences must route
+        // its 1-token rows through the DECODE kernel: the paged prefill kernel
+        // diverges from the canonical decode kernel for q_len==1 (GPU-verified),
+        // but this path routes the whole batch by `max_input_len`, so a lone
+        // 1-token member would ride the prefill kernel. Delegate the mixed case to
+        // the wave path, which splits single-token prefills into the decode group
+        // and restores order. Homogeneous batches (all-decode via `max_input_len==1`,
+        // or all-multi-token prefill) keep the direct path below (which also slices
+        // oversized prefills); mixed batches are caller-bounded like every other
+        // `forward_wave` caller.
+        {
+            let lens: Vec<usize> = inputs
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(1))
+                .collect();
+            if lens.iter().any(|&l| l == 1) && lens.iter().any(|&l| l > 1) {
+                let step = self.forward_wave(
+                    session,
+                    &[],
+                    &[],
+                    seq_indices,
+                    inputs,
+                    &[],
+                    &[],
+                    0,
+                    self.num_layers(),
+                    None,
+                )?;
+                return step.logits.ok_or_else(|| {
+                    candle::Error::Msg("forward_batched: wave delegation produced no logits".into())
+                });
+            }
+        }
+
         // Hold a generation guard for the entire forward pass.  This keeps
         // the pinned arena alive so all device-mapped pointers from
         // stager.submit() (used by quantization kernels) remain valid until
@@ -3087,6 +3121,29 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 seq_indices.len()
             );
         }
+        // A ragged batch mixing single- and multi-token sequences routes its
+        // 1-token rows through the DECODE kernel via the wave path (see
+        // `forward_batched` for why). Homogeneous batches keep the direct path.
+        {
+            let lens: Vec<usize> = inputs
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(1))
+                .collect();
+            if lens.iter().any(|&l| l == 1) && lens.iter().any(|&l| l > 1) {
+                return self.forward_wave(
+                    session,
+                    &[],
+                    &[],
+                    seq_indices,
+                    inputs,
+                    &[],
+                    &[],
+                    layer_start,
+                    layer_end,
+                    residual_in,
+                );
+            }
+        }
         // Same generation guard + header build as `forward_batched`; the only
         // differences are the layer range, the resumable residual, and that the
         // head runs (logits) only when the range reaches the last layer.
@@ -3192,8 +3249,8 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         {
             candle::bail!("forward_wave: input/seq length mismatch");
         }
-        let n_decode = decode_seqs.len();
-        let n_prefill = prefill_seqs.len();
+        let n_decode_in = decode_seqs.len();
+        let n_prefill_in = prefill_seqs.len();
 
         let stager_generation = session.begin_stager_generation();
 
@@ -3209,10 +3266,35 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 .map(|t| t.dims().get(1).copied().unwrap_or(1))
                 .collect()
         };
-        let dec_off = seq_off(decode_seqs);
-        let pre_off = seq_off(prefill_seqs);
+
+        // A single-token prefill is operationally a decode — one new token over a
+        // prefix — and the paged prefill kernel DIVERGES from the canonical decode
+        // kernel for `q_len == 1` (GPU-verified: cos ~0.94, argmax flips). Route
+        // every 1-token prefill row through the DECODE path (the correct
+        // single-token attention), keeping multi-token prefills on the prefill
+        // kernel. `single` / `multi` hold the original prefill indices of each
+        // class, so the caller's `[decode | prefill]` output order is restored by a
+        // stable inverse permutation at the end. `single` empty ⇒ no-op fast path.
+        let pre_lens_in = input_len(prefill_inputs);
+        let single: Vec<usize> = (0..n_prefill_in).filter(|&i| pre_lens_in[i] == 1).collect();
+        let multi: Vec<usize> = (0..n_prefill_in).filter(|&i| pre_lens_in[i] != 1).collect();
+
+        let mut proc_decode_seqs: Vec<usize> = decode_seqs.to_vec();
+        let mut proc_decode_inputs: Vec<Tensor> = decode_inputs.to_vec();
+        for &i in &single {
+            proc_decode_seqs.push(prefill_seqs[i]);
+            proc_decode_inputs.push(prefill_inputs[i].clone());
+        }
+        let proc_prefill_seqs: Vec<usize> = multi.iter().map(|&i| prefill_seqs[i]).collect();
+        let proc_prefill_inputs: Vec<Tensor> =
+            multi.iter().map(|&i| prefill_inputs[i].clone()).collect();
+        let n_decode = proc_decode_seqs.len();
+        let n_prefill = proc_prefill_seqs.len();
+
+        let dec_off = seq_off(&proc_decode_seqs);
+        let pre_off = seq_off(&proc_prefill_seqs);
         let glue_off = seq_off(glue_seqs);
-        let pre_lens = input_len(prefill_inputs);
+        let pre_lens = input_len(&proc_prefill_inputs);
         let glue_lens = input_len(glue_inputs);
         let _ = &dec_off;
 
@@ -3222,7 +3304,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         #[cfg(feature = "cuda")]
         let (_pm_guard, decode_headers) = if n_decode > 0 {
             let (pm_guard, buf, stride) =
-                session.build_decode_metadata(decode_seqs, &stager_generation)?;
+                session.build_decode_metadata(&proc_decode_seqs, &stager_generation)?;
             (pm_guard, DecodeHeaders::Decode { buf, stride })
         } else {
             (
@@ -3251,12 +3333,12 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
         // Assemble the combined context list in [decode | prefill | glue] order.
         let mut all_seqs: Vec<usize> = Vec::with_capacity(n_decode + n_prefill + glue_seqs.len());
-        all_seqs.extend_from_slice(decode_seqs);
-        all_seqs.extend_from_slice(prefill_seqs);
+        all_seqs.extend_from_slice(&proc_decode_seqs);
+        all_seqs.extend_from_slice(&proc_prefill_seqs);
         all_seqs.extend_from_slice(glue_seqs);
         let mut all_inputs: Vec<&Tensor> = Vec::with_capacity(all_seqs.len());
-        all_inputs.extend(decode_inputs.iter());
-        all_inputs.extend(prefill_inputs.iter());
+        all_inputs.extend(proc_decode_inputs.iter());
+        all_inputs.extend(proc_prefill_inputs.iter());
         all_inputs.extend(glue_inputs.iter());
         let all_lens: Vec<usize> = all_inputs
             .iter()
@@ -3289,15 +3371,51 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             layer_end,
             x_in,
         )?;
+        // Output ordering. The single-token prefills were folded into the decode
+        // group, so the internal row order is
+        // `[orig-decode | single-prefills | multi-prefills | glue]`.
+        //
+        // - Logits (final, head ran) are restored to the caller's
+        //   `[decode | prefill-in-caller-order]` so `pf_logits[k]` aligns with the
+        //   caller's `pf_seqs[k]`.
+        // - The intermediate residual is an OPAQUE continuation buffer, re-fed
+        //   verbatim on the next layer window. `forward_wave` re-partitions the same
+        //   `prefill_seqs` into the same internal order every wave, so leaving the
+        //   residual in internal order keeps output and resume-input aligned —
+        //   reordering it to caller order would desync the resume and silently
+        //   corrupt the cohort. The caller's `[decode | prefill]` split by its own
+        //   decode count still lands correctly: the singles sit in the prefill
+        //   section, immediately after the `n_decode_in` real decode rows.
         Ok(match phase {
             WavePhase::Residual(x) => WaveStep {
                 residual: Some(x.to_tensor()),
                 logits: None,
             },
-            WavePhase::Logits(l) => WaveStep {
-                residual: None,
-                logits: Some(l.into_vec()?),
-            },
+            WavePhase::Logits(l) => {
+                let lg = l.into_vec()?;
+                let out = if single.is_empty() {
+                    lg
+                } else {
+                    // Original-prefill index → its logit position (one per row).
+                    let mut pre_logit_idx = vec![0usize; n_prefill_in];
+                    for (r, &j) in single.iter().enumerate() {
+                        pre_logit_idx[j] = n_decode_in + r;
+                    }
+                    for (r, &j) in multi.iter().enumerate() {
+                        pre_logit_idx[j] = n_decode + r;
+                    }
+                    let mut o: Vec<Tensor> = Vec::with_capacity(lg.len());
+                    o.extend_from_slice(&lg[0..n_decode_in]);
+                    for j in 0..n_prefill_in {
+                        o.push(lg[pre_logit_idx[j]].clone());
+                    }
+                    o
+                };
+                WaveStep {
+                    residual: None,
+                    logits: Some(out),
+                }
+            }
         })
     }
 
