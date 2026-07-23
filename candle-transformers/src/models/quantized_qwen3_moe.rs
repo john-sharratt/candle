@@ -2352,6 +2352,116 @@ mod tests {
         }
     }
 
+    /// Per-op decode profiler: prefill a realistic context, then time N single-token
+    /// decode steps and dump the `snapshot_profiles` op breakdown so we can see where
+    /// the per-token forward spends its time (attention kernel vs qkv/o_proj vs the
+    /// MoE `fwd_routing_wait` host sync vs the expert path). Iterates in ~1 min so
+    /// it drives forward-latency optimization without the daemon's substrate reload.
+    ///
+    /// Run with the profiler enabled:
+    ///   cargo test -p candle-transformers --release --features cuda,profile --lib \
+    ///     quantized_qwen3_moe::tests::decode_profile -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn decode_profile() -> Result<()> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            println!("⚠ decode_profile requires --features cuda,profile");
+            Ok(())
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use crate::models::batch_test::test_helpers::hf_get;
+            use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
+            use crate::models::batched_model::BatchedInference;
+
+            let device = match Device::new_cuda(0) {
+                Ok(d) => d,
+                Err(_) => {
+                    println!("skip: no CUDA device");
+                    return Ok(());
+                }
+            };
+            let model_path = hf_get(
+                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+                hf_hub::RepoType::Model,
+                "main",
+                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+            )
+            .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
+            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let inv_freq = raw
+                .rope_inv_freq()
+                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let mut session = model.create_batched_session(BatchedConfig::default())?;
+            let mk = |t: &[u32]| -> Result<Tensor> { Tensor::new(t, &device)?.unsqueeze(0) };
+
+            // Batch-size sweep to expose scaling: decode B sequences per step for
+            // B in {1, 4, 16}. If the forward is launch-bound, ms/STEP barely grows
+            // with B (launches amortize) → ms/token drops ~B× → near-linear tok/s.
+            // Sub-linear tok/s ⇒ per-session (non-amortized) work dominates.
+            let ctx: Vec<u32> = (0..3000u32).map(|i| (i % 2900) + 100).collect();
+            let n_steps = 60usize;
+            let mut baseline_ms_step = 0.0f64;
+            for (bi, &batch) in [1usize, 4, 16].iter().enumerate() {
+                let seqs: Vec<usize> = (0..batch)
+                    .map(|_| session.create_sequence())
+                    .collect::<Result<_>>()?;
+                for &sq in &seqs {
+                    let _ = model.forward_batched(&mut session, &[sq], &[mk(&ctx)?])?;
+                    session.advance_sequence(sq, ctx.len())?;
+                }
+                let inputs =
+                    |t: u32| -> Result<Vec<Tensor>> { (0..batch).map(|_| mk(&[t])).collect() };
+                let mut tok = 42u32;
+                for _ in 0..6 {
+                    let _ = model.forward_batched(&mut session, &seqs, &inputs(tok)?)?;
+                    for &sq in &seqs {
+                        session.advance_sequence(sq, 1)?;
+                    }
+                    tok = (tok + 1) % 2900 + 100;
+                }
+                let _ = model.snapshot_profiles();
+                let _ = crate::models::profile::pipeline_snapshot_and_reset();
+                let t0 = std::time::Instant::now();
+                for _ in 0..n_steps {
+                    let _ = model.forward_batched(&mut session, &seqs, &inputs(tok)?)?;
+                    for &sq in &seqs {
+                        session.advance_sequence(sq, 1)?;
+                    }
+                    tok = (tok + 1) % 2900 + 100;
+                }
+                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let ms_step = total_ms / n_steps as f64;
+                let ms_tok = ms_step / batch as f64;
+                let tok_s = 1000.0 / ms_tok;
+                if bi == 0 {
+                    baseline_ms_step = ms_step;
+                }
+                let scale = if bi == 0 {
+                    1.0
+                } else {
+                    (1000.0 / ms_tok) / (1000.0 / (baseline_ms_step)) // tok/s vs B=1 tok/s
+                };
+                println!(
+                    "B={batch:2}: {ms_step:6.2} ms/step | {ms_tok:5.2} ms/token | {tok_s:7.0} tok/s | scale×{scale:.1} (ideal ×{batch})"
+                );
+                // Per-op breakdown only for B=1 (needs --features profile).
+                if bi == 0 {
+                    let mut snap = model.snapshot_profiles();
+                    snap.merge(&crate::models::profile::pipeline_snapshot_and_reset());
+                    let mut rows = snap.entries.clone();
+                    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for (name, ms, cnt) in rows.iter().take(8) {
+                        println!("    {name:24} {:6.3} ms/tok  x{cnt}", ms / n_steps as f64);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// Capture a real MoE routing trace for offline predictor evaluation.
     ///
     /// Runs a single BF16×1 StoryRewrite generation against Qwen3-30B-A3B with
