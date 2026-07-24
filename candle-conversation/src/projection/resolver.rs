@@ -14,6 +14,7 @@ use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::{decode_wide_sigs, score_slots_weighted, WideQSig};
+use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnPartWrite,
@@ -1852,13 +1853,30 @@ impl Conversation {
             (|| -> candle::Result<bool> {
                 // 2. Relocation I/O under the persistence lock ONLY — the
                 //    substrate lock is released, so decode's in-RAM projection
-                //    proceeds during the read + re-append + fsync.
+                //    proceeds during the read + re-append + fsync. BUT the
+                //    scheduler thread's seal writes DO share this persistence lock,
+                //    so they block for the whole relocation — an off-thread stall
+                //    the scheduler can't time itself. Record the I/O wall-clock into
+                //    the scheduler's Sync bucket so a multi-second compaction shows
+                //    as Sync (a persistence wait) rather than unattributed Blocked,
+                //    and log it so the op's cost is visible on its own line.
+                let t_exec = std::time::Instant::now();
                 let result = {
                     let mut p = self.persistence.lock().unwrap();
                     p.execute_maintenance(&plan).map_err(|e| {
                         candle::Error::Msg(format!("substrate maintenance exec: {e}"))
                     })?
                 };
+                let exec_ms = t_exec.elapsed().as_millis() as u64;
+                note_persistence_maint_us(t_exec.elapsed().as_micros() as u64);
+                if exec_ms > 200 {
+                    tracing::info!(
+                        target: "candle_conversation::persistence::maintenance",
+                        exec_ms,
+                        "segment-maintenance relocation I/O held the persistence lock \
+                         (scheduler seal writes block for this duration → Sync phase)"
+                    );
+                }
                 // 3. Repoint the index at the relocated records under a brief write lock.
                 {
                     let mut substrate = self.write();

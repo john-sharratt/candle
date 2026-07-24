@@ -568,6 +568,13 @@ static PROV_ASSEMBLE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// band instead of hiding inside decode/prefill or the opaque "blocked" remainder.
 static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Persistence-maintenance stall (µs): a segment compaction on the persistence
+/// thread holds the persistence lock while the scheduler thread's seal writes
+/// block on it. Kept SEPARATE from [`WAIT_US`] because it is a pure off-thread
+/// *blocked* wait: it must carve only from the `blocked` remainder, never spill
+/// into decode/prefill/section the way an on-thread GPU sync legitimately can.
+static MAINT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Reprojection sub-phase timers (µs), swapped into the projection-decomposition
 /// panel each wave: `scan` = probe-extract + belief scan (provenance re-selection),
 /// `glue` = the shared gap-fill forward (boundary-seam tokens), `layout` = view
@@ -608,6 +615,18 @@ fn timed_synchronize(device: &Device) {
         t.elapsed().as_micros() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// Record a persistence-side stall into [`MAINT_US`] from another module (the
+/// segment-compaction I/O in `projection::resolver` holds the persistence lock
+/// while the scheduler thread's seal writes block on it — an off-thread wait the
+/// scheduler can't time itself). Surfaces as the Sync phase, but carved
+/// **blocked-only** in `push_phase_window`: the wall-clock added here is off-thread
+/// blocked time, so if it exceeds this window's real `blocked` remainder the excess
+/// is dropped rather than wrongly shrinking decode/prefill/section (which would
+/// inflate their tok/s).
+pub(crate) fn note_persistence_maint_us(us: u64) {
+    MAINT_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Run a blocking wait (e.g. `flush_blocking`) and add its wall-clock to
@@ -1599,6 +1618,10 @@ struct WaveStats {
     /// swapped in at flush). Carved out of the compute phases + blocked so a
     /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
     wait_ms: u64,
+    /// Persistence-maintenance stall this window ([`MAINT_US`], swapped in at
+    /// flush) — a segment compaction blocking the scheduler's seal writes. Folded
+    /// into the Sync band but carved blocked-only (never spills into compute).
+    maint_ms: u64,
     /// Drain sub-timers (ms) + prefilled tokens, swapped from the `DRAIN_*` atoms.
     /// `prefill` (time + tokens) is re-attributed OUT of the Projection/drain band
     /// INTO the Prefill phase so the ingest prefill shows real throughput; `elevate`
@@ -1631,6 +1654,7 @@ impl WaveStats {
             evict_ms: 0,
             idle_ms: 0,
             wait_ms: 0,
+            maint_ms: 0,
             drain_prefill_ms: 0,
             drain_prefill_tokens: 0,
             drain_elevate_ms: 0,
@@ -1688,8 +1712,10 @@ impl WaveStats {
         // attribution for that iteration is complete.
     }
 
-    /// Record one section-ingest forward (startup code-read / repo-map prefill).
-    /// Kept separate so the section phase isn't invisible behind `section_ms`.
+    /// Record one co-batched section-ingest advance (its own throughput channel so
+    /// the section panel isn't invisible behind decode). `fwd_ms` is the shared
+    /// co-batch wave-step time — sections ride decode's sweep, so this reflects the
+    /// concurrent throughput, not a serial section forward.
     fn record_section(&mut self, n_seqs: usize, n_tokens: usize, kv_len: usize, fwd_ms: u64) {
         let ch = &mut self.section;
         ch.fwds += 1;
@@ -1841,6 +1867,7 @@ impl WaveStats {
         // plus the drain sub-timers (prefill re-attributed to Prefill; elevate/glue
         // decompose the drain).
         self.wait_ms = WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
+        self.maint_ms = MAINT_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
         self.drain_prefill_ms =
             DRAIN_PREFILL_US.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000;
         self.drain_prefill_tokens =
@@ -1913,6 +1940,7 @@ impl WaveStats {
         self.evict_ms = 0;
         self.idle_ms = 0;
         self.wait_ms = 0;
+        self.maint_ms = 0;
         self.drain_prefill_ms = 0;
         self.drain_prefill_tokens = 0;
         self.drain_elevate_ms = 0;
@@ -1949,8 +1977,21 @@ impl WaveStats {
         let drain_prefill = self.drain_prefill_ms.min(self.drain_ms);
         let proj_dur = self.drain_ms.saturating_sub(drain_prefill) + self.reproj_ms;
         let mut decode_dur = self.decode_ms.saturating_sub(self.reproj_ms);
-        let mut prefill_dur = self.prefill_ms + drain_prefill;
-        let mut section_dur = self.section_ms;
+        // Continuous-fair-wave co-batching folds the prefill cohort and section
+        // chunks INTO the decode quantum — one shared forward per wave — so their
+        // PHASE wall-clock (`prefill_ms`/`section_ms`) is ~0; the time lives in
+        // `decode_ms`. The panel derives each phase's tok/s as `tok / dur`, so a
+        // per-phase duration of 0 renders prefill as an invisible zero-width bar,
+        // while stealing time from `decode_dur` to give prefill a slice inflates the
+        // decode rate (fewer ms for the same decode tokens). Instead give prefill
+        // and section their OWN co-batched forward time — the channel `ms_sum`
+        // recorded per wave in `decode_forward_cobatched` — as the display duration.
+        // These overlap the decode quantum (they ran concurrently inside it), which
+        // the stacked timeline normalizes to its own sum; the win is that `tok / dur`
+        // yields each class's real CONCURRENT rate, and decode keeps its full
+        // duration so its rate stays truthful.
+        let mut prefill_dur = self.prefill.ms_sum.max(self.prefill_ms) + drain_prefill;
+        let mut section_dur = self.section.ms_sum.max(self.section_ms);
         let alloc_dur = self.promote_ms;
         let accounted =
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
@@ -1970,7 +2011,7 @@ impl WaveStats {
         // quanta (relief mid-decode/prefill) → carve blocked first, then the
         // compute quanta, so a multi-second stall reads as Sync rather than
         // inflating decode/prefill or hiding in blocked.
-        let sync_dur = carve_ms(
+        let mut sync_dur = carve_ms(
             self.wait_ms,
             &mut [
                 &mut blocked_dur,
@@ -1979,6 +2020,12 @@ impl WaveStats {
                 &mut section_dur,
             ],
         );
+        // Persistence-maintenance stall (a segment compaction blocking seal writes)
+        // is off-thread blocked time, so it carves ONLY from the blocked remainder
+        // — never spilling into decode/prefill/section like an on-thread GPU sync
+        // can. Any excess over this window's blocked is dropped rather than wrongly
+        // shrinking a compute phase's duration (which would inflate its tok/s).
+        sync_dur += carve_ms(self.maint_ms, &mut [&mut blocked_dur]);
         // Idle (loop blocked on `rx.recv()` with no work) is unaccounted time, so
         // it sits in the blocked remainder — carve it out so a scheduler sitting
         // idle between requests reads as Idle, not Blocked. What's left in
@@ -5916,27 +5963,6 @@ impl Scheduler {
         r
     }
 
-    /// Fire all gap-fills deferred during a submission drain as ONE batched
-    /// forward, then clear the queue. Called at drain end, BEFORE the compute
-    /// phases that read the glue K/V. No-op when nothing was deferred.
-    fn flush_deferred_glue_fires(&mut self) -> Result<(), ConversationError> {
-        if self.deferred_glue_fires.is_empty() {
-            return Ok(());
-        }
-        let plans = std::mem::take(&mut self.deferred_glue_fires);
-        let t_glue = std::time::Instant::now();
-        let r = projection_assembler::fire_deferred_gap_fills(
-            &mut self.session,
-            &*self.model,
-            &self.device,
-            &plans,
-        );
-        DRAIN_GLUE_US.fetch_add(
-            t_glue.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        r
-    }
 
     /// Build phase of [`Self::apply_projection`] for the cross-conversation wave:
     /// inject the sealed prefix + collect the glue descriptor, but do NOT fire

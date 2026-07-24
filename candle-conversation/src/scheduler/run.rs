@@ -4,13 +4,13 @@ use std::time::Instant;
 
 /// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
 const DECODE_BUDGET: usize = 32;
-/// Maximum prefill passes per prefill quantum.
-const PREFILL_BUDGET: usize = 1;
 
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
-    /// Used as the "is there decode work to run" guard.
-    fn decode_width(&self) -> usize {
+    /// Used as the "is there decode work to run" guard — and by the decode-less
+    /// creep in `run_prefill_until_budget` to skip its standalone advance when the
+    /// decode quantum will co-batch the cohort instead.
+    pub(super) fn decode_width(&self) -> usize {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
@@ -90,40 +90,53 @@ impl Scheduler {
         }
     }
 
-    /// Run prefill passes until the budget is reached or prefill is empty.
+    /// Advance the continuous-fair-wave prefill cohort — ONLY via the co-batched
+    /// wave step (`decode_forward_cobatched`), never a separate serial forward.
+    ///
+    /// - If the decode quantum already advanced the cohort this wave
+    ///   (`wave_cohort_advanced`), nothing to do.
+    /// - If ANY decode is active, the decode quantum folds the cohort into its
+    ///   sweep (one shared expert load per layer) — so skip here even though the
+    ///   wave loop may have run this pass first (width ordering). Running the
+    ///   cohort standalone now would split decode and the cohort into two
+    ///   sequential forwards, the exact thing continuous-fair-waves removes.
+    /// - Only when there is NO decode to fold into do we advance the creep here,
+    ///   by running the SAME wave step with an empty decode group — a decode-less
+    ///   sweep through `decode_forward_cobatched`, not a distinct serial path. That
+    ///   step folds every no-decode class of work: dialogue prefills, section
+    ///   chunks (`build_section_batch`) and deferred glue (`take_wave_glue`), so it
+    ///   fires whenever any of the three has pending work.
     fn run_prefill_until_budget(&mut self) {
-        for _ in 0..PREFILL_BUDGET {
-            if self.prefill_width() == 0 {
-                return;
-            }
-            self.run_one_prefill_pass();
-            self.promote_finished_prefills_to_decodes();
+        if self.wave_cohort_advanced || self.decode_width() > 0 {
+            return;
+        }
+        if self.prefill_width() == 0
+            && self.section_ingest_width() == 0
+            && self.deferred_glue_fires.is_empty()
+        {
+            return;
+        }
+        if let Err(e) = self.decode_forward_cobatched(&[], &[]) {
+            tracing::error!("decode-less wave step failed: {e}");
         }
     }
 
-    /// Run section ingest chunks until the budget is reached or all ingests
-    /// are done. Uses the same PREFILL_BUDGET constant so section ingests and
-    /// turn prefills each get one chunk per loop iteration.
-    ///
-    /// `finalize_done_section_ingests` runs every iteration regardless of pending
-    /// width: a chunk co-batched into the decode wave (`wave_section_advanced`)
-    /// advances the section there, so a section it *completed* must still seal here
-    /// even though `run_one_section_ingest_chunk` is now a no-op. `build_section_batch`
-    /// / `run_one_section_ingest_chunk` self-guard on empty + already-advanced, so
-    /// the no-work case is cheap.
+    /// Seal completed section ingests. Section chunks are advanced ONLY by the
+    /// unified wave step (`decode_forward_cobatched`) — co-batched into decode's
+    /// sweep when decode is active, else folded into the decode-less sweep by
+    /// `run_prefill_until_budget`. This quantum only drains the sections that step
+    /// *completed* so they seal + send their `SealResult`. Cheap when none are done.
     fn run_section_ingest_until_budget(&mut self) {
-        for _ in 0..PREFILL_BUDGET {
-            self.run_one_section_ingest_chunk();
-            self.finalize_done_section_ingests();
-        }
+        self.finalize_done_section_ingests();
     }
 
     /// Main scheduler loop. Runs on the scheduler thread until shutdown.
     ///
-    /// Each iteration runs one prefill quantum (PREFILL_BUDGET passes) and
-    /// one decode quantum (DECODE_BUDGET steps). The wider phase runs first
-    /// so freshly-arrived prefills don't have to wait an entire decode
-    /// budget when there's no decode work yet.
+    /// Each iteration runs the unified wave step: decode (up to DECODE_BUDGET
+    /// steps) co-batches the creeping prefill/section cohort and deferred glue into
+    /// its sweep, and when no decode is active the same step advances the creep on
+    /// its own. The wider phase is dispatched first so freshly-arrived prefills
+    /// don't wait a whole decode budget when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
         // One-time snapshot of the governor's budget partition (capacity C, KV
@@ -145,12 +158,12 @@ impl Scheduler {
             IN_DRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
             self.batch_drain_gap_fills = true;
             let cont = self.drain_submissions();
-            // Fire the drain's deferred gap-fills as ONE forward (amortising the
-            // per-forward GPU launch floor across the whole drain) BEFORE the compute
-            // phases read the glue K/V.
-            if let Err(e) = self.flush_deferred_glue_fires() {
-                tracing::error!("deferred drain gap-fill batch failed: {e}");
-            }
+            // The drain's deferred gap-fills are NOT fired here. They are a pure
+            // K/V scatter whose ingest content prefills through a separate unit
+            // later, so the unified wave step consumes them (`take_wave_glue`) and
+            // co-batches the scatter into decode's sweep as a full-sweep member —
+            // one forward instead of a separate drain launch. See
+            // `decode_forward_cobatched`.
             self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
             self.wave_stats
@@ -185,11 +198,14 @@ impl Scheduler {
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
 
-            // 3. If idle, block waiting for work.
+            // 3. If idle, block waiting for work. Deferred glue counts as work: the
+            // unified wave step scatters it (`take_wave_glue`), so don't block while
+            // any is pending or it would never be consumed.
             if self.active_decodes.is_empty()
                 && self.active_prefills.is_empty()
                 && self.prefill_queue.is_empty()
                 && self.active_section_ingests.is_empty()
+                && self.deferred_glue_fires.is_empty()
             {
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
@@ -233,6 +249,17 @@ impl Scheduler {
                 self.timed_section();
                 self.timed_decode();
             }
+
+            // Drain prefills that reached the head this wave — whether they finished
+            // inside the co-batched DECODE sweep (`decode_width() > 0`) or the
+            // decode-less prefill sweep. This MUST run every wave, unconditionally:
+            // a finished prefill has `offset == tokens.len()` so it drops out of
+            // `prefill_width()`, and gating the drain behind the prefill quantum's
+            // early-returns (decode active, or `prefill_width() == 0` once the last
+            // in-flight prefill completes) strands finished prefills in
+            // `active_prefills` — blocking new admissions and stalling ingest with
+            // "no forwards". Idempotent and cheap when nothing finished.
+            self.promote_finished_prefills_to_decodes();
 
             // AIMD reopen (non-ingest): if a prior pressure episode narrowed the
             // admission window, probe it back open by one slot per loop once VRAM
@@ -356,6 +383,28 @@ impl Scheduler {
                 // pass run uncontended. Fires only well above the throttle
                 // target; no-op otherwise.
                 self.sync_if_backlog_critical();
+            }
+
+            // Livelock guard. If this wave had NO runnable forward work of any class,
+            // yet the idle `recv` above did not block (some queue is non-empty), then
+            // work exists that this thread cannot clear by spinning. During ingest a
+            // hot→warm backlog clamps `admit_window` to zero (`regulate_ingest_admission`),
+            // so queued prefills/sections can't be admitted and every width reads 0.
+            // Busy-spinning here burns a core AND continuously re-takes the conversation
+            // read lock, starving the persistence thread's install-warm WRITE lock — so
+            // the backlog can never drain, the gate never reopens, and the spin never
+            // ends. That is the observed deadlock: wave stuck 100% "blocked", backlog
+            // frozen, no hot→warm pass completing. A short sleep yields the uncontended
+            // lock window the drain needs and re-checks admission on the next wave;
+            // fresh submissions are still picked up by `drain_submissions` at the top.
+            // (On win32 the 2ms rounds up to the ~15ms scheduler timer granularity —
+            // ~60 Hz re-check, still far below a busy-spin, which is the point.)
+            if self.decode_width() == 0
+                && self.prefill_width() == 0
+                && self.section_ingest_width() == 0
+                && self.deferred_glue_fires.is_empty()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
 

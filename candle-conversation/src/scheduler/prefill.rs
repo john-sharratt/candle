@@ -2,6 +2,7 @@ use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
+use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 
 /// Default pool-budget headroom we keep free by offloading hot KV — see
@@ -1426,77 +1427,6 @@ impl Scheduler {
         }
     }
 
-    /// Run one prefill chunk across all active section ingests as a single
-    /// full-sweep forward, so collection members sharing the same prefix context
-    /// attend in parallel rather than serially. Skipped when the co-batched
-    /// decode wave already folded this wave's chunk into its sweep
-    /// (`wave_section_advanced`); `finalize_done_section_ingests` still runs.
-    pub(super) fn run_one_section_ingest_chunk(&mut self) {
-        // Co-batched into the decode wave's full sweep already this wave — one
-        // section chunk per wave, as the standalone pass also does.
-        if self.wave_section_advanced {
-            return;
-        }
-
-        // VRAM pressure gate (phase-d coverage): a wide multi-section ingest pins
-        // hot KV exactly like a prefill wave, so relieve before admitting the
-        // batch. Without this the section-ingest path could pin the card with no
-        // shedding — the only per-forward bound was the token cap.
-        if self.vram_under_pressure() {
-            self.relieve_vram_pressure("section", VramPhase::Load);
-        }
-
-        let Some((seq_ids, inputs, group_idxs, advances)) = self.build_section_batch() else {
-            return;
-        };
-
-        let total_tokens: usize = advances.iter().sum();
-        tracing::debug!(
-            target: "sched",
-            "section_ingest batch={} tokens={} seq_ids={:?}",
-            seq_ids.len(),
-            total_tokens,
-            seq_ids
-        );
-
-        // Attended-KV length swept, summed over the batch, before the forward
-        // advances the sequences.
-        let kv_len: usize = seq_ids
-            .iter()
-            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
-            .sum();
-        let t_fwd = Instant::now();
-        let nl = self.model.num_layers().max(1);
-        if let Err(e) = self.model.forward_wave(
-            &mut self.session,
-            &[],
-            &[],
-            &seq_ids,
-            &inputs,
-            &[],
-            &[],
-            0,
-            nl,
-            None,
-        ) {
-            let msg = format!("batched section ingest forward failed: {e}");
-            for &i in &group_idxs {
-                self.active_section_ingests[i].error =
-                    Some(ConversationError::Channel(msg.clone()));
-            }
-            return;
-        }
-        // Section ingest batch = n_seqs sequences, Σ advances tokens (ragged).
-        let fwd_ms = t_fwd.elapsed().as_millis() as u64;
-        self.wave_stats
-            .record_section(seq_ids.len(), total_tokens, kv_len, fwd_ms);
-
-        self.complete_section_chunk(&group_idxs, &advances);
-        // Claim this wave's section chunk so the co-batched decode wave doesn't
-        // fold a second one — one chunk per wave, as the cohort creeps one window.
-        self.wave_section_advanced = true;
-    }
-
     /// Drain completed or errored section ingest entries. Errored entries send
     /// `Err`; finished entries call `finalize_section_ingest` (seal + write)
     /// and send the `SealResult`.
@@ -1528,98 +1458,6 @@ impl Scheduler {
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.
         }
-    }
-
-    /// Advance the in-flight continuous-fair-wave prefill cohort by one wave's
-    /// worth of layers ([`Self::wave_prefill_layer_budget`]).
-    ///
-    /// A cohort is a batch of prefills that flow through the transformer layers
-    /// together, in lockstep, over multiple waves — its inter-layer residual
-    /// stream is held on the scheduler between waves so decode sweeps every layer
-    /// in between. When the cohort reaches the final layer its sequences' offsets
-    /// are committed and their `final_logits` recorded; they are then promoted to
-    /// decode by `promote_finished_prefills_to_decodes`.
-    pub(super) fn run_one_prefill_pass(&mut self) {
-        // Skip only when the co-batched decode wave already advanced the cohort
-        // this wave (`decode_forward_cobatched` set the guard). Otherwise advance
-        // it here — as the interleaved path when decode co-batching was declined
-        // for a mid-sweep window, or as the sole path when no decode is active.
-        if self.wave_cohort_advanced {
-            return;
-        }
-        // Continuous-fair-wave prefill (`docs/continuous_fair_waves.md`): advance
-        // ONE prefill cohort by a bounded number of layers (the priority throttle),
-        // holding its inter-layer residual stream across waves so decode sweeps
-        // every layer in between and keeps its experts hot. The whole token set of
-        // each prefill flows through the layers gradually (the rolling-window
-        // ingest context bounds it) rather than being token-chunked through all
-        // layers at once.
-        let n_layers = self.model.num_layers().max(1);
-        let budget = self.wave_prefill_layer_budget();
-
-        // Form a fresh group (dialogue prefills only — no decode here to co-batch
-        // section against) or resume the held one. Members are resolved by seq id
-        // so promotion's `swap_remove` can't invalidate the group between waves.
-        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
-            self.form_wave_group(false);
-        }
-        let (members, seq_ids, inputs, prefill_gidxs) = self.build_wave_group_inputs();
-        if seq_ids.is_empty() {
-            self.reset_wave_prefill();
-            return;
-        }
-
-        let start = self.wave_prefill_cursor;
-        let end = (start + budget).min(n_layers);
-        let residual_in = self.wave_prefill_residual.take();
-        // Attended-KV length (prefix/context summed over the batch) — the group's
-        // sequences are NOT advanced until the head, so this is stable across the
-        // group's layer advances.
-        let kv_len: usize = seq_ids
-            .iter()
-            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
-            .sum();
-        let total_tokens: usize = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(0))
-            .sum();
-
-        let t_fwd = Instant::now();
-        let step = match self.model.forward_wave(
-            &mut self.session,
-            &[],
-            &[],
-            &seq_ids,
-            &inputs,
-            &[],
-            &[],
-            start,
-            end,
-            residual_in,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                self.fail_wave_group(&members, &prefill_gidxs, &e);
-                return;
-            }
-        };
-        let fwd_ms = t_fwd.elapsed().as_millis() as u64;
-        self.wave_stats
-            .record(true, seq_ids.len(), total_tokens, kv_len, fwd_ms);
-
-        if end < n_layers {
-            // Paused mid-stack: persist the residual and keep the group. Decode
-            // sweeps all layers before we resume here next wave.
-            self.wave_prefill_residual = step.residual;
-            self.wave_prefill_cursor = end;
-            self.wave_prefill_members = members;
-            return;
-        }
-
-        // Reached the head: the group's tokens are now fully processed through
-        // every layer. Promote prefills, advance+seal sections.
-        let logits = step.logits.unwrap_or_default();
-        self.complete_wave_group(&members, &logits);
     }
 
     /// Clear the in-flight continuous-fair-wave prefill group (residual, cursor,
@@ -1875,27 +1713,112 @@ impl Scheduler {
         self.reset_wave_prefill();
     }
 
-    /// Decode forward, **co-batching** the creeping prefill group into decode's
-    /// sweep (`docs/continuous_fair_waves.md`). One shared expert load per layer
-    /// serves every co-batched row — the whole point on the streaming box.
+    /// Consume this wave's deferred gap-fill plans into a co-batchable glue group
+    /// `(parent slot ids, glue-token input tensors, per-slot scatter descriptors)`.
     ///
-    /// The wave group is dialogue prefills plus (when they co-form) section-ingest
-    /// chunks; decode sweeps all `N` layers while the group shares the grouped GEMM
-    /// only in `[cursor, win_end)`, so the sweep splits into up to THREE segments
-    /// (`[0, cursor)` / `[cursor, win_end)` / `[win_end, N)`). The group's residual
-    /// is an OPAQUE internal-order buffer held **whole** across waves — the segment
-    /// split narrows only `[decode | group]` at `n_dec`, never *within* the group,
-    /// so `forward_wave`'s singles-before-multis internal reorder stays intact. At
-    /// the head, per-sequence logits ARE caller-ordered, so members separate
-    /// cleanly there: prefills promote to decode, sections advance + seal.
+    /// Deferred glue is ingest / compression gap-fill — a pure K/V scatter whose
+    /// content prefills through a *separate* unit later (`apply_segments`), so it
+    /// has no same-wave, same-slot consumer and can ride the wave as a full-sweep
+    /// member alongside decode rather than a separate drain forward. `mem::take`
+    /// consumes it once; later decode steps this wave see an empty queue. Returns
+    /// `None` when nothing was deferred (or every plan was empty).
+    fn take_wave_glue(&mut self) -> Option<(Vec<usize>, Vec<Tensor>, Vec<PendingGlue>)> {
+        if self.deferred_glue_fires.is_empty() {
+            return None;
+        }
+        let plans = std::mem::take(&mut self.deferred_glue_fires);
+        let mut ids: Vec<usize> = Vec::with_capacity(plans.len());
+        let mut inputs: Vec<Tensor> = Vec::with_capacity(plans.len());
+        let mut pending: Vec<PendingGlue> = Vec::with_capacity(plans.len());
+        for p in &plans {
+            if p.glue_tokens.is_empty() {
+                continue;
+            }
+            let input = match Tensor::new(p.glue_tokens.as_slice(), &self.device)
+                .and_then(|t| t.unsqueeze(0))
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("wave glue input build failed: {e}");
+                    continue;
+                }
+            };
+            ids.push(p.parent_id.0);
+            inputs.push(input);
+            pending.push(PendingGlue {
+                write_slice: p.glue_write_slice.clone(),
+                write_in_blk: p.glue_write_in_blk.clone(),
+                fwd_ahead: p.fwd_ahead.clone(),
+            });
+        }
+        if ids.is_empty() {
+            None
+        } else {
+            Some((ids, inputs, pending))
+        }
+    }
+
+    /// Assert the glue slots were only scattered into, never advanced — the glue
+    /// forward must leave `session.offset == backing length` for each slot. A
+    /// trailing-append advance would desync the offset the next prefill reads from
+    /// the backing's actual length; the symptom is an OOB panic deep in a later
+    /// prefill. Named here at the source (mirrors `fire_gap_fill_batch`).
+    fn assert_glue_no_advance(&self, ids: &[usize]) -> candle::Result<()> {
+        for &id in ids {
+            let session_off = self.session.sequence_offset(id).unwrap_or(0);
+            let backing_len = self
+                .session
+                .sequence_caches(id)
+                .map(|c| c.current_seq_len())
+                .unwrap_or(session_off);
+            if backing_len != session_off {
+                return Err(candle::Error::Msg(format!(
+                    "wave glue desynced slot {id}: session offset {session_off} != backing \
+                     length {backing_len}. The glue forward advanced the slot instead of only \
+                     scattering into pre-reserved gaps."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Concatenate the present residual parts along the token dim (1) in the given
+    /// caller order, skipping `None` parts. Returns `None` when all are absent.
+    fn cat_caller_residual(parts: &[Option<&Tensor>]) -> candle::Result<Option<Tensor>> {
+        let present: Vec<&Tensor> = parts.iter().filter_map(|p| *p).collect();
+        match present.len() {
+            0 => Ok(None),
+            1 => Ok(Some(present[0].clone())),
+            _ => Ok(Some(Tensor::cat(&present, 1)?)),
+        }
+    }
+
+    /// The unified continuous-fair-wave step (`docs/continuous_fair_waves.md`): ONE
+    /// forward folding every class of work through the shared grouped GEMM so one
+    /// expert load per layer serves them all — the whole point on the streaming box.
     ///
-    /// When NO group is forming (no dialogue prefill), a pending section chunk
-    /// co-batches directly instead: decode + section as one full-sweep `[0, N)`
-    /// forward (no residual to hold; logits `[decode | section]` split at `n_dec`).
-    /// This is the common ingest-while-decoding case.
+    /// Two kinds of member co-batch here:
+    /// - **Full-sweep** — decode (1 token/seq) and glue (deferred gap-fill scatter).
+    ///   Both traverse all `N` layers every wave.
+    /// - **Creep** — the wave group: dialogue prefills plus section-ingest chunks.
+    ///   The group shares the GEMM only in `[cursor, win_end)`, its inter-layer
+    ///   residual held across waves so the full-sweep members overtake it.
     ///
-    /// Only the first decode step of a quantum folds work in (guarded by
-    /// `wave_cohort_advanced` / `wave_section_advanced`); the rest are plain decode.
+    /// So the sweep splits into up to THREE segments — `[0, cursor)` and
+    /// `[win_end, N)` carry only the full-sweep members, `[cursor, win_end)` adds
+    /// the creep. `forward_wave` returns the residual in CALLER order
+    /// `[decode | creep | glue]`, so the segment boundaries split it by contiguous
+    /// group: the creep is held WHOLE, the full-sweep members `[decode | glue]`
+    /// continue. At the head, per-sequence logits are `[decode | creep]` (glue
+    /// logits, if present, trail and are discarded): prefills promote, sections seal.
+    ///
+    /// With no creep group, all members are full-sweep: one `[0, N)` forward folding
+    /// decode + a standalone section chunk + glue. The glue is a side effect only —
+    /// its logits discarded and it must not advance its slot (asserted after).
+    ///
+    /// Called per decode step; the cohort/section/glue fold in on the first step
+    /// (`wave_cohort_advanced` / `wave_section_advanced` guards, `take_wave_glue`
+    /// drains once), the rest are plain decode.
     pub(super) fn decode_forward_cobatched(
         &mut self,
         decode_seqs: &[usize],
@@ -1905,19 +1828,38 @@ impl Scheduler {
         let n_dec = decode_seqs.len();
         let none_seqs: [usize; 0] = [];
         let none_inputs: [Tensor; 0] = [];
+        // Wave-step wall-clock, shared across the co-batched classes so the prefill
+        // and section throughput panels reflect the CONCURRENT rate (they ride
+        // decode's sweep in one forward) rather than reading zero.
+        let t_wave = Instant::now();
+
+        // Fold this wave's deferred glue in as a full-sweep member co-batched with
+        // decode (see `take_wave_glue`).
+        let glue = self.take_wave_glue();
+        let (glue_seqs, glue_inputs): (&[usize], &[Tensor]) = match &glue {
+            Some((ids, ins, _)) => (ids.as_slice(), ins.as_slice()),
+            None => (&none_seqs, &none_inputs),
+        };
+        let glue_pending: Option<&Vec<PendingGlue>> = glue.as_ref().map(|(_, _, p)| p);
+        let has_glue = !glue_seqs.is_empty();
+        let glue_tok: usize = glue_inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
+        // A "full-sweep" wave carries decode and/or glue across all N layers; it
+        // drives segments 1 and 3. With neither, only the creep runs (seg 2).
+        let has_fullsweep = n_dec > 0 || has_glue;
 
         let budget = self.wave_prefill_layer_budget();
         let cursor = self.wave_prefill_cursor;
         let win_end = (cursor + budget).min(n);
 
-        // Form/resume the wave group unless it was already advanced this wave.
-        // Decode is present here, so a fresh group folds section chunks in to
-        // co-batch the creep (`form_wave_group(true)`).
+        // Form/resume the creep group (dialogue prefills + section chunks) unless it
+        // was already advanced this wave. A fresh group folds section chunks in to
+        // co-batch the creep (`form_wave_group(true)`), unless the standalone
+        // section pass already ran this wave (no decode present).
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
             if cursor == 0 && self.wave_prefill_residual.is_none() {
-                // Fold sections into the fresh group only if the standalone section
-                // pass hasn't already run this wave (section-first ordering) — else
-                // the same chunk would be admitted twice.
                 self.form_wave_group(!self.wave_section_advanced);
             }
             self.build_wave_group_inputs()
@@ -1925,8 +1867,10 @@ impl Scheduler {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
-        // No group to creep → co-batch a standalone section chunk with decode if
-        // one is pending (first decode step only), else plain decode.
+        // No creep group → one full-sweep [0, N) forward folding decode + a
+        // standalone section chunk (if pending) + glue. All full-sweep, no residual
+        // to hold; logits `[decode | section]` split at n_dec (glue logits, if any,
+        // trail and are discarded).
         if seq_ids.is_empty() {
             let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
                 if self.vram_under_pressure() {
@@ -1936,58 +1880,73 @@ impl Scheduler {
             } else {
                 None
             };
-            let Some((sec_seqs, sec_inputs, sec_gidx, sec_adv)) = section else {
-                // Plain decode full sweep (any held group residual stays for its
-                // own wave; this decode step folds nothing).
-                return self
-                    .model
-                    .forward_wave(
-                        &mut self.session,
-                        decode_seqs,
-                        decode_inputs,
-                        &none_seqs,
-                        &none_inputs,
-                        &none_seqs,
-                        &none_inputs,
-                        0,
-                        n,
-                        None,
-                    )
-                    .map(|s| s.logits.unwrap_or_default());
+            let (sec_seqs, sec_inputs, sec_gidx, sec_adv) = match section {
+                Some((s, i, g, a)) => (s, i, g, a),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             };
-            // Decode + section, one full-sweep [0, N) forward: section rides
-            // decode's whole sweep, no residual to hold. Logits are caller-ordered
-            // `[decode | section]`; section logits are unused (advance + seal).
-            self.wave_section_advanced = true;
+            if sec_seqs.is_empty() && !has_fullsweep {
+                // Nothing to run: no creep, no section, no decode, no glue.
+                return Ok(Vec::new());
+            }
+            if !sec_seqs.is_empty() {
+                self.wave_section_advanced = true;
+            }
+            if let Some(p) = glue_pending {
+                self.session.set_pending_glue(p.clone());
+            }
             let out = self.model.forward_wave(
                 &mut self.session,
                 decode_seqs,
                 decode_inputs,
                 &sec_seqs,
                 &sec_inputs,
-                &none_seqs,
-                &none_inputs,
+                glue_seqs,
+                glue_inputs,
                 0,
                 n,
                 None,
             )?;
+            if has_glue {
+                self.assert_glue_no_advance(glue_seqs)?;
+            }
             let logits = out.logits.unwrap_or_default();
             let d = n_dec.min(logits.len());
             let dec_logits = logits[..d].to_vec();
-            self.complete_section_chunk(&sec_gidx, &sec_adv);
+            if !sec_gidx.is_empty() {
+                // Attended-KV summed before `complete_section_chunk` advances the
+                // sequences. One record per co-batched section chunk.
+                let sec_kv: usize = sec_seqs
+                    .iter()
+                    .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+                    .sum();
+                self.wave_stats.record_section(
+                    sec_seqs.len(),
+                    sec_adv.iter().sum(),
+                    sec_kv,
+                    t_wave.elapsed().as_millis() as u64,
+                );
+                self.complete_section_chunk(&sec_gidx, &sec_adv);
+            }
             return Ok(dec_logits);
         }
 
-        // Co-batch decode (all N) + the creeping group ([cursor, win_end)). The
-        // sweep splits into up to three segments; the group rides only the middle,
-        // its residual held WHOLE between waves (opaque internal order). Section
-        // members already sit inside `members` — they creep with the group; the
-        // held residual is never split within the group, so the internal reorder
-        // is preserved.
+        // Creep group present. Full-sweep members (decode + glue) ride all N layers;
+        // the creep rides only [cursor, win_end), its residual held WHOLE between
+        // waves. The residual crosses `forward_wave` in caller order
+        // `[decode | creep | glue]`, split by contiguous group at the boundaries.
         self.wave_cohort_advanced = true;
+        let creep_tok: usize = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
 
-        // Segment 1 — decode-only [0, cursor).
-        let dec_res: Option<Tensor> = if cursor > 0 {
+        // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
+        // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
+        // from its held residual at `cursor`. Yields caller order `[decode | glue]`.
+        let seg1_res: Option<Tensor> = if cursor > 0 && has_fullsweep {
+            if let Some(p) = glue_pending {
+                self.session.set_pending_glue(p.clone());
+            }
             self.model
                 .forward_wave(
                     &mut self.session,
@@ -1995,8 +1954,8 @@ impl Scheduler {
                     decode_inputs,
                     &none_seqs,
                     &none_inputs,
-                    &none_seqs,
-                    &none_inputs,
+                    glue_seqs,
+                    glue_inputs,
                     0,
                     cursor,
                     None,
@@ -2005,78 +1964,155 @@ impl Scheduler {
         } else {
             None
         };
-
-        // Segment 2 — co-batch decode + group over [cursor, win_end). Resume each
-        // from its layer-`cursor` residual (concatenated `[decode | group]`); at
-        // cursor 0 both embed fresh (residual None).
-        let pf_res = self.wave_prefill_residual.take();
-        let seg2_in: Option<Tensor> = match (dec_res.as_ref(), pf_res.as_ref()) {
-            (Some(d), Some(p)) => Some(Tensor::cat(&[d, p], 1)?),
-            (Some(d), None) => Some(d.clone()),
-            (None, Some(p)) => Some(p.clone()),
-            (None, None) => None,
+        // Split seg1's `[decode | glue]` so the creep residual inserts between them
+        // for seg2's `[decode | creep | glue]` order.
+        let (seg1_dec, seg1_glue): (Option<Tensor>, Option<Tensor>) = match &seg1_res {
+            Some(r) => {
+                let dec = if n_dec > 0 {
+                    Some(r.narrow(1, 0, n_dec)?)
+                } else {
+                    None
+                };
+                let g = if glue_tok > 0 {
+                    Some(r.narrow(1, n_dec, glue_tok)?)
+                } else {
+                    None
+                };
+                (dec, g)
+            }
+            None => (None, None),
         };
+
+        // Segment 2 — full-sweep members + creep over [cursor, win_end). Input
+        // residual caller order `[decode | creep | glue]`; at cursor 0 all embed
+        // fresh (None).
+        let pf_res = self.wave_prefill_residual.take();
+        let seg2_in = Self::cat_caller_residual(&[
+            seg1_dec.as_ref(),
+            pf_res.as_ref(),
+            seg1_glue.as_ref(),
+        ])?;
+        if let Some(p) = glue_pending {
+            self.session.set_pending_glue(p.clone());
+        }
+        // Time seg2 alone (the co-batch the creep actually rides) — seg1 is
+        // decode+glue over [0, cursor), which the creep did NOT ride, so charging
+        // its wall-clock to the prefill channel would understate the prefill rate.
+        let t_seg2 = Instant::now();
         let seg2 = match self.model.forward_wave(
             &mut self.session,
             decode_seqs,
             decode_inputs,
             &seq_ids,
             &inputs,
-            &none_seqs,
-            &none_inputs,
+            glue_seqs,
+            glue_inputs,
             cursor,
             win_end,
             seg2_in,
         ) {
             Ok(s) => s,
             Err(e) => {
-                // The co-batched group forward failed: drop the group cleanly
-                // (requeue scope prefills on OOM) so a fresh one forms next wave,
-                // then surface the error to the decode caller.
+                // Drop the creep group cleanly (requeue scope prefills on OOM) so a
+                // fresh one forms next wave, then surface the error.
                 self.fail_wave_group(&members, &prefill_gidxs, &e);
                 return Err(e);
             }
         };
 
-        if win_end >= n {
-            // Reached the head inside the window: per-sequence logits, caller order
-            // `[decode | group]`. Split at n_dec; the group portion aligns with
-            // `members` (prefills promote, sections seal).
-            let logits = seg2.logits.unwrap_or_default();
-            let split = n_dec.min(logits.len());
-            let (dec_logits, member_logits) = logits.split_at(split);
-            self.complete_wave_group(&members, member_logits);
-            return Ok(dec_logits.to_vec());
+        // Record the co-batched creep throughput — prefill and section members are
+        // tallied into their own channels, sharing seg2's wall-clock (the forward
+        // they rode concurrently with decode) so the dashboard shows their CONCURRENT
+        // rate instead of reading zero. One record per wave; KV is summed now, before
+        // `complete_wave_group` advances the sequences at the head.
+        {
+            let ms = t_seg2.elapsed().as_millis() as u64;
+            let (mut pf_seqs, mut pf_tok, mut pf_kv) = (0usize, 0usize, 0usize);
+            let (mut sc_seqs, mut sc_tok, mut sc_kv) = (0usize, 0usize, 0usize);
+            for (m, inp) in members.iter().zip(inputs.iter()) {
+                let tok = inp.dims().get(1).copied().unwrap_or(0);
+                match m {
+                    WaveMember::Prefill { seq_id } => {
+                        pf_seqs += 1;
+                        pf_tok += tok;
+                        pf_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
+                    }
+                    WaveMember::Section { seq_id, .. } => {
+                        sc_seqs += 1;
+                        sc_tok += tok;
+                        sc_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
+                    }
+                }
+            }
+            if pf_seqs > 0 {
+                self.wave_stats.record(true, pf_seqs, pf_tok, pf_kv, ms);
+            }
+            if sc_seqs > 0 {
+                self.wave_stats.record_section(sc_seqs, sc_tok, sc_kv, ms);
+            }
         }
 
-        // Paused: split the combined per-token residual into decode + group parts.
-        // The group part is held WHOLE (opaque internal order) for its next window.
+        if win_end >= n {
+            // Head reached: per-sequence logits, caller order `[decode | creep |
+            // glue]`. Decode first; creep members next (promote/seal); glue logits,
+            // if present, trail and are discarded.
+            if has_glue {
+                self.assert_glue_no_advance(glue_seqs)?;
+            }
+            let logits = seg2.logits.unwrap_or_default();
+            let d = n_dec.min(logits.len());
+            let creep_end = (d + members.len()).min(logits.len());
+            let dec_logits = logits[..d].to_vec();
+            let member_logits = logits[d..creep_end].to_vec();
+            self.complete_wave_group(&members, &member_logits);
+            return Ok(dec_logits);
+        }
+
+        // Paused: split seg2's `[decode | creep | glue]` residual. Hold the creep
+        // whole; continue the full-sweep members `[decode | glue]` into seg3.
         let res = seg2
             .residual
             .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
-        let group_rows: usize = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(0))
-            .sum();
-        let dec_part = res.narrow(1, 0, n_dec)?;
-        let group_part = res.narrow(1, n_dec, group_rows)?;
-        self.wave_prefill_residual = Some(group_part);
+        let dec_part = if n_dec > 0 {
+            Some(res.narrow(1, 0, n_dec)?)
+        } else {
+            None
+        };
+        let creep_part = res.narrow(1, n_dec, creep_tok)?;
+        let glue_part = if glue_tok > 0 {
+            Some(res.narrow(1, n_dec + creep_tok, glue_tok)?)
+        } else {
+            None
+        };
+        self.wave_prefill_residual = Some(creep_part);
         self.wave_prefill_cursor = win_end;
         self.wave_prefill_members = members;
 
-        // Segment 3 — decode-only [win_end, N) → decode logits.
+        // Segment 3 — full-sweep members only over [win_end, N). Input caller order
+        // `[decode | glue]`. Skipped when there is no full-sweep member (the creep
+        // paused at win_end, nothing else to sweep).
+        if !has_fullsweep {
+            return Ok(Vec::new());
+        }
+        let seg3_in = Self::cat_caller_residual(&[dec_part.as_ref(), glue_part.as_ref()])?;
+        if let Some(p) = glue_pending {
+            self.session.set_pending_glue(p.clone());
+        }
         let seg3 = self.model.forward_wave(
             &mut self.session,
             decode_seqs,
             decode_inputs,
             &none_seqs,
             &none_inputs,
-            &none_seqs,
-            &none_inputs,
+            glue_seqs,
+            glue_inputs,
             win_end,
             n,
-            Some(dec_part),
+            seg3_in,
         )?;
+        if has_glue {
+            self.assert_glue_no_advance(glue_seqs)?;
+        }
         Ok(seg3.logits.unwrap_or_default())
     }
 

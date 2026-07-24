@@ -458,20 +458,6 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
     }
 }
 
-/// Fire a batch of deferred drain gap-fills as ONE forward (see [`apply_segments`]
-/// `defer`). No-op when empty.
-pub(super) fn fire_deferred_gap_fills(
-    session: &mut BatchedInferenceSession,
-    model: &(dyn ManagedBatchedModel + Send),
-    device: &Device,
-    plans: &[GapFillPlan],
-) -> Result<(), ConversationError> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-    let refs: Vec<&GapFillPlan> = plans.iter().collect();
-    fire_gap_fill_batch(session, model, device, &refs)
-}
 
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
 /// injecting the sealed prefix and collecting all glue as the new region with

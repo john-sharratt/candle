@@ -3088,9 +3088,69 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             });
         }
 
-        let x_in = residual_in
-            .map(|t| TensorCat::from_cat_tensor(t, 0))
-            .transpose()?;
+        // Residual token order. `forward_wave_contexts` packs per-token hidden
+        // states in INTERNAL order `[orig-decode | single-prefills | multi-prefills
+        // | glue]` (the single-token prefills were folded into the decode group).
+        // The residual crosses the API boundary in CALLER order
+        // `[decode | prefill (caller order) | glue]` so a co-batched caller can
+        // split it by contiguous group — decode, section, cohort, glue — which is
+        // what lets a creeping cohort be held whole across a wave while the
+        // full-sweep members continue. We reorder caller→internal on the way in and
+        // internal→caller on the way out; the two permutations are exact inverses,
+        // so re-feeding the returned residual on the next layer window round-trips.
+        // When there are no single-token prefills the two orders coincide (the
+        // multis keep caller order), so the permutation is identity and we skip it.
+        let token_perm: Option<(Tensor, Tensor)> = if single.is_empty() {
+            None
+        } else {
+            let mut single_rank = vec![usize::MAX; n_prefill_in];
+            for (r, &i) in single.iter().enumerate() {
+                single_rank[i] = r;
+            }
+            let mut multi_tok_start = vec![0usize; n_prefill_in];
+            let mut acc = n_decode;
+            for &i in &multi {
+                multi_tok_start[i] = acc;
+                acc += pre_lens_in[i];
+            }
+            let glue_internal_base = acc;
+            let glue_tok: usize = glue_lens.iter().sum();
+            let total_tok = glue_internal_base + glue_tok;
+            let mut internal_of_caller: Vec<u32> = Vec::with_capacity(total_tok);
+            for t in 0..n_decode_in {
+                internal_of_caller.push(t as u32);
+            }
+            for j in 0..n_prefill_in {
+                if single_rank[j] != usize::MAX {
+                    internal_of_caller.push((n_decode_in + single_rank[j]) as u32);
+                } else {
+                    let start = multi_tok_start[j];
+                    for t in 0..pre_lens_in[j] {
+                        internal_of_caller.push((start + t) as u32);
+                    }
+                }
+            }
+            for t in 0..glue_tok {
+                internal_of_caller.push((glue_internal_base + t) as u32);
+            }
+            let mut caller_of_internal = vec![0u32; total_tok];
+            for (c, &k) in internal_of_caller.iter().enumerate() {
+                caller_of_internal[k as usize] = c as u32;
+            }
+            let i2c = Tensor::from_vec(internal_of_caller, total_tok, dev)?;
+            let c2i = Tensor::from_vec(caller_of_internal, total_tok, dev)?;
+            Some((i2c, c2i))
+        };
+
+        let x_in = match (residual_in, token_perm.as_ref()) {
+            (Some(t), Some((_, c2i))) => {
+                // Caller order → internal order for the resume. Tokens are dim 1
+                // (`[batch, tokens, hidden]`).
+                Some(TensorCat::from_cat_tensor(t.index_select(c2i, 1)?, 0)?)
+            }
+            (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
+            (None, _) => None,
+        };
         let phase = self.forward_wave_contexts(
             &mut contexts,
             n_decode,
@@ -3110,19 +3170,24 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         // - Logits (final, head ran) are restored to the caller's
         //   `[decode | prefill-in-caller-order]` so `pf_logits[k]` aligns with the
         //   caller's `pf_seqs[k]`.
-        // - The intermediate residual is an OPAQUE continuation buffer, re-fed
-        //   verbatim on the next layer window. `forward_wave` re-partitions the same
-        //   `prefill_seqs` into the same internal order every wave, so leaving the
-        //   residual in internal order keeps output and resume-input aligned —
-        //   reordering it to caller order would desync the resume and silently
-        //   corrupt the cohort. The caller's `[decode | prefill]` split by its own
-        //   decode count still lands correctly: the singles sit in the prefill
-        //   section, immediately after the `n_decode_in` real decode rows.
+        // - The intermediate residual is returned in CALLER order (see the
+        //   `token_perm` note above): internal→caller on the way out, caller→internal
+        //   on the way back in, exact inverses that round-trip across layer windows.
+        //   A co-batched caller can then split the residual by contiguous group
+        //   (decode | section | cohort | glue) to hold a creeping cohort whole while
+        //   the full-sweep members continue.
         Ok(match phase {
-            WavePhase::Residual(x) => WaveStep {
-                residual: Some(x.to_tensor()),
-                logits: None,
-            },
+            WavePhase::Residual(x) => {
+                // Internal order → caller order. Tokens are dim 1.
+                let res = match token_perm.as_ref() {
+                    Some((i2c, _)) => x.to_tensor().index_select(i2c, 1)?,
+                    None => x.to_tensor(),
+                };
+                WaveStep {
+                    residual: Some(res),
+                    logits: None,
+                }
+            }
             WavePhase::Logits(l) => {
                 let lg = l.into_vec()?;
                 let out = if single.is_empty() {
