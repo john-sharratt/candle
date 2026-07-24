@@ -114,30 +114,27 @@ fn emit_file_turns<S: InsertTurnSink>(
     on_prefilled: candle_conversation::ScopeProgressFn,
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
-    // Serial per scope: the response turn's summary must decode with the call
-    // turn in its projected prefix, so the two halves can't batch independently.
     // Gather-scope tags `["code", <path>]` scope every turn into a code-tagged
     // provenance gallery (and out of the untagged dialogue partition).
     let tags = vec!["code".to_string(), path.to_string()];
-    for scope in scopes {
-        let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
-        let call_user = header::render_part_user_prompt(path, scope);
-        let call_assistant = header::render_tool_call(path, scope);
-        let response_user = header::render_tool_response(path, scope, language, &body);
-        // Records the call turn, decodes + records the response summary, couples
-        // the pair. The role boundaries between and around the two turns are
-        // regenerated glue, never baked (see `Sequence::ingest_scope_roundtrip`).
-        let tokens = sink.ingest_scope_roundtrip(
-            &call_user,
-            &call_assistant,
-            &response_user,
-            tags.clone(),
-            SCOPE_SUMMARY_MAX_TOKENS,
-        )?;
-        // Fire per scope so the ingest bar + token count advance live.
-        on_prefilled(tokens);
-    }
-    Ok(())
+    // Render every scope's tool round-trip up front, in file order. The sink
+    // ingests them — the production sink forks each onto its own timeline and
+    // runs the two-turn round-trips CONCURRENTLY (co-batched on the wave engine),
+    // then splices the sealed pairs back onto this file's timeline in order; the
+    // model-less test sink runs them serially. Either way the inter-turn seams
+    // stay regenerated live glue (see `Sequence::ingest_scope_roundtrip_indices`).
+    let prepared: Vec<(String, String, String)> = scopes
+        .iter()
+        .map(|scope| {
+            let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
+            (
+                header::render_part_user_prompt(path, scope),
+                header::render_tool_call(path, scope),
+                header::render_tool_response(path, scope, language, &body),
+            )
+        })
+        .collect();
+    sink.ingest_scopes(prepared, tags, SCOPE_SUMMARY_MAX_TOKENS, &on_prefilled)
 }
 
 /// Progress units one file contributes: one per carved scope (prefill). The
@@ -230,7 +227,13 @@ pub const MAX_DECODE_FAILURES: usize = 16;
 /// manage VRAM itself (evict the right cold KV, keep the working set hot), so
 /// this is a concurrency target, not a VRAM-safety valve — raising it should let
 /// the engine batch wider, not thrash.
-pub const CODE_READ_PARALLELISM: usize = 48;
+///
+/// Each file worker now parallelises its OWN scopes
+/// ([`crate::turn_sink::SCOPE_PARALLELISM`]), so the concurrent conversation
+/// count is `CODE_READ_PARALLELISM × SCOPE_PARALLELISM`. Keep the product near the
+/// engine's sequence-slot budget: 12 files × 4 scopes = 48, matching the prior
+/// file-only concurrency while adding within-file (large-file) parallelism.
+pub const CODE_READ_PARALLELISM: usize = 12;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
 /// (no reprojection), inheriting the utility C5 compression level.
@@ -487,8 +490,9 @@ pub fn ingest_code_reading(
         n_files = per_file.len(),
         n_scopes = total,
         n_cached = present_hashes.len(),
-        "code_read: per-file ingest across {n_workers} file workers; each file's \
-         scopes are serial tool round-trips, batched across workers by the engine",
+        "code_read: per-file ingest across {n_workers} file workers; each file forks \
+         its scopes onto per-scope timelines, runs the two-turn round-trips in \
+         parallel (co-batched on the wave), and splices the pairs back in order",
     );
     progress.set_step_progress(0, total as u64);
 

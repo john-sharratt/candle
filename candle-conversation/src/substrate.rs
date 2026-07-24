@@ -3318,6 +3318,14 @@ impl Substrate {
         self.turn(timeline, index).map(|e| e.content.layout.clone())
     }
 
+    /// The turn's slot block extent `(block_start, block_end)` — needed by the
+    /// ordered-merge splice ([`crate::projection::resolver::Conversation::adopt_turn`])
+    /// to re-record a forked scope turn onto the file timeline preserving its
+    /// range verbatim. `None` if the turn isn't found.
+    pub fn turn_block_range(&self, timeline: TimelineId, index: TurnIndex) -> Option<(u64, u64)> {
+        self.turn(timeline, index).map(|e| e.block_range)
+    }
+
     /// Turn token IDs as a borrowed slice (zero-copy).
     pub fn assistant_token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> &[u32] {
         self.turn(timeline, index)

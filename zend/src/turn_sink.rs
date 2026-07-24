@@ -17,6 +17,13 @@
 
 use candle_conversation::Sequence;
 
+/// Concurrent scopes per chunk in the parallel per-file ingest
+/// ([`SequenceTurnSink::ingest_scopes`]). Chunks run sequentially, so this bounds
+/// both the concurrent fork/slot count (with [`crate::code_read::CODE_READ_PARALLELISM`]
+/// files in flight → `files × SCOPE_PARALLELISM` forks) and the window a fork's
+/// K/V must stay hot for the splice.
+const SCOPE_PARALLELISM: usize = 4;
+
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
 pub trait InsertTurnSink {
@@ -72,6 +79,36 @@ pub trait InsertTurnSink {
         let a = self.insert_prefill_turn(call_user, call_assistant, tags.clone())?;
         let b = self.insert_prefill_turn(response_user, "", tags)?;
         Ok(a + b)
+    }
+
+    /// Ingest one file's scopes, each as a two-turn tool round-trip
+    /// ([`Self::ingest_scope_roundtrip`]). `prepared` holds the rendered
+    /// `(call_user, call_assistant, response_user)` per scope IN FILE ORDER;
+    /// `on_prefilled` fires per scope with its token count.
+    ///
+    /// Default: **serial** — the correct fallback for model-less sinks (tests),
+    /// where the round-trip has no engine to parallelise across. The production
+    /// [`SequenceTurnSink`] overrides this to fork each scope onto its own
+    /// timeline, run the round-trips CONCURRENTLY (co-batched on the wave engine),
+    /// and splice the sealed pairs back onto the file timeline in order.
+    fn ingest_scopes(
+        &mut self,
+        prepared: Vec<(String, String, String)>,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        on_prefilled: &candle_conversation::ScopeProgressFn,
+    ) -> anyhow::Result<()> {
+        for (call_user, call_assistant, response_user) in prepared {
+            let tokens = self.ingest_scope_roundtrip(
+                &call_user,
+                &call_assistant,
+                &response_user,
+                tags.clone(),
+                max_summary_tokens,
+            )?;
+            on_prefilled(tokens);
+        }
+        Ok(())
     }
 
     /// Restart-resume cache probe: whether some conversation in the
@@ -157,6 +194,70 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                 max_summary_tokens,
             )
             .map_err(|e| anyhow::anyhow!("ingest_scope_roundtrip: {e}"))
+    }
+
+    /// Parallel per-file scope ingest: fork each scope onto its own timeline, run
+    /// the proven two-turn round-trips CONCURRENTLY in bounded chunks (co-batched
+    /// on the wave engine), then splice each fork's coupled pair onto the file
+    /// timeline IN ORDER (`splice_scope_turns`, which couples + tombstones the
+    /// fork). Chunks run sequentially so the concurrent fork count — and the
+    /// window in which a fork's K/V must stay HOT for the splice — stays bounded.
+    fn ingest_scopes(
+        &mut self,
+        prepared: Vec<(String, String, String)>,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        on_prefilled: &candle_conversation::ScopeProgressFn,
+    ) -> anyhow::Result<()> {
+        for chunk in prepared.chunks(SCOPE_PARALLELISM) {
+            // Fork one throwaway timeline per scope in this chunk.
+            let mut forks: Vec<Sequence> = Vec::with_capacity(chunk.len());
+            for _ in chunk {
+                forks.push(
+                    self.inner
+                        .fork_scope()
+                        .map_err(|e| anyhow::anyhow!("fork_scope: {e}"))?,
+                );
+            }
+            // Run each fork's two-turn round-trip concurrently; the scheduler
+            // co-batches their prefills + summary decodes on the shared wave.
+            let results: Vec<candle_conversation::Result<(u32, u32, usize)>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = forks
+                        .iter_mut()
+                        .zip(chunk.iter())
+                        .map(|(fork, (call_user, call_assistant, response_user))| {
+                            let tags = tags.clone();
+                            s.spawn(move || {
+                                fork.ingest_scope_roundtrip_indices(
+                                    call_user,
+                                    call_assistant,
+                                    response_user,
+                                    tags,
+                                    max_summary_tokens,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("scope ingest thread panicked"))
+                        .collect()
+                });
+            // Splice the sealed pairs onto the file timeline in scope order.
+            for (fork, res) in forks.iter().zip(results) {
+                let (call_idx, resp_idx, tokens) =
+                    res.map_err(|e| anyhow::anyhow!("scope round-trip: {e}"))?;
+                self.inner
+                    .splice_scope_turns(fork.timeline_id(), call_idx, resp_idx, tags.clone())
+                    .map_err(|e| anyhow::anyhow!("splice_scope_turns: {e}"))?;
+                on_prefilled(tokens);
+            }
+            // Drop the forks → frees their scheduler slots (their timelines are
+            // already tombstoned by `splice_scope_turns`).
+            drop(forks);
+        }
+        Ok(())
     }
 
     fn unit_cached(&self, key: &str, value: &str) -> bool {

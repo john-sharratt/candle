@@ -1705,28 +1705,48 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
     ) -> crate::Result<usize> {
+        let (call_idx, _resp_idx, tokens) = self.ingest_scope_roundtrip_indices(
+            call_user,
+            call_assistant,
+            response_user,
+            tags,
+            max_summary_tokens,
+        )?;
+        // Serial path: couple the pair here (the parallel splice couples on the
+        // file timeline instead, after adopting both turns — see `adopt_turn`).
+        self.couple_turn(call_idx)?;
+        Ok(tokens)
+    }
+
+    /// Core of [`Self::ingest_scope_roundtrip`] that returns the sealed
+    /// `(call_turn_index, response_turn_index, tokens_ingested)` **without**
+    /// coupling — so the parallel code_read path can run this on a per-scope FORK
+    /// and then splice both turns onto the file timeline (coupling there). The
+    /// two-turn shape and its live-glue seams are identical to the serial path.
+    pub fn ingest_scope_roundtrip_indices(
+        &mut self,
+        call_user: &str,
+        call_assistant: &str,
+        response_user: &str,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+    ) -> crate::Result<(u32, u32, usize)> {
         // code_reading is a tools-OFF layer: gate the WHOLE tool block out of every
         // projection this conversation runs, so the ingest never SELECTS (and thus
-        // never elevates) a tool section. Without this the tools collection selects
-        // 1-3 tools + the `<tools>` framing sections every turn — a pure waste for a
-        // file-summary ingest that never calls a tool. Set on `self.selection` so
-        // the staged Turn A (which projects through `self.selection`) inherits it.
+        // never elevates) a tool section.
         self.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Absent,
         );
-        // Turn A — the call: prefill `[request][tool_call]` + staged provenance
-        // (mirrors `insert_turn_staged`). `user_start` / `assistant_end` /
-        // `/no_think` are live glue; only intra-turn `user_end` / `assistant_start`
-        // bake, which the design allows (dominated by the turn's own content).
+        // Turn A — the call: prefill `[request][tool_call]` + staged provenance.
         let (call_acs, call_idx, call_tokens) =
             self.insert_turn_inner(call_user, call_assistant, tags.clone())?;
-        if let Some(idx) = call_idx {
-            self.persist_staged_ingest_events(idx, call_acs, 0.0, &[])?;
-        }
+        let call_idx = call_idx.ok_or_else(|| {
+            ConversationError::Channel("scope round-trip: call turn produced no index".into())
+        })?;
+        self.persist_staged_ingest_events(call_idx, call_acs, 0.0, &[])?;
         // Turn B — the response: submit the tool_response and DECODE the summary,
-        // `/no_think` + short + argmax. The decode sees Turn A (just recorded, so
-        // recent) — the summary answers the original request over the returned code.
+        // `/no_think` + short + argmax. The decode sees Turn A (just recorded).
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(SamplingConfig::compression()),
@@ -1737,7 +1757,6 @@ impl Sequence {
             crate::projection::NO_THINK_SELECTOR,
             crate::projection::OptionalState::Present,
         );
-        // Tools off for the summary decode too (Turn B projects through `opts`).
         opts.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Absent,
@@ -1745,13 +1764,61 @@ impl Sequence {
         let handle = self.submit_turn_with_options(response_user, opts)?;
         let response = handle.wait()?;
         let resp_tokens = response.token_ids.len();
+        let resp_idx = response
+            .seal
+            .as_ref()
+            .and_then(|s| s.turn_index)
+            .ok_or_else(|| {
+                ConversationError::Channel("scope round-trip: response turn produced no index".into())
+            })?;
         // Records Turn B + its staged provenance events (the decoded-ingest path).
         self.finish_turn_staged(handle, &response)?;
-        // Couple the call turn to the response turn — the two halves of one round-trip.
-        if let Some(idx) = call_idx {
-            self.couple_turn(idx)?;
-        }
-        Ok(call_tokens + resp_tokens)
+        Ok((call_idx, resp_idx, call_tokens + resp_tokens))
+    }
+
+    /// Fork this conversation onto a fresh timeline for one parallel scope
+    /// ingest. The returned [`Sequence`] shares the substrate (so a later
+    /// `adopt_turn` can reference its sealed K/V) but has its own scheduler slot
+    /// + timeline, so scopes ingest concurrently without ordering conflicts.
+    pub fn fork_scope(&self) -> crate::Result<Sequence> {
+        self.fork()
+    }
+
+    /// Splice a per-scope fork's two coupled turns onto THIS (file) timeline in
+    /// order, then couple them — the ordered-merge step of parallel code_read.
+    /// The fork's sealed K/V is referenced (not copied); its turns must still be
+    /// HOT (splice right after the fork completes). Records at the next two file
+    /// indices and returns them.
+    pub fn splice_scope_turns(
+        &self,
+        fork_timeline: TimelineId,
+        call_idx: u32,
+        resp_idx: u32,
+        tags: Vec<String>,
+    ) -> crate::Result<(u32, u32)> {
+        let file_tl = self.target.timeline;
+        let new_call = self
+            .substrate
+            .adopt_turn(
+                fork_timeline,
+                TurnIndex(call_idx),
+                file_tl,
+                Role::Assistant,
+                tags.clone(),
+            )
+            .map_err(ConversationError::Model)?;
+        let new_resp = self
+            .substrate
+            .adopt_turn(fork_timeline, TurnIndex(resp_idx), file_tl, Role::Assistant, tags)
+            .map_err(ConversationError::Model)?;
+        self.substrate
+            .couple_turn(file_tl, new_call.0)
+            .map_err(ConversationError::Model)?;
+        // The fork's turns now live on the file timeline (their K/V shared by
+        // reference); tombstone the fork so its orphaned timeline isn't reloaded
+        // or scored. The shared chunks stay alive via the file timeline's clones.
+        let _ = self.substrate.tombstone_timeline(fork_timeline);
+        Ok((new_call.0, new_resp.0))
     }
 
     /// Blocking convenience: submit + wait.

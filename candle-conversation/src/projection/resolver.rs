@@ -789,6 +789,71 @@ impl Conversation {
         Ok(idx)
     }
 
+    /// Ordered-merge splice for parallel code_read: re-record a turn from
+    /// `from_tl` (a per-scope fork timeline, sealed by the proven two-turn
+    /// round-trip) onto `to_tl` (the file timeline) at the next index, fully
+    /// persisted. The forked turn's K/V is referenced by the SAME
+    /// content-addressed chunks (no copy — the sealed sequences clone their
+    /// `ChunkGid` RAII handles, so the chunks outlive the dropped fork), and its
+    /// layout + block range are preserved verbatim so the inter-turn seams stay
+    /// LIVE GLUE (the correctness property code_read requires — a baked seam goes
+    /// stale on re-injection). `tags` are supplied by the caller (the scope's
+    /// `["code", <path>]`). The source turn must be HOT — splice right after the
+    /// fork completes, before the persistence thread migrates it warm.
+    ///
+    /// Persists the same three records `record_scope_turn` does: the `TurnDecl`
+    /// (via [`Self::record_turn`]), the token ids, and the wide-Q provenance sigs
+    /// (re-keyed onto the new stream so a provenance scan of the file timeline
+    /// admits the turn).
+    pub fn adopt_turn(
+        &self,
+        from_tl: TimelineId,
+        from_idx: TurnIndex,
+        to_tl: TimelineId,
+        role: Role,
+        tags: Vec<String>,
+    ) -> candle::Result<TurnIndex> {
+        use crate::persistence::content_hash::turn_stream_id;
+        let (layout, token_ids, block_range, sigs_blob) = {
+            let r = self.read();
+            let layout = r
+                .turn_layout(from_tl, from_idx)
+                .ok_or_else(|| candle::Error::Msg(format!("adopt_turn: {from_idx:?} missing")))?;
+            let token_ids = r.token_ids_of(from_tl, from_idx);
+            let block_range = r
+                .turn_block_range(from_tl, from_idx)
+                .ok_or_else(|| candle::Error::Msg("adopt_turn: no block range".into()))?;
+            let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
+            (layout, token_ids, block_range, sigs_blob)
+        };
+        let sealed = self.read().turn_sealed_of(from_tl, from_idx).ok_or_else(|| {
+            candle::Error::Msg(
+                "adopt_turn: source K/V not hot (migrated) — splice sooner".into(),
+            )
+        })?;
+        let token_count = token_ids.len();
+        let write = TurnPartWrite {
+            layout,
+            token_ids: TokenBuffer::from(token_ids.clone()),
+            token_count,
+            block_start: block_range.0,
+            block_end: block_range.1,
+            sealed_gpu: Some(sealed),
+            tags,
+        };
+        let idx = self.record_turn(to_tl, role, write, |seqs| Ok(seqs.to_vec()))?;
+        let stream_id = turn_stream_id(to_tl.raw(), idx.0);
+        if let Err(e) = self.persist_tokens_only(stream_id, &token_ids) {
+            tracing::warn!("adopt_turn persist tokens failed: {e}");
+        }
+        if let Some(blob) = sigs_blob {
+            if let Err(e) = self.persist_wide_q_sigs(stream_id, &blob) {
+                tracing::warn!("adopt_turn persist wide-Q sigs failed: {e}");
+            }
+        }
+        Ok(idx)
+    }
+
     /// Declare a stream in the persistence redo log AND mirror the decl into
     /// the LIVE substrate. The reload walker only installs decls at startup,
     /// but live readers — the tag-scoped belief gallery reading a turn's tags,
