@@ -635,7 +635,22 @@ impl TestParams {
             let seq_idxs: Vec<usize> = group.iter().map(|(idx, _)| *idx).collect();
             let tensors: Vec<Tensor> = group.into_iter().map(|(_, t)| t).collect();
 
-            let logits_vec = model.forward_batched(&mut session, &seq_idxs, &tensors)?;
+            let nl = model.num_layers();
+            let logits_vec = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &seq_idxs,
+                    &tensors,
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
 
             // Store logits and advance sequences
             for (&seq_idx, logits) in seq_idxs.iter().zip(logits_vec.into_iter()) {
@@ -740,8 +755,22 @@ impl TestParams {
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         for _repeat in 0..config.num_repeats.max(1) {
-            let logits_vec =
-                model.forward_batched(&mut session, &sequence_indices, &user_tensors)?;
+            let nl = model.num_layers();
+            let logits_vec = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &sequence_indices,
+                    &user_tensors,
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
 
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
@@ -1035,8 +1064,23 @@ impl TestParams {
         }
 
         let t_forward = profile_now();
-        // Forward all sequences in batch
-        let logits_vec = model.forward_batched(session, sequence_indices, &input_tensors)?;
+        // Forward all sequences in batch (decode step: q=1 rows in the decode group)
+        let nl = model.num_layers();
+        let logits_vec = model
+            .forward_wave(
+                session,
+                sequence_indices,
+                &input_tensors,
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )?
+            .logits
+            .unwrap_or_default();
         pipeline_record("bench:decode_forward_call", t_forward);
 
         for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {

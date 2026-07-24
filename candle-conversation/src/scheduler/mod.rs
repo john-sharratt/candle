@@ -1488,6 +1488,24 @@ pub(super) struct ActiveSectionIngest {
     pub(super) error: Option<ConversationError>,
 }
 
+/// A member of the in-flight continuous-fair-wave prefill group
+/// (`docs/continuous_fair_waves.md`). The group creeps through the layers
+/// together with its residual held whole between waves; members are separated
+/// only at the head, where `forward_wave`'s logits are in caller order. A member
+/// is resolved live by `seq_id` (not a stored index) so `swap_remove` in either
+/// backing collection can't invalidate it mid-creep.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum WaveMember {
+    /// Dialogue-turn prefill — resolved in `active_prefills`; its full token set
+    /// flows through the layers and it is promoted to decode at the head.
+    Prefill { seq_id: usize },
+    /// Section-ingest chunk — resolved in `active_section_ingests`; covers
+    /// `[offset, offset + advance)` (offset is stable until the head, where the
+    /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
+    /// co-batch with decode + the dialogue prefills.
+    Section { seq_id: usize, advance: usize },
+}
+
 // ————————————————————————————————————————————————————————————————————————————
 // Scheduler
 // ————————————————————————————————————————————————————————————————————————————
@@ -2372,11 +2390,22 @@ pub(crate) struct Scheduler {
     /// `cursor == 0` with no residual means no cohort is in flight.
     wave_prefill_residual: Option<Tensor>,
     wave_prefill_cursor: usize,
-    wave_prefill_seqs: Vec<usize>,
+    /// The in-flight wave group's members in a STABLE order (dialogue prefills
+    /// then section chunks). The order must not change between waves: `forward_wave`
+    /// re-partitions the same inputs into the same internal order each resume, and
+    /// the held residual only lines up if the input order is identical. Fixed at
+    /// formation — new prefills / sections wait for the next group.
+    wave_prefill_members: Vec<WaveMember>,
     /// Set once per decode quantum after the co-batched decode wave advances the
     /// prefill cohort, so only the FIRST decode step of the quantum folds the
     /// cohort in (one budget-sized layer advance per wave, not per decode step).
     wave_cohort_advanced: bool,
+    /// Set once per wave after the co-batched decode wave folded the active
+    /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
+    /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
+    /// decode + section + cohort). Skips the standalone `run_one_section_ingest_chunk`
+    /// pass that wave (`docs/continuous_fair_waves.md` §4).
+    wave_section_advanced: bool,
 
     /// Cache of `SectionId` → symbolic `debug_name`, so the promote tracker's name
     /// lookup is O(1) after the first sighting (sections are stable).
@@ -2504,8 +2533,9 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
-            wave_prefill_seqs: Vec::new(),
+            wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
+            wave_section_advanced: false,
             section_name_cache: HashMap::new(),
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
@@ -8677,42 +8707,6 @@ mod tests {
             &self.device
         }
 
-        fn forward_batched(
-            &self,
-            _session: &mut BatchedInferenceSession,
-            seq_indices: &[usize],
-            _inputs: &[Tensor],
-        ) -> candle::Result<Vec<Tensor>> {
-            self.dummy_logits(seq_indices.len())
-        }
-
-        fn forward_batched_layers(
-            &self,
-            _session: &mut BatchedInferenceSession,
-            seq_indices: &[usize],
-            _inputs: &[Tensor],
-            _layer_start: usize,
-            layer_end: usize,
-            _residual_in: Option<Tensor>,
-        ) -> candle::Result<candle_transformers::models::batched_inference::WaveStep> {
-            use candle_transformers::models::batched_inference::WaveStep;
-            // One-layer dummy: a range that reaches the (single) final layer runs
-            // the head; otherwise it would hand back a residual — but with
-            // num_layers()==1 the only valid full range is [0,1), so emit logits.
-            if layer_end >= self.num_layers() {
-                Ok(WaveStep {
-                    residual: None,
-                    logits: Some(self.dummy_logits(seq_indices.len())?),
-                })
-            } else {
-                // A zero-width dummy residual placeholder (never exercised with 1 layer).
-                Ok(WaveStep {
-                    residual: Some(Tensor::zeros((1, 1, 1), DType::F32, &self.device)?),
-                    logits: None,
-                })
-            }
-        }
-
         #[allow(clippy::too_many_arguments)]
         fn forward_wave(
             &self,
@@ -8842,9 +8836,21 @@ mod tests {
             .session
             .ensure_capacity(&[parent_raw], tokens.len())
             .unwrap();
+        let nl = scheduler.model.num_layers().max(1);
         scheduler
             .model
-            .forward_batched(&mut scheduler.session, &[parent_raw], &[input])
+            .forward_wave(
+                &mut scheduler.session,
+                &[],
+                &[],
+                &[parent_raw],
+                &[input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
             .unwrap();
         scheduler
             .session

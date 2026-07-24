@@ -1335,44 +1335,44 @@ impl Scheduler {
             .count()
     }
 
-    /// Run one prefill chunk across all active section ingests, batching them
-    /// into a single `forward_batched` call so collection members sharing the
-    /// same prefix context attend in parallel rather than serially.
-    pub(super) fn run_one_section_ingest_chunk(&mut self) {
+    /// Build one ragged section-ingest chunk: for each active section, its next
+    /// `min(remaining, cap)` tokens, packed until the per-forward token budget.
+    /// Returns `(seq_ids, inputs, group_idxs, advances)`, or `None` when nothing
+    /// is pending. Shared by the standalone pass and the co-batched decode wave.
+    ///
+    /// Ragged batch: each section advances by its OWN min(remaining, cap). The
+    /// varlen forward packs the heterogeneous lengths flat, so one near-finished
+    /// section no longer collapses the whole wave to the batch minimum — the bug
+    /// that dragged a 93-wide tool-catalog ingest down to ~1 token/seq/forward.
+    ///
+    /// Bound the TOTAL tokens to the same per-forward budget a normal prefill
+    /// targets (`max_prefill_pass_tokens`). Without this the whole active set
+    /// coalesces into one forward: the 93-section tool catalog (~21k tokens)
+    /// packed into a single pass whose transient activation spiked VRAM to the
+    /// card ceiling and paged. Sections beyond the budget ride the next chunk —
+    /// the wave loop pumps until every section seals — so throughput is unchanged
+    /// (each forward still fills to the expert-amortization target) while the peak
+    /// stays bounded. At least one section is always admitted so the wave makes
+    /// progress.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn build_section_batch(
+        &mut self,
+    ) -> Option<(Vec<usize>, Vec<Tensor>, Vec<usize>, Vec<usize>)> {
+        // Sections already creeping inside the wave group are excluded — their
+        // offset isn't advanced until that group's head, so picking them here would
+        // ingest the same chunk twice.
+        let in_flight = self.wave_group_section_seqs();
         let active: Vec<usize> = (0..self.active_section_ingests.len())
             .filter(|&i| {
                 let s = &self.active_section_ingests[i];
-                s.error.is_none() && s.offset < s.tokens.len()
+                s.error.is_none()
+                    && s.offset < s.tokens.len()
+                    && !in_flight.contains(&s.sequence_id.0)
             })
             .collect();
         if active.is_empty() {
-            return;
+            return None;
         }
-
-        // VRAM pressure gate (phase-d coverage): a wide multi-section ingest pins
-        // hot KV exactly like a prefill wave, so relieve before admitting the
-        // batch. Without this the section-ingest path could pin the card with no
-        // shedding — the only per-forward bound was the token cap below.
-        if self.vram_under_pressure() {
-            self.relieve_vram_pressure("section", VramPhase::Load);
-        }
-
-        // Ragged batch: each section advances by its OWN min(remaining, cap).
-        // The varlen forward packs the heterogeneous lengths flat, so one
-        // near-finished section no longer collapses the whole wave to the batch
-        // minimum — the bug that dragged a 93-wide tool-catalog ingest down to
-        // ~1 token/seq/forward. Mirrors `run_one_prefill_pass`.
-        //
-        // Bound the TOTAL tokens per forward to the same per-forward budget a
-        // normal prefill targets (`max_prefill_pass_tokens`). Without this the
-        // whole active set coalesces into one forward: the 93-section tool
-        // catalog (~21k tokens) packed into a single pass whose transient
-        // activation spiked VRAM to the card ceiling and paged (one forward took
-        // minutes on a 16 GB card). Sections beyond the budget ride the next
-        // `run_one_section_ingest_chunk` pass — the wave loop calls this until
-        // every section seals — so throughput is unchanged (each forward still
-        // fills to the expert-amortization target) while the peak stays bounded.
-        // At least one section is always admitted so the wave makes progress.
         let cap = self.max_prefill_pass_tokens;
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
@@ -1403,8 +1403,52 @@ impl Scheduler {
             }
         }
         if seq_ids.is_empty() {
+            return None;
+        }
+        Some((seq_ids, inputs, group_idxs, advances))
+    }
+
+    /// Commit one section-ingest chunk after its forward (standalone or
+    /// co-batched): advance each section by its own `advance`, record its slot
+    /// tokens, and bump its offset. Section logits are never used (no decode).
+    pub(super) fn complete_section_chunk(&mut self, group_idxs: &[usize], advances: &[usize]) {
+        for (&i, &advance) in group_idxs.iter().zip(advances.iter()) {
+            let s = &mut self.active_section_ingests[i];
+            if let Err(e) = self.session.advance_sequence(s.sequence_id.0, advance) {
+                s.error = Some(ConversationError::Model(e));
+                continue;
+            }
+            let seq_id = s.sequence_id;
+            let off = s.offset;
+            let chunk_tokens = s.tokens[off..off + advance].to_vec();
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
+            s.offset += advance;
+        }
+    }
+
+    /// Run one prefill chunk across all active section ingests as a single
+    /// full-sweep forward, so collection members sharing the same prefix context
+    /// attend in parallel rather than serially. Skipped when the co-batched
+    /// decode wave already folded this wave's chunk into its sweep
+    /// (`wave_section_advanced`); `finalize_done_section_ingests` still runs.
+    pub(super) fn run_one_section_ingest_chunk(&mut self) {
+        // Co-batched into the decode wave's full sweep already this wave — one
+        // section chunk per wave, as the standalone pass also does.
+        if self.wave_section_advanced {
             return;
         }
+
+        // VRAM pressure gate (phase-d coverage): a wide multi-section ingest pins
+        // hot KV exactly like a prefill wave, so relieve before admitting the
+        // batch. Without this the section-ingest path could pin the card with no
+        // shedding — the only per-forward bound was the token cap.
+        if self.vram_under_pressure() {
+            self.relieve_vram_pressure("section", VramPhase::Load);
+        }
+
+        let Some((seq_ids, inputs, group_idxs, advances)) = self.build_section_batch() else {
+            return;
+        };
 
         let total_tokens: usize = advances.iter().sum();
         tracing::debug!(
@@ -1422,44 +1466,35 @@ impl Scheduler {
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
             .sum();
         let t_fwd = Instant::now();
-        let logits_vec = match self
-            .model
-            .forward_batched(&mut self.session, &seq_ids, &inputs)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("batched section ingest forward failed: {e}");
-                for &i in &group_idxs {
-                    self.active_section_ingests[i].error =
-                        Some(ConversationError::Channel(msg.clone()));
-                }
-                return;
+        let nl = self.model.num_layers().max(1);
+        if let Err(e) = self.model.forward_wave(
+            &mut self.session,
+            &[],
+            &[],
+            &seq_ids,
+            &inputs,
+            &[],
+            &[],
+            0,
+            nl,
+            None,
+        ) {
+            let msg = format!("batched section ingest forward failed: {e}");
+            for &i in &group_idxs {
+                self.active_section_ingests[i].error =
+                    Some(ConversationError::Channel(msg.clone()));
             }
-        };
+            return;
+        }
         // Section ingest batch = n_seqs sequences, Σ advances tokens (ragged).
         let fwd_ms = t_fwd.elapsed().as_millis() as u64;
         self.wave_stats
             .record_section(seq_ids.len(), total_tokens, kv_len, fwd_ms);
 
-        // Logits are produced but not used — section ingests have no decode.
-        // We only need to advance each section by ITS OWN advance and record
-        // its slot tokens.
-        for ((_logits, &i), &advance) in logits_vec
-            .into_iter()
-            .zip(group_idxs.iter())
-            .zip(advances.iter())
-        {
-            let s = &mut self.active_section_ingests[i];
-            if let Err(e) = self.session.advance_sequence(s.sequence_id.0, advance) {
-                s.error = Some(ConversationError::Model(e));
-                continue;
-            }
-            let seq_id = s.sequence_id;
-            let off = s.offset;
-            let chunk_tokens = s.tokens[off..off + advance].to_vec();
-            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
-            s.offset += advance;
-        }
+        self.complete_section_chunk(&group_idxs, &advances);
+        // Claim this wave's section chunk so the co-batched decode wave doesn't
+        // fold a second one — one chunk per wave, as the cohort creeps one window.
+        self.wave_section_advanced = true;
     }
 
     /// Drain completed or errored section ingest entries. Errored entries send
@@ -1522,56 +1557,13 @@ impl Scheduler {
         let n_layers = self.model.num_layers().max(1);
         let budget = self.wave_prefill_layer_budget();
 
-        // Resume the in-flight cohort, or form a fresh one from every ready
-        // prefill. Keyed by sequence id so promotion's `swap_remove` can't
-        // invalidate it between waves.
+        // Form a fresh group (dialogue prefills only — no decode here to co-batch
+        // section against) or resume the held one. Members are resolved by seq id
+        // so promotion's `swap_remove` can't invalidate the group between waves.
         if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
-            self.wave_prefill_seqs = (0..self.active_prefills.len())
-                .filter(|&i| {
-                    let p = &self.active_prefills[i];
-                    p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
-                })
-                .map(|i| self.active_prefills[i].work.sequence_id.0)
-                .collect();
+            self.form_wave_group(false);
         }
-        let cohort = self.wave_prefill_seqs.clone();
-        if cohort.is_empty() {
-            self.reset_wave_prefill();
-            return;
-        }
-
-        // Build the batch: sequence ids + the FULL token tensor of each prefill.
-        // The wave supplies q_lens to the attention every layer; embedding happens
-        // once (at cursor 0), and the residual carries the rest.
-        let mut seq_ids: Vec<usize> = Vec::with_capacity(cohort.len());
-        let mut inputs: Vec<Tensor> = Vec::with_capacity(cohort.len());
-        let mut group_idxs: Vec<usize> = Vec::with_capacity(cohort.len());
-        for &sid in &cohort {
-            let Some(i) = self
-                .active_prefills
-                .iter()
-                .position(|p| p.work.sequence_id.0 == sid)
-            else {
-                continue;
-            };
-            if self.active_prefills[i].error.is_some()
-                || self.active_prefills[i].final_logits.is_some()
-            {
-                continue;
-            }
-            if self.active_prefills[i].prefill_start.is_none() {
-                self.active_prefills[i].prefill_start = Some(Instant::now());
-            }
-            let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
-            match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
-                Ok(t) => {
-                    seq_ids.push(sid);
-                    inputs.push(t);
-                    group_idxs.push(i);
-                }
-                Err(e) => self.active_prefills[i].error = Some(ConversationError::Model(e)),
-            }
-        }
+        let (members, seq_ids, inputs, prefill_gidxs) = self.build_wave_group_inputs();
         if seq_ids.is_empty() {
             self.reset_wave_prefill();
             return;
@@ -1580,9 +1572,9 @@ impl Scheduler {
         let start = self.wave_prefill_cursor;
         let end = (start + budget).min(n_layers);
         let residual_in = self.wave_prefill_residual.take();
-        // Attended-KV length (prefix/context summed over the batch) — the prefill
+        // Attended-KV length (prefix/context summed over the batch) — the group's
         // sequences are NOT advanced until the head, so this is stable across the
-        // cohort's layer advances.
+        // group's layer advances.
         let kv_len: usize = seq_ids
             .iter()
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
@@ -1593,30 +1585,21 @@ impl Scheduler {
             .sum();
 
         let t_fwd = Instant::now();
-        let step = match self.model.forward_batched_layers(
+        let step = match self.model.forward_wave(
             &mut self.session,
+            &[],
+            &[],
             &seq_ids,
             &inputs,
+            &[],
+            &[],
             start,
             end,
             residual_in,
         ) {
             Ok(s) => s,
             Err(e) => {
-                if candle_nn::kv_cache::is_device_oom(&e) {
-                    // The batch outgrew the card's VRAM. Narrow the admission
-                    // window and requeue the batch's scope-ingest prefills rather
-                    // than dropping their content; drop this cohort's residual so a
-                    // fresh (narrower) one forms next wave.
-                    self.handle_prefill_oom(&group_idxs, &e);
-                } else {
-                    let msg = format!("wave prefill forward failed: {e}");
-                    for &i in &group_idxs {
-                        self.active_prefills[i].error =
-                            Some(ConversationError::Channel(msg.clone()));
-                    }
-                }
-                self.reset_wave_prefill();
+                self.fail_wave_group(&members, &prefill_gidxs, &e);
                 return;
             }
         };
@@ -1625,176 +1608,383 @@ impl Scheduler {
             .record(true, seq_ids.len(), total_tokens, kv_len, fwd_ms);
 
         if end < n_layers {
-            // Paused mid-stack: persist the residual and keep the cohort. Decode
+            // Paused mid-stack: persist the residual and keep the group. Decode
             // sweeps all layers before we resume here next wave.
             self.wave_prefill_residual = step.residual;
             self.wave_prefill_cursor = end;
-            self.wave_prefill_seqs = seq_ids;
+            self.wave_prefill_members = members;
             return;
         }
 
-        // Reached the head: the cohort's tokens are now fully processed through
-        // every layer. Commit offsets + logits and hand them to the promotion path.
+        // Reached the head: the group's tokens are now fully processed through
+        // every layer. Promote prefills, advance+seal sections.
         let logits = step.logits.unwrap_or_default();
-        self.complete_wave_cohort(&seq_ids, &logits);
+        self.complete_wave_group(&members, &logits);
     }
 
-    /// Clear the in-flight continuous-fair-wave prefill cohort (residual, cursor,
-    /// sequences) so the next wave forms a fresh one.
+    /// Clear the in-flight continuous-fair-wave prefill group (residual, cursor,
+    /// members) so the next wave forms a fresh one.
     fn reset_wave_prefill(&mut self) {
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
-        self.wave_prefill_seqs.clear();
+        self.wave_prefill_members.clear();
     }
 
-    /// Finish a prefill cohort that reached the final layer: for each sequence
-    /// (in `pf_seqs` order, aligned with `logits`), commit its offset, emit its
-    /// staged/progress events, record its `final_logits` for promotion, then clear
-    /// the cohort. Shared by the prefill-only wave and the co-batched decode wave.
-    fn complete_wave_cohort(&mut self, pf_seqs: &[usize], logits: &[Tensor]) {
-        for (k, &sid) in pf_seqs.iter().enumerate() {
-            let Some(i) = self
-                .active_prefills
-                .iter()
-                .position(|p| p.work.sequence_id.0 == sid)
-            else {
-                continue;
-            };
-            let total = self.active_prefills[i].work.tokens.len();
-            let seq_id = self.active_prefills[i].work.sequence_id;
-            if let Err(e) = self.session.advance_sequence(seq_id.0, total) {
-                self.active_prefills[i].error = Some(ConversationError::Model(e));
-                continue;
+    /// Set of section-ingest `seq_id`s currently in flight in the wave group, so
+    /// the standalone section pass and a fresh group formation don't double-admit
+    /// a chunk that is already creeping (its offset isn't advanced until the head).
+    pub(super) fn wave_group_section_seqs(&self) -> std::collections::HashSet<usize> {
+        self.wave_prefill_members
+            .iter()
+            .filter_map(|m| match m {
+                WaveMember::Section { seq_id, .. } => Some(*seq_id),
+                WaveMember::Prefill { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Form a FRESH wave group into `wave_prefill_members`: every ready dialogue
+    /// prefill, plus — when `include_sections` and at least one prefill is present
+    /// — section chunks bounded by the per-forward token cap. Section chunks join
+    /// only alongside a cohort (so they co-batch a creep that is happening anyway);
+    /// with no cohort the caller uses the faster full-sweep section path instead.
+    /// Members are ordered prefills-then-sections and this order is then fixed for
+    /// the group's life (the held residual depends on a stable input order).
+    fn form_wave_group(&mut self, include_sections: bool) {
+        let mut members: Vec<WaveMember> = (0..self.active_prefills.len())
+            .filter(|&i| {
+                let p = &self.active_prefills[i];
+                p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
+            })
+            .map(|i| WaveMember::Prefill {
+                seq_id: self.active_prefills[i].work.sequence_id.0,
+            })
+            .collect();
+        if include_sections && !members.is_empty() {
+            let cap = self.max_prefill_pass_tokens;
+            let mut sec_tokens = 0usize;
+            for i in 0..self.active_section_ingests.len() {
+                let s = &self.active_section_ingests[i];
+                if s.error.is_some() || s.offset >= s.tokens.len() {
+                    continue;
+                }
+                let advance = (s.tokens.len() - s.offset).min(cap);
+                // Bound the section contribution to the per-forward token budget
+                // (at least one always admitted); the rest ride the next group.
+                if sec_tokens > 0 && sec_tokens + advance > cap {
+                    break;
+                }
+                members.push(WaveMember::Section {
+                    seq_id: s.sequence_id.0,
+                    advance,
+                });
+                sec_tokens += advance;
             }
-            let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
-            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &all_tokens);
-            self.active_prefills[i].offset = total;
-            // Staged calibration prefill: emit every segment's pinned projection
-            // here at completion (a wave processes the whole token set at once).
-            if let Some(comp) = self.active_prefills[i].work.staged_composition.clone() {
-                let gen_start = self.active_prefills[i].work.assistant_content_start;
-                let offs = self.active_prefills[i].work.projection_offsets.clone();
-                for seg in 0..offs.len() {
-                    let prev_off = if seg == 0 { gen_start } else { offs[seg - 1] };
-                    let mut ev = comp.clone();
-                    ev.start_token = prev_off.saturating_sub(gen_start);
+        }
+        self.wave_prefill_members = members;
+    }
+
+    /// Resume the held wave group: rebuild each member's `(seq_id, input tensor)`
+    /// from its live backing (prefill = full token set; section = its stable
+    /// `[offset, offset+advance)` chunk), dropping members that errored/completed.
+    /// Returns the kept members (aligned with `seq_ids`/`inputs`) plus the
+    /// `active_prefills` positions of the prefill members (for OOM/error routing).
+    #[allow(clippy::type_complexity)]
+    fn build_wave_group_inputs(&mut self) -> (Vec<WaveMember>, Vec<usize>, Vec<Tensor>, Vec<usize>) {
+        let members = self.wave_prefill_members.clone();
+        let mut kept: Vec<WaveMember> = Vec::with_capacity(members.len());
+        let mut seq_ids: Vec<usize> = Vec::with_capacity(members.len());
+        let mut inputs: Vec<Tensor> = Vec::with_capacity(members.len());
+        let mut prefill_gidxs: Vec<usize> = Vec::new();
+        for m in members {
+            match m {
+                WaveMember::Prefill { seq_id } => {
+                    let Some(i) = self
+                        .active_prefills
+                        .iter()
+                        .position(|p| p.work.sequence_id.0 == seq_id)
+                    else {
+                        continue;
+                    };
+                    if self.active_prefills[i].error.is_some()
+                        || self.active_prefills[i].final_logits.is_some()
+                    {
+                        continue;
+                    }
+                    if self.active_prefills[i].prefill_start.is_none() {
+                        self.active_prefills[i].prefill_start = Some(Instant::now());
+                    }
+                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
+                        Ok(t) => {
+                            kept.push(m);
+                            seq_ids.push(seq_id);
+                            inputs.push(t);
+                            prefill_gidxs.push(i);
+                        }
+                        Err(e) => self.active_prefills[i].error = Some(ConversationError::Model(e)),
+                    }
+                }
+                WaveMember::Section { seq_id, advance } => {
+                    let Some(i) = self
+                        .active_section_ingests
+                        .iter()
+                        .position(|s| s.sequence_id.0 == seq_id)
+                    else {
+                        continue;
+                    };
+                    if self.active_section_ingests[i].error.is_some() {
+                        continue;
+                    }
+                    let off = self.active_section_ingests[i].offset;
+                    let end = (off + advance).min(self.active_section_ingests[i].tokens.len());
+                    let toks: Vec<u32> = self.active_section_ingests[i].tokens[off..end].to_vec();
+                    match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
+                        Ok(t) => {
+                            kept.push(m);
+                            seq_ids.push(seq_id);
+                            inputs.push(t);
+                        }
+                        Err(e) => {
+                            self.active_section_ingests[i].error =
+                                Some(ConversationError::Model(e))
+                        }
+                    }
+                }
+            }
+        }
+        (kept, seq_ids, inputs, prefill_gidxs)
+    }
+
+    /// Finish a wave group that reached the final layer: `members`/`member_logits`
+    /// are aligned in caller order. Prefill members commit their offset, emit
+    /// staged/progress events and record `final_logits` for promotion to decode;
+    /// section members advance their chunk + record slot tokens (sealed later by
+    /// `finalize_done_section_ingests`). Clears the group.
+    fn complete_wave_group(&mut self, members: &[WaveMember], member_logits: &[Tensor]) {
+        for (k, m) in members.iter().enumerate() {
+            match *m {
+                WaveMember::Prefill { seq_id: sid } => {
+                    let Some(i) = self
+                        .active_prefills
+                        .iter()
+                        .position(|p| p.work.sequence_id.0 == sid)
+                    else {
+                        continue;
+                    };
+                    let total = self.active_prefills[i].work.tokens.len();
+                    let seq_id = self.active_prefills[i].work.sequence_id;
+                    if let Err(e) = self.session.advance_sequence(seq_id.0, total) {
+                        self.active_prefills[i].error = Some(ConversationError::Model(e));
+                        continue;
+                    }
+                    let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &all_tokens);
+                    self.active_prefills[i].offset = total;
+                    // Staged calibration prefill: emit every segment's pinned
+                    // projection here at completion (a wave processes the whole
+                    // token set at once).
+                    if let Some(comp) = self.active_prefills[i].work.staged_composition.clone() {
+                        let gen_start = self.active_prefills[i].work.assistant_content_start;
+                        let offs = self.active_prefills[i].work.projection_offsets.clone();
+                        for seg in 0..offs.len() {
+                            let prev_off = if seg == 0 { gen_start } else { offs[seg - 1] };
+                            let mut ev = comp.clone();
+                            ev.start_token = prev_off.saturating_sub(gen_start);
+                            let _ = self.active_prefills[i]
+                                .work
+                                .event_tx
+                                .send(TurnEvent::Projection(ev));
+                        }
+                        self.active_prefills[i].next_projection = offs.len();
+                    }
                     let _ = self.active_prefills[i]
                         .work
                         .event_tx
-                        .send(TurnEvent::Projection(ev));
+                        .send(TurnEvent::PrefillProgress {
+                            tokens_done: total,
+                            tokens_total: total,
+                        });
+                    if let Some(l) = member_logits.get(k) {
+                        self.active_prefills[i].final_logits = Some(l.clone());
+                    }
                 }
-                self.active_prefills[i].next_projection = offs.len();
-            }
-            let _ = self.active_prefills[i]
-                .work
-                .event_tx
-                .send(TurnEvent::PrefillProgress {
-                    tokens_done: total,
-                    tokens_total: total,
-                });
-            if let Some(l) = logits.get(k) {
-                self.active_prefills[i].final_logits = Some(l.clone());
+                WaveMember::Section { seq_id: sid, advance } => {
+                    let Some(i) = self
+                        .active_section_ingests
+                        .iter()
+                        .position(|s| s.sequence_id.0 == sid)
+                    else {
+                        continue;
+                    };
+                    if let Err(e) = self.session.advance_sequence(sid, advance) {
+                        self.active_section_ingests[i].error = Some(ConversationError::Model(e));
+                        continue;
+                    }
+                    let seq_id = self.active_section_ingests[i].sequence_id;
+                    let off = self.active_section_ingests[i].offset;
+                    let end = (off + advance).min(self.active_section_ingests[i].tokens.len());
+                    let chunk_tokens = self.active_section_ingests[i].tokens[off..end].to_vec();
+                    super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
+                    self.active_section_ingests[i].offset = end;
+                }
             }
         }
         self.reset_wave_prefill();
     }
 
-    /// Decode forward, **co-batching** the in-flight prefill cohort into decode's
-    /// sweep at the cohort's active layer window (`docs/continuous_fair_waves.md`).
+    /// Route a wave-group forward failure. On device-OOM, requeue the prefill
+    /// members' scope prefills ([`Self::handle_prefill_oom`]) — section members and
+    /// dialogue turns just retry next wave once the group is dropped. On any other
+    /// error, surface it on each member's backing entry. Always resets the group.
+    fn fail_wave_group(
+        &mut self,
+        members: &[WaveMember],
+        prefill_gidxs: &[usize],
+        err: &candle::Error,
+    ) {
+        if candle_nn::kv_cache::is_device_oom(err) {
+            self.handle_prefill_oom(prefill_gidxs, err);
+        } else {
+            let msg = format!("wave group forward failed: {err}");
+            for m in members {
+                match *m {
+                    WaveMember::Prefill { seq_id } => {
+                        if let Some(i) = self
+                            .active_prefills
+                            .iter()
+                            .position(|p| p.work.sequence_id.0 == seq_id)
+                        {
+                            self.active_prefills[i].error =
+                                Some(ConversationError::Channel(msg.clone()));
+                        }
+                    }
+                    WaveMember::Section { seq_id, .. } => {
+                        if let Some(i) = self
+                            .active_section_ingests
+                            .iter()
+                            .position(|s| s.sequence_id.0 == seq_id)
+                        {
+                            self.active_section_ingests[i].error =
+                                Some(ConversationError::Channel(msg.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        self.reset_wave_prefill();
+    }
+
+    /// Decode forward, **co-batching** the creeping prefill group into decode's
+    /// sweep (`docs/continuous_fair_waves.md`). One shared expert load per layer
+    /// serves every co-batched row — the whole point on the streaming box.
     ///
-    /// Decode sweeps all `N` layers; the prefill cohort shares the layer's grouped
-    /// GEMM (one expert load serves both) only in `[cursor, cursor+budget)`, then
-    /// its residual is persisted (or its logits promoted when it reaches `N`). The
-    /// sweep is segmented so decode runs alone before/after the window:
-    ///   `[0, cursor)` decode-only → `[cursor, win_end)` decode+prefill →
-    ///   `[win_end, N)` decode-only.
-    /// Only the FIRST decode step of a quantum folds the cohort in (guarded by
-    /// `wave_cohort_advanced`); the rest — and the no-cohort case — are plain
-    /// decode forwards.
+    /// The wave group is dialogue prefills plus (when they co-form) section-ingest
+    /// chunks; decode sweeps all `N` layers while the group shares the grouped GEMM
+    /// only in `[cursor, win_end)`, so the sweep splits into up to THREE segments
+    /// (`[0, cursor)` / `[cursor, win_end)` / `[win_end, N)`). The group's residual
+    /// is an OPAQUE internal-order buffer held **whole** across waves — the segment
+    /// split narrows only `[decode | group]` at `n_dec`, never *within* the group,
+    /// so `forward_wave`'s singles-before-multis internal reorder stays intact. At
+    /// the head, per-sequence logits ARE caller-ordered, so members separate
+    /// cleanly there: prefills promote to decode, sections advance + seal.
+    ///
+    /// When NO group is forming (no dialogue prefill), a pending section chunk
+    /// co-batches directly instead: decode + section as one full-sweep `[0, N)`
+    /// forward (no residual to hold; logits `[decode | section]` split at `n_dec`).
+    /// This is the common ingest-while-decoding case.
+    ///
+    /// Only the first decode step of a quantum folds work in (guarded by
+    /// `wave_cohort_advanced` / `wave_section_advanced`); the rest are plain decode.
     pub(super) fn decode_forward_cobatched(
         &mut self,
         decode_seqs: &[usize],
         decode_inputs: &[Tensor],
     ) -> candle::Result<Vec<Tensor>> {
-        // Already folded the cohort into a decode step this wave → plain decode
-        // (only the first decode step of a quantum co-batches).
-        if self.wave_cohort_advanced {
-            return self
-                .model
-                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
-        }
-
         let n = self.model.num_layers().max(1);
+        let n_dec = decode_seqs.len();
+        let none_seqs: [usize; 0] = [];
+        let none_inputs: [Tensor; 0] = [];
+
         let budget = self.wave_prefill_layer_budget();
         let cursor = self.wave_prefill_cursor;
         let win_end = (cursor + budget).min(n);
 
-        // Co-batch ONLY when the prefill window sits at a sweep boundary — cursor 0
-        // (window at the start) or win_end == N (window at the end) — so decode's
-        // sweep splits into at most TWO segments and co-batching adds NO extra
-        // kernel launch over interleaving. A mid-sweep window (3 segments) is left
-        // to the interleaved prefill pass (`run_one_prefill_pass`, gated on
-        // `wave_cohort_advanced`), which advances the cohort in one separate forward
-        // while decode runs plain — so a small-budget (High-priority) throttle
-        // can't triple decode's launch cost (docs/continuous_fair_waves.md).
-        if cursor != 0 && win_end < n {
-            return self
-                .model
-                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
-        }
+        // Form/resume the wave group unless it was already advanced this wave.
+        // Decode is present here, so a fresh group folds section chunks in to
+        // co-batch the creep (`form_wave_group(true)`).
+        let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
+            if cursor == 0 && self.wave_prefill_residual.is_none() {
+                // Fold sections into the fresh group only if the standalone section
+                // pass hasn't already run this wave (section-first ordering) — else
+                // the same chunk would be admitted twice.
+                self.form_wave_group(!self.wave_section_advanced);
+            }
+            self.build_wave_group_inputs()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
-        // Form a fresh cohort from ready prefills if none is in flight.
-        if self.wave_prefill_cursor == 0 && self.wave_prefill_residual.is_none() {
-            self.wave_prefill_seqs = (0..self.active_prefills.len())
-                .filter(|&i| {
-                    let p = &self.active_prefills[i];
-                    p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
-                })
-                .map(|i| self.active_prefills[i].work.sequence_id.0)
-                .collect();
-        }
-        if self.wave_prefill_seqs.is_empty() {
-            return self
-                .model
-                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
-        }
-
-        // Build the cohort's sequences + full-token inputs.
-        let cohort = self.wave_prefill_seqs.clone();
-        let mut pf_seqs: Vec<usize> = Vec::with_capacity(cohort.len());
-        let mut pf_inputs: Vec<Tensor> = Vec::with_capacity(cohort.len());
-        for &sid in &cohort {
-            let Some(i) = self
-                .active_prefills
-                .iter()
-                .position(|p| p.work.sequence_id.0 == sid)
-            else {
-                continue;
+        // No group to creep → co-batch a standalone section chunk with decode if
+        // one is pending (first decode step only), else plain decode.
+        if seq_ids.is_empty() {
+            let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
+                if self.vram_under_pressure() {
+                    self.relieve_vram_pressure("section", VramPhase::Load);
+                }
+                self.build_section_batch()
+            } else {
+                None
             };
-            if self.active_prefills[i].error.is_some()
-                || self.active_prefills[i].final_logits.is_some()
-            {
-                continue;
-            }
-            if self.active_prefills[i].prefill_start.is_none() {
-                self.active_prefills[i].prefill_start = Some(Instant::now());
-            }
-            let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
-            if let Ok(t) = Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
-                pf_seqs.push(sid);
-                pf_inputs.push(t);
-            }
+            let Some((sec_seqs, sec_inputs, sec_gidx, sec_adv)) = section else {
+                // Plain decode full sweep (any held group residual stays for its
+                // own wave; this decode step folds nothing).
+                return self
+                    .model
+                    .forward_wave(
+                        &mut self.session,
+                        decode_seqs,
+                        decode_inputs,
+                        &none_seqs,
+                        &none_inputs,
+                        &none_seqs,
+                        &none_inputs,
+                        0,
+                        n,
+                        None,
+                    )
+                    .map(|s| s.logits.unwrap_or_default());
+            };
+            // Decode + section, one full-sweep [0, N) forward: section rides
+            // decode's whole sweep, no residual to hold. Logits are caller-ordered
+            // `[decode | section]`; section logits are unused (advance + seal).
+            self.wave_section_advanced = true;
+            let out = self.model.forward_wave(
+                &mut self.session,
+                decode_seqs,
+                decode_inputs,
+                &sec_seqs,
+                &sec_inputs,
+                &none_seqs,
+                &none_inputs,
+                0,
+                n,
+                None,
+            )?;
+            let logits = out.logits.unwrap_or_default();
+            let d = n_dec.min(logits.len());
+            let dec_logits = logits[..d].to_vec();
+            self.complete_section_chunk(&sec_gidx, &sec_adv);
+            return Ok(dec_logits);
         }
-        if pf_seqs.is_empty() {
-            self.reset_wave_prefill();
-            return self
-                .model
-                .forward_batched(&mut self.session, decode_seqs, decode_inputs);
-        }
+
+        // Co-batch decode (all N) + the creeping group ([cursor, win_end)). The
+        // sweep splits into up to three segments; the group rides only the middle,
+        // its residual held WHOLE between waves (opaque internal order). Section
+        // members already sit inside `members` — they creep with the group; the
+        // held residual is never split within the group, so the internal reorder
+        // is preserved.
         self.wave_cohort_advanced = true;
-        let n_dec = decode_seqs.len();
-        let none_seqs: [usize; 0] = [];
-        let none_inputs: [Tensor; 0] = [];
 
         // Segment 1 — decode-only [0, cursor).
         let dec_res: Option<Tensor> = if cursor > 0 {
@@ -1816,9 +2006,9 @@ impl Scheduler {
             None
         };
 
-        // Segment 2 — co-batch decode + prefill over [cursor, win_end). Resume
-        // each type from its layer-`cursor` residual (concatenated); at cursor 0
-        // both embed fresh (residual None).
+        // Segment 2 — co-batch decode + group over [cursor, win_end). Resume each
+        // from its layer-`cursor` residual (concatenated `[decode | group]`); at
+        // cursor 0 both embed fresh (residual None).
         let pf_res = self.wave_prefill_residual.take();
         let seg2_in: Option<Tensor> = match (dec_res.as_ref(), pf_res.as_ref()) {
             (Some(d), Some(p)) => Some(Tensor::cat(&[d, p], 1)?),
@@ -1826,41 +2016,53 @@ impl Scheduler {
             (None, Some(p)) => Some(p.clone()),
             (None, None) => None,
         };
-        let seg2 = self.model.forward_wave(
+        let seg2 = match self.model.forward_wave(
             &mut self.session,
             decode_seqs,
             decode_inputs,
-            &pf_seqs,
-            &pf_inputs,
+            &seq_ids,
+            &inputs,
             &none_seqs,
             &none_inputs,
             cursor,
             win_end,
             seg2_in,
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The co-batched group forward failed: drop the group cleanly
+                // (requeue scope prefills on OOM) so a fresh one forms next wave,
+                // then surface the error to the decode caller.
+                self.fail_wave_group(&members, &prefill_gidxs, &e);
+                return Err(e);
+            }
+        };
 
         if win_end >= n {
-            // Reached the head inside the window: logits for [decode | prefill].
+            // Reached the head inside the window: per-sequence logits, caller order
+            // `[decode | group]`. Split at n_dec; the group portion aligns with
+            // `members` (prefills promote, sections seal).
             let logits = seg2.logits.unwrap_or_default();
             let split = n_dec.min(logits.len());
-            let (dec_logits, pf_logits) = logits.split_at(split);
-            self.complete_wave_cohort(&pf_seqs, pf_logits);
+            let (dec_logits, member_logits) = logits.split_at(split);
+            self.complete_wave_group(&members, member_logits);
             return Ok(dec_logits.to_vec());
         }
 
-        // Paused: split the combined residual back into decode + prefill parts.
+        // Paused: split the combined per-token residual into decode + group parts.
+        // The group part is held WHOLE (opaque internal order) for its next window.
         let res = seg2
             .residual
             .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
-        let pf_rows: usize = pf_inputs
+        let group_rows: usize = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
         let dec_part = res.narrow(1, 0, n_dec)?;
-        let pf_part = res.narrow(1, n_dec, pf_rows)?;
-        self.wave_prefill_residual = Some(pf_part);
+        let group_part = res.narrow(1, n_dec, group_rows)?;
+        self.wave_prefill_residual = Some(group_part);
         self.wave_prefill_cursor = win_end;
-        self.wave_prefill_seqs = pf_seqs;
+        self.wave_prefill_members = members;
 
         // Segment 3 — decode-only [win_end, N) → decode logits.
         let seg3 = self.model.forward_wave(
@@ -2364,9 +2566,22 @@ impl Scheduler {
                 let input = Tensor::new(chunk, &self.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(ConversationError::Model)?;
+                let nl = self.model.num_layers();
                 let logits_vec = self
                     .model
-                    .forward_batched(&mut self.session, &[sequence_id.0], &[input])
+                    .forward_wave(
+                        &mut self.session,
+                        &[],
+                        &[],
+                        &[sequence_id.0],
+                        &[input],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )
+                    .map(|s| s.logits.unwrap_or_default())
                     .map_err(ConversationError::Model)?;
                 self.session
                     .advance_sequence(sequence_id.0, chunk.len())
@@ -2384,7 +2599,19 @@ impl Scheduler {
 
             let logits_vec = self
                 .model
-                .forward_batched(&mut self.session, &[sequence_id.0], &[input])
+                .forward_wave(
+                    &mut self.session,
+                    &[],
+                    &[],
+                    &[sequence_id.0],
+                    &[input],
+                    &[],
+                    &[],
+                    0,
+                    self.model.num_layers().max(1),
+                    None,
+                )
+                .map(|s| s.logits.unwrap_or_default())
                 .map_err(ConversationError::Model)?;
 
             self.session

@@ -104,11 +104,15 @@ impl Scheduler {
     /// Run section ingest chunks until the budget is reached or all ingests
     /// are done. Uses the same PREFILL_BUDGET constant so section ingests and
     /// turn prefills each get one chunk per loop iteration.
+    ///
+    /// `finalize_done_section_ingests` runs every iteration regardless of pending
+    /// width: a chunk co-batched into the decode wave (`wave_section_advanced`)
+    /// advances the section there, so a section it *completed* must still seal here
+    /// even though `run_one_section_ingest_chunk` is now a no-op. `build_section_batch`
+    /// / `run_one_section_ingest_chunk` self-guard on empty + already-advanced, so
+    /// the no-work case is cheap.
     fn run_section_ingest_until_budget(&mut self) {
         for _ in 0..PREFILL_BUDGET {
-            if self.section_ingest_width() == 0 {
-                return;
-            }
             self.run_one_section_ingest_chunk();
             self.finalize_done_section_ingests();
         }
@@ -212,6 +216,7 @@ impl Scheduler {
             // reset here (before both quanta) so its meaning is per-wave regardless
             // of the width-ordered dispatch below.
             self.wave_cohort_advanced = false;
+            self.wave_section_advanced = false;
             let dw = self.foreground_decode_width();
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();

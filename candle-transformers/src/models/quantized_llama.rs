@@ -2454,7 +2454,22 @@ mod tests {
                 (1, prefill_len),
                 &device,
             )?;
-            let logits_vec = model.forward_batched(&mut session, &[seq_idx], &[prefill_input])?;
+            let nl = model.num_layers();
+            let logits_vec = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &[seq_idx],
+                    &[prefill_input],
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
@@ -2471,7 +2486,22 @@ mod tests {
                     .to_scalar::<u32>()?;
                 all_tokens.push(next_token);
                 let input = Tensor::from_vec(vec![next_token], (1, 1), &device)?;
-                let out = model.forward_batched(&mut session, &[seq_idx], &[input])?;
+                let nl = model.num_layers();
+                let out = model
+                    .forward_wave(
+                        &mut session,
+                        &[seq_idx],
+                        &[input],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?
+                    .logits
+                    .unwrap_or_default();
                 session.advance_sequence(seq_idx, 1)?;
                 last_logits = out
                     .into_iter()
@@ -2630,11 +2660,39 @@ mod tests {
         let prefill_input = Tensor::from_vec(prefill_tokens.clone(), (1, prefill_len), &device)?;
 
         // Prefill both
-        let f16_logits =
-            model.forward_batched(&mut f16_session, &[f16_seq], &[prefill_input.clone()])?;
+        let nl = model.num_layers();
+        let f16_logits = model
+            .forward_wave(
+                &mut f16_session,
+                &[],
+                &[],
+                &[f16_seq],
+                &[prefill_input.clone()],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )?
+            .logits
+            .unwrap_or_default();
         f16_session.advance_sequence(f16_seq, prefill_len)?;
 
-        let r16_logits = model.forward_batched(&mut r16_session, &[r16_seq], &[prefill_input])?;
+        let r16_logits = model
+            .forward_wave(
+                &mut r16_session,
+                &[],
+                &[],
+                &[r16_seq],
+                &[prefill_input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )?
+            .logits
+            .unwrap_or_default();
         r16_session.advance_sequence(r16_seq, prefill_len)?;
 
         let f16_l = &f16_logits[0]; // [1, vocab]
@@ -2681,10 +2739,39 @@ mod tests {
         for step in 0..num_decode {
             let input = Tensor::from_vec(vec![next_token], (1, 1), &device)?;
 
-            let f16_out = model.forward_batched(&mut f16_session, &[f16_seq], &[input.clone()])?;
+            let nl = model.num_layers();
+            let f16_out = model
+                .forward_wave(
+                    &mut f16_session,
+                    &[f16_seq],
+                    &[input.clone()],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
             f16_session.advance_sequence(f16_seq, 1)?;
 
-            let r16_out = model.forward_batched(&mut r16_session, &[r16_seq], &[input])?;
+            let r16_out = model
+                .forward_wave(
+                    &mut r16_session,
+                    &[r16_seq],
+                    &[input],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
             r16_session.advance_sequence(r16_seq, 1)?;
 
             let f16_l = &f16_out[0];

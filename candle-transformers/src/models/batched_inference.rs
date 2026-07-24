@@ -14,8 +14,14 @@
 //!     num_layers, n_kv_head, head_dim, &device, BatchedConfig::default()
 //! )?;
 //!
-//! // Run batched inference - BatchedInference<M> implements ManagedBatchedModel
-//! let outputs = model.forward_batched(&mut session, &seq_indices, &input_tensors)?;
+//! // Run batched inference - BatchedInference<M> implements ManagedBatchedModel.
+//! // `forward_wave` is the single forward entry: a full-sweep prefill group here
+//! // (empty decode/glue groups, layers `[0, num_layers)`, no resumed residual).
+//! let n = model.num_layers();
+//! let outputs = model
+//!     .forward_wave(&mut session, &[], &[], &seq_indices, &input_tensors, &[], &[], 0, n, None)?
+//!     .logits
+//!     .unwrap_or_default();
 //! ```
 
 use super::expert_lre::PipelineStats;
@@ -2740,48 +2746,6 @@ pub trait ManagedBatchedModel {
         }
     }
 
-    /// Run a batched forward pass for specific sequences.
-    ///
-    /// This method processes a subset of sequences in parallel, using the session's
-    /// chunked KV backing for efficient paged attention.
-    ///
-    /// # Arguments
-    /// * `session` - The batched inference session managing KV caches
-    /// * `seq_indices` - Which sequence indices to process
-    /// * `inputs` - Input tensors, one per sequence in seq_indices (same order)
-    ///
-    /// # Returns
-    /// A vector of output logits tensors, one per input sequence.
-    fn forward_batched(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-    ) -> Result<Vec<Tensor>>;
-
-    /// Re-entrant, layer-range forward for the continuous-fair-wave engine
-    /// (`docs/continuous_fair_waves.md`). Runs layers `[layer_start, layer_end)`
-    /// over `seq_indices`, threading the inter-layer residual stream:
-    ///
-    /// - `residual_in = None` embeds `inputs` (entry into the first layer);
-    ///   `Some(packed)` resumes a paused batch from its persisted residual.
-    /// - The returned [`WaveStep`] carries `residual: Some(_)` when the range
-    ///   stopped short of the last layer (persist + resume next wave), or
-    ///   `logits: Some(_)` (one row per sequence) when it reached the head.
-    ///
-    /// The caller advances `SequenceState.offset` only when a prefill's residual
-    /// reaches the head — the tokens are not committed to the sequence until the
-    /// full stack has run.
-    fn forward_batched_layers(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-        layer_start: usize,
-        layer_end: usize,
-        residual_in: Option<Tensor>,
-    ) -> Result<WaveStep>;
-
     /// Co-batched continuous-fair-wave forward: run decode (q=1) + prefill (q=N) +
     /// glue (q=G) rows through ONE forward (layer range `[layer_start, layer_end)`)
     /// with the mixed attention dispatch and the single shared FFN/MoE
@@ -2934,301 +2898,6 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         }
     }
 
-    fn forward_batched(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-    ) -> Result<Vec<Tensor>> {
-        if inputs.len() != seq_indices.len() {
-            candle::bail!(
-                "Input count {} doesn't match sequence count {}",
-                inputs.len(),
-                seq_indices.len()
-            );
-        }
-
-        // A ragged batch that MIXES single- and multi-token sequences must route
-        // its 1-token rows through the DECODE kernel: the paged prefill kernel
-        // diverges from the canonical decode kernel for q_len==1 (GPU-verified),
-        // but this path routes the whole batch by `max_input_len`, so a lone
-        // 1-token member would ride the prefill kernel. Delegate the mixed case to
-        // the wave path, which splits single-token prefills into the decode group
-        // and restores order. Homogeneous batches (all-decode via `max_input_len==1`,
-        // or all-multi-token prefill) keep the direct path below (which also slices
-        // oversized prefills); mixed batches are caller-bounded like every other
-        // `forward_wave` caller.
-        {
-            let lens: Vec<usize> = inputs
-                .iter()
-                .map(|t| t.dims().get(1).copied().unwrap_or(1))
-                .collect();
-            if lens.iter().any(|&l| l == 1) && lens.iter().any(|&l| l > 1) {
-                let step = self.forward_wave(
-                    session,
-                    &[],
-                    &[],
-                    seq_indices,
-                    inputs,
-                    &[],
-                    &[],
-                    0,
-                    self.num_layers(),
-                    None,
-                )?;
-                return step.logits.ok_or_else(|| {
-                    candle::Error::Msg("forward_batched: wave delegation produced no logits".into())
-                });
-            }
-        }
-
-        // Hold a generation guard for the entire forward pass.  This keeps
-        // the pinned arena alive so all device-mapped pointers from
-        // stager.submit() (used by quantization kernels) remain valid until
-        // every layer's kernels have completed.  Dropped at function exit,
-        // which syncs the stream and reclaims overflow arenas.
-        let stager_generation = session.begin_stager_generation();
-
-        // Calculate max input length for capacity
-        let max_input_len = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .max()
-            .unwrap_or(1);
-
-        // NOTE: We intentionally do NOT call session.ensure_capacity() here.
-        //
-        // Both the prefill path (paged_prefill_batched → ensure_chunked_capacity_batch)
-        // and the decode path (paged_decode_attention → ensure_chunked_capacity_batch)
-        // ensure capacity per-layer, right before each layer processes.
-        //
-        // Pre-allocating across ALL layers simultaneously is harmful for quantized
-        // KV cache modes (Q4_0, Q8_0): it creates float arenas for all 32 layers
-        // at once, consuming ~18 GB of VRAM before any reconciliation can free them.
-        // Per-layer allocation allows reconcile + consolidation to release float
-        // arenas after each layer, keeping peak memory bounded.
-
-        // Build the final decode/prefill headers before the mutable caches borrow.
-        // Fetch per-sequence offsets now (immutable borrow) so prefill meta can be
-        // built here — eliminating the two-phase override later.
-        let seq_offsets: Vec<usize> = seq_indices
-            .iter()
-            .map(|&i| session.sequence_offset(i).unwrap_or(0))
-            .collect();
-        // Per-sequence new-token (query) lengths — ragged across the prefill batch.
-        let input_lens: Vec<usize> = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .collect();
-        #[cfg(feature = "cuda")]
-        let (_pm_guard, decode_headers) = if max_input_len == 1 {
-            let (pm_guard, buf, stride) =
-                session.build_decode_metadata(seq_indices, &stager_generation)?;
-            (pm_guard, DecodeHeaders::Decode { buf, stride })
-        } else {
-            let mut meta =
-                BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
-            // A reprojection-glue forward stages its per-slot glue descriptors on
-            // the session; attach them so the layer routes HD128 to the paged-glue
-            // kernel. Consumed once — ordinary prefills leave `glue` None.
-            if let Some(pending) = session.take_pending_glue() {
-                meta.glue = build_glue_meta(pending, &input_lens, self.device())?;
-            }
-            (None, DecodeHeaders::Prefill(meta))
-        };
-        #[cfg(not(feature = "cuda"))]
-        let decode_headers = if max_input_len == 1 {
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            }
-        } else {
-            let meta = BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
-            DecodeHeaders::Prefill(meta)
-        };
-
-        // Get caches for the requested sequences
-        let mut caches_data = session.caches_for_sequences_mut(seq_indices);
-
-        // Build contexts from the collected data
-        let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(inputs.len());
-        for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
-            contexts.push(SequenceContext {
-                offset: *offset,
-                kv_caches: caches,
-                input_ids: &inputs[i],
-                input_len: input_lens[i],
-            });
-        }
-
-        // Slice large prefills to bound a single forward's token count. Ragged:
-        // group sequences so each slice's TOTAL tokens (Σ input_lens) stays within
-        // MAX_PREFILL_TOKENS, rather than count × max_len. Decode (1 token/seq) is
-        // cheap and never sliced.
-        let total_tokens: usize = input_lens.iter().sum();
-        let outputs = if total_tokens > MAX_PREFILL_TOKENS && max_input_len > 1 {
-            let mut all_logits = Vec::with_capacity(contexts.len());
-            let mut slice_start = 0usize;
-            while slice_start < contexts.len() {
-                // Grow the slice until the next sequence would exceed the token
-                // budget; always take at least one sequence.
-                let mut slice_tokens = 0usize;
-                let mut slice_end = slice_start;
-                while slice_end < contexts.len() {
-                    let l = contexts[slice_end].input_len;
-                    if slice_end > slice_start && slice_tokens + l > MAX_PREFILL_TOKENS {
-                        break;
-                    }
-                    slice_tokens += l;
-                    slice_end += 1;
-                }
-                let slice = &mut contexts[slice_start..slice_end];
-                let offsets: Vec<usize> = slice.iter().map(|c| c.offset).collect();
-                let lens: Vec<usize> = slice.iter().map(|c| c.input_len).collect();
-                let meta = BatchedPrefillMeta::new_ragged(&offsets, &lens, self.device())?;
-                let slice_logits =
-                    self.forward_batch(slice, &stager_generation, DecodeHeaders::Prefill(meta))?;
-                all_logits.extend(slice_logits.into_vec()?);
-                slice_start = slice_end;
-            }
-            all_logits
-        } else {
-            // Small enough to process in one shot
-            self.forward_batch(&mut contexts, &stager_generation, decode_headers)?
-                .into_vec()?
-        };
-
-        if max_input_len > 1 {
-            let _ = session.compact_check()?;
-        }
-
-        Ok(outputs)
-    }
-
-    fn forward_batched_layers(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-        layer_start: usize,
-        layer_end: usize,
-        residual_in: Option<Tensor>,
-    ) -> Result<WaveStep> {
-        if inputs.len() != seq_indices.len() {
-            candle::bail!(
-                "Input count {} doesn't match sequence count {}",
-                inputs.len(),
-                seq_indices.len()
-            );
-        }
-        // A ragged batch mixing single- and multi-token sequences routes its
-        // 1-token rows through the DECODE kernel via the wave path (see
-        // `forward_batched` for why). Homogeneous batches keep the direct path.
-        {
-            let lens: Vec<usize> = inputs
-                .iter()
-                .map(|t| t.dims().get(1).copied().unwrap_or(1))
-                .collect();
-            if lens.iter().any(|&l| l == 1) && lens.iter().any(|&l| l > 1) {
-                return self.forward_wave(
-                    session,
-                    &[],
-                    &[],
-                    seq_indices,
-                    inputs,
-                    &[],
-                    &[],
-                    layer_start,
-                    layer_end,
-                    residual_in,
-                );
-            }
-        }
-        // Same generation guard + header build as `forward_batched`; the only
-        // differences are the layer range, the resumable residual, and that the
-        // head runs (logits) only when the range reaches the last layer.
-        let stager_generation = session.begin_stager_generation();
-        let max_input_len = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .max()
-            .unwrap_or(1);
-        let seq_offsets: Vec<usize> = seq_indices
-            .iter()
-            .map(|&i| session.sequence_offset(i).unwrap_or(0))
-            .collect();
-        let input_lens: Vec<usize> = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .collect();
-        #[cfg(feature = "cuda")]
-        let (_pm_guard, decode_headers) = if max_input_len == 1 {
-            let (pm_guard, buf, stride) =
-                session.build_decode_metadata(seq_indices, &stager_generation)?;
-            (pm_guard, DecodeHeaders::Decode { buf, stride })
-        } else {
-            let mut meta =
-                BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
-            if let Some(pending) = session.take_pending_glue() {
-                meta.glue = build_glue_meta(pending, &input_lens, self.device())?;
-            }
-            (None, DecodeHeaders::Prefill(meta))
-        };
-        #[cfg(not(feature = "cuda"))]
-        let decode_headers = if max_input_len == 1 {
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            }
-        } else {
-            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
-                &seq_offsets,
-                &input_lens,
-                self.device(),
-            )?)
-        };
-
-        let mut caches_data = session.caches_for_sequences_mut(seq_indices);
-        let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(inputs.len());
-        for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
-            contexts.push(SequenceContext {
-                offset: *offset,
-                kv_caches: caches,
-                input_ids: &inputs[i],
-                input_len: input_lens[i],
-            });
-        }
-
-        // A resumed batch feeds its persisted residual back as the wave's `x`.
-        // Wave prefills are bounded (the rolling-window ingest context), so a
-        // single forward covers the batch — no `MAX_PREFILL_TOKENS` slicing here.
-        let x_in = residual_in
-            .map(|t| TensorCat::from_cat_tensor(t, 0))
-            .transpose()?;
-        let phase = self.forward_batch_layers(
-            &mut contexts,
-            &stager_generation,
-            decode_headers,
-            layer_start,
-            layer_end,
-            x_in,
-        )?;
-        let step = match phase {
-            WavePhase::Residual(x) => WaveStep {
-                residual: Some(x.to_tensor()),
-                logits: None,
-            },
-            WavePhase::Logits(l) => WaveStep {
-                residual: None,
-                logits: Some(l.into_vec()?),
-            },
-        };
-        if max_input_len > 1 && step.logits.is_some() {
-            let _ = session.compact_check()?;
-        }
-        Ok(step)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn forward_wave(
         &self,
@@ -3249,6 +2918,69 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         {
             candle::bail!("forward_wave: input/seq length mismatch");
         }
+
+        // Bound a single forward's token count: a PURE prefill full sweep whose
+        // total tokens exceed the budget is split into token-bounded sub-forwards
+        // and its logits concatenated (the slicing the retired `forward_batched`
+        // provided). Only applies with no decode/glue rows, a full `[0, N)` sweep,
+        // and no resumed residual — the co-batched / re-entrant paths are bounded
+        // by the scheduler's admission window + OOM retry instead.
+        let num_layers = self.num_layers();
+        if decode_seqs.is_empty()
+            && glue_seqs.is_empty()
+            && residual_in.is_none()
+            && layer_start == 0
+            && layer_end == num_layers
+        {
+            let lens: Vec<usize> = prefill_inputs
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(1))
+                .collect();
+            let total: usize = lens.iter().sum();
+            let max_len = lens.iter().copied().max().unwrap_or(1);
+            // Only slice ACROSS sequences: a single sequence over the budget can't
+            // be split (you can't slice within a sequence) and must run whole — as
+            // the old `forward_batched` did. Requiring `> 1` sequence also makes the
+            // recursion terminate: a one-sequence slice re-enters here, fails this
+            // guard, and runs whole instead of re-slicing itself forever.
+            if total > MAX_PREFILL_TOKENS && max_len > 1 && prefill_seqs.len() > 1 {
+                let mut all_logits: Vec<Tensor> = Vec::with_capacity(prefill_seqs.len());
+                let mut start = 0usize;
+                while start < prefill_seqs.len() {
+                    let mut toks = 0usize;
+                    let mut end = start;
+                    while end < prefill_seqs.len() {
+                        let l = lens[end];
+                        if end > start && toks + l > MAX_PREFILL_TOKENS {
+                            break;
+                        }
+                        toks += l;
+                        end += 1;
+                    }
+                    let step = self.forward_wave(
+                        session,
+                        &[],
+                        &[],
+                        &prefill_seqs[start..end],
+                        &prefill_inputs[start..end],
+                        &[],
+                        &[],
+                        0,
+                        num_layers,
+                        None,
+                    )?;
+                    all_logits.extend(step.logits.ok_or_else(|| {
+                        candle::Error::Msg("forward_wave slice: no logits".into())
+                    })?);
+                    start = end;
+                }
+                return Ok(WaveStep {
+                    residual: None,
+                    logits: Some(all_logits),
+                });
+            }
+        }
+
         let n_decode_in = decode_seqs.len();
         let n_prefill_in = prefill_seqs.len();
 

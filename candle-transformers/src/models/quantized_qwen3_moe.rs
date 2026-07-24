@@ -2098,7 +2098,7 @@ mod tests {
         {
             use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{
-                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
+                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
             };
             use crate::models::batched_model::BatchedInference;
 
@@ -2134,10 +2134,33 @@ mod tests {
                 let nb = (&b * &b)?.sum_all()?.to_scalar::<f32>()?.sqrt();
                 Ok(dot / (na * nb + 1e-6))
             };
+            // Single-group reference forward through the unified wave entry: one
+            // prefill group, full sweep. `forward_wave` reclassifies q=1 rows into
+            // the decode group internally, so this is exactly the old `forward_batched`.
+            let fb = |session: &mut BatchedInferenceSession,
+                      seqs: &[usize],
+                      inputs: &[Tensor]|
+             -> Result<Vec<Tensor>> {
+                Ok(model
+                    .forward_wave(session, &[], &[], seqs, inputs, &[], &[], 0, n, None)?
+                    .logits
+                    .unwrap_or_default())
+            };
+            // Layer-range reference through the wave entry (the retired
+            // `forward_batched_layers`): prefill group, layers `[ls, le)`, residual.
+            let fbl = |session: &mut BatchedInferenceSession,
+                       seqs: &[usize],
+                       inputs: &[Tensor],
+                       ls: usize,
+                       le: usize,
+                       residual: Option<Tensor>|
+             -> Result<WaveStep> {
+                model.forward_wave(session, &[], &[], seqs, inputs, &[], &[], ls, le, residual)
+            };
             // Prefill an identical `ctx` context into `s`, leaving offset at ctx.len().
-            let mut prep =
+            let prep =
                 |session: &mut BatchedInferenceSession, s: usize, ctx: &[u32]| -> Result<()> {
-                    let _ = model.forward_batched(session, &[s], &[mk(ctx)?])?;
+                    let _ = fb(session, &[s], &[mk(ctx)?])?;
                     session.advance_sequence(s, ctx.len())?;
                     Ok(())
                 };
@@ -2157,8 +2180,8 @@ mod tests {
             prep(&mut session, p0, &ctx_p)?;
             prep(&mut session, p1, &ctx_p)?;
 
-            let sep_dec = model.forward_batched(&mut session, &[d0], &[mk(&dec_tok)?])?;
-            let sep_pre = model.forward_batched(&mut session, &[p0], &[mk(&pre_tok)?])?;
+            let sep_dec = fb(&mut session, &[d0], &[mk(&dec_tok)?])?;
+            let sep_pre = fb(&mut session, &[p0], &[mk(&pre_tok)?])?;
             let wave = model
                 .forward_wave(
                     &mut session,
@@ -2186,17 +2209,14 @@ mod tests {
             let b = session.create_sequence()?;
             prep(&mut session, a, &ctx_p)?;
             prep(&mut session, b, &ctx_p)?;
-            let full = model
-                .forward_batched_layers(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?
+            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?
                 .logits
                 .expect("full sweep logits");
             let k = n / 2;
-            let mid = model
-                .forward_batched_layers(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
+            let mid = fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
                 .residual
                 .expect("paused sweep must return a residual");
-            let split = model
-                .forward_batched_layers(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?
+            let split = fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?
                 .logits
                 .expect("resumed sweep logits");
             let c_split = cos(&full[0], &split[0])?;
@@ -2214,8 +2234,7 @@ mod tests {
             for &s in &[e0, e1, e2, e3] {
                 prep(&mut session, s, &ctx_d)?;
             }
-            let sep_d2 =
-                model.forward_batched(&mut session, &[e0, e1], &[mk(&dec_tok)?, mk(&dec_tok)?])?;
+            let sep_d2 = fb(&mut session, &[e0, e1], &[mk(&dec_tok)?, mk(&dec_tok)?])?;
             let wave_d2 = model
                 .forward_wave(
                     &mut session,
@@ -2251,8 +2270,8 @@ mod tests {
             prep(&mut session, dg, &ctx_d)?;
             prep(&mut session, dg2, &ctx_d)?;
             let one_tok = [61u32];
-            let sep_dec1 = model.forward_batched(&mut session, &[dg], &[mk(&dec_tok)?])?;
-            let sep_pre1 = model.forward_batched(&mut session, &[g0], &[mk(&one_tok)?])?;
+            let sep_dec1 = fb(&mut session, &[dg], &[mk(&dec_tok)?])?;
+            let sep_pre1 = fb(&mut session, &[g0], &[mk(&one_tok)?])?;
             let wave_1 = model
                 .forward_wave(
                     &mut session,
@@ -2290,11 +2309,10 @@ mod tests {
             prep(&mut session, r1s, &ctx_d)?;
             // References: each row run alone (r0s = multi-token prefill kernel, r1s
             // = 1-token → decode kernel via `max_input_len==1`).
-            let ref_multi = model.forward_batched(&mut session, &[r0s], &[mk(&pre_tok)?])?;
-            let ref_one = model.forward_batched(&mut session, &[r1s], &[mk(&one_tok)?])?;
-            // Mixed ragged batch [5-token, 1-token] in ONE forward_batched call.
-            let mixed =
-                model.forward_batched(&mut session, &[r0, r1], &[mk(&pre_tok)?, mk(&one_tok)?])?;
+            let ref_multi = fb(&mut session, &[r0s], &[mk(&pre_tok)?])?;
+            let ref_one = fb(&mut session, &[r1s], &[mk(&one_tok)?])?;
+            // Mixed ragged batch [5-token, 1-token] in ONE wave prefill group.
+            let mixed = fb(&mut session, &[r0, r1], &[mk(&pre_tok)?, mk(&one_tok)?])?;
             assert_eq!(mixed.len(), 2, "ragged batch = one logit row per sequence");
             let c_m = cos(&ref_multi[0], &mixed[0])?;
             let c_s = cos(&ref_one[0], &mixed[1])?;
@@ -2313,28 +2331,26 @@ mod tests {
             prep(&mut session, w0, &ctx_p)?;
             prep(&mut session, w1, &ctx_d)?;
             let kk = n / 2;
-            let mixed_res = model
-                .forward_batched_layers(
-                    &mut session,
-                    &[w0, w1],
-                    &[mk(&pre_tok)?, mk(&one_tok)?],
-                    0,
-                    kk,
-                    None,
-                )?
-                .residual
-                .expect("paused mixed cohort must return a residual");
-            let mixed_split = model
-                .forward_batched_layers(
-                    &mut session,
-                    &[w0, w1],
-                    &[mk(&pre_tok)?, mk(&one_tok)?],
-                    kk,
-                    n,
-                    Some(mixed_res),
-                )?
-                .logits
-                .expect("resumed mixed cohort must produce logits");
+            let mixed_res = fbl(
+                &mut session,
+                &[w0, w1],
+                &[mk(&pre_tok)?, mk(&one_tok)?],
+                0,
+                kk,
+                None,
+            )?
+            .residual
+            .expect("paused mixed cohort must return a residual");
+            let mixed_split = fbl(
+                &mut session,
+                &[w0, w1],
+                &[mk(&pre_tok)?, mk(&one_tok)?],
+                kk,
+                n,
+                Some(mixed_res),
+            )?
+            .logits
+            .expect("resumed mixed cohort must produce logits");
             assert_eq!(mixed_split.len(), 2, "split cohort = one logit row per seq");
             let c_sm = cos(&ref_multi[0], &mixed_split[0])?;
             let c_ss = cos(&ref_one[0], &mixed_split[1])?;
@@ -2346,6 +2362,105 @@ mod tests {
             assert!(
                 c_ss > 0.999,
                 "split mixed 1-token row corrupted on resume (cos={c_ss})"
+            );
+
+            // ── Test 3e: DECODE + a MULTI-MEMBER GROUP co-batched, then the
+            // combined `[decode | group]` residual split by `narrow` at n_dec and
+            // each part resumed INDEPENDENTLY — exactly the residual bookkeeping in
+            // `decode_forward_cobatched` when section chunks creep alongside the
+            // prefill cohort (group = [prefill-multi, section-multi, section-1tok]).
+            // Decode rows are first in `forward_wave`'s internal order, so
+            // `narrow(0, n_dec)` is the decode part and `narrow(n_dec, ..)` the group
+            // part (held WHOLE, never split within). Every resumed row must equal
+            // its solo full-sweep — a mis-split would corrupt decode or the ingest.
+            let kk2 = n / 2;
+            // Solo references (each row alone, full sweep) on their own sequences.
+            let rda = session.create_sequence()?;
+            let rga = session.create_sequence()?;
+            let rgb = session.create_sequence()?;
+            let rgc = session.create_sequence()?;
+            for &s in &[rda, rga, rgb, rgc] {
+                prep(&mut session, s, &ctx_d)?;
+            }
+            let sref_d = fb(&mut session, &[rda], &[mk(&dec_tok)?])?;
+            let sref_a = fb(&mut session, &[rga], &[mk(&pre_tok)?])?;
+            let sref_b = fb(&mut session, &[rgb], &[mk(&pre_tok)?])?;
+            let sref_c = fb(&mut session, &[rgc], &[mk(&one_tok)?])?;
+            // Co-batch decode [da] + group [ga, gb, gc], paused at kk2.
+            let da = session.create_sequence()?;
+            let ga = session.create_sequence()?;
+            let gb = session.create_sequence()?;
+            let gc = session.create_sequence()?;
+            for &s in &[da, ga, gb, gc] {
+                prep(&mut session, s, &ctx_d)?;
+            }
+            let combined = model
+                .forward_wave(
+                    &mut session,
+                    &[da],
+                    &[mk(&dec_tok)?],
+                    &[ga, gb, gc],
+                    &[mk(&pre_tok)?, mk(&pre_tok)?, mk(&one_tok)?],
+                    &[],
+                    &[],
+                    0,
+                    kk2,
+                    None,
+                )?
+                .residual
+                .expect("paused co-batch must return a residual");
+            // Split: 1 decode token, then the group's tokens (held whole).
+            let gtok = pre_tok.len() + pre_tok.len() + one_tok.len();
+            let dec_part = combined.narrow(1, 0, 1)?;
+            let grp_part = combined.narrow(1, 1, gtok)?;
+            // Resume decode alone to N.
+            let dec_fin = model
+                .forward_wave(
+                    &mut session,
+                    &[da],
+                    &[mk(&dec_tok)?],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    kk2,
+                    n,
+                    Some(dec_part),
+                )?
+                .logits
+                .expect("decode resume logits");
+            // Resume the group alone to N (members re-passed in the SAME order).
+            let grp_fin = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &[ga, gb, gc],
+                    &[mk(&pre_tok)?, mk(&pre_tok)?, mk(&one_tok)?],
+                    &[],
+                    &[],
+                    kk2,
+                    n,
+                    Some(grp_part),
+                )?
+                .logits
+                .expect("group resume logits");
+            assert_eq!(dec_fin.len(), 1, "decode resume = one row");
+            assert_eq!(grp_fin.len(), 3, "group resume = one row per member");
+            let c_ed = cos(&sref_d[0], &dec_fin[0])?;
+            let c_ea = cos(&sref_a[0], &grp_fin[0])?;
+            let c_eb = cos(&sref_b[0], &grp_fin[1])?;
+            let c_ec = cos(&sref_c[0], &grp_fin[2])?;
+            println!(
+                "co-batch split-residual resume: decode={c_ed:.5} group=[{c_ea:.5},{c_eb:.5},{c_ec:.5}]"
+            );
+            assert!(
+                c_ed > 0.999,
+                "decode part corrupted by residual split (cos={c_ed})"
+            );
+            assert!(
+                c_ea > 0.999 && c_eb > 0.999 && c_ec > 0.999,
+                "group member corrupted by residual split (cos=[{c_ea},{c_eb},{c_ec}])"
             );
 
             Ok(())
@@ -2403,20 +2518,45 @@ mod tests {
             // Sub-linear tok/s ⇒ per-session (non-amortized) work dominates.
             let ctx: Vec<u32> = (0..3000u32).map(|i| (i % 2900) + 100).collect();
             let n_steps = 60usize;
+            let nl = model.num_layers();
             let mut baseline_ms_step = 0.0f64;
             for (bi, &batch) in [1usize, 4, 16].iter().enumerate() {
                 let seqs: Vec<usize> = (0..batch)
                     .map(|_| session.create_sequence())
                     .collect::<Result<_>>()?;
                 for &sq in &seqs {
-                    let _ = model.forward_batched(&mut session, &[sq], &[mk(&ctx)?])?;
+                    // Context prefill (q>1): prefill group.
+                    let _ = model.forward_wave(
+                        &mut session,
+                        &[],
+                        &[],
+                        &[sq],
+                        &[mk(&ctx)?],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?;
                     session.advance_sequence(sq, ctx.len())?;
                 }
                 let inputs =
                     |t: u32| -> Result<Vec<Tensor>> { (0..batch).map(|_| mk(&[t])).collect() };
                 let mut tok = 42u32;
                 for _ in 0..6 {
-                    let _ = model.forward_batched(&mut session, &seqs, &inputs(tok)?)?;
+                    // Decode step (q=1): decode group — the path this benchmark times.
+                    let _ = model.forward_wave(
+                        &mut session,
+                        &seqs,
+                        &inputs(tok)?,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?;
                     for &sq in &seqs {
                         session.advance_sequence(sq, 1)?;
                     }
@@ -2426,7 +2566,18 @@ mod tests {
                 let _ = crate::models::profile::pipeline_snapshot_and_reset();
                 let t0 = std::time::Instant::now();
                 for _ in 0..n_steps {
-                    let _ = model.forward_batched(&mut session, &seqs, &inputs(tok)?)?;
+                    let _ = model.forward_wave(
+                        &mut session,
+                        &seqs,
+                        &inputs(tok)?,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?;
                     for &sq in &seqs {
                         session.advance_sequence(sq, 1)?;
                     }
@@ -2728,7 +2879,22 @@ mod tests {
                 (1, prefill_len),
                 &device,
             )?;
-            let logits_vec = model.forward_batched(&mut session, &[seq_idx], &[prefill_input])?;
+            let nl = model.num_layers();
+            let logits_vec = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &[seq_idx],
+                    &[prefill_input],
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
@@ -2745,7 +2911,21 @@ mod tests {
                     .to_scalar::<u32>()?;
                 all_tokens.push(next_token);
                 let input = Tensor::from_vec(vec![next_token], (1, 1), &device)?;
-                let out = model.forward_batched(&mut session, &[seq_idx], &[input])?;
+                let out = model
+                    .forward_wave(
+                        &mut session,
+                        &[seq_idx],
+                        &[input],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        0,
+                        nl,
+                        None,
+                    )?
+                    .logits
+                    .unwrap_or_default();
                 session.advance_sequence(seq_idx, 1)?;
                 last_logits = out
                     .into_iter()

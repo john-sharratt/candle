@@ -602,7 +602,22 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
         }
 
         for (chunk_len, (group_seqs, group_inputs)) in by_chunk_len {
-            let logits_vec = model.forward_batched(&mut session, &group_seqs, &group_inputs)?;
+            let nl = model.num_layers();
+            let logits_vec = model
+                .forward_wave(
+                    &mut session,
+                    &[],
+                    &[],
+                    &group_seqs,
+                    &group_inputs,
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )?
+                .logits
+                .unwrap_or_default();
             for (&seq_idx, logits) in group_seqs.iter().zip(logits_vec.into_iter()) {
                 let orig_i = seq_indices
                     .iter()
@@ -655,7 +670,22 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
             .map(|&i| Tensor::new(&[current_tokens[i]], device)?.unsqueeze(0))
             .collect::<Result<_>>()?;
 
-        let logits_vec = model.forward_batched(&mut session, &active_seqs, &active_inputs)?;
+        let nl = model.num_layers();
+        let logits_vec = model
+            .forward_wave(
+                &mut session,
+                &active_seqs,
+                &active_inputs,
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )?
+            .logits
+            .unwrap_or_default();
         for &seq_idx in &active_seqs {
             session.advance_sequence(seq_idx, 1)?;
         }

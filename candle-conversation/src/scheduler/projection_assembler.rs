@@ -1030,9 +1030,22 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
             .map_err(ConversationError::Model)?;
         {
             let _g = profile::span("prefill:forward");
+            let nl = ctx.model.num_layers().max(1);
             let _logits = ctx
                 .model
-                .forward_batched(ctx.session, &[parent_id.0], &[input])
+                .forward_wave(
+                    ctx.session,
+                    &[],
+                    &[],
+                    &[parent_id.0],
+                    &[input],
+                    &[],
+                    &[],
+                    0,
+                    nl,
+                    None,
+                )
+                .map(|s| s.logits.unwrap_or_default())
                 .map_err(ConversationError::Model)?;
         }
         ctx.session
@@ -1151,8 +1164,13 @@ pub(super) fn fire_gap_fill_batch(
     let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
     {
         let _g = profile::span("prefill:gap_fill");
+        // Route the glue islands through the wave's GLUE group so the pending
+        // per-slot scatter descriptors (staged above) drive the paged-glue kernel.
+        // A glue-only wave carries no logits (it only scatters K/V) and the result
+        // is discarded — the forward's whole purpose is the K/V side effect.
+        let n = model.num_layers();
         model
-            .forward_batched(session, &ids, &inputs)
+            .forward_wave(session, &[], &[], &[], &[], &ids, &inputs, 0, n, None)
             .map_err(ConversationError::Model)?;
     }
     // The gap-fill must ONLY scatter K/V into the pre-reserved gaps — it must not

@@ -1209,6 +1209,12 @@ inline void launch_paged_prefill_int8(
     dim3 grid(grid_x, (uint32_t)n_kv_head, (uint32_t)(batch_size * num_splits));
     dim3 block(I8_THREADS, 1, 1);
 
+    // Clear any error left sticky on this thread by a PRIOR launch so the
+    // post-launch check below reflects only this kernel — otherwise a stale
+    // error is misattributed here (printed against this grid) even though this
+    // launch config is valid and its output correct.
+    (void)cudaGetLastError();
+
     paged_prefill_int8_kernel<QT, HEAD_DIM><<<grid, block, 0, stream>>>(
         (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
         headers_ptr, cu_seqlens_q, q_lens, kv_lens,
