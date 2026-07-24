@@ -519,6 +519,9 @@ fn main() -> Result<()> {
         if segs.is_empty() {
             anyhow::bail!("no seg-*.log/.active files in {}", target.display());
         }
+        // Let a single-segment view's `load_log_tokenizer` fall back to sibling
+        // segments for the init-time `Tokenizer` singleton (in an early segment).
+        let _ = TOKENIZER_DIR.set(target.clone());
         if matches!(cli.cmd, Cmd::Summary) {
             return segment_summary(&segs);
         }
@@ -3863,15 +3866,39 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
 /// Load the tokenizer embedded in the log's `Tokenizer` record. Returns
 /// `Ok(None)` when the log has no such record — the substrate is then
 /// opaque to text decoding and the caller should fall back to `--ids`.
+/// The segmented store's directory, set in `main` when the target is a `.substrate`
+/// dir. Lets [`load_log_tokenizer`] fall back to sibling segments: the `Tokenizer`
+/// record is a singleton written ONCE at engine init (deduped by SHA), so on a
+/// segmented store it lives in an early sealed segment — NOT the active segment a
+/// single-segment view opens. Without this, `tokens`/`turns`/`tree` couldn't
+/// decode text against a multi-segment store even though the tokenizer is present.
+static TOKENIZER_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn load_log_tokenizer(log: &mut LogFile) -> Result<Option<Tokenizer>> {
     let manifest = build_manifest(log)?;
-    let Some(loc) = manifest.tokenizer else {
-        return Ok(None);
-    };
-    let rec = read_record_at(log, loc.offset, loc.record_size)?;
-    let tok = Tokenizer::from_bytes(&rec.payload)
-        .map_err(|e| anyhow::anyhow!("load tokenizer from Tokenizer record: {e}"))?;
-    Ok(Some(tok))
+    if let Some(loc) = manifest.tokenizer {
+        let rec = read_record_at(log, loc.offset, loc.record_size)?;
+        let tok = Tokenizer::from_bytes(&rec.payload)
+            .map_err(|e| anyhow::anyhow!("load tokenizer from Tokenizer record: {e}"))?;
+        return Ok(Some(tok));
+    }
+    // The active segment carries no Tokenizer record — scan sibling segments
+    // (earliest first: the singleton lives in the earliest live segment, so this
+    // finds it on the first hit and doesn't walk the whole store).
+    if let Some(dir) = TOKENIZER_DIR.get() {
+        for (_, path, _) in enumerate_segments(dir)? {
+            let mut seg = LogFile::open_read_only(&path)?;
+            let m = build_manifest(&mut seg)?;
+            if let Some(loc) = m.tokenizer {
+                let rec = read_record_at(&mut seg, loc.offset, loc.record_size)?;
+                let tok = Tokenizer::from_bytes(&rec.payload).map_err(|e| {
+                    anyhow::anyhow!("load tokenizer from Tokenizer record: {e}")
+                })?;
+                return Ok(Some(tok));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn meta(log: &mut LogFile) -> Result<()> {
