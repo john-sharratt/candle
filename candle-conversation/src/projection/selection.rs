@@ -34,7 +34,7 @@
 //! Emission orders **by insertion** (the LLM reads sequentially and
 //! reordering by score destroys dialogue coherence). The split is deliberate:
 //! all selection rules in this module return their result sorted by
-//! [`TurnIndex`] regardless of the score-based order they were chosen in.
+//! [`TurnKey`] regardless of the score-based order they were chosen in.
 //!
 //! # Sequence rule
 //!
@@ -50,7 +50,7 @@
 //!   emission:  insertion order
 //! ```
 
-use super::ids::{GroupId, TurnIndex};
+use super::ids::{GroupId, TurnKey};
 use super::schema::{SelectionDefault, SelectionRule};
 use crate::substrate::ContentResolver;
 
@@ -63,7 +63,7 @@ pub fn resolve_default_turn(
     default: Option<&SelectionDefault>,
     group: GroupId,
     resolver: &dyn ContentResolver,
-) -> Option<TurnIndex> {
+) -> Option<TurnKey> {
     resolver.turn_with_tag(group, &default?.tag)
 }
 
@@ -75,12 +75,12 @@ pub fn resolve_default_turn(
 /// - `threshold` — turns with `score < threshold` are filtered out as
 ///   ineligible (except `Sequence`'s recent-N which bypasses the gate)
 /// - `turns` — all candidate turns, **in insertion order** (ascending
-///   `TurnIndex`), each as `(TurnIndex, score)`
+///   `TurnKey`), each as `(TurnKey, score)`
 /// - `budget_tokens`:
 ///   - `None` — unbounded phase-1 pass (pick natural set)
 ///   - `Some(n)` — bounded phase-2 pass; trim to fit `n` tokens per the
 ///     rule's trim policy
-/// - `token_counts` — closure mapping `TurnIndex → token count`
+/// - `token_counts` — closure mapping `TurnKey → token count`
 ///
 /// # Trim policy under budget
 ///
@@ -93,15 +93,15 @@ pub fn resolve_default_turn(
 ///
 /// # Return
 ///
-/// Always in **insertion order** (ascending `TurnIndex`), even though
+/// Always in **insertion order** (ascending `TurnKey`), even though
 /// internal selection ordered by score.
 pub fn apply_selection(
     rule: &SelectionRule,
     threshold: f32,
-    turns: &[(TurnIndex, f32)],
+    turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
-) -> Vec<TurnIndex> {
+    token_counts: &dyn Fn(TurnKey) -> usize,
+) -> Vec<TurnKey> {
     match rule {
         SelectionRule::AlwaysVisible => {
             select_always_visible(threshold, turns, budget_tokens, token_counts)
@@ -132,12 +132,12 @@ pub fn apply_selection(
 
 fn select_always_visible(
     threshold: f32,
-    turns: &[(TurnIndex, f32)],
+    turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
-) -> Vec<TurnIndex> {
+    token_counts: &dyn Fn(TurnKey) -> usize,
+) -> Vec<TurnKey> {
     // Filter by threshold, keep insertion order.
-    let mut eligible: Vec<(TurnIndex, f32)> = turns
+    let mut eligible: Vec<(TurnKey, f32)> = turns
         .iter()
         .filter(|(_, s)| *s >= threshold)
         .copied()
@@ -155,17 +155,17 @@ fn select_always_visible(
 fn select_top_k(
     k: usize,
     threshold: f32,
-    turns: &[(TurnIndex, f32)],
+    turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
-) -> Vec<TurnIndex> {
-    let mut eligible: Vec<(TurnIndex, f32)> = turns
+    token_counts: &dyn Fn(TurnKey) -> usize,
+) -> Vec<TurnKey> {
+    let mut eligible: Vec<(TurnKey, f32)> = turns
         .iter()
         .filter(|(_, s)| *s >= threshold)
         .copied()
         .collect();
 
-    // Sort descending by score; ties broken by ascending TurnIndex (earlier wins).
+    // Sort descending by score; ties broken by ascending TurnKey (earlier wins).
     eligible.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -186,17 +186,17 @@ fn select_top_k(
 
 fn select_single(
     threshold: f32,
-    turns: &[(TurnIndex, f32)],
+    turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
-) -> Vec<TurnIndex> {
+    token_counts: &dyn Fn(TurnKey) -> usize,
+) -> Vec<TurnKey> {
     let best = turns
         .iter()
         .filter(|(_, s)| *s >= threshold)
         .max_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.0.cmp(&a.0)) // tie: lower TurnIndex wins
+                .then(b.0.cmp(&a.0)) // tie: lower TurnKey wins
         });
 
     match best {
@@ -218,16 +218,16 @@ fn select_conversation(
     recent: usize,
     historical_top_k: usize,
     threshold: f32,
-    turns: &[(TurnIndex, f32)],
+    turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
-) -> Vec<TurnIndex> {
+    token_counts: &dyn Fn(TurnKey) -> usize,
+) -> Vec<TurnKey> {
     // Split: last `recent` turns are inviolate regardless of score.
     let split_at = turns.len().saturating_sub(recent);
     let (older, inviolate) = turns.split_at(split_at);
 
     // Historical: threshold-filtered, top-k by score.
-    let mut historical: Vec<(TurnIndex, f32)> = older
+    let mut historical: Vec<(TurnKey, f32)> = older
         .iter()
         .filter(|(_, s)| *s >= threshold)
         .copied()
@@ -247,7 +247,7 @@ fn select_conversation(
     }
 
     // Combine and emit in insertion order.
-    let mut selected: Vec<TurnIndex> = historical
+    let mut selected: Vec<TurnKey> = historical
         .iter()
         .map(|(idx, _)| *idx)
         .chain(inviolate.iter().map(|(idx, _)| *idx))
@@ -261,9 +261,9 @@ fn select_conversation(
 /// Remove turns (lowest-scored first) from `eligible` until the total token
 /// count fits within `budget`. `eligible` must already be sorted by score desc.
 pub(super) fn trim_to_budget_low_score_first(
-    eligible: &mut Vec<(TurnIndex, f32)>,
+    eligible: &mut Vec<(TurnKey, f32)>,
     budget: usize,
-    token_counts: &dyn Fn(TurnIndex) -> usize,
+    token_counts: &dyn Fn(TurnKey) -> usize,
 ) {
     // Sort descending score so we can pop from the back (lowest score).
     eligible.sort_by(|a, b| {
@@ -284,12 +284,15 @@ pub(super) fn trim_to_budget_low_score_first(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::ids::TurnIndex;
+    use crate::projection::ids::{TimelineId, TurnIndex};
 
-    fn t(n: u32) -> TurnIndex {
-        TurnIndex(n)
+    /// All selection-rule tests operate within ONE conversation, so every key
+    /// shares a timeline and orders by index — the single-timeline case the
+    /// rules are defined against.
+    fn t(n: u32) -> TurnKey {
+        TurnKey::new(TimelineId::for_test(1), TurnIndex(n))
     }
-    fn tc(_: TurnIndex) -> usize {
+    fn tc(_: TurnKey) -> usize {
         10
     } // uniform 10 tokens each
 
@@ -362,7 +365,7 @@ mod tests {
     #[test]
     fn single_budget_overflow_drops() {
         let turns = vec![(t(0), 0.9)];
-        let tc_big = |_: TurnIndex| 100usize;
+        let tc_big = |_: TurnKey| 100usize;
         let r = apply_selection(&SelectionRule::Single, 0.0, &turns, Some(50), &tc_big);
         assert!(r.is_empty());
     }

@@ -7107,9 +7107,12 @@ impl Scheduler {
                     continue;
                 }
                 let (wcfg, _) = cfg.windowed(decode_pos);
+                // Key by the SAME `<timeline>:<index>` the belief carry uses — a
+                // group holds many conversations, so a bare index would seat the
+                // challenger under a key the carry never reads back.
                 let fresh: Vec<(String, f32)> = cands
                     .iter()
-                    .map(|(idx, score)| (idx.0.to_string(), *score))
+                    .map(|(key, score)| (crate::projection::turn_belief_key(*key), *score))
                     .collect();
                 prior_belief.seat_turn_boundary_challenger(
                     GroupKey::TurnGroup(group.name.clone()),

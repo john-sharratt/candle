@@ -146,9 +146,57 @@ pub fn fold_provenance(raw: &WideQSig) -> WideQSig {
     }
 }
 
-/// 10-byte header: magic(4) · n_tokens(u16) · n_heads(u16) · words_per_head(u16).
-const WIDE_MAGIC: &[u8; 4] = b"WQS3";
-const WIDE_HEADER: usize = 10;
+/// Record magic: `WQS` + a single ASCII version digit.
+///
+/// The substrate is an append-only log that outlives any one daemon build, so a
+/// single store holds records written by every version that ever ran against it.
+/// The decoder therefore reads **every** version it has emitted; the encoder
+/// always writes [`WIDE_VERSION_CURRENT`]. Mixed-version records coexist.
+///
+/// | version | header | `n_tokens` | notes |
+/// |---------|--------|------------|-------|
+/// | `WQS3`  | 10 B   | `u16` @4   | wraps mod 65536 past 65,535 tokens — a long turn decodes back as only its leading `len % 65536` signatures |
+/// | `WQS4`  | 12 B   | `u32` @4   | current; the widened count fixes that truncation |
+///
+/// Widening `n_tokens` shifted `n_heads` / `words_per_head`, so the version digit
+/// is what keeps a v3 record from being parsed at v4 offsets (which would read
+/// garbage counts rather than fail).
+const WIDE_MAGIC_PREFIX: &[u8; 3] = b"WQS";
+const WIDE_VERSION_CURRENT: u8 = b'4';
+const WIDE_HEADER: usize = 12;
+
+/// Header fields of one encoded record: `(header_len, n_tokens, n_heads,
+/// words_per_head)`. `None` for a foreign or unknown-version blob.
+fn parse_wide_header(bytes: &[u8]) -> Option<(usize, usize, u16, usize)> {
+    if bytes.len() < 4 || &bytes[0..3] != WIDE_MAGIC_PREFIX {
+        return None;
+    }
+    match bytes[3] {
+        b'3' => {
+            if bytes.len() < 10 {
+                return None;
+            }
+            Some((
+                10,
+                u16::from_le_bytes([bytes[4], bytes[5]]) as usize,
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+                u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
+            ))
+        }
+        b'4' => {
+            if bytes.len() < 12 {
+                return None;
+            }
+            Some((
+                12,
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize,
+                u16::from_le_bytes([bytes[8], bytes[9]]),
+                u16::from_le_bytes([bytes[10], bytes[11]]) as usize,
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// Encode a turn's **complete per-token** wide `sign(Q)` history — one [`WideQSig`]
 /// per token, in token order — to the opaque bytes stored in the substrate's
@@ -158,8 +206,9 @@ pub fn encode_wide_sigs(sigs: &[WideQSig]) -> Vec<u8> {
     let n_heads = sigs.first().map(|w| w.n_heads).unwrap_or(0);
     let wph = sigs.first().map(WideQSig::words_per_head).unwrap_or(0);
     let mut out = Vec::with_capacity(WIDE_HEADER + sigs.len() * n_heads as usize * wph * 8);
-    out.extend_from_slice(WIDE_MAGIC);
-    out.extend_from_slice(&(sigs.len() as u16).to_le_bytes());
+    out.extend_from_slice(WIDE_MAGIC_PREFIX);
+    out.push(WIDE_VERSION_CURRENT);
+    out.extend_from_slice(&(sigs.len() as u32).to_le_bytes());
     out.extend_from_slice(&n_heads.to_le_bytes());
     out.extend_from_slice(&(wph as u16).to_le_bytes());
     for tok in sigs {
@@ -170,21 +219,17 @@ pub fn encode_wide_sigs(sigs: &[WideQSig]) -> Vec<u8> {
     out
 }
 
-/// Decode a turn's complete per-token wide `sign(Q)` history. `None` on bad magic
-/// or truncation.
+/// Decode a turn's complete per-token wide `sign(Q)` history, dispatching on the
+/// record's version so every layout ever written stays readable. `None` on a
+/// foreign / unknown-version blob or a truncated payload.
 pub fn decode_wide_sigs(bytes: &[u8]) -> Option<Vec<WideQSig>> {
-    if bytes.len() < WIDE_HEADER || &bytes[0..4] != WIDE_MAGIC {
-        return None;
-    }
-    let n_tokens = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-    let n_heads = u16::from_le_bytes([bytes[6], bytes[7]]);
-    let wph = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let (header_len, n_tokens, n_heads, wph) = parse_wide_header(bytes)?;
     let words_per_tok = n_heads as usize * wph;
-    if bytes.len() < WIDE_HEADER + n_tokens * words_per_tok * 8 {
+    if bytes.len() < header_len + n_tokens * words_per_tok * 8 {
         return None;
     }
     let mut sigs = Vec::with_capacity(n_tokens);
-    let mut off = WIDE_HEADER;
+    let mut off = header_len;
     for _ in 0..n_tokens {
         let mut words = Vec::with_capacity(words_per_tok);
         for _ in 0..words_per_tok {
@@ -265,5 +310,131 @@ mod tests {
         assert_eq!(decode_wide_sigs(&bytes), Some(history));
         assert_eq!(decode_wide_sigs(b"nope"), None);
         assert_eq!(decode_wide_sigs(&encode_wide_sigs(&[])), Some(vec![]));
+    }
+
+    /// The 12-byte header, byte for byte: `WQS4` · n_tokens(u32 LE) ·
+    /// n_heads(u16 LE) · words_per_head(u16 LE), then the packed words.
+    #[test]
+    fn wide_sigs_header_is_exact_bytes() {
+        let sigs = vec![
+            WideQSig {
+                n_heads: 1,
+                words: vec![0x0102_0304_0506_0708],
+            },
+            WideQSig {
+                n_heads: 1,
+                words: vec![0x1112_1314_1516_1718],
+            },
+        ];
+        let bytes = encode_wide_sigs(&sigs);
+        assert_eq!(
+            &bytes[..WIDE_HEADER],
+            &[
+                b'W', b'Q', b'S', b'4', // magic
+                2, 0, 0, 0, // n_tokens = 2 (u32 LE)
+                1, 0, // n_heads = 1 (u16 LE)
+                1, 0, // words_per_head = 1 (u16 LE)
+            ],
+            "wide-sig header layout"
+        );
+        assert_eq!(bytes.len(), WIDE_HEADER + 2 * 8);
+        assert_eq!(
+            &bytes[WIDE_HEADER..WIDE_HEADER + 8],
+            &0x0102_0304_0506_0708u64.to_le_bytes()
+        );
+    }
+
+    /// A history longer than `u16::MAX` round-trips in full. The old header
+    /// encoded `n_tokens` as `u16`, so 65,537 tokens wrapped to 1 and the decode
+    /// returned a single leading signature — silently discarding a large scope's
+    /// entire provenance.
+    #[test]
+    fn wide_sigs_history_beyond_u16_roundtrips() {
+        let n = u16::MAX as usize + 2; // 65_537
+        let history: Vec<WideQSig> = (0..n)
+            .map(|i| WideQSig {
+                n_heads: 1,
+                words: vec![i as u64],
+            })
+            .collect();
+        let bytes = encode_wide_sigs(&history);
+        let decoded = decode_wide_sigs(&bytes).expect("decodes");
+        assert_eq!(decoded.len(), n, "every token survives the round-trip");
+        assert_eq!(decoded.first().unwrap().words[0], 0);
+        assert_eq!(decoded.last().unwrap().words[0], (n - 1) as u64);
+    }
+
+    /// A record written under the old 10-byte `WQS3` layout still decodes: the
+    /// substrate holds records from every version that ran against it, so both
+    /// coexist. Parsed at v3 offsets (`u16` n_tokens at 4, header 10), NOT v4's.
+    #[test]
+    fn legacy_wqs3_record_still_decodes() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(b"WQS3");
+        legacy.extend_from_slice(&2u16.to_le_bytes()); // n_tokens (u16 @ offset 4)
+        legacy.extend_from_slice(&1u16.to_le_bytes()); // n_heads
+        legacy.extend_from_slice(&1u16.to_le_bytes()); // words_per_head
+        legacy.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        legacy.extend_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+        assert_eq!(
+            decode_wide_sigs(&legacy),
+            Some(vec![
+                WideQSig {
+                    n_heads: 1,
+                    words: vec![0x0102_0304_0506_0708],
+                },
+                WideQSig {
+                    n_heads: 1,
+                    words: vec![0x1112_1314_1516_1718],
+                },
+            ]),
+            "a v3 record decodes at v3 offsets, coexisting with v4",
+        );
+    }
+
+    /// Version dispatch: a v3 blob and a v4 blob carrying the SAME signatures
+    /// decode identically, even though their byte layouts differ (10- vs 12-byte
+    /// header, `u16` vs `u32` count).
+    #[test]
+    fn v3_and_v4_records_decode_to_the_same_history() {
+        let sigs = vec![
+            WideQSig {
+                n_heads: 1,
+                words: vec![0xAAAA_BBBB_CCCC_DDDD],
+            },
+            WideQSig {
+                n_heads: 1,
+                words: vec![0x1122_3344_5566_7788],
+            },
+        ];
+        // v4 is what the encoder writes today.
+        let v4 = encode_wide_sigs(&sigs);
+        assert_eq!(&v4[..4], b"WQS4");
+
+        // Hand-build the equivalent v3 record (the retired encoder's layout).
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(b"WQS3");
+        v3.extend_from_slice(&(sigs.len() as u16).to_le_bytes());
+        v3.extend_from_slice(&1u16.to_le_bytes()); // n_heads
+        v3.extend_from_slice(&1u16.to_le_bytes()); // words_per_head
+        for s in &sigs {
+            v3.extend_from_slice(&s.words[0].to_le_bytes());
+        }
+
+        assert_eq!(decode_wide_sigs(&v3), decode_wide_sigs(&v4));
+        assert_eq!(decode_wide_sigs(&v3), Some(sigs));
+    }
+
+    /// An unknown version digit (a future format this build can't read) decodes
+    /// to `None` rather than mis-parsing — the turn is treated as unsigned.
+    #[test]
+    fn unknown_version_is_rejected() {
+        let mut future = Vec::new();
+        future.extend_from_slice(b"WQS9");
+        future.extend_from_slice(&1u32.to_le_bytes());
+        future.extend_from_slice(&1u16.to_le_bytes());
+        future.extend_from_slice(&1u16.to_le_bytes());
+        future.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+        assert_eq!(decode_wide_sigs(&future), None);
     }
 }

@@ -302,7 +302,7 @@ pub struct Projection {
     /// [`super::event::from_projection_with_origins`] so the persisted projection
     /// record / GUI can show "why is this turn in my context?". Empty entries
     /// (e.g. the live user message) carry no origin.
-    pub selection_origins: HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    pub selection_origins: HashMap<TurnKey, SelectionOrigin>,
 }
 
 /// A belief node's identity: a named section collection (the tool catalog) or a
@@ -337,11 +337,11 @@ impl PriorBelief {
 
     /// Record a turn's prior belief in a belief-driven turn group (repo_map
     /// clusters, code scopes). The turn-axis analogue of [`Self::set`].
-    pub fn set_turn(&mut self, group: &str, index: TurnIndex, score: f32, selected: bool) {
+    pub fn set_turn(&mut self, group: &str, turn: TurnKey, score: f32, selected: bool) {
         self.beliefs
             .entry(GroupKey::TurnGroup(group.to_string()))
             .or_default()
-            .insert(index.0.to_string(), (score, selected));
+            .insert(turn_belief_key(turn), (score, selected));
     }
 
     /// Rebuild the prior belief from a completed projection's selection — every
@@ -370,7 +370,18 @@ impl PriorBelief {
         }
         for t in &sel.turns {
             if t.index != u32::MAX && t.selected {
-                pb.set_turn(&t.group, TurnIndex(t.index), t.score, true);
+                // Carry the belief under the turn's full `(timeline, index)`
+                // identity — the persisted selection stamps the timeline exactly
+                // so consumers never re-derive `group → timeline`, which is
+                // ambiguous once a group holds many conversations.
+                if let Some(tl) = t.timeline.and_then(TimelineId::from_raw) {
+                    pb.set_turn(
+                        &t.group,
+                        TurnKey::new(tl, TurnIndex(t.index)),
+                        t.score,
+                        true,
+                    );
+                }
             }
         }
         pb
@@ -486,13 +497,13 @@ impl PriorBelief {
     /// Aligned `(scores, selected)` for a turn group's candidate turns, in the
     /// given order — the seed for [`crate::provenance::belief_step`] on the turn
     /// axis. Unknown turns read `(0.0, false)`.
-    fn turn_group(&self, group: &str, turns: &[(TurnIndex, f32)]) -> (Vec<f32>, Vec<bool>) {
+    fn turn_group(&self, group: &str, turns: &[(TurnKey, f32)]) -> (Vec<f32>, Vec<bool>) {
         let map = self.beliefs.get(&GroupKey::TurnGroup(group.to_string()));
         let mut scores = vec![0.0f32; turns.len()];
         let mut selected = vec![false; turns.len()];
         if let Some(m) = map {
-            for (i, (idx, _)) in turns.iter().enumerate() {
-                if let Some(&(sc, sel)) = m.get(&idx.0.to_string()) {
+            for (i, (key, _)) in turns.iter().enumerate() {
+                if let Some(&(sc, sel)) = m.get(&turn_belief_key(*key)) {
                     scores[i] = sc;
                     selected[i] = sel;
                 }
@@ -500,6 +511,17 @@ impl PriorBelief {
         }
         (scores, selected)
     }
+}
+
+/// Belief-map key for a turn: `"<timeline>:<index>"`.
+///
+/// Qualified by timeline because a belief-driven group holds many conversations
+/// (`code_reading` declares one per file) and turn indices restart per timeline —
+/// a bare index would make turn 3 of every file share one carried belief. Every
+/// producer of a turn-group belief key (the carry, and the scheduler's
+/// turn-boundary challenger) MUST route through here so they stay aligned.
+pub(crate) fn turn_belief_key(turn: TurnKey) -> String {
+    format!("{}:{}", turn.timeline.raw(), turn.index.0)
 }
 
 #[cfg(test)]
@@ -519,7 +541,16 @@ impl PriorBelief {
 
 #[cfg(test)]
 mod prior_belief_tests {
-    use super::{GroupKey, PriorBelief, TurnIndex};
+    use super::{GroupKey, PriorBelief, TimelineId, TurnIndex, TurnKey};
+
+    /// Belief-map turn keys are timeline-qualified (`"<timeline>:<index>"`), so
+    /// turn 3 of one conversation can't collide with turn 3 of another.
+    fn tk(n: u32) -> TurnKey {
+        TurnKey::new(TimelineId::for_test(1), TurnIndex(n))
+    }
+    fn tkey(n: u32) -> String {
+        format!("{}:{}", TimelineId::for_test(1).raw(), n)
+    }
 
     #[test]
     fn merge_from_overlays_present_collections_and_preserves_absent_ones() {
@@ -629,23 +660,19 @@ mod prior_belief_tests {
         };
         let pb = PriorBelief::from_selection(&sel);
         let group = pb.tgroup("structure");
-        assert_eq!(group.get("0"), Some(&(500.0, true)));
-        assert_eq!(group.get("1"), None);
+        assert_eq!(group.get(&tkey(0)), Some(&(500.0, true)));
+        assert_eq!(group.get(&tkey(1)), None);
         assert_eq!(group.len(), 1, "only the selected memory turn is carried");
     }
 
     #[test]
     fn turn_group_aligns_carried_belief_to_candidate_order() {
         let mut pb = PriorBelief::default();
-        pb.set_turn("structure", TurnIndex(3), 500.0, true);
-        pb.set_turn("structure", TurnIndex(7), 200.0, false);
+        pb.set_turn("structure", tk(3), 500.0, true);
+        pb.set_turn("structure", tk(7), 200.0, false);
         // Candidates in a different order than they were carried; the seed must
         // realign by turn index, and unknown turns read (0.0, false).
-        let turns = vec![
-            (TurnIndex(7), 0.0),
-            (TurnIndex(3), 0.0),
-            (TurnIndex(5), 0.0),
-        ];
+        let turns = vec![(tk(7), 0.0), (tk(3), 0.0), (tk(5), 0.0)];
         let (scores, selected) = pb.turn_group("structure", &turns);
         assert_eq!(scores, vec![200.0, 500.0, 0.0]);
         assert_eq!(selected, vec![false, true, false]);
@@ -655,38 +682,38 @@ mod prior_belief_tests {
     fn challenger_seats_a_turn_group_member_by_index_key() {
         let mut pb = PriorBelief::default();
         // One carried cluster; a spare slot at budget_max 3.
-        pb.set_turn("clusters", TurnIndex(0), 900.0, true);
+        pb.set_turn("clusters", tk(0), 900.0, true);
         pb.seat_turn_boundary_challenger(
             GroupKey::TurnGroup("clusters".into()),
-            &[("4".to_string(), 246.0), ("9".to_string(), 30.0)],
+            &[(tkey(4), 246.0), (tkey(9), 30.0)],
             3,
             100.0,
         );
         let g = pb.tgroup("clusters");
-        assert_eq!(g["0"], (900.0, true), "incumbent survives");
-        assert_eq!(g["4"], (100.0, true), "strongest fresh turn seated");
-        assert!(g.get("9").is_none(), "weaker rival not seated");
+        assert_eq!(g[&tkey(0)], (900.0, true), "incumbent survives");
+        assert_eq!(g[&tkey(4)], (100.0, true), "strongest fresh turn seated");
+        assert!(g.get(&tkey(9)).is_none(), "weaker rival not seated");
     }
 
     #[test]
     fn merge_from_and_decay_span_both_axes() {
         let mut carried = PriorBelief::default();
         carried.set("tools", "calc", 400.0, true);
-        carried.set_turn("structure", TurnIndex(2), 800.0, true);
+        carried.set_turn("structure", tk(2), 800.0, true);
         // decay scales scores on both the collection and turn-group axes.
         carried.decay_scores(0.5);
         assert_eq!(carried.coll("tools")["calc"], (200.0, true));
-        assert_eq!(carried.tgroup("structure")["2"], (400.0, true));
+        assert_eq!(carried.tgroup("structure")[&tkey(2)], (400.0, true));
         // merge overlays a turn group wholesale, leaving the collection intact.
         let mut newer = PriorBelief::default();
-        newer.set_turn("structure", TurnIndex(5), 900.0, true);
+        newer.set_turn("structure", tk(5), 900.0, true);
         carried.merge_from(&newer);
         assert_eq!(
-            carried.tgroup("structure").get("2"),
+            carried.tgroup("structure").get(&tkey(2)),
             None,
             "replaced wholesale"
         );
-        assert_eq!(carried.tgroup("structure")["5"], (900.0, true));
+        assert_eq!(carried.tgroup("structure")[&tkey(5)], (900.0, true));
         assert_eq!(
             carried.coll("tools")["calc"],
             (200.0, true),
@@ -1004,7 +1031,7 @@ pub fn run_with_sink<R: ContentResolver>(
     struct GroupState<'a> {
         schema: &'a GroupSchema,
         layer_idx: usize,
-        selected: Vec<(TurnIndex, f32)>, // (index, score), insertion order
+        selected: Vec<(TurnKey, f32)>, // ((timeline, index), score), insertion order
         group_score: f32,
         /// The §8 score-density selector produced `selected` (already
         /// budget-fit and in chronological order — summaries ABOVE the turns
@@ -1017,7 +1044,7 @@ pub fn run_with_sink<R: ContentResolver>(
     let mut group_states: Vec<GroupState> = Vec::new();
     // Why each selected turn entered the slot — collected as we select, surfaced
     // on the returned `Projection` so the persisted record / GUI can show it.
-    let mut selection_origins: HashMap<(GroupId, TurnIndex), SelectionOrigin> = HashMap::new();
+    let mut selection_origins: HashMap<TurnKey, SelectionOrigin> = HashMap::new();
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
@@ -1027,24 +1054,27 @@ pub fn run_with_sink<R: ContentResolver>(
                 continue;
             }
 
-            let count = resolver.turn_count(group.id);
             // Candidates are every turn in the group — raw turns AND summary
-            // forest nodes alike. A summary carries its own K/V and provenance
-            // signature, so a cross-corpus hit can score a summary node directly
-            // and pull it into the window when the raw turns it covers didn't
-            // themselves score high enough. The `score_density` path (target
-            // group with a tree) still overrides this list wholesale; on the
-            // belief and rule-based paths, summaries compete on score and the
-            // descendant-dedup below keeps the SPECIFIC over the coarse.
-            let all_turns: Vec<(TurnIndex, f32)> = (0..count)
-                .map(|i| {
-                    let idx = TurnIndex(i);
-                    let score = resolver.turn_score(group.id, idx);
-                    (idx, score)
+            // forest nodes alike — across EVERY conversation the group holds.
+            // A group is a shape, not a conversation: `code_reading` declares one
+            // timeline per file, so candidates are keyed by `(timeline, index)`.
+            // A summary carries its own K/V and provenance signature, so a
+            // cross-corpus hit can score a summary node directly and pull it into
+            // the window when the raw turns it covers didn't themselves score high
+            // enough. The `score_density` path (target group with a tree) still
+            // overrides this list wholesale; on the belief and rule-based paths,
+            // summaries compete on score and the descendant-dedup below keeps the
+            // SPECIFIC over the coarse.
+            let all_turns: Vec<(TurnKey, f32)> = resolver
+                .group_turns(group.id)
+                .into_iter()
+                .map(|key| {
+                    let score = resolver.turn_score(key);
+                    (key, score)
                 })
                 .collect();
 
-            let tc = |idx: TurnIndex| resolver.turn_token_count(group.id, idx);
+            let tc = |key: TurnKey| resolver.turn_token_count(key);
 
             // Score-density override: when this is the *target* group
             // and a summary tree exists for the target timeline, swap
@@ -1053,7 +1083,7 @@ pub fn run_with_sink<R: ContentResolver>(
             // `layer.window` so the flexbox step caps the group's
             // natural consumption at the score-density total.
             let mut score_density_used = false;
-            let selected: Vec<(TurnIndex, f32)> = if layer_is_target && group.id == target.group {
+            let selected: Vec<(TurnKey, f32)> = if layer_is_target && group.id == target.group {
                 if let Some(picks) =
                     resolver.summary_tree_select(target.timeline, layer.window as u32)
                 {
@@ -1065,17 +1095,20 @@ pub fn run_with_sink<R: ContentResolver>(
                     // last-selection side-channel; production callers
                     // pass a no-op.  Skipped entirely when the
                     // rule-based path runs (no tree → no `picks`).
+                    // Score-density picks come from the target timeline's own
+                    // forest, so every pick keys to `target.timeline`.
                     let mut diag = SelectionDiagnostics::new(layer.window as u32);
                     for (turn_idx, origin, score) in &picks {
-                        let tokens = resolver.turn_token_count(group.id, *turn_idx) as u32;
+                        let key = TurnKey::new(target.timeline, *turn_idx);
+                        let tokens = resolver.turn_token_count(key) as u32;
                         diag.push(NodeId(turn_idx.0), *origin, *score, tokens);
-                        selection_origins.insert((group.id, *turn_idx), *origin);
+                        selection_origins.insert(key, *origin);
                     }
                     diag.pending_count = resolver.pending_summary_len(target.timeline);
                     sink(diag);
                     picks
                         .iter()
-                        .map(|(idx, _origin, score)| (*idx, *score))
+                        .map(|(idx, _origin, score)| (TurnKey::new(target.timeline, *idx), *score))
                         .collect()
                 } else {
                     Vec::new()
@@ -1086,7 +1119,7 @@ pub fn run_with_sink<R: ContentResolver>(
 
             // Fall through to the rule-based unbounded selection path
             // when score-density wasn't applicable.
-            let mut selected: Vec<(TurnIndex, f32)> = if score_density_used {
+            let mut selected: Vec<(TurnKey, f32)> = if score_density_used {
                 selected
             } else if group.is_belief_driven() {
                 // Belief-driven turn selection: RelLeak (hysteresis + budget) over
@@ -1108,13 +1141,13 @@ pub fn run_with_sink<R: ContentResolver>(
                     floor,
                 );
                 let mut out = Vec::new();
-                for ((idx, _), b) in all_turns.iter().zip(&beliefs) {
+                for ((key, _), b) in all_turns.iter().zip(&beliefs) {
                     // Record every candidate's belief so `build_selection` stamps
                     // it and the next reprojection can seed from it.
-                    selection_scores.set_turn(group.id, *idx, b.score);
+                    selection_scores.set_turn(*key, b.score);
                     if b.selected {
-                        out.push((*idx, b.score));
-                        selection_origins.insert((group.id, *idx), SelectionOrigin::Belief);
+                        out.push((*key, b.score));
+                        selection_origins.insert(*key, SelectionOrigin::Belief);
                     }
                 }
                 out
@@ -1127,15 +1160,15 @@ pub fn run_with_sink<R: ContentResolver>(
                     &tc,
                 );
 
-                let selected: Vec<(TurnIndex, f32)> = selected_indices
+                let selected: Vec<(TurnKey, f32)> = selected_indices
                     .iter()
-                    .map(|&idx| {
+                    .map(|&key| {
                         let score = all_turns
                             .iter()
-                            .find(|(i, _)| *i == idx)
+                            .find(|(k, _)| *k == key)
                             .map(|(_, s)| *s)
                             .unwrap_or(0.0);
-                        (idx, score)
+                        (key, score)
                     })
                     .collect();
                 selected
@@ -1153,14 +1186,16 @@ pub fn run_with_sink<R: ContentResolver>(
             if !score_density_used {
                 let any_summary = selected
                     .iter()
-                    .any(|(idx, _)| resolver.turn_kind(group.id, *idx).is_summary());
+                    .any(|(key, _)| resolver.turn_kind(*key).is_summary());
                 if any_summary {
-                    let picked: HashSet<TurnIndex> = selected.iter().map(|(idx, _)| *idx).collect();
-                    selected.retain(|(idx, _)| {
+                    let picked: HashSet<TurnKey> = selected.iter().map(|(key, _)| *key).collect();
+                    selected.retain(|(key, _)| {
+                        // A summary only covers turns on its OWN timeline, so the
+                        // covered indices re-key against that same timeline.
                         resolver
-                            .node_covers(group.id, *idx)
+                            .node_covers(*key)
                             .into_iter()
-                            .all(|covered| !picked.contains(&covered))
+                            .all(|covered| !picked.contains(&TurnKey::new(key.timeline, covered)))
                     });
                 }
             }
@@ -1172,11 +1207,11 @@ pub fn run_with_sink<R: ContentResolver>(
             // score gates; it fires only when empty, so it never double-selects
             // or fights the belief challenger.
             if selected.is_empty() {
-                if let Some(idx) = resolve_default_turn(group.default.as_ref(), group.id, resolver)
+                if let Some(key) = resolve_default_turn(group.default.as_ref(), group.id, resolver)
                 {
                     let sentinel = layer.score_threshold.max(group.score_threshold);
-                    selected.push((idx, sentinel));
-                    selection_origins.insert((group.id, idx), SelectionOrigin::Fallback);
+                    selected.push((key, sentinel));
+                    selection_origins.insert(key, SelectionOrigin::Fallback);
                 }
             }
 
@@ -1187,14 +1222,16 @@ pub fn run_with_sink<R: ContentResolver>(
             // score). Mirrors `select_conversation`'s `split_at = len - recent`.
             if !score_density_used {
                 if let SelectionRule::Sequence { recent, .. } = &group.selection {
-                    let split = count.saturating_sub(*recent as u32);
-                    for (idx, _) in &selected {
-                        let origin = if idx.0 >= split {
+                    // `Sequence` is the live-conversation rule, so the group holds
+                    // one timeline and candidate order is index order.
+                    let split = (all_turns.len() as u32).saturating_sub(*recent as u32);
+                    for (key, _) in &selected {
+                        let origin = if key.index.0 >= split {
                             SelectionOrigin::Recent
                         } else {
                             SelectionOrigin::Historical
                         };
-                        selection_origins.insert((group.id, *idx), origin);
+                        selection_origins.insert(*key, origin);
                     }
                 }
             }
@@ -1331,7 +1368,7 @@ pub fn run_with_sink<R: ContentResolver>(
             let tokens: usize = gs
                 .selected
                 .iter()
-                .map(|(idx, _)| resolver.turn_token_count(gs.schema.id, *idx))
+                .map(|(key, _)| resolver.turn_token_count(*key))
                 .sum();
             (gs.schema.id, tokens)
         })
@@ -1362,7 +1399,7 @@ pub fn run_with_sink<R: ContentResolver>(
         .collect();
     let layer_budgets = flexbox_distribute(&layer_items, turn_budget);
 
-    let mut final_selected: Vec<(GroupId, TurnIndex)> = vec![];
+    let mut final_selected: Vec<(GroupId, TurnKey)> = vec![];
 
     for (slot, &li) in surviving_layer_indices.iter().enumerate() {
         let layer_budget = layer_budgets[slot];
@@ -1398,13 +1435,13 @@ pub fn run_with_sink<R: ContentResolver>(
                 // raw `TurnIndex` — placing every summary AFTER its content —
                 // and could silently drop picks via `historical_top_k`. Emit
                 // the picks verbatim, in their existing order.
-                for (idx, _) in &gs.selected {
-                    final_selected.push((gs.schema.id, *idx));
+                for (key, _) in &gs.selected {
+                    final_selected.push((gs.schema.id, *key));
                 }
                 continue;
             }
             let group_budget = group_budgets[gi];
-            let tc = |idx: TurnIndex| resolver.turn_token_count(gs.schema.id, idx);
+            let tc = |key: TurnKey| resolver.turn_token_count(key);
 
             let mut selected_indices = if gs.schema.is_belief_driven() {
                 // Belief already decided the surviving set (RelLeak + the rule's
@@ -1466,11 +1503,11 @@ pub fn run_with_sink<R: ContentResolver>(
 
         for gs in layer_groups {
             // Turns for this group in insertion order.
-            let mut group_turns: Vec<TurnIndex> = final_selected
+            let mut group_turns: Vec<TurnKey> = final_selected
                 .iter()
-                .filter_map(|(gid, idx)| {
+                .filter_map(|(gid, key)| {
                     if *gid == gs.schema.id {
-                        Some(*idx)
+                        Some(*key)
                     } else {
                         None
                     }
@@ -1490,7 +1527,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 group_turns.sort();
             }
 
-            for idx in group_turns {
+            for key in group_turns {
                 // Ghost summary turns (`record_summary_turn` →
                 // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
                 // with no K/V in any tier. They must never become a
@@ -1500,24 +1537,22 @@ pub fn run_with_sink<R: ContentResolver>(
                 // (which then drops at inject time). Skip them at the
                 // projection source so every consumer — the elevate set and the
                 // assembler alike — sees only turns that carry injectable K/V.
-                if resolver.turn_token_count(gs.schema.id, idx) == 0 {
+                if resolver.turn_token_count(key) == 0 {
                     continue;
                 }
                 // Prefer the producer's `layer_id` from the resolver
                 // record; fall back to projector context if the
                 // resolver doesn't track origins (e.g. test mocks).
-                let origin_layer = resolver
-                    .turn_origin(gs.schema.id, idx)
-                    .unwrap_or(layer_id_for_walk);
+                let origin_layer = resolver.turn_origin(key).unwrap_or(layer_id_for_walk);
                 turns.push(ResolvedTurn {
                     id: TurnId {
                         layer_id: origin_layer,
                         group_id: gs.schema.id,
-                        index: idx,
+                        index: key.index,
                     },
                     // Stamp the conversation ONCE, here, where the target-aware
                     // resolver knows it — so no downstream consumer re-derives it.
-                    timeline: resolver.turn_timeline(gs.schema.id, idx),
+                    timeline: Some(key.timeline),
                 });
             }
         }

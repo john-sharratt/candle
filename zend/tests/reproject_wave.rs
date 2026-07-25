@@ -157,8 +157,10 @@ mod wave {
         let config = DaemonConfig {
             workspace,
             port: 0,
-            skip_code_read: true,
-            skip_repo_scan: true,
+            disabled_layers: ["repo_map", "code_reading"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));

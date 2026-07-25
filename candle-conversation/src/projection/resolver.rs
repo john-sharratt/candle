@@ -476,9 +476,9 @@ impl Conversation {
         target: ProjectionTarget,
         probe: &[WideQSig],
         observe: bool,
-    ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnIndex, f32)>)>) {
+    ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
         let mut scores = ProjectionScores::new();
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {
             return (scores, candidates);
         }
@@ -556,9 +556,9 @@ impl Conversation {
         probe: &[WideQSig],
         scores: &mut ProjectionScores,
         observe: bool,
-    ) -> Vec<(GroupId, Vec<(TurnIndex, f32)>)> {
+    ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
         use crate::persistence::content_hash::turn_stream_id;
-        let mut per_group: Vec<(GroupId, Vec<(TurnIndex, f32)>)> = Vec::new();
+        let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {
             return per_group;
         }
@@ -567,115 +567,133 @@ impl Conversation {
             if !group.is_belief_driven() {
                 continue;
             }
-            let Some(timeline) = sub.resolve_turn_timeline(Some(target), group.id) else {
-                continue;
+            // Score EVERY conversation in the group, not just the first. A belief
+            // group like `code_reading` declares one timeline per file; scoring
+            // only the first-registered timeline left every other file at score 0
+            // — structurally unreachable, no matter how well it matched the query.
+            // A belief group is never the projection target (the target is the
+            // Sequence dialogue group, skipped above), but mirror the target mask
+            // anyway so the invariant holds if that ever changes.
+            let timelines: Vec<TimelineId> = if group.id == target.group {
+                vec![target.timeline]
+            } else {
+                sub.active_timelines_for_group(group.id).collect()
             };
-            // Enumerate the group's turns exactly as selection does — the whole
-            // resolved timeline, `0..turn_count`, fetched by stream id — instead
-            // of scanning `all_streams()` per group (which is O(all timelines'
-            // streams) on the reproject hot path).
-            let count = sub.turn_count(timeline);
-            // Per candidate turn: its full sig plus the self-referencing sub-window
-            // seams recorded on it. A turn with no seams scores as one whole-turn
-            // window (the prior behaviour); a turn with N seams scores as N+1
-            // focused windows that all resolve back to it — so a query matching one
-            // structural region of a prefilled listing surfaces the whole turn
-            // without diluting against the rest.
-            let mut arcs: Vec<Arc<Vec<WideQSig>>> = Vec::new();
-            let mut arc_turn: Vec<TurnIndex> = Vec::new();
-            let mut arc_bounds: Vec<Vec<(usize, usize)>> = Vec::new();
-            for i in 0..count {
-                let idx = TurnIndex(i);
-                // Summary forest nodes are selected only by the score-density
-                // path, never the belief/rule path — mirror project.rs and skip
-                // them so a summary can't take a raw turn's belief slot.
-                if sub
-                    .tree_meta_of(timeline, idx)
-                    .map(|m| m.kind.is_summary())
-                    .unwrap_or(false)
-                {
+            let mut cands: Vec<(TurnKey, f32)> = Vec::new();
+            for timeline in timelines {
+                // Enumerate this conversation's turns `0..turn_count`, fetched by
+                // stream id — the (timeline, index) keys line up with selection.
+                let count = sub.turn_count(timeline);
+                // Per candidate turn: its full sig plus the self-referencing sub-window
+                // seams recorded on it. A turn with no seams scores as one whole-turn
+                // window (the prior behaviour); a turn with N seams scores as N+1
+                // focused windows that all resolve back to it — so a query matching one
+                // structural region of a prefilled listing surfaces the whole turn
+                // without diluting against the rest.
+                let mut arcs: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+                let mut arc_turn: Vec<TurnIndex> = Vec::new();
+                let mut arc_bounds: Vec<Vec<(usize, usize)>> = Vec::new();
+                for i in 0..count {
+                    let idx = TurnIndex(i);
+                    // Summary forest nodes are selected only by the score-density
+                    // path, never the belief/rule path — mirror project.rs and skip
+                    // them so a summary can't take a raw turn's belief slot.
+                    if sub
+                        .tree_meta_of(timeline, idx)
+                        .map(|m| m.kind.is_summary())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Cached decode (see `belief_gallery`): decode once per session.
+                    let Some(window) = sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i))
+                    else {
+                        continue;
+                    };
+                    let len = window.len();
+                    // Self-referencing projection events mark sub-window seams (token
+                    // offsets). Clamp into the sig's index space and derive contiguous
+                    // `[start, end)` bounds; no seams ⇒ one window over the whole turn.
+                    let mut seams: Vec<usize> = sub
+                        .projection_events_blob(timeline, idx)
+                        .map(decode_events)
+                        .map(|evs| {
+                            evs.iter()
+                                .filter(|e| e.self_reference)
+                                .map(|e| (e.start_token as usize).min(len))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    seams.sort_unstable();
+                    seams.dedup();
+                    arc_bounds.push(subwindow_bounds(len, &seams));
+                    arcs.push(window);
+                    arc_turn.push(idx);
+                }
+                if arcs.is_empty() {
                     continue;
                 }
-                // Cached decode (see `belief_gallery`): decode once per session.
-                let Some(window) = sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i)) else {
-                    continue;
-                };
-                let len = window.len();
-                // Self-referencing projection events mark sub-window seams (token
-                // offsets). Clamp into the sig's index space and derive contiguous
-                // `[start, end)` bounds; no seams ⇒ one window over the whole turn.
-                let mut seams: Vec<usize> = sub
-                    .projection_events_blob(timeline, idx)
-                    .map(decode_events)
-                    .map(|evs| {
-                        evs.iter()
-                            .filter(|e| e.self_reference)
-                            .map(|e| (e.start_token as usize).min(len))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                seams.sort_unstable();
-                seams.dedup();
-                arc_bounds.push(subwindow_bounds(len, &seams));
-                arcs.push(window);
-                arc_turn.push(idx);
-            }
-            if arcs.is_empty() {
-                continue;
-            }
-            // Flatten every turn's sub-windows into gallery windows, all tagged
-            // with the SAME slot as their owning turn (`wslot[i] = arc index`). So
-            // `score_slots` aggregates a turn's regions into ONE case — best-token
-            // agreement across the whole cluster — rather than making each region
-            // its own case that splits the turn's vote and competes with its
-            // siblings (which penalised large clusters). The seams still bound the
-            // windows, ready for the diverse-window step, but never fight each
-            // other. Then the L46-weighted vote (§83) decides the cluster.
-            let mut wref: Vec<&[WideQSig]> = Vec::new();
-            let mut wslot: Vec<usize> = Vec::new();
-            for (ai, arc) in arcs.iter().enumerate() {
-                for &(s, e) in &arc_bounds[ai] {
-                    if e > s {
-                        wref.push(&arc[s..e]);
-                        wslot.push(ai);
+                // Flatten every turn's sub-windows into gallery windows, all tagged
+                // with the SAME slot as their owning turn (`wslot[i] = arc index`). So
+                // `score_slots` aggregates a turn's regions into ONE case — best-token
+                // agreement across the whole cluster — rather than making each region
+                // its own case that splits the turn's vote and competes with its
+                // siblings (which penalised large clusters). The seams still bound the
+                // windows, ready for the diverse-window step, but never fight each
+                // other. Then the L46-weighted vote (§83) decides the cluster.
+                let mut wref: Vec<&[WideQSig]> = Vec::new();
+                let mut wslot: Vec<usize> = Vec::new();
+                for (ai, arc) in arcs.iter().enumerate() {
+                    for &(s, e) in &arc_bounds[ai] {
+                        if e > s {
+                            wref.push(&arc[s..e]);
+                            wslot.push(ai);
+                        }
                     }
                 }
-            }
-            if wref.is_empty() {
-                continue;
-            }
-            let n_turns = arcs.len();
-            // Per-layer-group vote weights from the group's `policy.layer_weights`
-            // (empty ⇒ uniform). Repo_map peaks on L46 (§83); other groups inherit
-            // uniform. Configured in the schema YAML, not hard-coded.
-            let fresh =
-                score_slots_weighted(probe, &wref, &wslot, n_turns, &group.policy.layer_weights);
-            // Normalize the raw scores against each turn's learned hit level so
-            // selection compares candidates on a common 0-1000 band, not a shared
-            // absolute scale (docs/provenance_score_normalization.md). Scope =
-            // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
-            // resetting learning for the regenerated clusters; child = the turn's
-            // index within that gallery.
-            let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
-            let raw_pairs: Vec<(ChildKey, f32)> = (0..n_turns)
-                .map(|ai| (ChildKey::turn(arc_turn[ai].0 as u64), fresh[ai]))
-                .collect();
-            // One lock for the read-then-(maybe)-write, so no other thread mutates
-            // the levels between this turn's normalize and observe. Learning only
-            // fires on the once-per-turn seal scan, not on every reprojection.
-            let normed = {
-                let mut cache = self.normalization.lock().unwrap();
-                let normed = cache.normalize(&scope, &raw_pairs);
-                if observe {
-                    cache.observe(&scope, &raw_pairs);
+                if wref.is_empty() {
+                    continue;
                 }
-                normed
-            };
-            let mut cands: Vec<(TurnIndex, f32)> = Vec::with_capacity(n_turns);
-            for (ai, (_, sc)) in normed.iter().enumerate() {
-                let idx = arc_turn[ai];
-                scores.set_turn(timeline, idx, *sc);
-                cands.push((idx, *sc));
+                let n_turns = arcs.len();
+                // Per-layer-group vote weights from the group's `policy.layer_weights`
+                // (empty ⇒ uniform). Repo_map peaks on L46 (§83); other groups inherit
+                // uniform. Configured in the schema YAML, not hard-coded.
+                let fresh = score_slots_weighted(
+                    probe,
+                    &wref,
+                    &wslot,
+                    n_turns,
+                    &group.policy.layer_weights,
+                );
+                // Normalize the raw scores against each turn's learned hit level so
+                // selection compares candidates on a common 0-1000 band, not a shared
+                // absolute scale (docs/provenance_score_normalization.md). Scope =
+                // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
+                // resetting learning for the regenerated clusters; child = the turn's
+                // index within that gallery.
+                let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
+                let raw_pairs: Vec<(ChildKey, f32)> = (0..n_turns)
+                    .map(|ai| (ChildKey::turn(arc_turn[ai].0 as u64), fresh[ai]))
+                    .collect();
+                // One lock for the read-then-(maybe)-write, so no other thread mutates
+                // the levels between this turn's normalize and observe. Learning only
+                // fires on the once-per-turn seal scan, not on every reprojection.
+                let normed = {
+                    let mut cache = self.normalization.lock().unwrap();
+                    let normed = cache.normalize(&scope, &raw_pairs);
+                    if observe {
+                        cache.observe(&scope, &raw_pairs);
+                    }
+                    normed
+                };
+                for (ai, (_, sc)) in normed.iter().enumerate() {
+                    let idx = arc_turn[ai];
+                    scores.set_turn(timeline, idx, *sc);
+                    cands.push((TurnKey::new(timeline, idx), *sc));
+                }
+            }
+            if cands.is_empty() {
+                continue;
             }
             per_group.push((group.id, cands));
         }
@@ -1844,10 +1862,6 @@ impl<'a> TargetedRead<'a> {
     pub fn new(read: SubstrateRead<'a>, target: ProjectionTarget) -> Self {
         Self { read, target }
     }
-
-    fn timeline_for(&self, group: GroupId) -> Option<TimelineId> {
-        self.read.resolve_turn_timeline(Some(self.target), group)
-    }
 }
 
 impl<'a> std::ops::Deref for TargetedRead<'a> {
@@ -1858,65 +1872,65 @@ impl<'a> std::ops::Deref for TargetedRead<'a> {
 }
 
 impl<'a> ContentResolver for TargetedRead<'a> {
-    fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.timeline_for(group) else {
-            return 0;
+    /// Target group → only `target.timeline` (sibling conversations of the same
+    /// shape stay masked, so a slot never sees another chat's history). Every
+    /// other group → **all** its active conversations: `code_reading` declares
+    /// one timeline per file, and collapsing to the first-registered one made
+    /// every other file unreachable to both scoring and projection.
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
+        let turns_of = |tl: TimelineId| {
+            (0..Substrate::turn_count(&self.read, tl)).map(move |i| TurnKey::new(tl, TurnIndex(i)))
         };
-        Substrate::turn_count(&self.read, timeline)
+        if group == self.target.group {
+            return turns_of(self.target.timeline).collect();
+        }
+        self.read
+            .active_timelines_for_group(group)
+            .flat_map(turns_of)
+            .collect()
     }
 
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.timeline_for(group) else {
-            return 0;
-        };
-        self.read.turn_token_count_of(timeline, index)
+    fn turn_token_count(&self, turn: TurnKey) -> usize {
+        self.read.turn_token_count_of(turn.timeline, turn.index)
     }
 
-    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
-        let Some(timeline) = self.timeline_for(group) else {
-            return 0.0;
-        };
-        self.read.turn_score_for_timeline(timeline, index)
+    fn turn_score(&self, turn: TurnKey) -> f32 {
+        self.read.turn_score_for_timeline(turn.timeline, turn.index)
     }
 
-    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.timeline_for(group)?;
-        let (layer, _) = self.read.timeline_target(timeline)?;
+    fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
+        let (layer, _) = self.read.timeline_target(turn.timeline)?;
         Some(layer)
     }
 
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
-        let timeline = self.timeline_for(group)?;
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
         // Call the Substrate inherent method (timeline-keyed) via deref — not the
         // trait method (group-keyed) on `SubstrateRead`.
-        Substrate::turn_with_tag(&self.read, timeline, tag)
-    }
-
-    fn turn_timeline(&self, group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
-        self.timeline_for(group)
-    }
-
-    fn turn_kind(&self, group: GroupId, index: TurnIndex) -> TurnKind {
-        let Some(timeline) = self.timeline_for(group) else {
-            return TurnKind::Normal;
+        let find = |tl: TimelineId| {
+            Substrate::turn_with_tag(&self.read, tl, tag).map(|idx| TurnKey::new(tl, idx))
         };
+        if group == self.target.group {
+            return find(self.target.timeline);
+        }
+        self.read.active_timelines_for_group(group).find_map(find)
+    }
+
+    fn turn_kind(&self, turn: TurnKey) -> TurnKind {
         self.read
-            .tree_meta_of(timeline, index)
+            .tree_meta_of(turn.timeline, turn.index)
             .map(|m| m.kind)
             .unwrap_or(TurnKind::Normal)
     }
 
-    fn node_covers(&self, group: GroupId, index: TurnIndex) -> Vec<TurnIndex> {
-        let Some(timeline) = self.timeline_for(group) else {
-            return Vec::new();
-        };
-        // Walk the immutable forest downward from `index`, collecting every
+    fn node_covers(&self, turn: TurnKey) -> Vec<TurnIndex> {
+        // Walk the immutable forest downward from `turn`, collecting every
         // transitive child. `tree_meta_of` gives a node's direct children;
         // Normal leaves have none, so a raw turn yields an empty cover set.
+        // A summary only ever covers turns on its own timeline.
         let mut out = Vec::new();
-        let mut stack = vec![index];
+        let mut stack = vec![turn.index];
         while let Some(node) = stack.pop() {
-            if let Some(meta) = self.read.tree_meta_of(timeline, node) {
+            if let Some(meta) = self.read.tree_meta_of(turn.timeline, node) {
                 for &child in &meta.children {
                     out.push(child);
                     stack.push(child);
