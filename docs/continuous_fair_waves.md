@@ -140,7 +140,36 @@ per-cursor layer-advance throttle driven by `decode_priority`.
   run at full speed when nothing interactive is in flight. The same loop serves
   both without a mode switch.
 
-## 7. Open questions
+## 7. Wave time-slicing and mid-wave admission
+
+The decode *quantum* — the batch of decode steps one scheduler-loop iteration
+runs before returning to the top — is bounded by **wall-clock, not step count**.
+It is clipped to `WAVE_SLICE` (2 s) regardless of whether the in-flight
+generations have finished; unfinished sequences persist in `active_decodes` and
+resume in the next quantum, so clipping simply passes the remaining work forward.
+(A large `MAX_DECODE_STEPS` backstop only engages if steps ever run far under the
+~74 ms/step WDDM launch floor.) Time-slicing replaces the old fixed 32-step
+budget so the loop returns to the top on a predictable cadence no matter how fast
+or slow the steps run.
+
+That cadence matters because the top of the loop is where the creep cohort
+re-forms. Two consequences:
+
+- **Mid-wave admission.** After every step the quantum runs the same admission it
+  runs at the loop top — `drain_submissions` → `promote_new_prefills` →
+  `pump_scope_prefills`, under the identical `admit_window`/VRAM entry criteria —
+  so a conversation that queues *while a wave is executing* is projected and
+  seated in `active_prefills` immediately rather than waiting for the whole
+  in-flight generation to finish. It joins the creep at the next quantum boundary,
+  bounded by `WAVE_SLICE`. The creep's held residual is a fixed-member-order
+  invariant, so new work is never injected mid-sweep — only picked up when
+  `form_wave_group` re-forms at a sweep boundary.
+- **Per-slice relief.** The cheap ingest throttle (`regulate_ingest_admission` +
+  the gentle warm-backed demote) also runs after each step, self-gated on an
+  active ingest, so KV production is bound to the hot→warm drain rate *across* a
+  long slice rather than only once per quantum.
+
+## 8. Open questions
 
 - **Per-cursor layer budget arithmetic.** `N/R` is the clean statement of intent;
   the exact fractional-accumulator rule (and whether prefill advances in
