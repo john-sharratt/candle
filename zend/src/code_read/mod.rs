@@ -755,6 +755,27 @@ fn process_one_file(
             "failed to tag conversation metadata (resume cache): {e:#}",
         );
     }
+
+    // The file's conversation is now complete: every scope's tool round-trip is
+    // spliced onto its timeline and sealed, and nothing attends this file again
+    // until a projection retrieves it. Flag it for full KV eviction so the
+    // persistence pipeline offloads its turns to cold (NVMe) and frees BOTH the
+    // VRAM and RAM copies — otherwise the sealed turns linger hot and accumulate
+    // across a large multi-file ingest until the card fills (the VRAM-exhaustion
+    // grind). `FreeSequence` on drop only releases the batch slot, not the
+    // sealed KV, so this proactive flag is what actually reclaims the space;
+    // `elevate_to_hot` pulls the file back from cold on demand if reselected.
+    let flagged = engine
+        .lock()
+        .unwrap()
+        .evict_ingest_timeline(conv.timeline_id());
+    tracing::debug!(
+        target: "zend::code_read::ingest",
+        file = %file.path,
+        turns = flagged,
+        "flagged completed file conversation for full KV eviction to cold",
+    );
+
     // `conv` drops here → FreeSequence releases the GPU slot; the sealed
     // turns and metadata remain in the substrate. Summarisation of these
     // scopes happens later in the background summariser.

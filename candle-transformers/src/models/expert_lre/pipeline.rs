@@ -729,10 +729,28 @@ impl PipelineState {
             let num_hits = hits.len();
             let num_loaded = loaded.len();
             self.pass_misses += num_loaded;
+            // Refresh the live resident-expert VRAM gauge from the current slot
+            // occupancy (rises on install above, falls on evict elsewhere), so the
+            // whole-card decomposition tracks experts paging VRAM↔pinned RAM.
+            #[cfg(feature = "cuda")]
+            let resident_vram = {
+                let occupied = self.inner.slots.len() - self.inner.free_slots.len();
+                let slot_bytes = self
+                    .layer_geometries
+                    .iter()
+                    .map(|g| g.total_repacked_size)
+                    .max()
+                    .unwrap_or(0);
+                occupied * slot_bytes
+            };
             if let Ok(mut s) = self.stats.lock() {
                 s.expert_hits += num_hits;
                 s.expert_misses += num_loaded;
                 s.dma_loads += num_loaded;
+                #[cfg(feature = "cuda")]
+                {
+                    s.resident_vram_bytes = resident_vram;
+                }
             }
         }
 

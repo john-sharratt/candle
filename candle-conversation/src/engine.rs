@@ -718,6 +718,29 @@ impl ConversationEngine {
         self.conversation.timeline_has_kv(timeline)
     }
 
+    /// Fully evict a **completed ingest** `timeline`'s KV from VRAM + RAM once
+    /// it is durable on disk: flag every turn residence `evict_when_cold` and
+    /// wake the persistence thread so the hot→warm→cold pipeline runs promptly.
+    /// As each turn migrates, its VRAM is freed at warm-land and its RAM copy at
+    /// cold-land, leaving it cold-only on NVMe — `elevate_to_hot` pulls it back
+    /// on demand if a later projection re-selects it. Returns the number of turn
+    /// residences flagged.
+    ///
+    /// Unlike [`Self::demote_timelines_hot`] (hot→warm, keeps the warm RAM
+    /// copy), this reclaims **both** resident tiers: a completed code_read file
+    /// is not attended again until retrieval, so keeping it warm only wastes RAM
+    /// and PCIe migration bandwidth. Fire-and-forget — the actual frees happen
+    /// on the persistence thread as durability lands.
+    pub fn evict_ingest_timeline(&self, timeline: TimelineId) -> usize {
+        let flagged = self.conversation.mark_timeline_evict_when_cold(timeline);
+        if flagged > 0 {
+            // Wake the persistence thread so the flagged turns migrate → persist
+            // → evict now, rather than waiting for the next periodic tick.
+            self.persist_thread.trigger();
+        }
+        flagged
+    }
+
     /// The segmented redo log's maintenance state — `(segment_count, last_op)`,
     /// where `last_op` is `(label, unix_secs)` — for the daemon status / GUI
     /// compaction indicator.

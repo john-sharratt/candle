@@ -697,6 +697,14 @@ pub struct ModelWeights {
     /// `QMatMul` at load; retained here for introspection. Experts are unaffected (always FP16).
     #[allow(dead_code)]
     int8mode: Int8Mode,
+    /// Fixed VRAM bytes held by the **base** (non-expert) weights — embeddings,
+    /// attention projections, norms, router, lm_head. Measured at load as the
+    /// driver-used delta across weight loading, minus the resident-expert
+    /// footprint. Added to the live resident-expert gauge to report the model's
+    /// total (time-varying) weight VRAM for the whole-card decomposition. `0` on
+    /// non-CUDA.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    base_weight_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -757,6 +765,16 @@ impl BatchedModelCore for ModelWeights {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.expert_cache.as_ref().map(|cache| cache.expert_stats())
+    }
+
+    fn resident_weight_bytes(&self) -> Option<usize> {
+        // Fixed base weights + the live resident-expert footprint (0 when no
+        // global expert cache). Rises/falls as experts page VRAM↔pinned RAM.
+        let experts = self
+            .expert_cache
+            .as_ref()
+            .map_or(0, |cache| cache.resident_vram_bytes());
+        Some(self.base_weight_bytes + experts)
     }
 
     fn reset_expert_stats(&self) {
@@ -1165,6 +1183,10 @@ impl ModelWeights {
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
             // mmap (`from_gguf_by_path`) load path.
             int8mode: Int8Mode::Off,
+            // Reader path: experts live in per-block caches (not the global
+            // `expert_cache`), so the whole-card weight decomposition can't
+            // attribute them here — left unmeasured.
+            base_weight_bytes: 0,
         })
     }
 
@@ -1342,6 +1364,19 @@ impl ModelWeights {
             }
         }
 
+        // Driver-used VRAM baseline BEFORE any weights load (the governor's
+        // balloon has already been freed). The delta from here to the fully-built
+        // model, minus the resident-expert footprint, is the fixed base-weight
+        // VRAM the whole-card decomposition reports (see `base_weight_bytes`).
+        #[cfg(feature = "cuda")]
+        let used_before_weights: usize = if matches!(device, Device::Cuda(_)) {
+            get_vram_info()
+                .map(|(free, total)| total.saturating_sub(free))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         // Helper: load tensor directly to VRAM
         let load_tensor = |name: &str| -> Result<QTensor> {
             let tensor_info = ct
@@ -1495,6 +1530,13 @@ impl ModelWeights {
         let total_units = total_expert_ticks + num_layers;
 
         // ── Build Expert Cache ──
+        // Driver-used VRAM bracketing the expert-cache build, so the base-weight
+        // measurement can EXCLUDE experts by construction (base = the driver delta
+        // OUTSIDE this bracket). Subtracting the expert gauge instead would cancel
+        // against the gauge re-added in `resident_weight_bytes`, collapsing the
+        // whole figure back to the raw (governor-balloon-polluted) driver delta.
+        #[cfg(feature = "cuda")]
+        let used_before_experts = super::batched_model::driver_used_bytes(device);
         let expert_cache = if !all_host_refs.is_empty() && n_expert > 0 {
             // Determine per-expert shapes from the first layer's first expert
             // Use max expert size across all layers for budget calculation
@@ -1582,6 +1624,10 @@ impl ModelWeights {
             warm_mmap(&mmap);
             None
         };
+        // Driver-used VRAM right after the expert cache built — the delta from
+        // `used_before_experts` is the experts' driver footprint (excluded from base).
+        #[cfg(feature = "cuda")]
+        let used_after_experts = super::batched_model::driver_used_bytes(device);
 
         // ── Load layers ──
         let mut layers = Vec::with_capacity(num_layers);
@@ -1743,6 +1789,36 @@ impl ModelWeights {
             int8mode
         );
 
+        // Base-weight VRAM = the driver-used growth OUTSIDE the expert-cache
+        // bracket: embeddings + rotary/misc (before the cache) plus attention +
+        // norms + router + lm_head (the layer loop, after it). Experts are
+        // excluded by construction — `resident_weight_bytes` adds the live expert
+        // gauge back on top, so nothing cancels. Fixed for the session (dense
+        // weights never move); the experts are the only time-varying part.
+        #[cfg(feature = "cuda")]
+        let base_weight_bytes: usize = if matches!(device, Device::Cuda(_)) {
+            let used_after = get_vram_info()
+                .map(|(free, total)| total.saturating_sub(free))
+                .unwrap_or(0);
+            let pre_experts = used_before_experts.saturating_sub(used_before_weights);
+            let post_experts = used_after.saturating_sub(used_after_experts);
+            let base = pre_experts + post_experts;
+            let expert_driver = used_after_experts.saturating_sub(used_before_experts);
+            let expert_gauge = expert_cache.as_ref().map_or(0, |c| c.resident_vram_bytes());
+            tracing::info!(
+                target: "candle_transformers::quantized_qwen3_moe",
+                base_gib = base as f64 / 1e9,
+                expert_driver_gib = expert_driver as f64 / 1e9,
+                expert_gauge_gib = expert_gauge as f64 / 1e9,
+                "weight VRAM breakdown (base = non-expert driver delta; experts from gauge)"
+            );
+            base
+        } else {
+            0
+        };
+        #[cfg(not(feature = "cuda"))]
+        let base_weight_bytes: usize = 0;
+
         Ok(Self {
             embeddings,
             layers,
@@ -1754,6 +1830,7 @@ impl ModelWeights {
             _mmap_registration: _mmap_guard,
             device: device.clone(),
             int8mode,
+            base_weight_bytes,
         })
     }
 

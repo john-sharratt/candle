@@ -732,14 +732,25 @@ fn run_pass(
             );
             hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
             hot_to_warm_count += 1;
-            // Atomic dual install: replace residence.hot with the new
-            // GPU Q-format sequences (drops the old R16/F16 Arcs from
-            // record_turn), and install warm with the CPU copy. The
-            // next turn's apply_projection injects residence.hot
-            // directly — no warm→hot promotion needed, no kv_migrate
-            // scatter into freshly-allocated arenas. Decode reads
-            // exactly the bytes the convert kernel wrote.
-            view.install_warm_and_hot(idx, hot, warm);
+            if view.residence_evict_when_cold(idx) {
+                // Completed-ingest / collection-member residence flagged for full
+                // eviction: don't keep the fresh GPU Q copy resident — install
+                // warm-only and drop hot now, so the VRAM returns immediately.
+                // The warm→cold write below (reading the CPU warm copy) then
+                // frees warm too via `install_cold`, leaving it cold-only. The
+                // just-produced `hot` Q sequences drop here → arena chunks return
+                // to the pool.
+                view.install_warm_and_evict_hot(idx, warm);
+            } else {
+                // Atomic dual install: replace residence.hot with the new
+                // GPU Q-format sequences (drops the old R16/F16 Arcs from
+                // record_turn), and install warm with the CPU copy. The
+                // next turn's apply_projection injects residence.hot
+                // directly — no warm→hot promotion needed, no kv_migrate
+                // scatter into freshly-allocated arenas. Decode reads
+                // exactly the bytes the convert kernel wrote.
+                view.install_warm_and_hot(idx, hot, warm);
+            }
         }
     }
     let install_ms = t_install.elapsed().as_millis() as u64;
@@ -793,8 +804,8 @@ fn run_pass(
     // GPU sealed); the same payload as warm, only its device backing
     // differs.
     let pending_cold = conversation.read().snapshot_pending_cold();
-    let mut cold_installs: Vec<(ResidenceIndex, Vec<StoredSequence>, u64)> =
-        Vec::with_capacity(pending_cold.len());
+    let mut warm_to_cold_bytes: u64 = 0;
+    let mut warm_to_cold_count: usize = 0;
     for (idx, stream_id, hot) in pending_cold {
         if backings.len() != hot.len() {
             tracing::warn!(
@@ -811,46 +822,23 @@ fn run_pass(
                 continue;
             }
         };
-        let stored = match conversation.persist_turn_chunks_capture(stream_id, &grid) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("persist: warm→cold write failed for {idx:?}: {e}");
-                continue;
-            }
-        };
-        if stored.is_empty() {
-            continue;
-        }
-        // Mark the stream durable through the last-written chunk so
-        // the recovery walker knows the turn's chunks landed.
-        let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
-        let through = (total_chunks.max(1) - 1) as u64;
-        if let Err(e) = conversation.commit_stream_through(stream_id, through) {
-            tracing::warn!("persist: commit_stream for {idx:?} failed: {e}");
-        }
-        let bytes_for_item: u64 = stored
-            .iter()
-            .flat_map(|s| s.chunks.iter())
-            .map(|c| c.record_len)
-            .sum();
+        warm_to_cold_bytes = warm_to_cold_bytes.saturating_add(grid.bytes() as u64);
+        warm_to_cold_count += 1;
         tracing::trace!(
             target: "candle_conversation::persistence::tier",
             residence = idx.0,
             stream_id = stream_id.0,
-            bytes = bytes_for_item,
-            "persisted warm → cold (redo-log append)"
+            bytes = grid.bytes(),
+            "enqueue warm → cold (off-thread writer append + install_cold)"
         );
-        cold_installs.push((idx, stored, bytes_for_item));
-    }
-    let mut warm_to_cold_bytes: u64 = 0;
-    let mut warm_to_cold_count: usize = 0;
-    if !cold_installs.is_empty() {
-        let mut view = conversation.write();
-        for (idx, stored, bytes) in cold_installs {
-            warm_to_cold_bytes = warm_to_cold_bytes.saturating_add(bytes);
-            warm_to_cold_count += 1;
-            view.install_cold(idx, stored);
-        }
+        // Hand the redo-log append + `install_cold` to the off-thread writer: the
+        // GPU gather is done here, so the cold-write disk I/O no longer blocks this
+        // thread's next hot→warm VRAM-relief pass, and `install_cold` runs
+        // post-write so `slot.cold` is only ever set on durable data (the
+        // `purge_warm` RAM-unload invariant). `snapshot_pending_cold` skips the
+        // now `cold_pending` residence until the write lands, so no double-write;
+        // the writer's dual-cap queue backpressures a sustained cold backlog.
+        conversation.enqueue_kv_cold(idx, stream_id, grid);
     }
 
     // ── Phase 2.5: section persist ─────────────────────────────────────

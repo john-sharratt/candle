@@ -261,6 +261,21 @@ impl Scheduler {
             // "no forwards". Idempotent and cheap when nothing finished.
             self.promote_finished_prefills_to_decodes();
 
+            // Per-wave ingest backpressure + gentle demote. These are cheap (an
+            // atomic backlog read + a bounded warm-backed LRU walk) and self-gate on
+            // `ingest_timelines` (a no-op when not ingesting), so they run EVERY wave
+            // — not on the 2 s telemetry cadence like the footprint defrag below.
+            // CFW's co-batched wave folds a wide prefill cohort into every forward,
+            // so KV grows far faster per wave than the serial passes it replaced; a
+            // 2 s-cadence throttle lets `used` overshoot massively between ticks (the
+            // leak-like climb) and lets ingest outrun the hot→warm drain into
+            // warm-starvation, where the demote finds nothing warm-backed to shed.
+            // Sizing the admission window to the drain backlog and shedding the
+            // warm-backed tail every wave bounds KV production to the drain rate, so
+            // `used` holds at the demote watermark instead of climbing.
+            self.regulate_ingest_admission();
+            self.demote_cold_ingest_if_pressured();
+
             // AIMD reopen (non-ingest): if a prior pressure episode narrowed the
             // admission window, probe it back open by one slot per loop once VRAM
             // is no longer under pressure — gradual recovery so we don't snap to
@@ -319,6 +334,12 @@ impl Scheduler {
                     .vram_free_total()
                     .map(|(f, t)| (mib(t), mib(f)))
                     .unwrap_or((0, 0));
+                // Live resident model-weight VRAM: fixed base weights + the
+                // resident-expert footprint, which rises/falls as MoE experts page
+                // VRAM↔pinned RAM. Sampled from the model each wave so the weights
+                // band tracks the real (time-varying) footprint rather than a
+                // static startup snapshot. `0` when the model can't report it.
+                let weights_mib = self.model.resident_weight_bytes().map(mib).unwrap_or(0);
                 // Active-work counts at this wave for the slots panel.
                 let slots = (
                     self.slot_conversations.len() as u32,
@@ -330,7 +351,7 @@ impl Scheduler {
                     kv_vram,
                     backlog,
                     fmt,
-                    (reserved_mib, total_mib, free_mib),
+                    (reserved_mib, total_mib, free_mib, weights_mib),
                     slots,
                 );
                 // Return freed KV VRAM to the OS every wave. FIRST release
@@ -356,17 +377,10 @@ impl Scheduler {
                     );
                 }
                 self.trim_kv_pool();
-                // Gentle-early ladder (bottom rung): demote cold, warm-backed
-                // ingest KV to RAM once `used` crosses ~50% of C — long before the
-                // near-cap footprint controllers. Ingest KV is zero-reload-cost, so
-                // shedding it first keeps a bulk repo ingest from pinning the whole
-                // corpus hot. No-op when nothing is ingesting / below the watermark.
-                self.demote_cold_ingest_if_pressured();
-                // Leading backpressure: size the ingest admission window to the
-                // hot→warm drain backlog so throughput scales down as seals outrun
-                // the drain and back up as it catches up — keeping `used` off the
-                // warm-starved climb the demote alone can't prevent under load.
-                self.regulate_ingest_admission();
+                // NOTE: the gentle-early ingest demote + admission backpressure now
+                // run PER-WAVE (above), not on this 2 s cadence — they're cheap and
+                // must track CFW's fast per-wave KV growth to hold `used` at the
+                // demote watermark. Only the expensive footprint defrag stays here.
                 // Footprint reclaim: defrag the fragmented reserved gap when it
                 // nears capacity (so a wide forward's transient peak can't push the
                 // card into WDDM paging), and bulk-evict resident KV only when

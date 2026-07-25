@@ -1769,7 +1769,9 @@ impl Sequence {
             .as_ref()
             .and_then(|s| s.turn_index)
             .ok_or_else(|| {
-                ConversationError::Channel("scope round-trip: response turn produced no index".into())
+                ConversationError::Channel(
+                    "scope round-trip: response turn produced no index".into(),
+                )
             })?;
         // Records Turn B + its staged provenance events (the decoded-ingest path).
         self.finish_turn_staged(handle, &response)?;
@@ -1781,6 +1783,11 @@ impl Sequence {
     /// `adopt_turn` can reference its sealed K/V) but has its own scheduler slot
     /// + timeline, so scopes ingest concurrently without ordering conflicts.
     pub fn fork_scope(&self) -> crate::Result<Sequence> {
+        // Do NOT mark the fork append-only / evict_when_cold: `adopt_turn` requires
+        // the fork's turns to still be HOT at splice, so auto-evicting them would
+        // race the splice ("source K/V not hot"). The fork's orphaned hot is freed
+        // instead at `tombstone_timeline` (below), where the file timeline's cloned
+        // chunk handles keep the shared KV alive.
         self.fork()
     }
 
@@ -1809,7 +1816,13 @@ impl Sequence {
             .map_err(ConversationError::Model)?;
         let new_resp = self
             .substrate
-            .adopt_turn(fork_timeline, TurnIndex(resp_idx), file_tl, Role::Assistant, tags)
+            .adopt_turn(
+                fork_timeline,
+                TurnIndex(resp_idx),
+                file_tl,
+                Role::Assistant,
+                tags,
+            )
             .map_err(ConversationError::Model)?;
         self.substrate
             .couple_turn(file_tl, new_call.0)

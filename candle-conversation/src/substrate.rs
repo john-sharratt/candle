@@ -323,13 +323,25 @@ pub struct SequenceResidence {
     /// across tier transitions since the payload itself doesn't change.
     /// `0` for a freshly-allocated residence with no bytes anywhere.
     pub byte_size: u64,
-    /// When `true`, the persistence thread frees `hot` the moment a cold
-    /// copy lands (Phase 2.5 `install_cold`) — offloading VRAM as the build
-    /// runs.  Set only for **collection-member** sections (prefix-transparent:
-    /// nothing attends back over them during the build, and the per-turn
-    /// `elevate_to_hot` reloads the projection's top-k selection on demand).
-    /// Boundary/turn residences leave this `false` and stay hot.
+    /// When `true`, the persistence thread fully offloads this residence as its
+    /// KV becomes durable — freeing `hot` (VRAM) the moment a warm/cold copy
+    /// exists and `warm` (RAM) the moment the cold copy lands (`install_cold`),
+    /// leaving it cold-only on NVMe. `elevate_to_hot` pulls it back on demand.
+    /// Set for two offload-only cases:
+    ///   - **collection-member** sections (prefix-transparent: nothing attends
+    ///     back over them during the build; hot→cold, no warm), and
+    ///   - **completed-ingest** turns (e.g. a code_read file's turns, spliced
+    ///     and sealed, not attended again until retrieval; hot→warm→cold).
+    /// Live dialogue turns and boundary sections leave this `false` and stay
+    /// resident.
     pub evict_when_cold: bool,
+    /// `true` while this residence's warm→cold redo-log write is in flight on the
+    /// off-thread [`crate::persistence::writer::SubstrateWriter`] (set at enqueue,
+    /// cleared by `install_cold`). [`Self::snapshot_pending_cold`] skips it so the
+    /// persistence thread doesn't re-gather + double-write the same turn while its
+    /// first write is still queued. Distinct from `cold.is_some()`, which only
+    /// becomes true once that write lands.
+    pub cold_pending: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -1104,6 +1116,7 @@ impl Substrate {
             cold: None,
             byte_size: 0,
             evict_when_cold: false,
+            cold_pending: false,
         });
         idx
     }
@@ -1287,15 +1300,30 @@ impl Substrate {
         debug_assert!(!cold.is_empty(), "install_cold called with empty Vec");
         let slot = &mut self.residence[residence.0];
         slot.cold = Some(cold);
-        // Offload-as-we-go: a flagged collection-member section now has its
-        // (quantized) bytes safely on disk, so free the VRAM immediately.  The
-        // drop returns the arena chunks to the pool for the next prefill; the
-        // per-turn `elevate_to_hot` reloads this section if the projection's
-        // top-k re-selects it.  Runs under the persistence thread's substrate
-        // write lock (Phase 2.5), so the arena free is serialised with the
-        // scheduler's allocations.
-        if slot.evict_when_cold {
-            slot.hot = None;
+        // The async write landed — clear the in-flight flag so a re-gather is
+        // gated by `cold.is_some()` from here on.
+        slot.cold_pending = false;
+        // Offload-as-we-go: the (quantized) bytes are now durable on disk, so
+        // free EVERY resident tier and let `elevate_to_hot` pull the residence
+        // back from cold (NVMe) on demand if a later projection re-selects it.
+        //   - Sections are hot→cold (no warm): the `warm` drop is a no-op.
+        //   - Completed-ingest turns are hot→warm→cold: `hot` was already freed
+        //     at warm-land (see the migrate install loop), and dropping `warm`
+        //     here reclaims the RAM copy too — leaving the turn cold-only, off
+        //     both the VRAM and RAM tiers.
+        // The drop returns arena chunks to the pool / frees the CPU copy. Runs
+        // under the persistence thread's substrate write lock (Phase 2.5), so
+        // the arena free is serialised with the scheduler's allocations.
+        if !slot.evict_when_cold {
+            return;
+        }
+        let had_hot = slot.hot.take().is_some();
+        let had_warm = slot.warm.take().is_some();
+        if had_hot {
+            Self::remove_from_lru(&mut self.hot_lru, residence);
+        }
+        if had_warm {
+            Self::remove_from_lru(&mut self.warm_lru, residence);
         }
     }
 
@@ -1304,6 +1332,70 @@ impl Substrate {
     /// Set by the scheduler's collection-member quantize drain.
     pub fn mark_section_evict_when_cold(&mut self, residence: ResidenceIndex) {
         self.residence[residence.0].evict_when_cold = true;
+    }
+
+    /// Whether `residence` is flagged for full eviction once its KV is durable
+    /// on disk — read by the persistence thread's hot→warm install so a flagged
+    /// turn goes straight to warm-only (its GPU copy freed the moment warm
+    /// lands) rather than lingering hot until cold. See
+    /// [`SequenceResidence::evict_when_cold`].
+    pub fn residence_evict_when_cold(&self, residence: ResidenceIndex) -> bool {
+        self.residence[residence.0].evict_when_cold
+    }
+
+    /// Flag every turn residence of `timeline` for full eviction the moment its
+    /// KV is durable on disk (see [`SequenceResidence::evict_when_cold`]): the
+    /// hot→warm install frees VRAM as warm lands, then `install_cold` frees the
+    /// warm RAM copy as cold lands, leaving each turn cold-only on NVMe.
+    ///
+    /// Used to reclaim a **completed ingest** conversation (e.g. a code_read
+    /// file) whose turns won't be attended again until retrieval pulls them
+    /// back via `elevate_to_hot` — so their KV must not linger resident and
+    /// accumulate through a large multi-file ingest. Returns the number of turn
+    /// residences flagged.
+    ///
+    /// Reclaims VRAM **immediately** for any turn already warm-backed: it drops
+    /// the hot copy on the spot (keeping warm — a safe demote, since the RAM copy
+    /// survives and `elevate_to_hot` reloads on demand). This is the load-bearing
+    /// case: a file usually completes AFTER its turns have already migrated
+    /// hot→warm, so `install_warm_and_evict_hot` (which only fires DURING the
+    /// migrate, for residences flagged beforehand) never ran for them — nothing
+    /// else drops their hot until the async, possibly-lagging cold write lands.
+    /// Without this, completed files' hot KV piles up and fills the card mid-ingest.
+    pub fn mark_timeline_evict_when_cold(&mut self, timeline: TimelineId) -> usize {
+        let Some(entry) = self.timelines.get(&timeline) else {
+            return 0;
+        };
+        let residences: Vec<ResidenceIndex> =
+            entry.turns.values().map(|t| t.content.residence).collect();
+        for r in &residences {
+            self.residence[r.0].evict_when_cold = true;
+            // Immediate hot-drop for already-warm turns (VRAM back now, warm kept).
+            let (has_hot, has_warm) = {
+                let slot = &self.residence[r.0];
+                (slot.hot.is_some(), slot.warm.is_some())
+            };
+            if has_hot && has_warm {
+                self.residence[r.0].hot = None;
+                Self::remove_from_lru(&mut self.hot_lru, *r);
+            }
+        }
+        residences.len()
+    }
+
+    /// Flag a SINGLE turn's residence for full eviction once its KV is durable —
+    /// see [`Self::mark_timeline_evict_when_cold`]. Set at splice time (while the
+    /// turn is still hot, before the hot→warm migrate) so the migrate's
+    /// `install_warm_and_evict_hot` drops its Q-format hot the moment warm lands,
+    /// instead of installing a resident Q copy. Load-bearing for code_read: a
+    /// scope turn adopted onto its file timeline is never re-attended until query
+    /// time, and the file timeline is NOT in the scheduler's `ingest_timelines`,
+    /// so the gentle demote never covers it — without this its migrated Q hot
+    /// copy accumulates and climbs the card (`quant_live` leak).
+    pub fn mark_turn_evict_when_cold(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        if let Some(r) = self.turn(timeline, idx).map(|t| t.content.residence) {
+            self.residence[r.0].evict_when_cold = true;
+        }
     }
 
     /// Snapshot indices of hot-resident slots that lack a warm copy —
@@ -1370,7 +1462,10 @@ impl Substrate {
             .iter()
             .filter_map(|&idx| {
                 let slot = &self.residence[idx.0];
-                if slot.cold.is_some() {
+                // Skip a turn whose cold copy already landed OR whose async cold
+                // write is still queued on the writer — re-selecting the latter
+                // would double-write the same KV.
+                if slot.cold.is_some() || slot.cold_pending {
                     return None;
                 }
                 slot.warm
@@ -1378,6 +1473,13 @@ impl Substrate {
                     .map(|warm| (idx, slot.stream_id, warm.clone()))
             })
             .collect()
+    }
+
+    /// Flag a residence's warm→cold write as in flight on the off-thread writer,
+    /// so [`Self::snapshot_pending_cold`] won't re-gather it before the write lands
+    /// (which clears the flag via `install_cold`). Set at enqueue.
+    pub fn mark_cold_pending(&mut self, residence: ResidenceIndex) {
+        self.residence[residence.0].cold_pending = true;
     }
 
     /// Classify a batch of items (sections + turns) by what work
@@ -2729,6 +2831,29 @@ impl Substrate {
     /// deletion would only take effect on the next reload.
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
+        // A tombstoned timeline's KV is dead — release its resident VRAM NOW rather
+        // than wait for compaction. Its chunks survive for any other holder: a
+        // code_read scope fork's two turns are spliced onto the file timeline
+        // (which clones the chunk handles) right before the fork is tombstoned, so
+        // dropping the fork's hot only releases its redundant reference. For a
+        // genuinely deleted timeline the KV is dead anyway. Without this, the
+        // fork's orphaned hot copies — which nothing else evicts, the fork being
+        // tombstoned and never demoted — accumulate on the card through a bulk
+        // ingest (the `quant_live` climb).
+        let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
+            Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
+            None => return,
+        };
+        for r in &residences {
+            // Flag evict_when_cold BEFORE dropping hot: it closes the race where the
+            // persistence thread snapshotted this residence's hot before the
+            // tombstone and installs it after — `install_warm_and_evict_hot` (which
+            // the flag selects) then drops that re-added Q copy instead of keeping it.
+            self.residence[r.0].evict_when_cold = true;
+            if self.residence[r.0].hot.take().is_some() {
+                Self::remove_from_lru(&mut self.hot_lru, *r);
+            }
+        }
     }
 
     /// Whether `timeline` has been tombstoned.
@@ -5228,6 +5353,84 @@ mod tests {
             "boundary section stays hot"
         );
         assert!(sub.residence[boundary.0].cold.is_some());
+    }
+
+    /// A completed-ingest turn flagged `evict_when_cold` is fully evicted from
+    /// BOTH resident tiers when its cold copy lands: `install_cold` drops hot
+    /// AND warm and clears both LRUs, leaving it cold-only on NVMe. An unflagged
+    /// turn keeps its resident copies.
+    #[test]
+    fn install_cold_fully_evicts_flagged_turn_from_both_tiers() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, flagged) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, kept) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+
+        // One turn is a completed-ingest residence flagged for full eviction; the
+        // other stays live. Both start hot + warm (on both LRUs).
+        sub.residence[flagged.0].evict_when_cold = true;
+        assert!(sub.hot_lru.contains(&flagged) && sub.warm_lru.contains(&flagged));
+
+        sub.install_cold(flagged, cold());
+        sub.install_cold(kept, cold());
+
+        // Flagged: cold durable, and BOTH resident tiers freed + off both LRUs.
+        assert!(sub.residence[flagged.0].cold.is_some(), "cold durable");
+        assert!(sub.residence[flagged.0].hot.is_none(), "VRAM reclaimed");
+        assert!(sub.residence[flagged.0].warm.is_none(), "RAM reclaimed");
+        assert!(!sub.hot_lru.contains(&flagged), "off hot_lru");
+        assert!(!sub.warm_lru.contains(&flagged), "off warm_lru");
+
+        // Unflagged: cold lands but the turn stays fully resident.
+        assert!(sub.residence[kept.0].cold.is_some());
+        assert!(sub.residence[kept.0].hot.is_some(), "kept stays hot");
+        assert!(sub.residence[kept.0].warm.is_some(), "kept stays warm");
+    }
+
+    /// `mark_timeline_evict_when_cold` flags every turn residence of exactly the
+    /// named timeline (leaving other timelines' turns untouched) and reports the
+    /// count; an unknown timeline is a no-op.
+    #[test]
+    fn mark_timeline_evict_when_cold_flags_every_turn_of_that_timeline() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let ingest = alloc.next();
+        let live = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(ingest, layer, group);
+        sub.register_timeline(live, layer, group);
+
+        let (_, a) = install_hot_and_warm(&mut sub, ingest, 10);
+        let (_, b) = install_hot_and_warm(&mut sub, ingest, 10);
+        let (_, c) = install_hot_and_warm(&mut sub, live, 10);
+
+        let n = sub.mark_timeline_evict_when_cold(ingest);
+        assert_eq!(n, 2, "both ingest turns flagged");
+        assert!(sub.residence[a.0].evict_when_cold);
+        assert!(sub.residence[b.0].evict_when_cold);
+        assert!(
+            !sub.residence[c.0].evict_when_cold,
+            "the other timeline's turn is untouched"
+        );
+        // Already-warm ingest turns get their hot copy dropped immediately (VRAM
+        // reclaimed now) while warm is kept; the other timeline stays fully hot.
+        assert!(sub.residence[a.0].hot.is_none() && sub.residence[a.0].warm.is_some());
+        assert!(sub.residence[b.0].hot.is_none() && sub.residence[b.0].warm.is_some());
+        assert!(!sub.hot_lru.contains(&a) && !sub.hot_lru.contains(&b));
+        assert!(sub.residence[c.0].hot.is_some() && sub.residence[c.0].warm.is_some());
+
+        // Unknown timeline → no-op.
+        assert_eq!(sub.mark_timeline_evict_when_cold(alloc.next()), 0);
     }
 
     /// A zero target evicts nothing — there's no incoming load to make room

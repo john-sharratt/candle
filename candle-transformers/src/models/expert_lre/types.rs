@@ -50,6 +50,13 @@ pub struct PipelineStats {
     pub fence_stalls: usize,
     /// Total MoE work requests processed.
     pub work_requests: usize,
+    /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
+    /// slot_size`. Unlike the counters above (monotonic tallies), this is a
+    /// gauge: it rises as experts load into VRAM and falls as they stream out
+    /// to pinned RAM under pressure, so the whole-card VRAM decomposition can
+    /// show the model's time-varying resident-expert footprint. Seeded at cache
+    /// construction and refreshed by the pipeline thread each classify.
+    pub resident_vram_bytes: usize,
 }
 
 impl PipelineStats {
@@ -65,10 +72,14 @@ impl PipelineStats {
             .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
-    /// Reset all counters to zero.
+    /// Reset all counters to zero. `resident_vram_bytes` is a live gauge, not a
+    /// per-interval tally, so it survives the reset (otherwise an inline-mode
+    /// cache — which never re-seeds it via a classify — would read 0 forever).
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
+            let resident = s.resident_vram_bytes;
             *s = Self::default();
+            s.resident_vram_bytes = resident;
         }
     }
 

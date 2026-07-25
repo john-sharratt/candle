@@ -44,6 +44,9 @@ struct Wave {
     free: f64,
     qkv: f64,
     fkv: f64,
+    // Model weights resident in the pool (MiB), captured at startup — the
+    // whole-card decomp carves these out of `slack` so the weights band is real.
+    wt: f64,
     // Projection decomposition (ms): pdrain (drain minus re-attributed prefill) +
     // drain elevate/glue; reproject total + scan/glue/layout.
     pdrain: f64,
@@ -204,6 +207,7 @@ fn build_body() -> Telemetry {
                 free: s.free_mib as f64,
                 qkv: s.quant_mib as f64,
                 fkv: s.float_mib as f64,
+                wt: s.weights_mib as f64,
                 pdrain: s.pdrain_ms as f64,
                 delev: s.drain_elevate_ms as f64,
                 dglue: s.drain_glue_ms as f64,

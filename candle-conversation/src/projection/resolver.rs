@@ -11,13 +11,15 @@ use super::project::ProjectionTarget;
 use super::schema::{LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
+use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::{decode_wide_sigs, score_slots_weighted, WideQSig};
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
-    ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
-    TurnPartWrite,
+    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
+    SubstrateWrite, TurnPartWrite,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -108,6 +110,12 @@ pub struct Conversation {
     /// last completed op). Refreshed by the persistence thread each pass; read
     /// by `/v1/status` off this separate lock so it never blocks on compaction.
     maintenance: Arc<Mutex<(usize, Option<(String, u64)>, bool)>>,
+    /// Off-thread substrate writer: the redo-log append for every turn/section
+    /// stream-decl is enqueued here and drained by a dedicated thread, so a seal on
+    /// the inference thread never blocks on the persistence lock (which a
+    /// compaction can hold across its relocation I/O). Shared across clones; the
+    /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
+    writer: Arc<SubstrateWriter>,
 }
 
 impl Default for Conversation {
@@ -137,13 +145,18 @@ impl Conversation {
         let mut substrate = Substrate::new();
         let persistence = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
             .expect("ephemeral SubstratePersistence");
+        let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
+        let inner = Arc::new(RwLock::new(substrate));
+        let persistence = Arc::new(Mutex::new(persistence));
+        let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
-            inner: Arc::new(RwLock::new(substrate)),
+            inner,
             allocator: Arc::new(TimelineAllocator::new()),
-            maintenance: Arc::new(Mutex::new((persistence.segment_count(), None, false))),
-            persistence: Arc::new(Mutex::new(persistence)),
+            maintenance,
+            persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
+            writer,
         }
     }
 
@@ -153,13 +166,18 @@ impl Conversation {
     /// [`SubstratePersistence::open_in_with_substrate`] and pass both
     /// here.
     pub fn from_parts(substrate: Substrate, persistence: SubstratePersistence) -> Self {
+        let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
+        let inner = Arc::new(RwLock::new(substrate));
+        let persistence = Arc::new(Mutex::new(persistence));
+        let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
-            inner: Arc::new(RwLock::new(substrate)),
+            inner,
             allocator: Arc::new(TimelineAllocator::new()),
-            maintenance: Arc::new(Mutex::new((persistence.segment_count(), None, false))),
-            persistence: Arc::new(Mutex::new(persistence)),
+            maintenance,
+            persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
+            writer,
         }
     }
 
@@ -827,11 +845,14 @@ impl Conversation {
             let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
             (layout, token_ids, block_range, sigs_blob)
         };
-        let sealed = self.read().turn_sealed_of(from_tl, from_idx).ok_or_else(|| {
-            candle::Error::Msg(
-                "adopt_turn: source K/V not hot (migrated) — splice sooner".into(),
-            )
-        })?;
+        let sealed = self
+            .read()
+            .turn_sealed_of(from_tl, from_idx)
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "adopt_turn: source K/V not hot (migrated) — splice sooner".into(),
+                )
+            })?;
         let token_count = token_ids.len();
         let write = TurnPartWrite {
             layout,
@@ -843,14 +864,22 @@ impl Conversation {
             tags,
         };
         let idx = self.record_turn(to_tl, role, write, |seqs| Ok(seqs.to_vec()))?;
+        // Self-evict this code_read scope turn: it's never re-attended until query
+        // time, and the file timeline is NOT in the scheduler's `ingest_timelines`,
+        // so the gentle demote never covers it. Flag it now — while still hot,
+        // before the hot→warm migrate — so the migrate drops its Q-format hot the
+        // instant warm lands (`install_warm_and_evict_hot`) instead of leaving a
+        // resident Q copy piling up on the file timeline (the quant-KV climb). This
+        // is targeted to the code_read splice path (unlike a `summarize`-based
+        // marker, which `--disable-summariser` would spuriously set on dialogue).
+        // The source fork's turns are freed by `tombstone_timeline` at splice.
+        self.write().mark_turn_evict_when_cold(to_tl, idx);
         let stream_id = turn_stream_id(to_tl.raw(), idx.0);
-        if let Err(e) = self.persist_tokens_only(stream_id, &token_ids) {
-            tracing::warn!("adopt_turn persist tokens failed: {e}");
-        }
+        // Off-thread writer (never the persistence lock) so a compaction can't
+        // stall the parallel code_read splice.
+        self.enqueue_tokens(stream_id, token_ids.clone());
         if let Some(blob) = sigs_blob {
-            if let Err(e) = self.persist_wide_q_sigs(stream_id, &blob) {
-                tracing::warn!("adopt_turn persist wide-Q sigs failed: {e}");
-            }
+            self.enqueue_wide_q_sigs(stream_id, blob);
         }
         Ok(idx)
     }
@@ -861,14 +890,22 @@ impl Conversation {
     /// section-by-name lookups — consult the in-memory decls, so a stream
     /// declared in the current session (every calibration turn or section on
     /// a fresh substrate) must be visible to them without a restart.
-    fn declare_and_mirror(&self, decl: StreamDecl, err_ctx: &str) -> candle::Result<StreamId> {
-        let stream_id = self
-            .persistence
-            .lock()
-            .unwrap()
-            .declare_stream(&decl)
-            .map_err(|e| candle::Error::Msg(format!("{err_ctx}: {e}")))?;
+    fn declare_and_mirror(&self, decl: StreamDecl, _err_ctx: &str) -> candle::Result<StreamId> {
+        // The stream id is a PURE function of the decl (`turn_stream_id` /
+        // `section_stream_id`), so compute it locally, apply the decl in-memory
+        // synchronously (projection needs it this instant), and hand ONLY the
+        // durable redo-log append to the off-thread writer. The inference thread
+        // never takes the persistence lock, so a segment compaction holding it
+        // can't block the seal. Reconstruct is order-independent + per-turn
+        // fault-isolated, so the async append is crash-safe: worst case a decl
+        // lost on crash yields an absent turn, never corruption.
+        let stream_id = decl.stream_id();
+        let payload = decl.encode();
         self.write().apply_stream_decl(stream_id, decl);
+        self.writer.enqueue(WriteJob::StreamDecl {
+            stream_id: stream_id.0,
+            payload,
+        });
         Ok(stream_id)
     }
 
@@ -1473,6 +1510,14 @@ impl Conversation {
         false
     }
 
+    /// Flag every turn residence of `timeline` for full eviction once its KV is
+    /// durable on disk — see [`crate::substrate::Substrate::mark_timeline_evict_when_cold`].
+    /// The persistence pipeline then frees the turns' VRAM (at warm-land) and
+    /// RAM (at cold-land), leaving them cold-only. Returns the count flagged.
+    pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
+        self.write().mark_timeline_evict_when_cold(timeline)
+    }
+
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
     /// and persist a `RecordType::DebugId` record to the redo log.
     /// Last-write-wins on replay.  Idempotent: if the substrate
@@ -1626,6 +1671,31 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
     }
 
+    /// Enqueue a warm→cold KV migration onto the off-thread writer (phase 2). The
+    /// caller (persistence thread) has already gathered `grid` off the GPU; the
+    /// writer appends the chunks, folds their locations into the substrate index,
+    /// marks the stream durable, and `install_cold`s (drops hot) — all AFTER the
+    /// append. So the persistence thread's hot→warm VRAM-relief drain is never
+    /// blocked by cold-write disk I/O, and `slot.cold` is only ever set on durable
+    /// data, keeping the `purge_warm` RAM-unload invariant intact. Bounded by the
+    /// writer's dual-cap backpressure.
+    pub fn enqueue_kv_cold(
+        &self,
+        residence: ResidenceIndex,
+        stream_id: StreamId,
+        grid: TurnChunkGrid,
+    ) {
+        // Flag the write in flight BEFORE enqueuing so the next persistence pass's
+        // `snapshot_pending_cold` skips this residence until `install_cold` (on the
+        // writer) clears it — no double gather/write.
+        self.write().mark_cold_pending(residence);
+        self.writer.enqueue(WriteJob::KvCold {
+            residence,
+            stream_id,
+            grid,
+        });
+    }
+
     /// Persist the projection schema/template into the substrate's
     /// `Template` record — compare-and-insert (only appends when it differs
     /// from what the log already holds), then commit if written. Lets the
@@ -1667,6 +1737,31 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.append_wide_q_sigs(stream_id, payload)
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
+    }
+
+    /// Enqueue a turn/section `Tokens` record onto the off-thread writer — the
+    /// durable copy for reload. The in-memory token buffer is already set at
+    /// record time, so this NEVER blocks the seal on the persistence lock (which a
+    /// compaction holds across its whole relocation I/O). Metadata-class: exempt
+    /// from the writer's KV byte cap, so a warm→cold backlog can't stall it either.
+    /// Async is crash-safe — a `Tokens` record lost on crash yields an absent turn
+    /// (reconstruct is order-independent + per-turn fault-isolated), never corruption.
+    pub fn enqueue_tokens(&self, stream_id: StreamId, token_ids: Vec<u32>) {
+        self.writer.enqueue(WriteJob::Tokens {
+            stream_id,
+            token_ids,
+        });
+    }
+
+    /// Mirror a turn's wide-Q signature into the in-RAM substrate synchronously
+    /// (the same-session provenance scan reads it back immediately) and enqueue
+    /// the durable redo-log append onto the off-thread writer — so the seal never
+    /// blocks on the persistence lock. Same crash-safety as [`Self::enqueue_tokens`].
+    pub fn enqueue_wide_q_sigs(&self, stream_id: StreamId, payload: Vec<u8>) {
+        self.write()
+            .set_wide_q_sigs_blob(stream_id, payload.clone());
+        self.writer
+            .enqueue(WriteJob::WideQSigs { stream_id, payload });
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`

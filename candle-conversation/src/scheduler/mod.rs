@@ -1766,7 +1766,7 @@ impl WaveStats {
         kv_vram: Option<(usize, usize)>,
         backlog: u64,
         fmt: Option<(u32, u64, u64, u32, u64, u64)>,
-        vram_decomp: (u64, u64, u64),
+        vram_decomp: (u64, u64, u64, u64),
         slots: (u32, u32, u32, u32),
     ) {
         let elapsed = self.window_start.elapsed();
@@ -4905,17 +4905,11 @@ impl Scheduler {
         // the compression path must too — otherwise the compressed text is
         // unrecoverable from the substrate (only its K/V chunks survive).
         let stream_id = turn_stream_id(timeline.raw(), idx.0);
-        if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids) {
-            tracing::warn!("persist summary tokens failed: {e}");
-        }
+        conversation.enqueue_tokens(stream_id, persist_token_ids.clone());
         // Persist the node's wide-Q signature under the same stream — the
         // gallery entry a provenance scan matches against the summary.
         if !wide_sigs.is_empty() {
-            if let Err(e) =
-                conversation.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&wide_sigs))
-            {
-                tracing::warn!("persist summary wide-Q sigs failed: {e}");
-            }
+            conversation.enqueue_wide_q_sigs(stream_id, encode_wide_sigs(&wide_sigs));
         }
         // Synthesize + persist the node's projection event: the mandatory
         // provenance linkage naming the node itself and the turns it covers
@@ -5736,15 +5730,11 @@ impl Scheduler {
         // Persist the turn's token ids — `record_turn` only declared the turn
         // stream; without this the scope's text is unrecoverable from disk.
         let stream_id = turn_stream_id(timeline.raw(), idx.0);
-        if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids) {
-            tracing::warn!("scope ingest persist tokens failed: {e}");
-        }
+        conversation.enqueue_tokens(stream_id, persist_token_ids.clone());
         // Persist the scope turn's wide-Q signature (in-RAM + redo log) — the
         // gallery entry a provenance scan matches against.
         if !sigs.is_empty() {
-            if let Err(e) = conversation.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&sigs)) {
-                tracing::warn!("scope ingest persist wide-Q sigs failed: {e}");
-            }
+            conversation.enqueue_wide_q_sigs(stream_id, encode_wide_sigs(&sigs));
         }
         if let Some(tx) = responder {
             let _ = tx.send(Ok(idx));
@@ -5962,7 +5952,6 @@ impl Scheduler {
         profile::report("apply_projection");
         r
     }
-
 
     /// Build phase of [`Self::apply_projection`] for the cross-conversation wave:
     /// inject the sealed prefix + collect the glue descriptor, but do NOT fire
@@ -7106,24 +7095,18 @@ impl Scheduler {
                 // same turn stream.
                 if !wide_sigs.is_empty() {
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    if let Err(e) =
-                        conversation.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&wide_sigs))
-                    {
-                        tracing::warn!("persist wide-Q sigs failed: {e}");
-                    }
+                    conversation.enqueue_wide_q_sigs(stream_id, encode_wide_sigs(&wide_sigs));
                 }
-                // Synchronously persist the turn's `Tokens` record —
-                // tiny and load-bearing for substrate reconstruction.
-                // The heavy `Chunks` records + the matching `Commit`
-                // are deferred to the persistence thread; we fire its
-                // trigger below.
+                // Persist the turn's `Tokens` record — tiny and
+                // load-bearing for substrate reconstruction. Enqueued onto
+                // the off-thread writer (not written under the persistence
+                // lock) so a compaction holding that lock can't stall the
+                // seal; the heavy `Chunks` records + matching `Commit` are
+                // likewise deferred to the persistence thread (trigger below).
                 {
                     use turn_stream_id;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids)
-                    {
-                        tracing::warn!("persist tokens failed: {e}");
-                    }
+                    conversation.enqueue_tokens(stream_id, persist_token_ids.clone());
                 }
                 // Wake the persistence thread so it drains the new
                 // turn (hot→warm migrate, warm→cold redo-log write,
@@ -7209,11 +7192,10 @@ impl Scheduler {
                 if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
                     tracing::warn!("declare section stream failed: {e}");
                 }
-                // Persist the section's token ids, then fire the persistence
+                // Persist the section's token ids (off-thread writer, so the seal
+                // never blocks on the persistence lock), then fire the persistence
                 // trigger so the chunks land on disk in the next pass.
-                if let Err(e) = conversation.persist_tokens_only(stream_id, tokens) {
-                    tracing::warn!("persist section tokens failed: {e}");
-                }
+                conversation.enqueue_tokens(stream_id, tokens.to_vec());
                 self.persist_trigger.fire();
             }
             SealAction::None => unreachable!("filtered above"),
