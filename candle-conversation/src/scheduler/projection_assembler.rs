@@ -758,6 +758,13 @@ fn inject_sealed_section(
             return Ok(());
         }
     };
+    // Fence B: if this section's hot Q arenas were just produced on the persistence
+    // thread's copy stream, order the primary stream after that convert before the
+    // forward reads them (one-shot; no-op otherwise). The read lock above already
+    // dropped, so the write lock here can't deadlock.
+    ctx.conversation
+        .write()
+        .fence_section_hot_read(sid, ctx.device);
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
 
     let toks = ctx.conversation.read().section_tokens_of(sid);
@@ -866,6 +873,12 @@ fn inject_sealed_turn(
         );
         return Ok(());
     }
+    // Fence B: order the primary stream after any copy-stream convert that just
+    // produced this turn's hot Q arenas, before the forward reads them (one-shot;
+    // no-op when no migrate landed since the last read).
+    ctx.conversation
+        .write()
+        .fence_turn_hot_read(timeline, index, ctx.device);
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
 
     let toks: Vec<u32> = ctx
@@ -934,6 +947,11 @@ fn inject_sealed_turn_half(
             return Ok(());
         }
     };
+    // Fence B: same-turn residence as `inject_sealed_turn`; order the primary
+    // stream after any pending copy-stream convert before the forward reads it.
+    ctx.conversation
+        .write()
+        .fence_turn_hot_read(timeline, index, ctx.device);
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
 
     walker.sealed_turns += 1;

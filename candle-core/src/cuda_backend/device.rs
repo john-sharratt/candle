@@ -139,6 +139,30 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// A view of this device whose stream operations — `cuda_stream`, the
+    /// `memcpy_*` helpers, and every kernel launched through a [`CudaFunc`] built
+    /// from it — issue on `stream` instead of the primary stream. Shares the CUDA
+    /// context, loaded modules, cuBLAS handle and RNG (all `Arc`); only the stream
+    /// differs, so it is cheap to build.
+    ///
+    /// Used by the persistence thread to run the hot→warm KV migration on a
+    /// dedicated copy stream that overlaps decode: pass `dev.with_stream(copy)` as
+    /// the device to the migrate path and every device-issued op routes onto
+    /// `copy` in one move. The caller is responsible for the cross-stream fences
+    /// (an event on the primary stream that `copy` waits on before reading data the
+    /// primary stream produced, and vice-versa) — sharing a device view does NOT
+    /// add any ordering between the two streams.
+    pub fn with_stream(&self, stream: Arc<cudarc::driver::CudaStream>) -> Self {
+        Self {
+            id: self.id,
+            context: self.context.clone(),
+            custom_modules: self.custom_modules.clone(),
+            stream,
+            blas: self.blas.clone(),
+            curand: self.curand.clone(),
+        }
+    }
+
     /// Returns the underlying CUDA context.
     ///
     /// Useful for creating secondary streams ([`CudaContext::new_stream`]) or

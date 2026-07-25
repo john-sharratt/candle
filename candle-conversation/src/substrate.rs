@@ -43,6 +43,8 @@
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
+use candle::cuda::cudarc::driver::CudaEvent;
+use candle::Device;
 use candle_nn::kv_cache::{QuantFormat, SealedSequence};
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
@@ -287,6 +289,20 @@ pub struct ConvCompression {
     pub force_v: Option<QuantFormat>,
 }
 
+/// Type-erased GPU completion fence — a boxed `CudaEvent` recorded on the
+/// persistence thread's copy stream after a hot→warm convert wrote a residence's
+/// Q-format arenas. Wrapped in a newtype with a `Debug` impl so it can live in the
+/// `#[derive(Debug)]` residence WITHOUT pulling a CUDA type into this core module;
+/// the scheduler downcasts the inner `Arc<dyn Any>` back to `CudaEvent` to wait.
+#[derive(Clone)]
+pub struct InstallFence(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for InstallFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstallFence(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct SequenceResidence {
     /// Persistence-layer stream identity for this residence. Set at
@@ -342,6 +358,14 @@ pub struct SequenceResidence {
     /// first write is still queued. Distinct from `cold.is_some()`, which only
     /// becomes true once that write lands.
     pub cold_pending: bool,
+    /// GPU completion fence for a hot copy produced on the persistence thread's
+    /// dedicated copy stream (the KV-migration decode-overlap path). Set by
+    /// [`Self::install_warm_and_hot`] to the event recorded on the copy stream
+    /// AFTER the convert wrote these Q-format arenas; the scheduler waits on it (on
+    /// its primary stream) and clears it the FIRST time it reads this residence's
+    /// hot KV, so a reproject can't attend half-written Q bytes. `None` when the
+    /// migrate ran without a copy stream, or once the fence has been consumed.
+    pub install_fence: Option<InstallFence>,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -1117,6 +1141,7 @@ impl Substrate {
             byte_size: 0,
             evict_when_cold: false,
             cold_pending: false,
+            install_fence: None,
         });
         idx
     }
@@ -1266,6 +1291,7 @@ impl Substrate {
         residence: ResidenceIndex,
         hot: Vec<SealedSequence>,
         warm: Vec<SealedSequence>,
+        install_fence: Option<InstallFence>,
     ) {
         debug_assert!(
             !hot.is_empty(),
@@ -1291,6 +1317,70 @@ impl Substrate {
         );
         self.residence[residence.0].warm = Some(warm);
         self.warm_lru.push_front(residence);
+        // Carry the copy-stream completion fence so the scheduler orders its first
+        // read of these Q arenas after the convert that wrote them (see
+        // [`Self::take_install_fence`]).
+        self.residence[residence.0].install_fence = install_fence;
+    }
+
+    /// Take (and clear) a residence's pending copy-stream completion fence, if any.
+    /// Called by the scheduler on the FIRST read of a freshly-migrated residence's
+    /// hot KV: it waits the returned event on the primary stream so the subsequent
+    /// reproject/decode kernels are ordered after the convert. One-shot — later
+    /// reads on the same stream inherit the ordering and get `None`.
+    fn take_install_fence(&mut self, residence: ResidenceIndex) -> Option<InstallFence> {
+        self.residence
+            .get_mut(residence.0)
+            .and_then(|r| r.install_fence.take())
+    }
+
+    /// Order the scheduler's primary stream after the copy-stream convert that
+    /// produced a freshly-migrated TURN's hot Q arenas, then clear the fence
+    /// (one-shot). Call on the FIRST scheduler read of the turn's hot KV (the
+    /// reproject/decode inject), before the forward that reads it — so the forward
+    /// can't attend half-written Q bytes. No-op if the turn has no residence or no
+    /// pending fence (the overwhelmingly common case: no migrate landed since the
+    /// last read).
+    pub fn fence_turn_hot_read(&mut self, timeline: TimelineId, index: TurnIndex, device: &Device) {
+        // Resolve the residence the same way `turn_sealed_of` does (the
+        // `turn_residence` helper is test-only). `residence` is Copy, so the
+        // immutable borrow ends before the `&mut self` wait below.
+        if let Some(residence) = self.turn(timeline, index).map(|e| e.content.residence) {
+            self.wait_install_fence(residence, device);
+        }
+    }
+
+    /// Section analogue of [`Self::fence_turn_hot_read`].
+    pub fn fence_section_hot_read(&mut self, section: SectionId, device: &Device) {
+        if let Some(residence) = self.section_residence(section) {
+            self.wait_install_fence(residence, device);
+        }
+    }
+
+    /// Enqueue `primary_stream.wait(install_fence)` for a residence and clear it.
+    /// Downcasts the type-erased fence back to a `CudaEvent`; on a non-CUDA device
+    /// or a missing/mismatched fence it is a no-op.
+    fn wait_install_fence(&mut self, residence: ResidenceIndex, device: &Device) {
+        let Some(fence) = self.take_install_fence(residence) else {
+            return;
+        };
+        let Device::Cuda(d) = device else {
+            return;
+        };
+        match fence.0.downcast::<CudaEvent>() {
+            Ok(ev) => {
+                if let Err(e) = d.cuda_stream().wait(&ev) {
+                    tracing::warn!(
+                        target: "candle_conversation::persistence::tier",
+                        "install-fence wait failed: {e:?}"
+                    );
+                }
+            }
+            Err(_) => tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                "install-fence downcast failed (unexpected type)"
+            ),
+        }
     }
 
     /// Install the cold-tier references for a residence slot — called
@@ -5087,6 +5177,26 @@ mod tests {
         sub.residence[residence.0].byte_size = bytes;
         sub.install_warm(residence, vec![minimal_sealed_layer()]);
         (idx, residence)
+    }
+
+    /// `install_fence` / `take_install_fence` is one-shot: the first read of a
+    /// freshly-migrated residence returns the fence and CLEARS it, so later reads on
+    /// the same primary stream inherit the ordering and get `None`. (The GPU wait is
+    /// CUDA-only; this pins the take-and-clear contract on the CPU, which is what
+    /// prevents a reproject from re-waiting or, worse, never clearing the fence.)
+    #[test]
+    fn take_install_fence_is_one_shot() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, residence) = install_hot_and_warm(&mut sub, timeline, 1_000);
+        // No fence installed yet → None.
+        assert!(sub.take_install_fence(residence).is_none());
+        // Install a fence — any Send+Sync payload stands in for the `CudaEvent`.
+        sub.residence[residence.0].install_fence = Some(InstallFence(Arc::new(0u8)));
+        // First take returns it; second is cleared (one-shot).
+        assert!(sub.take_install_fence(residence).is_some());
+        assert!(sub.take_install_fence(residence).is_none());
+        // Out-of-range residence is a safe None.
+        assert!(sub.take_install_fence(ResidenceIndex(9999)).is_none());
     }
 
     /// Budget-aware eviction frees the **least-recently-promoted** turns

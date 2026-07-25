@@ -516,16 +516,20 @@ impl PinnedStager {
 
     /// Create a stager that uses `stream` for H2D copies and synchronization,
     /// instead of the device's default stream.  Used by the background quantizer
-    /// thread which runs all CUDA work on a dedicated second stream.
+    /// thread which runs all CUDA work on a dedicated second stream. Honors the
+    /// `CANDLE_ARENA_MB` override like [`Self::new`] (an oversized arena is wasted
+    /// pinned host memory when the stream only stages small buffers, e.g. the
+    /// hot→warm convert descriptors); overflow slabs still cover any larger pass.
     pub fn with_stream(dev: &CudaDevice, stream: Arc<CudaStream>) -> Self {
-        let arena = PinnedArena::new(DEFAULT_ARENA_SIZE)
+        let arena_size = Self::effective_arena_size();
+        let arena = PinnedArena::new(arena_size)
             .expect("failed to allocate pinned arena for PinnedStager::with_stream");
         Self {
             inner: Arc::new(Mutex::new(PinnedStagerInner {
                 dev: Some(dev.clone()),
                 explicit_stream: Some(stream),
                 arenas: vec![arena],
-                arena_size: DEFAULT_ARENA_SIZE,
+                arena_size,
                 pending_owned: Vec::new(),
                 pending_owned_bytes: 0,
                 arena_dirty: false,

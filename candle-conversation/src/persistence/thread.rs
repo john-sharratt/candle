@@ -36,7 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::quantized::pinned_staging::PinnedBuf;
+use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
 use candle::Device;
 use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, SealedSequence};
 use crossbeam::channel::{self, Receiver, Sender};
@@ -45,7 +45,7 @@ use super::cold_load::preallocate_pinned_scratch;
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
-use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
+use crate::substrate::{ConvCompression, InstallFence, ResidenceIndex, StoredSequence};
 use std::collections::HashMap;
 use sysinfo::System;
 
@@ -167,19 +167,32 @@ impl PersistenceThread {
         let pending_warm_bytes = Arc::new(AtomicU64::new(0));
         let loop_backlog = pending_warm_bytes.clone();
 
-        // All persist-thread CUDA work runs on the device's primary
-        // stream — selection, convert, gather, DtoH. Sharing the primary
-        // stream with decode serialises persistence behind in-flight
-        // inference work but eliminates the cross-stream coordination
-        // bugs that arose when persist read shared mutable state
-        // (per-head table, head_gids) on a side stream without proper
-        // fences.
+        // A DEDICATED copy stream (not the primary decode stream): the hot→warm
+        // convert + gather + DtoH run on it so they overlap decode on the primary
+        // stream instead of serialising behind it. Created once here (the first
+        // extra stream triggers a one-time context sync + flips the context into
+        // multi-stream mode).
         //
-        // Bound as `copy_stream` for compatibility with the migrate API's
-        // parameter name (it was originally a dedicated DMA-only side
-        // stream). It is now the primary stream.
+        // ORDERING CONTRACT (read before touching the migrate synchronisation):
+        // - Fence C (`migrate_group_hot_to_warm`) orders the copy convert AFTER the
+        //   primary-stream source writes + dst allocs — load-bearing.
+        // - The convert→scheduler-read ordering is TODAY provided by the internal
+        //   `copy_stream.synchronize()` inside `migrate_sealed_layers_to_cpu_batch`
+        //   (chunk_ops.rs, Phase 3): it drains the copy stream (incl. the V convert,
+        //   which retires last) on THIS thread before `install_warm_and_hot`
+        //   publishes the hot. Fence B (the per-residence `install_fence` waited at
+        //   the reproject inject sites) is redundant belt-and-suspenders WHILE that
+        //   sync stands, and becomes solely load-bearing only if it is removed.
+        // - Fence B is INJECT-ONLY. Other primary-stream consumers of a migrated
+        //   hot arena — arena defrag (`defragment_arenas`) and hot eviction — are
+        //   NOT fence-covered. So the Phase-3 `copy_stream.synchronize()` MUST NOT
+        //   be removed (to make install async) without either fencing those paths
+        //   on the install event or globally fencing the pool.
         let copy_stream: Arc<CudaStream> = match &device {
-            Device::Cuda(d) => d.cuda_stream(),
+            Device::Cuda(d) => d
+                .cuda_context()
+                .new_stream()
+                .expect("substrate-persistence: failed to create dedicated copy stream"),
             _ => panic!("substrate-persistence: requires a CUDA device"),
         };
 
@@ -266,6 +279,18 @@ fn run_loop(
         let _ = d.cuda_context().bind_to_thread();
     }
 
+    // Dedicated copy-stream pinned stager for the migrate's convert descriptor
+    // H2D. It MUST share the copy stream with the convert kernel so the upload and
+    // the kernel are FIFO-ordered on one stream — the backing's stager is bound to
+    // the PRIMARY stream, and feeding copy-stream kernels from it reads
+    // not-yet-uploaded descriptors cross-stream (CUDA_ERROR_ILLEGAL_ADDRESS).
+    // Created once here (allocates a pinned arena, needs the context bind above) and
+    // reused across passes.
+    let copy_stager: Option<PinnedStager> = match &device {
+        candle::Device::Cuda(d) => Some(PinnedStager::with_stream(d, copy_stream.clone())),
+        _ => None,
+    };
+
     // Re-used pinned host scratch for the hot→warm DtoH. Eagerly allocated at
     // thread start — while the host heap is still clean and unfragmented — at
     // the full migration staging cap, so it holds the largest batch any pass can
@@ -311,6 +336,7 @@ fn run_loop(
             &backings,
             &device,
             &copy_stream,
+            copy_stager.as_ref(),
             compression_policy.as_ref(),
             &mut pinned_scratch,
             run_maintenance,
@@ -407,6 +433,7 @@ fn migrate_group_hot_to_warm(
     backings: &[ChunkedKvBacking],
     device: &Device,
     copy_stream: &Arc<CudaStream>,
+    copy_stager: Option<&PinnedStager>,
     policy: Option<&CompressionPolicy>,
     group: &[(ResidenceIndex, Vec<SealedSequence>)],
     pinned_scratch: &mut Option<PinnedBuf>,
@@ -421,6 +448,15 @@ fn migrate_group_hot_to_warm(
     if group.is_empty() {
         return;
     }
+    // A device view whose ops issue on the dedicated COPY stream. The convert
+    // (Phase 2) and gather + DtoH (Phase 3) run through this so they overlap decode
+    // on the primary stream; Phase 1 (selection + dst-arena alloc + descriptor
+    // staging) stays on the primary `device`. Fence C (between the phases) orders
+    // the copy work after the primary work it depends on.
+    let copy_device: Device = match device {
+        Device::Cuda(d) => Device::Cuda(d.with_stream(copy_stream.clone())),
+        other => other.clone(),
+    };
     // Per-residence (new_hot, new_warm) accumulators, one slot per layer.
     let mut hot_per: Vec<Vec<SealedSequence>> = (0..group.len())
         .map(|_| Vec::with_capacity(n_layers))
@@ -496,19 +532,52 @@ fn migrate_group_hot_to_warm(
         }
         *quantize_ms += t_q.elapsed().as_millis() as u64;
 
+        // ── Fence C: primary → copy, before the copy-stream convert ─────────
+        // Phase 1 ran on the PRIMARY stream (`device`): it read the source arenas
+        // (decode output) and ALLOCATED the dst-Q arenas. (The convert *descriptors*
+        // are NOT staged here — that happens inside the Phase-2 convert on the COPY
+        // stream via the copy-stream stager, so it is FIFO with the convert kernel
+        // and needs no fence.) Phase 2's convert runs on the COPY stream and both
+        // reads the primary-written source and writes the primary-allocated dst
+        // arenas, so make the copy stream wait on a primary-stream event that
+        // captures all prior primary work.
+        //
+        // On any event failure, fall back to a device-wide sync so the convert can
+        // NEVER proceed unordered — matching Fence B's failure discipline. A silent
+        // warn-and-continue would be a real read-before-write race on the source K/V.
+        if let Device::Cuda(d) = device {
+            let fenced = match d.cuda_stream().record_event(None) {
+                Ok(ev) => copy_stream.wait(&ev).is_ok(),
+                Err(_) => false,
+            };
+            if !fenced {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::tier",
+                    "persist: Fence C event failed — falling back to device sync"
+                );
+                if let Err(e) = device.synchronize() {
+                    tracing::warn!(
+                        target: "candle_conversation::persistence::tier",
+                        "persist: Fence C device-sync fallback also failed: {e:?}"
+                    );
+                }
+            }
+        }
+
         // ── Phase 2: ONE batched convert across every layer's descriptors ───
         // `n_layers × n_chunks × n_kv_head` blocks in a single launch (tiled at
-        // the grid.y cap), filling all dst arenas before the migrate DtoH reads
-        // them (same primary stream, FIFO). No-op when `policy` is None
-        // (`all_descs` empty). Counts toward `quantize_ms`. Bit-identical to the
-        // per-layer convert — proven by `quantize_layers_batched_matches_per_layer`.
+        // the grid.y cap), filling all dst arenas before the migrate gather reads
+        // them (same COPY stream, FIFO). No-op when `policy` is None (`all_descs`
+        // empty). Counts toward `quantize_ms`. Bit-identical to the per-layer
+        // convert — proven by `quantize_layers_batched_matches_per_layer`.
         if !all_descs.is_empty() {
             let t_conv = std::time::Instant::now();
             let conv = candle_nn::kv_cache::convert_deferred_descs(
                 &backings[0],
                 &all_descs,
                 n_kv_head,
-                device,
+                &copy_device,
+                copy_stager,
             );
             let dt = t_conv.elapsed().as_millis() as u64;
             *quantize_ms += dt;
@@ -535,7 +604,7 @@ fn migrate_group_hot_to_warm(
         let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
         let warm_result = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch(
             &backing_refs,
-            device,
+            &copy_device,
             copy_stream,
             pinned_scratch,
             &per_layer_refs,
@@ -594,30 +663,23 @@ fn run_pass(
     backings: &[ChunkedKvBacking],
     device: &Device,
     copy_stream: &Arc<CudaStream>,
+    copy_stager: Option<&PinnedStager>,
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
     run_maintenance: bool,
 ) {
-    // Cross-thread write→read barrier. This persist pass runs on the background
-    // persistence thread and reads each freshly-sealed turn's K/V for the
-    // hot→warm migrate below. Those K/V bytes were WRITTEN by the scheduler
-    // thread's decode. Both threads queue on the same primary CUDA stream, but
-    // the ordering between two host threads issuing onto one stream is not
-    // guaranteed — the migrate could begin reading a turn's arena before the
-    // decode's writes to it have retired on the GPU, capturing half-written
-    // K/V. Synchronize the device once, up front, so every prior decode write
-    // is retired before we read any source arena. This is on the background
-    // thread, off the decode hot path.
+    // No pre-migrate device sync. The migrate reads each freshly-sealed turn's
+    // source K/V, written by the scheduler thread's decode on the PRIMARY stream.
+    // The Phase-1 selection below runs on the primary stream too, so it is
+    // FIFO-ordered after those writes (a sealed sequence's decode writes are
+    // enqueued before its seal, which is before this pass's snapshot — hence before
+    // any Phase-1 launch); a sealed sequence takes no further writes, so there is no
+    // in-flight write to race. The COPY-stream convert/gather that follow read the
+    // same source (and the Phase-1 allocations), and are ordered after all of it by
+    // Fence C (`migrate_group_hot_to_warm`). So the device-wide drain is not needed.
     let t_pass = std::time::Instant::now();
-    if let Err(e) = device.synchronize() {
-        tracing::warn!(
-            target: "candle_conversation::persistence::tier",
-            "persist: pre-migrate device sync failed: {e:?}"
-        );
-    }
     // Phase-timing breakdown so we can see *where* the hot→warm drain spends its
     // time (the demote starves when this can't keep up with the ingest seal rate).
-    let sync_pre_ms = t_pass.elapsed().as_millis() as u64;
     let t_migrate = std::time::Instant::now();
 
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
@@ -673,6 +735,7 @@ fn run_pass(
             backings,
             device,
             copy_stream,
+            copy_stager,
             effective.as_ref(),
             &group,
             pinned_scratch,
@@ -687,31 +750,37 @@ fn run_pass(
     }
     let migrate_ms = t_migrate.elapsed().as_millis() as u64;
     let t_sync_post = std::time::Instant::now();
-    // Primary-stream sync after ALL groups/layers complete.
+    // Fence B (replaces the post-migrate device-wide sync). Records ONE completion
+    // event on the copy stream — after all groups' converts — and carries it into
+    // each install; the scheduler waits it on its primary stream ONLY when it first
+    // reads that residence (`take_install_fence` at the reproject inject sites), so
+    // decode that never touches the migrated turn is not stalled.
     //
-    // `quantize_sealed_in_place` and the format-preserving DtoH leave
-    // work in flight on the primary stream — selection kernel, convert
-    // kernel, dst arena allocations, head-gid staging copies, kv_migrate
-    // gather, the final DtoH itself. We need one explicit sync before
-    // the substrate write — otherwise `install_warm_and_hot` (CPU
-    // bookkeeping) can return and the next turn's `apply_projection`
-    // can start before the GPU has finished writing the new Q-format
-    // arenas the slot now references.
-    //
-    // Device-wide (not just primary-stream) sync: the reproject on the scheduler
-    // thread reads these freshly-installed Q-arenas for the NEXT turn's context,
-    // and if any of the convert's V work retires on a stream the primary-stream
-    // sync doesn't cover, the reproject captures incomplete V (K, whose convert
-    // retires earlier, is fine) — the V-only multi-turn duplication corruption.
-    // `device.synchronize()` waits for every stream, closing that window.
-    if let Err(e) = device.synchronize() {
-        tracing::warn!(
-            "cache: device sync after hot→warm batch failed: {e:?} (last CUDA kernel on this thread: {})",
-            candle::last_cuda_kernel_launch()
-        );
-        // The whole batch's GPU work is suspect — don't install any of it.
-        installs.clear();
-    }
+    // NOTE: this is currently REDUNDANT with the Phase-3 internal
+    // `copy_stream.synchronize()` (see the spawn-site ordering contract) which
+    // already retires the convert on this thread before install — Fence B guards
+    // the V-only multi-turn duplication window belt-and-suspenders and becomes
+    // solely load-bearing only if that sync is ever removed. It is inject-only and
+    // does NOT cover defrag/eviction of the migrated arenas.
+    let install_fence: Option<InstallFence> = match copy_stream.record_event(None) {
+        Ok(ev) => Some(InstallFence(Arc::new(ev))),
+        Err(e) => {
+            // Couldn't record the fence — fall back to a full device sync so the
+            // install is still correctly ordered, and install with no fence.
+            tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                "persist: Fence B event record failed: {e:?} — device-sync fallback"
+            );
+            if let Err(e2) = device.synchronize() {
+                tracing::warn!(
+                    "cache: device sync fallback after hot→warm batch failed: {e2:?} (last CUDA kernel: {})",
+                    candle::last_cuda_kernel_launch()
+                );
+                installs.clear();
+            }
+            None
+        }
+    };
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
     let t_install = std::time::Instant::now();
     let mut hot_to_warm_bytes: u64 = 0;
@@ -749,23 +818,23 @@ fn run_pass(
                 // directly — no warm→hot promotion needed, no kv_migrate
                 // scatter into freshly-allocated arenas. Decode reads
                 // exactly the bytes the convert kernel wrote.
-                view.install_warm_and_hot(idx, hot, warm);
+                view.install_warm_and_hot(idx, hot, warm, install_fence.clone());
             }
         }
     }
     let install_ms = t_install.elapsed().as_millis() as u64;
-    // Log the breakdown when the pass did real work OR was slow even with nothing
-    // to install (isolates a dominant `device.synchronize()` cost). This is the
-    // number that tells us whether the drain is sync-bound, the serial 48-layer
-    // migrate, or install-lock-bound.
+    // Log the breakdown when the pass did real work OR was slow with nothing to
+    // install — telling us whether the drain is copy-bound (the DtoH), the
+    // per-layer quantize/convert, or install-lock-bound. `sync_post_ms` now only
+    // times the Fence-B event record (≈0), non-zero only on its device-sync
+    // fallback.
     let total_ms = t_pass.elapsed().as_millis() as u64;
-    if hot_to_warm_count > 0 || sync_pre_ms + migrate_ms + sync_post_ms > 50 {
+    if hot_to_warm_count > 0 || migrate_ms + sync_post_ms > 50 {
         tracing::debug!(
             target: "candle_conversation::persistence::tier",
             residences = hot_to_warm_count,
             mib = hot_to_warm_bytes / (1 << 20),
             n_layers,
-            sync_pre_ms,
             migrate_ms,
             quantize_ms,
             select_ms,

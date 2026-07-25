@@ -351,9 +351,11 @@ impl Scheduler {
             self.promote_finished_prefills_to_decodes();
 
             // Per-wave ingest backpressure + gentle demote. These are cheap (an
-            // atomic backlog read + a bounded warm-backed LRU walk) and self-gate on
-            // `ingest_timelines` (a no-op when not ingesting), so they run EVERY wave
-            // — not on the 2 s telemetry cadence like the footprint defrag below.
+            // atomic backlog read + a bounded warm-backed LRU walk); the two ingest
+            // calls self-gate on `ingest_timelines` (a no-op when not ingesting),
+            // while the proactive demote below gates on a watermark stats-read (and
+            // DOES fire for non-ingest dialogue). All run EVERY wave — not on the 2 s
+            // telemetry cadence like the footprint defrag below.
             // CFW's co-batched wave folds a wide prefill cohort into every forward,
             // so KV grows far faster per wave than the serial passes it replaced; a
             // 2 s-cadence throttle lets `used` overshoot massively between ticks (the
@@ -364,6 +366,12 @@ impl Scheduler {
             // `used` holds at the demote watermark instead of climbing.
             self.regulate_ingest_admission();
             self.demote_cold_ingest_if_pressured();
+            // Proactive general demote — the gentle backstop for reload-costly
+            // (dialogue / non-ingest) hot KV, above the ingest rung and below the
+            // ~92% near-cap trip. Holds `used` under its watermark per-wave so the
+            // relief ladder rarely reaches its blocking hot→warm flush. Cheap
+            // stats-read no-op below the watermark.
+            self.demote_cold_hot_proactive();
 
             // AIMD reopen (non-ingest): if a prior pressure episode narrowed the
             // admission window, probe it back open by one slot per loop once VRAM

@@ -21,6 +21,8 @@ use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
 use candle::cuda::cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// One copy in a migration plan: `byte_len` bytes from `src_ptr` to
 /// `dst_ptr`, both raw device addresses.
@@ -92,7 +94,7 @@ pub fn kv_migrate(device: &candle::Device, plan: &MigrationPlan) -> candle::Resu
 pub fn kv_migrate_on(
     device: &candle::Device,
     plan: &MigrationPlan,
-    stream: Option<&CudaStream>,
+    stream: Option<&Arc<CudaStream>>,
 ) -> candle::Result<()> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::cuda_backend::kernels;
@@ -113,18 +115,22 @@ pub fn kv_migrate_on(
     let dst: Vec<i64> = plan.records.iter().map(|r| r.dst_ptr).collect();
     let lens: Vec<i64> = plan.records.iter().map(|r| r.byte_len).collect();
 
-    let src_gpu = dev
+    let default_stream = dev.cuda_stream();
+    let used_stream = stream.unwrap_or(&default_stream);
+    // Upload the plan arrays on the SAME stream the gather kernel runs on. `dev`'s
+    // `memcpy_stod` uploads on the device PRIMARY stream — correct only while
+    // `used_stream` IS the primary stream; on a dedicated copy stream that would be
+    // an UNFENCED cross-stream read (the kernel could run before the upload retired).
+    let src_gpu = used_stream
         .memcpy_stod(&src)
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: src plan HtoD: {e}")))?;
-    let dst_gpu = dev
+    let dst_gpu = used_stream
         .memcpy_stod(&dst)
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: dst plan HtoD: {e}")))?;
-    let len_gpu = dev
+    let len_gpu = used_stream
         .memcpy_stod(&lens)
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: len plan HtoD: {e}")))?;
 
-    let default_stream = dev.cuda_stream();
-    let used_stream = stream.unwrap_or(&default_stream);
     let (sp, _sg) = src_gpu.device_ptr(used_stream);
     let (dp, _dg) = dst_gpu.device_ptr(used_stream);
     let (lp, _lg) = len_gpu.device_ptr(used_stream);

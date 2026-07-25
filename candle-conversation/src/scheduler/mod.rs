@@ -6528,6 +6528,17 @@ impl Scheduler {
                     (0..n_layers).map(|_| Vec::new()).collect();
                 let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
                 let chunk_size = self.chunk_size;
+                // Fence B: this path reads the prefix sections' hot Q arenas and
+                // scatters them on the primary stream. If a copy-stream convert just
+                // produced any of them, order the primary stream after it first
+                // (one-shot each; no-op otherwise). Done under a brief write lock
+                // before the read-locked gather block below.
+                {
+                    let mut wv = conversation.write();
+                    for &prefix_id in prefix_section_ids {
+                        wv.fence_section_hot_read(prefix_id, &self.device);
+                    }
+                }
                 {
                     let view = conversation.read();
                     for &prefix_id in prefix_section_ids {

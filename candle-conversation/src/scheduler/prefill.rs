@@ -151,6 +151,31 @@ fn ingest_demote_pct() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_pct("CANDLE_INGEST_DEMOTE_PCT", 50, 95))
 }
+/// Capacity fraction (%) at which **general** (dialogue / non-ingest) cold hot KV
+/// starts proactively demoting to the warm (RAM) tier — the gentle backstop that
+/// sits between the zero-reload ingest rung ([`ingest_demote_pct`], ~50%) and the
+/// reactive near-cap bulk eviction (`vram_evict_high_pct`, ~92%). Reload-costly
+/// KV shouldn't shed as eagerly as ingest, so this watermark defaults to the
+/// bulk-evict's own low-water TARGET (~80% of C): held gently per-wave so `used`
+/// coasts under it instead of climbing to the 92% trip that drives the relief
+/// ladder into a blocking hot→warm flush. Only the LRU tail is shed and the live
+/// working set is always protected, so it never force-evicts what's attended. Env
+/// `CANDLE_GENERAL_DEMOTE_PCT`, default 80, clamped to 95.
+fn general_demote_pct() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_pct("CANDLE_GENERAL_DEMOTE_PCT", 80, 95))
+}
+/// Hysteresis band (percentage points of C) ABOVE [`general_demote_pct`] that the
+/// proactive demote must see before it fires, while it still sheds all the way back
+/// DOWN to the watermark. Without a band the demote nibbles every wave — shed to
+/// 80%, one warm→hot reselection pushes to 81%, shed again — churning reload-costly
+/// dialogue KV. The band turns that into a rarer, larger shed: `used` coasts in
+/// `[watermark, watermark+band]` and only re-fires after climbing the full band.
+/// Env `CANDLE_GENERAL_DEMOTE_HYST_PCT`, default 5, clamped to 20.
+fn general_demote_hyst_pct() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_pct("CANDLE_GENERAL_DEMOTE_HYST_PCT", 5, 20))
+}
 /// Target hot→warm drain backlog, as a % of resident capacity, above which
 /// ingest admission throttles down (and below half of which it reopens). This
 /// is the *leading* backpressure signal — it keeps `used` off the warm-starved
@@ -967,6 +992,73 @@ impl Scheduler {
                 window,
                 nudged,
                 "cold-ingest demote (gentle-early)"
+            );
+        }
+    }
+
+    /// Proactive general demote — the gentle backstop for reload-costly (dialogue /
+    /// non-ingest) hot KV, run per-wave BEFORE pressure builds. Once resident `used`
+    /// climbs a hysteresis band ([`general_demote_hyst_pct`]) above
+    /// [`general_demote_pct`] of C (~80%, the bulk-evict's own low-water target),
+    /// shed the least-recently-used *warm-backed* hot tail across the resident
+    /// conversations back down to that watermark via [`Self::evict_cold_tail`]
+    /// — oldest-first, reversible (a reselected turn reloads warm→hot), and always
+    /// protecting the live working set. Holding `used` under the watermark this way
+    /// keeps it off the ~92% near-cap trip that drives the relief ladder into its
+    /// blocking hot→warm flush (the "massive sync" waves), so the flush fires only
+    /// when this proactive shed genuinely can't keep up.
+    ///
+    /// When the tail is hot-WITHOUT-warm (warm-copy production lagging the seal
+    /// rate — the warm-starved case `evict_cold_tail` can't shed), NUDGE the
+    /// persistence drain (non-blocking `fire`) and let the next wave shed the
+    /// freshly-warmed backlog. Never `flush_blocking` here — that is the reactive
+    /// ladder's last resort, not this proactive rung. No-op below the watermark
+    /// (a cheap stats read), so a workload comfortably under capacity pays nothing.
+    pub(super) fn demote_cold_hot_proactive(&mut self) {
+        let (Some(capacity), Some((used, _))) =
+            (self.resident_capacity(), self.session.vram_pool_stats())
+        else {
+            return;
+        };
+        let watermark = capacity / 100 * general_demote_pct();
+        // Hysteresis: fire only once `used` climbs a band above the watermark, but
+        // shed all the way back to the watermark — a rarer, larger shed instead of
+        // per-wave nibbling that would churn reload-costly dialogue KV warm↔hot (a
+        // single warm→hot reselection must not immediately re-trigger the demote).
+        let trigger = watermark + capacity / 100 * general_demote_hyst_pct();
+        if used <= trigger {
+            return;
+        }
+        let target_bytes = used.saturating_sub(watermark) as u64;
+        // Shed whatever is already warm-backed — a reversible move to RAM, no
+        // migration. Oldest-first and working-set-protected inside evict_cold_tail.
+        let report = self.evict_cold_tail(target_bytes);
+        // Still over the watermark after shedding all warm-backed hot ⇒ the tail is
+        // warm-starved (hot-without-warm). Kick the async drain so next wave can
+        // shed it; a `fire` is a no-op when a pass is already queued.
+        let nudged = if self
+            .session
+            .vram_pool_stats()
+            .is_some_and(|(u, _)| u > watermark)
+        {
+            self.persist_trigger.fire();
+            true
+        } else {
+            false
+        };
+        if report.count > 0 {
+            // Freed hot chunks scatter across arenas → release + trim so `reserved`
+            // can actually fall (see the Costly-rung reclaim note).
+            let _ = self.session.release_empty_arenas();
+            self.trim_kv_pool();
+            tracing::debug!(
+                target: "candle_conversation::scheduler::vram_relief",
+                used_mib = used / (1 << 20),
+                watermark_mib = watermark / (1 << 20),
+                turns = report.count,
+                freed_mib = report.bytes / (1 << 20),
+                nudged,
+                "general cold-hot demote (proactive)"
             );
         }
     }
