@@ -14,7 +14,7 @@ use crate::code_read::parsers::{
     bash, c, cpp, css, fallback, go, html, java, javascript, markdown, php, python, ruby, rust,
     structured_config, typescript,
 };
-use crate::code_read::types::{ChunkKind, Scope};
+use crate::code_read::types::{ChunkKind, Scope, MAX_SCOPE_LINES};
 use crate::repo_scan::Language;
 
 /// Carve `source` for a file with the given `language` and `is_tsx`
@@ -53,7 +53,7 @@ pub fn carve(source: &[u8], language: Language, is_tsx: bool) -> Vec<Scope> {
     };
     if let Some(scopes) = tier1 {
         if !scopes.is_empty() {
-            return fill_gaps(scopes, total_lines);
+            return cap_scope_lines(fill_gaps(scopes, total_lines));
         }
     }
 
@@ -64,13 +64,61 @@ pub fn carve(source: &[u8], language: Language, is_tsx: bool) -> Vec<Scope> {
     };
     if let Some(scopes) = tier2 {
         if !scopes.is_empty() {
-            return fill_gaps(scopes, total_lines);
+            return cap_scope_lines(fill_gaps(scopes, total_lines));
         }
     }
 
     // Fallback already covers the whole file in fixed-line windows;
     // no gap-fill needed.
-    fallback::carve(source)
+    cap_scope_lines(fallback::carve(source))
+}
+
+/// Split any scope longer than [`MAX_SCOPE_LINES`] into `[part N]` windows,
+/// preserving order and coverage.
+///
+/// The cap is enforced HERE, over the final scope list, rather than in each
+/// parser. Tier-1 splits oversize nodes on child boundaries (a semantic split,
+/// better labels — see `tree_sitter_util::emit_split`), but that only bounds
+/// nodes that *have* children to split on. Every other producer was unbounded:
+/// [`fill_gaps`] emits one scope per uncovered run however long, the Markdown and
+/// YAML/TOML/JSON header carves emit one scope per section/top-level key, and a
+/// childless tree-sitter leaf can exceed the cap on its own. A single oversize
+/// scope becomes one enormous turn, which is what drives a turn past the
+/// per-token signature limit and dilutes its provenance across the whole span.
+/// Enforcing the invariant on every return path means no tier can violate it.
+fn cap_scope_lines(scopes: Vec<Scope>) -> Vec<Scope> {
+    if scopes
+        .iter()
+        .all(|s| s.end_line.saturating_sub(s.start_line) + 1 <= MAX_SCOPE_LINES)
+    {
+        return scopes; // common case: nothing to split, no reallocation
+    }
+    let mut out = Vec::with_capacity(scopes.len() + 8);
+    for scope in scopes {
+        let lines = scope.end_line.saturating_sub(scope.start_line) + 1;
+        if lines <= MAX_SCOPE_LINES {
+            out.push(scope);
+            continue;
+        }
+        let mut part = 1usize;
+        let mut chunk_start = scope.start_line;
+        while chunk_start <= scope.end_line {
+            let chunk_end = (chunk_start + MAX_SCOPE_LINES - 1).min(scope.end_line);
+            let mut labelled = scope.path.clone();
+            if let Some(last) = labelled.last_mut() {
+                *last = format!("{last} [part {part}]");
+            }
+            out.push(Scope {
+                path: labelled,
+                kind: scope.kind,
+                start_line: chunk_start,
+                end_line: chunk_end,
+            });
+            chunk_start = chunk_end + 1;
+            part += 1;
+        }
+    }
+    out
 }
 
 /// Count `source`'s logical line count — matches the semantics used
@@ -418,5 +466,53 @@ func main() {
         let scopes = carve(src, Language::Json, false);
         let total = count_lines(src);
         assert!(every_line_covered(&scopes, total));
+    }
+
+    /// No tier may emit a scope longer than `MAX_SCOPE_LINES`, and capping must
+    /// preserve full line coverage. The gap-fill path was the unbounded one: a
+    /// file tier-1 parses successfully but that leaves a huge unclaimed region
+    /// (a generated table, a long data literal) yielded ONE scope spanning the
+    /// whole run, which becomes one enormous turn.
+    #[test]
+    fn no_tier_emits_a_scope_over_the_line_cap() {
+        let big = (MAX_SCOPE_LINES as usize) * 3 + 17;
+        let assert_capped = |scopes: &[Scope], total: u32, what: &str| {
+            assert!(
+                every_line_covered(scopes, total),
+                "{what}: coverage preserved"
+            );
+            for s in scopes {
+                let lines = s.end_line - s.start_line + 1;
+                assert!(
+                    lines <= MAX_SCOPE_LINES,
+                    "{what}: scope {:?} spans {lines} lines (cap {MAX_SCOPE_LINES})",
+                    s.path
+                );
+            }
+        };
+
+        // Gap-fill: a tiny fn tier-1 recognises, then a long uncovered tail.
+        let mut rust = String::from("fn a() {}\n");
+        for i in 0..big {
+            rust.push_str(&format!("const K{i}: u32 = {i};\n"));
+        }
+        let scopes = carve(rust.as_bytes(), Language::Rust, false);
+        assert_capped(&scopes, count_lines(rust.as_bytes()), "rust gap-fill");
+
+        // Tier-2 markdown: one section with a very long body.
+        let mut md = String::from("# only section\n");
+        for i in 0..big {
+            md.push_str(&format!("line {i}\n"));
+        }
+        let scopes = carve(md.as_bytes(), Language::Markdown, false);
+        assert_capped(&scopes, count_lines(md.as_bytes()), "markdown section");
+
+        // Tier-2 structured config: one enormous top-level key.
+        let mut yaml = String::from("root:\n");
+        for i in 0..big {
+            yaml.push_str(&format!("  k{i}: {i}\n"));
+        }
+        let scopes = carve(yaml.as_bytes(), Language::Yaml, false);
+        assert_capped(&scopes, count_lines(yaml.as_bytes()), "yaml top-level key");
     }
 }

@@ -89,6 +89,15 @@ struct Cli {
     #[arg(long = "disable-layer", value_name = "NAME")]
     disable_layer: Vec<String>,
 
+    /// Override the content root a derived ingest layer reads from, as
+    /// `<layer>=<path>`. Repeatable (e.g. `--ingest-dir code_reading=zend/src
+    /// --ingest-dir repo_map=zend`). The path is relative to the workspace, or
+    /// absolute. Scopes an ingest to a subtree so a rebuilt substrate stays
+    /// small instead of absorbing the whole workspace; pair with
+    /// `--disable-layer` to skip a layer outright.
+    #[arg(long = "ingest-dir", value_name = "LAYER=PATH")]
+    ingest_dir: Vec<String>,
+
     /// Do not run the background summariser thread (no AVL summary-forest
     /// extension, no per-conversation summarisation registration). Brings the
     /// engine up without the summariser — useful for bulk corpus prefill.
@@ -136,9 +145,15 @@ async fn main() -> anyhow::Result<()> {
     // `--working-dir` (if given) is the workspace; otherwise the positional path.
     // Create it first so a fresh mind directory has somewhere for `.substrate` and
     // `projection.yaml` to land, then canonicalize to an absolute path.
-    let ws_arg = cli.working_dir.clone().unwrap_or_else(|| cli.workspace.clone());
+    let ws_arg = cli
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| cli.workspace.clone());
     if let Err(e) = std::fs::create_dir_all(&ws_arg) {
-        eprintln!("warning: could not create working dir {}: {e}", ws_arg.display());
+        eprintln!(
+            "warning: could not create working dir {}: {e}",
+            ws_arg.display()
+        );
     }
     let workspace = ws_arg.canonicalize().unwrap_or(ws_arg);
 
@@ -186,10 +201,35 @@ async fn main() -> anyhow::Result<()> {
     let disabled_layers: std::collections::HashSet<String> =
         cli.disable_layer.iter().cloned().collect();
 
+    // `--ingest-dir <layer>=<path>` — parsed up front so a malformed pair fails
+    // the launch rather than silently ingesting the whole workspace.
+    let mut ingest_dirs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for spec in &cli.ingest_dir {
+        let Some((layer, path)) = spec.split_once('=') else {
+            anyhow::bail!("invalid --ingest-dir {spec:?}: expected <layer>=<path>");
+        };
+        if layer.trim().is_empty() || path.trim().is_empty() {
+            anyhow::bail!("invalid --ingest-dir {spec:?}: both <layer> and <path> are required");
+        }
+        let path = path.trim();
+        // Fail fast on a bad path — every ingest mode reads this root, and a typo
+        // would otherwise silently ingest nothing (folder/file scans) rather than
+        // erroring. Relative paths resolve under the workspace; absolute replace it.
+        if !workspace.join(path).is_dir() {
+            anyhow::bail!(
+                "invalid --ingest-dir {spec:?}: {} is not a directory",
+                workspace.join(path).display(),
+            );
+        }
+        ingest_dirs.insert(layer.trim().to_string(), path.to_string());
+    }
+
     let config = DaemonConfig {
         workspace: workspace.clone(),
         port: cli.port,
         disabled_layers: disabled_layers.clone(),
+        ingest_dirs: ingest_dirs.clone(),
         disable_summariser: cli.disable_summariser,
         compact_substrate: cli.compact_substrate,
     };
@@ -200,6 +240,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             layers = %names.join(", "),
             "--disable-layer: startup ingest suppressed for these projection layers",
+        );
+    }
+    if !ingest_dirs.is_empty() {
+        let mut pairs: Vec<String> = ingest_dirs
+            .iter()
+            .map(|(layer, path)| format!("{layer}={path}"))
+            .collect();
+        pairs.sort();
+        tracing::info!(
+            overrides = %pairs.join(", "),
+            "--ingest-dir: these layers ingest from an overridden content root",
         );
     }
     if cli.disable_summariser {

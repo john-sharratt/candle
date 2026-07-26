@@ -17,6 +17,7 @@
 //!   layer's system prompt, other than the registry-backed `tools`. Each is filled
 //!   with calibrated sections from a folder named after it (`<name>s/`).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use candle_conversation::projection::{LayerSchema, Schema, SelectionRule, SystemPromptItem};
@@ -107,7 +108,15 @@ fn is_live_conversation(layer: &LayerSchema) -> bool {
 /// override, the same signal `build_projection_builder`/`tool_def` use — draws
 /// raw turn-sinks from its (controlled) folders. This keeps the derivation
 /// generic: no per-layer allow/deny list, just built-ins plus the mind gate.
-pub fn ingest_layers(schema: &Schema, workspace: &Path) -> Vec<IngestLayer> {
+///
+/// `dirs` holds `--ingest-dir <layer>=<path>` overrides: each replaces the
+/// derived content root for that layer, so a rebuild can be scoped to a subtree
+/// (e.g. `code_reading=zend/src`) instead of sweeping the whole workspace.
+pub fn ingest_layers(
+    schema: &Schema,
+    workspace: &Path,
+    dirs: &HashMap<String, String>,
+) -> Vec<IngestLayer> {
     let is_mind = workspace.join("projection.yaml").is_file();
     let mut out = Vec::new();
     for layer in &schema.layers {
@@ -117,27 +126,34 @@ pub fn ingest_layers(schema: &Schema, workspace: &Path) -> Vec<IngestLayer> {
         let Some(group) = layer.groups.first() else {
             continue;
         };
-        let (mode, folder, display) = match layer.name.as_str() {
-            "repo_map" => (
-                IngestMode::Folders,
-                ".".to_string(),
-                "Scanning repository".to_string(),
-            ),
-            "code_reading" => (
-                IngestMode::Files,
-                ".".to_string(),
-                "Reading code".to_string(),
-            ),
+        let override_dir = dirs.get(&layer.name);
+        let (mode, default_folder, base_display) = match layer.name.as_str() {
+            "repo_map" => (IngestMode::Folders, ".", "Scanning repository"),
+            "code_reading" => (IngestMode::Files, ".", "Reading code"),
             other => {
-                if !is_mind || !workspace.join(other).is_dir() {
+                if !is_mind {
                     continue;
                 }
-                (
-                    IngestMode::Raw,
-                    other.to_string(),
-                    format!("Loading {other}"),
-                )
+                (IngestMode::Raw, other, "Loading")
             }
+        };
+        // An `--ingest-dir <layer>=<path>` override replaces the derived content
+        // root. Relative paths resolve under the workspace; an absolute path
+        // replaces it outright (`Path::join` semantics).
+        let folder = override_dir
+            .cloned()
+            .unwrap_or_else(|| default_folder.to_string());
+        // A raw sink only exists when its content folder does — checked against
+        // the RESOLVED folder so an override points the check at the same place
+        // the ingest will read.
+        if mode == IngestMode::Raw && !workspace.join(&folder).is_dir() {
+            continue;
+        }
+        let display = match (mode, override_dir) {
+            (IngestMode::Raw, None) => format!("Loading {}", layer.name),
+            (IngestMode::Raw, Some(d)) => format!("Loading {} ({d})", layer.name),
+            (_, None) => base_display.to_string(),
+            (_, Some(d)) => format!("{base_display} ({d})"),
         };
         out.push(IngestLayer {
             name: layer.name.clone(),

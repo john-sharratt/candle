@@ -730,15 +730,25 @@ fn sealed_bytes(sealed: &[SealedSequence]) -> usize {
 /// selection decisions.  The engine emits a [`super::Projection`] of opaque
 /// ids; the caller looks up content from those ids in its own store.
 pub trait ContentResolver {
-    /// How many turns have been appended to `group`.
-    fn turn_count(&self, group: GroupId) -> u32;
+    /// Every turn visible in `group`, across **all** of its active timelines.
+    ///
+    /// A group is a *shape*, not a conversation: `code_reading` declares one
+    /// conversation per file, so a group routinely holds many timelines. Turn
+    /// indices are per-timeline, so `(group, index)` alone is ambiguous — index 3
+    /// exists in every file's timeline. Enumerating [`TurnKey`]s (timeline +
+    /// index) is what lets every conversation in a multi-timeline group be scored
+    /// and projected, instead of only the first-registered one.
+    ///
+    /// Returned in a stable order: timelines in registration order, turns
+    /// ascending within each.
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey>;
 
     /// Token count for a turn.  Stable across projection calls.
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize;
+    fn turn_token_count(&self, turn: TurnKey) -> usize;
 
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
-    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32;
+    fn turn_score(&self, turn: TurnKey) -> f32;
 
     /// Layer that produced a given turn.  Used to denormalise
     /// `layer_id` onto the emitted `TurnId` without a back-lookup
@@ -747,7 +757,7 @@ pub trait ContentResolver {
     /// Default impl returns `None` (resolver doesn't track origins).
     /// When `None`, projection emit falls back to the layer-walk's
     /// `layer_id` — which is correct for tests using mock resolvers.
-    fn turn_origin(&self, _group: GroupId, _index: TurnIndex) -> Option<LayerId> {
+    fn turn_origin(&self, _turn: TurnKey) -> Option<LayerId> {
         None
     }
 
@@ -756,19 +766,7 @@ pub trait ContentResolver {
     /// cluster tagged `"."`, etc.) when normal selection is empty — so the
     /// group never drops out of the projection. Off the hot path: only consulted
     /// on an empty selection. Default `None` (mock resolvers carry no tags).
-    fn turn_with_tag(&self, _group: GroupId, _tag: &str) -> Option<TurnIndex> {
-        None
-    }
-
-    /// The timeline (conversation) a projected turn belongs to.  The target-aware
-    /// resolver resolves this from the projection target, so it is stamped ONCE
-    /// onto the emitted [`crate::projection::ResolvedTurn`] and read directly
-    /// downstream — no consumer re-derives `group → timeline` (which is what let
-    /// the reproject pick the wrong conversation and drop a slot's history).
-    ///
-    /// Default impl returns `None` (mock resolvers in tests don't track
-    /// timelines; their turns never reach the apply path).
-    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+    fn turn_with_tag(&self, _group: GroupId, _tag: &str) -> Option<TurnKey> {
         None
     }
 
@@ -781,7 +779,7 @@ pub trait ContentResolver {
     ///
     /// Default impl returns `Normal` (mock resolvers and non-summarised timelines
     /// have no forest, so every turn is raw).
-    fn turn_kind(&self, _group: GroupId, _index: TurnIndex) -> TurnKind {
+    fn turn_kind(&self, _turn: TurnKey) -> TurnKind {
         TurnKind::Normal
     }
 
@@ -798,7 +796,7 @@ pub trait ContentResolver {
     ///
     /// Default impl returns empty (mock resolvers / non-summarised timelines
     /// have no forest, so nothing is covered).
-    fn node_covers(&self, _group: GroupId, _index: TurnIndex) -> Vec<TurnIndex> {
+    fn node_covers(&self, _turn: TurnKey) -> Vec<TurnIndex> {
         Vec::new()
     }
 
@@ -4119,35 +4117,37 @@ impl Substrate {
 /// so structural-only callers (e.g. tests reading only turn counts and
 /// sealed pointers) can still pass `&substrate` to `Builder::project`.
 ///
-/// **Phase 1 caveat**: when a group has multiple timelines, this impl
-/// reads from the *first registered* timeline only.  Phase 3 replaces
-/// this with `TargetedRead` which filters by `target.timeline` within
-/// the target group.
+/// Enumerates **every** active timeline in a group, so a group holding many
+/// conversations (`code_reading` declares one per file) is fully visible rather
+/// than collapsing to the first-registered timeline.
+///
+/// This impl has **no projection target**, so it applies **no sibling-timeline
+/// masking**: it surfaces every conversation in a group, including what would be
+/// the target group. A target-masked projection (where a live slot must NOT see
+/// sibling conversations of the same shape) MUST project through [`TargetedRead`]
+/// — this bare impl is for structural / test callers only.
 impl ContentResolver for Substrate {
-    fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.active_timelines_for_group(group).next() else {
-            return 0;
-        };
-        Substrate::turn_count(self, timeline)
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
+        self.active_timelines_for_group(group)
+            .flat_map(|tl| {
+                (0..Substrate::turn_count(self, tl)).map(move |i| TurnKey::new(tl, TurnIndex(i)))
+            })
+            .collect()
     }
 
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.active_timelines_for_group(group).next() else {
-            return 0;
-        };
-        self.turn(timeline, index)
+    fn turn_token_count(&self, turn: TurnKey) -> usize {
+        self.turn(turn.timeline, turn.index)
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(&self, _group: GroupId, _index: TurnIndex) -> f32 {
+    fn turn_score(&self, _turn: TurnKey) -> f32 {
         // Bare substrate has no attached scores; pair via ScoredSubstrate
         // or read through Conversation::read_scored to see non-zero values.
         0.0
     }
 
-    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.active_timelines_for_group(group).next()?;
-        let (layer, _) = self.timeline_target(timeline)?;
+    fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
+        let (layer, _) = self.timeline_target(turn.timeline)?;
         Some(layer)
     }
 
@@ -4237,42 +4237,39 @@ impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
     }
 }
 
-/// Group-keyed [`ContentResolver`] impl over a `(Substrate, ProjectionScores)`
-/// pair.
+/// [`ContentResolver`] impl over a `(Substrate, ProjectionScores)` pair.
 ///
-/// **Phase 1 caveat**: when a group has multiple timelines, this impl reads
-/// from the *first registered* timeline only.  Phase 3 replaces this with
-/// `TargetedRead` which filters by `target.timeline` within the target group.
+/// Enumerates every active timeline in a group, so a multi-conversation group is
+/// scored and projected in full rather than collapsing to the first timeline.
+/// Like the bare [`Substrate`] impl, it carries **no target** and applies **no
+/// sibling-timeline masking** — a target-masked projection routes through
+/// [`TargetedRead`]; this pairing is for structural / test callers.
 impl<'a> ContentResolver for ScoredSubstrate<'a> {
-    fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
-            return 0;
-        };
-        Substrate::turn_count(self.substrate, timeline)
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
+        self.substrate
+            .active_timelines_for_group(group)
+            .flat_map(|tl| {
+                (0..Substrate::turn_count(self.substrate, tl))
+                    .map(move |i| TurnKey::new(tl, TurnIndex(i)))
+            })
+            .collect()
     }
 
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
-            return 0;
-        };
+    fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.substrate
-            .turn(timeline, index)
+            .turn(turn.timeline, turn.index)
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
-        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
-            return 0.0;
-        };
-        if self.substrate.turn(timeline, index).is_none() {
+    fn turn_score(&self, turn: TurnKey) -> f32 {
+        if self.substrate.turn(turn.timeline, turn.index).is_none() {
             return 0.0;
         }
-        self.scores.turn(timeline, index)
+        self.scores.turn(turn.timeline, turn.index)
     }
 
-    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.substrate.active_timelines_for_group(group).next()?;
-        let (layer, _) = self.substrate.timeline_target(timeline)?;
+    fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
+        let (layer, _) = self.substrate.timeline_target(turn.timeline)?;
         Some(layer)
     }
 
@@ -4348,42 +4345,47 @@ impl<'a> std::ops::Deref for SubstrateRead<'a> {
     }
 }
 
+/// Untargeted read guard: enumerates every active timeline in a group and applies
+/// **no** sibling-timeline masking (it has no target). Wrap in [`TargetedRead`]
+/// for a target-masked projection; this bare guard is for structural / test reads.
 impl<'a> ContentResolver for SubstrateRead<'a> {
-    fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
-            return 0;
-        };
-        Substrate::turn_count(&self.guard, timeline)
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
+        self.guard
+            .active_timelines_for_group(group)
+            .flat_map(|tl| {
+                (0..Substrate::turn_count(&self.guard, tl))
+                    .map(move |i| TurnKey::new(tl, TurnIndex(i)))
+            })
+            .collect()
     }
 
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
-            return 0;
-        };
+    fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.guard
-            .turn(timeline, index)
+            .turn(turn.timeline, turn.index)
             .map_or(0, |e| e.content.token_count)
     }
 
-    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
-        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
-            return 0.0;
-        };
-        if self.guard.turn(timeline, index).is_none() {
+    fn turn_score(&self, turn: TurnKey) -> f32 {
+        if self.guard.turn(turn.timeline, turn.index).is_none() {
             return 0.0;
         }
-        self.scores_or_empty().turn(timeline, index)
+        self.scores_or_empty().turn(turn.timeline, turn.index)
     }
 
-    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.guard.active_timelines_for_group(group).next()?;
-        let (layer, _) = self.guard.timeline_target(timeline)?;
+    fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
+        let (layer, _) = self.guard.timeline_target(turn.timeline)?;
         Some(layer)
     }
 
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
-        let timeline = self.guard.active_timelines_for_group(group).next()?;
-        self.guard.turn_with_tag(timeline, tag)
+    /// Searches every active timeline in the group — a group's declared `default`
+    /// member (e.g. the workspace-root cluster tagged `"."`) can live in any of
+    /// its conversations, not just the first.
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
+        self.guard.active_timelines_for_group(group).find_map(|tl| {
+            self.guard
+                .turn_with_tag(tl, tag)
+                .map(|idx| TurnKey::new(tl, idx))
+        })
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {
@@ -6153,6 +6155,52 @@ mod tests {
         assert_eq!(sub.timelines_with_metadata("path", "x.rs"), vec![a]);
         assert_eq!(sub.timelines_with_metadata("path", "y.rs"), vec![b]);
         assert!(sub.timelines_with_metadata("path", "z.rs").is_empty());
+    }
+
+    /// A group holding MANY conversations must surface every one of them.
+    ///
+    /// `code_reading` declares one conversation per file, so this is the shape
+    /// the coding agent actually runs. The resolver used to collapse a group to
+    /// its first-registered timeline, which made every other file structurally
+    /// unreachable — not scored by provenance, not projectable — no matter how
+    /// well it matched the query. Tombstoned conversations still drop out.
+    #[test]
+    fn group_turns_span_every_conversation_in_the_group() {
+        use crate::projection::TurnKey;
+
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (file_a, file_b, retired) = (alloc.next(), alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        for tl in [file_a, file_b, retired] {
+            sub.register_timeline(tl, layer, group);
+        }
+        // Two turns per conversation — note the indices COLLIDE across
+        // timelines, which is exactly why a bare `(group, index)` key is
+        // ambiguous and the turn identity has to carry the timeline.
+        for tl in [file_a, file_b, retired] {
+            sub.append_with_blocks(tl, 10, 0, 0);
+            sub.append_with_blocks(tl, 10, 0, 0);
+        }
+        sub.tombstone_timeline(retired);
+
+        let turns = ContentResolver::group_turns(&sub, group);
+        assert_eq!(
+            turns,
+            vec![
+                TurnKey::new(file_a, TurnIndex(0)),
+                TurnKey::new(file_a, TurnIndex(1)),
+                TurnKey::new(file_b, TurnIndex(0)),
+                TurnKey::new(file_b, TurnIndex(1)),
+            ],
+            "both live conversations enumerate in registration order; the \
+             tombstoned one drops out",
+        );
+        // Each key resolves against its OWN conversation.
+        for key in &turns {
+            assert_eq!(ContentResolver::turn_token_count(&sub, *key), 10);
+        }
     }
 
     // ── Tombstone ─────────────────────────────────────────────────────
