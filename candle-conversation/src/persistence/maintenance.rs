@@ -55,7 +55,6 @@
 //! the source's higher-id-losing copies are simply superseded by id order.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
 use std::time::SystemTime;
 
 use super::manifest::{
@@ -233,16 +232,6 @@ impl MaintenancePlan {
     pub fn op(&self) -> MaintenanceOp {
         self.op
     }
-
-    /// Number of chunk relocations — drives the batched execute loop's range math.
-    pub fn chunk_reloc_count(&self) -> usize {
-        self.chunk_relocs.len()
-    }
-
-    /// Number of `Tokens`-record relocations — drives the batched execute loop.
-    pub fn token_reloc_count(&self) -> usize {
-        self.token_relocs.len()
-    }
 }
 
 /// The relocated records' new locations, produced by
@@ -256,21 +245,6 @@ pub struct MaintenanceResult {
 }
 
 impl MaintenanceResult {
-    /// An empty accumulator, for merging the per-batch results of a chunked
-    /// [`SubstratePersistence::execute_maintenance_batch`] run.
-    pub fn empty() -> Self {
-        Self {
-            chunk_updates: Vec::new(),
-            token_updates: Vec::new(),
-        }
-    }
-
-    /// Fold another batch's relocations into this accumulator.
-    pub fn merge(&mut self, other: MaintenanceResult) {
-        self.chunk_updates.extend(other.chunk_updates);
-        self.token_updates.extend(other.token_updates);
-    }
-
     /// Repoint the substrate index at the relocated records, then refresh cold
     /// residence refs. **Supersession guard:** a record whose index entry no
     /// longer points at `old_loc` was rewritten since the plan was made, so its
@@ -520,42 +494,13 @@ impl SubstratePersistence {
     /// copies are durable (fsynced) before any source is unlinked. Returns the
     /// new locations for [`MaintenanceResult::apply_to_substrate`].
     pub fn execute_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceResult> {
-        let nc = plan.chunk_relocs.len();
-        let nt = plan.token_relocs.len();
-        let result = self.execute_maintenance_batch(plan, 0..nc, 0..nt, true, true)?;
-        // Single-shot entry point: fsync the relocations durable before the caller
-        // unlinks sources (the batched resolver path commits after its loop instead).
-        self.commit()?;
-        Ok(result)
-    }
-
-    /// Batched variant of [`Self::execute_maintenance`]: relocate only the given
-    /// slices of the plan's chunk/token relocations (and, when flagged, re-emit the
-    /// resident set / relocate the singletons). APPEND-ONLY — does NOT fsync; the
-    /// caller commits exactly once after the last batch. The caller drives the
-    /// batches and RELEASES the persistence lock between each, so the scheduler's
-    /// seal writes (which share the lock) interleave — a whole huge segment
-    /// relocated under one lock hold stalls decode for many seconds (the
-    /// maintenance Sync-band spikes). The sources are unlinked only in
-    /// [`Self::finish_maintenance`], after every batch + the single commit + the
-    /// index apply, so the durable-before-unlink invariant holds regardless of how
-    /// the relocation is chunked.
-    pub fn execute_maintenance_batch(
-        &mut self,
-        plan: &MaintenancePlan,
-        chunk_range: Range<usize>,
-        token_range: Range<usize>,
-        emit_resident: bool,
-        emit_singletons: bool,
-    ) -> Result<MaintenanceResult> {
         // Resident set — re-emitted from in-RAM state (not read from disk), so
         // the normal encoding append. When re-emitted, record the active segment
         // it lands into (captured BEFORE the appends, the floor of the segments
         // the re-emission writes to) as the new drop-safety floor, so subsequent
         // older-only ops can skip the re-emission (see `need_resident_reemit`). An
         // empty resident set means the planner chose to skip — leave the floor.
-        // Emitted only on the first batch (`emit_resident`).
-        if emit_resident && !plan.resident.is_empty() {
+        if !plan.resident.is_empty() {
             let reemit_floor = self.segments.active_id();
             for r in &plan.resident {
                 self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, &r.payload)?;
@@ -567,10 +512,9 @@ impl SubstratePersistence {
         // group with **coalesced reads + verbatim staging** (no decode / CRC /
         // re-encode) so the fast block-read path is used, not a syscall per
         // record.
-        let chunk_slice = &plan.chunk_relocs[chunk_range];
-        let mut chunk_updates = Vec::with_capacity(chunk_slice.len());
+        let mut chunk_updates = Vec::with_capacity(plan.chunk_relocs.len());
         let mut by_seg: BTreeMap<SegmentId, Vec<(StreamId, u64, ChunkLoc)>> = BTreeMap::new();
-        for &(sid, idx, old) in chunk_slice {
+        for &(sid, idx, old) in &plan.chunk_relocs {
             by_seg.entry(old.segment).or_default().push((sid, idx, old));
         }
         for (source, recs) in by_seg {
@@ -609,10 +553,9 @@ impl SubstratePersistence {
         }
 
         // Tokens — same coalesced verbatim path.
-        let token_slice = &plan.token_relocs[token_range];
-        let mut token_updates = Vec::with_capacity(token_slice.len());
+        let mut token_updates = Vec::with_capacity(plan.token_relocs.len());
         let mut tok_by_seg: BTreeMap<SegmentId, Vec<(StreamId, RecordLoc)>> = BTreeMap::new();
-        for &(sid, old) in token_slice {
+        for &(sid, old) in &plan.token_relocs {
             tok_by_seg.entry(old.segment).or_default().push((sid, old));
         }
         for (source, recs) in tok_by_seg {
@@ -648,24 +591,17 @@ impl SubstratePersistence {
         }
 
         // Singletons — few (≤3); the encoding append repoints them via
-        // `manifest.ingest`. Relocated once, on the final batch (`emit_singletons`).
-        if emit_singletons {
-            for &(rt, old) in &plan.singleton_relocs {
-                let rec = self
-                    .segments
-                    .read_record_at(old.segment, old.offset, old.record_size)?;
-                self.append_record(rt, 0, 0, 0, 0, &rec.payload)?;
-            }
+        // `manifest.ingest`.
+        for &(rt, old) in &plan.singleton_relocs {
+            let rec = self
+                .segments
+                .read_record_at(old.segment, old.offset, old.record_size)?;
+            self.append_record(rt, 0, 0, 0, 0, &rec.payload)?;
         }
 
-        // Append-only: no fsync here. When the plan is relocated in multiple
-        // batches (the chunked resolver loop), fsyncing every batch would be N
-        // redundant `sync_data()`s — the final `commit()` flushes all dirty pages
-        // at once. The caller commits exactly ONCE after the last batch (the
-        // `execute_maintenance` wrapper does so on its single call; the resolver's
-        // batch loop commits after the loop), and `finish_maintenance` unlinks the
-        // sources only after that — so the durable-before-unlink barrier holds while
-        // the per-batch lock hold stays bounded.
+        // Durability barrier: relocated copies are fsynced before any source is
+        // unlinked (in `finish_maintenance`).
+        self.commit()?;
         Ok(MaintenanceResult {
             chunk_updates,
             token_updates,
@@ -1223,107 +1159,6 @@ mod tests {
                 chunk_payload(12)
             );
             assert_eq!(substrate.live_chunk_count(), 2);
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The CHUNKED `execute_maintenance_batch` loop (the resolver's path: bounded
-    /// relocations per lock hold, one commit after the loop) must compact correctly
-    /// and identically to the single-shot path. Driven one record per batch — so the
-    /// first/last-flag logic, the chunk→token range carry, and the append-only-then-
-    /// single-commit durability are all exercised across several batches — the result
-    /// must be: live chunks relocated + readable, the superseded chunk untouched, the
-    /// source segment dropped, and everything durable after a reopen.
-    #[test]
-    fn chunked_execute_maintenance_batch_compacts_correctly() {
-        let dir = tmp_dir("batch_compact");
-        let sid = StreamId(303);
-        {
-            let mut substrate = Substrate::new();
-            let mut sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            for i in 0..4u64 {
-                // seg 1: 4 chunks written.
-                sp.write_chunk(sid, i, 32, 4, &chunk_payload(100 + i as u32))
-                    .unwrap();
-            }
-            sp.commit().unwrap();
-            sp.seal_active().unwrap();
-            sp.write_chunk(sid, 1, 32, 4, &chunk_payload(200)).unwrap(); // seg 2 supersedes chunk-1
-            sp.commit().unwrap();
-        }
-        {
-            let mut substrate = Substrate::new();
-            let mut sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            // Plan the (forced) op, then relocate it ONE record per batch — the loop
-            // mirrors `run_maintenance_pass` (`c_end`/`rem`/`t_end`/`last`) with a
-            // batch size of 1 so ≥2 batches run.
-            let plan = sp
-                .plan_maintenance(&substrate, true)
-                .unwrap()
-                .expect("a maintenance plan");
-            assert!(
-                plan.chunk_reloc_count() >= 2,
-                "fixture must span more than one batch (got {})",
-                plan.chunk_reloc_count()
-            );
-            let (nc, nt) = (plan.chunk_reloc_count(), plan.token_reloc_count());
-            let mut result = MaintenanceResult::empty();
-            let (mut dc, mut dt, mut first) = (0usize, 0usize, true);
-            loop {
-                let c_end = (dc + 1).min(nc);
-                let rem = 1 - (c_end - dc);
-                let t_end = (dt + rem).min(nt);
-                let last = c_end == nc && t_end == nt;
-                result.merge(
-                    sp.execute_maintenance_batch(&plan, dc..c_end, dt..t_end, first, last)
-                        .unwrap(),
-                );
-                dc = c_end;
-                dt = t_end;
-                first = false;
-                if last {
-                    break;
-                }
-            }
-            sp.commit().unwrap(); // the single post-loop fsync
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
-
-            assert!(
-                !sealed_log(&dir, 1).exists(),
-                "source segment was compacted away"
-            );
-            for i in [0u64, 2, 3] {
-                assert_eq!(
-                    sp.read_chunk(&substrate, sid, i).unwrap(),
-                    chunk_payload(100 + i as u32),
-                    "live chunk {i} relocated intact"
-                );
-            }
-            assert_eq!(
-                sp.read_chunk(&substrate, sid, 1).unwrap(),
-                chunk_payload(200),
-                "superseded chunk keeps its seg-2 value"
-            );
-        }
-        // Reopen: durable + consistent after the single post-loop commit.
-        {
-            let mut substrate = Substrate::new();
-            let mut sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            for i in [0u64, 2, 3] {
-                assert_eq!(
-                    sp.read_chunk(&substrate, sid, i).unwrap(),
-                    chunk_payload(100 + i as u32)
-                );
-            }
-            assert_eq!(
-                sp.read_chunk(&substrate, sid, 1).unwrap(),
-                chunk_payload(200)
-            );
-            assert_eq!(substrate.live_chunk_count(), 4);
         }
         std::fs::remove_dir_all(&dir).ok();
     }

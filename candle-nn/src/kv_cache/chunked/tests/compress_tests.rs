@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
+use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Tensor};
 use half::f16;
 
@@ -250,8 +250,7 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
         }
         if deferred {
             // ONE batched convert across every layer's descriptors.
-            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device, None)
-                .expect("batched convert");
+            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device).expect("batched convert");
         }
         device.synchronize().unwrap();
 
@@ -275,100 +274,6 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
     assert_eq!(
         bytes_immediate, bytes_deferred,
         "deferred cross-layer batched convert produced different quant bytes than the immediate per-layer path"
-    );
-}
-
-/// Copy-stream equivalence (the Phase-2 overlap guard): running the batched convert
-/// on a DEDICATED copy stream — via [`candle::CudaDevice::with_stream`], exactly as
-/// the persistence thread does to overlap the migration with decode — must produce
-/// warm KV whose raw quantized bytes are **bit-identical** to running it on the
-/// primary stream. The stream split is only correct with two cross-stream fences:
-/// Fence C (the copy stream waits a primary-stream event so the convert runs after
-/// the primary selection + dst-arena alloc) and a completion event (the primary
-/// stream waits before the readback so it can't race the convert's writes — the
-/// V-later-than-K hazard). Drop or misplace either fence and the readback captures
-/// half-written Q bytes and diverges here. Mirrors
-/// `quantize_layers_deferred_matches_immediate_bytes`, differing only in WHICH
-/// stream the convert runs on.
-#[test]
-fn convert_on_copy_stream_matches_primary_bytes() {
-    let Some(device) = cuda_device_or_skip() else {
-        return;
-    };
-    let policy = CompressionPolicy::new(5);
-    let n_layers = 3usize;
-    let n_tokens = 96usize; // 3 full 32-token chunks → all go through the convert
-
-    let run = |on_copy: bool| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Staging stream for the per-layer deferred quantize (selection + alloc,
-        // primary). The convert below runs either on this primary device or on a
-        // dedicated copy stream.
-        let copy_stream = cuda_stream(&device);
-        let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
-        let mut items: Vec<(ChunkedKvBacking, SealedSequence)> = Vec::new();
-        for layer in 0..n_layers {
-            let backing = cuda_backing_with_policy(&device, &policy);
-            let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 1) * 1000);
-            let mut pinned: Option<PinnedBuf> = None;
-            let warm = quantize_sealed_in_place_deferred(
-                &backing,
-                &[&src],
-                &policy,
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &mut descs,
-            )
-            .expect("quantize");
-            items.push((backing, warm.into_iter().next().expect("one sequence")));
-        }
-        // ONE batched convert across every layer's descriptors — on the primary
-        // device, or on a `with_stream` copy-stream device view with the fences.
-        if on_copy {
-            let Device::Cuda(cdev) = &device else {
-                unreachable!("cuda_device_or_skip returns a CUDA device")
-            };
-            let cstream = cdev.cuda_context().new_stream().expect("new copy stream");
-            // Copy-stream stager for the descriptor H2D (must share the convert's
-            // stream — the whole point of the fix).
-            let copy_stager = PinnedStager::with_stream(cdev, cstream.clone());
-            // Fence C: order the copy convert after the primary selection + alloc.
-            let ev_pre = cdev.cuda_stream().record_event(None).expect("record Fence C");
-            cstream.wait(&ev_pre).expect("copy wait Fence C");
-            let copy_dev = Device::Cuda(cdev.with_stream(cstream.clone()));
-            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &copy_dev, Some(&copy_stager))
-                .expect("copy-stream batched convert");
-            // Completion fence: order the primary-stream readback after the convert.
-            let ev_post = cstream.record_event(None).expect("record completion");
-            cdev.cuda_stream()
-                .wait(&ev_post)
-                .expect("primary wait completion");
-        } else {
-            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device, None)
-                .expect("primary batched convert");
-        }
-        device.synchronize().unwrap();
-
-        // Read each layer's warm chunk raw K/V bytes back.
-        let mut out = Vec::with_capacity(n_layers);
-        for (backing, warm) in items {
-            let n_chunks = warm.chunks.len();
-            let slot = backing.alloc_sequence().unwrap();
-            backing.inject_sealed_at_tail(slot, &warm).expect("inject warm");
-            let mut layer_bytes = Vec::with_capacity(n_chunks);
-            for blk in 0..n_chunks {
-                layer_bytes.push(backing.read_raw_sealed_chunk(slot, blk).expect("read raw chunk"));
-            }
-            out.push(layer_bytes);
-        }
-        out
-    };
-
-    let bytes_primary = run(false);
-    let bytes_copy = run(true);
-    assert_eq!(
-        bytes_primary, bytes_copy,
-        "convert on a dedicated copy stream produced different quant bytes than the primary stream — a missing/mis-ordered cross-stream fence"
     );
 }
 
@@ -438,8 +343,7 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
         };
         // ONE batched convert across every layer's descriptors — identical for
         // both paths, so the compare isolates the selection.
-        convert_deferred_descs(&backings[0], &descs, N_KV_HEAD, &device, None)
-            .expect("batched convert");
+        convert_deferred_descs(&backings[0], &descs, N_KV_HEAD, &device).expect("batched convert");
         device.synchronize().unwrap();
 
         let mut out = Vec::with_capacity(n_layers);

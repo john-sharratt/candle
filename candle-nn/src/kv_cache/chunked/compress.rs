@@ -36,7 +36,7 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{dtype_to_ggml_float, identity_pal_map_128, PalHeadDesc};
 #[cfg(feature = "cuda")]
-use candle::quantized::pinned_staging::{Generation, PinnedBuf, PinnedStager};
+use candle::quantized::pinned_staging::{Generation, PinnedBuf};
 #[cfg(feature = "cuda")]
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
@@ -1158,27 +1158,16 @@ fn convert_descs_batched(
 
 /// Run the deferred cross-layer convert accumulated by
 /// [`quantize_sealed_in_place_deferred`]: ONE batched launch over EVERY layer's
-/// descriptors (`n_layers × n_chunks × n_kv_head` blocks) on `device`'s stream,
-/// filling the dst arenas the returned sequences point at, before the persist pass
-/// reads them. Any layer's `backing` works (the descriptors carry their own arena
-/// pointers).
-///
-/// STREAM-PAIRING INVARIANT: the descriptor H2D and the convert kernel MUST run on
-/// the same stream. The kernel runs on `device.cuda_stream()`. When `device` is a
-/// copy-stream [`candle::CudaDevice::with_stream`] view (the persist thread's
-/// overlap path), the caller MUST pass `copy_stager` = a stager bound to that SAME
-/// copy stream. Passing `None` with a copy-stream `device` would stage descriptors
-/// on the backing's PRIMARY-stream stager while the kernel runs on the copy stream
-/// — an unfenced cross-stream read of not-yet-uploaded descriptor pointers →
-/// `CUDA_ERROR_ILLEGAL_ADDRESS`. `None` is valid ONLY when `device` is the primary
-/// device (tests / non-overlap path), where the backing's primary stager matches.
+/// descriptors on the primary stream (`n_layers × n_chunks × n_kv_head` blocks),
+/// filling the dst arenas the returned sequences point at, before the persist
+/// pass reads them. `backing` supplies the pinned stager + CUDA device; any
+/// layer's backing works (the descriptors carry their own arena pointers).
 #[cfg(feature = "cuda")]
 pub fn convert_deferred_descs(
     backing: &ChunkedKvBacking,
     descs: &[PalHeadDesc],
     n_kv_head: usize,
     device: &Device,
-    copy_stager: Option<&PinnedStager>,
 ) -> Result<()> {
     if descs.is_empty() {
         return Ok(());
@@ -1187,19 +1176,9 @@ pub fn convert_deferred_descs(
         Device::Cuda(d) => d,
         _ => candle::bail!("convert_deferred_descs: requires a CUDA device"),
     };
-    // The descriptor H2D MUST run on the SAME stream as the convert kernel
-    // (`cuda_dev.cuda_stream()`). The backing's stager is bound to the device's
-    // PRIMARY stream; when `device` is a dedicated COPY-stream view (the persist
-    // thread's overlap path), pass a `copy_stager` bound to that same copy stream so
-    // the descriptor upload and the kernel are FIFO-ordered on one stream. Without
-    // it the kernel reads descriptor pointers the primary-stream upload hasn't
-    // retired yet → CUDA_ERROR_ILLEGAL_ADDRESS (the V pass dereferences garbage).
-    let stager = match copy_stager {
-        Some(s) => s.begin_generation(),
-        None => backing.begin_stager_generation_required(),
-    };
-    let stream = cuda_dev.cuda_stream();
-    convert_descs_batched(descs, n_kv_head, &stager, &stream)?;
+    let stager = backing.begin_stager_generation_required();
+    let primary_stream = cuda_dev.cuda_stream();
+    convert_descs_batched(descs, n_kv_head, &stager, &primary_stream)?;
     drop(stager);
     Ok(())
 }

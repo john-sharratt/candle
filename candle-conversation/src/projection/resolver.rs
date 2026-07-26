@@ -10,7 +10,6 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
-use crate::persistence::maintenance::MaintenanceResult;
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -1956,67 +1955,21 @@ impl Conversation {
                 //    the scheduler's Sync bucket so a multi-second compaction shows
                 //    as Sync (a persistence wait) rather than unattributed Blocked,
                 //    and log it so the op's cost is visible on its own line.
-                // Relocate in BOUNDED BATCHES, releasing the persistence lock
-                // between each so the scheduler's seal writes (which share the lock)
-                // interleave. A whole huge segment relocated under one lock hold
-                // stalls decode for many seconds (the maintenance Sync-band spikes —
-                // seen at 15-17 s under heavy code_read cold-eviction). Correctness
-                // is unchanged: each batch is fsynced durable on return, and the
-                // sources are unlinked only in `finish_maintenance` below, after
-                // EVERY batch + the index apply.
-                const RELOC_BATCH: usize = 128; // records per lock hold
                 let t_exec = std::time::Instant::now();
-                let nc = plan.chunk_reloc_count();
-                let nt = plan.token_reloc_count();
-                let mut result = MaintenanceResult::empty();
-                let mut dc = 0usize;
-                let mut dt = 0usize;
-                let mut first = true;
-                let mut max_hold_ms = 0u64;
-                let mut batches = 0u64;
-                loop {
-                    let c_end = (dc + RELOC_BATCH).min(nc);
-                    let rem = RELOC_BATCH - (c_end - dc);
-                    let t_end = (dt + rem).min(nt);
-                    let last = c_end == nc && t_end == nt;
-                    let t_batch = std::time::Instant::now();
-                    let r = {
-                        let mut p = self.persistence.lock().unwrap();
-                        p.execute_maintenance_batch(&plan, dc..c_end, dt..t_end, first, last)
-                            .map_err(|e| {
-                                candle::Error::Msg(format!("substrate maintenance exec: {e}"))
-                            })?
-                        // lock released HERE → seal writes interleave before the next batch
-                    };
-                    max_hold_ms = max_hold_ms.max(t_batch.elapsed().as_millis() as u64);
-                    batches += 1;
-                    result.merge(r);
-                    dc = c_end;
-                    dt = t_end;
-                    first = false;
-                    if last {
-                        break;
-                    }
-                }
-                // ONE fsync after the whole relocation (the batches are append-only)
-                // — durable before `finish_maintenance` unlinks any source below, so
-                // the durable-before-unlink barrier holds without N per-batch fsyncs.
-                {
+                let result = {
                     let mut p = self.persistence.lock().unwrap();
-                    p.commit().map_err(|e| {
-                        candle::Error::Msg(format!("substrate maintenance commit: {e}"))
-                    })?;
-                }
+                    p.execute_maintenance(&plan).map_err(|e| {
+                        candle::Error::Msg(format!("substrate maintenance exec: {e}"))
+                    })?
+                };
                 let exec_ms = t_exec.elapsed().as_millis() as u64;
                 note_persistence_maint_us(t_exec.elapsed().as_micros() as u64);
                 if exec_ms > 200 {
                     tracing::info!(
                         target: "candle_conversation::persistence::maintenance",
                         exec_ms,
-                        max_hold_ms,
-                        batches,
-                        "segment-maintenance relocation I/O (batched; per-batch lock \
-                         hold bounded so scheduler seal writes interleave)"
+                        "segment-maintenance relocation I/O held the persistence lock \
+                         (scheduler seal writes block for this duration → Sync phase)"
                     );
                 }
                 // 3. Repoint the index at the relocated records under a brief write lock.
