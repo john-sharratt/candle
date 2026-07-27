@@ -1252,6 +1252,13 @@ impl BatchedInferenceSession {
     /// Call this after freeing sequences to reclaim GPU memory.
     /// Returns the total number of arenas freed across all layers.
     pub fn compact(&self) -> Result<usize> {
+        // Deferred while a hot→warm migrate is reading arena base pointers: the
+        // scheduler's arena free/relocate/trim must not unmap memory the migrate's
+        // select/convert/copy kernels are dereferencing (crash layer 2 @42553ca3).
+        // Relief resumes next wave; migrates run in ~hundreds of ms.
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(0);
+        }
         if !self.compact_check()? {
             return Ok(0);
         }
@@ -1268,6 +1275,10 @@ impl BatchedInferenceSession {
     /// reclaimed arenas. Used by the scheduler's VRAM-pressure backpressure
     /// path, where reclaiming any arena is worth it. Returns arenas freed.
     pub fn compact_forced(&self) -> Result<usize> {
+        // See `compact` — deferred during a hot→warm migrate.
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(0);
+        }
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.compact_forced()?;
@@ -1281,6 +1292,11 @@ impl BatchedInferenceSession {
     /// compaction). Does NOT release the emptied arenas — pair with
     /// [`release_empty_arenas`](Self::release_empty_arenas). Returns chunks moved.
     pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
+        // See `compact` — deferred during a hot→warm migrate (relocation would
+        // reindex arenas the migrate's frozen gids address).
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(0);
+        }
         let n = self.backings.len();
         if n == 0 {
             return Ok(0);
@@ -1310,6 +1326,12 @@ impl BatchedInferenceSession {
     /// path (the costly speculative defrag is left to the allocation-time OOM
     /// retry). Returns arenas freed.
     pub fn release_empty_arenas(&self) -> Result<usize> {
+        // See `compact` — deferred during a hot→warm migrate. The migrate's own
+        // source arenas are Arc-pinned, but neighbour arenas in the dense per-head
+        // table are not, so the whole release is deferred.
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(0);
+        }
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.release_empty_arenas()?;
@@ -1398,6 +1420,13 @@ impl BatchedInferenceSession {
     /// `pool_reserved` tracking `pool_used` so the VRAM budget stays physically
     /// accurate. Only releases memory nothing is using; never touches live KV.
     pub fn trim_kv_pool(&self, keep_bytes: usize) -> Option<(usize, usize)> {
+        // `cuMemPoolTrimTo` synchronously UNMAPS freed pool memory (not
+        // stream-ordered) at device-pool granularity — the sharpest form of the
+        // free-under-read crash if the migrate's kernel is dereferencing an arena
+        // base pointer in trimmed memory. Defer for the migrate window (layer 2).
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return None;
+        }
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(d) = &self.device {

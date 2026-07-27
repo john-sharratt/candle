@@ -253,13 +253,16 @@ impl ChunkedKvBacking {
         let arena_idx = new_gid.arena_idx();
         let chunk_idx = new_gid.chunk_idx();
         let copy_result = self.inner.storage.try_write(|s| {
-            // Re-validate source (still must exist and not be tombstoned)
-            if source_arena_idx >= s.arena_count() {
+            // Re-validate the source by MAP LOOKUP, not an index-vs-len bound:
+            // storage `arenas` is a keyed map with holes once any arena has been
+            // tombstoned, so `arena_count()` (the map LEN) undercounts and a
+            // perfectly valid high-index source would be misjudged "tombstoned".
+            // That misjudgement made this path skip the copy and hand back a
+            // detached pseudo-gid aliasing the live source (see below) — the
+            // stale-gid corruption at the root of the CFW crash/drift.
+            let Some(source_key) = s.arena_key(source_arena_idx) else {
                 return Ok(false);
-            }
-            let source_key = s
-                .arena_key(source_arena_idx)
-                .ok_or_else(|| candle::Error::Msg("source arena not found".into()))?;
+            };
 
             if source_key == target_key {
                 Self::copy_chunk_data_static(
@@ -292,9 +295,21 @@ impl ChunkedKvBacking {
         match copy_result {
             Ok(true) => Ok(new_gid),
             Ok(false) => {
-                // Source was tombstoned between locks ? skip migration.
-                // new_gid drops here, returning GID to pool.
-                Ok(ChunkGid::detached(source_gid as i64))
+                // The source arena is genuinely absent from storage. The caller
+                // holds the source gid's Arc across this call, so a live source
+                // cannot be tombstoned under us (`try_tombstone` requires
+                // `live == 0`) — absence here means an arena was freed while
+                // chunks still referenced it: the exact invariant violation
+                // behind the stale-gid KV corruption. Fail loudly. The old
+                // fallback returned `ChunkGid::detached(source_gid)` — an
+                // UNTRACKED alias of the freed id that let its arena index be
+                // re-tenanted under a live chunk window (illegal-address when
+                // strides differ, silent cross-context KV reads when not).
+                // new_gid drops here, returning the dest GID to the pool.
+                Err(candle::Error::Msg(format!(
+                    "migrate_chunk: source arena {source_arena_idx} (gid {source_gid}) vanished \
+                     while its chunk is still referenced — arena freed with live KV"
+                )))
             }
             Err(e) => {
                 // Data copy failed ? new_gid drops here, returning GID to pool.
@@ -1748,10 +1763,20 @@ impl ChunkedKvBacking {
             for &raw in &unique_raws {
                 let src_arena_idx = (raw as usize) / arena_chunks;
                 let src_chunk_idx = (raw as usize) % arena_chunks;
-                if src_arena_idx >= s.arena_count() {
-                    // Tombstoned between phases — leave the dest GID
-                    // freshly-allocated and skip the copy.
-                    continue;
+                // Hole-aware existence check (map lookup), NOT index-vs-len:
+                // `arena_count()` is the map LEN, which undercounts once any
+                // arena has been tombstoned — the old bound misjudged valid
+                // high-index sources as "tombstoned" and SKIPPED their copy,
+                // leaving the freshly-allocated destination chunk with
+                // UNINITIALIZED contents that were then stored as warm KV and
+                // later attended over (silent garbage-context corruption). The
+                // batch holds every source chunk's gid Arc, so a genuinely
+                // absent arena is an arena freed with live KV — fail loudly.
+                if s.arena_key(src_arena_idx).is_none() {
+                    return Err(candle::Error::Msg(format!(
+                        "hot→warm batch: source arena {src_arena_idx} (gid {raw}) vanished \
+                         while its chunk is still referenced — arena freed with live KV"
+                    )));
                 }
                 let src_key = src_keys[&raw].clone();
                 let cpu_key = ArenaKey {

@@ -126,6 +126,21 @@ pub struct ArenaRefcounts {
     /// full → non-full transition so the pool's `allocate_any` can find it via
     /// find-first-set instead of scanning every arena.
     capacity: Arc<CapacityBitmap>,
+    /// Creation window guard: `true` from registration until the arena hands
+    /// out its FIRST gid. `register_arena` releases the metadata lock before
+    /// its caller allocates chunks or writes data, so a freshly-registered
+    /// arena sits at `live == 0`, unprotected — and `try_tombstone` on another
+    /// thread could free it (and recycle its INDEX to a different owner) while
+    /// the creator is mid-allocation or mid-write. That is the "arena with
+    /// active KV freed under an in-flight kernel" class: an illegal address
+    /// when the memory unmaps, or silent cross-context KV contamination when
+    /// the index/memory is re-tenanted. This flag closes the window at the
+    /// ownership level: an arena is tombstoneable only after its creator has
+    /// taken at least one slot (from then on `live > 0` protects it, and a
+    /// later genuine drop to `live == 0` is legitimately reclaimable).
+    /// Cleared with `Release` after the live increment; checked with `Acquire`
+    /// before the live read, so observing `false` implies seeing `live ≥ 1`.
+    creation_pending: AtomicBool,
 }
 
 impl ArenaRefcounts {
@@ -159,7 +174,17 @@ impl ArenaRefcounts {
             arena_idx,
             key,
             capacity,
+            creation_pending: AtomicBool::new(true),
         }
+    }
+
+    /// Whether this arena is still inside its creation window (registered but
+    /// no gid allocated yet). `Acquire` pairs with the `Release` clear in
+    /// [`Self::occupy`]: a `false` here guarantees the first slot's live
+    /// increment is visible.
+    #[inline]
+    fn creation_pending(&self) -> bool {
+        self.creation_pending.load(Ordering::Acquire)
     }
 
     /// Unpack the recycle head into `(top_slot_idx, version)`; `top == arena_chunks`
@@ -215,6 +240,11 @@ impl ArenaRefcounts {
         self.set_occupied(i);
         self.live.fetch_add(1, Ordering::Relaxed);
         self.pool_total_live.fetch_add(1, Ordering::Relaxed);
+        // End the creation window AFTER the live increment (Release), so a
+        // tombstoner that Acquire-observes `creation_pending == false` also
+        // sees `live ≥ 1` — there is no interleaving where the arena looks
+        // both "past creation" and "empty" while its first chunk is in flight.
+        self.creation_pending.store(false, Ordering::Release);
     }
 
     /// Claim a free slot in O(1): pop the recycle stack, else bump the high-
@@ -790,10 +820,18 @@ impl ArenaPool {
         }
 
         let tables = self.tables.read().unwrap();
-        // Lowest-index fully-free, non-protected arena.
+        // Lowest-index fully-free, non-protected arena. `creation_pending` is
+        // checked FIRST: its Acquire load pairs with `occupy`'s Release clear,
+        // so an arena observed past its creation window is guaranteed to show
+        // its first allocation in `live_count` — a freshly-registered arena
+        // whose creator hasn't allocated yet can never be tombstoned (freeing
+        // it would unmap memory an in-flight kernel writes, and recycle its
+        // index to a second owner: cross-context KV contamination).
         let candidate = tables
             .iter()
-            .filter(|(idx, t)| t.live_count() == 0 && !protected_arenas.contains(idx))
+            .filter(|(idx, t)| {
+                !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
+            })
             .map(|(&idx, _)| idx)
             .min()?;
         drop(tables);

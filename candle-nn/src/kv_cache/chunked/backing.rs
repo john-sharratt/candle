@@ -1375,6 +1375,58 @@ impl BackingInner {
         )
     }
 
+    /// Validate a selection batch's gids against the CURRENT storage arenas
+    /// before any per-head table is uploaded and the selection kernel launched.
+    ///
+    /// The kernel addresses `row[gid / stride].base + (gid % stride) *
+    /// row.chunk_byte_stride` with no bounds knowledge, so two host-state
+    /// corruptions become silent OOB reads (or garbage-KV reads) on the GPU:
+    ///   - a gid whose arena is ABSENT from storage (freed while referenced;
+    ///     its table row is zeroed → near-null deref), and
+    ///   - a gid whose `chunk_idx` exceeds the arena's per-FORMAT capacity
+    ///     (`arena_chunks_for_format`): the arena index was re-tenanted with a
+    ///     different-capacity format between gid mint and table build, so
+    ///     `old_chunk_idx × new_stride` walks past the slab (the sanitizer-
+    ///     confirmed read at exactly slab end).
+    /// Failing here converts the corrupt launch into a named, recoverable
+    /// error carrying both sides of the mismatch.
+    pub fn validate_selection_gids(&self, gids: &[HeadGids], label: &str) -> Result<()> {
+        let stride = arena_gid_stride();
+        let n_kv_head = self.n_kv_head;
+        self.storage.read(|s| -> Result<()> {
+            for (ci, hg) in gids.iter().enumerate() {
+                for h in 0..n_kv_head {
+                    for (side, raw) in [("K", hg.k_gid(h).raw()), ("V", hg.v_gid(h).raw())] {
+                        if raw < 0 {
+                            continue; // sentinel / absent palette slot
+                        }
+                        let arena_idx = raw as usize / stride;
+                        let chunk_idx = raw as usize % stride;
+                        let Some(arena) = s.arena(arena_idx) else {
+                            candle::bail!(
+                                "selection gid validation ({label}): chunk {ci} head {h} \
+                                 {side}-gid {raw} → arena {arena_idx} ABSENT from storage \
+                                 (chunk_idx {chunk_idx}) — arena freed under a live gid"
+                            );
+                        };
+                        let cap = super::types::arena_chunks_for_format(arena.format());
+                        if chunk_idx >= cap {
+                            candle::bail!(
+                                "selection gid validation ({label}): chunk {ci} head {h} \
+                                 {side}-gid {raw} → arena {arena_idx} is {:?} (capacity \
+                                 {cap}) but chunk_idx is {chunk_idx} — pool/storage format \
+                                 mismatch: the gid was minted under a different-capacity \
+                                 format (arena index re-tenanted under a live gid)",
+                                arena.format()
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?
+    }
+
     /// Host-side build of the per-head arena table: the flat `i64` row data
     /// (`arena_idx * n_kv_head + head`, each `PerHeadEntry::COLS` wide) plus the
     /// arena count. Exposed so the cross-layer persist selection can concatenate
@@ -1421,16 +1473,20 @@ impl BackingInner {
         // that physically exists in this backing, which is the right
         // invariant: any gid valid against this backing has
         // `arena_idx ∈ [0, max_arena_idx]`.
-        let num_arenas = self
-            .storage
-            .read(|s| s.arenas().keys().max().copied().map(|m| m + 1).unwrap_or(0))?;
-
-        if num_arenas == 0 {
-            return Ok((Vec::new(), 0));
-        }
-
+        // Capture `num_arenas` AND the base pointers under ONE storage read —
+        // never two. A split read (bound under one lock, pointers under another)
+        // lets the scheduler free/relocate an arena between the two, so the dense
+        // table's rows no longer correspond to the arenas the caller's frozen gids
+        // address — the persist select/convert/copy kernel then dereferences a
+        // stale/zero base pointer → CUDA_ERROR_ILLEGAL_ADDRESS. The migrate-in-flight
+        // guard blocks arena free/relocate/trim for the whole build→launch→readback
+        // window; this single-lock capture is the belt-and-suspenders half.
         self.storage.read(|s| {
             let arenas = s.arenas();
+            let num_arenas = arenas.keys().max().copied().map(|m| m + 1).unwrap_or(0);
+            if num_arenas == 0 {
+                return Ok((Vec::new(), 0));
+            }
             let mut data: Vec<i64> = vec![0i64; num_arenas * n_kv_head * PerHeadEntry::COLS];
 
             for arena_idx in 0..num_arenas {

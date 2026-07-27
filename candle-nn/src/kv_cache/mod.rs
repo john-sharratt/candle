@@ -48,6 +48,7 @@ pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;
+pub use chunked::{enter_migrate, migrate_in_flight, MigrateGuard};
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::{

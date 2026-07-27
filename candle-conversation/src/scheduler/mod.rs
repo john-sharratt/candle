@@ -6737,6 +6737,14 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
+        // Defer while a hot→warm migrate is in flight: the quantize frees/swaps
+        // the section's float source arenas, and the migrate's dense per-head
+        // table addresses every arena — freeing one under it → the persist
+        // convert kernel reads a stale base pointer (illegal address, layer 2
+        // @42553ca3). Leave the sections pending; they drain next wave.
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(());
+        }
         let drained: Vec<PendingSectionQuantize> =
             self.pending_section_quantize.drain(..).collect();
         self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
@@ -6759,6 +6767,11 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
+        // See `quantize_pending_sections` — deferred during a hot→warm migrate
+        // so the member quantize doesn't free arenas the migrate's table reads.
+        if candle_nn::kv_cache::migrate_in_flight() {
+            return Ok(());
+        }
         let mut members: Vec<PendingSectionQuantize> = Vec::new();
         let mut keep: Vec<PendingSectionQuantize> = Vec::new();
         for p in self.pending_section_quantize.drain(..) {

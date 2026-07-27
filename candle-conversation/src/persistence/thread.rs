@@ -667,6 +667,12 @@ fn run_pass(
     let mut select_ms = 0u64;
     let mut alloc_ms = 0u64;
     let mut convert_ms = 0u64;
+    // Mark the migrate in flight: the scheduler defers arena free / defrag /
+    // release / trim while this is held, so the migrate's select/convert/copy
+    // kernels can't read an arena base pointer a concurrent free/`cuMemPoolTrimTo`
+    // has unmapped (crash layer 2 @42553ca3). Dropped right after the device sync
+    // below, before install — by then the kernels have retired.
+    let migrate_guard = candle_nn::kv_cache::enter_migrate();
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);
         migrate_group_hot_to_warm(
@@ -713,6 +719,10 @@ fn run_pass(
         installs.clear();
     }
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
+    // Migrate GPU work has retired (the sync above) — release the guard so the
+    // scheduler's VRAM relief resumes. The install below only drops old hot Arcs
+    // (its own arena frees), which no in-flight kernel is reading.
+    drop(migrate_guard);
     let t_install = std::time::Instant::now();
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;

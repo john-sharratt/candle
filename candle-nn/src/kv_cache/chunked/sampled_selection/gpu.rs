@@ -856,6 +856,9 @@ impl PagedSelectionGpuInputs {
         generation: Option<&Generation>,
         dev: &candle::CudaDevice,
     ) -> Result<Self> {
+        // Refuse to launch the selection kernel over gids that don't match the
+        // current storage arenas — a named host error beats a silent GPU OOB.
+        backing.validate_selection_gids(chunk_gids_keepalive, "single-layer")?;
         let per_head_table = backing.per_head_table_sync()?;
         let per_head_table_buf = {
             let (storage, layout) = per_head_table.storage_and_layout();
@@ -882,7 +885,15 @@ impl PagedSelectionGpuInputs {
                 })
             })
             .collect();
-        let head_gids_buf = stage_i64_slice(&head_gids, generation, dev)?;
+        // OWNED upload, never the pinned-stager arena: an arena-backed GpuBuf's
+        // bytes are valid only while the staging generation chain stays alive,
+        // and the selection kernel consumes this table asynchronously — a
+        // last-generation drop on ANOTHER thread syncs one stream and resets
+        // the arena, recycling these bytes under the in-flight kernel (the
+        // clobbered-gids OOB). The table is tiny; the owned CudaSlice is held
+        // by the GpuBuf and freed stream-ordered after the kernel — safe.
+        let _ = generation;
+        let head_gids_buf = stage_i64_slice(&head_gids, None, dev)?;
 
         Ok(Self {
             chunk_gids_keepalive,
@@ -932,10 +943,15 @@ impl PagedSelectionGpuInputs {
         let mut chunk_gids_keepalive: Vec<HeadGids> = Vec::new();
         let mut arena_offset: usize = 0; // running arena count, in arenas
 
-        for (backing, gids_layer) in backings.iter().zip(chunk_gids_per_layer) {
+        for (layer_idx, (backing, gids_layer)) in
+            backings.iter().zip(chunk_gids_per_layer).enumerate()
+        {
             if backing.n_kv_head != n_kv_head || backing.head_dim != head_dim {
                 candle::bail!("from_head_gids_multi: heterogeneous layer geometry");
             }
+            // Refuse to launch the fused selection over gids that don't match
+            // this layer's current storage arenas (see validate_selection_gids).
+            backing.validate_selection_gids(gids_layer, &format!("multi layer {layer_idx}"))?;
             let (table, num_arenas) = backing.per_head_table_host()?;
             // Append this layer's dense [0, num_arenas) arena rows; the offset
             // makes its local arena_idx land at global (arena_offset + idx).
@@ -976,7 +992,12 @@ impl PagedSelectionGpuInputs {
                 _ => candle::bail!("paged selection backing must be on CUDA"),
             }
         };
-        let head_gids_buf = stage_i64_slice(&unified_head_gids, generation, dev)?;
+        // OWNED upload — same staging-lifetime hazard as `from_head_gids`: the
+        // fused selection kernel reads this asynchronously, and an arena-backed
+        // staging buffer can be reset+recycled under it by a last-generation
+        // drop on another thread. See the comment there.
+        let _ = generation;
+        let head_gids_buf = stage_i64_slice(&unified_head_gids, None, dev)?;
 
         Ok((
             Self {
@@ -1011,7 +1032,9 @@ impl PagedSelectionGpuInputs {
         let head_gids =
             self.head_gids[start_chunk * gids_per_chunk..end_chunk * gids_per_chunk].to_vec();
         let chunk_gids_keepalive = self.chunk_gids_keepalive[start_chunk..end_chunk].to_vec();
-        let head_gids_buf = stage_i64_slice(&head_gids, generation, &self.dev)?;
+        // OWNED upload — same staging-lifetime hazard as `from_head_gids`.
+        let _ = generation;
+        let head_gids_buf = stage_i64_slice(&head_gids, None, &self.dev)?;
 
         Ok(Self {
             chunk_gids_keepalive,
