@@ -1763,7 +1763,7 @@ impl Scheduler {
     /// trailing-append advance would desync the offset the next prefill reads from
     /// the backing's actual length; the symptom is an OOB panic deep in a later
     /// prefill. Named here at the source (mirrors `fire_gap_fill_batch`).
-    fn assert_glue_no_advance(&self, ids: &[usize]) -> candle::Result<()> {
+    fn reconcile_glue_offsets(&mut self, ids: &[usize]) -> candle::Result<()> {
         for &id in ids {
             let session_off = self.session.sequence_offset(id).unwrap_or(0);
             let backing_len = self
@@ -1771,12 +1771,35 @@ impl Scheduler {
                 .sequence_caches(id)
                 .map(|c| c.current_seq_len())
                 .unwrap_or(session_off);
-            if backing_len != session_off {
-                return Err(candle::Error::Msg(format!(
-                    "wave glue desynced slot {id}: session offset {session_off} != backing \
-                     length {backing_len}. The glue forward advanced the slot instead of only \
-                     scattering into pre-reserved gaps."
-                )));
+            if backing_len > session_off {
+                // The co-batched glue scatter reserved gap chunk space (the backing
+                // grew) that the unified wave didn't reflect in the slot's logical
+                // offset. Left as-is, the NEXT prefill computes its write region from
+                // the stale, shorter offset and clobbers the already-occupied
+                // [offset, backing) span — an out-of-bounds write deep in the paged
+                // kernel that poisons the CUDA context (illegal address). Sync the
+                // offset up to the true backing length so later prefills append past
+                // the reserved region instead. (Previously this desync was a hard
+                // assert that aborted the whole wave — the crash root at 42553ca3.)
+                self.session
+                    .advance_sequence(id, backing_len - session_off)
+                    .map_err(|e| candle::Error::Msg(format!("reconcile_glue_offsets: {e}")))?;
+                tracing::debug!(
+                    slot = id,
+                    from = session_off,
+                    to = backing_len,
+                    "glue offset reconciled up to backing length"
+                );
+            } else if backing_len < session_off {
+                // Offset AHEAD of backing — a genuinely advanced slot, not a benign
+                // reservation lag. This shouldn't happen; surface it loudly but keep
+                // the daemon alive (a wave abort here poisons the context too).
+                tracing::error!(
+                    slot = id,
+                    offset = session_off,
+                    backing = backing_len,
+                    "glue slot offset AHEAD of backing — possible KV corruption"
+                );
             }
         }
         Ok(())
@@ -1907,7 +1930,7 @@ impl Scheduler {
                 None,
             )?;
             if has_glue {
-                self.assert_glue_no_advance(glue_seqs)?;
+                self.reconcile_glue_offsets(glue_seqs)?;
             }
             let logits = out.logits.unwrap_or_default();
             let d = n_dec.min(logits.len());
@@ -2057,7 +2080,7 @@ impl Scheduler {
             // glue]`. Decode first; creep members next (promote/seal); glue logits,
             // if present, trail and are discarded.
             if has_glue {
-                self.assert_glue_no_advance(glue_seqs)?;
+                self.reconcile_glue_offsets(glue_seqs)?;
             }
             let logits = seg2.logits.unwrap_or_default();
             let d = n_dec.min(logits.len());
@@ -2111,7 +2134,7 @@ impl Scheduler {
             seg3_in,
         )?;
         if has_glue {
-            self.assert_glue_no_advance(glue_seqs)?;
+            self.reconcile_glue_offsets(glue_seqs)?;
         }
         Ok(seg3.logits.unwrap_or_default())
     }

@@ -1075,12 +1075,24 @@ impl ChunkedKvBacking {
                 .map(|s| s.block_count())
                 .unwrap_or(0)
         };
-        self.ensure_max_blocks(current_block_count + 1)?;
+        // +2: the immutable gap chunk PLUS an empty writable chunk placed after it
+        // (see below).
+        self.ensure_max_blocks(current_block_count + 2)?;
         // Full-by-construction: valid window is the chunk tail `[offset, 32)` with
         // `offset + usage == CHUNK_SIZE`, so the gap is immutable to every
         // writer-region scan (see the doc above).
         let offset = (CHUNK_SIZE as u32 - n_tokens) as u16;
         let cw = self.alloc_block_chunks(n_tokens, offset)?;
+        // A fresh empty writer chunk to sit AFTER the gap. Without it the gap is
+        // `last_chunk()`, and a co-batched decode/prefill on this same slot in the
+        // unified wave validates its `last_chunk()` as the writable tail — the gap
+        // is full-by-construction (`offset+usage == CHUNK_SIZE`), so the write-slice
+        // check fails ("writable tail is already full/stale"), the wave forward
+        // aborts, and the paged kernel is left to read a stale slot → illegal
+        // address. Leaving an empty writable chunk past the gap keeps the decode's
+        // `last_chunk()` a real writer (matching the write path, which already
+        // targets `writer_start_idx`, not the gap). The crash root at 42553ca3.
+        let writer_cw = self.alloc_block_chunks(0, 0)?;
         let mut state = self
             .state
             .write()
@@ -1090,8 +1102,10 @@ impl ChunkedKvBacking {
             let gap_idx = slot.block_count().saturating_sub(1);
             // Advance the writer boundary PAST the gap so it is never the active
             // writer; the glue forward fills it by explicit target, and the next
-            // sealed inject appends after it.
+            // sealed inject appends after it. The empty writer chunk we push next
+            // is exactly at `gap_idx + 1`, so the boundary lands on a real tail.
             slot.set_writer_start_idx(gap_idx + 1);
+            slot.push_chunk(writer_cw);
             slot.invalidate_gpu_chunks();
             Ok((gap_idx, offset as u32))
         } else {
