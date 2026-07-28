@@ -704,9 +704,10 @@ fn quantize_sealed_in_place_impl(
     let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
     for chunk_i in 0..n_chunks {
         // Per (head, side): resolve the N_PALETTE band formats up front. A
-        // uniform group allocates one CONTIGUOUS run (the select/QREL kernels
-        // walk all bands from band 0's pointer — see `alloc_chunk_run_for_key`);
-        // mixed-format groups (never select-walked as a unit) allocate per band.
+        // uniform group allocates one CONTIGUOUS run for select/QREL walk
+        // locality (correctness is per-band via `resolve_band_source`, not the
+        // run layout — see `alloc_chunk_run_for_key`); mixed-format groups
+        // allocate per band.
         let mut k_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
         let mut v_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
         for h in 0..n_kv_head {

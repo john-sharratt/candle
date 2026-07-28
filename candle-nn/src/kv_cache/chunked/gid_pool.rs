@@ -289,12 +289,11 @@ impl ArenaRefcounts {
     }
 
     /// Claim `len` CONSECUTIVE slots, returning the first index. High-water
-    /// mark only — recycled singleton slots are never consecutive-by-contract,
-    /// and the run exists to satisfy the kernels' layout invariant that a
-    /// (chunk, head, side)'s N_PALETTE band slots are contiguous (the QREL and
-    /// fused-select kernels walk all bands from band 0's pointer; a scattered
-    /// run reads foreign bands and overruns the arena tail —
-    /// CUDA_ERROR_ILLEGAL_ADDRESS). Callers serialize via `alloc_gate`.
+    /// mark only — recycled singleton slots are never consecutive-by-contract.
+    /// Contiguous runs give the QREL / fused-select walk better spatial
+    /// locality; they are not required for correctness (each band is addressed
+    /// through its own gid — `resolve_band_source`). Callers serialize via
+    /// `alloc_gate`.
     fn try_claim_run(&self, len: usize) -> Option<usize> {
         let h = self.hwm.load(Ordering::Relaxed) as usize;
         if h + len <= self.arena_chunks {
@@ -1100,26 +1099,11 @@ impl ChunkGidPool {
     pub fn register_arena(&self, key: ArenaKey) -> usize {
         let arena_idx = {
             let mut state = self.inner.metadata.lock().unwrap();
-            let mut recycled = true;
             let arena_idx = state.free_arenas.pop_front().unwrap_or_else(|| {
-                recycled = false;
                 let idx = state.next_arena_idx;
                 state.next_arena_idx += 1;
                 idx
             });
-            // Index re-tenancy is the one topology change no pointer-validity
-            // check can see: a frozen table or stale gid that still names this
-            // index now resolves to the NEW tenant (existence and capacity
-            // checks pass) and reads the wrong arena's bytes. Log every
-            // recycle so a fault window can be correlated against it.
-            if recycled {
-                tracing::debug!(
-                    target: "candle_nn::kv_cache::gid_pool",
-                    arena_idx,
-                    ?key,
-                    "arena index recycled to new tenant"
-                );
-            }
             if arena_idx >= state.arena_registry.len() {
                 state.arena_registry.resize(arena_idx + 1, None);
             }

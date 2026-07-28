@@ -657,25 +657,6 @@ impl SequenceState {
     /// a stream sync per layer. A missing buffer is left for the next decode
     /// sync's full rebuild; a shape mismatch (defensive) falls back to full
     /// invalidation.
-    /// Diagnostic: byte-compare the cached device slot-state against a fresh
-    /// re-serialization of the current chunk windows (see
-    /// [`super::gpu_chunks::GpuChunksGuard::audit_against`]). `None` = clean.
-    pub(crate) fn audit_gpu_chunks(
-        &mut self,
-        n_kv_head: usize,
-        head_dim: usize,
-        arena_info: &[ResolvedArenaInfo],
-    ) -> Option<String> {
-        let SequenceState {
-            ref chunks,
-            ref mut gpu_chunks,
-            ..
-        } = *self;
-        gpu_chunks
-            .as_mut()
-            .audit_against(chunks, n_kv_head, head_dim, arena_info)
-    }
-
     pub(crate) fn refresh_decode_writer_slice(
         &mut self,
         n_kv_head: usize,

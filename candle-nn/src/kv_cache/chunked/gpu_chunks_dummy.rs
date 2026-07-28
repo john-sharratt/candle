@@ -72,17 +72,6 @@ impl GpuChunksGuard<'_> {
 
     pub(crate) fn clear(&mut self) {}
 
-    /// No device cache exists without CUDA — always consistent.
-    pub(crate) fn audit_against(
-        &self,
-        _chunks: &[ChunkWindow],
-        _n_kv_head: usize,
-        _head_dim: usize,
-        _arena_info: &[ResolvedArenaInfo],
-    ) -> Option<String> {
-        None
-    }
-
     pub(crate) fn rebuild_decode(
         &mut self,
         _chunks: &[ChunkWindow],

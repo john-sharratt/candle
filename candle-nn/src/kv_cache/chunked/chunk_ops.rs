@@ -1252,9 +1252,9 @@ impl ChunkedKvBacking {
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
             // Per (head, side): a uniform band group allocates one CONTIGUOUS
-            // run (the select/QREL kernels walk all N_PALETTE bands from band
-            // 0's pointer — see `alloc_chunk_run_for_key`); mixed groups
-            // allocate per band.
+            // run for select/QREL walk locality (see `alloc_chunk_run_for_key`;
+            // correctness is per-band via `resolve_band_source`, not the run
+            // layout); mixed groups allocate per band.
             for h in 0..n_kv_head {
                 let base = h * N_PALETTE;
                 let alloc_side = |fmts: &[crate::kv_cache::KvFormat]| -> Result<Vec<ChunkGid>> {
@@ -1414,10 +1414,10 @@ impl ChunkedKvBacking {
         use std::mem::MaybeUninit;
         let t_pool = std::time::Instant::now();
         let gids_per_spec = GIDS_PER_HEAD * n_kv_head;
-        // Uniform (head, side) band groups allocate as CONTIGUOUS runs (the
-        // select/QREL layout contract — see `alloc_chunk_run_for_key`); only
-        // mixed-format groups fall through to the batched singleton path
-        // below, whose recycle-stack pops scatter.
+        // Uniform (head, side) band groups allocate as CONTIGUOUS runs for
+        // select/QREL walk locality (correctness is per-band via
+        // `resolve_band_source` — see `alloc_chunk_run_for_key`); only
+        // mixed-format groups fall through to the batched singleton path below.
         let mut run_groups: Vec<(usize, usize, bool, ArenaKey)> = Vec::new();
         let mut positions_per_key: ahash::HashMap<ArenaKey, Vec<(usize, usize)>> =
             ahash::HashMap::with_capacity_and_hasher(8, ahash::RandomState::new());
@@ -2659,12 +2659,10 @@ impl ChunkedKvBacking {
         // ── Phase 3: allocate dest GPU GIDs (one state.write) ──────────
         // Palette-band runs first: for every (chunk, head, side) whose
         // N_PALETTE band gids are distinct and share one format, allocate the
-        // dest slots as one CONTIGUOUS run — the select/QREL kernels walk all
-        // bands from band 0's pointer, so a lifted turn with scattered dest
-        // bands reads foreign bands on its next quantize pass and overruns the
-        // arena tail (the bulk-ingest CUDA_ERROR_ILLEGAL_ADDRESS). Leftovers
-        // (shared or mixed-format band groups — never select-walked) fall back
-        // to singleton allocation.
+        // dest slots as one CONTIGUOUS run for select/QREL walk locality
+        // (correctness is per-band via `resolve_band_source`, not the run
+        // layout). Leftovers (shared or mixed-format band groups) fall back to
+        // singleton allocation.
         let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
             std::collections::HashMap::new();
         {

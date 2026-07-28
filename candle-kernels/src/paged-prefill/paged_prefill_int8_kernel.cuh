@@ -480,43 +480,8 @@ paged_prefill_int8_kernel(
         for (int tok = t0; tok < tok_end; ++tok) {
             int w_slice, w_in_blk;
             resolve_pos(slot_hdr, prefix_len + tok, w_slice, w_in_blk);
-            // Slot-state integrity guard for the write path (see the
-            // sealed-tile guard): a wild slice index or null record here
-            // would WRITE through a garbage pointer. Name the values and skip
-            // the token. Block-uniform values — no barrier divergence.
-            if (w_slice >= (int)slot_hdr.n_slices || w_in_blk >= 32) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD(W): pos %d of slot(b=%d,h=%d) -> slice %d/%u in_blk %d "
-                           "(prefix=%d q=%d)\n",
-                           prefix_len + tok, batch_idx, kv_head_idx, w_slice,
-                           slot_hdr.n_slices, w_in_blk, prefix_len, q_len);
-                }
-                continue;
-            }
             const uint8_t* w_sl = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, w_slice, n_kv_head);
-            const uint64_t w_rec = *reinterpret_cast<const uint64_t*>(w_sl + 8);
-            if (w_rec == 0) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD(W): null kvheads_ptr at pos %d slice %d of slot(b=%d,h=%d)\n",
-                           prefix_len + tok, w_slice, batch_idx, kv_head_idx);
-                }
-                continue;
-            }
             const uint8_t* w_head = get_head<HEAD_DIM>(w_sl, kv_head_idx);
-            bool w_bands_ok = true;
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                w_bands_ok = w_bands_ok && kvhead_k_ptr<HEAD_DIM>(w_head, p) != 0
-                                        && kvhead_v_ptr<HEAD_DIM>(w_head, p) != 0;
-            }
-            if (!w_bands_ok) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD(W): null band ptr in writer record at pos %d slice %d "
-                           "of slot(b=%d,h=%d)\n",
-                           prefix_len + tok, w_slice, batch_idx, kv_head_idx);
-                }
-                continue;
-            }
             const QT* k_row = k_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
             const QT* v_row = v_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
             const QT* q_row = q + ((int64_t)(q_start + tok) * n_head + first_q_head) * HEAD_DIM;
@@ -579,53 +544,8 @@ paged_prefill_int8_kernel(
         if (!fresh) {
             int sl_idx;
             resolve_pos(slot_hdr, cur, sl_idx, in_blk0);
-            // Slot-state integrity guard: a resolved position must land inside
-            // the slot's slice array with an in-chunk offset < 32, and the
-            // slice's record and band pointers must be non-null. A violation
-            // means the host staged inconsistent slot state — the known class
-            // is a member whose logical offset ran ahead of its physical
-            // backing (kv_len spans positions the block table doesn't cover),
-            // which sends this resolve past the slot's span in the packed
-            // uploads. Dereferencing would be a wild read with no attribution;
-            // name the values and skip the position instead. All values are
-            // block-uniform, so the branch cannot diverge the barriers.
-            if (sl_idx >= (int)slot_hdr.n_slices || in_blk0 >= 32) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD: pos %d of slot(b=%d,h=%d) -> slice %d/%u in_blk %d "
-                           "(prefix=%d q=%d kv=%d)\n",
-                           cur, batch_idx, kv_head_idx, sl_idx, slot_hdr.n_slices, in_blk0,
-                           prefix_len, q_len, kv_len);
-                }
-                cur += 1;
-                continue;
-            }
             const uint8_t* sl = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, sl_idx, n_kv_head);
-            const uint64_t rec_ptr = *reinterpret_cast<const uint64_t*>(sl + 8);
-            if (rec_ptr == 0) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD: null kvheads_ptr at pos %d slice %d of slot(b=%d,h=%d) "
-                           "(prefix=%d q=%d)\n",
-                           cur, sl_idx, batch_idx, kv_head_idx, prefix_len, q_len);
-                }
-                cur += 1;
-                continue;
-            }
             sl_head = get_head<HEAD_DIM>(sl, kv_head_idx);
-            bool bands_ok = true;
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                bands_ok = bands_ok && kvhead_k_ptr<HEAD_DIM>(sl_head, p) != 0
-                                    && kvhead_v_ptr<HEAD_DIM>(sl_head, p) != 0;
-            }
-            if (!bands_ok) {
-                if (tid == 0) {
-                    printf("PPI8 GUARD: null band ptr in record at pos %d slice %d of "
-                           "slot(b=%d,h=%d)\n",
-                           cur, sl_idx, batch_idx, kv_head_idx);
-                }
-                cur += 1;
-                continue;
-            }
             int sl_off = (int)slice_offset(sl);
             int sl_len = (int)slice_len(sl);
             int remaining = sl_off + sl_len - in_blk0;

@@ -1114,18 +1114,6 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Diagnostic: audit one slot's cached device slot-state against a fresh
-    /// re-serialization from the current block table + live arena registry.
-    /// Returns `None` when the cache is byte-consistent (or absent). A `Some`
-    /// report names each stale chunk with the cached-vs-fresh embedded value —
-    /// exactly what an in-flight kernel would read versus what it should read.
-    pub fn audit_gpu_chunks_report(&self, batch_idx: usize) -> Option<String> {
-        let arena_info = self.resolve_arena_info().ok()?;
-        let mut state = self.state.write().ok()?;
-        let seq = state.sequences.get_mut(batch_idx)?.as_mut()?;
-        seq.audit_gpu_chunks(self.inner.n_kv_head, self.inner.head_dim, &arena_info)
-    }
-
     /// Patch each sequence's cached decode slot-state WRITER slice after a
     /// mid-decode prefill wrote tokens into the writer chunk in place — see
     /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(1) per

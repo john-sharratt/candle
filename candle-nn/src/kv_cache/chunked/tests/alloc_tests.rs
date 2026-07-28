@@ -306,13 +306,12 @@ mod tests {
             let row = k_gid_snapshot(&backing)[4].clone();
 
             // Writer-block band slots come from CONTIGUOUS high-water runs, never
-            // the recycle stack: the select/QREL kernels walk a (chunk, head,
-            // side)'s N_PALETTE bands from band 0's pointer, so recycled
-            // (scattered) singleton slots would break the layout the kernels
-            // assume (foreign-band reads + arena-tail overrun). The freed slots
-            // from seqs 1 and 3 remain for singleton allocs; this new block's
-            // bands take the next fresh run at/above the prior high-water mark
-            // and stay consecutive.
+            // the recycle stack: the run allocator prefers a fresh high-water run
+            // (a locality optimization for the select/QREL walk — correctness is
+            // per-band, see `resolve_band_source`). The freed slots from seqs 1
+            // and 3 remain for singleton allocs; this new block's bands take the
+            // next fresh run at/above the prior high-water mark and stay
+            // consecutive.
             assert!(
                 row[0] >= 128,
                 "run-allocated K head-0 GID must come from the fresh high-water \

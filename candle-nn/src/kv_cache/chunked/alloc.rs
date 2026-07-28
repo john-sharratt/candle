@@ -699,8 +699,11 @@ impl ChunkedKvBacking {
         let v_key = self.active_v_arena_key();
         let mut gids = Vec::with_capacity(n);
         // Per head: one CONTIGUOUS run of N_PALETTE K slots and one of V slots
-        // (see `alloc_chunk_run_for_key` — the select/QREL kernels walk all
-        // bands from band 0's pointer, so the run layout is load-bearing).
+        // (see `alloc_chunk_run_for_key`). Correctness does NOT depend on the
+        // run layout — every kernel addresses each band through its own gid
+        // (`resolve_band_source`, and the per-palette KvHead record pointers) —
+        // but contiguous bands give the select/QREL walk better spatial
+        // locality, so we mint them as runs where a run is available.
         // HeadGids layout stays `head * GIDS_PER_HEAD + palette * 2 + is_value`.
         for _h in 0..self.inner.n_kv_head {
             let k_run = self
@@ -796,14 +799,13 @@ impl BackingInner {
             .expect("just registered arena, must have capacity"))
     }
 
-    /// Allocate `len` CONSECUTIVE slots in one arena of `key` — the layout
-    /// contract the paged select/QREL kernels rely on: a (chunk, head, side)'s
-    /// N_PALETTE band slots must be contiguous, because the kernels walk every
-    /// band from band 0's pointer. Singleton allocation only satisfies this
-    /// incidentally (fresh arenas fill sequentially); under free-list
-    /// recycling the bands scatter — foreign-band reads and an arena-tail
-    /// overrun (CUDA_ERROR_ILLEGAL_ADDRESS). Mirrors
-    /// [`Self::alloc_chunk_for_key`]'s register-on-exhaustion retry.
+    /// Allocate `len` CONSECUTIVE slots in one arena of `key`. Contiguity is a
+    /// LOCALITY optimization for the paged select/QREL walk, not a correctness
+    /// requirement — each band is addressed through its own gid
+    /// (`resolve_band_source`), so scattered bands read correctly, just with
+    /// worse spatial locality. Falls back to singleton allocation when no run
+    /// is available. Mirrors [`Self::alloc_chunk_for_key`]'s
+    /// register-on-exhaustion retry.
     pub(super) fn alloc_chunk_run_for_key(
         &self,
         key: super::arena::ArenaKey,

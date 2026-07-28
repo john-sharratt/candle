@@ -954,8 +954,7 @@ fn kernel_drop_cheap_format_blocks(
         let per_head_table_gpu = dev.memcpy_stod(&per_head_table).expect("phtab upload");
 
         const TEST_ARENA_CHUNKS: i64 = 8192;
-        let mut head_gids: Vec<i64> =
-            Vec::with_capacity(n_chunks * src_n_kv_head * N_PALETTE * 2);
+        let mut head_gids: Vec<i64> = Vec::with_capacity(n_chunks * src_n_kv_head * N_PALETTE * 2);
         for ci in 0..n_chunks {
             for _h in 0..src_n_kv_head {
                 for p in 0..N_PALETTE as i64 {
@@ -1594,9 +1593,9 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
         // size for 32-element blocks, so per-head byte offsets / strides are
         // identical between K and V.
         let single_head_bytes = (head_dim * 128) as i64; // head_dim blocks × 128 bytes/block
-        // The kernels address each palette band through its own gid with a
-        // per-band chunk stride; the monolithic per-head upload is presented
-        // as 4 contiguous band slots (gid chunk_idx = palette index).
+                                                         // The kernels address each palette band through its own gid with a
+                                                         // per-band chunk stride; the monolithic per-head upload is presented
+                                                         // as 4 contiguous band slots (gid chunk_idx = palette index).
         let band_chunk_stride = single_head_bytes / 4;
 
         // Layout note: the dump stores chunks token-major (`[head, token, dim]`),
