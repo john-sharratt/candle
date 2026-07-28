@@ -42,6 +42,7 @@ use crate::projection::{
 use crate::scheduler::profile;
 use crate::sequence_handle::SequenceId;
 use crate::summary_tree::SelectionOrigin;
+use crate::summary_tree::TurnKind;
 
 /// Per-slot state owned by the projection assembler.
 ///
@@ -295,7 +296,7 @@ pub(crate) fn assemble_pieces(
 pub(crate) fn materialize_conversation(
     segments: &[ProjectionSegment],
     markers: &BoundaryMarkers,
-    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    origins: &HashMap<TurnKey, SelectionOrigin>,
     resolver: &dyn ContentResolver,
     schema: &Schema,
     mut decode: impl FnMut(&[u32]) -> String,
@@ -329,25 +330,30 @@ pub(crate) fn materialize_conversation(
                 index,
                 role,
                 timeline,
-            } => Some(MaterializedPiece::Turn {
-                turn: SelectedTurn {
-                    layer: layer_name_of_group(schema, group).unwrap_or("").to_string(),
-                    group: group_name_of(schema, group)
-                        .unwrap_or("conversation")
-                        .to_string(),
-                    index: index.0,
-                    role: role_str(role).to_string(),
-                    tokens: resolver.turn_token_count(group, index) as u32,
-                    kind: resolver.turn_kind(group, index),
-                    reason: origins.get(&(group, index)).copied(),
-                    timeline: timeline.map(|tl| tl.raw()),
-                    // Materialized display spine — the turn is shown, and the
-                    // belief score isn't threaded here (the carry reads
-                    // `ProjectionSelection::turns`, not the materialized pieces).
-                    selected: true,
-                    score: 0.0,
-                },
-            }),
+            } => {
+                let key = timeline.map(|tl| TurnKey::new(tl, index));
+                Some(MaterializedPiece::Turn {
+                    turn: SelectedTurn {
+                        layer: layer_name_of_group(schema, group).unwrap_or("").to_string(),
+                        group: group_name_of(schema, group)
+                            .unwrap_or("conversation")
+                            .to_string(),
+                        index: index.0,
+                        role: role_str(role).to_string(),
+                        // A turn's identity is (timeline, index); the group alone is
+                        // ambiguous once a group holds many conversations.
+                        tokens: key.map_or(0, |k| resolver.turn_token_count(k)) as u32,
+                        kind: key.map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
+                        reason: key.and_then(|k| origins.get(&k)).copied(),
+                        timeline: timeline.map(|tl| tl.raw()),
+                        // Materialized display spine — the turn is shown, and the
+                        // belief score isn't threaded here (the carry reads
+                        // `ProjectionSelection::turns`, not the materialized pieces).
+                        selected: true,
+                        score: 0.0,
+                    },
+                })
+            }
             // The live user message is a separate prefill unit (not part of
             // `project()`'s segments), so it never reaches this spine — the panel
             // renders the in-flight turn from `um`/`dm`. The compression turn-half

@@ -260,7 +260,10 @@ impl std::fmt::Display for TurnIndex {
 /// otherwise be passed as an anonymous tuple: HashMap keys, iterator
 /// items, function returns, eviction candidate handles. Keeps call sites
 /// self-documenting and rules out the silent positional-swap bug.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+/// Ordered by `(timeline, index)`: turns group by conversation, ascending by
+/// index within each. For a single-timeline group that is exactly insertion
+/// order, which is what the selection rules rely on.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TurnKey {
     pub timeline: TimelineId,
     pub index: TurnIndex,

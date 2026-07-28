@@ -378,6 +378,7 @@ impl InferenceState {
         tokenizer_path: PathBuf,
         workspace: PathBuf,
         disabled_layers: HashSet<String>,
+        ingest_dirs: HashMap<String, String>,
         disable_summariser: bool,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
@@ -1138,7 +1139,8 @@ impl InferenceState {
         // (`workspace/<folder>`); folder/file walks are cached per folder so
         // co-located sinks pay for a single walk. A projection with no turn-sinks
         // (a pure conversational mind) does no filesystem reading here.
-        let ingest_layers = crate::ingest::ingest_layers(proj_builder_refresh.schema(), &workspace);
+        let ingest_layers =
+            crate::ingest::ingest_layers(proj_builder_refresh.schema(), &workspace, &ingest_dirs);
         progress.set_step(LoadStep::Ingesting);
         let mut ingest_convs: HashMap<String, IngestConv> = HashMap::new();
         let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
@@ -3403,6 +3405,7 @@ impl ZendSession {
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
         let disabled_layers = self.config.disabled_layers.clone();
+        let ingest_dirs = self.config.ingest_dirs.clone();
         let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
@@ -3475,6 +3478,7 @@ impl ZendSession {
                     tok_path,
                     workspace,
                     disabled_layers,
+                    ingest_dirs,
                     disable_summariser,
                     compact_substrate,
                     load_progress_for_blocking,
@@ -4075,6 +4079,7 @@ mod sanitize_tests {
 mod projection_schema_tests {
     use super::{build_projection_builder, fmt_selection, system_prompt_labels};
     use candle_conversation::projection::SelectionRule;
+    use std::collections::HashMap;
     use std::path::Path;
 
     /// `fmt_selection` renders every selection rule as the viewer's one-liner.
@@ -4130,7 +4135,11 @@ mod projection_schema_tests {
         let builder = build_projection_builder(Path::new("demo-project"));
         // "demo-project" doesn't exist on disk, so no folder-backed raw sinks
         // resolve — only the two built-in pipelines.
-        let layers = crate::ingest::ingest_layers(builder.schema(), Path::new("demo-project"));
+        let layers = crate::ingest::ingest_layers(
+            builder.schema(),
+            Path::new("demo-project"),
+            &HashMap::new(),
+        );
         let got: Vec<(&str, IngestMode, &str)> = layers
             .iter()
             .map(|l| (l.name.as_str(), l.mode, l.folder.as_str()))
@@ -4156,6 +4165,39 @@ mod projection_schema_tests {
         );
     }
 
+    /// `--ingest-dir <layer>=<path>` replaces a derived layer's content root, so
+    /// a rebuild can be scoped to a subtree instead of sweeping the workspace.
+    /// Layers without an override keep their derived root.
+    #[test]
+    fn ingest_dir_overrides_a_layers_content_root() {
+        use crate::ingest::IngestMode;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let mut dirs = HashMap::new();
+        dirs.insert("code_reading".to_string(), "zend/src".to_string());
+
+        let layers =
+            crate::ingest::ingest_layers(builder.schema(), Path::new("demo-project"), &dirs);
+        let code = layers
+            .iter()
+            .find(|l| l.name == "code_reading")
+            .expect("code_reading derives");
+        assert_eq!(code.folder, "zend/src", "content root is the override");
+        assert_eq!(code.mode, IngestMode::Files, "mode is unchanged");
+        assert!(
+            code.display.contains("zend/src"),
+            "the scoped root shows in the loading phase label: {:?}",
+            code.display
+        );
+
+        // An un-overridden layer keeps its derived root.
+        let repo = layers
+            .iter()
+            .find(|l| l.name == "repo_map")
+            .expect("repo_map derives");
+        assert_eq!(repo.folder, ".");
+        assert_eq!(repo.display, "Scanning repository");
+    }
+
     /// A coding-agent workspace with a folder matching a declared-but-pipeline-fed
     /// layer name (e.g. `bug_analysis/`) must NOT be ingested as a raw sink; only a
     /// mind (a workspace with its own `projection.yaml`) draws raw sinks from its
@@ -4170,7 +4212,7 @@ mod projection_schema_tests {
 
         // Not a mind (no projection.yaml): the built-in pipelines only; the
         // colliding `bug_analysis/` folder is never a raw sink.
-        let coding = crate::ingest::ingest_layers(builder.schema(), &ws);
+        let coding = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert_eq!(
             coding.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
             vec!["repo_map", "code_reading"],
@@ -4183,7 +4225,7 @@ mod projection_schema_tests {
 
         // Make it a mind: now the same folder IS drawn as a raw sink.
         std::fs::write(ws.join("projection.yaml"), "layers: []").unwrap();
-        let mind = crate::ingest::ingest_layers(builder.schema(), &ws);
+        let mind = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert!(
             mind.iter()
                 .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Raw),

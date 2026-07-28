@@ -16,6 +16,10 @@ mod common;
 use common::open_conversation;
 
 const SCAN_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
 layers:
   - name: mem
     window: 8000
@@ -31,17 +35,9 @@ layers:
     score_formula: max
     budget:
       priority: 40
-    system_prompt:
-      sections:
-        - id: frame
-          content: "frame"
     groups:
       - id: clusters
         selection: { kind: top_k, k: 2 }
-system_prompt:
-  sections:
-    - id: sys
-      content: "sys"
 "#;
 
 /// A folded `WideQSig`: 12 heads (3 layer-groups × 4 kv-heads), head_dim 128 →
@@ -205,6 +201,10 @@ fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
 }
 
 const TWO_LAYER_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
 layers:
   - name: mem
     window: 8000
@@ -220,10 +220,6 @@ layers:
     score_formula: max
     budget:
       priority: 40
-    system_prompt:
-      sections:
-        - id: frame
-          content: "frame"
     groups:
       - id: clusters
         selection: { kind: top_k, k: 2 }
@@ -241,17 +237,9 @@ layers:
     score_formula: max
     budget:
       priority: 100
-    system_prompt:
-      sections:
-        - id: frame2
-          content: "frame2"
     groups:
       - id: convo
         selection: { kind: conversation, recent: 4, historical_top_k: 8 }
-system_prompt:
-  sections:
-    - id: sys
-      content: "sys"
 "#;
 
 /// Regression: `score_beliefs` must score belief-driven turn groups in EVERY
@@ -319,6 +307,99 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
         cands.iter().any(|(gid, _)| *gid == clusters),
         "clusters candidates must be reported for the challenger",
     );
+}
+
+/// Regression: a belief-driven group holding MANY conversations
+/// (`code_reading` declares one timeline per file) must have EVERY conversation
+/// scored, not just the first-registered one. Before the fix, the scan resolved
+/// the group to a single timeline, so every file but the first sat at score 0 —
+/// structurally unreachable no matter how well it matched the query.
+#[test]
+fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
+    use candle_conversation::projection::{TimelineId, TurnIndex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(TWO_LAYER_YAML).unwrap();
+    let mem_layer = builder.id_for_layer("mem").unwrap();
+    let clusters = builder.id_for_group("clusters").unwrap();
+    let dialogue_layer = builder.id_for_layer("dialogue").unwrap();
+    let convo = builder.id_for_group("convo").unwrap();
+
+    // Two "files", each its own conversation under the `clusters` group. Both
+    // carry the same three signatures — crucially their turn indices COLLIDE
+    // (each file has turns 0/1/2), the ambiguity the (timeline, index) key
+    // resolves. Turn 1 (`0x5555…`) is the probe target in BOTH files.
+    let file_a = TimelineId::from_raw(201).unwrap();
+    let file_b = TimelineId::from_raw(202).unwrap();
+    conv.register_timeline(file_a, mem_layer, clusters);
+    conv.register_timeline(file_b, mem_layer, clusters);
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xFFFF_FFFF_FFFF_FFFFu64,
+    ];
+    for tl in [file_a, file_b] {
+        for fill in fills {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: 4,
+                        tags: vec!["repo_map".to_string()],
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(
+                turn_stream_id(tl.raw(), idx.0),
+                &encode_wide_sigs(&[sig(fill)]),
+            )
+            .expect("persist sigs");
+        }
+    }
+
+    // Target the DIALOGUE group, so `clusters` is a non-target group and its
+    // conversations aren't masked to a single timeline.
+    let dlg_tl = TimelineId::from_raw(299).unwrap();
+    conv.register_timeline(dlg_tl, dialogue_layer, convo);
+    let target = ProjectionTarget {
+        layer: dialogue_layer,
+        group: convo,
+        timeline: dlg_tl,
+    };
+    let probe = vec![sig(fills[1])];
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
+
+    // The probed turn (index 1) wins in EVERY file — including `file_b`, the
+    // second-registered one, which the old collapse never scored.
+    for (label, tl) in [("file_a", file_a), ("file_b", file_b)] {
+        let s0 = scores.turn(tl, TurnIndex(0));
+        let s1 = scores.turn(tl, TurnIndex(1));
+        let s2 = scores.turn(tl, TurnIndex(2));
+        assert!(
+            s1 > 0.0 && s1 > s0 && s1 > s2,
+            "{label}: probed turn 1 must be scored highest, not left at 0: \
+             s0={s0}, s1={s1}, s2={s2}",
+        );
+    }
+
+    // The challenger candidates carry turns from BOTH conversations, keyed by
+    // (timeline, index) so the colliding indices stay distinct.
+    let cluster_cands = cands
+        .iter()
+        .find(|(g, _)| *g == clusters)
+        .map(|(_, c)| c)
+        .expect("clusters group reported candidates");
+    assert_eq!(
+        cluster_cands.len(),
+        6,
+        "three turns from each of the two files",
+    );
+    assert!(cluster_cands.iter().any(|(k, _)| k.timeline == file_a));
+    assert!(cluster_cands.iter().any(|(k, _)| k.timeline == file_b));
 }
 
 #[test]

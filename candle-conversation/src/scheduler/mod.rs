@@ -2453,6 +2453,11 @@ pub(crate) struct Scheduler {
     /// decode + section + cohort). Skips the standalone `run_one_section_ingest_chunk`
     /// pass that wave (`docs/continuous_fair_waves.md` §4).
     wave_section_advanced: bool,
+    /// Set when a mid-wave admission drain (inside the time-sliced decode quantum)
+    /// observes a shutdown / channel-disconnect. The request is consumed there, so
+    /// the top-of-loop drain can't re-read it; the main loop breaks on this flag
+    /// before it would otherwise block on the idle recv.
+    shutdown_requested: bool,
 
     /// Cache of `SectionId` → symbolic `debug_name`, so the promote tracker's name
     /// lookup is O(1) after the first sighting (sections are stable).
@@ -2583,6 +2588,7 @@ impl Scheduler {
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
             wave_section_advanced: false,
+            shutdown_requested: false,
             section_name_cache: HashMap::new(),
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
@@ -8050,9 +8056,12 @@ impl Scheduler {
                     continue;
                 }
                 let (wcfg, _) = cfg.windowed(decode_pos);
+                // Key by the SAME `<timeline>:<index>` the belief carry uses — a
+                // group holds many conversations, so a bare index would seat the
+                // challenger under a key the carry never reads back.
                 let fresh: Vec<(String, f32)> = cands
                     .iter()
-                    .map(|(idx, score)| (idx.0.to_string(), *score))
+                    .map(|(key, score)| (crate::projection::turn_belief_key(*key), *score))
                     .collect();
                 prior_belief.seat_turn_boundary_challenger(
                     GroupKey::TurnGroup(group.name.clone()),

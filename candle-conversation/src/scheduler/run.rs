@@ -1,21 +1,22 @@
 use super::prefill::VramPhase;
 use super::*;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
-/// ABLATION (diagnostic, temporary): override via `ZEND_DECODE_BUDGET` to test
-/// whether the quantum length (steps between outer-loop request/seal/maintenance
-/// interleaves) is the stored-summary drift ingredient — `1` emulates the
-/// pre-CFW per-step cadence.
-fn decode_budget() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("ZEND_DECODE_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32)
-    })
-}
+/// Wall-clock ceiling for one decode quantum ("wave"). The quantum is CLIPPED to
+/// this whether or not decode has finished — unfinished sequences persist in
+/// `active_decodes` and resume in the next quantum, so clipping just passes the
+/// remaining work forward. Time-slicing (rather than the old fixed 32-step
+/// budget) guarantees the loop returns to the top every ~2 s to re-form the creep
+/// cohort with work admitted mid-wave, run admission + relief, and aggregate
+/// telemetry — regardless of how fast or slow the individual steps run.
+const WAVE_SLICE: Duration = Duration::from_millis(2000);
+
+/// Hard safety cap on decode steps within one quantum, independent of the wall
+/// clock. At the ~74 ms/step WDDM launch floor a 2 s slice is ~27 steps, far
+/// under this; the cap only engages if decode ever runs far faster (TCC mode /
+/// CUDA graphs), bounding per-quantum KV growth so the loop-top relief can't be
+/// outrun before the deadline check fires.
+const MAX_DECODE_STEPS: usize = 256;
 
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
@@ -48,11 +49,14 @@ impl Scheduler {
             .count()
     }
 
-    /// Run decode steps until the budget is reached or decode is empty.
+    /// Run decode steps until the `WAVE_SLICE` deadline or decode is empty.
     ///
-    /// We deliberately do **not** yield mid-quantum on width comparisons —
-    /// the outer dispatcher already chose this phase to run, and the budget
-    /// is what guarantees the other phase gets airtime.
+    /// The quantum is clipped by wall-clock, not step count — an unfinished
+    /// generation is passed forward via `active_decodes` to the next quantum. We
+    /// deliberately do **not** yield mid-quantum on width comparisons (the outer
+    /// dispatcher already chose this phase; the time slice is what guarantees the
+    /// other phases get airtime), but we DO admit newly-queued work mid-quantum via
+    /// `mid_wave_admission` so a long generation can't starve fresh conversations.
     fn run_decode_until_budget(&mut self) {
         // Phase-b VRAM relief: a sustained decode grows KV every step with no
         // admission gate of its own, so relieve once at the quantum boundary when
@@ -76,7 +80,9 @@ impl Scheduler {
         self.drain_pending_reprojections();
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
-        for _ in 0..decode_budget() {
+        let deadline = Instant::now() + WAVE_SLICE;
+        let mut steps = 0usize;
+        loop {
             if self.decode_width() == 0 {
                 // No live decode work, but there may be sequences inserted as
                 // finished during the prefill phase (EOS on first token) that
@@ -99,7 +105,72 @@ impl Scheduler {
             self.wave_stats
                 .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
             self.cleanup_finished();
+            steps += 1;
+
+            // Take on conversations that queued WHILE this wave was executing,
+            // under the same entry criteria the top-of-loop admission uses. The
+            // newly-projected prefills land in `active_prefills` now and join the
+            // creep cohort the moment this quantum clips to the top and
+            // `form_wave_group` re-forms — so admission latency is bounded by
+            // WAVE_SLICE, not by the whole in-flight generation finishing.
+            if !self.mid_wave_admission() {
+                self.shutdown_requested = true;
+                return;
+            }
+
+            // Clip to the time slice regardless of remaining decode work; the
+            // remaining sequences persist in `active_decodes` and resume next
+            // quantum. The step cap is only a backstop if steps ever run far
+            // under the WDDM floor (see `MAX_DECODE_STEPS`).
+            if Instant::now() >= deadline || steps >= MAX_DECODE_STEPS {
+                return;
+            }
         }
+    }
+
+    /// Admit work that arrived mid-wave and run the cheap per-wave KV relief, so a
+    /// time-sliced decode quantum adapts to newly-queued conversations and keeps KV
+    /// bounded across a long slice without waiting for the quantum to end. Mirrors
+    /// the top-of-loop admission (`drain` → `promote` → `pump`) under the identical
+    /// `admit_window`/VRAM cap, plus the per-wave ingest throttle + gentle demote.
+    ///
+    /// Returns `false` if the drain observed shutdown/disconnect: the request is
+    /// already consumed here (so the top-of-loop drain can't re-read it), so the
+    /// caller records the intent and the main loop breaks on it.
+    ///
+    /// Cheap on the common path: the rx peek skips the whole admission block when
+    /// nothing queued, and the ingest relief self-gates on `ingest_timelines`
+    /// (a no-op outside a workspace ingest).
+    fn mid_wave_admission(&mut self) -> bool {
+        if !self.rx.is_empty() {
+            // Flag the drain so the assembler attributes its sub-timers to the
+            // drain buckets and `apply_projection` DEFERS its gap-fills into the
+            // unified wave step (`take_wave_glue`), exactly as the loop-top drain.
+            let t_drain = Instant::now();
+            IN_DRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.batch_drain_gap_fills = true;
+            let cont = self.drain_submissions();
+            self.batch_drain_gap_fills = false;
+            IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.wave_stats
+                .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
+            if !cont {
+                return false;
+            }
+            let t_promote = Instant::now();
+            self.promote_new_prefills();
+            self.pump_scope_prefills();
+            self.wave_stats
+                .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
+        }
+        // Bound KV production to the hot→warm drain rate across the slice, not just
+        // once per quantum. Self-gated on an active ingest so a plain dialogue decode
+        // pays nothing (the loop-top call still handles the ingest-finished reopen).
+        if !self.ingest_timelines.is_empty() {
+            self.regulate_ingest_admission();
+            self.demote_cold_ingest_if_pressured();
+        }
+        true
     }
 
     /// Advance the continuous-fair-wave prefill cohort — ONLY via the co-batched
@@ -144,11 +215,11 @@ impl Scheduler {
 
     /// Main scheduler loop. Runs on the scheduler thread until shutdown.
     ///
-    /// Each iteration runs the unified wave step: decode (up to DECODE_BUDGET
-    /// steps) co-batches the creeping prefill/section cohort and deferred glue into
-    /// its sweep, and when no decode is active the same step advances the creep on
-    /// its own. The wider phase is dispatched first so freshly-arrived prefills
-    /// don't wait a whole decode budget when there's no decode work yet.
+    /// Each iteration runs the unified wave step: decode (clipped to `WAVE_SLICE`)
+    /// co-batches the creeping prefill/section cohort and deferred glue into its
+    /// sweep, and when no decode is active the same step advances the creep on its
+    /// own. The wider phase is dispatched first so freshly-arrived prefills don't
+    /// wait a whole decode slice when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
         // One-time snapshot of the governor's budget partition (capacity C, KV
@@ -159,6 +230,12 @@ impl Scheduler {
         }
 
         loop {
+            // A mid-wave admission drain inside the decode quantum can consume the
+            // shutdown request (so the top-of-loop drain below can't see it) — break
+            // on the recorded intent before blocking on the idle recv.
+            if self.shutdown_requested {
+                break;
+            }
             // 1. Drain pending submissions (non-blocking). This synchronously
             // handles SubmitTurn (projection + elevate + apply_segments gap-fill
             // + view create) on the scheduler thread — a prime suspect for the

@@ -227,6 +227,7 @@ pub use ids::{
     TurnIndex, TurnKey,
 };
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
+pub(crate) use project::turn_belief_key;
 pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,

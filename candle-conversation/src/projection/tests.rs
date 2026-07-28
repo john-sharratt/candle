@@ -32,10 +32,6 @@ struct MockResolver {
     section_tokens: HashMap<u32, usize>,
     default_score: f32,
     default_tokens: usize,
-    /// Conversation stamped onto every emitted turn (mirrors the real
-    /// target-aware resolver, which returns `target.timeline` for the target
-    /// group). `None` ⇒ the trait default (untracked).
-    timeline: Option<TimelineId>,
     /// Score-density picks returned verbatim by `summary_tree_select` —
     /// `(turn_index, origin, score)` in the chronological order the real §8
     /// selector produces (each summary node BEFORE the turns it covers).
@@ -90,11 +86,6 @@ impl MockResolver {
         self
     }
 
-    fn with_timeline(mut self, timeline: TimelineId) -> Self {
-        self.timeline = Some(timeline);
-        self
-    }
-
     /// Bind `tag` to `idx` in `group` so `turn_with_tag` resolves it — the
     /// substrate-side counterpart is a `TurnDecl.tags` scan.
     fn with_tag(mut self, group: GroupId, tag: &str, idx: TurnIndex) -> Self {
@@ -126,6 +117,19 @@ impl MockResolver {
         self
     }
 
+    /// The synthetic conversation holding `group`'s turns. Each group gets its
+    /// own timeline, mirroring the real model where a group is a shape and its
+    /// turns live in one or more conversations under it.
+    fn timeline_of(group: GroupId) -> TimelineId {
+        TimelineId::for_test(group.raw() as u64)
+    }
+
+    /// Inverse of [`Self::timeline_of`] — recovers the group a mock turn key
+    /// belongs to, so the `(group, index)`-keyed fixtures still resolve.
+    fn group_of(turn: TurnKey) -> u32 {
+        turn.timeline.raw() as u32
+    }
+
     /// Mark turn `summary` as a summary forest node that transitively covers
     /// `covered` (the turn indices beneath it). Used to exercise the rule-based
     /// descendant-dedup without a real substrate tree.
@@ -137,29 +141,26 @@ impl MockResolver {
 }
 
 impl ContentResolver for MockResolver {
-    fn turn_count(&self, group: GroupId) -> u32 {
-        self.turn_counts.get(&group.raw()).copied().unwrap_or(0)
+    fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
+        let tl = Self::timeline_of(group);
+        (0..self.turn_counts.get(&group.raw()).copied().unwrap_or(0))
+            .map(|i| TurnKey::new(tl, TurnIndex(i)))
+            .collect()
     }
 
-    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
+    fn turn_token_count(&self, turn: TurnKey) -> usize {
         *self
             .tokens
-            .get(&(group.raw(), index.0))
+            .get(&(Self::group_of(turn), turn.index.0))
             .unwrap_or(&self.default_tokens)
     }
 
-    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
+    fn turn_score(&self, turn: TurnKey) -> f32 {
         // Mock returns a single explicit belief score.
         *self
             .scores
-            .get(&(group.raw(), index.0))
+            .get(&(Self::group_of(turn), turn.index.0))
             .unwrap_or(&self.default_score)
-    }
-
-    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
-        // Mirror the real target-aware resolver: stamp the configured timeline
-        // onto every emitted turn.
-        self.timeline
     }
 
     fn section_score(&self, section: SectionId) -> f32 {
@@ -174,17 +175,17 @@ impl ContentResolver for MockResolver {
         *self.section_tokens.get(&section.raw()).unwrap_or(&0)
     }
 
-    fn turn_kind(&self, _group: GroupId, index: TurnIndex) -> TurnKind {
-        if self.summary_idx.contains(&index.0) {
+    fn turn_kind(&self, turn: TurnKey) -> TurnKind {
+        if self.summary_idx.contains(&turn.index.0) {
             TurnKind::SummaryOfSummaries
         } else {
             TurnKind::Normal
         }
     }
 
-    fn node_covers(&self, _group: GroupId, index: TurnIndex) -> Vec<TurnIndex> {
+    fn node_covers(&self, turn: TurnKey) -> Vec<TurnIndex> {
         self.covers
-            .get(&index.0)
+            .get(&turn.index.0)
             .map(|v| v.iter().copied().map(TurnIndex).collect())
             .unwrap_or_default()
     }
@@ -197,10 +198,10 @@ impl ContentResolver for MockResolver {
         self.tree_picks.clone()
     }
 
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
         self.tag_turns
             .get(&(group.raw(), tag.to_string()))
-            .map(|&raw| TurnIndex(raw))
+            .map(|&raw| TurnKey::new(Self::timeline_of(group), TurnIndex(raw)))
     }
 }
 
@@ -485,7 +486,7 @@ fn append_increments_correctly() {
     assert_eq!(i0.0, 0);
     assert_eq!(i1.0, 1);
     assert_eq!(i2.0, 2);
-    assert_eq!(resolver.turn_count(conv), 3);
+    assert_eq!(resolver.group_turns(conv).len(), 3);
 }
 
 #[test]
@@ -493,7 +494,7 @@ fn turn_count_zero_for_empty_group() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
     let facts = b.id_for_group("facts").unwrap();
     let resolver = MockResolver::new();
-    assert_eq!(resolver.turn_count(facts), 0);
+    assert_eq!(resolver.group_turns(facts).len(), 0);
 }
 
 // —— Projection: basic visibility ——————————————————————————————————————————————
@@ -566,8 +567,9 @@ fn projected_turn_carries_its_resolved_timeline() {
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let conv = b.id_for_group("conversation").unwrap();
 
-    let tl = TimelineId::for_test(42);
-    let mut resolver = MockResolver::new().with_timeline(tl);
+    // The mock gives each group its own conversation, mirroring the real model.
+    let tl = MockResolver::timeline_of(conv);
+    let mut resolver = MockResolver::new();
     resolver.append(conv);
     resolver.append(conv);
 
@@ -1181,7 +1183,7 @@ layers:
         (TurnIndex(6), SelectionOrigin::RecencyDecay, 0.5),
         (TurnIndex(9), SelectionOrigin::RecencyDecay, 0.5),
     ];
-    let resolver = resolver.with_timeline(tl).with_tree_picks(picks, &[7]);
+    let resolver = resolver.with_tree_picks(picks, &[7]);
 
     let proj = b.project(
         ProjectionTarget {
@@ -2520,7 +2522,7 @@ layers:
 
     let total_tokens: usize = proj
         .sealed_turns()
-        .map(|t| resolver.turn_token_count(t.group(), t.index()))
+        .map(|t| t.key().map_or(0, |k| resolver.turn_token_count(k)))
         .sum();
     assert!(
         total_tokens <= 4500,
@@ -2708,7 +2710,7 @@ layers:
     let capped_tokens: usize = proj
         .sealed_turns()
         .filter(|t| t.group() == capped)
-        .map(|t| resolver.turn_token_count(t.group(), t.index()))
+        .map(|t| t.key().map_or(0, |k| resolver.turn_token_count(k)))
         .sum();
 
     // max_percent: 20 of 9500 = 1900 tokens max for capped_grp.

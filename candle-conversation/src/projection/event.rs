@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{CollectionId, GroupId, SectionId, TurnIndex};
+use super::ids::{CollectionId, GroupId, SectionId, TurnIndex, TurnKey};
 use super::project::{ProjectionSegment, SealedKind};
 use super::schema::{Schema, SystemPromptItem};
 use crate::substrate::ContentResolver;
@@ -38,7 +38,7 @@ use crate::summary_tree::{SelectionOrigin, TurnKind};
 #[derive(Debug, Clone, Default)]
 pub struct SelectionScores {
     sections: HashMap<SectionId, f32>,
-    turns: HashMap<(GroupId, u32), f32>,
+    turns: HashMap<TurnKey, f32>,
 }
 
 impl SelectionScores {
@@ -47,9 +47,11 @@ impl SelectionScores {
         self.sections.get(&id).copied().unwrap_or(0.0)
     }
 
-    /// Belief score for a turn, or `0.0` if it carried none.
-    pub fn turn(&self, group: GroupId, index: TurnIndex) -> f32 {
-        self.turns.get(&(group, index.0)).copied().unwrap_or(0.0)
+    /// Belief score for a turn, or `0.0` if it carried none. Keyed by the
+    /// turn's full `(timeline, index)` identity — a group holds many
+    /// conversations, so a bare index would collide across them.
+    pub fn turn(&self, turn: TurnKey) -> f32 {
+        self.turns.get(&turn).copied().unwrap_or(0.0)
     }
 
     /// Record a section's belief score.
@@ -58,8 +60,8 @@ impl SelectionScores {
     }
 
     /// Record a turn's belief score.
-    pub fn set_turn(&mut self, group: GroupId, index: TurnIndex, score: f32) {
-        self.turns.insert((group, index.0), score);
+    pub fn set_turn(&mut self, turn: TurnKey, score: f32) {
+        self.turns.insert(turn, score);
     }
 }
 
@@ -478,7 +480,7 @@ pub fn from_projection(
 /// the no-origin wrapper above pass an empty map (every `reason` is then `None`).
 pub fn from_projection_with_origins(
     segments: &[ProjectionSegment],
-    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    origins: &HashMap<TurnKey, SelectionOrigin>,
     schema: &Schema,
     resolver: &dyn ContentResolver,
     scores: &SelectionScores,
@@ -504,7 +506,7 @@ pub fn from_projection_with_origins(
                 })
             }
             ProjectionSegment::Sealed(SealedKind::Turn(t, _role)) => {
-                let tokens = resolver.turn_token_count(t.group(), t.index()) as u32;
+                let tokens = t.key().map_or(0, |k| resolver.turn_token_count(k)) as u32;
                 let label = group_name_of(schema, t.group())
                     .unwrap_or("conversation")
                     .to_string();
@@ -538,7 +540,7 @@ pub fn from_projection_with_origins(
 /// conversation segments plus the current message.
 fn build_selection(
     segments: &[ProjectionSegment],
-    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    origins: &HashMap<TurnKey, SelectionOrigin>,
     schema: &Schema,
     resolver: &dyn ContentResolver,
     scores: &SelectionScores,
@@ -565,14 +567,14 @@ fn build_selection(
                         .to_string(),
                     index: t.index().0,
                     role: role_str(*role).to_string(),
-                    tokens: resolver.turn_token_count(t.group(), t.index()) as u32,
-                    kind: resolver.turn_kind(t.group(), t.index()),
-                    reason: origins.get(&(t.group(), t.index())).copied(),
+                    tokens: t.key().map_or(0, |k| resolver.turn_token_count(k)) as u32,
+                    kind: t.key().map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
+                    reason: t.key().and_then(|k| origins.get(&k)).copied(),
                     timeline: t.timeline.map(|tl| tl.raw()),
                     // A turn in the segments was selected; stamp its belief score
                     // so the next reprojection can seed its turn-group carry.
                     selected: true,
-                    score: scores.turn(t.group(), t.index()),
+                    score: t.key().map_or(0.0, |k| scores.turn(k)),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -840,7 +842,7 @@ pub(crate) fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> 
 #[cfg(test)]
 mod tests {
     use super::super::builder::Builder;
-    use super::super::ids::{GroupId, Reserved, SectionId, TurnId, TurnIndex};
+    use super::super::ids::{GroupId, Reserved, SectionId, TurnId, TurnIndex, TurnKey};
     use super::super::project::{
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
@@ -999,13 +1001,19 @@ layers:
     }
 
     impl ContentResolver for TokResolver {
-        fn turn_count(&self, _group: GroupId) -> u32 {
-            0
+        fn group_turns(&self, _group: GroupId) -> Vec<TurnKey> {
+            Vec::new()
         }
-        fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-            *self.turn_tokens.get(&(group.raw(), index.0)).unwrap_or(&0)
+        /// Fixtures are keyed by `(group, index)`; the emitted turns carry a
+        /// timeline whose raw id is the group id (see the mock in
+        /// `projection::tests`), so the lookup re-derives it.
+        fn turn_token_count(&self, turn: TurnKey) -> usize {
+            *self
+                .turn_tokens
+                .get(&(turn.timeline.raw() as u32, turn.index.0))
+                .unwrap_or(&0)
         }
-        fn turn_score(&self, _group: GroupId, _index: TurnIndex) -> f32 {
+        fn turn_score(&self, _turn: TurnKey) -> f32 {
             0.0
         }
         fn section_token_count(&self, section: SectionId) -> usize {
@@ -1038,7 +1046,9 @@ layers:
                         group_id: conv,
                         index: TurnIndex(idx),
                     },
-                    timeline: None,
+                    // A turn resolves by (timeline, index); the fixture keys its
+                    // token counts by the group id, so the conversation id matches.
+                    timeline: crate::projection::TimelineId::from_raw(conv.raw() as u64),
                 },
                 crate::Role::Assistant,
             ))
@@ -1237,7 +1247,9 @@ layers:
                         group_id: conv,
                         index: TurnIndex(0),
                     },
-                    timeline: None,
+                    // Turns resolve by (timeline, index); the fixture keys its
+                    // token counts by the group id, so the ids line up.
+                    timeline: crate::projection::TimelineId::from_raw(conv.raw() as u64),
                 },
                 crate::Role::User,
             )),

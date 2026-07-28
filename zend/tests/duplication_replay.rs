@@ -75,8 +75,12 @@ mod replay {
         let config = DaemonConfig {
             workspace,
             port: 0,
-            skip_code_read: true,
-            skip_repo_scan: true,
+            // Bring the daemon up without the workspace ingest sweep — this test
+            // exercises decode replay, not retrieval.
+            disabled_layers: ["repo_map", "code_reading"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ..Default::default()
         };
         // NOTE: caller must invoke `session.start_loading()` from WITHIN the Tokio
