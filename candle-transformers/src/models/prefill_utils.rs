@@ -23,6 +23,8 @@ use {
 use crate::models::prefill_capture::maybe_capture;
 #[cfg(feature = "cuda")]
 use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::HeadGids;
 
 /// Uploaded per-slot `SlotHeader[b]` payloads for a chunked attention launch.
 ///
@@ -38,6 +40,18 @@ struct SlotHeaderUpload {
     /// duration of the kernel launch. The position_map upload is layer-invariant
     /// and held separately in the per-forward [`SharedPm`] cache.
     _guards: (GpuBuf, GpuBuf, GpuBuf),
+    /// Pins every chunk the uploaded slot headers address: an uploaded page
+    /// table is a REFERENCE, so it must hold the referenced gids alive. One
+    /// `HeadGids` Arc clone per live chunk — while held, a concurrent
+    /// quantize-swap (`quantize_sealed_in_place` on the persistence thread
+    /// rewriting the slot's shared sealed-prefix chunks mid-wave) cannot drop
+    /// the last gid, so the float source arena can never hit `live == 0` and
+    /// be released/re-tenanted under the in-flight paged-prefill kernel. The
+    /// multi-wave CFW creep opened a seconds-wide window for exactly that
+    /// (pre-CFW prefills finished within one forward, so the window was ~ms).
+    /// Dropped with this struct after the forward's logits readback — i.e.
+    /// after the kernels have retired.
+    _pinned_gids: Vec<HeadGids>,
 }
 
 /// Per-forward cache of the layer-invariant uploaded `position_map`.
@@ -99,6 +113,9 @@ fn build_slot_headers(
     // arena_byte_size walks measured ~0.5 ms per layer-call at deep
     // prefixes, ~30x the slice build itself).
     let mut slots: Vec<SlotStateHost> = Vec::with_capacity(caches.len());
+    // Reference pin: every chunk the headers will address (see
+    // `SlotHeaderUpload::_pinned_gids`).
+    let mut pinned_gids: Vec<HeadGids> = Vec::new();
     for cache in caches.iter() {
         let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
         let mut slices: Vec<TokenSliceHost> = Vec::new();
@@ -107,6 +124,7 @@ fn build_slot_headers(
             for c in it {
                 let rope_base = cum;
                 cum = cum.saturating_add(c.token_count as u32);
+                pinned_gids.push(c.gids.clone());
                 slices.push(TokenSliceHost::from_live_chunk(
                     &c,
                     rope_base,
@@ -278,6 +296,7 @@ fn build_slot_headers(
     Ok(SlotHeaderUpload {
         headers_ptr,
         _guards: (headers_gpu, slices_gpu, records_gpu),
+        _pinned_gids: pinned_gids,
     })
 }
 

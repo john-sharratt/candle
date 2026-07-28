@@ -3037,8 +3037,20 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         // class, so the caller's `[decode | prefill]` output order is restored by a
         // stable inverse permutation at the end. `single` empty ⇒ no-op fast path.
         let pre_lens_in = input_len(prefill_inputs);
-        let single: Vec<usize> = (0..n_prefill_in).filter(|&i| pre_lens_in[i] == 1).collect();
-        let multi: Vec<usize> = (0..n_prefill_in).filter(|&i| pre_lens_in[i] != 1).collect();
+        // ABLATION (diagnostic, temporary): keep single-token prefills in the
+        // prefill group instead of promoting them into the decode group — tests
+        // whether the promotion's caller↔internal reindexing writes KV into
+        // the wrong slot under the unified wave (in-bounds cross-slot writes:
+        // silent contamination + downstream illegal address).
+        let promote_singles = std::env::var("ZEND_ABLATE_SINGLE_PROMOTE").is_err();
+        let single: Vec<usize> = if promote_singles {
+            (0..n_prefill_in).filter(|&i| pre_lens_in[i] == 1).collect()
+        } else {
+            Vec::new()
+        };
+        let multi: Vec<usize> = (0..n_prefill_in)
+            .filter(|&i| !single.contains(&i))
+            .collect();
 
         let mut proc_decode_seqs: Vec<usize> = decode_seqs.to_vec();
         let mut proc_decode_inputs: Vec<Tensor> = decode_inputs.to_vec();

@@ -1139,6 +1139,12 @@ impl Scheduler {
     /// compression of *everything* pending (a 697-turn / 23 GiB / 66 s stall was
     /// the symptom). The background persistence thread drains the rest.
     fn compress_pending_turns(&mut self, budget_bytes: u64) -> usize {
+        // ABLATION (diagnostic, temporary): skip the turn compress-to-free rung
+        // to test whether freshly-quantized turn pages are a necessary
+        // ingredient of the decode-onset illegal address.
+        if std::env::var("ZEND_ABLATE_SECTION_QUANT").is_ok() {
+            return 0;
+        }
         // Need an engine-wide turn policy to compress against; without one turns
         // stay native float (lossless capture) and there is nothing to bring
         // forward.
