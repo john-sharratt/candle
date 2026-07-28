@@ -663,7 +663,19 @@ mod tests {
             _ => unreachable!(),
         };
         CudaResources {
-            copy_stream: cuda_dev.cuda_context().new_stream().unwrap(),
+            // The PRIMARY stream, not a dedicated side stream. The lift's
+            // work — staging allocations, HtoD fills, dst-arena scatters —
+            // interleaves with primary-stream producers (arena allocations
+            // from the async pool are valid in primary-stream order; the
+            // quantize/convert fill sources there too). A private stream
+            // consumes them with no recorded dependency, so under load it
+            // races ahead of the primary queue and dereferences memory whose
+            // allocation/fill has not yet retired — the bulk-ingest
+            // decode-onset CUDA_ERROR_ILLEGAL_ADDRESS. On one stream every
+            // step sees its producers by FIFO order. A dedicated DMA stream
+            // needs event fences at every producer/consumer edge before it
+            // can come back.
+            copy_stream: cuda_dev.cuda_stream(),
             pinned: None,
             stager: ColdLoadStager::new(),
         }

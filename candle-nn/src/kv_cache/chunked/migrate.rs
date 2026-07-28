@@ -125,6 +125,23 @@ pub fn kv_migrate_on(
 
     let default_stream = dev.cuda_stream();
     let used_stream = stream.unwrap_or(&default_stream);
+    // Cross-stream ordering fence. The three plan uploads above — and the
+    // record sources themselves when they are freshly written (e.g. Q arenas
+    // filled by the primary-stream convert moments earlier) — are allocated
+    // and copied in PRIMARY-stream order (`memcpy_stod` + the async pool's
+    // stream-ordered validity). When the caller passes a dedicated copy
+    // stream, the kernel below consumes them on THAT stream with no recorded
+    // dependency: under load the primary stream queues seconds deep, so the
+    // copy stream reaches the plan/source bytes long before their allocation
+    // and fill retire — CUDA_ERROR_ILLEGAL_ADDRESS inside
+    // `run_kv_migrate_copy` (the bulk-ingest decode-onset crash). Drain the
+    // device once before the cross-stream launch; the default-stream path
+    // needs no fence (same-stream FIFO).
+    if stream.is_some() {
+        device
+            .synchronize()
+            .map_err(|e| candle::Error::Msg(format!("kv_migrate: pre-launch fence: {e}")))?;
+    }
     let (sp, _sg) = src_gpu.device_ptr(used_stream);
     let (dp, _dg) = dst_gpu.device_ptr(used_stream);
     let (lp, _lg) = len_gpu.device_ptr(used_stream);
