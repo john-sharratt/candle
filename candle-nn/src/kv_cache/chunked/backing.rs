@@ -281,6 +281,15 @@ impl BackingInner {
         for key in keys {
             while let Some(arena_idx) = self.pool.next_tombstone(key.clone()) {
                 self.storage.release_arena(arena_idx)?;
+                // Paired with the recycle log in `ChunkGidPool::register_arena`:
+                // a fault correlated between a free here and a re-registration
+                // of the same index is the index-re-tenancy signature.
+                tracing::debug!(
+                    target: "candle_nn::kv_cache::gid_pool",
+                    arena_idx,
+                    ?key,
+                    "arena index freed (empty sweep)"
+                );
                 freed += 1;
             }
         }
