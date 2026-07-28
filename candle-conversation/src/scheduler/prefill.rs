@@ -1659,7 +1659,23 @@ impl Scheduler {
                             tokens_total: total,
                         });
                     if let Some(l) = member_logits.get(k) {
-                        self.active_prefills[i].final_logits = Some(l.clone());
+                        // DEEP-copy the final-logits row at capture. `Tensor::clone`
+                        // is shallow (shared storage), and this tensor is HELD until
+                        // the once-per-wave `promote_finished_prefills_to_decodes`
+                        // samples the turn's FIRST token from it — up to a whole
+                        // decode quantum later. The wave's forward path reuses its
+                        // output buffers, so by promotion time the shared storage
+                        // holds a LATER step's logits for some other slot: the first
+                        // token gets sampled from a foreign distribution, and a
+                        // greedy summary anchors on it and coherently continues in
+                        // whatever language that row suggests (the stored CJK drift,
+                        // 0.007%→0.135% at 42553ca3, amplified later by longer
+                        // quanta). A real copy makes the captured row immutable —
+                        // one ~vocab-sized row per completed prefill, negligible.
+                        let owned = l
+                            .copy()
+                            .unwrap_or_else(|_| l.clone());
+                        self.active_prefills[i].final_logits = Some(owned);
                     }
                 }
                 WaveMember::Section { seq_id: sid, advance } => {
