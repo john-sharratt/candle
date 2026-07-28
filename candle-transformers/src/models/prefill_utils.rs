@@ -908,10 +908,11 @@ pub fn paged_glue_attn(
     _n_kv_head: usize,
     _head_dim: usize,
     _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
-    _col_actual_pos: &Tensor,
+    _glue_write_slice: &Tensor,
+    _glue_write_in_blk: &Tensor,
+    _fwd_ahead: &Tensor,
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
-    _fwd_window: usize,
     _generation: &Generation,
 ) -> Result<Tensor> {
     candle::bail!("paged-glue requires the cuda feature")
