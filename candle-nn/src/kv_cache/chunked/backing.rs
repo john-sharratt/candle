@@ -23,7 +23,7 @@ use super::{
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaLocation, PerHeadEntry};
-use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo};
+use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo, N_PALETTE};
 use crate::{arena_gid_stride, CHUNK_SIZE};
 
 /// Default fraction of reclaimable arenas that triggers pack-down.
@@ -351,21 +351,12 @@ impl BackingInner {
         fragmentation_threshold: f32,
         max_moves: usize,
     ) -> Result<usize> {
-        // Single-slot relocation is DISABLED for GPU arenas: the select/QREL
-        // kernels walk a (chunk, head, side)'s N_PALETTE band slots from band
-        // 0's pointer, so every allocation path mints them as CONTIGUOUS runs
-        // (`alloc_chunk_run_for_key`) — and a defrag pass that moves slots
-        // one at a time scatters those runs again, re-arming the foreign-band
-        // reads and arena-tail overruns (CUDA_ERROR_ILLEGAL_ADDRESS) the run
-        // allocator exists to prevent. VRAM reclaim still happens through the
-        // empty-arena sweep + pool trim (which move nothing). Relocation can
-        // return once it moves band GROUPS as units, or once the kernels
-        // address each band through its own gid.
-        let _ = (fragmentation_threshold, max_moves);
-        if true {
-            return Ok(0);
-        }
-        #[allow(unreachable_code)]
+        // Single-slot relocation is safe: every kernel addresses each palette
+        // band through that band's own gid (see `resolve_band_source` in
+        // select_kv_format.cuh and the KvHead per-palette record pointers), so
+        // scattering a (chunk, head, side)'s band slots across arenas never
+        // changes what a kernel reads. The run allocator still mints bands as
+        // contiguous runs for locality, but nothing depends on it.
         if !self.pool.needs_defragmentation(fragmentation_threshold) {
             return Ok(0);
         }
@@ -1453,29 +1444,36 @@ impl BackingInner {
         self.storage.read(|s| -> Result<()> {
             for (ci, hg) in gids.iter().enumerate() {
                 for h in 0..n_kv_head {
-                    for (side, raw) in [("K", hg.k_gid(h).raw()), ("V", hg.v_gid(h).raw())] {
-                        if raw < 0 {
-                            continue; // sentinel / absent palette slot
-                        }
-                        let arena_idx = raw as usize / stride;
-                        let chunk_idx = raw as usize % stride;
-                        let Some(arena) = s.arena(arena_idx) else {
-                            candle::bail!(
-                                "selection gid validation ({label}): chunk {ci} head {h} \
-                                 {side}-gid {raw} → arena {arena_idx} ABSENT from storage \
-                                 (chunk_idx {chunk_idx}) — arena freed under a live gid"
-                            );
-                        };
-                        let cap = super::types::arena_chunks_for_format(arena.format());
-                        if chunk_idx >= cap {
-                            candle::bail!(
-                                "selection gid validation ({label}): chunk {ci} head {h} \
-                                 {side}-gid {raw} → arena {arena_idx} is {:?} (capacity \
-                                 {cap}) but chunk_idx is {chunk_idx} — pool/storage format \
-                                 mismatch: the gid was minted under a different-capacity \
-                                 format (arena index re-tenanted under a live gid)",
-                                arena.format()
-                            );
+                    for p in 0..N_PALETTE {
+                        for (side, raw) in [
+                            ("K", hg.k_gid_pal(h, p).raw()),
+                            ("V", hg.v_gid_pal(h, p).raw()),
+                        ] {
+                            if raw < 0 {
+                                continue; // sentinel / absent palette slot
+                            }
+                            let arena_idx = raw as usize / stride;
+                            let chunk_idx = raw as usize % stride;
+                            let Some(arena) = s.arena(arena_idx) else {
+                                candle::bail!(
+                                    "selection gid validation ({label}): chunk {ci} head {h} \
+                                     palette {p} {side}-gid {raw} → arena {arena_idx} ABSENT \
+                                     from storage (chunk_idx {chunk_idx}) — arena freed under \
+                                     a live gid"
+                                );
+                            };
+                            let cap = super::types::arena_chunks_for_format(arena.format());
+                            if chunk_idx >= cap {
+                                candle::bail!(
+                                    "selection gid validation ({label}): chunk {ci} head {h} \
+                                     palette {p} {side}-gid {raw} → arena {arena_idx} is {:?} \
+                                     (capacity {cap}) but chunk_idx is {chunk_idx} — \
+                                     pool/storage format mismatch: the gid was minted under a \
+                                     different-capacity format (arena index re-tenanted under \
+                                     a live gid)",
+                                    arena.format()
+                                );
+                            }
                         }
                     }
                 }

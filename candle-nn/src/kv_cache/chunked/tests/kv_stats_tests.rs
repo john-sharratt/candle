@@ -822,7 +822,10 @@ fn kernel_drop_cheap_format_blocks(
     const N_PALETTE: usize = 4;
     let blocks_per_head = head_dim;
     let single_head_bytes = (blocks_per_head * 128) as i64;
-    let single_head_chunk_stride = single_head_bytes;
+    // The kernels address each palette band through its own gid with a
+    // per-band chunk stride; the monolithic per-head upload is presented as
+    // N_PALETTE contiguous band slots (gid chunk_idx = palette index).
+    let band_chunk_stride = single_head_bytes / N_PALETTE as i64;
 
     fn dim_major_block(
         chunk: &[f32],
@@ -939,8 +942,8 @@ fn kernel_drop_cheap_format_blocks(
                     vp as i64,
                     head_off,
                     head_off,
-                    single_head_chunk_stride,
-                    single_head_chunk_stride,
+                    band_chunk_stride,
+                    band_chunk_stride,
                     metadata_kr16_vf32,
                     outer_one_bits,
                     outer_one_bits,
@@ -951,11 +954,14 @@ fn kernel_drop_cheap_format_blocks(
         let per_head_table_gpu = dev.memcpy_stod(&per_head_table).expect("phtab upload");
 
         const TEST_ARENA_CHUNKS: i64 = 8192;
-        let mut head_gids: Vec<i64> = Vec::with_capacity(n_chunks * src_n_kv_head * 2);
+        let mut head_gids: Vec<i64> =
+            Vec::with_capacity(n_chunks * src_n_kv_head * N_PALETTE * 2);
         for ci in 0..n_chunks {
             for _h in 0..src_n_kv_head {
-                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // K
-                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // V
+                for p in 0..N_PALETTE as i64 {
+                    head_gids.push(ci as i64 * TEST_ARENA_CHUNKS + p); // K band p
+                    head_gids.push(ci as i64 * TEST_ARENA_CHUNKS + p); // V band p
+                }
             }
         }
 
@@ -1588,7 +1594,10 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
         // size for 32-element blocks, so per-head byte offsets / strides are
         // identical between K and V.
         let single_head_bytes = (head_dim * 128) as i64; // head_dim blocks × 128 bytes/block
-        let single_head_chunk_stride = single_head_bytes; // one chunk per arena → stride irrelevant
+        // The kernels address each palette band through its own gid with a
+        // per-band chunk stride; the monolithic per-head upload is presented
+        // as 4 contiguous band slots (gid chunk_idx = palette index).
+        let band_chunk_stride = single_head_bytes / 4;
 
         // Layout note: the dump stores chunks token-major (`[head, token, dim]`),
         // but the selection kernel sees each block as 32 tokens of one channel
@@ -1734,8 +1743,8 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
                     vp as i64,
                     head_off,
                     head_off,
-                    single_head_chunk_stride,
-                    single_head_chunk_stride,
+                    band_chunk_stride,
+                    band_chunk_stride,
                     metadata_kr16_vf32,
                     outer_one_bits,
                     outer_one_bits,
@@ -1748,14 +1757,16 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             .memcpy_stod(&per_head_table_host)
             .expect("per_head upload");
 
-        // head_gids: 2 entries per (chunk, head): K_GID, V_GID. We use
-        // arena_idx = chunk_idx, chunk_idx = 0, ARENA_CHUNKS = 8192.
+        // head_gids: 8 entries per (chunk, head) — K/V per palette band. We use
+        // arena_idx = chunk_idx, chunk_idx = palette, ARENA_CHUNKS = 8192.
         const TEST_ARENA_CHUNKS: i64 = 8192;
-        let mut head_gids: Vec<i64> = Vec::with_capacity(chunks.len() * n_kv_head * 2);
+        let mut head_gids: Vec<i64> = Vec::with_capacity(chunks.len() * n_kv_head * 8);
         for ci in 0..chunks.len() {
             for _h in 0..n_kv_head {
-                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // K
-                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // V
+                for p in 0..4i64 {
+                    head_gids.push(ci as i64 * TEST_ARENA_CHUNKS + p); // K band p
+                    head_gids.push(ci as i64 * TEST_ARENA_CHUNKS + p); // V band p
+                }
             }
         }
 

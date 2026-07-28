@@ -3,6 +3,7 @@ use super::profile::sampled_profile_record_duration;
 use super::CompressionSummary;
 use super::{ErrorSurface, SampleFormat, SampleSide, SampledSelectionBenchmarkResult};
 use crate::kv_cache::chunked::backing::BackingInner;
+use crate::kv_cache::chunked::head_gids::GIDS_PER_HEAD;
 use crate::kv_cache::QuantFormat;
 use crate::kv_cache::{arena_gid_stride, ChunkedKvBacking, HeadGids, KvFormat, N_PALETTE};
 use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr};
@@ -877,11 +878,20 @@ impl PagedSelectionGpuInputs {
         let n_kv_head = backing.n_kv_head;
         let blocks_per_chunk = n_kv_head * backing.head_dim;
         let chunk_gids_keepalive = chunk_gids_keepalive.to_vec();
+        // Stage every palette band's gid (HeadGids natural order:
+        // head * GIDS_PER_HEAD + palette * 2 + is_v) — the selection kernels
+        // address each band through its own gid, never by extrapolating from
+        // band 0.
         let head_gids: Vec<i64> = chunk_gids_keepalive
             .iter()
             .flat_map(|gids| {
                 (0..n_kv_head).flat_map(move |head_idx| {
-                    [gids.k_gid(head_idx).raw(), gids.v_gid(head_idx).raw()]
+                    (0..N_PALETTE).flat_map(move |p| {
+                        [
+                            gids.k_gid_pal(head_idx, p).raw(),
+                            gids.v_gid_pal(head_idx, p).raw(),
+                        ]
+                    })
                 })
             })
             .collect();
@@ -959,8 +969,10 @@ impl PagedSelectionGpuInputs {
             let gid_off = arena_offset as i64 * arena_chunks;
             for gids in gids_layer.iter() {
                 for h in 0..n_kv_head {
-                    unified_head_gids.push(gids.k_gid(h).raw() + gid_off);
-                    unified_head_gids.push(gids.v_gid(h).raw() + gid_off);
+                    for p in 0..N_PALETTE {
+                        unified_head_gids.push(gids.k_gid_pal(h, p).raw() + gid_off);
+                        unified_head_gids.push(gids.v_gid_pal(h, p).raw() + gid_off);
+                    }
                 }
             }
             chunk_counts.push(gids_layer.len());
@@ -1022,7 +1034,7 @@ impl PagedSelectionGpuInputs {
         generation: Option<&Generation>,
     ) -> Result<Self> {
         let end_chunk = start_chunk + chunk_count;
-        let gids_per_chunk = self.n_kv_head * 2;
+        let gids_per_chunk = self.n_kv_head * GIDS_PER_HEAD;
         if end_chunk > self.chunk_gids_keepalive.len()
             || end_chunk * gids_per_chunk > self.head_gids.len()
         {

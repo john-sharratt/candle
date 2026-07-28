@@ -1998,8 +1998,10 @@ fn test_cuda_selection_matches_cpu() {
         .collect();
 
     // Build per-head table: one arena per chunk, n_kv_head=1, F32 format.
-    // Each arena has: k_ptr, v_ptr, k_byte_offset=0, v_byte_offset=0,
-    // k_chunk_byte_stride = num_blocks * 32 * 4 (F32), same for V,
+    // Palette4 rows (36 i64): palette[0] populated, palette[1..3] zeroed.
+    // The kernels address each palette band through its own gid with a
+    // per-band chunk stride; the monolithic per-chunk upload is presented as
+    // 4 contiguous band slots (gid chunk_idx = palette index).
     // metadata = 0 (F32 format, GPU location).
     let blocks_per_chunk = chunk_gpus[0].num_blocks;
     assert!(
@@ -2008,41 +2010,43 @@ fn test_cuda_selection_matches_cpu() {
             .all(|cg| cg.num_blocks == blocks_per_chunk),
         "All chunks must have the same number of blocks for the paged kernel"
     );
-    let chunk_byte_stride = (blocks_per_chunk * 32 * 4) as i64; // F32: 4 bytes per elem
+    let band_chunk_stride = (blocks_per_chunk / 4 * 32 * 4) as i64; // F32: 4 bytes per elem
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
 
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
-        .map(|cg| {
+        .flat_map(|cg| {
             let (k_ptr, _) = cg.k_gpu.device_ptr(&stream);
             let (v_ptr, _) = cg.v_gpu.device_ptr(&stream);
-            // PerHeadTableEntry: [k_ptr, v_ptr, k_byte_offset, v_byte_offset,
-            //                     k_chunk_byte_stride, v_chunk_byte_stride, metadata]
-            // metadata: (k_format_tag << 16) | (v_format_tag << 8) | location
-            // ArenaFormat::F32 = 0, so metadata = 0
-            [
+            let mut row = vec![
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
                 0i64,
-                chunk_byte_stride,
-                chunk_byte_stride,
+                band_chunk_stride,
+                band_chunk_stride,
                 0i64,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            row.extend_from_slice(&[0i64; 27]);
+            row
         })
-        .flatten()
         .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
 
-    // Build chunk descriptors: each chunk is its own arena at chunk_idx=0.
-    // GID = arena_idx * ARENA_CHUNKS + chunk_idx = arena_idx * ARENA_CHUNKS + 0
-    // n_kv_head=1, so head_gids = [K_GID, V_GID] per chunk.
+    // Build chunk descriptors: each chunk is its own arena; band p of the
+    // head lives at chunk_idx = p. n_kv_head=1, so head_gids carries
+    // 8 gids per chunk (K/V per palette band).
     const TEST_ARENA_CHUNKS: i64 = 8192; // matches ARENA_CHUNKS in types.rs
-    let mut head_gids: Vec<i64> = Vec::with_capacity(chunk_gpus.len() * 2);
+    let mut head_gids: Vec<i64> = Vec::with_capacity(chunk_gpus.len() * 8);
     for (i, _cg) in chunk_gpus.iter().enumerate() {
-        head_gids.push(i as i64 * TEST_ARENA_CHUNKS); // K GID: arena_idx=i, chunk_idx=0
-        head_gids.push(i as i64 * TEST_ARENA_CHUNKS); // V GID: same arena
+        for p in 0..4i64 {
+            head_gids.push(i as i64 * TEST_ARENA_CHUNKS + p); // K band p
+            head_gids.push(i as i64 * TEST_ARENA_CHUNKS + p); // V band p
+        }
     }
 
     let _total_blocks = chunks.len() * blocks_per_chunk;
@@ -3160,9 +3164,12 @@ fn test_cuda_r16_qproj_matches_cpu() {
         })
         .collect();
 
-    // Per-head table: K ptr = R16 byte buffer, V ptr = F16 byte buffer
-    // R16: 128 bytes per block (block_r16), chunk_byte_stride = blocks_per_chunk * 128
-    // F16 V: chunk_byte_stride = blocks_per_chunk * 32 * 2 (F16: 2 bytes per elem)
+    // Per-head table: K ptr = R16 byte buffer, V ptr = F16 byte buffer.
+    // Palette4 rows (36 i64): palette[0] populated, palette[1..3] zeroed.
+    // The kernels address each palette band through its own gid with a
+    // per-band chunk stride; the monolithic per-chunk uploads are presented
+    // as 4 contiguous band slots (gid chunk_idx = palette index).
+    // R16: 128 bytes per block (block_r16); F16 V: 32 * 2 bytes per block.
     let blocks_per_chunk = chunk_gpus[0].num_blocks;
     assert!(
         chunk_gpus
@@ -3170,39 +3177,46 @@ fn test_cuda_r16_qproj_matches_cpu() {
             .all(|cg| cg.num_blocks == blocks_per_chunk),
         "All chunks must have the same number of blocks"
     );
-    let k_chunk_byte_stride = (blocks_per_chunk * 128) as i64; // R16: 128 bytes per block
-    let v_chunk_byte_stride = (blocks_per_chunk * 32 * 2) as i64; // F16: 2 bytes per elem
+    let k_band_chunk_stride = (blocks_per_chunk / 4 * 128) as i64; // R16: 128 bytes per block
+    let v_band_chunk_stride = (blocks_per_chunk / 4 * 32 * 2) as i64; // F16: 2 bytes per elem
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
 
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
-        .map(|cg| {
+        .flat_map(|cg| {
             let (k_ptr, _) = cg.k_r16_gpu.device_ptr(&stream);
             let (v_ptr, _) = cg.v_f16_gpu.device_ptr(&stream);
             // metadata: (k_format_tag << 16) | (v_format_tag << 8) | location
-            // ArenaFormat::R16 = 39, ArenaFormat::F16 = 1
-            let metadata = (39i64 << 16) | (1i64 << 8) | 0i64;
-            [
+            // ArenaFormat::R16 = 3, ArenaFormat::F16 = 1
+            let metadata = (3i64 << 16) | (1i64 << 8) | 0i64;
+            let mut row = vec![
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
                 0i64,
-                k_chunk_byte_stride,
-                v_chunk_byte_stride,
+                k_band_chunk_stride,
+                v_band_chunk_stride,
                 metadata,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            row.extend_from_slice(&[0i64; 27]);
+            row
         })
-        .flatten()
         .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
 
-    // Chunk descriptors with head_gids
+    // Chunk descriptors: 8 gids per (chunk, head) — K/V per palette band,
+    // band p at chunk_idx = p within the chunk's arena.
     const TEST_ARENA_CHUNKS_R16: i64 = 8192;
-    let mut head_gids: Vec<i64> = Vec::with_capacity(chunk_gpus.len() * 2);
+    let mut head_gids: Vec<i64> = Vec::with_capacity(chunk_gpus.len() * 8);
     for (i, _cg) in chunk_gpus.iter().enumerate() {
-        head_gids.push(i as i64 * TEST_ARENA_CHUNKS_R16); // K GID
-        head_gids.push(i as i64 * TEST_ARENA_CHUNKS_R16); // V GID (same arena)
+        for p in 0..4i64 {
+            head_gids.push(i as i64 * TEST_ARENA_CHUNKS_R16 + p); // K band p
+            head_gids.push(i as i64 * TEST_ARENA_CHUNKS_R16 + p); // V band p
+        }
     }
 
     // Tracking

@@ -1431,6 +1431,47 @@ __device__ __forceinline__ PerHeadTableEntry load_per_head_entry(
     return per_head_lookup(per_head_table, arena_idx, head_idx, n_kv_head);
 }
 
+// Resolve one palette band's source view (chunk base pointer, storage format,
+// outer scale) from that band's OWN gid and per-head table row.
+//
+// Each (head, palette) band is an independent arena slot: bands of one head
+// may live in different arenas, at non-contiguous chunk indices, and in
+// different formats (format selection is per-(head, palette)). The selection
+// kernels therefore address every band through its own gid; nothing here
+// assumes band contiguity or format uniformity across a head.
+//
+// The head_gids buffer carries all GIDS_PER_HEAD gids per (chunk, head), in
+// HeadGids order: head * GIDS_PER_HEAD + palette * 2 + is_v.
+__device__ __forceinline__ void resolve_band_source(
+    const int64_t* __restrict__ per_head_table_raw,
+    const int64_t* __restrict__ head_gids,
+    int chunk_idx,
+    int head_idx,
+    int n_kv_head,
+    int arena_chunks,
+    int palette,
+    bool is_v,
+    const char** ptr_out,
+    int* fmt_out,
+    float* outer_out
+) {
+    const int64_t gid = __ldg(&head_gids[
+        (int64_t)chunk_idx * n_kv_head * GIDS_PER_HEAD
+        + head_idx * GIDS_PER_HEAD + palette * 2 + (is_v ? 1 : 0)]);
+    const int arena_idx      = (int)(gid / (int64_t)arena_chunks);
+    const int chunk_in_arena = (int)(gid - (int64_t)arena_idx * (int64_t)arena_chunks);
+    PerHeadTableEntry e = load_per_head_entry(per_head_table_raw, arena_idx, head_idx, n_kv_head);
+    if (is_v) {
+        *ptr_out   = per_head_v_ptr(e) + (int64_t)chunk_in_arena * e.v_chunk_byte_stride;
+        *fmt_out   = per_head_get_v_format(e);
+        *outer_out = per_head_get_v_scale(e);
+    } else {
+        *ptr_out   = per_head_k_ptr(e) + (int64_t)chunk_in_arena * e.k_chunk_byte_stride;
+        *fmt_out   = per_head_get_k_format(e);
+        *outer_out = per_head_get_k_scale(e);
+    }
+}
+
 // =============================================================================
 // PER-(CHUNK, HEAD) QUANTILE KERNEL
 // =============================================================================
@@ -1494,23 +1535,25 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
 
     const int chunk_idx = head_id / n_kv_head;
     const int head_idx  = head_id % n_kv_head;
-    const int gid_base  = chunk_idx * n_kv_head * 2;
 
-    // K setup
-    const int64_t k_gid      = __ldg(&head_gids[gid_base + head_idx * 2]);
-    const int k_arena_idx     = (int)(k_gid / (int64_t)arena_chunks);
-    const int k_chunk_idx     = (int)(k_gid - (int64_t)k_arena_idx * (int64_t)arena_chunks);
-    PerHeadTableEntry ph_k    = load_per_head_entry(per_head_table_raw, k_arena_idx, head_idx, n_kv_head);
-    const int   k_fmt         = per_head_get_k_format(ph_k);
-    const char* k_chunk_data  = per_head_k_ptr(ph_k) + (int64_t)k_chunk_idx * ph_k.k_chunk_byte_stride;
-
-    // V setup (for v_head_amax)
-    const int64_t v_gid      = __ldg(&head_gids[gid_base + head_idx * 2 + 1]);
-    const int v_arena_idx     = (int)(v_gid / (int64_t)arena_chunks);
-    const int v_chunk_idx     = (int)(v_gid - (int64_t)v_arena_idx * (int64_t)arena_chunks);
-    PerHeadTableEntry ph_v    = load_per_head_entry(per_head_table_raw, v_arena_idx, head_idx, n_kv_head);
-    const int   v_fmt         = per_head_get_v_format(ph_v);
-    const char* v_chunk_data  = per_head_v_ptr(ph_v) + (int64_t)v_chunk_idx * ph_v.v_chunk_byte_stride;
+    // Per-band source views, resolved through each band's own gid. Held in
+    // shared memory so the walk loops stay register-neutral under the
+    // launch_bounds occupancy cap. Index [0] = K, [1] = V.
+    __shared__ const char* s_band_ptr  [2][N_PALETTE];
+    __shared__ int         s_band_fmt  [2][N_PALETTE];
+    __shared__ float       s_band_outer[2][N_PALETTE];
+    if (tid < 2 * N_PALETTE) {
+        const int side = tid >> 2; // 0 = K, 1 = V
+        const int p    = tid & (N_PALETTE - 1);
+        resolve_band_source(per_head_table_raw, head_gids, chunk_idx, head_idx,
+                            n_kv_head, arena_chunks, p, side != 0,
+                            &s_band_ptr[side][p], &s_band_fmt[side][p],
+                            &s_band_outer[side][p]);
+    }
+    __syncthreads();
+    // Block walk → band mapping: block b covers dim b of the head, and each
+    // band holds sub_head_dim consecutive dims' blocks in its own slot.
+    const int band_blocks = blocks_per_head / N_PALETTE;
 
     __shared__ float warp_min[QREL_WARPS_PER_BLOCK];
     __shared__ float warp_max[QREL_WARPS_PER_BLOCK];
@@ -1533,27 +1576,31 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     float local_k_amax = 0.0f;
     float local_v_amax = 0.0f;
 
-    const float k_src_outer = per_head_get_k_scale(ph_k);
-    const float v_src_outer = per_head_get_v_scale(ph_v);
     for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
+        const int p   = block_in_head / band_blocks;
+        const int bib = block_in_head - p * band_blocks; // block within band
+        const int   k_fmt        = s_band_fmt[0][p];
+        const char* k_chunk_data = s_band_ptr[0][p];
         float k_val, q_val;
         if (ArenaFormat::is_quantized(k_fmt)) {
             const int   k_blk_bytes = quant_block_bytes(k_fmt);
-            const char* k_blk_ptr   = k_chunk_data + (int64_t)block_in_head * k_blk_bytes;
-            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, k_src_outer);
+            const char* k_blk_ptr   = k_chunk_data + (int64_t)bib * k_blk_bytes;
+            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
         } else {
-            k_val = load_as_float(k_chunk_data, block_in_head * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
             q_val = 0.0f;
         }
 
+        const int   v_fmt        = s_band_fmt[1][p];
+        const char* v_chunk_data = s_band_ptr[1][p];
         float v_val;
         if (ArenaFormat::is_quantized(v_fmt)) {
             const int   v_blk_bytes = quant_block_bytes(v_fmt);
-            const char* v_blk_ptr   = v_chunk_data + (int64_t)block_in_head * v_blk_bytes;
-            v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, v_src_outer);
+            const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
+            v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
         } else {
-            v_val = load_as_float(v_chunk_data, block_in_head * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
+            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
         }
 
         // All 32 lanes participate in the warp reduce; only lane 0 accumulates.
@@ -1636,21 +1683,27 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
         const float k_abs_inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), k_amax_safe);
         const float v_abs_inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), v_amax_safe);
         for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
+            const int p   = block_in_head / band_blocks;
+            const int bib = block_in_head - p * band_blocks;
+            const int   k_fmt        = s_band_fmt[0][p];
+            const char* k_chunk_data = s_band_ptr[0][p];
             float k_val;
             if (ArenaFormat::is_quantized(k_fmt)) {
                 const int   k_blk_bytes = quant_block_bytes(k_fmt);
-                const char* k_blk_ptr   = k_chunk_data + (int64_t)block_in_head * k_blk_bytes;
-                k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, k_src_outer);
+                const char* k_blk_ptr   = k_chunk_data + (int64_t)bib * k_blk_bytes;
+                k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             } else {
-                k_val = load_as_float(k_chunk_data, block_in_head * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+                k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
             }
+            const int   v_fmt        = s_band_fmt[1][p];
+            const char* v_chunk_data = s_band_ptr[1][p];
             float v_val;
             if (ArenaFormat::is_quantized(v_fmt)) {
                 const int   v_blk_bytes = quant_block_bytes(v_fmt);
-                const char* v_blk_ptr   = v_chunk_data + (int64_t)block_in_head * v_blk_bytes;
-                v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, v_src_outer);
+                const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
+                v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
             } else {
-                v_val = load_as_float(v_chunk_data, block_in_head * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
+                v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
             }
             int k_bin = (int)floorf(__fmul_rn(fabsf(k_val), k_abs_inv_range));
             k_bin = max(0, min(QREL_HIST_BINS - 1, k_bin));
@@ -1696,15 +1749,19 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
 
     const float inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), head_max - head_min);
     for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
+        const int p   = block_in_head / band_blocks;
+        const int bib = block_in_head - p * band_blocks;
+        const int   k_fmt        = s_band_fmt[0][p];
+        const char* k_chunk_data = s_band_ptr[0][p];
         float k_val;
         float q_val;
         if (ArenaFormat::is_quantized(k_fmt)) {
             const int k_blk_bytes = quant_block_bytes(k_fmt);
-            const char* k_blk_ptr = k_chunk_data + (int64_t)block_in_head * k_blk_bytes;
-            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, k_src_outer);
+            const char* k_blk_ptr = k_chunk_data + (int64_t)bib * k_blk_bytes;
+            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
         } else {
-            const int k_elem_in_chunk = block_in_head * 32 + lane;
+            const int k_elem_in_chunk = bib * 32 + lane;
             k_val = load_as_float(k_chunk_data, k_elem_in_chunk, arena_fmt_to_dtype_code(k_fmt));
             q_val = 0.0f;
         }
@@ -1960,10 +2017,11 @@ __device__ __forceinline__ void bitonic_sort_amax_desc(
 //   s_warp_pop[4], s_first_alive[4]      ~32 B  compaction scratch
 //   s_live_count, s_slot_{amax,p95,p80,mean,p25}  ~24 B  cross-warp scalars
 //   s_claim_count                          ~4 B  pass-1 claim count
-//   spill_v_chunk_ptr              u64      8 B  } V-reload register spill slots —
-//   spill_v_src_fmt                i32      4 B  } written end of Phase 1 by tid 0,
-//   spill_v_src_outer              f32      4 B  } read before V reload.  Keeps 4
-//                                               } regs free across K process_side.
+//   s_band_ptr    [2][4]       ptr       64 B  } per-band source views (one per
+//   s_band_fmt    [2][4]       i32       32 B  } (side, palette) gid) — resolved
+//   s_band_outer  [2][4]       f32       32 B  } up front, read by Phase 1 and
+//                                              } V reload. Keeps source ptrs/fmts
+//                                              } out of regs across process_side.
 //
 // Total: ~12.7 KB.  8 × 12.7 KB = 101.6 KB < 102.4 KB (MaxShared budget on Ada).
 // launch_bounds(128, 8) caps REG at 64; search_scales_for_fmt is __noinline__ so
@@ -2109,14 +2167,15 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
     // the pass-1 claim count from tid 0 to the rest of the block.
     __shared__ int      s_claim_count;
 
-    // Register-spill slots for V-reload data.  Written by tid 0 at the end of
-    // the Phase 1 scope (alongside alive-mask init), made visible by the
-    // __syncthreads that follows.  Read back before V reload.  Keeping these 4
-    // regs (v_chunk_data×2, v_src_fmt, v_src_outer) out of the frame across
-    // Phase 2.5 / Phase 2 / Phase 3 / K process_side is worth 16 B of smem.
-    __shared__ unsigned long long spill_v_chunk_ptr;
-    __shared__ int                spill_v_src_fmt;
-    __shared__ float              spill_v_src_outer;
+    // Per-band source views, resolved through each band's own gid (bands of a
+    // head may live in different arenas, at non-contiguous chunk indices, and
+    // in different formats). Living in smem keeps the source pointers/formats
+    // out of the register frame across Phase 2.5 / Phase 2 / Phase 3 and both
+    // process_side calls — the same occupancy argument as the former V-reload
+    // spill slots, which these arrays replace. Index [0] = K, [1] = V.
+    __shared__ const char* s_band_ptr  [2][N_PALETTE];
+    __shared__ int         s_band_fmt  [2][N_PALETTE];
+    __shared__ float       s_band_outer[2][N_PALETTE];
 
     const int head_id = blockIdx.x;
     const int tid     = threadIdx.x;
@@ -2138,36 +2197,25 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
     const float v_valid_corr = 32.0f / (float)valid_len;
     const float k_valid_corr = 4.0f / (float)min(4, valid_len);
 
-    const int     gid_base        = chunk_id * n_kv_head * 2;
-    const int64_t k_gid           = __ldg(&head_gids[gid_base + head_idx * 2]);
-    const int64_t v_gid           = __ldg(&head_gids[gid_base + head_idx * 2 + 1]);
-    const int     k_arena_idx     = (int)(k_gid / (int64_t)arena_chunks);
-    const int     k_chunk_in_arena= (int)(k_gid - (int64_t)k_arena_idx * (int64_t)arena_chunks);
-    const int     v_arena_idx     = (int)(v_gid / (int64_t)arena_chunks);
-    const int     v_chunk_in_arena= (int)(v_gid - (int64_t)v_arena_idx * (int64_t)arena_chunks);
+    // Resolve every band's source view through its own gid; one thread per
+    // (side, band). The barrier publishes the views for Phase 1 and V reload.
+    if (tid < 2 * N_PALETTE) {
+        const int side = tid >> 2; // 0 = K, 1 = V
+        const int p    = tid & (N_PALETTE - 1);
+        resolve_band_source(per_head_table_raw, head_gids, chunk_id, head_idx,
+                            n_kv_head, arena_chunks, p, side != 0,
+                            &s_band_ptr[side][p], &s_band_fmt[side][p],
+                            &s_band_outer[side][p]);
+    }
+    __syncthreads();
+    // Block → band mapping: block b covers dim b of the head; each band holds
+    // FUSED_BAND_BLOCKS consecutive dims' blocks in its own arena slot.
+    constexpr int FUSED_BAND_BLOCKS = FUSED_HEAD_BLOCKS / N_PALETTE;
 
     const float q_med    = __ldg(&q_relevance_median[head_id]);
     const float q_spread = __ldg(&q_relevance_spread[head_id]);
 
-    // ── Phase 1 scope ─────────────────────────────────────────────────────────
-    // k_ph / v_ph struct lifetime (≈14 regs each) is bounded to this block so
-    // the compiler can reclaim them once the derived pointers/scalars are
-    // extracted.  v_chunk_data / v_src_fmt / v_src_outer are also scoped here:
-    // they are spilled to smem at the end and reloaded just before V reload,
-    // keeping them out of the register frame across Phase 2.5, Phase 2, Phase 3,
-    // and the entire K process_side — the largest contiguous live range.
     {
-    PerHeadTableEntry k_ph = load_per_head_entry(per_head_table_raw, k_arena_idx, head_idx, n_kv_head);
-    PerHeadTableEntry v_ph = load_per_head_entry(per_head_table_raw, v_arena_idx, head_idx, n_kv_head);
-
-    const int   k_src_fmt    = per_head_get_k_format(k_ph);
-    const int   v_src_fmt    = per_head_get_v_format(v_ph);
-    const char* k_chunk_data = per_head_k_ptr(k_ph) + (int64_t)k_chunk_in_arena * k_ph.k_chunk_byte_stride;
-    const char* v_chunk_data = per_head_v_ptr(v_ph) + (int64_t)v_chunk_in_arena * v_ph.v_chunk_byte_stride;
-    const float k_src_outer  = per_head_get_k_scale(k_ph);
-    const float v_src_outer  = per_head_get_v_scale(v_ph);
-    // k_ph / v_ph are dead after this point; the compiler reclaims their regs.
-
     // ── Phase 1: Load all 128 blocks; compute per-block amax and q-relevance ──
     // Multi-warp stride: each of the 4 warps owns 32 blocks (warp_id, +4, +8 …).
     // Lanes within a warp cooperate to load one block's 32 elements; warp-
@@ -2175,20 +2223,26 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
     // block. No cross-warp dependencies in this phase — the closing
     // __syncthreads makes Phase 2.5/2 see consistent smem state.
     for (int blk = warp_id; blk < FUSED_HEAD_BLOCKS; blk += FUSED_WARPS_PER_BLOCK) {
+        const int p   = blk / FUSED_BAND_BLOCKS;
+        const int bib = blk - p * FUSED_BAND_BLOCKS; // block within band
+        const int   k_src_fmt    = s_band_fmt[0][p];
+        const char* k_chunk_data = s_band_ptr[0][p];
+        const int   v_src_fmt    = s_band_fmt[1][p];
+        const char* v_chunk_data = s_band_ptr[1][p];
         float k_val = 0.0f, q_val = 0.0f, v_val = 0.0f;
 
         if (ArenaFormat::is_quantized(k_src_fmt)) {
-            const char* k_blk = k_chunk_data + (int64_t)blk * quant_block_bytes(k_src_fmt);
-            k_val = dequant_element_inline<float, true>(k_blk, lane, k_src_fmt, k_src_outer);
+            const char* k_blk = k_chunk_data + (int64_t)bib * quant_block_bytes(k_src_fmt);
+            k_val = dequant_element_inline<float, true>(k_blk, lane, k_src_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk, lane, k_src_fmt);
         } else {
-            k_val = load_as_float(k_chunk_data, blk * 32 + lane, arena_fmt_to_dtype_code(k_src_fmt));
+            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_src_fmt));
         }
         if (ArenaFormat::is_quantized(v_src_fmt)) {
-            const char* v_blk = v_chunk_data + (int64_t)blk * quant_block_bytes(v_src_fmt);
-            v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt, v_src_outer);
+            const char* v_blk = v_chunk_data + (int64_t)bib * quant_block_bytes(v_src_fmt);
+            v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt, s_band_outer[1][p]);
         } else {
-            v_val = load_as_float(v_chunk_data, blk * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt));
+            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt));
         }
 
         smem_kv   [blk * 32 + lane] = __float2half(k_val);   // K stored as f16; V discarded (reloaded before V process_side)
@@ -2243,20 +2297,16 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
         }
     }
 
-    // Spill V-reload data + initialise alive masks in one tid-0 write.
-    // The __syncthreads below makes both visible to all threads.
-    // v_chunk_data / v_src_fmt / v_src_outer die at the scope close below.
+    // Initialise alive masks; the __syncthreads below makes them visible to
+    // all threads. (V-reload source views live in the s_band_* arrays.)
     if (tid == 0) {
-        spill_v_chunk_ptr  = (unsigned long long)(uintptr_t)v_chunk_data;
-        spill_v_src_fmt    = v_src_fmt;
-        spill_v_src_outer  = v_src_outer;
         // Initialize alive masks: bits 0..127 set, upper bits 128..191 zero.
         k_alive_lo = ~0ULL;
         k_alive_hi = ~0ULL;
         v_alive_lo = ~0ULL;
         v_alive_hi = ~0ULL;
     }
-    }  // ── end Phase 1 scope: k_ph, v_ph, k/v_chunk_data, k/v_src_fmt/outer freed ──
+    }  // ── end Phase 1 scope ──
     __syncthreads();
 
     // ── Phase 2.5: per-token attention-sink detection ─────────────────────────
@@ -2744,24 +2794,24 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
     );
 
     // Reload V values into smem_kv.  K data is consumed; overwriting is safe.
-    // Pointer and format are recovered from smem spill slots written in Phase 1.
-    // Scoped so v_chunk_data_r / v_src_fmt_r / v_src_outer_r die at the brace,
-    // keeping them out of the V process_side frame.
+    // Per-band source views come from the s_band_* arrays resolved up front,
+    // so nothing V-related was live across the K process_side frame.
     {
-        const char* v_chunk_data_r = (const char*)(uintptr_t)spill_v_chunk_ptr;
-        const int   v_src_fmt_r    = spill_v_src_fmt;
-        const float v_src_outer_r  = spill_v_src_outer;
         for (int blk = warp_id; blk < FUSED_HEAD_BLOCKS; blk += FUSED_WARPS_PER_BLOCK) {
+            const int p   = blk / FUSED_BAND_BLOCKS;
+            const int bib = blk - p * FUSED_BAND_BLOCKS;
+            const int   v_src_fmt_r    = s_band_fmt[1][p];
+            const char* v_chunk_data_r = s_band_ptr[1][p];
             float v_val;
             if (ArenaFormat::is_quantized(v_src_fmt_r)) {
-                const char* v_blk = v_chunk_data_r + (int64_t)blk * quant_block_bytes(v_src_fmt_r);
-                v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt_r, v_src_outer_r);
+                const char* v_blk = v_chunk_data_r + (int64_t)bib * quant_block_bytes(v_src_fmt_r);
+                v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
             } else {
-                v_val = load_as_float(v_chunk_data_r, blk * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt_r));
+                v_val = load_as_float(v_chunk_data_r, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt_r));
             }
             smem_kv[blk * 32 + lane] = __float2half(v_val);
         }
-    }  // v_chunk_data_r, v_src_fmt_r, v_src_outer_r freed here
+    }
     __syncthreads();
 
     // Lazy-load v_head_amax_val just before V process_side so it is not live
@@ -2969,28 +3019,26 @@ extern "C" __global__ void sample_quant_errors_paged(
     float*   warp_f32   = smem_f32  [warp_in_block];
     uint8_t* warp_quant = smem_quant[warp_in_block];
 
+    // One CUDA block samples one dim, which lives in exactly one palette band;
+    // address that band through its own gid.
+    const int sub_head_dim = head_dim / N_PALETTE;
+    const int band     = dim_idx / sub_head_dim;
+    const int dim_in_band = dim_idx - band * sub_head_dim;
+
     for (int chunk_idx = warp_in_block; chunk_idx < num_chunks; chunk_idx += SELECT_WARPS_PER_BLOCK) {
-        const int gid_base = chunk_idx * n_kv_head * 2;
-        const int64_t gid = side_is_k
-            ? __ldg(&head_gids[gid_base + head_idx * 2])
-            : __ldg(&head_gids[gid_base + head_idx * 2 + 1]);
-
-        const int arena_idx = (int)(gid / (int64_t)arena_chunks);
-        const int chunk_idx_in_arena = (int)(gid - (int64_t)arena_idx * (int64_t)arena_chunks);
-
-        PerHeadTableEntry ph = load_per_head_entry(per_head_table_raw, arena_idx, head_idx, n_kv_head);
-
-        const int src_fmt = side_is_k ? per_head_get_k_format(ph) : per_head_get_v_format(ph);
-        const char* head_base = side_is_k ? per_head_k_ptr(ph) : per_head_v_ptr(ph);
-        const int64_t chunk_stride = side_is_k ? ph.k_chunk_byte_stride : ph.v_chunk_byte_stride;
-        const char* chunk_data = head_base + (int64_t)chunk_idx_in_arena * chunk_stride;
+        const char* chunk_data;
+        int src_fmt;
+        float band_outer;
+        resolve_band_source(per_head_table_raw, head_gids, chunk_idx, head_idx,
+                            n_kv_head, arena_chunks, band, side_is_k == 0,
+                            &chunk_data, &src_fmt, &band_outer);
 
         float x_val;
         float k_val = 0.0f;
         float q_val = 0.0f;
         if (ArenaFormat::is_quantized(src_fmt)) {
             const int blk_bytes = quant_block_bytes(src_fmt);
-            const char* blk_ptr = chunk_data + (int64_t)dim_idx * blk_bytes;
+            const char* blk_ptr = chunk_data + (int64_t)dim_in_band * blk_bytes;
             x_val = side_is_k
                 ? dequant_element_inline<float, true >(blk_ptr, lane, src_fmt, 1.0f)
                 : dequant_element_inline<float, false>(blk_ptr, lane, src_fmt, 1.0f);
@@ -2999,7 +3047,7 @@ extern "C" __global__ void sample_quant_errors_paged(
                 q_val = dequant_q_element(blk_ptr, lane, src_fmt);
             }
         } else {
-            const int elem_in_chunk = dim_idx * 32 + lane;
+            const int elem_in_chunk = dim_in_band * 32 + lane;
             x_val = load_as_float(chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(src_fmt));
             if (side_is_k) {
                 k_val = x_val;
@@ -3127,34 +3175,30 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
     float*   warp_f32   = smem_f32  [warp_in_block];
     uint8_t* warp_quant = smem_quant[warp_in_block];
 
+    // One CUDA block samples one dim, which lives in exactly one palette band;
+    // address that band through its own gid (K and V bands independently).
+    const int sub_head_dim = head_dim / N_PALETTE;
+    const int band     = dim_idx / sub_head_dim;
+    const int dim_in_band = dim_idx - band * sub_head_dim;
+
     for (int chunk_idx = warp_in_block; chunk_idx < num_chunks; chunk_idx += SELECT_WARPS_PER_BLOCK) {
-        const int gid_base = chunk_idx * n_kv_head * 2;
-        const int64_t k_gid = __ldg(&head_gids[gid_base + head_idx * 2]);
-        const int64_t v_gid = __ldg(&head_gids[gid_base + head_idx * 2 + 1]);
-
-        // K-side per-head table lookup
-        const int k_arena_idx = (int)(k_gid / (int64_t)arena_chunks);
-        const int k_chunk_in_arena = (int)(k_gid - (int64_t)k_arena_idx * (int64_t)arena_chunks);
-        PerHeadTableEntry k_ph = load_per_head_entry(per_head_table_raw, k_arena_idx, head_idx, n_kv_head);
-
-        // V-side per-head table lookup (may be a different arena)
-        const int v_arena_idx = (int)(v_gid / (int64_t)arena_chunks);
-        const int v_chunk_in_arena = (int)(v_gid - (int64_t)v_arena_idx * (int64_t)arena_chunks);
-        PerHeadTableEntry v_ph = load_per_head_entry(per_head_table_raw, v_arena_idx, head_idx, n_kv_head);
-
         // ── K pass ────────────────────────────────────────────────────
-        const int k_src_fmt = per_head_get_k_format(k_ph);
-        const char* k_chunk_data = per_head_k_ptr(k_ph) + (int64_t)k_chunk_in_arena * k_ph.k_chunk_byte_stride;
+        const char* k_chunk_data;
+        int k_src_fmt;
+        float k_band_outer;
+        resolve_band_source(per_head_table_raw, head_gids, chunk_idx, head_idx,
+                            n_kv_head, arena_chunks, band, false,
+                            &k_chunk_data, &k_src_fmt, &k_band_outer);
 
         float k_val = 0.0f;
         float q_val = 0.0f;
         if (ArenaFormat::is_quantized(k_src_fmt)) {
             const int blk_bytes = quant_block_bytes(k_src_fmt);
-            const char* blk_ptr = k_chunk_data + (int64_t)dim_idx * blk_bytes;
+            const char* blk_ptr = k_chunk_data + (int64_t)dim_in_band * blk_bytes;
             k_val = dequant_element_inline<float, true>(blk_ptr, lane, k_src_fmt, 1.0f);
             q_val = dequant_q_element(blk_ptr, lane, k_src_fmt);
         } else {
-            const int elem_in_chunk = dim_idx * 32 + lane;
+            const int elem_in_chunk = dim_in_band * 32 + lane;
             k_val = load_as_float(k_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(k_src_fmt));
         }
 
@@ -3178,16 +3222,20 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
         }
 
         // ── V pass ────────────────────────────────────────────────────
-        const int v_src_fmt = per_head_get_v_format(v_ph);
-        const char* v_chunk_data = per_head_v_ptr(v_ph) + (int64_t)v_chunk_in_arena * v_ph.v_chunk_byte_stride;
+        const char* v_chunk_data;
+        int v_src_fmt;
+        float v_band_outer;
+        resolve_band_source(per_head_table_raw, head_gids, chunk_idx, head_idx,
+                            n_kv_head, arena_chunks, band, true,
+                            &v_chunk_data, &v_src_fmt, &v_band_outer);
 
         float v_val = 0.0f;
         if (ArenaFormat::is_quantized(v_src_fmt)) {
             const int blk_bytes = quant_block_bytes(v_src_fmt);
-            const char* blk_ptr = v_chunk_data + (int64_t)dim_idx * blk_bytes;
+            const char* blk_ptr = v_chunk_data + (int64_t)dim_in_band * blk_bytes;
             v_val = dequant_element_inline<float>(blk_ptr, lane, v_src_fmt, 1.0f);
         } else {
-            const int elem_in_chunk = dim_idx * 32 + lane;
+            const int elem_in_chunk = dim_in_band * 32 + lane;
             v_val = load_as_float(v_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(v_src_fmt));
         }
 

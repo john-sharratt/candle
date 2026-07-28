@@ -1252,7 +1252,8 @@ pub fn quantize_palette4_convert_buffered(
 ///
 /// # Safety
 /// All device pointers must be valid. `head_gids_ptr` must have
-/// `total_heads * 2` i64 entries (interleaved K/V GIDs).
+/// `total_heads * 8` i64 entries (K/V GIDs for each of the 4 palette bands,
+/// in HeadGids order: `head * 8 + palette * 2 + is_v`).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn select_kv_format_palette4_paged(
     per_head_table_ptr: u64,
@@ -1327,6 +1328,11 @@ pub unsafe fn select_kv_format_palette4_paged(
     );
 }
 
+/// Gids staged per (chunk, head) for the selection kernels: K and V for each
+/// of the 4 palette bands, in HeadGids order (`head * 8 + palette * 2 + is_v`).
+/// Must match `GIDS_PER_HEAD` in candle-nn's `head_gids.rs` and `arena_table.cuh`.
+const SELECT_GIDS_PER_HEAD: usize = 8;
+
 /// Paged format selection — runs the fused per-head palette-4 selection kernel
 /// and returns the per-block effective format tags. Used by tests.
 ///
@@ -1348,7 +1354,7 @@ pub fn select_kv_format_paged_batched_raw(
     arena_chunks: usize,
     dev: &CudaDevice,
 ) -> Result<(CudaSlice<i32>, CudaSlice<i32>)> {
-    let n_chunks = head_gids.len() / (n_kv_head * 2);
+    let n_chunks = head_gids.len() / (n_kv_head * SELECT_GIDS_PER_HEAD);
     let total_heads = n_chunks * n_kv_head;
     let total_blocks = total_heads * blocks_per_head;
 
@@ -1647,7 +1653,7 @@ pub fn select_kv_format_paged_per_head(
     arena_chunks: usize,
     dev: &CudaDevice,
 ) -> Result<(CudaSlice<i32>, CudaSlice<i32>)> {
-    let n_chunks = head_gids.len() / (n_kv_head * 2);
+    let n_chunks = head_gids.len() / (n_kv_head * SELECT_GIDS_PER_HEAD);
     let total_heads = n_chunks * n_kv_head;
 
     if total_heads == 0 || n_kv_head == 0 {
