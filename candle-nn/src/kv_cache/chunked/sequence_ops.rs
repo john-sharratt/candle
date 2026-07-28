@@ -1349,8 +1349,6 @@ impl ChunkedKvBacking {
             return Ok((0, 0));
         }
 
-        let chunk_size = CHUNK_SIZE;
-
         self.ensure_max_blocks(total_parent_blocks)?;
 
         let mut state = self
@@ -1418,51 +1416,43 @@ impl ChunkedKvBacking {
             Option<super::meta_pool::MetaGid>,
         )> = {
             let ps = state.sequences[parent_batch].as_ref().unwrap();
+            let parent_len = ps.seq_len();
             parent_blocks
                 .iter()
-                .enumerate()
-                .map(|(_view_blk, &parent_blk)| {
-                    let cw = ps.chunk_at(parent_blk);
-                    let gids = cw
-                        .map(|cw| cw.gids.clone())
-                        .unwrap_or_else(|| HeadGids::uniform(ChunkGid::detached(-1), 1));
-                    let (usage, offset) = if let Some(cw) = cw {
-                        (cw.usage, cw.offset)
-                    } else {
-                        (chunk_size as u32, 0u16)
-                    };
-                    let (k_pal, v_pal, k_scale, v_scale) = match cw {
-                        Some(cw) => (
-                            cw.k_pal.clone(),
-                            cw.v_pal.clone(),
-                            cw.k_scale.clone(),
-                            cw.v_scale.clone(),
-                        ),
-                        None => (
-                            self.inner.identity_pal.clone(),
-                            self.inner.identity_pal.clone(),
-                            self.inner.identity_scale.clone(),
-                            self.inner.identity_scale.clone(),
-                        ),
+                .map(|&parent_blk| {
+                    // A missing parent chunk is a HOLE in a live slot's block
+                    // table — the parent lost backing between the caller's block
+                    // enumeration and this borrow (eviction/truncate racing view
+                    // creation). Substituting a sentinel here would count a full
+                    // phantom chunk of tokens ("computed write len N is invalid"
+                    // downstream) and hand the kernels a base-0 pointer
+                    // (CUDA_ERROR_ILLEGAL_ADDRESS). Fail loudly with the exact
+                    // hole instead.
+                    let Some(cw) = ps.chunk_at(parent_blk) else {
+                        candle::bail!(
+                            "create_view_sequence: parent slot {parent_batch} block \
+                             {parent_blk} has no chunk (parent seq_len {parent_len}, \
+                             {} blocks borrowed) — live block table lost its backing",
+                            parent_blocks.len()
+                        );
                     };
                     // The view borrows the parent block's GIDs by Arc clone — same
                     // physical placement — so the parent's resident record (if any)
                     // is valid for the view too. Propagate the handle so the
                     // reproject glue reads the resident record instead of rebuilding.
-                    let meta = cw.and_then(|cw| cw.meta.clone());
-                    (
-                        gids,
-                        usage,
-                        offset,
+                    Ok((
+                        cw.gids.clone(),
+                        cw.usage,
+                        cw.offset,
                         ps.rope_pos(parent_blk),
-                        k_pal,
-                        v_pal,
-                        k_scale,
-                        v_scale,
-                        meta,
-                    )
+                        cw.k_pal.clone(),
+                        cw.v_pal.clone(),
+                        cw.k_scale.clone(),
+                        cw.v_scale.clone(),
+                        cw.meta.clone(),
+                    ))
                 })
-                .collect()
+                .collect::<candle::Result<Vec<_>>>()?
         };
         let borrowed_token_count: usize = borrowed_meta
             .iter()
