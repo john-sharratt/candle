@@ -2635,6 +2635,17 @@ impl ChunkedKvBacking {
             }
         }
 
+        // Stream-ordered allocation fence: the dest arenas above come from the
+        // device's ASYNC pool, whose allocations become valid in primary-stream
+        // order — but every access below runs on the COPY stream. With no
+        // recorded dependency, the copy stream can reach the new arena bytes
+        // before the primary stream reaches the allocation point (routine under
+        // bulk load, where waves queue the primary stream seconds deep) —
+        // CUDA_ERROR_ILLEGAL_ADDRESS on the scatter/convert. Drain the device
+        // once so the allocations are valid on every stream before any
+        // copy-stream use.
+        device.synchronize()?;
+
         // ── Phase 4: build scatter plan staging → dest GPU arenas ──────
         let gpu_arena_info = self.resolve_arena_info()?;
         let mut plan = MigrationPlan::new();

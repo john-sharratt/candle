@@ -252,6 +252,26 @@ impl Scheduler {
         let logits_vec = match self.decode_forward_cobatched(&seq_ids_raw, &inputs) {
             Ok(l) => l,
             Err(e) => {
+                // Fault-time audit: byte-compare each failed slot's cached
+                // device slot-state (the table the decode kernel actually read)
+                // against a fresh re-serialization from the live block table +
+                // arena registry. A mismatch names the exact stale chunk record
+                // and the embedded value the kernel dereferenced — host-side,
+                // unaffected by the poisoned CUDA context.
+                let mut audited_clean = 0usize;
+                for &sid in &seq_ids_raw {
+                    for (layer, backing) in self.session.backings().iter().enumerate() {
+                        match backing.audit_gpu_chunks_report(sid) {
+                            Some(report) => tracing::warn!(
+                                "decode fault audit: seq {sid} layer {layer}: {report}"
+                            ),
+                            None => audited_clean += 1,
+                        }
+                    }
+                }
+                tracing::warn!(
+                    "decode fault audit: {audited_clean} (seq,layer) caches byte-consistent"
+                );
                 self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
                 return;
             }
