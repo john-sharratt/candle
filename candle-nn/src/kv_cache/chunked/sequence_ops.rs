@@ -2092,6 +2092,17 @@ impl ChunkedKvBacking {
             })
             .collect();
         slot.extend_chunks(windows);
+        // The injection changed the slot's chunk layout out from under the
+        // cached device-side slot-state (GpuChunks). The cache's count-mismatch
+        // detection catches a GROWN table, but a same-count window replacement
+        // (steady-state reprojection: truncate re-inject with an equal number
+        // of chunks) leaves the stale serialization live — its embedded arena
+        // base pointers keep addressing the PREVIOUS windows' chunks, whose
+        // gids this injection just dropped. Once those arenas empty, the sweep
+        // frees and RECYCLES their indices, and the next decode launch reads
+        // through freed (or re-tenanted) memory. Invalidate unconditionally —
+        // O(1); the next decode sync rebuilds from the current table.
+        slot.invalidate_gpu_chunks();
         let block_end = slot.block_count();
 
         Ok((block_start, block_end))
