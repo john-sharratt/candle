@@ -288,6 +288,31 @@ impl ArenaRefcounts {
         None // full: recycle stack empty and high-water mark exhausted.
     }
 
+    /// Claim `len` CONSECUTIVE slots, returning the first index. High-water
+    /// mark only — recycled singleton slots are never consecutive-by-contract,
+    /// and the run exists to satisfy the kernels' layout invariant that a
+    /// (chunk, head, side)'s N_PALETTE band slots are contiguous (the QREL and
+    /// fused-select kernels walk all bands from band 0's pointer; a scattered
+    /// run reads foreign bands and overruns the arena tail —
+    /// CUDA_ERROR_ILLEGAL_ADDRESS). Callers serialize via `alloc_gate`.
+    fn try_claim_run(&self, len: usize) -> Option<usize> {
+        let h = self.hwm.load(Ordering::Relaxed) as usize;
+        if h + len <= self.arena_chunks {
+            self.hwm.store((h + len) as u32, Ordering::Relaxed);
+            for i in 0..len {
+                self.occupy(h + i);
+            }
+            return Some(h);
+        }
+        None
+    }
+
+    /// Whether the never-used tail can still fit a run of `len` slots.
+    #[inline]
+    fn run_fits(&self, len: usize) -> bool {
+        (self.hwm.load(Ordering::Relaxed) as usize) + len <= self.arena_chunks
+    }
+
     /// Increment a slot's refcount — called by `ChunkGid::clone`. The
     /// slot must already be allocated (count ≥ 1); we never need
     /// Acquire semantics because the data is already visible.
@@ -666,6 +691,32 @@ impl ArenaPool {
     /// Allocate a single gid from any arena. Iterates arenas in
     /// `arena_idx` order (lowest first) so live data clusters in low
     /// indices, keeping compaction effective.
+    /// Claim `len` CONSECUTIVE slots in one arena of this pool, returning the
+    /// first raw gid and the arena's refcount table. Only the never-used
+    /// high-water tail of an arena can host a run (see
+    /// [`ArenaRefcounts::try_claim_run`]); arenas whose tail is exhausted are
+    /// skipped, and `None` means the caller must register a fresh arena.
+    fn allocate_run(&self, len: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
+        let _gate = self.alloc_gate.lock().unwrap();
+        let stride = arena_gid_stride();
+        let tables = self.tables.read().unwrap();
+        let mut indices: Vec<usize> = tables.keys().copied().collect();
+        indices.sort_unstable();
+        for arena_idx in indices {
+            let table = &tables[&arena_idx];
+            if !table.run_fits(len) {
+                continue;
+            }
+            if let Some(first) = table.try_claim_run(len) {
+                if table.is_full() {
+                    self.capacity.clear(arena_idx);
+                }
+                return Some(((arena_idx * stride + first) as i64, Arc::clone(table)));
+            }
+        }
+        None
+    }
+
     fn allocate_any(&self) -> Option<(i64, Arc<ArenaRefcounts>)> {
         // Serialize the claiming walk: only one thread scans this pool's
         // `counts` arrays at a time, so `try_claim_one` can probe occupancy
@@ -1132,6 +1183,22 @@ impl ChunkGidPool {
             id,
             backing: GidBacking::Pooled(table),
         })
+    }
+
+    /// Allocate `len` CONSECUTIVE slots in one arena of `key`'s pool. `None`
+    /// when no arena's never-used tail fits the run — the caller registers a
+    /// fresh arena and retries (a fresh arena always fits: `len` ≤ capacity).
+    pub fn allocate_run_for(&self, key: ArenaKey, len: usize) -> Option<Vec<ChunkGid>> {
+        let pool = self.inner.pools.get(&key)?;
+        let (first, table) = pool.allocate_run(len)?;
+        Some(
+            (0..len as i64)
+                .map(|i| ChunkGid {
+                    id: first + i,
+                    backing: GidBacking::Pooled(Arc::clone(&table)),
+                })
+                .collect(),
+        )
     }
 
     /// Bulk variant of [`Self::allocate_for`] — returns up to `n` gids.

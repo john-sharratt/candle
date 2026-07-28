@@ -1251,13 +1251,28 @@ impl ChunkedKvBacking {
                 .state
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            // Per (head, side): a uniform band group allocates one CONTIGUOUS
+            // run (the select/QREL kernels walk all N_PALETTE bands from band
+            // 0's pointer — see `alloc_chunk_run_for_key`); mixed groups
+            // allocate per band.
             for h in 0..n_kv_head {
-                for p in 0..N_PALETTE {
-                    let sub = h * N_PALETTE + p;
-                    let k_gid =
-                        self.alloc_chunk_for_key(ArenaKey::uniform(k_formats[sub], location))?;
-                    let v_gid =
-                        self.alloc_chunk_for_key(ArenaKey::uniform(v_formats[sub], location))?;
+                let base = h * N_PALETTE;
+                let alloc_side = |fmts: &[crate::kv_cache::KvFormat]| -> Result<Vec<ChunkGid>> {
+                    let band = &fmts[base..base + N_PALETTE];
+                    if band.iter().all(|f| *f == band[0]) {
+                        self.alloc_chunk_run_for_key(
+                            ArenaKey::uniform(band[0], location),
+                            N_PALETTE,
+                        )
+                    } else {
+                        band.iter()
+                            .map(|f| self.alloc_chunk_for_key(ArenaKey::uniform(*f, location)))
+                            .collect()
+                    }
+                };
+                let k_run = alloc_side(k_formats)?;
+                let v_run = alloc_side(v_formats)?;
+                for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
                     gid_vec.push(k_gid);
                     gid_vec.push(v_gid);
                 }
@@ -2618,6 +2633,14 @@ impl ChunkedKvBacking {
         };
 
         // ── Phase 3: allocate dest GPU GIDs (one state.write) ──────────
+        // Palette-band runs first: for every (chunk, head, side) whose
+        // N_PALETTE band gids are distinct and share one format, allocate the
+        // dest slots as one CONTIGUOUS run — the select/QREL kernels walk all
+        // bands from band 0's pointer, so a lifted turn with scattered dest
+        // bands reads foreign bands on its next quantize pass and overruns the
+        // arena tail (the bulk-ingest CUDA_ERROR_ILLEGAL_ADDRESS). Leftovers
+        // (shared or mixed-format band groups — never select-walked) fall back
+        // to singleton allocation.
         let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
             std::collections::HashMap::new();
         {
@@ -2625,7 +2648,51 @@ impl ChunkedKvBacking {
                 .state
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            let n_kv_head = self.inner.n_kv_head;
+            for seq in sequences {
+                for chunk in &seq.chunks {
+                    for h in 0..n_kv_head {
+                        for side_v in [false, true] {
+                            let raws: Vec<i64> = (0..crate::kv_cache::arena_table::N_PALETTE)
+                                .map(|p| {
+                                    if side_v {
+                                        chunk.gids.v_gid_pal(h, p).raw()
+                                    } else {
+                                        chunk.gids.k_gid_pal(h, p).raw()
+                                    }
+                                })
+                                .collect();
+                            let distinct: std::collections::HashSet<i64> =
+                                raws.iter().copied().collect();
+                            if distinct.len() != raws.len()
+                                || raws.iter().any(|r| *r < 0 || new_gids.contains_key(r))
+                            {
+                                continue;
+                            }
+                            let Some(first_key) = src_keys.get(&raws[0]) else {
+                                continue;
+                            };
+                            if raws[1..].iter().any(|r| {
+                                src_keys.get(r).map(|k| k.format) != Some(first_key.format)
+                            }) {
+                                continue;
+                            }
+                            let gpu_key = ArenaKey {
+                                format: first_key.format,
+                                location: ArenaLocation::Gpu,
+                            };
+                            let run = self.alloc_chunk_run_for_key(gpu_key, raws.len())?;
+                            for (raw, gid) in raws.into_iter().zip(run) {
+                                new_gids.insert(raw, gid);
+                            }
+                        }
+                    }
+                }
+            }
             for &raw in &unique_raws {
+                if new_gids.contains_key(&raw) {
+                    continue;
+                }
                 let src_key = &src_keys[&raw];
                 let gpu_key = ArenaKey {
                     format: src_key.format,

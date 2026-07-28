@@ -1490,13 +1490,7 @@ pub fn paged_glue_attn(
     let zero_q = vec![0usize; b_sz];
     let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
     let header_upload = build_slot_headers(
-        caches,
-        &zero_q,
-        n_kv_head,
-        head_dim,
-        generation,
-        &glue_pm,
-        None,
+        caches, &zero_q, n_kv_head, head_dim, generation, &glue_pm, None,
     )?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);

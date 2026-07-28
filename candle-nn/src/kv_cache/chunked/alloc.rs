@@ -698,11 +698,20 @@ impl ChunkedKvBacking {
         let k_key = self.active_k_arena_key();
         let v_key = self.active_v_arena_key();
         let mut gids = Vec::with_capacity(n);
-        // For each head, allocate N_PALETTE K GIDs then N_PALETTE V GIDs in palette order.
+        // Per head: one CONTIGUOUS run of N_PALETTE K slots and one of V slots
+        // (see `alloc_chunk_run_for_key` — the select/QREL kernels walk all
+        // bands from band 0's pointer, so the run layout is load-bearing).
+        // HeadGids layout stays `head * GIDS_PER_HEAD + palette * 2 + is_value`.
         for _h in 0..self.inner.n_kv_head {
-            for _p in 0..N_PALETTE {
-                gids.push(self.alloc_chunk_for_key(k_key.clone())?);
-                gids.push(self.alloc_chunk_for_key(v_key.clone())?);
+            let k_run = self
+                .inner
+                .alloc_chunk_run_for_key(k_key.clone(), N_PALETTE)?;
+            let v_run = self
+                .inner
+                .alloc_chunk_run_for_key(v_key.clone(), N_PALETTE)?;
+            for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
+                gids.push(k_gid);
+                gids.push(v_gid);
             }
         }
 
@@ -725,6 +734,15 @@ impl ChunkedKvBacking {
         key: super::arena::ArenaKey,
     ) -> Result<super::gid_pool::ChunkGid> {
         self.inner.alloc_chunk_for_key(key)
+    }
+
+    /// See [`BackingInner::alloc_chunk_run_for_key`].
+    pub(super) fn alloc_chunk_run_for_key(
+        &self,
+        key: super::arena::ArenaKey,
+        len: usize,
+    ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        self.inner.alloc_chunk_run_for_key(key, len)
     }
 
     /// Bulk variant of [`Self::alloc_chunk_for_key`] — allocates `n`
@@ -776,6 +794,30 @@ impl BackingInner {
             .pool
             .allocate_for(key)
             .expect("just registered arena, must have capacity"))
+    }
+
+    /// Allocate `len` CONSECUTIVE slots in one arena of `key` — the layout
+    /// contract the paged select/QREL kernels rely on: a (chunk, head, side)'s
+    /// N_PALETTE band slots must be contiguous, because the kernels walk every
+    /// band from band 0's pointer. Singleton allocation only satisfies this
+    /// incidentally (fresh arenas fill sequentially); under free-list
+    /// recycling the bands scatter — foreign-band reads and an arena-tail
+    /// overrun (CUDA_ERROR_ILLEGAL_ADDRESS). Mirrors
+    /// [`Self::alloc_chunk_for_key`]'s register-on-exhaustion retry.
+    pub(super) fn alloc_chunk_run_for_key(
+        &self,
+        key: super::arena::ArenaKey,
+        len: usize,
+    ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        if let Some(gids) = self.pool.allocate_run_for(key.clone(), len) {
+            self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+            return Ok(gids);
+        }
+        let arena_idx = self.pool.register_arena(key.clone());
+        self.ensure_arena_exists(arena_idx, key.clone())?;
+        self.pool
+            .allocate_run_for(key, len)
+            .ok_or_else(|| candle::Error::Msg("fresh arena cannot fit palette run".into()))
     }
 
     /// Bulk allocator — mirrors [`Self::alloc_chunk_for_key`]'s

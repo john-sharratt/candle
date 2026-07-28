@@ -298,16 +298,17 @@ impl GpuChunksGuard<'_> {
         let buf = self.inner.buf.as_slice();
         let mut report = String::new();
         if n != chunks.len() {
-            report.push_str(&format!(
-                "COUNT cache={n} host={}; ",
-                chunks.len()
-            ));
+            report.push_str(&format!("COUNT cache={n} host={}; ", chunks.len()));
         }
         let mut scratch = vec![0u8; rec_bytes];
         for (i, cw) in chunks.iter().take(n).enumerate() {
             let hdr = &buf[i * SLICE_HEADER_BYTES..(i + 1) * SLICE_HEADER_BYTES];
             let got_ptr = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-            let resident = cw.meta.as_ref().map(|m| m.device_addr()).filter(|&a| a != 0);
+            let resident = cw
+                .meta
+                .as_ref()
+                .map(|m| m.device_addr())
+                .filter(|&a| a != 0);
             match resident {
                 Some(addr) => {
                     if got_ptr != addr {

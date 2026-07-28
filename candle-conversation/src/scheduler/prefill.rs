@@ -1738,9 +1738,7 @@ impl Scheduler {
                     }
                 }
             }
-            tracing::warn!(
-                "wave fault audit: {audited_clean} (seq,layer) caches byte-consistent"
-            );
+            tracing::warn!("wave fault audit: {audited_clean} (seq,layer) caches byte-consistent");
             let msg = format!("wave group forward failed: {err}");
             for m in members {
                 match *m {

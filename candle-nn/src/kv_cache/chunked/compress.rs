@@ -703,20 +703,44 @@ fn quantize_sealed_in_place_impl(
     let t_alloc = std::time::Instant::now();
     let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
     for chunk_i in 0..n_chunks {
+        // Per (head, side): resolve the N_PALETTE band formats up front. A
+        // uniform group allocates one CONTIGUOUS run (the select/QREL kernels
+        // walk all bands from band 0's pointer — see `alloc_chunk_run_for_key`);
+        // mixed-format groups (never select-walked as a unit) allocate per band.
+        let mut k_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
+        let mut v_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
+        for h in 0..n_kv_head {
+            let k_fmts: Vec<_> = (0..N_PALETTE)
+                .map(|p| {
+                    policy
+                        .override_k_quant
+                        .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p])
+                })
+                .collect();
+            let v_fmts: Vec<_> = (0..N_PALETTE)
+                .map(|p| {
+                    policy
+                        .override_v_quant
+                        .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p])
+                })
+                .collect();
+            let alloc_side = |fmts: &[crate::kv_cache::QuantFormat]| -> Result<Vec<ChunkGid>> {
+                if fmts.iter().all(|f| *f == fmts[0]) {
+                    backing.alloc_chunk_run_for_key(ArenaKey::gpu_quant(fmts[0]), N_PALETTE)
+                } else {
+                    fmts.iter()
+                        .map(|f| backing.alloc_chunk_for_key(ArenaKey::gpu_quant(*f)))
+                        .collect()
+                }
+            };
+            k_gids.push(alloc_side(&k_fmts)?);
+            v_gids.push(alloc_side(&v_fmts)?);
+        }
         let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
         for h in 0..n_kv_head {
             for p in 0..N_PALETTE {
-                let slot = h * N_PALETTE + p;
-                let k_fmt = policy
-                    .override_k_quant
-                    .unwrap_or(k_palette_formats[chunk_i][slot]);
-                let v_fmt = policy
-                    .override_v_quant
-                    .unwrap_or(v_palette_formats[chunk_i][slot]);
-                let k_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_quant(k_fmt))?;
-                let v_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_quant(v_fmt))?;
-                chunk_gids.push(k_gid);
-                chunk_gids.push(v_gid);
+                chunk_gids.push(k_gids[h][p].clone());
+                chunk_gids.push(v_gids[h][p].clone());
             }
         }
         new_gids_per_chunk.push(chunk_gids);

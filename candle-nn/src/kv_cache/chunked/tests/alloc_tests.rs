@@ -305,17 +305,18 @@ mod tests {
 
             let row = k_gid_snapshot(&backing)[4].clone();
 
-            // The 4 initial seqs filled contiguous slots 0..128 (fresh arena → the
-            // high-water mark hands them out in order). Freeing seqs 1 and 3 pushes
-            // their slots onto the recycle stack; the new alloc pops from it, so it
-            // reuses a freed slot in [0, 128) rather than growing the arena (which
-            // would hand out a slot ≥ 128 via the high-water mark). The recycle
-            // list is LIFO, so the exact slot is unspecified — and the free list
-            // deliberately no longer packs a chunk's sub-band gids contiguously
-            // (within-arena order is irrelevant to compaction).
+            // Writer-block band slots come from CONTIGUOUS high-water runs, never
+            // the recycle stack: the select/QREL kernels walk a (chunk, head,
+            // side)'s N_PALETTE bands from band 0's pointer, so recycled
+            // (scattered) singleton slots would break the layout the kernels
+            // assume (foreign-band reads + arena-tail overrun). The freed slots
+            // from seqs 1 and 3 remain for singleton allocs; this new block's
+            // bands take the next fresh run at/above the prior high-water mark
+            // and stay consecutive.
             assert!(
-                row[0] < 128,
-                "recycled K head-0 GID must reuse a freed slot in [0,128), got {}",
+                row[0] >= 128,
+                "run-allocated K head-0 GID must come from the fresh high-water \
+                 tail (>= 128), got {}",
                 row[0]
             );
         }
@@ -387,13 +388,14 @@ mod tests {
 
             let row = k_gid_snapshot(&backing)[4].clone();
             // The 4 initial seqs took contiguous slots 0..128 (high-water mark).
-            // Freeing seqs 1 and 3 returns their slots to the recycle stack, so
-            // the new alloc pops one back — reusing a slot in [0,128) rather than
-            // growing the arena (a fresh slot would be ≥ 128). LIFO order ⇒ the
-            // exact slot is unspecified.
+            // Freeing seqs 1 and 3 pushes their slots onto the recycle stack —
+            // available to singleton allocs — but writer-block band slots come
+            // from CONTIGUOUS high-water runs (the select/QREL layout contract),
+            // so the new block's gids land at/above the prior high-water mark.
             assert!(
-                row[0] < 128,
-                "recycled slot should reuse a freed GID in [0,128), got {}",
+                row[0] >= 128,
+                "run-allocated slot must come from the fresh high-water tail \
+                 (>= 128), got {}",
                 row[0]
             );
         }
@@ -480,13 +482,16 @@ mod tests {
 
             let row = k_gid_snapshot(&backing)[2].clone();
             // Seq 0 took slots [0,64) (two blocks), seq 1 took [64,128). Freeing
-            // seq 0 returns [0,64) to the recycle stack; seq 2's two blocks pop
-            // them all back, so both its K head-0 gids land in [0,64) — recycled,
-            // not freshly grown. LIFO order ⇒ the per-block positions are
-            // unspecified, so assert membership rather than exact values.
+            // seq 0 pushes [0,64) onto the recycle stack — but writer-block band
+            // slots come from CONTIGUOUS high-water runs (the select/QREL layout
+            // contract; see `alloc_chunk_run_for_key`), never recycled
+            // singletons. Seq 2's blocks therefore take fresh runs at/above the
+            // prior high-water mark; the freed slots stay available for
+            // singleton allocs.
             assert!(
-                row[0] < 64 && row[1] < 64,
-                "both blocks should recycle seq 0's freed slots in [0,64), got {row:?}"
+                row[0] >= 128 && row[1] >= 128,
+                "run-allocated blocks must come from the fresh high-water tail \
+                 (>= 128), got {row:?}"
             );
         }
 
@@ -656,7 +661,10 @@ mod tests {
                 (5, CHUNK_SIZE as u16 - 5),
                 "usage=5, offset=27 (full: offset+usage==CHUNK_SIZE)"
             );
-            assert_eq!(block_count(&backing, 0), 1);
+            // Gap + the empty writer chunk pushed after it (the immutable gap
+            // must never be the slot's writable tail — see
+            // `reserve_glue_gap_chunk`).
+            assert_eq!(block_count(&backing, 0), 2);
         }
 
         #[test]
@@ -680,13 +688,16 @@ mod tests {
             // chunk's rope_base (Σ preceding usage) is its logical start.
             let backing = create_test_backing();
             backing.alloc_sequence().unwrap();
-            backing.reserve_glue_gap_chunk(0, 3).unwrap(); // logical [0,3)
-            backing.reserve_glue_gap_chunk(0, 7).unwrap(); // logical [3,10)
-            backing.reserve_glue_gap_chunk(0, 2).unwrap(); // logical [10,12)
+            // Each reserve pushes [gap, empty writer]: gaps land at even block
+            // indices, zero-usage writer chunks between them (they don't move
+            // the cumulative rope base).
+            backing.reserve_glue_gap_chunk(0, 3).unwrap(); // logical [0,3) at blk 0
+            backing.reserve_glue_gap_chunk(0, 7).unwrap(); // logical [3,10) at blk 2
+            backing.reserve_glue_gap_chunk(0, 2).unwrap(); // logical [10,12) at blk 4
             assert_eq!(rope_base_of(&backing, 0, 0), 0, "gap0 base");
-            assert_eq!(rope_base_of(&backing, 0, 1), 3, "gap1 base = Σ(3)");
-            assert_eq!(rope_base_of(&backing, 0, 2), 10, "gap2 base = Σ(3,7)");
-            assert_eq!(rope_base_of(&backing, 0, 3), 12, "end = Σ(3,7,2)");
+            assert_eq!(rope_base_of(&backing, 0, 2), 3, "gap1 base = Σ(3)");
+            assert_eq!(rope_base_of(&backing, 0, 4), 10, "gap2 base = Σ(3,7)");
+            assert_eq!(rope_base_of(&backing, 0, 5), 12, "end = Σ(3,7,2)");
         }
 
         #[test]
