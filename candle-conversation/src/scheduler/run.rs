@@ -3,7 +3,19 @@ use super::*;
 use std::time::Instant;
 
 /// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
-const DECODE_BUDGET: usize = 32;
+/// ABLATION (diagnostic, temporary): override via `ZEND_DECODE_BUDGET` to test
+/// whether the quantum length (steps between outer-loop request/seal/maintenance
+/// interleaves) is the stored-summary drift ingredient — `1` emulates the
+/// pre-CFW per-step cadence.
+fn decode_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("ZEND_DECODE_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32)
+    })
+}
 
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
@@ -64,7 +76,7 @@ impl Scheduler {
         self.drain_pending_reprojections();
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
-        for _ in 0..DECODE_BUDGET {
+        for _ in 0..decode_budget() {
             if self.decode_width() == 0 {
                 // No live decode work, but there may be sequences inserted as
                 // finished during the prefill phase (EOS on first token) that
