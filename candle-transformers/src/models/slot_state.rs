@@ -365,6 +365,15 @@ impl TokenSliceHost {
         // (the dominant per-layer-per-forward cost); the slice will carry the
         // record's device address as `kvheads_ptr`. Only transient/float chunks
         // (`meta.is_none()`) build a scratch record from `heads`.
+        // ABLATION (diagnostic, temporary): ZEND_NO_RESIDENT_META forces every
+        // slice onto the scratch path — records rebuilt from gids each forward —
+        // to test whether stale resident-record CONTENT (raw chunk pointers
+        // serialized at record-build time) is the bulk-ingest illegal-address
+        // faulter. Remove after the verdict.
+        static NO_RESIDENT_META: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_resident =
+            *NO_RESIDENT_META.get_or_init(|| std::env::var("ZEND_NO_RESIDENT_META").is_ok());
+        let meta = if no_resident { None } else { meta };
         let heads: Vec<KvHeadHost> = if meta.is_some() {
             Vec::new()
         } else {

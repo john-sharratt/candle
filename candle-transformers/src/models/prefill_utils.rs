@@ -90,6 +90,7 @@ fn build_slot_headers(
     head_dim: usize,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
+    expected_offsets: Option<&[usize]>,
 ) -> Result<SlotHeaderUpload> {
     let t_build = profile_now();
     let arena_info = {
@@ -164,6 +165,23 @@ fn build_slot_headers(
                 ));
             }
         });
+        // Count invariant: the slices must cover EXACTLY the slot's recorded
+        // sealed-KV offset. A shortfall means the block table lost chunks (the
+        // host-side "computed write len N is invalid" class); the kernel would
+        // seek a token past the covered range and walk off the END of the slice
+        // array into adjacent stager memory — garbage headers, garbage
+        // kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS with no attribution.
+        if let Some(expected) = expected_offsets {
+            let want = expected[slot_i];
+            if (cum as usize) != want {
+                candle::bail!(
+                    "slot header build: batch slot {slot_i} slices cover {cum} tokens \
+                     but the slot's recorded offset is {want} ({} slices) — block \
+                     table lost chunks",
+                    slices.len()
+                );
+            }
+        }
         slots.push(SlotStateHost::from_slices(
             slices,
             writer_start_idx,
@@ -592,8 +610,15 @@ fn paged_prefill_batched_impl(
         }
     };
 
-    let header_upload =
-        build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation, shared_pm)?;
+    let header_upload = build_slot_headers(
+        caches,
+        q_lens,
+        n_kv_head,
+        head_dim,
+        generation,
+        shared_pm,
+        Some(offsets),
+    )?;
     let headers_ptr = header_upload.headers_ptr;
 
     profile_sync(q.device());
@@ -1464,8 +1489,15 @@ pub fn paged_glue_attn(
     // does not extend a write region. Built fresh every call (always-miss).
     let zero_q = vec![0usize; b_sz];
     let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
-    let header_upload =
-        build_slot_headers(caches, &zero_q, n_kv_head, head_dim, generation, &glue_pm)?;
+    let header_upload = build_slot_headers(
+        caches,
+        &zero_q,
+        n_kv_head,
+        head_dim,
+        generation,
+        &glue_pm,
+        None,
+    )?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);
 
