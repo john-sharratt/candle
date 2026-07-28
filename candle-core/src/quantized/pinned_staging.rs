@@ -79,6 +79,12 @@ impl Drop for Generation {
             // Re-check: another generation may have started between our
             // unlock and re-lock.
             if inner.live_generations == 0 {
+                tracing::debug!(
+                    target: "candle_core::pinned_staging",
+                    arenas = inner.arenas.len(),
+                    thread = ?std::thread::current().id(),
+                    "stager arena reset (last generation dropped)"
+                );
                 for a in inner.arenas.iter_mut() {
                     a.reset();
                 }
@@ -601,6 +607,13 @@ impl PinnedStager {
             // resetting. This keeps all previously-submitted bump pointers
             // valid while maintaining zero-copy bump allocation performance.
             if inner.live_generations > 0 {
+                tracing::debug!(
+                    target: "candle_core::pinned_staging",
+                    live_generations = inner.live_generations,
+                    arenas = inner.arenas.len(),
+                    thread = ?std::thread::current().id(),
+                    "stager arena full — adding overflow arena"
+                );
                 let overflow = PinnedArena::new(inner.arena_size)?;
                 inner.arenas.push(overflow);
                 inner.bump_outstanding += 1;
@@ -752,6 +765,11 @@ impl PinnedStager {
 
     /// Sync stream and reset arenas (for when arena is full).
     fn sync_and_reset_arena(&self) -> Result<()> {
+        tracing::debug!(
+            target: "candle_core::pinned_staging",
+            thread = ?std::thread::current().id(),
+            "stager arena full with no live generations — sync + reset"
+        );
         let (dev, explicit_stream) = {
             let inner = self.inner.lock().unwrap();
             (inner.dev.clone(), inner.explicit_stream.clone())

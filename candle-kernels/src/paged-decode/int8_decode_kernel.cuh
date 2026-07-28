@@ -1628,7 +1628,8 @@ inline int fused_attn_sm_count() {
 // grow, never in the steady-state timed path. Single-stream decode only (the
 // pool is process-global, not per-stream).
 inline void fused_attn_partial_pool(
-    int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out
+    int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out,
+    cudaStream_t stream
 ) {
     static float* g_acc = nullptr;
     static float* g_ml  = nullptr;
@@ -1637,14 +1638,24 @@ inline void fused_attn_partial_pool(
     int64_t need_acc = rows * splits * head_dim;
     int64_t need_ml  = rows * splits * 2;
     if (need_acc > g_cap_acc) {
-        if (g_acc) cudaFree(g_acc);
+        if (g_acc) {
+            // Drain the stream before freeing: cudaFree is not stream-ordered,
+            // and an earlier split launch on this stream may still be writing
+            // the old pool. Growth is rare (a new high-water row count), so
+            // the sync cost is amortized away.
+            cudaStreamSynchronize(stream);
+            cudaFree(g_acc);
+        }
         if (cudaMalloc(&g_acc, (size_t)need_acc * sizeof(float)) != cudaSuccess) {
             g_acc = nullptr; g_cap_acc = 0; *acc_out = nullptr; *ml_out = nullptr; return;
         }
         g_cap_acc = need_acc;
     }
     if (need_ml > g_cap_ml) {
-        if (g_ml) cudaFree(g_ml);
+        if (g_ml) {
+            cudaStreamSynchronize(stream);
+            cudaFree(g_ml);
+        }
         if (cudaMalloc(&g_ml, (size_t)need_ml * sizeof(float)) != cudaSuccess) {
             g_ml = nullptr; g_cap_ml = 0; *acc_out = nullptr; *ml_out = nullptr; return;
         }
@@ -1706,7 +1717,7 @@ void launch_int8_decode_attn(
         float* pm = nullptr;
         if (need_pool) {
             fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, partials_per_row,
-                                    HEAD_DIM, &pa, &pm);
+                                    HEAD_DIM, &pa, &pm, stream);
         }
 
         dim3 grid(num_active_slots, n_kv_head, num_splits);
