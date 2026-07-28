@@ -351,6 +351,21 @@ impl BackingInner {
         fragmentation_threshold: f32,
         max_moves: usize,
     ) -> Result<usize> {
+        // Single-slot relocation is DISABLED for GPU arenas: the select/QREL
+        // kernels walk a (chunk, head, side)'s N_PALETTE band slots from band
+        // 0's pointer, so every allocation path mints them as CONTIGUOUS runs
+        // (`alloc_chunk_run_for_key`) — and a defrag pass that moves slots
+        // one at a time scatters those runs again, re-arming the foreign-band
+        // reads and arena-tail overruns (CUDA_ERROR_ILLEGAL_ADDRESS) the run
+        // allocator exists to prevent. VRAM reclaim still happens through the
+        // empty-arena sweep + pool trim (which move nothing). Relocation can
+        // return once it moves band GROUPS as units, or once the kernels
+        // address each band through its own gid.
+        let _ = (fragmentation_threshold, max_moves);
+        if true {
+            return Ok(0);
+        }
+        #[allow(unreachable_code)]
         if !self.pool.needs_defragmentation(fragmentation_threshold) {
             return Ok(0);
         }

@@ -1414,20 +1414,37 @@ impl ChunkedKvBacking {
         use std::mem::MaybeUninit;
         let t_pool = std::time::Instant::now();
         let gids_per_spec = GIDS_PER_HEAD * n_kv_head;
+        // Uniform (head, side) band groups allocate as CONTIGUOUS runs (the
+        // select/QREL layout contract — see `alloc_chunk_run_for_key`); only
+        // mixed-format groups fall through to the batched singleton path
+        // below, whose recycle-stack pops scatter.
+        let mut run_groups: Vec<(usize, usize, bool, ArenaKey)> = Vec::new();
         let mut positions_per_key: ahash::HashMap<ArenaKey, Vec<(usize, usize)>> =
             ahash::HashMap::with_capacity_and_hasher(8, ahash::RandomState::new());
         for (s_idx, spec) in specs.iter().enumerate() {
             for h in 0..n_kv_head {
-                for p in 0..N_PALETTE {
-                    let sub = h * N_PALETTE + p;
-                    positions_per_key
-                        .entry(ArenaKey::uniform(spec.k_formats[sub], location))
-                        .or_default()
-                        .push((s_idx, sub * 2));
-                    positions_per_key
-                        .entry(ArenaKey::uniform(spec.v_formats[sub], location))
-                        .or_default()
-                        .push((s_idx, sub * 2 + 1));
+                let base = h * N_PALETTE;
+                let kf = &spec.k_formats[base..base + N_PALETTE];
+                if kf.iter().all(|f| *f == kf[0]) {
+                    run_groups.push((s_idx, base, false, ArenaKey::uniform(kf[0], location)));
+                } else {
+                    for p in 0..N_PALETTE {
+                        positions_per_key
+                            .entry(ArenaKey::uniform(kf[p], location))
+                            .or_default()
+                            .push((s_idx, (base + p) * 2));
+                    }
+                }
+                let vf = &spec.v_formats[base..base + N_PALETTE];
+                if vf.iter().all(|f| *f == vf[0]) {
+                    run_groups.push((s_idx, base, true, ArenaKey::uniform(vf[0], location)));
+                } else {
+                    for p in 0..N_PALETTE {
+                        positions_per_key
+                            .entry(ArenaKey::uniform(vf[p], location))
+                            .or_default()
+                            .push((s_idx, (base + p) * 2 + 1));
+                    }
                 }
             }
         }
@@ -1449,6 +1466,13 @@ impl ChunkedKvBacking {
         for (key, positions) in positions_per_key {
             let gids = self.alloc_chunks_for_key_bulk(key, positions.len())?;
             for (gid, (s_idx, gid_idx)) in gids.into_iter().zip(positions) {
+                spec_buffers[s_idx][gid_idx].write(gid);
+            }
+        }
+        for (s_idx, base, is_v, key) in run_groups {
+            let run = self.alloc_chunk_run_for_key(key, N_PALETTE)?;
+            for (p, gid) in run.into_iter().enumerate() {
+                let gid_idx = (base + p) * 2 + usize::from(is_v);
                 spec_buffers[s_idx][gid_idx].write(gid);
             }
         }
