@@ -5981,7 +5981,15 @@ impl Scheduler {
         // glue K/V into whatever this rebuild placed at those indices. Drop the
         // superseded plan and defer only this latest projection, so exactly one
         // (current) plan fires against the slot as this call built it.
-        let defer = if self.batch_drain_gap_fills {
+        // ABLATION (diagnostic, temporary): with ZEND_ABLATE_WAVE_GLUE set,
+        // never defer gap-fills into the wave-folded glue group — fire them
+        // immediately through the dedicated `fire_gap_fill_batch` forward (the
+        // 50ca23a8 path). Tests whether the wave-glue write path (GlueMeta /
+        // paged-glue kernel co-batch) subtly corrupts the role-seam KV it
+        // scatters — the drift's role-confusion phenotype.
+        let defer = if self.batch_drain_gap_fills
+            && std::env::var("ZEND_ABLATE_WAVE_GLUE").is_err()
+        {
             self.deferred_glue_fires
                 .retain(|p| p.parent_id != parent_id);
             Some(&mut self.deferred_glue_fires)
