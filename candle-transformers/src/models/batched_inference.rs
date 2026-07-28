@@ -2253,6 +2253,47 @@ impl BatchedInferenceSession {
         }
     }
 
+    /// Token count actually covered by a sequence's live block table — the sum
+    /// of live-chunk token counts in the layer-0 backing, i.e. exactly the
+    /// `cum` the slot-header build walks (all layers share chunk boundaries).
+    /// This is the physical ground truth the wave-boundary offset reconciler
+    /// compares `session.offset` against; `current_seq_len` is the write
+    /// cursor and reads 0 for freshly injected slots whose tables already
+    /// hold sealed tokens, so it cannot serve as the backing length.
+    pub fn sequence_backing_tokens(&self, idx: usize) -> Option<usize> {
+        let caches = self.sequence_caches(idx)?;
+        let cache = caches.caches.first()?;
+        let mut cum: usize = 0;
+        cache.k_cache().chunked_visit_live_chunks(|it| {
+            for c in it {
+                cum += c.token_count as usize;
+            }
+        });
+        Some(cum)
+    }
+
+    /// Set a sequence's logical offset outright. Used by the wave-boundary
+    /// offset reconciler to clamp a slot whose offset ran AHEAD of its physical
+    /// backing (a projection that dropped un-liftable sections injects fewer
+    /// tokens than the planner counted): every wave's kv metadata is derived
+    /// from this offset, and the attention kernels resolve each position
+    /// through the slot's physical block table — an offset past the backing
+    /// sends them past the end of the slot's staged state into neighboring
+    /// uploads. The backing length is the single source of truth at a wave
+    /// boundary; positions are slot-relative (slice ropes), so the clamped
+    /// value is also the correct RoPE base for new tokens.
+    pub fn set_sequence_offset(&mut self, idx: usize, offset: usize) -> Result<()> {
+        if idx >= self.sequences.len() {
+            candle::bail!("invalid sequence index {}", idx);
+        }
+        if let Some(ref mut state) = self.sequences[idx] {
+            state.offset = offset;
+            Ok(())
+        } else {
+            candle::bail!("sequence {} not allocated", idx);
+        }
+    }
+
     /// Record a turn boundary for a sequence, capturing the current KV state.
     ///
     /// Commits the active window to `recorded_metas` and returns a `SealedSequence`
@@ -3040,6 +3081,47 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
         let stager_generation = session.begin_stager_generation();
 
+        // Forward-entry invariant: every member's logical offset must equal
+        // the token count its live block table covers. The varlen metadata
+        // (`cu_seqlens`/`kv_lens`) below is built from the offsets, while the
+        // per-layer slot headers are built from the block tables — the
+        // attention kernels resolve every `[0, kv_len)` position through the
+        // table, so any divergence walks them past the slot's span in the
+        // packed staged uploads (garbage slice indices → wild record pointers
+        // → CUDA_ERROR_ILLEGAL_ADDRESS, or silent cross-slot reads). Offsets
+        // run AHEAD of the backing when a projection drops sections it could
+        // not lift to hot under VRAM pressure; they run BEHIND after glue
+        // reserves gap chunks the wave didn't reflect. Positions are
+        // slot-relative (slice ropes), so the backing length is also the
+        // correct RoPE base either way. This is the choke point every
+        // forward passes through — wave steps, deferred projection gap-fills,
+        // and probes alike.
+        for ids in [decode_seqs, prefill_seqs, glue_seqs] {
+            for &i in ids {
+                let off = session.sequence_offset(i).unwrap_or(0);
+                let backing = session.sequence_backing_tokens(i).unwrap_or(off);
+                if backing != off {
+                    if backing < off {
+                        tracing::warn!(
+                            seq = i,
+                            offset = off,
+                            backing,
+                            "sequence offset AHEAD of backing at forward entry — \
+                             clamped down (projection dropped un-liftable sections)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            seq = i,
+                            offset = off,
+                            backing,
+                            "sequence offset behind backing at forward entry — advanced"
+                        );
+                    }
+                    session.set_sequence_offset(i, backing)?;
+                }
+            }
+        }
+
         // Per-group offsets + query lengths.
         let dev = self.device();
         let seq_off = |ids: &[usize]| -> Vec<usize> {
@@ -3124,6 +3206,26 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         all_seqs.extend_from_slice(&proc_decode_seqs);
         all_seqs.extend_from_slice(&proc_prefill_seqs);
         all_seqs.extend_from_slice(glue_seqs);
+        // A sequence id must appear in exactly ONE group: `caches_for_sequences_mut`
+        // yields one entry per unique id, so a duplicate COLLAPSES the context
+        // list and shifts every later member's cache against the group varlen
+        // metadata built above — slot headers then describe a different
+        // sequence than the kernel's cu_seqlens/kv_lens entry, and the kernel
+        // walks past the (shorter) slot's staged state into neighboring
+        // uploads. Fail loudly instead.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(all_seqs.len());
+            for &id in &all_seqs {
+                if !seen.insert(id) {
+                    candle::bail!(
+                        "forward wave: sequence {id} appears in more than one group \
+                         (decode {proc_decode_seqs:?} | prefill {proc_prefill_seqs:?} \
+                         | glue {glue_seqs:?}) — the context list would collapse and \
+                         desync every later member's cache from its metadata"
+                    );
+                }
+            }
+        }
         let mut all_inputs: Vec<&Tensor> = Vec::with_capacity(all_seqs.len());
         all_inputs.extend(proc_decode_inputs.iter());
         all_inputs.extend(proc_prefill_inputs.iter());

@@ -76,6 +76,15 @@ pub struct SharedPm {
     base_ptr: u64,
     /// Per-slot byte offset into the packed buffer, in slot order.
     byte_offsets: Vec<usize>,
+    /// Per-slot `(n_slices, covered_tokens)` at map build time, in slot order.
+    /// The map encodes `(slice_idx, in_blk)` pairs that index THAT layout's
+    /// slice array; every later layer re-derives its slice list from live
+    /// state and must match this shape exactly, or the kernel would resolve
+    /// positions through a stale map into a different slice list — a wild
+    /// `slice_idx` walks off the slice array into unrelated stager memory and
+    /// dereferences a garbage `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with
+    /// no attribution). Checked on every cache hit in `build_slot_headers`.
+    per_slot_shape: Vec<(u32, u32)>,
 }
 
 /// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
@@ -114,6 +123,9 @@ fn build_slot_headers(
     // arena_byte_size walks measured ~0.5 ms per layer-call at deep
     // prefixes, ~30x the slice build itself).
     let mut slots: Vec<SlotStateHost> = Vec::with_capacity(caches.len());
+    // Per-slot prefix token count (sum of live-chunk token counts), captured
+    // for the position-map shape guard below.
+    let mut slot_prefix: Vec<u32> = Vec::with_capacity(caches.len());
     // Reference pin: every chunk the headers will address (see
     // `SlotHeaderUpload::_pinned_gids`).
     let mut pinned_gids: Vec<HeadGids> = Vec::new();
@@ -182,6 +194,7 @@ fn build_slot_headers(
                 );
             }
         }
+        slot_prefix.push(cum);
         slots.push(SlotStateHost::from_slices(
             slices,
             writer_start_idx,
@@ -205,6 +218,46 @@ fn build_slot_headers(
     if !pm_cached {
         for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
             slot.extend_for_write_region(add, chunk_size);
+        }
+    }
+    // Position-map shape guard (cache hits): the cached map was built from an
+    // earlier layer's slice layout; the kernel resolves every k_pos through it
+    // into THIS layer's slice array. If any slot's layout changed since the
+    // build — a chunk boundary moved, a chunk appeared or vanished — the map's
+    // `(slice_idx, in_blk)` entries index the wrong slices, and a slice_idx
+    // past this layer's slice count sends the kernel through a garbage
+    // `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with no attribution). Refuse
+    // to launch and name the slot + shape delta instead.
+    if pm_cached {
+        let cache = shared_pm.borrow();
+        let s = cache
+            .as_ref()
+            .expect("pm_cached implies shared_pm is populated");
+        if s.per_slot_shape.len() != slots.len() {
+            candle::bail!(
+                "slot header build: cached position_map covers {} slots but this \
+                 layer has {} — wave membership changed mid-forward",
+                s.per_slot_shape.len(),
+                slots.len()
+            );
+        }
+        for (i, slot) in slots.iter().enumerate() {
+            let (want_slices, want_covered) = s.per_slot_shape[i];
+            let this_covered = slot_prefix[i].saturating_add(q_lens[i] as u32);
+            if slot.slices.len() as u32 != want_slices || this_covered != want_covered {
+                candle::bail!(
+                    "slot header build: batch slot {i} slice layout changed \
+                     mid-forward under the cached position_map: map was built \
+                     over {want_slices} slices / {want_covered} covered tokens, \
+                     this layer has {} slices / {} covered tokens (prefix {} + \
+                     q_len {}) — a concurrent mutation moved the slot's chunk \
+                     boundaries between layers",
+                    slot.slices.len(),
+                    this_covered,
+                    slot_prefix[i],
+                    q_lens[i]
+                );
+            }
         }
     }
     pipeline_record("slot:build", t_build);
@@ -317,10 +370,15 @@ fn build_slot_headers(
         pm_pinned.copy_from_slice(pm_bytes);
         let pm_gpu = generation.submit(pm_pinned)?;
         let base_ptr = pm_gpu.dev_ptr();
+        let per_slot_shape: Vec<(u32, u32)> = slots
+            .iter()
+            .map(|s| (s.slices.len() as u32, s.position_map.len() as u32))
+            .collect();
         *shared_pm.borrow_mut() = Some(SharedPm {
             _gpu: pm_gpu,
             base_ptr,
             byte_offsets: byte_offsets.clone(),
+            per_slot_shape,
         });
         byte_offsets
     };

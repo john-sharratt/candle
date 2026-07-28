@@ -193,11 +193,26 @@ impl Scheduler {
     /// Each sequence contributes exactly 1 token (its last generated token).
     /// One batched `forward_batched` call processes all sequences in parallel.
     pub(super) fn batch_decode_step(&mut self) {
+        // A slot with a pending deferred glue fire reprojects THIS wave (the
+        // co-batched glue member rewrites its `[sealed | glue]` prefix), so its
+        // logical offset and block table are mid-rewrite. It must not also run
+        // a decode step this wave: the wave would then list the same slot in
+        // both the decode and glue groups, and the per-unique-id cache borrow
+        // (`caches_for_sequences_mut`) collapses the assembled context list,
+        // desyncing every later member's varlen metadata from its slot headers.
+        // Skip it here; its decode resumes next wave against the reprojected
+        // backing (the glue fire drains in `take_wave_glue` during this step).
+        let glue_pending: std::collections::HashSet<usize> = self
+            .deferred_glue_fires
+            .iter()
+            .map(|p| p.parent_id.0)
+            .collect();
         let seq_ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
             .map(|(&id, _)| id)
+            .filter(|id| !glue_pending.contains(&id.0))
             .collect();
 
         if seq_ids.is_empty() {
