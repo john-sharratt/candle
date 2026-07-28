@@ -1165,7 +1165,7 @@ impl Sequence {
             .max_tokens
             .unwrap_or(self.config.max_response_tokens);
 
-        tracing::debug!(
+        tracing::trace!(
             max_decode_tokens = max_tokens,
             forced_eos_after = sampling.forced_eos_after,
             graceful_eos_after = sampling.graceful_eos_after,

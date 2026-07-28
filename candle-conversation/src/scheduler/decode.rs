@@ -267,26 +267,6 @@ impl Scheduler {
         let logits_vec = match self.decode_forward_cobatched(&seq_ids_raw, &inputs) {
             Ok(l) => l,
             Err(e) => {
-                // Fault-time audit: byte-compare each failed slot's cached
-                // device slot-state (the table the decode kernel actually read)
-                // against a fresh re-serialization from the live block table +
-                // arena registry. A mismatch names the exact stale chunk record
-                // and the embedded value the kernel dereferenced — host-side,
-                // unaffected by the poisoned CUDA context.
-                let mut audited_clean = 0usize;
-                for &sid in &seq_ids_raw {
-                    for (layer, backing) in self.session.backings().iter().enumerate() {
-                        match backing.audit_gpu_chunks_report(sid) {
-                            Some(report) => tracing::warn!(
-                                "decode fault audit: seq {sid} layer {layer}: {report}"
-                            ),
-                            None => audited_clean += 1,
-                        }
-                    }
-                }
-                tracing::warn!(
-                    "decode fault audit: {audited_clean} (seq,layer) caches byte-consistent"
-                );
                 self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
                 return;
             }
@@ -414,31 +394,12 @@ impl Scheduler {
         let sample_ms = t_sample.elapsed().as_millis() as u64;
         super::record_phase(t_sample, "decode_sample");
 
-        // Summary/compression turns decode in the background and, three half-
-        // passes deep, flood the default DEBUG view.  When *every* sequence in
-        // this batch is a compression turn, log the step at TRACE so a real
-        // foreground decode stays readable at DEBUG; mixed/normal batches stay
-        // DEBUG.
-        let all_compression = !seq_ids.is_empty()
-            && seq_ids.iter().all(|id| {
-                self.active_decodes.get(id).is_some_and(|s| {
-                    matches!(
-                        s.seal_action,
-                        SealAction::CompressionPass { .. } | SealAction::CompressionTurn { .. }
-                    )
-                })
-            });
-
         // Pre-decode the sampled tokens into a readable string for the timing
-        // trace.  Only built when the level it will be logged at is actually
-        // active (gated by `tracing::enabled!`) so the tokenizer call doesn't
-        // fire on the hot path under default logging.  Multi-sequence batches
-        // join the per-sequence fragments with `|`.
-        let want_token_str = if all_compression {
-            tracing::enabled!(target: "candle_conversation::scheduler::timing", tracing::Level::TRACE)
-        } else {
-            tracing::enabled!(target: "candle_conversation::scheduler::timing", tracing::Level::DEBUG)
-        };
+        // trace.  Only built when TRACE is active (gated by `tracing::enabled!`)
+        // so the tokenizer call doesn't fire on the hot path under default
+        // logging.  Multi-sequence batches join the per-sequence fragments
+        // with `|`.
+        let want_token_str = tracing::enabled!(target: "candle_conversation::scheduler::timing", tracing::Level::TRACE);
         let token_str: String = if want_token_str {
             let skip = !self.show_special_tokens;
             // Slot-labelled (`seq:token`): each fragment attributes to its slot
@@ -460,25 +421,14 @@ impl Scheduler {
             String::new()
         };
 
-        if all_compression {
-            tracing::trace!(
-                target: "candle_conversation::scheduler::timing",
-                batch = seq_ids.len(),
-                fwd_ms,
-                sample_ms,
-                token_str = %token_str,
-                "decode_step",
-            );
-        } else {
-            tracing::debug!(
-                target: "candle_conversation::scheduler::timing",
-                batch = seq_ids.len(),
-                fwd_ms,
-                sample_ms,
-                token_str = %token_str,
-                "decode_step",
-            );
-        }
+        tracing::trace!(
+            target: "candle_conversation::scheduler::timing",
+            batch = seq_ids.len(),
+            fwd_ms,
+            sample_ms,
+            token_str = %token_str,
+            "decode_step",
+        );
 
         // Advance each sequence's tool-call stencil with the token just sampled:
         // feed it into an active walk, or start a walk if it is a trigger token

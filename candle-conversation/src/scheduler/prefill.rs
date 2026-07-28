@@ -1722,23 +1722,6 @@ impl Scheduler {
         if candle_nn::kv_cache::is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
         } else {
-            // Fault-time audit (see the decode-side hook): byte-compare every
-            // wave member's cached device slot-state against a fresh
-            // re-serialization, so a stale embedded pointer is named host-side.
-            let mut audited_clean = 0usize;
-            for m in members {
-                if let WaveMember::Prefill { seq_id } = *m {
-                    for (layer, backing) in self.session.backings().iter().enumerate() {
-                        match backing.audit_gpu_chunks_report(seq_id) {
-                            Some(report) => tracing::warn!(
-                                "wave fault audit: seq {seq_id} layer {layer}: {report}"
-                            ),
-                            None => audited_clean += 1,
-                        }
-                    }
-                }
-            }
-            tracing::warn!("wave fault audit: {audited_clean} (seq,layer) caches byte-consistent");
             let msg = format!("wave group forward failed: {err}");
             for m in members {
                 match *m {
@@ -2400,7 +2383,7 @@ impl Scheduler {
         // (temp>0 + top_k/top_p) or greedy (temp≈0 → argmax), and at what context
         // depth. Enable with
         // `RUST_LOG=candle_conversation::scheduler::decode=debug`.
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::decode",
             seq = work.sequence_id.0,
             context_depth,

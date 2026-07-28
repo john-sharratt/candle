@@ -642,11 +642,11 @@ impl SamplingConfig {
     pub fn resolve_thinking_tokens(&mut self, tokenizer: &tokenizers::Tokenizer) {
         if let Some(id) = tokenizer.token_to_id("</think>") {
             self.segment_close_token_id = id as i32;
-            tracing::debug!("Resolved </think> token ID: {}", id);
+            tracing::trace!("Resolved </think> token ID: {}", id);
         }
         if let Some(id) = tokenizer.token_to_id("<think>") {
             self.segment_open_token_id = id as i32;
-            tracing::debug!("Resolved <think> token ID: {}", id);
+            tracing::trace!("Resolved <think> token ID: {}", id);
         }
         // Resolve sentence-end token IDs for graceful_segment_close_after.
         // We probe both the bare character and common BPE compound forms.
@@ -659,7 +659,7 @@ impl SamplingConfig {
                 }
             }
         }
-        tracing::debug!(
+        tracing::trace!(
             "Resolved {} sentence-end token IDs: {:?}",
             self.sentence_end_token_ids.len(),
             self.sentence_end_token_ids
@@ -691,7 +691,7 @@ impl SamplingConfig {
                 }
             }
         }
-        tracing::debug!(
+        tracing::trace!(
             "Resolved {} reflection-marker suppress token IDs: {:?}",
             self.segment_suppress_tokens.len(),
             self.segment_suppress_tokens
@@ -1254,7 +1254,7 @@ impl DecodeHealthConfig {
             add(&s);
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "Resolved {} structural token IDs: {:?}",
             self.structural_token_ids.len(),
             self.structural_token_ids
