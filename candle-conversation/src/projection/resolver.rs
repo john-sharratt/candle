@@ -237,6 +237,13 @@ impl Conversation {
             .set_timeline_summarize(timeline, summarize);
     }
 
+    /// Mark `layer` as an append-only ingest layer (code_reading/repo_map) so
+    /// projections targeting it score/select self-local. See
+    /// [`crate::substrate::Substrate::mark_layer_append_only`].
+    pub fn mark_layer_append_only(&self, layer: LayerId) {
+        self.inner.write().unwrap().mark_layer_append_only(layer);
+    }
+
     /// Acquire an unscored read guard.  The returned guard implements
     /// [`ContentResolver`] but every score lookup returns zero —
     /// appropriate for callers reading structural fields (turn counts,
@@ -604,6 +611,12 @@ impl Conversation {
             return per_group;
         }
         let sub = self.inner.read().unwrap();
+        // Self-local when the target is an append-only ingest layer: mask EVERY
+        // belief group to the target timeline, so an ingest scope-summary scores
+        // only its own scope (mirror of the `TargetedRead::group_turns` selection
+        // mask). Dialogue targets are never append-only, so cross-file scoring
+        // there is untouched.
+        let self_local = sub.is_append_only_layer(target.layer);
         for group in &layer.groups {
             if !group.is_belief_driven() {
                 continue;
@@ -615,7 +628,7 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
-            let timelines: Vec<TimelineId> = if group.id == target.group {
+            let timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
                 sub.active_timelines_for_group(group.id).collect()
@@ -2111,7 +2124,12 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         let turns_of = |tl: TimelineId| {
             (0..Substrate::turn_count(&self.read, tl)).map(move |i| TurnKey::new(tl, TurnIndex(i)))
         };
-        if group == self.target.group {
+        // Self-local: the target group is always masked to the target timeline
+        // (a slot never sees a sibling chat); when the target is an append-only
+        // ingest layer (code_reading/repo_map), EVERY group is masked the same way
+        // so a scope summary is grounded only in its own scope — the multi-timeline
+        // scan (cross-file retrieval) belongs to dialogue, not ingest generation.
+        if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
             return turns_of(self.target.timeline).collect();
         }
         self.read
@@ -2139,7 +2157,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         let find = |tl: TimelineId| {
             Substrate::turn_with_tag(&self.read, tl, tag).map(|idx| TurnKey::new(tl, idx))
         };
-        if group == self.target.group {
+        // Self-local on an append-only ingest target — see `group_turns`.
+        if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
             return find(self.target.timeline);
         }
         self.read.active_timelines_for_group(group).find_map(find)

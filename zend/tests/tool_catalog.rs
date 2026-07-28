@@ -192,12 +192,83 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // are `kind: template` items now and don't appear in the section
     // name map — see `projection.yaml`.)
     // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
-    for name in ["frame", "tools_overview"] {
+    // (`frame` is now the `assistant` option of the `persona` selector, not a
+    // standalone section — see `projection.yaml`.)
+    for name in ["history_stance", "tools_overview"] {
         assert!(
             builder.id_for_system_section(name).is_some(),
             "static section {name:?} must still resolve",
         );
     }
+}
+
+/// The ingest summariser drives the shared system prompt into summarizer mode via
+/// `selection.select("persona", "summarize")` (see `ingest_scope_roundtrip`). That
+/// call silently no-ops if the ids don't match the schema, so pin them: the parsed
+/// `projection.yaml` must expose a `persona` SELECTOR (>1 option) carrying both an
+/// `assistant` and a `summarize` option.
+#[test]
+fn persona_selector_exposes_assistant_and_summarize() {
+    let builder = build_test_projection();
+    let tree = builder
+        .schema()
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|it| match it {
+            SystemPromptItem::SectionTree(t) => Some(t),
+            _ => None,
+        })
+        .expect("system prompt has a section_tree");
+    let persona = tree
+        .nodes
+        .iter()
+        .find(|n| n.name == "persona")
+        .expect("section_tree has a `persona` node");
+    let opt_ids: Vec<&str> = persona.options.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        persona.options.len() >= 2,
+        "persona must be a selector (>1 option) so the ingest can select it: {opt_ids:?}"
+    );
+    assert!(
+        opt_ids.contains(&"assistant"),
+        "persona options: {opt_ids:?}"
+    );
+    assert!(
+        opt_ids.contains(&"summarize"),
+        "persona options: {opt_ids:?}"
+    );
+}
+
+/// The ingest stuffs few-shot summarizer example TURNS via
+/// `set_optional("summarize_examples", Present)`. Pin that the parsed schema
+/// exposes a `summarize_examples` optional node carrying real example turns
+/// (ChatML assistant markers + a sample summary), so the id resolves and the
+/// stuffing actually lands.
+#[test]
+fn summarize_examples_optional_carries_stuffed_turns() {
+    let builder = build_test_projection();
+    let node = builder
+        .schema()
+        .system_prompt
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            SystemPromptItem::SectionTree(t) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.nodes.iter())
+        .find(|n| n.name == "summarize_examples")
+        .expect("schema has a `summarize_examples` optional node");
+    let content: String = node.options.iter().map(|o| o.content.as_str()).collect();
+    assert!(
+        content.contains("<|im_start|>assistant"),
+        "stuffed content must be real example TURNS (assistant markers)",
+    );
+    assert!(
+        content.contains("Jitter returns"),
+        "stuffed content must carry the sample summaries",
+    );
 }
 
 // ── extract_tool_calls ───────────────────────────────────────────────────────

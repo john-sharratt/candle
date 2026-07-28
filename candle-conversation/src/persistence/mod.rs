@@ -433,6 +433,7 @@ impl SubstratePersistence {
             if self.pending_index.len() >= INDEX_FLUSH_ENTRIES {
                 self.flush_header_index()?;
             }
+            self.rotate_if_over_target()?;
         }
         Ok((segment, offset, size))
     }
@@ -461,6 +462,7 @@ impl SubstratePersistence {
             if self.pending_index.len() >= INDEX_FLUSH_ENTRIES {
                 self.flush_header_index()?;
             }
+            self.rotate_if_over_target()?;
         }
         Ok((segment, offset, size))
     }
@@ -1025,6 +1027,28 @@ impl SubstratePersistence {
             return Ok(());
         }
         self.seal_active()
+    }
+
+    /// Seal + rotate the active segment when its durable **plus staged** bytes
+    /// have reached the size target — a byte-based check on the append path, not
+    /// only at external commit boundaries. A long append batch (migration
+    /// relocation, large-file ingest) stages many records between commits, so
+    /// `should_rotate` alone — which fires only after a group-commit — lets the
+    /// active overshoot the target by the whole batch (observed: ~8 GB segments
+    /// against the 4 GB target). Checking `write_offset + pending_len` on every
+    /// data append bounds each segment to ~target + one record and, as a side
+    /// benefit, caps the in-memory staging buffer at ~target. [`Self::seal_active`]
+    /// flushes the index chain and commits the staged records durable first, so
+    /// the sealed segment is well-formed and the batch continues in a fresh
+    /// active. Cheap on the common path: two field reads; the seal fires at most
+    /// once per segment fill. Never called for `HeaderIndex` appends (the seal
+    /// path emits those), so it can't recurse.
+    fn rotate_if_over_target(&mut self) -> Result<()> {
+        let projected = self.segments.write_offset() + self.segments.pending_len() as u64;
+        if projected >= self.segments.target_bytes() {
+            self.seal_active()?;
+        }
+        Ok(())
     }
 
     /// Seal the active segment and mint a fresh one, unconditionally. Completes
@@ -1705,6 +1729,49 @@ mod tests {
             assert_eq!(
                 sp.read_chunk(&substrate, sid, (n - 1) as u64).unwrap(),
                 chunk_payload((n - 1) as u32)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A long append batch (many records staged before any external commit)
+    /// must roll segments **on the append path**, bounding each to ~target —
+    /// not overshoot by the whole batch. Regression: with only commit-boundary
+    /// rotation the active grew to ~2× the target (observed 8 GB segments
+    /// against the 4 GB target), because `maybe_rotate_active` runs after a
+    /// group-commit and a whole migration/ingest batch stages between commits.
+    #[test]
+    fn append_batch_rotates_by_bytes_not_only_at_commit() {
+        let dir = tmp_dir("append_rotate");
+        let sid = StreamId(9091);
+        // Tiny target so a modest batch crosses it many times.
+        let target = 128 * 1024u64;
+        let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+        sp.segments.set_target_bytes_for_test(target);
+
+        // Write a batch far larger than the target with NO intervening commit.
+        let n = 2000u32;
+        for i in 0..n {
+            sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i)).unwrap();
+        }
+        // Rotation already fired on the append path — before we ever commit.
+        // (Pre-fix: the whole batch stayed in one active until the end-commit,
+        // giving ~1 segment; the fix seals a fresh one every ~target bytes.)
+        let mid_batch_segments = sp.segment_count();
+        assert!(
+            mid_batch_segments > 4,
+            "append-path rotation should have sealed several segments mid-batch, got {mid_batch_segments}"
+        );
+        sp.commit().unwrap();
+
+        // Every sealed segment's on-disk size is bounded to ~target (+ one
+        // record of slack): the append-path check rolls before overshoot, and
+        // seal truncates the over-allocated tail so file size == record bytes.
+        for &id in sp.segments.sealed_ids() {
+            let bytes = sp.segments.sealed_record_bytes(id).unwrap();
+            assert!(
+                bytes <= target + 64 * 1024,
+                "sealed segment {id:?} = {bytes} B exceeds target {target} B + slack"
             );
         }
         std::fs::remove_dir_all(&dir).ok();

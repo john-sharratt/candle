@@ -34,8 +34,13 @@ pub const FILE_MAGIC: u32 = 0x474f_4c53;
 pub const FILE_FORMAT_VERSION: u32 = 2;
 
 /// The file is grown ahead in extents of this size so appends write into
-/// already-allocated space.
-const GROW_EXTENT: u64 = 1 << 20;
+/// already-allocated space — one `set_len` per extent instead of per record.
+/// 64 MiB keeps grow syscalls rare even filling a multi-GiB segment at NVMe
+/// bandwidth (a 4 GiB segment grows ~64 times, not ~4096). The only cost of a
+/// large extent is a transient over-allocated tail on the *active* segment;
+/// `seal_and_rotate` truncates that tail to the logical end when the segment
+/// seals, so sealed segments never carry the slack on disk.
+const GROW_EXTENT: u64 = 64 << 20;
 
 /// Decoded superblock contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -573,7 +578,7 @@ mod tests {
         let r = rec(2, 0, b"x");
         {
             let mut log = LogFile::create(&path).unwrap();
-            // Physical file is grown to a 1 MiB extent.
+            // Physical file is grown to the first `GROW_EXTENT` up front.
             assert!(log.allocated_len() >= GROW_EXTENT);
             log.stage(&r);
             log.commit().unwrap();

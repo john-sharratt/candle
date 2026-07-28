@@ -165,6 +165,27 @@ pub struct Substrate {
     /// `residence[idx].warm`.
     warm_lru: LinkedList<ResidenceIndex>,
 
+    /// Residences the scheduler is **actively using in the current wave's
+    /// projection** — the union of every live slot's working set plus the
+    /// units of an in-flight elevate. Published by
+    /// [`Self::set_working_set_pins`] under the write lock at elevate time and
+    /// honoured by the `evict_when_cold` hot-drop paths
+    /// ([`Self::install_warm_and_evict_hot`], [`Self::install_cold`],
+    /// [`Self::mark_timeline_evict_when_cold`]): a pinned residence keeps its
+    /// hot copy even when flagged, so the persistence thread can't yank a turn
+    /// out from under a forward that is about to attend it. The drop is merely
+    /// deferred — the `evict_when_cold` flag stays set, so the residence still
+    /// sheds hot on a later pass (or via `demote_cold_ingest`, already
+    /// keep-set-aware) once it leaves the working set. Transient — never
+    /// written to the redo log, rebuilt each wave from live scheduler state.
+    ///
+    /// This closes the invariant the multi-timeline belief scan broke: pre-scan
+    /// a selected turn was always the (hot) target timeline; now selection
+    /// reaches completed-file turns flagged `evict_when_cold`, which the
+    /// persistence thread would otherwise evict mid-wave (free-under-read on the
+    /// shared stream). See `active_timelines_for_group` in `score_belief_groups`.
+    working_set_pins: HashSet<ResidenceIndex>,
+
     /// Per-stream in-RAM index of where each chunk / tokens record /
     /// committed-through watermark sits on disk.
     /// Built by replaying the redo log on startup (and updated on
@@ -218,6 +239,19 @@ pub struct Substrate {
     /// its turns shed to at compaction. Same replay-order-independence as
     /// tombstones.
     distilled_timelines: HashMap<TimelineId, DistillMode>,
+
+    /// Layers whose conversations are **append-only ingest trunks** (code_reading,
+    /// repo_map) rather than interactive dialogue. A projection whose *target* is
+    /// on such a layer is scored/selected **self-local**: every belief group is
+    /// masked to the target's own timeline, not enumerated across all files (see
+    /// `TargetedRead::group_turns` / `score_belief_groups`). This keeps an ingest
+    /// scope-summary grounded in its own scope + system prompt — the multi-timeline
+    /// belief scan is a *dialogue-retrieval* feature and has no place generating a
+    /// scope's own summary, where cross-file turns derail it off-topic/off-language.
+    /// Transient (rebuilt from the ingest setup each session), never redo-logged.
+    /// Marked via [`Self::mark_layer_append_only`]; NOT keyed on `summarize`, which
+    /// `--disable-summariser` also clears on dialogue.
+    append_only_layers: HashSet<LayerId>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -1148,6 +1182,21 @@ impl Substrate {
         }
     }
 
+    /// Mark `layer` as an append-only ingest layer (code_reading, repo_map) — a
+    /// projection targeting it is scored/selected self-local. Idempotent; called
+    /// once per ingest layer at setup. See [`Self::append_only_layers`].
+    pub fn mark_layer_append_only(&mut self, layer: LayerId) {
+        self.append_only_layers.insert(layer);
+    }
+
+    /// Whether `layer` is an append-only ingest layer — read by the belief
+    /// scoring/selection to decide self-local masking (all groups → target
+    /// timeline). Dialogue layers are never marked, so cross-file retrieval there
+    /// is untouched. See [`Self::mark_layer_append_only`].
+    pub fn is_append_only_layer(&self, layer: LayerId) -> bool {
+        self.append_only_layers.contains(&layer)
+    }
+
     /// Place `sealed` into the residence slot's hot tier and push the
     /// slot onto the hot-LRU front (MRU). Used by every code path that
     /// brings KV bytes into VRAM — fresh seal, cold→hot promotion,
@@ -1235,6 +1284,16 @@ impl Substrate {
         warm: Vec<SealedSequence>,
     ) {
         self.install_warm(residence, warm);
+        // Working-set pin DEFERS the hot-drop. The scheduler is attending this
+        // residence in the current wave (a cross-timeline belief pick that
+        // `elevate_projection_working_set` just lifted), so keep hot — the
+        // residence now holds hot+warm dual residency and sheds hot on a later
+        // pass, once it leaves the working set (the `evict_when_cold` flag stays
+        // set). Dropping it here is a free-under-read against the in-flight
+        // forward on the shared stream. See [`Self::working_set_pins`].
+        if self.working_set_pins.contains(&residence) {
+            return;
+        }
         if self.residence[residence.0].hot.take().is_some() {
             Self::remove_from_lru(&mut self.hot_lru, residence);
         }
@@ -1296,6 +1355,11 @@ impl Substrate {
     /// the redo log. Cold has no LRU (it's already the cheapest tier).
     pub fn install_cold(&mut self, residence: ResidenceIndex, cold: Vec<StoredSequence>) {
         debug_assert!(!cold.is_empty(), "install_cold called with empty Vec");
+        // Working-set pin defers the resident-tier drop below (same reason as
+        // `install_warm_and_evict_hot`): a pinned residence keeps hot+warm even
+        // once cold lands. The `evict_when_cold` flag stays set, so a later
+        // `install_cold`/demote sheds it once it leaves the working set.
+        let pinned = self.working_set_pins.contains(&residence);
         let slot = &mut self.residence[residence.0];
         slot.cold = Some(cold);
         // The async write landed — clear the in-flight flag so a re-gather is
@@ -1312,7 +1376,7 @@ impl Substrate {
         // The drop returns arena chunks to the pool / frees the CPU copy. Runs
         // under the persistence thread's substrate write lock (Phase 2.5), so
         // the arena free is serialised with the scheduler's allocations.
-        if !slot.evict_when_cold {
+        if !slot.evict_when_cold || pinned {
             return;
         }
         let had_hot = slot.hot.take().is_some();
@@ -1339,6 +1403,33 @@ impl Substrate {
     /// [`SequenceResidence::evict_when_cold`].
     pub fn residence_evict_when_cold(&self, residence: ResidenceIndex) -> bool {
         self.residence[residence.0].evict_when_cold
+    }
+
+    /// Publish the scheduler's live working set as the eviction keep-set —
+    /// resolving `keep_turns` / `keep_sections` (the union of every live slot's
+    /// projection plus any in-flight elevate) to their residence indices and
+    /// replacing [`Self::working_set_pins`] wholesale. Called under the write
+    /// lock at elevate time, before any KV is attended, so the persistence
+    /// thread's `evict_when_cold` hot-drops honour it for the whole wave.
+    ///
+    /// Wholesale replace (not merge) is correct: the union is recomputed from
+    /// current scheduler state each call, so a residence that has left every
+    /// working set drops out of the pin set and becomes evictable again. Mirrors
+    /// the protected-set resolution in [`Self::demote_cold_ingest`].
+    pub fn set_working_set_pins(&mut self, keep_turns: &[TurnKey], keep_sections: &[SectionId]) {
+        let mut pins: HashSet<ResidenceIndex> =
+            HashSet::with_capacity(keep_turns.len() + keep_sections.len());
+        for &key in keep_turns {
+            if let Some(e) = self.turn(key.timeline, key.index) {
+                pins.insert(e.content.residence);
+            }
+        }
+        for &sid in keep_sections {
+            if let Some(e) = self.sections.get(&sid) {
+                pins.insert(e.residence);
+            }
+        }
+        self.working_set_pins = pins;
     }
 
     /// Flag every turn residence of `timeline` for full eviction the moment its
@@ -1368,12 +1459,16 @@ impl Substrate {
             entry.turns.values().map(|t| t.content.residence).collect();
         for r in &residences {
             self.residence[r.0].evict_when_cold = true;
-            // Immediate hot-drop for already-warm turns (VRAM back now, warm kept).
+            // Immediate hot-drop for already-warm turns (VRAM back now, warm kept)
+            // — UNLESS the residence is pinned into the current wave's working
+            // set (a concurrent slot selected this just-completed file), in which
+            // case defer: the flag stays set and a later pass sheds it once it
+            // leaves the working set. See [`Self::working_set_pins`].
             let (has_hot, has_warm) = {
                 let slot = &self.residence[r.0];
                 (slot.hot.is_some(), slot.warm.is_some())
             };
-            if has_hot && has_warm {
+            if has_hot && has_warm && !self.working_set_pins.contains(r) {
                 self.residence[r.0].hot = None;
                 Self::remove_from_lru(&mut self.hot_lru, *r);
             }
@@ -5433,6 +5528,162 @@ mod tests {
 
         // Unknown timeline → no-op.
         assert_eq!(sub.mark_timeline_evict_when_cold(alloc.next()), 0);
+    }
+
+    /// A residence pinned into the current wave's working set is NOT evicted by
+    /// `install_cold` even when flagged `evict_when_cold`: the drop is deferred
+    /// (hot+warm kept, flag still set) so the persistence thread can't free a
+    /// turn the scheduler is attending. An identically-flagged but unpinned turn
+    /// evicts as normal. This is the multi-timeline-scan free-under-read fix.
+    #[test]
+    fn working_set_pin_defers_install_cold_eviction() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (pinned_idx, pinned) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, unpinned) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+
+        // Both are completed-ingest residences flagged for full eviction.
+        sub.residence[pinned.0].evict_when_cold = true;
+        sub.residence[unpinned.0].evict_when_cold = true;
+        // Only the first is in the scheduler's live working set.
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+
+        sub.install_cold(pinned, cold());
+        sub.install_cold(unpinned, cold());
+
+        // Pinned: cold durable, but hot+warm KEPT (deferred), flag still set.
+        assert!(sub.residence[pinned.0].cold.is_some(), "cold durable");
+        assert!(sub.residence[pinned.0].hot.is_some(), "pinned keeps hot");
+        assert!(sub.residence[pinned.0].warm.is_some(), "pinned keeps warm");
+        assert!(sub.hot_lru.contains(&pinned) && sub.warm_lru.contains(&pinned));
+        assert!(
+            sub.residence[pinned.0].evict_when_cold,
+            "flag stays set — eviction is deferred, not cancelled"
+        );
+        // Unpinned: evicted from both resident tiers as usual.
+        assert!(
+            sub.residence[unpinned.0].hot.is_none(),
+            "unpinned VRAM reclaimed"
+        );
+        assert!(
+            sub.residence[unpinned.0].warm.is_none(),
+            "unpinned RAM reclaimed"
+        );
+    }
+
+    /// `install_warm_and_evict_hot` keeps the hot copy (dual hot+warm residency)
+    /// when the residence is pinned, and drops it when not — so a mid-migrate
+    /// install can't yank a residence the current wave is using.
+    #[test]
+    fn working_set_pin_defers_install_warm_and_evict_hot() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // Two hot-only residences (append_complete installs hot; no warm yet).
+        let pinned_idx = sub
+            .append_complete(
+                timeline,
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        let pinned = sub.turn_residence(timeline, pinned_idx).unwrap();
+        let unpinned_idx = sub
+            .append_complete(
+                timeline,
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        let unpinned = sub.turn_residence(timeline, unpinned_idx).unwrap();
+
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+
+        // The migrate produced a warm copy for each; install it and evict hot.
+        sub.install_warm_and_evict_hot(pinned, vec![minimal_sealed_layer()]);
+        sub.install_warm_and_evict_hot(unpinned, vec![minimal_sealed_layer()]);
+
+        // Pinned: hot KEPT (now dual hot+warm); unpinned: hot dropped, warm only.
+        assert!(sub.residence[pinned.0].hot.is_some(), "pinned keeps hot");
+        assert!(sub.residence[pinned.0].warm.is_some(), "pinned gained warm");
+        assert!(sub.hot_lru.contains(&pinned));
+        assert!(
+            sub.residence[unpinned.0].hot.is_none(),
+            "unpinned hot dropped"
+        );
+        assert!(
+            sub.residence[unpinned.0].warm.is_some(),
+            "unpinned warm installed"
+        );
+        assert!(!sub.hot_lru.contains(&unpinned));
+    }
+
+    /// `mark_timeline_evict_when_cold`'s immediate hot-drop skips a pinned
+    /// residence (deferred, flag still set) while dropping an unpinned sibling.
+    #[test]
+    fn working_set_pin_defers_mark_timeline_immediate_drop() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (pinned_idx, pinned) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_, unpinned) = install_hot_and_warm(&mut sub, timeline, 10);
+
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+        let n = sub.mark_timeline_evict_when_cold(timeline);
+        assert_eq!(n, 2, "both turns flagged");
+
+        // Both flagged; the immediate hot-drop fires only for the unpinned turn.
+        assert!(sub.residence[pinned.0].evict_when_cold);
+        assert!(sub.residence[unpinned.0].evict_when_cold);
+        assert!(
+            sub.residence[pinned.0].hot.is_some(),
+            "pinned keeps hot (deferred)"
+        );
+        assert!(sub.hot_lru.contains(&pinned));
+        assert!(
+            sub.residence[unpinned.0].hot.is_none(),
+            "unpinned hot dropped now"
+        );
+        assert!(!sub.hot_lru.contains(&unpinned));
+    }
+
+    /// `set_working_set_pins` replaces the keep-set wholesale — a residence that
+    /// leaves the working set drops its pin and becomes evictable again.
+    #[test]
+    fn set_working_set_pins_replaces_wholesale() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (a_idx, a) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (b_idx, _b) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[a.0].evict_when_cold = true;
+
+        // Wave 1 pins A; wave 2 pins only B → A is no longer protected.
+        sub.set_working_set_pins(&[TurnKey::new(timeline, a_idx)], &[]);
+        sub.set_working_set_pins(&[TurnKey::new(timeline, b_idx)], &[]);
+
+        let cold = vec![StoredSequence {
+            chunks: vec![StoredChunk {
+                log_offset: 0,
+                record_len: 1024,
+                token_count: 32,
+            }],
+            token_count: 32,
+        }];
+        sub.install_cold(a, cold);
+        assert!(
+            sub.residence[a.0].hot.is_none(),
+            "A left the working set → eviction resumes"
+        );
     }
 
     /// A zero target evicts nothing — there's no incoming load to make room

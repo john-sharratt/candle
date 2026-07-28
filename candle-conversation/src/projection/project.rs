@@ -809,6 +809,16 @@ pub const NO_THINK_SELECTOR: &str = "no_think";
 /// between the schema, chat.rs, and the ingest path.
 pub const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 
+/// Selector that force-pins a single member of a belief-driven (`TopK`) tool
+/// catalog. When set to a tool's section name the `TopK` arm emits **exactly**
+/// that member and skips belief selection entirely — score-independent, the same
+/// by-name pick `SelectionRule::Named` does, but available on the production
+/// `tools` collection without switching its rule. The code_read summary path
+/// sets it to `file_read` so the prefilled `read_file` tool_call/response is
+/// backed by a coherent, present tool definition (tools ON, one tool, forced).
+/// Unset ⇒ ordinary belief selection. Kept here so the string can't drift.
+pub const FORCE_TOOL_SELECTOR: &str = "force_tool";
+
 /// The two states of an `optional` section-tree node: whether its content is
 /// projected (`Present`) or omitted (`Absent`).
 ///
@@ -1960,6 +1970,19 @@ fn select_collection_sections<R: ContentResolver>(
             out
         }
         SelectionRule::TopK { .. } => {
+            // Forced-member pin: when the runtime sets `FORCE_TOOL_SELECTOR` to a
+            // member's name, emit exactly that member and skip belief selection
+            // (the code_read summary path pins `file_read` so its prefilled
+            // tool_call/response is backed by a present tool definition). Same
+            // by-name pick as `Named`, score-independent. Unset ⇒ belief path.
+            if let Some(target) = selection_state.get(FORCE_TOOL_SELECTOR) {
+                if let Some(s) = coll.sections.iter().find(|s| s.name == target) {
+                    let mut out = Vec::new();
+                    push_section_segment(&mut out, s);
+                    scores.set_section(s.id, coll.score_threshold.max(1.0));
+                    return out;
+                }
+            }
             // Belief-driven selection: the collection's policy (RelLeak budget +
             // hysteresis) decides the surviving set from the per-section scores,
             // seeded from the prior projection's belief so decay/reinforcement

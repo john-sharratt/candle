@@ -309,6 +309,75 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
     );
 }
 
+/// Self-local ingest gate: when the projection TARGET is on an append-only ingest
+/// layer, every belief group — including non-target cross-layer ones — is masked
+/// to the target's own timeline, so a scope-summary is grounded in its own scope
+/// and never pulls cross-file/cross-group turns. Same setup as
+/// `score_beliefs_scores_a_group_in_a_non_target_layer`, but the target layer is
+/// marked append-only, so the clusters group (which HAS matching turns on `mem_tl`)
+/// scores NOTHING — its turns are masked away because the target timeline has none.
+#[test]
+fn append_only_target_masks_belief_groups_self_local() {
+    use candle_conversation::projection::TurnIndex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(TWO_LAYER_YAML).unwrap();
+    let mem_layer = builder.id_for_layer("mem").unwrap();
+    let clusters = builder.id_for_group("clusters").unwrap();
+    let dialogue_layer = builder.id_for_layer("dialogue").unwrap();
+    let convo = builder.id_for_group("convo").unwrap();
+
+    let mem_tl = candle_conversation::projection::TimelineId::from_raw(11).unwrap();
+    conv.register_timeline(mem_tl, mem_layer, clusters);
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xFFFF_FFFF_FFFF_FFFFu64,
+    ];
+    for fill in fills {
+        let idx = conv
+            .record_turn(
+                mem_tl,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        conv.persist_wide_q_sigs(
+            turn_stream_id(mem_tl.raw(), idx.0),
+            &encode_wide_sigs(&[sig(fill)]),
+        )
+        .expect("persist sigs");
+    }
+
+    let dlg_tl = candle_conversation::projection::TimelineId::from_raw(22).unwrap();
+    conv.register_timeline(dlg_tl, dialogue_layer, convo);
+    // Mark the TARGET layer append-only — this is the whole difference from the
+    // base test (where clusters scores across its timelines).
+    conv.mark_layer_append_only(dialogue_layer);
+    let target = ProjectionTarget {
+        layer: dialogue_layer,
+        group: convo,
+        timeline: dlg_tl,
+    };
+    let probe = vec![sig(fills[1])];
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
+
+    // The clusters group's turns (on mem_tl) are masked to the target timeline
+    // (dlg_tl), which has none — so nothing is scored and no candidates surface.
+    assert_eq!(scores.turn(mem_tl, TurnIndex(0)), 0.0);
+    assert_eq!(scores.turn(mem_tl, TurnIndex(1)), 0.0);
+    assert_eq!(scores.turn(mem_tl, TurnIndex(2)), 0.0);
+    assert!(
+        !cands.iter().any(|(gid, _)| *gid == clusters),
+        "append-only target: cross-layer clusters group must NOT be scored",
+    );
+}
+
 /// Regression: a belief-driven group holding MANY conversations
 /// (`code_reading` declares one timeline per file) must have EVERY conversation
 /// scored, not just the first-registered one. Before the fix, the scan resolved

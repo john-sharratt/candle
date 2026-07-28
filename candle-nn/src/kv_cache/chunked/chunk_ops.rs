@@ -2160,7 +2160,8 @@ impl ChunkedKvBacking {
                         })?;
                         if info.base_ptr == 0 {
                             return Err(candle::Error::Msg(
-                                "migrate_sealed_layers_to_cpu_batch: source arena not GPU-resident".into(),
+                                "migrate_sealed_layers_to_cpu_batch: source arena not GPU-resident"
+                                    .into(),
                             ));
                         }
                         let len = info.chunk_byte_stride as usize;

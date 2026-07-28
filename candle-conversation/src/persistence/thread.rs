@@ -681,11 +681,15 @@ fn run_pass(
     let mut select_ms = 0u64;
     let mut alloc_ms = 0u64;
     let mut convert_ms = 0u64;
-    // Mark the migrate in flight: the scheduler defers arena free / defrag /
-    // release / trim while this is held, so the migrate's select/convert/copy
-    // kernels can't read an arena base pointer a concurrent free/`cuMemPoolTrimTo`
-    // has unmapped (crash layer 2 @42553ca3). Dropped right after the device sync
-    // below, before install — by then the kernels have retired.
+    // Hold the migration-in-flight guard across the whole hot→warm GPU window —
+    // from before `per_head_table_host` captures arena base pointers (inside
+    // `migrate_group_hot_to_warm`) through the post-migrate `device.synchronize()`
+    // below. While held, the scheduler defers arena free / defrag / trim
+    // (`BatchedInferenceSession::{release_empty_arenas,compact,defragment_bounded,
+    // trim_kv_pool}`), so the `run_select_kv_format_palette4_paged` kernel can't
+    // read a base pointer that a concurrent `cuMemPoolTrimTo` has unmapped.
+    // Dropped right after the sync (below), before install — by then the kernel
+    // has retired, so the install's own arena frees are safe.
     let migrate_guard = candle_nn::kv_cache::enter_migrate();
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);

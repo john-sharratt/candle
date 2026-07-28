@@ -62,9 +62,9 @@ pub use compression_policy::{
     QWEN3_MOE_KV_FACTORS,
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool, GpuArenaFormatStats};
-pub use migrate_guard::{enter_migrate, migrate_in_flight, MigrateGuard};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
+pub use migrate_guard::{enter_migrate, migrate_in_flight, MigrateGuard};
 pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};
 pub use types::{LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
 

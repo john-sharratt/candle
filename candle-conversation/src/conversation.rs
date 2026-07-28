@@ -137,7 +137,7 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
-use crate::stencil::TriggerRegistry;
+use crate::stencil::{ThinkMode, TriggerRegistry};
 use crossbeam::channel::Sender;
 use std::sync::Arc;
 
@@ -1731,12 +1731,38 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
     ) -> crate::Result<(u32, u32, usize)> {
-        // code_reading is a tools-OFF layer: gate the WHOLE tool block out of every
-        // projection this conversation runs, so the ingest never SELECTS (and thus
-        // never elevates) a tool section.
+        // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
+        // the shared system prompt into its summarizer mode via selection — the
+        // generic, per-mode section-toggling design rather than a bespoke per-layer
+        // prompt string:
+        //   - tools ON, force-pinned to `file_read`: the round-trip PREFILLS a
+        //     `read_file` tool_call and its tool_response, so the projection must
+        //     present a coherent tool context or the model can't connect the
+        //     prefill to any capability and degrades (refusals, off-language,
+        //     hallucinated tool chatter). Enable the tool block and force-select
+        //     exactly the one tool the prefill uses (see `FORCE_TOOL_SELECTOR`) —
+        //     one present, coherent tool, no belief-driven catalog noise.
+        //   - `persona = summarize`: swaps the "You are Zen, pair programming…"
+        //     dialogue frame for the terse code-summarizer frame (content-provided,
+        //     English, summary-only) — the fix for the reasoning/refusal/off-language
+        //     summaries the conversational persona produced.
+        //   - `response_length = terse`: the default `standard` length section says
+        //     "a short paragraph or two", which fights the two-sentence goal.
         self.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
-            crate::projection::OptionalState::Absent,
+            crate::projection::OptionalState::Present,
+        );
+        self.selection
+            .select(crate::projection::FORCE_TOOL_SELECTOR, "file_read");
+        self.selection.select("persona", "summarize");
+        self.selection.select("response_length", "terse");
+        //   - `summarize_examples = present`: stuff a few worked example turns
+        //     (unrelated sample files) between the system prompt and this scope's
+        //     turns, so the model imitates the exact request→summary shape — the
+        //     strongest lever against reasoning/refusal/off-language drift.
+        self.selection.set_optional(
+            "summarize_examples",
+            crate::projection::OptionalState::Present,
         );
         // Turn A — the call: prefill `[request][tool_call]` + staged provenance.
         let (call_acs, call_idx, call_tokens) =
@@ -1746,10 +1772,22 @@ impl Sequence {
         })?;
         self.persist_staged_ingest_events(call_idx, call_acs, 0.0, &[])?;
         // Turn B — the response: submit the tool_response and DECODE the summary,
-        // `/no_think` + short + argmax. The decode sees Turn A (just recorded).
+        // `/no_think` + short + low-temp nucleus. The decode sees Turn A (just recorded).
+        //
+        // `/no_think` alone does NOT reliably stop this hybrid 30B MoE from opening
+        // a real `<think>` block: the empty block is *decoded*, not baked (see
+        // `DecodeState::prefill_tokens` doc), so under sampling the model often opens
+        // `<think>` and burns the whole `max_summary_tokens` budget on runaway —
+        // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
+        // "thought" as the stored summary. Route the summary through the SAME
+        // canonical think-close steering the dialogue path uses (`apply_think_mode`),
+        // as `ThinkMode::Off`: with the short summary budget it collapses to a forced
+        // empty block, so the budget goes to the summary, not the reasoning.
+        let mut summary_sampling = SamplingConfig::compression();
+        summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
-            sampling: Some(SamplingConfig::compression()),
+            sampling: Some(summary_sampling),
             tags,
             ..Default::default()
         };
@@ -1757,10 +1795,15 @@ impl Sequence {
             crate::projection::NO_THINK_SELECTOR,
             crate::projection::OptionalState::Present,
         );
+        // Same tools-ON, single-tool pin as the conversation-level selection above:
+        // the decode's own projection must also carry the coherent `file_read`
+        // context the tool_response turn refers to.
         opts.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
-            crate::projection::OptionalState::Absent,
+            crate::projection::OptionalState::Present,
         );
+        opts.selection
+            .select(crate::projection::FORCE_TOOL_SELECTOR, "file_read");
         let handle = self.submit_turn_with_options(response_user, opts)?;
         let response = handle.wait()?;
         let resp_tokens = response.token_ids.len();

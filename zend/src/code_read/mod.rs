@@ -351,6 +351,11 @@ pub fn ingest_files(
     let group = proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    // Append-only ingest: a scope-summary projection targeting this layer is
+    // scored/selected self-local (belief groups masked to the fork's own timeline)
+    // so the summary is grounded in its own scope, not derailed by cross-file
+    // retrieval. The multi-timeline scan stays on for dialogue.
+    engine.lock().unwrap().mark_layer_append_only(layer);
     let system_prompt = layer_system_prompt(proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
 
@@ -884,8 +889,10 @@ fn layer_system_prompt(builder: &Builder, layer_name: &str, config: &SequenceCon
         "projection schema missing '{layer_name}' layer"
     );
     // Every ingest conversation frames on the single shared system prompt (bare
-    // sections only — the section tree and tool catalog are not part of the
-    // ingest framing).
+    // top-level sections only — the `section_tree` framing, incl. the `persona`
+    // selector, is materialised per turn by the projection from the schema +
+    // selection, so the summarization framing is driven by `persona: summarize`
+    // set on the ingest selection, not baked here). See `ingest_scope_roundtrip`.
     let mut body = String::new();
     for item in &builder.schema().system_prompt.items {
         if let SystemPromptItem::Section(s) = item {

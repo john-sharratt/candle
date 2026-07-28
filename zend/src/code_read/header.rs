@@ -11,7 +11,7 @@
 //!   Summarize `src/auth/handler.rs` (lines 47-93) in no more than two sentences.
 //!
 //! Segment 2 (assistant — tool call):
-//!   <tool_call>{"name":"read_file","arguments":{"path":"src/auth/handler.rs",
+//!   <tool_call>{"name":"file_read","arguments":{"path":"src/auth/handler.rs",
 //!               "start_line":47,"end_line":93}}</tool_call>
 //!
 //! Segment 3 (user — tool response):
@@ -76,9 +76,14 @@ pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
 /// after this, then appends [`render_tool_response`] as a distinct user
 /// segment. Prefilled, so the model doesn't decode this; it learns the
 /// pattern by seeing it in context.
+///
+/// The call names the canonical `file_read` tool (not its `read_file` alias) so
+/// it matches the tool definition the summary projection force-pins into the
+/// catalog (`FORCE_TOOL_SELECTOR` → `file_read`) — the prefilled call and the
+/// one presented tool agree on name, keeping the tool context coherent.
 pub fn render_tool_call(path: &str, scope: &Scope) -> String {
     format!(
-        "<tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"{path}\",\
+        "<tool_call>{{\"name\":\"file_read\",\"arguments\":{{\"path\":\"{path}\",\
          \"start_line\":{start},\"end_line\":{end}}}}}</tool_call>",
         path = path,
         start = scope.start_line,
@@ -187,7 +192,7 @@ mod tests {
         let tc = render_tool_call("src/lib.rs", &scope(142, 187));
         assert!(tc.starts_with("<tool_call>"));
         assert!(tc.ends_with("</tool_call>"));
-        assert!(tc.contains("\"name\":\"read_file\""));
+        assert!(tc.contains("\"name\":\"file_read\""));
         assert!(tc.contains("\"path\":\"src/lib.rs\""));
         assert!(tc.contains("\"start_line\":142"));
         assert!(tc.contains("\"end_line\":187"));

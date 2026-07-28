@@ -231,7 +231,7 @@ pub(crate) use project::turn_belief_key;
 pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,
-    SealedKind, SelectionState, NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
+    SealedKind, SelectionState, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};

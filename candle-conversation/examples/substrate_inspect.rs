@@ -3891,9 +3891,8 @@ fn load_log_tokenizer(log: &mut LogFile) -> Result<Option<Tokenizer>> {
             let m = build_manifest(&mut seg)?;
             if let Some(loc) = m.tokenizer {
                 let rec = read_record_at(&mut seg, loc.offset, loc.record_size)?;
-                let tok = Tokenizer::from_bytes(&rec.payload).map_err(|e| {
-                    anyhow::anyhow!("load tokenizer from Tokenizer record: {e}")
-                })?;
+                let tok = Tokenizer::from_bytes(&rec.payload)
+                    .map_err(|e| anyhow::anyhow!("load tokenizer from Tokenizer record: {e}"))?;
                 return Ok(Some(tok));
             }
         }

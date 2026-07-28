@@ -562,6 +562,15 @@ impl ConversationEngine {
             .set_timeline_summarize(timeline, summarize);
     }
 
+    /// Mark `layer` as an append-only ingest layer (code_reading/repo_map): a
+    /// projection targeting it is scored/selected self-local (belief groups masked
+    /// to the target timeline), so an ingest scope-summary is grounded in its own
+    /// scope rather than cross-file retrieval. Called once per ingest layer at
+    /// setup. See [`crate::substrate::Substrate::mark_layer_append_only`].
+    pub fn mark_layer_append_only(&self, layer: LayerId) {
+        self.conversation.mark_layer_append_only(layer);
+    }
+
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
     /// metadata bag and persist it. Used by utility ingests to tag each
     /// conversation with a content hash + descriptive fields for the

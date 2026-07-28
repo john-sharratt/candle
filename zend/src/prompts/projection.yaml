@@ -129,13 +129,33 @@ system_prompt:
           dialect: no_think_prefix
           default: absent
 
-        - kind: section
-          id: frame
-          content: |+
-            You are Zen, an AI coding assistant — a highly skilled software engineer with
-            extensive knowledge in many programming languages, frameworks, and best practices.
-            You are pair programming with the user: conversational, opinionated, and
-            technically precise. Answer the question they actually ask.
+        # Persona frame. `assistant` is the interactive dialogue agent; `summarize`
+        # reframes the model as a terse code-summarization engine for the append-only
+        # code_reading / repo_map INGEST (set via `persona: summarize` on the ingest
+        # selection — see `ingest_scope_roundtrip`). The dialogue "You are Zen…"
+        # priming is conversational, which on the ingest summariser makes the model
+        # reason aloud, refuse ("I can't access that file"), or drift off-language
+        # instead of emitting a summary; the `summarize` frame pins content-is-
+        # provided (no refusals), English (no drift), and summary-only (no preamble).
+        - kind: selector
+          id: persona
+          default: assistant
+          options:
+            - id: assistant
+              content: |+
+                You are Zen, an AI coding assistant — a highly skilled software engineer with
+                extensive knowledge in many programming languages, frameworks, and best practices.
+                You are pair programming with the user: conversational, opinionated, and
+                technically precise. Answer the question they actually ask.
+            - id: summarize
+              content: |+
+                You are a code-summarization engine. Each tool response contains a code excerpt
+                that is ALREADY PROVIDED to you in full. Read that excerpt and reply with ONLY a
+                concise summary — at most two sentences, in English — of what the code does. Do
+                not think out loud, restate the request, add any preamble, headings, or notes,
+                translate to another language, apologize, or claim you cannot access, view, or
+                open the file: the code is right there in the tool response. Output the summary
+                and nothing else.
 
         # Binary toggle driven by zend (`set_optional("reasoning_stance", …)`,
         # see api/chat.rs): present ⇔ the turn thinks, the inverse of
@@ -334,6 +354,84 @@ system_prompt:
     - kind: template
       id: system_close
       dialect: system_end
+
+    # Few-shot summarizer demonstrations — PROPER CONTEXT STUFFING: real user/
+    # assistant example turns emitted AFTER `system_close` (the system-end token),
+    # mirroring the exact code_read scope round-trip (user summarise request →
+    # assistant `<tool_call>` → user `<tool_response>` with the excerpt → assistant
+    # two-sentence summary). Reuses the section framework only to GATE them: OFF by
+    # default, the code_read ingest turns them on via
+    # set_optional("summarize_examples", Present) alongside persona=summarize, so the
+    # model imitates the exact request→summary shape (terse, English, no preamble,
+    # no refusal on thin content). Sealed once into the shared prefix (never into a
+    # stored scope turn). The sample files are unrelated to this repo — pure format
+    # demonstrations. The `<|im_start|>`/`<|im_end|>` are the tokenizer's real
+    # special tokens (same as the tool-calibration ChatML examples).
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: summarize_examples
+          default: absent
+          content: |+
+            <|im_start|>user
+            Summarize `billing/webhooks.py` (lines 1-9) in no more than two sentences.<|im_end|>
+            <|im_start|>assistant
+            <tool_call>{"name":"file_read","arguments":{"path":"billing/webhooks.py","start_line":1,"end_line":9}}</tool_call><|im_end|>
+            <|im_start|>user
+            <tool_response>
+            billing/webhooks.py (lines 1-9):
+
+            ```python
+            1  @bp.route("/stripe", methods=["POST"])
+            2  def stripe_webhook():
+            3      payload = request.get_data()
+            4      sig = request.headers.get("Stripe-Signature", "")
+            5      try:
+            6          event = stripe.Webhook.construct_event(payload, sig, ENDPOINT_SECRET)
+            7      except stripe.error.SignatureVerificationError:
+            8          abort(400)
+            9      return handle_event(event), 200
+            ```
+            </tool_response><|im_end|>
+            <|im_start|>assistant
+            This Flask POST endpoint receives Stripe webhooks, verifying each request's signature against the endpoint secret and aborting with 400 on a verification failure. Valid events are dispatched to handle_event and acknowledged with a 200.<|im_end|>
+            <|im_start|>user
+            Summarize `internal/retry/backoff.go` (lines 12-18) in no more than two sentences.<|im_end|>
+            <|im_start|>assistant
+            <tool_call>{"name":"file_read","arguments":{"path":"internal/retry/backoff.go","start_line":12,"end_line":18}}</tool_call><|im_end|>
+            <|im_start|>user
+            <tool_response>
+            internal/retry/backoff.go (lines 12-18):
+
+            ```go
+            12  func Jitter(base time.Duration, attempt int) time.Duration {
+            13      ceiling := base * (1 << uint(attempt))
+            14      if ceiling <= 0 {
+            15          ceiling = base
+            16      }
+            17      return time.Duration(rand.Int63n(int64(ceiling)))
+            18  }
+            ```
+            </tool_response><|im_end|>
+            <|im_start|>assistant
+            Jitter returns a randomized retry backoff, uniformly sampled between zero and an exponentially growing ceiling (the base duration doubled per attempt). It falls back to the base duration as the ceiling when the shift overflows to a non-positive value.<|im_end|>
+            <|im_start|>user
+            Summarize `db/migrations/0007_add_orders_index.sql` (lines 1-4) in no more than two sentences.<|im_end|>
+            <|im_start|>assistant
+            <tool_call>{"name":"file_read","arguments":{"path":"db/migrations/0007_add_orders_index.sql","start_line":1,"end_line":4}}</tool_call><|im_end|>
+            <|im_start|>user
+            <tool_response>
+            db/migrations/0007_add_orders_index.sql (lines 1-4):
+
+            ```sql
+            1  -- Speed up the customer order-history page
+            2  CREATE INDEX CONCURRENTLY idx_orders_customer_created
+            3      ON orders (customer_id, created_at DESC);
+            4
+            ```
+            </tool_response><|im_end|>
+            <|im_start|>assistant
+            This migration adds a concurrent composite index on the orders table over customer_id and created_at (descending). It targets the customer order-history query and contains no other schema changes.<|im_end|>
 
 
 layers:

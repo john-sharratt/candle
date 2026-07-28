@@ -7743,6 +7743,34 @@ impl Scheduler {
     /// per-bucket report is logged at WARN with `whence` identifying the caller,
     /// so the drop has a visible cause rather than only the downstream
     /// `apply_projection: ... dropping it` symptom.
+    /// Publish the union of every live slot's projection working set — plus the
+    /// `extra_sections` / `extra_turns` an in-flight elevate is about to lift —
+    /// as the substrate's eviction keep-set (`Substrate::working_set_pins`). A
+    /// pinned residence is protected from the persistence thread's
+    /// `evict_when_cold` hot-drop for the duration of the wave, closing the
+    /// free-under-read the multi-timeline belief scan opened (it can now select
+    /// completed-file turns whose KV the persistence thread would otherwise
+    /// evict mid-forward). Recomputed wholesale each call, so residences that
+    /// have left every working set drop out and become evictable again.
+    fn publish_working_set_pins(
+        &self,
+        conversation: &Conversation,
+        extra_sections: &[SectionId],
+        extra_turns: &[TurnKey],
+    ) {
+        let mut keep_turns: Vec<TurnKey> = Vec::new();
+        let mut keep_sections: Vec<SectionId> = Vec::new();
+        for st in self.slot_projection_state.values() {
+            keep_sections.extend(st.working_set.sections.iter().copied());
+            keep_turns.extend(st.working_set.turns.iter().copied());
+        }
+        keep_sections.extend(extra_sections.iter().copied());
+        keep_turns.extend(extra_turns.iter().copied());
+        conversation
+            .write()
+            .set_working_set_pins(&keep_turns, &keep_sections);
+    }
+
     fn elevate_projection_working_set(
         &mut self,
         conversation: &Conversation,
@@ -7757,6 +7785,14 @@ impl Scheduler {
                 .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
                 || name.starts_with("section#")
         }
+        // Publish the eviction keep-set FIRST, before any KV is lifted or
+        // attended: the union of every live slot's working set plus the units
+        // this elevate is about to lift. Runs on every elevate (submit +
+        // reproject), so the persistence thread's `evict_when_cold` hot-drops
+        // never yank a residence the current wave is using — the fix for the
+        // multi-timeline belief scan reaching completed-file (evicted) turns.
+        // See `Substrate::working_set_pins`.
+        self.publish_working_set_pins(conversation, sections, turns);
         if sections.is_empty() && turns.is_empty() {
             return;
         }

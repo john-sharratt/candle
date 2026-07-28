@@ -1135,7 +1135,11 @@ fn convert_descs_batched(
     if descs.is_empty() {
         return Ok(());
     }
-    debug_assert_eq!(descs.len() % n_kv_head, 0, "descs must be [jobs × n_kv_head]");
+    debug_assert_eq!(
+        descs.len() % n_kv_head,
+        0,
+        "descs must be [jobs × n_kv_head]"
+    );
     let n_jobs = descs.len() / n_kv_head;
     const MAX_GRID_Y: usize = 65_535;
     let mut base = 0usize;

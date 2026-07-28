@@ -23,8 +23,7 @@ use crate::kv_cache::arena_table::ArenaLocation;
 use crate::kv_cache::chunked::{ChunkedKvBacking, CompressionPolicy};
 use crate::kv_cache::{
     convert_deferred_descs, quantize_layers_deferred, quantize_sealed_in_place,
-    quantize_sealed_in_place_deferred, KvFormat,
-    SealedSequence,
+    quantize_sealed_in_place_deferred, KvFormat, SealedSequence,
 };
 
 const N_KV_HEAD: usize = 2;
@@ -250,7 +249,8 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
         }
         if deferred {
             // ONE batched convert across every layer's descriptors.
-            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device).expect("batched convert");
+            convert_deferred_descs(&items[0].0, &descs, N_KV_HEAD, &device)
+                .expect("batched convert");
         }
         device.synchronize().unwrap();
 
@@ -259,10 +259,16 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
         for (backing, warm) in items {
             let n_chunks = warm.chunks.len();
             let slot = backing.alloc_sequence().unwrap();
-            backing.inject_sealed_at_tail(slot, &warm).expect("inject warm");
+            backing
+                .inject_sealed_at_tail(slot, &warm)
+                .expect("inject warm");
             let mut layer_bytes = Vec::with_capacity(n_chunks);
             for blk in 0..n_chunks {
-                layer_bytes.push(backing.read_raw_sealed_chunk(slot, blk).expect("read raw chunk"));
+                layer_bytes.push(
+                    backing
+                        .read_raw_sealed_chunk(slot, blk)
+                        .expect("read raw chunk"),
+                );
             }
             out.push(layer_bytes);
         }
@@ -350,11 +356,16 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
         for (backing, warm) in backings.iter().zip(&warms) {
             let n_chunks = warm.chunks.len();
             let slot = backing.alloc_sequence().unwrap();
-            backing.inject_sealed_at_tail(slot, warm).expect("inject warm");
+            backing
+                .inject_sealed_at_tail(slot, warm)
+                .expect("inject warm");
             let mut layer_bytes = Vec::with_capacity(n_chunks);
             for blk in 0..n_chunks {
-                layer_bytes
-                    .push(backing.read_raw_sealed_chunk(slot, blk).expect("read raw chunk"));
+                layer_bytes.push(
+                    backing
+                        .read_raw_sealed_chunk(slot, blk)
+                        .expect("read raw chunk"),
+                );
             }
             out.push(layer_bytes);
         }
@@ -392,31 +403,39 @@ fn migrate_layers_batched_matches_per_layer_bytes() {
         let backing = cuda_backing_with_policy(&device, &policy);
         let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 1) * 500);
         let mut pinned: Option<PinnedBuf> = None;
-        let warm =
-            quantize_sealed_in_place(&backing, &[&src], &policy, &device, &copy_stream, &mut pinned)
-                .expect("quantize");
+        let warm = quantize_sealed_in_place(
+            &backing,
+            &[&src],
+            &policy,
+            &device,
+            &copy_stream,
+            &mut pinned,
+        )
+        .expect("quantize");
         gpu_seqs.push(warm.into_iter().next().expect("one sequence"));
         backings.push(backing);
     }
 
     // Read a GPU sequence's raw per-chunk bytes (inject into a fresh slot).
-    let read_bytes = |backing: &ChunkedKvBacking, seq: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
-        let n = seq.chunks.len();
-        let slot = backing.alloc_sequence().unwrap();
-        backing.inject_sealed_at_tail(slot, seq).expect("inject");
-        (0..n)
-            .map(|blk| backing.read_raw_sealed_chunk(slot, blk).expect("read raw"))
-            .collect()
-    };
+    let read_bytes =
+        |backing: &ChunkedKvBacking, seq: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let n = seq.chunks.len();
+            let slot = backing.alloc_sequence().unwrap();
+            backing.inject_sealed_at_tail(slot, seq).expect("inject");
+            (0..n)
+                .map(|blk| backing.read_raw_sealed_chunk(slot, blk).expect("read raw"))
+                .collect()
+        };
     // Warm CPU seq → elevate back to GPU → read: canonical bytes for comparison.
-    let warm_to_bytes = |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut pin: Option<PinnedBuf> = None;
-        let round = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
-            .expect("elevate warm → gpu");
-        device.synchronize().unwrap();
-        read_bytes(backing, &round[0])
-    };
+    let warm_to_bytes =
+        |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut pin: Option<PinnedBuf> = None;
+            let round = backing
+                .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
+                .expect("elevate warm → gpu");
+            device.synchronize().unwrap();
+            read_bytes(backing, &round[0])
+        };
 
     // Path A — per-layer migrate.
     let bytes_a: Vec<_> = (0..n_layers)

@@ -464,7 +464,6 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
     }
 }
 
-
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
 /// injecting the sealed prefix and collecting all glue as the new region with
 /// each column's TRUE logical position. Reserves the glue writer chunk but does

@@ -4029,6 +4029,70 @@ layers:
 }
 
 #[test]
+fn top_k_force_tool_pin_overrides_belief_then_falls_back() {
+    use crate::projection::{ProjectionMode, SelectionState, FORCE_TOOL_SELECTOR};
+    let b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools_outro = b.id_for_system_section("tools_outro").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    // Hostile scores: tool_b and tool_d rank highest, so ordinary top-2 belief
+    // would keep exactly those. tool_c is deliberately the WORST-scored member.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+
+    // Pin tool_c by name via FORCE_TOOL_SELECTOR → exactly that one member is
+    // emitted, score notwithstanding, and the belief top-2 is skipped entirely.
+    let mut sel = SelectionState::new();
+    sel.select(FORCE_TOOL_SELECTOR, "tool_c");
+    let p = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel);
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(
+        ids,
+        vec![framing, tools_intro, tool_c, tools_outro],
+        "force_tool pin must emit exactly the pinned member, overriding belief"
+    );
+
+    // Unset pin → ordinary belief top-2 (tool_b, tool_d by score).
+    let p_unset = b.project_with_selection(
+        target,
+        &resolver,
+        ProjectionMode::Decode,
+        &SelectionState::default(),
+    );
+    let unset_ids: Vec<SectionId> = p_unset.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(
+        unset_ids,
+        vec![framing, tools_intro, tool_b, tool_d, tools_outro],
+        "unset force_tool pin must fall through to belief top-2"
+    );
+
+    // Pin names a non-member → no override; belief top-2 still governs.
+    let mut sel_bad = SelectionState::new();
+    sel_bad.select(FORCE_TOOL_SELECTOR, "nonexistent");
+    let p_bad = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel_bad);
+    let bad_ids: Vec<SectionId> = p_bad.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(
+        bad_ids,
+        vec![framing, tools_intro, tool_b, tool_d, tools_outro],
+        "unknown force_tool member must fall through to belief, not blank the collection"
+    );
+}
+
+#[test]
 fn named_selection_rejects_empty_selector() {
     use crate::projection::ConstructionError;
     const YAML: &str = r#"

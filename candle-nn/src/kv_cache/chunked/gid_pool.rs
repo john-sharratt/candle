@@ -65,7 +65,9 @@ use std::{
 use strum::IntoEnumIterator;
 
 use super::arena::ArenaKey;
-use crate::kv_cache::chunked::types::{arena_chunks_for_format, arena_gid_stride, TARGET_ARENA_BYTES};
+use crate::kv_cache::chunked::types::{
+    arena_chunks_for_format, arena_gid_stride, TARGET_ARENA_BYTES,
+};
 use crate::kv_cache::{ArenaLocation, KvFormat, QuantFormat};
 
 /// Per-arena refcount table. Lives behind an `Arc` shared by every
@@ -714,10 +716,7 @@ impl ArenaPool {
                         if table.is_full() {
                             self.capacity.clear(arena_idx);
                         }
-                        return Some((
-                            (arena_idx * stride + chunk_idx) as i64,
-                            Arc::clone(table),
-                        ));
+                        return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
                     }
                 }
             }
@@ -1379,7 +1378,9 @@ impl ChunkGidPool {
             let reserved = arenas.saturating_mul(TARGET_ARENA_BYTES);
             // Slab is ~TARGET_ARENA_BYTES regardless of format, so per-chunk
             // bytes = slab / chunks-per-slab; live bytes = occupied slots × that.
-            let per_chunk = TARGET_ARENA_BYTES.checked_div(pool.arena_chunks).unwrap_or(0);
+            let per_chunk = TARGET_ARENA_BYTES
+                .checked_div(pool.arena_chunks)
+                .unwrap_or(0);
             let live = pool.total_live().saturating_mul(per_chunk);
             if matches!(key.format, KvFormat::Float(_)) {
                 s.float_arenas += arenas;
@@ -1464,7 +1465,8 @@ mod tests {
 
         // Per-chunk bytes derive from the same slab-capacity helper the accessor
         // uses, so the expected live bytes are exact, not tolerance-based.
-        let f_per_chunk = TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Float(DType::BF16));
+        let f_per_chunk =
+            TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Float(DType::BF16));
         let q_per_chunk =
             TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Quantized(QuantFormat::Q8_0));
 

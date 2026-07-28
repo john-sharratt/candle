@@ -1477,10 +1477,11 @@ impl BackingInner {
         // never two. A split read (bound under one lock, pointers under another)
         // lets the scheduler free/relocate an arena between the two, so the dense
         // table's rows no longer correspond to the arenas the caller's frozen gids
-        // address — the persist select/convert/copy kernel then dereferences a
-        // stale/zero base pointer → CUDA_ERROR_ILLEGAL_ADDRESS. The migrate-in-flight
-        // guard blocks arena free/relocate/trim for the whole build→launch→readback
-        // window; this single-lock capture is the belt-and-suspenders half.
+        // address — the persist select kernel then dereferences a stale/zero base
+        // pointer (`run_select_kv_format_palette4_paged` → CUDA_ERROR_ILLEGAL_ADDRESS).
+        // The migrate-in-flight guard (see `migrate_in_flight`) additionally blocks
+        // arena free/relocate/trim for the whole build→launch→readback window; this
+        // single-lock capture is the belt-and-suspenders half of that fix.
         self.storage.read(|s| {
             let arenas = s.arenas();
             let num_arenas = arenas.keys().max().copied().map(|m| m + 1).unwrap_or(0);

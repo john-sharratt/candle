@@ -147,6 +147,10 @@ pub struct SegmentedLog {
     /// Sealed segment ids present on disk, ascending. Excludes the active.
     sealed: Vec<SegmentId>,
     pool: SealedPool,
+    /// Size the active grows to before it is sealed. [`SEGMENT_TARGET_BYTES`]
+    /// in production; a field (not the bare const) so tests can drive rotation
+    /// with a tiny target instead of writing multiple GiB.
+    target_bytes: u64,
 }
 
 /// Everything [`SegmentedLog::open_with_sink`] hands back to the persistence
@@ -329,6 +333,7 @@ impl SegmentedLog {
             active,
             sealed,
             pool: SealedPool::new(OPEN_SEALED_SEGMENTS),
+            target_bytes: SEGMENT_TARGET_BYTES,
         };
         Ok(OpenedSegments {
             segments,
@@ -383,7 +388,21 @@ impl SegmentedLog {
 
     /// Whether the active segment has reached the seal threshold.
     pub fn should_rotate(&self) -> bool {
-        self.active.write_offset() >= SEGMENT_TARGET_BYTES
+        self.active.write_offset() >= self.target_bytes
+    }
+
+    /// The active-segment seal threshold — [`SEGMENT_TARGET_BYTES`] unless a
+    /// test lowered it. The append-path byte check (`rotate_if_over_target`)
+    /// reads this so it stays in lock-step with `should_rotate`.
+    pub fn target_bytes(&self) -> u64 {
+        self.target_bytes
+    }
+
+    /// Lower the seal threshold so a test can exercise rotation without writing
+    /// multiple GiB. Production always uses the [`SEGMENT_TARGET_BYTES`] default.
+    #[cfg(test)]
+    pub fn set_target_bytes_for_test(&mut self, bytes: u64) {
+        self.target_bytes = bytes;
     }
 
     /// Seal the active segment and mint a fresh one at the next id. The caller
@@ -406,7 +425,15 @@ impl SegmentedLog {
         let new_id = old_id.next();
 
         let new_active = LogFile::create(&self.dir.join(segment_name(new_id)))?;
-        let old_active = std::mem::replace(&mut self.active, new_active);
+        let mut old_active = std::mem::replace(&mut self.active, new_active);
+        // Reclaim the over-allocated tail: the active was physically grown to a
+        // `GROW_EXTENT` boundary for cheap appends, but a sealed segment is
+        // immutable, so shrink its file to the logical end. Without this every
+        // sealed segment wastes up to one `GROW_EXTENT` of disk — real cost
+        // across a large corpus (and it grows with the extent size), and it made
+        // a segment's on-disk size diverge from its record bytes.
+        let logical_end = old_active.write_offset();
+        old_active.truncate_to(logical_end)?;
         // Close the now-sealed segment's write handle; future reads reopen it
         // read-only via the pool.
         drop(old_active);

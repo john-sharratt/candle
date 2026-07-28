@@ -276,18 +276,30 @@ impl SamplingConfig {
         }
     }
 
-    /// Decode config for the summary compressor. Greedy (temperature 0, so the
-    /// compression stays deterministic and faithful) but with a repetition
-    /// penalty — plain argmax with no penalty collapses into degenerate loops
-    /// and word-salad on this task (e.g. `"valid, valid, firm, firm, …"` or a
-    /// paragraph that repeats one clause to the token cap). A multiplicative
-    /// `repeat_penalty` breaks those loops while leaving legitimate repetition
-    /// (a repo map listing `candle-core, candle-nn, …`) intact — unlike
-    /// cumulative frequency/presence penalties, which suppress such lists. The
-    /// brevity itself comes from the per-layer `summary` prompts, not the
-    /// penalty. Tuned via the `regen_summaries` example.
+    /// Decode config for the summary compressor. Low-temperature nucleus
+    /// sampling (temperature 0.7, top-k 40, top-p 0.95) with a repetition
+    /// penalty.
+    ///
+    /// Sampling — not pure argmax — is deliberate. Under argmax the summary
+    /// locks DETERMINISTICALLY onto a single continuation, and the `repeat_penalty`
+    /// then pushes that greedy pick *away* from the tokens already in context;
+    /// when the attended context is even mildly off-distribution the penalised
+    /// argmax lands on degenerate loops or an off-language drift (whole summaries
+    /// decoding to another language), with no way to recover since the path is
+    /// deterministic. Sampling from a constrained top-k/top-p nucleus keeps the
+    /// decode on the plausible-English probability mass and shrugs off that mild
+    /// contamination instead of committing to it.
+    ///
+    /// The `repeat_penalty` still breaks the occasional loop sampling can fall
+    /// into (`"valid, valid, firm, firm, …"`), while leaving legitimate
+    /// repetition (a repo map listing `candle-core, candle-nn, …`) intact —
+    /// unlike cumulative frequency/presence penalties, which suppress such lists.
+    /// Brevity comes from the per-layer `summary` prompts, not the penalty.
+    /// Tuned via the `regen_summaries` example.
     pub fn compression() -> Self {
-        Self::argmax().with_repeat_penalty(1.3)
+        Self::top_k(40, 0.7)
+            .with_top_p(0.95)
+            .with_repeat_penalty(1.3)
     }
 
     /// Top-K sampling with temperature.
@@ -684,6 +696,69 @@ impl SamplingConfig {
             self.segment_suppress_tokens.len(),
             self.segment_suppress_tokens
         );
+    }
+
+    /// Apply the canonical `<think>`-block close steering for `mode` — the single
+    /// place both the dialogue path (`zend` session) and the ingest scope-summary
+    /// decode configure thinking behaviour, so the two can never drift.
+    ///
+    /// Resolves the `<think>`/`</think>` token IDs, sets the reflection-suppress
+    /// penalty and (for `Off`) drops the thinking temp boost, then programs the
+    /// per-span EOT close ramp + graceful/force cutoffs from `mode.eot_budget()`.
+    ///
+    /// `max_response_tokens` guards the short-output case. `Off`/`Quick`'s EOT
+    /// budget (~220/300) is a *dialogue backstop* — it assumes the model self-closes
+    /// an empty block from the `/no_think` glue and only caps a runaway. A short
+    /// summary (`max_response_tokens` ≈ 100) can never reach a 300-token backstop,
+    /// so when the block budget can't fit the response the steering collapses to a
+    /// forced **empty** close — the budget goes to the answer, not runaway (often
+    /// off-language) reasoning. Dialogue budgets sit well above the EOT force, so
+    /// their steering is unchanged.
+    ///
+    /// The EOS (answer-length) budget and the mid-sentence closer script stay
+    /// caller-set: they depend on the response-length dial and the dialect.
+    pub fn apply_think_mode(
+        &mut self,
+        mode: crate::stencil::ThinkMode,
+        tokenizer: &tokenizers::Tokenizer,
+        max_response_tokens: usize,
+    ) {
+        self.resolve_thinking_tokens(tokenizer);
+        self.segment_suppress_penalty = mode.suppress_penalty();
+        if mode == crate::stencil::ThinkMode::Off {
+            self.segment_temp_boost = 0.0;
+        }
+        self.set_think_close_budget(mode, max_response_tokens);
+    }
+
+    /// The tokenizer-independent half of [`Self::apply_think_mode`]: program the
+    /// per-span EOT close ramp + graceful/force cutoffs from `mode.eot_budget()`,
+    /// with the short-output collapse. Split out so the budget logic is unit-
+    /// testable without a tokenizer.
+    fn set_think_close_budget(
+        &mut self,
+        mode: crate::stencil::ThinkMode,
+        max_response_tokens: usize,
+    ) {
+        let (graceful, force) = mode.eot_budget();
+        // Collapse to a forced empty block ONLY for `Off` (which wants no thinking
+        // at all) when its backstop can't fire within the budget. Never collapse a
+        // reasoning dial: `Deep`/`Exhaustive` have large per-span think budgets that
+        // are deliberately independent of the answer-length budget, and their spans
+        // restart, so a small `max_response_tokens` must not empty their reasoning.
+        let collapse = mode == crate::stencil::ThinkMode::Off
+            && (force.max(0) as usize) >= max_response_tokens.max(1);
+        if collapse {
+            self.graceful_segment_close_after = 0;
+            self.force_segment_close_after = 1;
+            self.segment_close_ramp_start = 0;
+            self.segment_close_ramp_len = 1;
+        } else {
+            self.graceful_segment_close_after = graceful;
+            self.force_segment_close_after = force;
+            self.segment_close_ramp_start = graceful;
+            self.segment_close_ramp_len = force;
+        }
     }
 
     /// Set a hard per-segment token limit after which the segment-close token is forced.
@@ -1512,6 +1587,46 @@ mod sampling_config_tests {
     fn with_segment_temp_boost_sets_value() {
         let cfg = SamplingConfig::default().with_segment_temp_boost(0.05);
         assert_eq!(cfg.segment_temp_boost, 0.05);
+    }
+
+    #[test]
+    fn think_close_budget_collapses_off_only_on_tight_budget() {
+        use crate::stencil::ThinkMode;
+        // Off with a short summary budget (100 < the 300 backstop): collapse to a
+        // forced EMPTY block so the budget goes to the answer, not runaway thinking.
+        let mut off_tight = SamplingConfig::compression();
+        off_tight.set_think_close_budget(ThinkMode::Off, 100);
+        assert_eq!(
+            off_tight.force_segment_close_after, 1,
+            "Off + tight → empty"
+        );
+        assert_eq!(off_tight.graceful_segment_close_after, 0);
+        assert_eq!(off_tight.segment_close_ramp_len, 1);
+
+        // Off with a roomy dialogue budget keeps the normal (220, 300) backstop.
+        let mut off_roomy = SamplingConfig::compression();
+        off_roomy.set_think_close_budget(ThinkMode::Off, 4096);
+        let (g, f) = ThinkMode::Off.eot_budget();
+        assert_eq!(
+            off_roomy.force_segment_close_after, f,
+            "Off + roomy → backstop"
+        );
+        assert_eq!(off_roomy.graceful_segment_close_after, g);
+
+        // A REASONING dial is NEVER collapsed, even with a tiny answer budget — its
+        // per-span think budget is independent of the answer length.
+        let mut deep_tight = SamplingConfig::compression();
+        deep_tight.set_think_close_budget(ThinkMode::Deep, 50);
+        let (dg, df) = ThinkMode::Deep.eot_budget();
+        assert_eq!(
+            deep_tight.force_segment_close_after, df,
+            "Deep never collapses"
+        );
+        assert_eq!(deep_tight.graceful_segment_close_after, dg);
+        assert!(
+            df > 50,
+            "sanity: Deep's force budget exceeds the tiny answer budget"
+        );
     }
 
     #[test]

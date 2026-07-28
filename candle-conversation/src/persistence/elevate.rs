@@ -113,6 +113,15 @@ pub fn elevate_to_hot(
     sections: &[SectionId],
     turns: &[TurnKey],
 ) -> Result<ElevationReport> {
+    // Hold the migration-in-flight guard for the WHOLE elevate GPU window: the
+    // warm→hot lift allocates fresh hot arenas and scatters into them
+    // (`kv_migrate` on the shared stream) from the persistence thread, exactly
+    // like the hot→warm migrate — and with the same hazard: scheduler-side
+    // arena free / defrag / release / `cuMemPoolTrimTo` relief unmapping an
+    // arena a lift kernel is mid-read/write (the decode-onset illegal-address
+    // under bulk ingest, where lifts and waves overlap constantly). The guard
+    // defers that relief until the lift's kernels have retired.
+    let _migrate_guard = candle_nn::kv_cache::enter_migrate();
     // ── Phase 1: classify ───────────────────────────────────────────────
     let plan: PromotionPlan = conversation
         .read()
@@ -502,6 +511,16 @@ pub fn elevate_to_hot(
             bytes_cold_to_hot = report.bytes_cold_to_hot,
             "elevate_to_hot batch complete"
         );
+    }
+
+    // Retire the lift's in-flight GPU work before the migrate guard (top of fn)
+    // drops on return — the guard only protects arenas while HELD, so releasing
+    // it with scatters still queued would reopen the free-under-read window it
+    // exists to close. Only when work actually ran.
+    if report.warm_to_hot > 0 || report.cold_to_hot > 0 {
+        if let Err(e) = device.synchronize() {
+            tracing::warn!("elevate_to_hot: post-lift device sync failed: {e:?}");
+        }
     }
 
     Ok(report)
