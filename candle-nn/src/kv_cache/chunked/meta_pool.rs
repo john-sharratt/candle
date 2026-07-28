@@ -690,6 +690,7 @@ mod tests {
             chunk_byte_stride: 512,
             k_format_tag: ArenaFormatTag::Q8_0,
             v_format_tag: ArenaFormatTag::Q4_0,
+            chunk_capacity: u32::MAX,
         }];
 
         let mut dst = vec![0u8; rec];
@@ -760,12 +761,14 @@ mod tests {
                 chunk_byte_stride: 256,
                 k_format_tag: ArenaFormatTag::Q8_0,
                 v_format_tag: ArenaFormatTag::Q8_0,
+                chunk_capacity: u32::MAX,
             },
             ResolvedArenaInfo {
                 base_ptr: 0x9000,
                 chunk_byte_stride: 128,
                 k_format_tag: ArenaFormatTag::Q4_0,
                 v_format_tag: ArenaFormatTag::Q4_0,
+                chunk_capacity: u32::MAX,
             },
         ];
         let mut dst = vec![0u8; rec];

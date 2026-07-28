@@ -637,4 +637,10 @@ pub struct ResolvedArenaInfo {
     pub k_format_tag: ArenaFormatTag,
     /// Format tag for V data in this arena.
     pub v_format_tag: ArenaFormatTag,
+    /// Number of chunk slots this arena actually holds. Format-specific and
+    /// generally SMALLER than `arena_gid_stride()` (the raw-GID namespace is
+    /// sized for the densest format), so a gid's `chunk_idx` can be in-range
+    /// for the namespace yet out of range for its arena — addressing past the
+    /// arena's end. Validators compare `chunk_idx` against this, not the stride.
+    pub chunk_capacity: u32,
 }

@@ -116,7 +116,14 @@ fn build_slot_headers(
     // Reference pin: every chunk the headers will address (see
     // `SlotHeaderUpload::_pinned_gids`).
     let mut pinned_gids: Vec<HeadGids> = Vec::new();
-    for cache in caches.iter() {
+    // A live gid whose arena has no entry (or a zeroed hole entry) would silently
+    // resolve to `base_ptr 0` in `from_gids` — an in-band value that is legal for
+    // absent-palette sentinels (raw < 0) but, for a real gid, means the slot's
+    // block table outlived its arena: the kernel would deref ~null
+    // (CUDA_ERROR_ILLEGAL_ADDRESS) with zero attribution. Refuse to launch and
+    // name the chunk instead.
+    let mut dangling: Option<(usize, i64, usize, u16, u16)> = None;
+    for (slot_i, cache) in caches.iter().enumerate() {
         let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
         let mut slices: Vec<TokenSliceHost> = Vec::new();
         let mut cum: u32 = 0;
@@ -124,6 +131,29 @@ fn build_slot_headers(
             for c in it {
                 let rope_base = cum;
                 cum = cum.saturating_add(c.token_count as u32);
+                if dangling.is_none() {
+                    for gid in c.gids.as_slice() {
+                        let raw = gid.raw();
+                        if raw < 0 {
+                            continue;
+                        }
+                        let a = gid.arena_idx();
+                        // Two failure classes, one check: a freed arena (zeroed
+                        // hole entry), and a chunk_idx past the arena's real
+                        // format-specific capacity (the raw-GID namespace is
+                        // sized for the densest format, so an in-namespace idx
+                        // can still address past this arena's end — a stale gid
+                        // recycled across formats).
+                        let live = arena_info.get(a).is_some_and(|ai| {
+                            ai.chunk_byte_stride != 0
+                                && (gid.chunk_idx() as u32) < ai.chunk_capacity
+                        });
+                        if !live {
+                            dangling = Some((slot_i, raw, a, c.offset, c.token_count));
+                            break;
+                        }
+                    }
+                }
                 pinned_gids.push(c.gids.clone());
                 slices.push(TokenSliceHost::from_live_chunk(
                     &c,
@@ -139,6 +169,13 @@ fn build_slot_headers(
             writer_start_idx,
             !pm_cached,
         ));
+    }
+    if let Some((slot_i, raw, arena, offset, tokens)) = dangling {
+        candle::bail!(
+            "slot header build: batch slot {slot_i} holds a live chunk (gid {raw}, \
+             offset {offset}, tokens {tokens}) whose arena {arena} is freed — the \
+             block table lost its backing (freed with live KV)"
+        );
     }
 
     // Extend each slot's position_map to cover the write region. Ragged: slot i

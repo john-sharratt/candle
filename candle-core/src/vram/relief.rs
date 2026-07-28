@@ -181,8 +181,11 @@ impl VramGovernor {
             }
             self.do_sync();
             let mut freed = self.invoke_tier(trigger, tier, want);
-            freed = freed
-                .saturating_add(self.invoke_cross_class(trigger, tier, want.saturating_sub(freed)));
+            freed = freed.saturating_add(self.invoke_cross_class(
+                trigger,
+                tier,
+                want.saturating_sub(freed),
+            ));
             self.do_sync();
             freed
         } else {

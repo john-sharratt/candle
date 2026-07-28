@@ -67,7 +67,6 @@ pub mod error;
 #[cfg(feature = "cuda")]
 pub mod gpu_keepalive;
 pub mod gpu_memory;
-pub mod vram;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
@@ -92,6 +91,7 @@ mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
 mod variable;
+pub mod vram;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;

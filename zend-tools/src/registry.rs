@@ -875,7 +875,6 @@ fn register_all() -> &'static [RegisteredTool] {
         BYTES_PACK,
         BYTES_UNPACK,
         BYTES_XOR,
-
         // Code execution (5) — JavaScript on the embedded sandboxed engine
         CODE_RUN,
         CODE_SESSION_OPEN,

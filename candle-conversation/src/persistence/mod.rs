@@ -1752,7 +1752,8 @@ mod tests {
         // Write a batch far larger than the target with NO intervening commit.
         let n = 2000u32;
         for i in 0..n {
-            sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i)).unwrap();
+            sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i))
+                .unwrap();
         }
         // Rotation already fired on the append path — before we ever commit.
         // (Pre-fix: the whole batch stayed in one active until the end-commit,

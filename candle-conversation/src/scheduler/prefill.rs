@@ -1674,9 +1674,7 @@ impl Scheduler {
                         // 0.007%→0.135% at 42553ca3, amplified later by longer
                         // quanta). A real copy makes the captured row immutable —
                         // one ~vocab-sized row per completed prefill, negligible.
-                        let owned = l
-                            .copy()
-                            .unwrap_or_else(|_| l.clone());
+                        let owned = l.copy().unwrap_or_else(|_| l.clone());
                         self.active_prefills[i].final_logits = Some(owned);
                     }
                 }

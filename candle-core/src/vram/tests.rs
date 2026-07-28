@@ -226,7 +226,11 @@ fn escalates_but_withholds_critical_above_floor() -> Result<()> {
     assert_eq!(cheap.load(Ordering::Relaxed), 1);
     assert_eq!(mod_.load(Ordering::Relaxed), 1);
     assert_eq!(costly.load(Ordering::Relaxed), 1);
-    assert_eq!(crit.load(Ordering::Relaxed), 0, "Critical withheld above floor");
+    assert_eq!(
+        crit.load(Ordering::Relaxed),
+        0,
+        "Critical withheld above floor"
+    );
     assert_eq!(gov.sync_count(), 0, "no sync until Critical");
     Ok(())
 }
@@ -240,7 +244,11 @@ fn critical_syncs_before_and_after() -> Result<()> {
     vram.set(gov.kv_floor() - GIB);
     let res = gov.relieve_pressure(AllocClass::Kv)?;
     assert!(crit.load(Ordering::Relaxed) >= 1, "Critical engaged");
-    assert_eq!(gov.sync_count(), 2, "sync before AND after aggressive relief");
+    assert_eq!(
+        gov.sync_count(),
+        2,
+        "sync before AND after aggressive relief"
+    );
     assert_eq!(res, ReliefResult::Exhausted(0), "nothing freed → exhausted");
     Ok(())
 }
@@ -268,7 +276,11 @@ fn relief_stops_when_recovered() -> Result<()> {
     vram.set(gov.kv_floor()); // deep
     gov.relieve_pressure(AllocClass::Kv)?;
     assert_eq!(triv.load(Ordering::Relaxed), 1);
-    assert_eq!(mod_.load(Ordering::Relaxed), 0, "recovered before eviction rungs");
+    assert_eq!(
+        mod_.load(Ordering::Relaxed),
+        0,
+        "recovered before eviction rungs"
+    );
     Ok(())
 }
 
@@ -299,7 +311,9 @@ fn allocate_gives_up_after_full_ladder() {
     let vram = FakeVram::new(0, 73 * GIB);
     let gov = governed(&vram, 73 * GIB, 2 * GIB);
     // No relievers; alloc always OOMs.
-    let res: Result<()> = gov.allocate(AllocClass::Kv, GIB, || Err(Error::Msg("out of memory".into())));
+    let res: Result<()> = gov.allocate(AllocClass::Kv, GIB, || {
+        Err(Error::Msg("out of memory".into()))
+    });
     assert!(res.is_err());
     // Reached Critical (rate limit 0), so it did sync while trying.
     assert!(gov.sync_count() >= 1);
@@ -311,8 +325,9 @@ fn allocate_gives_up_after_full_ladder() {
 fn allocate_propagates_non_oom_error() {
     let vram = FakeVram::new(0, 73 * GIB);
     let gov = governed(&vram, 73 * GIB, 2 * GIB);
-    let res: Result<()> =
-        gov.allocate(AllocClass::Kv, GIB, || Err(Error::Msg("shape mismatch".into())));
+    let res: Result<()> = gov.allocate(AllocClass::Kv, GIB, || {
+        Err(Error::Msg("shape mismatch".into()))
+    });
     assert!(res.is_err());
     // A non-OOM error must NOT trigger the relief ladder.
     assert_eq!(gov.sync_count(), 0);
@@ -336,7 +351,13 @@ fn forecast_counts_reversible_evictable_only() {
     let gov = governed(&vram, 73 * GIB, 2 * GIB);
     // 2 GiB reversibly evictable at Moderate, plus a huge Critical-only pool.
     counting_relief(&gov, &vram, AllocClass::Kv, Criticality::Moderate, 2 * GIB);
-    counting_relief(&gov, &vram, AllocClass::Kv, Criticality::Critical, 100 * GIB);
+    counting_relief(
+        &gov,
+        &vram,
+        AllocClass::Kv,
+        Criticality::Critical,
+        100 * GIB,
+    );
     // Units of 1 GiB: headroom(4) + reversible(2) = 6, excludes the Critical pool.
     assert_eq!(gov.forecast_units(GIB), 6);
 }
@@ -364,7 +385,10 @@ fn all_experts_resident_when_they_fit() -> Result<()> {
     let budget = gov.expert_budget()?;
     let num_slots = (budget / max_expert).min(total_experts);
     let all_resident = num_slots >= total_experts;
-    assert!(budget >= total_expert_bytes, "budget should fit all experts here");
+    assert!(
+        budget >= total_expert_bytes,
+        "budget should fit all experts here"
+    );
     assert!(all_resident);
     Ok(())
 }
@@ -405,7 +429,10 @@ fn forecast_recovers_when_headroom_returns() {
     let low = gov.forecast_units(GIB);
     vram.set(40 * GIB);
     let high = gov.forecast_units(GIB);
-    assert!(high > low, "forecast grows back as headroom returns ({low} -> {high})");
+    assert!(
+        high > low,
+        "forecast grows back as headroom returns ({low} -> {high})"
+    );
 }
 
 // ── Diagnostics ──────────────────────────────────────────────────────────────
@@ -631,7 +658,11 @@ mod scenarios {
                 move || f2.load(Ordering::Relaxed),
             );
 
-            let (v, kv, kv2) = (self.vram.clone(), self.kv_held.clone(), self.kv_held.clone());
+            let (v, kv, kv2) = (
+                self.vram.clone(),
+                self.kv_held.clone(),
+                self.kv_held.clone(),
+            );
             self.gov.register_relief(
                 AllocClass::Kv,
                 Criticality::Moderate,
@@ -804,7 +835,7 @@ mod scenarios {
     fn oom_on_arena_alloc_retries_through_relief() -> Result<()> {
         let s = loaded(CARD, true);
         s.grow_kv(40 * GIB); // fill toward the floor
-        // Drive headroom below one arena so the alloc "fails".
+                             // Drive headroom below one arena so the alloc "fails".
         let arena = 512 * MIB;
         s.vram.set(arena / 2);
         let vr = s.vram.clone();
@@ -871,7 +902,11 @@ mod scenarios {
         s.gov.relieve_pressure(AllocClass::Kv)?;
         assert!(s.kv() < kv_calm, "KV was shed under contention");
         assert!(s.kv() >= s.floor, "but never below the floor");
-        assert_eq!(s.gov.sync_count(), 0, "Moderate handled it — no Critical sync");
+        assert_eq!(
+            s.gov.sync_count(),
+            0,
+            "Moderate handled it — no Critical sync"
+        );
 
         // Contention clears: forecast recovers.
         s.vram.release(theft);
@@ -1023,7 +1058,10 @@ mod real_cuda {
             let _ = gov.measure()?;
         }
         let per_read_us = t.elapsed().as_nanos() as f64 / n as f64 / 1000.0;
-        eprintln!("[real_cuda] probe.read() latency: {per_read_us:.2}µs/call ({:?})", before.source);
+        eprintln!(
+            "[real_cuda] probe.read() latency: {per_read_us:.2}µs/call ({:?})",
+            before.source
+        );
 
         // Balloon to 95% (default), then free+trim → capacity C. Time it: the
         // balloon runs at startup and must not move init time.
@@ -1134,8 +1172,18 @@ mod real_cuda {
         for tier in Criticality::ALL {
             gov.register_relief(AllocClass::Kv, tier, |_| ReliefOutcome::new(0), || 4 * GIB);
         }
-        gov.register_relief(AllocClass::Expert, Criticality::Moderate, |_| ReliefOutcome::new(0), || GIB);
-        gov.register_relief(AllocClass::Expert, Criticality::Critical, |_| ReliefOutcome::new(0), || GIB);
+        gov.register_relief(
+            AllocClass::Expert,
+            Criticality::Moderate,
+            |_| ReliefOutcome::new(0),
+            || GIB,
+        );
+        gov.register_relief(
+            AllocClass::Expert,
+            Criticality::Critical,
+            |_| ReliefOutcome::new(0),
+            || GIB,
+        );
 
         let per_seq = 512 * MIB;
         let n = 100_000u64;
@@ -1168,9 +1216,15 @@ mod real_cuda {
         eprintln!("  measure()          : {measure_ns:.0} ns");
         eprintln!("  forecast_units()   : {forecast_ns:.0} ns");
         eprintln!("  relieve_pressure() : {pressure_ns:.0} ns  (healthy, no eviction)");
-        eprintln!("  → per-wave check   : {per_wave_ns:.0} ns  = {:.3} µs", per_wave_ns / 1000.0);
+        eprintln!(
+            "  → per-wave check   : {per_wave_ns:.0} ns  = {:.3} µs",
+            per_wave_ns / 1000.0
+        );
         // Compare to representative wave times.
-        for (label, wave_ms) in [("decode wave ~25ms", 25.0), ("prefill wave ~2000ms", 2000.0)] {
+        for (label, wave_ms) in [
+            ("decode wave ~25ms", 25.0),
+            ("prefill wave ~2000ms", 2000.0),
+        ] {
             let frac = (per_wave_ns / 1e9) / (wave_ms / 1e3) * 100.0;
             eprintln!("  vs {label}: {frac:.5}% of the wave");
         }

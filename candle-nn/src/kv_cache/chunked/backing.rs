@@ -72,11 +72,32 @@ fn register_state(inner: &Arc<BackingInner>, state: &Arc<RwLock<BlockTableState>
 /// Called from the arena-alloc OOM/budget path, so it compacts **forced**
 /// (defrag threshold 0): under VRAM pressure we want to reclaim every
 /// arena we can, not wait for the steady-state fragmentation threshold.
+///
+/// Excluded from pointer-capture windows like every other topology mutator:
+/// compacting relocates/frees arenas whose base pointers an in-flight
+/// hot→warm migrate or warm→hot elevate has captured. `try_enter_relief`
+/// never blocks, so when the OOM happens ON a capturing thread (which holds
+/// the read side) this degrades to `0` freed and a clean propagated
+/// allocation error — recoverable, unlike a free-under-read corruption.
 pub(super) fn request_global_compact() -> usize {
+    let Some(_topology) = super::migrate_guard::try_enter_relief() else {
+        return 0;
+    };
     let mut freed = 0;
+    let mut quiesced = false;
     if let Ok(registry) = BACKING_REGISTRY.lock() {
         for weak in registry.iter() {
             if let Some(backing) = weak.upgrade() {
+                // Quiesce in-flight kernels once before the first free: wave
+                // kernels don't take the topology lock, so a trailing
+                // (deep-queued) kernel may still read arenas that emptied after
+                // its launch (see `BatchedInferenceSession::compact`).
+                if !quiesced {
+                    if backing.device.synchronize().is_err() {
+                        return 0;
+                    }
+                    quiesced = true;
+                }
                 if let Ok(n) = backing.compact_arenas_forced() {
                     freed += n;
                 }
@@ -1569,6 +1590,7 @@ impl BackingInner {
         needed: Option<&std::collections::HashSet<usize>>,
     ) -> Result<Vec<ResolvedArenaInfo>> {
         use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
+        use crate::kv_cache::chunked::arena_chunks_for_format;
 
         let chunk_size = CHUNK_SIZE;
         let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
@@ -1585,6 +1607,7 @@ impl BackingInner {
                     chunk_byte_stride: 0,
                     k_format_tag: ArenaFormatTag::BF16,
                     v_format_tag: ArenaFormatTag::BF16,
+                    chunk_capacity: 0,
                 };
                 num_arenas
             ];
@@ -1616,6 +1639,7 @@ impl BackingInner {
                     chunk_byte_stride,
                     k_format_tag: k_tag,
                     v_format_tag: v_tag,
+                    chunk_capacity: arena_chunks_for_format(arena.format()) as u32,
                 };
             }
 

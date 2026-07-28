@@ -66,11 +66,11 @@ impl Default for GovernorConfig {
             // Trivial/Cheap engage early at zero hit-rate cost; Moderate/Costly
             // (KV eviction) are withheld until near the floor; Critical == floor.
             ladder: [
-                LadderTier::new(2 * GIB, 0.040), // Trivial
+                LadderTier::new(2 * GIB, 0.040),     // Trivial
                 LadderTier::new(3 * GIB / 2, 0.030), // Cheap
-                LadderTier::new(GIB, 0.015),     // Moderate
-                LadderTier::new(GIB / 2, 0.005), // Costly
-                LadderTier::new(0, 0.0),         // Critical
+                LadderTier::new(GIB, 0.015),         // Moderate
+                LadderTier::new(GIB / 2, 0.005),     // Costly
+                LadderTier::new(0, 0.0),             // Critical
             ],
             balloon_target_frac: env_f64("CANDLE_VRAM_BALLOON_FRAC", 0.95),
             balloon_floor: env_bytes_mb("CANDLE_VRAM_BALLOON_FLOOR_MB", 512),

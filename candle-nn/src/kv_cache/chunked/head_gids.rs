@@ -351,6 +351,7 @@ mod tests {
             chunk_byte_stride: stride,
             k_format_tag: ArenaFormatTag::BF16,
             v_format_tag: ArenaFormatTag::BF16,
+            chunk_capacity: u32::MAX,
         }
     }
 

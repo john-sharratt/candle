@@ -1252,18 +1252,24 @@ impl BatchedInferenceSession {
     /// Call this after freeing sequences to reclaim GPU memory.
     /// Returns the total number of arenas freed across all layers.
     pub fn compact(&self) -> Result<usize> {
-        // Defer while the persistence thread's hot→warm migrate is reading arena
-        // base pointers: compaction relocates/frees arenas the migrate's select
-        // kernel is mid-read (cross-thread, unfenced) → CUDA_ERROR_ILLEGAL_ADDRESS.
-        // Relief resumes next wave; migrates run in ~hundreds of ms. The
-        // allocation-time OOM path (`request_global_compact`) bypasses the session
-        // and is intentionally NOT gated, so a real OOM still makes progress.
-        if candle_nn::kv_cache::migrate_in_flight() {
+        // Exclude pointer captures (hot→warm migrate / warm→hot elevate) for the
+        // WHOLE compaction: relocating/freeing an arena a capture's kernel is
+        // mid-read (cross-thread, unfenced) → CUDA_ERROR_ILLEGAL_ADDRESS. The
+        // guard is a held write lock, not an advisory check — a capture starting
+        // mid-compaction blocks until the compaction finishes. On contention we
+        // skip; relief resumes next wave (captures run in ~hundreds of ms).
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
             return Ok(0);
-        }
+        };
         if !self.compact_check()? {
             return Ok(0);
         }
+        // Quiesce in-flight kernels before unmapping: wave kernels don't take
+        // the topology lock — their uploaded tables pin chunks host-side only —
+        // so a trailing (deep-queued) kernel may still be reading arenas that
+        // emptied after its launch. One bounded sync per relief pass, at the
+        // only chokepoint where device memory actually unmaps.
+        self.device.synchronize()?;
         let t_compact = profile_now();
         let mut total_freed = 0;
         for backing in &self.backings {
@@ -1277,11 +1283,11 @@ impl BatchedInferenceSession {
     /// reclaimed arenas. Used by the scheduler's VRAM-pressure backpressure
     /// path, where reclaiming any arena is worth it. Returns arenas freed.
     pub fn compact_forced(&self) -> Result<usize> {
-        // See `compact` — deferred during a hot→warm migrate (scheduler relief
-        // only; the OOM `request_global_compact` path is not gated).
-        if candle_nn::kv_cache::migrate_in_flight() {
+        // See `compact` — held for the whole forced pass, quiesced before it.
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
             return Ok(0);
-        }
+        };
+        self.device.synchronize()?;
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.compact_forced()?;
@@ -1295,15 +1301,17 @@ impl BatchedInferenceSession {
     /// compaction). Does NOT release the emptied arenas — pair with
     /// [`release_empty_arenas`](Self::release_empty_arenas). Returns chunks moved.
     pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
-        // See `compact` — deferred during a hot→warm migrate (relocation would
-        // reindex arenas the migrate's frozen gids address).
-        if candle_nn::kv_cache::migrate_in_flight() {
+        // See `compact` — relocation reindexes arenas a capture's frozen gids
+        // address, so the exclusion covers the whole bounded pass.
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
             return Ok(0);
-        }
+        };
         let n = self.backings.len();
         if n == 0 {
             return Ok(0);
         }
+        // See `compact` — quiesce before relocating (a move frees the source).
+        self.device.synchronize()?;
         let mut remaining = max_moves;
         let mut moved = 0;
         for (i, backing) in self.backings.iter().enumerate() {
@@ -1329,14 +1337,18 @@ impl BatchedInferenceSession {
     /// path (the costly speculative defrag is left to the allocation-time OOM
     /// retry). Returns arenas freed.
     pub fn release_empty_arenas(&self) -> Result<usize> {
-        // See `compact` — deferred during a hot→warm migrate; freeing/unmapping an
-        // arena (esp. via the trailing `trim_kv_pool`) the select kernel reads is
-        // the direct cause of the crash. The migrate's own source arenas are
-        // Arc-pinned (never `live==0`), but neighbour arenas in the dense per-head
-        // table are not — so the whole release is deferred, not just some arenas.
-        if candle_nn::kv_cache::migrate_in_flight() {
+        // See `compact`. The migrate's dense per-head table addresses EVERY
+        // arena — including fully-empty ones — so even this "only frees what
+        // nothing uses" sweep is a pointer invalidator: the capture's own source
+        // arenas are Arc-pinned (never `live==0`), but empty neighbour arenas in
+        // the table are exactly what this sweep unmaps. Held for the whole sweep
+        // so a capture starting mid-sweep waits instead of racing it.
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
             return Ok(0);
-        }
+        };
+        // See `compact` — quiesce before unmapping. An arena that emptied this
+        // wave may still be addressed by that wave's in-flight trailing kernels.
+        self.device.synchronize()?;
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.release_empty_arenas()?;
@@ -1426,13 +1438,14 @@ impl BatchedInferenceSession {
     /// accurate. Only releases memory nothing is using; never touches live KV.
     pub fn trim_kv_pool(&self, keep_bytes: usize) -> Option<(usize, usize)> {
         // `cuMemPoolTrimTo` SYNCHRONOUSLY unmaps freed pool memory (not
-        // stream-ordered), so trimming while the persistence thread's select
-        // kernel is dereferencing an arena base pointer that lives in trimmed
-        // memory is the sharpest form of the free-under-read crash. Defer for the
-        // migrate window (see `release_empty_arenas`).
-        if candle_nn::kv_cache::migrate_in_flight() {
+        // stream-ordered) — the sharpest form of the free-under-read crash — so
+        // the exclusion is held across the trim itself (see `compact`).
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
             return None;
-        }
+        };
+        // See `compact` — quiesce before the (synchronous, non-stream-ordered)
+        // pool unmap.
+        self.device.synchronize().ok()?;
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(d) = &self.device {

@@ -389,10 +389,7 @@ fn registry() -> &'static Mutex<HashMap<usize, Arc<VramGovernor>>> {
 /// Install (or replace) the governor for its GPU so KV and expert code can reach
 /// the same instance via [`get`].
 pub fn install(governor: Arc<VramGovernor>) {
-    registry()
-        .lock()
-        .unwrap()
-        .insert(governor.gpu_id, governor);
+    registry().lock().unwrap().insert(governor.gpu_id, governor);
 }
 
 /// The governor for `gpu_id`, if installed.
