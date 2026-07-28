@@ -1068,15 +1068,6 @@ impl Scheduler {
         if self.pending_reprojections.is_empty() {
             return;
         }
-        // ABLATION (diagnostic, temporary): drop mid-decode reprojections
-        // entirely — each view keeps its submit-time context to completion.
-        // Tests whether the reproject-apply path (provenance scan → inject →
-        // view swap) is the CJK-drift ingredient: drift onset at depth matches
-        // reprojections over an accumulating adopted-turn corpus.
-        if std::env::var("ZEND_ABLATE_REPROJECT").is_ok() {
-            self.pending_reprojections.clear();
-            return;
-        }
         let _t_drain = super::PhaseTimer::new("drain_reprojections");
         let pending = std::mem::take(&mut self.pending_reprojections);
 

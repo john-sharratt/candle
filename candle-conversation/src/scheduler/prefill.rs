@@ -1150,12 +1150,6 @@ impl Scheduler {
     /// compression of *everything* pending (a 697-turn / 23 GiB / 66 s stall was
     /// the symptom). The background persistence thread drains the rest.
     fn compress_pending_turns(&mut self, budget_bytes: u64) -> usize {
-        // ABLATION (diagnostic, temporary): skip the turn compress-to-free rung
-        // to test whether freshly-quantized turn pages are a necessary
-        // ingredient of the decode-onset illegal address.
-        if std::env::var("ZEND_ABLATE_SECTION_QUANT").is_ok() {
-            return 0;
-        }
         // Need an engine-wide turn policy to compress against; without one turns
         // stay native float (lossless capture) and there is nothing to bring
         // forward.
@@ -1300,15 +1294,6 @@ impl Scheduler {
     ///   prefill creeps `~N/R` layers per wave while decode keeps its experts hot.
     pub(super) fn wave_prefill_layer_budget(&self) -> usize {
         let n = self.model.num_layers().max(1);
-        // ABLATION (diagnostic, temporary): full-depth windows — a prefill
-        // always sweeps all N layers in ONE wave (no creep pause/resume, no
-        // held residual). Tests whether the windowed creep's resume path is
-        // the stored-drift ingredient (KV written across window boundaries at
-        // subtly wrong offsets/rope ⇒ garbled turn context ⇒ greedy off-language
-        // summaries that start mid-sentence).
-        if std::env::var("ZEND_ABLATE_CREEP").is_ok() {
-            return n;
-        }
         if self.foreground_decode_width() == 0 {
             return n;
         }
@@ -1911,37 +1896,9 @@ impl Scheduler {
         // decode's sweep in one forward) rather than reading zero.
         let t_wave = Instant::now();
 
-        // ABLATION (diagnostic, temporary): pure-decode waves — decode never
-        // shares a forward with glue/section/creep rows (the 50ca23a8 layout).
-        // Glue fires in its own immediate forward below; sections and the
-        // prefill cohort advance via their standalone passes. Tests whether the
-        // decode+X co-batching itself is the CJK-drift ingredient at 42553ca3.
-        let pure_decode = std::env::var("ZEND_ABLATE_PURE_DECODE").is_ok() && n_dec > 0;
-
         // Fold this wave's deferred glue in as a full-sweep member co-batched with
         // decode (see `take_wave_glue`).
         let glue = self.take_wave_glue();
-        if pure_decode {
-            if let Some((ids, ins, pend)) = &glue {
-                // Fire the glue in its own decode-less forward right now (it
-                // cannot wait: scope prefills block on their gap fills).
-                self.session.set_pending_glue(pend.clone());
-                let _ = self.model.forward_wave(
-                    &mut self.session,
-                    &none_seqs,
-                    &none_inputs,
-                    &none_seqs,
-                    &none_inputs,
-                    ids.as_slice(),
-                    ins.as_slice(),
-                    0,
-                    n,
-                    None,
-                )?;
-                self.reconcile_glue_offsets(ids)?;
-            }
-        }
-        let glue = if pure_decode { None } else { glue };
         let (glue_seqs, glue_inputs): (&[usize], &[Tensor]) = match &glue {
             Some((ids, ins, _)) => (ids.as_slice(), ins.as_slice()),
             None => (&none_seqs, &none_inputs),
@@ -1964,9 +1921,7 @@ impl Scheduler {
         // was already advanced this wave. A fresh group folds section chunks in to
         // co-batch the creep (`form_wave_group(true)`), unless the standalone
         // section pass already ran this wave (no decode present).
-        let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced
-            && !pure_decode
-        {
+        let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
             if cursor == 0 && self.wave_prefill_residual.is_none() {
                 self.form_wave_group(!self.wave_section_advanced);
             }
@@ -1980,10 +1935,7 @@ impl Scheduler {
         // to hold; logits `[decode | section]` split at n_dec (glue logits, if any,
         // trail and are discarded).
         if seq_ids.is_empty() {
-            let section = if !self.wave_cohort_advanced
-                && !self.wave_section_advanced
-                && !pure_decode
-            {
+            let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
                 if self.vram_under_pressure() {
                     self.relieve_vram_pressure("section", VramPhase::Load);
                 }

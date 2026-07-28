@@ -306,22 +306,15 @@ fn run_loop(
         if run_maintenance {
             last_maintenance = Instant::now();
         }
-        // ABLATION (diagnostic, temporary): skip the ENTIRE persistence pass
-        // (migrate + gathers + installs + maintenance) to test whether ANY
-        // persist-thread GPU work is a necessary ingredient of the decode-onset
-        // illegal address. Redo-log writes of tokens/events still flow through
-        // the scheduler-side paths.
-        if std::env::var("ZEND_ABLATE_PERSIST").is_err() {
-            run_pass(
-                &conversation,
-                &backings,
-                &device,
-                &copy_stream,
-                compression_policy.as_ref(),
-                &mut pinned_scratch,
-                run_maintenance,
-            );
-        }
+        run_pass(
+            &conversation,
+            &backings,
+            &device,
+            &copy_stream,
+            compression_policy.as_ref(),
+            &mut pinned_scratch,
+            run_maintenance,
+        );
 
         // Re-stamp the residual backlog (post-drain) so the signal decays as
         // soon as the pass installs warm, letting admission reopen promptly.
@@ -644,14 +637,7 @@ fn run_pass(
     // the previous step's writes without explicit fences. After all
     // layers are migrated we take **one** substrate write lock and
     // install every warm copy at once.
-    // ABLATION (diagnostic, temporary): disable the hot→warm migrate entirely
-    // to test whether it is a necessary ingredient of the decode-onset illegal
-    // address. Controlled experiment; revert after the verdict.
-    let pending_warm: Vec<_> = if std::env::var("ZEND_ABLATE_MIGRATE").is_ok() {
-        Vec::new()
-    } else {
-        conversation.read().snapshot_pending_warm()
-    };
+    let pending_warm: Vec<_> = conversation.read().snapshot_pending_warm();
     let n_layers = backings.len();
     for (idx, hot, _) in &pending_warm {
         if hot.len() != n_layers {

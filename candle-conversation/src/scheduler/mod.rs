@@ -3205,20 +3205,6 @@ impl Scheduler {
 
             SchedulerRequest::FreeSequence { sequence_id } => {
                 tracing::debug!(target: "sched", "free_sequence {}", sequence_id);
-                // ABLATION (diagnostic, temporary): leak the slot instead of
-                // freeing — tests whether slot teardown (synchronous cuMemFree
-                // of slot-state buffers + chunk drops) is the ingredient of the
-                // decode-onset illegal address at first scope completions.
-                if std::env::var("ZEND_ABLATE_FREE").is_ok() {
-                    return true;
-                }
-                // Quiesce the device before tearing the slot down: freeing drops
-                // the slot-state device buffers via SYNCHRONOUS cuMemFree and
-                // releases chunk gids — memory in-flight wave kernels may still
-                // read (see `perform_seal_and_write`'s sync note).
-                if let Err(e) = self.device.synchronize() {
-                    tracing::warn!("free_sequence: pre-teardown device sync failed: {e:?}");
-                }
                 if let Err(e) = self.session.free_sequence(sequence_id.0) {
                     tracing::warn!("failed to free sequence {}: {}", sequence_id, e);
                 }
@@ -4276,18 +4262,6 @@ impl Scheduler {
         } = job;
         let timeline = target.timeline;
 
-        // Quiesce the device before dropping chunk references: the co-batched
-        // wave that decoded this pass may still have kernels in flight whose
-        // uploaded tables address the children's hot chunks (and the probe
-        // slot's state). The demote below drops hot Arcs and `free_summary_slot`
-        // tears the slot down with synchronous frees — doing either under a
-        // live kernel is the deterministic decode-onset illegal address at the
-        // first scope completions (this path fires exactly then, and bypasses
-        // the FreeSequence request the other teardown barrier covers). One sync
-        // per summary completion — rare, negligible.
-        if let Err(e) = self.device.synchronize() {
-            tracing::warn!("summary completion: pre-teardown device sync failed: {e:?}");
-        }
         // The children were lifted to hot only so this pass's decode could attend
         // over them. Now that the summary has decoded, drop their hot copies
         // (keeping warm) so a long run of summary passes can't accumulate
@@ -5796,12 +5770,6 @@ impl Scheduler {
     /// every path out of a compression pass (success or error). The decoded
     /// delta's RAII `ChunkGid`s keep the arena chunks alive after this returns.
     fn free_summary_slot(&mut self, slot: SequenceId) {
-        // Quiesce before teardown: this bypasses the FreeSequence request path,
-        // and the wave that decoded the pass may still be in flight (see the
-        // sync note in `complete_compression_pass`).
-        if let Err(e) = self.device.synchronize() {
-            tracing::warn!("free_summary_slot: pre-teardown device sync failed: {e:?}");
-        }
         let _ = self.session.free_sequence(slot.0);
         self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
@@ -5977,15 +5945,7 @@ impl Scheduler {
         // glue K/V into whatever this rebuild placed at those indices. Drop the
         // superseded plan and defer only this latest projection, so exactly one
         // (current) plan fires against the slot as this call built it.
-        // ABLATION (diagnostic, temporary): with ZEND_ABLATE_WAVE_GLUE set,
-        // never defer gap-fills into the wave-folded glue group — fire them
-        // immediately through the dedicated `fire_gap_fill_batch` forward (the
-        // 50ca23a8 path). Tests whether the wave-glue write path (GlueMeta /
-        // paged-glue kernel co-batch) subtly corrupts the role-seam KV it
-        // scatters — the drift's role-confusion phenotype.
-        let defer = if self.batch_drain_gap_fills
-            && std::env::var("ZEND_ABLATE_WAVE_GLUE").is_err()
-        {
+        let defer = if self.batch_drain_gap_fills {
             self.deferred_glue_fires
                 .retain(|p| p.parent_id != parent_id);
             Some(&mut self.deferred_glue_fires)
@@ -6793,12 +6753,6 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
-        // ABLATION (diagnostic, temporary): skip the section quantize entirely
-        // to test whether freshly-quantized section pages are a necessary
-        // ingredient of the decode-onset illegal address.
-        if std::env::var("ZEND_ABLATE_SECTION_QUANT").is_ok() {
-            return Ok(());
-        }
         // Defer while a hot→warm migrate is in flight: the quantize frees/swaps
         // the section's float source arenas, and the migrate's dense per-head
         // table addresses every arena — freeing one under it → the persist
@@ -6829,10 +6783,6 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
-        // ABLATION (diagnostic, temporary): see `quantize_pending_sections`.
-        if std::env::var("ZEND_ABLATE_SECTION_QUANT").is_ok() {
-            return Ok(());
-        }
         // See `quantize_pending_sections` — deferred during a hot→warm migrate
         // so the member quantize doesn't free arenas the migrate's table reads.
         if candle_nn::kv_cache::migrate_in_flight() {
@@ -7014,18 +6964,6 @@ impl Scheduler {
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
     ) -> Result<Option<SealResult>, ConversationError> {
-        // Quiesce the device before mutating slot state. The seal snapshots,
-        // truncates, and re-injects this slot's chunk layout — state the
-        // co-batched wave's in-flight kernels (and their uploaded tables) may
-        // still be reading. Pre-CFW every forward ended with a synchronous
-        // logits readback, which serialized seals behind kernel retirement for
-        // free; the unified wave broke that implicit barrier, letting the
-        // seal's teardown overlap live kernels (the deterministic decode-onset
-        // CUDA_ERROR_ILLEGAL_ADDRESS at the first scope completions). One sync
-        // per seal, at the mutation gate — the class fix, not a per-path patch.
-        if let Err(e) = self.device.synchronize() {
-            tracing::warn!("seal: pre-mutation device sync failed: {e:?}");
-        }
         // The substrate target (where a `SealAction::Turn` write
         // lands) is read from `slot_targets` rather than threaded
         // through the request — see [`Self::slot_targets`].
