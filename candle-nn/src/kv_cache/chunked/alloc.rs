@@ -43,24 +43,35 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 /// that fit fine in VRAM with no spill. A fixed headroom matches what the
 /// forward pass actually needs.
 ///
-/// Default 256 MiB; override with `CANDLE_KV_VRAM_RESERVE_MB` (raise it for very
-/// wide models such as 235B, where the per-chunk activation is larger).
+/// Scales with the card (`total / 12`, floored at 384 MiB); override with
+/// `CANDLE_KV_VRAM_RESERVE_MB`.
 #[cfg(feature = "cuda")]
-fn vram_reserve_bytes(_total: usize) -> usize {
+fn vram_reserve_bytes(total: usize) -> usize {
     if let Ok(v) = std::env::var("CANDLE_KV_VRAM_RESERVE_MB") {
         if let Ok(mb) = v.trim().parse::<usize>() {
             return mb.saturating_mul(1024 * 1024);
         }
     }
-    // 384 MiB. Serves two roles: headroom for forward-pass activations in our
-    // own accounting, AND the hard floor of *current* driver-free VRAM we refuse
-    // to dip below (see `vram_has_room`). The floor is what keeps the machine
-    // off the cliff — it guarantees we never drive free toward zero and push the
-    // OS into a paging death-spiral, regardless of what our pool accounting
-    // estimates. Sized to clear a 30B-A3B forward pass while still letting the
-    // 16 GB dev card hold large session batches; override with
-    // `CANDLE_KV_VRAM_RESERVE_MB` (e.g. raise it on a busy shared desktop).
-    384 * 1024 * 1024
+    // Serves two roles: headroom for the forward pass's transient activations in
+    // our own accounting, AND the hard floor of *current* driver-free VRAM we
+    // refuse to dip below (see `vram_has_room`) — the floor that keeps the machine
+    // off the WDDM paging cliff.
+    //
+    // The activation peak is NOT "a few hundred MiB independent of total VRAM":
+    // a wide ingest prefill (a fat cohort of sequences attending a long context)
+    // materialises several GiB of transient tensors, and even a small decode alloc
+    // needs a CONTIGUOUS block the fragmented pool free-list can't provide. A fixed
+    // 384 MiB reserve let the pool grow until only ~384 MiB driver-free remained —
+    // exactly where those allocations spill to host memory and collapse throughput
+    // to 13–46 s/forward (the 62→65 GiB grind). The peak correlates with the
+    // workload width, which in turn correlates with the card (you run wide cohorts
+    // on big cards), so scale the reserve with `total`: `total / 12` is 6 GiB on a
+    // 72 GiB card, 2.7 GiB on 32 GiB, ~1.3 GiB on a 16 GiB card — enough contiguous
+    // driver-free that the wide prefill activations (and any decode alloc) stay
+    // resident. Floored at 384 MiB for tiny cards; raise via the env var if a
+    // workload's activations still spill (it caps the hot-KV budget in exchange,
+    // which the ingest's evict-to-cold absorbs).
+    (total / 12).max(384 * 1024 * 1024)
 }
 
 /// Extra VRAM headroom kept free ON TOP of [`vram_reserve_bytes`] that ONLY a
@@ -225,13 +236,30 @@ pub fn vram_budget_available(device: &Device) -> Option<usize> {
     // reported false pressure while 10+ GiB of reusable pool sat free (the pool
     // can't return it to the OS: freed chunks are scattered inside partially-used
     // segments, so `cuMemPoolTrimTo` reclaims nothing), evicting pointlessly and
-    // collapsing the admission window. Pool *growth* is still capped at the DXGI
-    // budget (`headroom`), so this can never oversubscribe the card.
+    // collapsing the admission window.
+    //
+    // BUT this only holds while the pool has NOT claimed the whole card. Reuse is
+    // genuine for chunk-sized KV arenas, which slot into the fragmented free-blocks;
+    // it is a LIE for the large, CONTIGUOUS activation buffers each forward
+    // allocates — those can't use scattered free-blocks, so they force the pool to
+    // grow, and once `reserved >= capacity` (the balloon-measured resident C) that
+    // growth spills to host memory (WDDM) and collapses throughput to 13–46 s/forward.
+    // In that oversubscribed state the reuse is phantom headroom that keeps the
+    // scheduler admitting into the wall (`budget` reads ~8 GiB while `used` flatlines
+    // and free = 0). Drop it there so the budget honestly falls to `headroom` (≈0),
+    // admission backs off, and relief fires instead of digging deeper. `capacity == 0`
+    // means the balloon hasn't measured yet (startup, no pressure) — keep the reuse.
     if let Some(gov) = candle::vram::get(gpu_id) {
         let headroom = gov.measure().ok()?.headroom as usize;
-        let reuse = match (d.pool_reserved_bytes(), d.pool_used_bytes()) {
-            (Ok(r), Ok(u)) => r.saturating_sub(u),
-            _ => 0,
+        let (reserved, used) = match (d.pool_reserved_bytes(), d.pool_used_bytes()) {
+            (Ok(r), Ok(u)) => (r, u),
+            _ => (0, 0),
+        };
+        let capacity = gov.capacity() as usize;
+        let reuse = if capacity == 0 || reserved < capacity {
+            reserved.saturating_sub(used)
+        } else {
+            0
         };
         return Some(headroom.saturating_add(reuse));
     }

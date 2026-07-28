@@ -71,6 +71,22 @@ pub enum WavePhase {
     Logits(TensorCat),
 }
 
+/// Driver-used VRAM right now (`total − free` from `cuMemGetInfo`), in bytes;
+/// `0` on non-CUDA / query failure. Dense models capture this at the start and
+/// end of weight loading — the delta is their fixed resident-weight footprint,
+/// reported through [`BatchedModelCore::resident_weight_bytes`] for the
+/// whole-card VRAM decomposition.
+#[cfg(feature = "cuda")]
+pub(crate) fn driver_used_bytes(device: &Device) -> usize {
+    if matches!(device, Device::Cuda(_)) {
+        candle::quantized::get_vram_info()
+            .map(|(free, total)| total.saturating_sub(free))
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 // ============================================================================
 // Core Model Trait (Simple Accessors Only)
 // ============================================================================
@@ -118,6 +134,14 @@ pub trait BatchedModelCore {
 
     /// Snapshot expert pipeline telemetry counters (if this model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
+        None
+    }
+
+    /// Live VRAM bytes held by the model's weights — fixed base weights plus the
+    /// **time-varying** resident-expert footprint (MoE experts page VRAM↔RAM
+    /// under pressure). `None` if the model can't report it (dense models, no
+    /// expert cache, non-CUDA). Feeds the whole-card VRAM decomposition.
+    fn resident_weight_bytes(&self) -> Option<usize> {
         None
     }
 

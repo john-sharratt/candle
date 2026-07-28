@@ -219,6 +219,10 @@ pub struct WaveSample {
     /// Driver total / free VRAM (MiB, `cuMemGetInfo`) for the whole-card decomp.
     pub total_mib: u64,
     pub free_mib: u64,
+    /// Resident model-weight VRAM (MiB) this wave — fixed base weights plus the
+    /// live resident-expert footprint (MoE experts page VRAM↔RAM), sampled from
+    /// the model each wave. The whole-card decomp carves this out as its own band.
+    pub weights_mib: u64,
     /// Projection decomposition (ms). `pdrain` = submission drain MINUS the prefill
     /// re-attributed to the Prefill phase, decomposed into `drain_elevate`
     /// (sealed-prefix inject / warm→hot) + `drain_glue` (submit gap-fill) + drain
@@ -344,12 +348,12 @@ pub(crate) fn wave_sample(
     used_mib: u64,
     backlog: u64,
     fmt: Option<(u32, u64, u64, u32, u64, u64)>,
-    vram: (u64, u64, u64),
+    vram: (u64, u64, u64, u64),
     proj: (u64, u64, u64, u64, u64, u64, u64),
     slots: (u32, u32, u32, u32),
 ) -> WaveSample {
     let (fa, fm, fl, qa, qm, ql) = fmt.unwrap_or((0, 0, 0, 0, 0, 0));
-    let (reserved_mib, total_mib, free_mib) = vram;
+    let (reserved_mib, total_mib, free_mib, weights_mib) = vram;
     let (
         pdrain_ms,
         drain_elevate_ms,
@@ -377,6 +381,7 @@ pub(crate) fn wave_sample(
         reserved_mib,
         total_mib,
         free_mib,
+        weights_mib,
         pdrain_ms,
         drain_elevate_ms,
         drain_glue_ms,
@@ -466,7 +471,7 @@ mod tests {
             58000,
             123,
             Some((70, 1120, 1001, 467, 7472, 3360)),
-            (9000, 65536, 20000),
+            (9000, 65536, 20000, 18500),
             (12, 3, 4, 34, 5, 6, 7),
             (48, 8, 2, 40),
         ));

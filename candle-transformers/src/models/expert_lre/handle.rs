@@ -346,6 +346,32 @@ impl ExpertCache {
         let all_resident = false;
 
         let stats = PipelineStats::new_shared();
+        // Seed the resident-expert VRAM gauge with the startup footprint (occupied
+        // slots × slot size) so it reads correctly before the first classify
+        // refreshes it. `inner` + `layer_geometries` are still in scope here,
+        // before they move into `PipelineState` below.
+        #[cfg(feature = "cuda")]
+        {
+            let occupied = inner.slots.len() - inner.free_slots.len();
+            let slot_bytes = layer_geometries
+                .iter()
+                .map(|g| g.total_repacked_size)
+                .max()
+                .unwrap_or(0);
+            let seeded = occupied * slot_bytes;
+            tracing::info!(
+                target: "candle_transformers::expert_lre",
+                num_slots = inner.slots.len(),
+                free_slots = inner.free_slots.len(),
+                occupied,
+                slot_bytes,
+                resident_gib = seeded as f64 / 1e9,
+                "expert cache: seeded resident-VRAM gauge"
+            );
+            if let Ok(mut s) = stats.lock() {
+                s.resident_vram_bytes = seeded;
+            }
+        }
 
         let state = PipelineState {
             inner,
@@ -437,6 +463,15 @@ impl ExpertCache {
     // ────────────────────────────────────────────────────────────────────────
     // Public API
     // ────────────────────────────────────────────────────────────────────────
+
+    /// Live VRAM bytes held by resident expert slots (`occupied_slots ×
+    /// slot_size`) — the model's **time-varying** MoE weight footprint. Rises as
+    /// experts load into VRAM and falls as they stream out to pinned RAM under
+    /// pressure. Read lock-free from the shared stats gauge (seeded at
+    /// construction, refreshed each classify). `0` on non-CUDA / no-expert models.
+    pub fn resident_vram_bytes(&self) -> usize {
+        PipelineStats::snapshot(&self.stats).resident_vram_bytes
+    }
 
     /// Submit a full MoE dispatch to the pipeline.
     ///

@@ -43,6 +43,7 @@ pub mod streams;
 pub mod thread;
 pub mod transfer;
 pub mod walker;
+pub mod writer;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -2854,6 +2854,12 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Live VRAM held by the model's weights (fixed base + time-varying resident
+    /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
+    fn resident_weight_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -3263,6 +3269,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn resident_weight_bytes(&self) -> Option<usize> {
+        self.model().resident_weight_bytes()
     }
 
     fn reset_expert_stats(&self) {

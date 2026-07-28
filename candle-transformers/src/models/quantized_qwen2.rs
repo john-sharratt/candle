@@ -481,6 +481,11 @@ pub struct ModelWeights {
     device: Device,
     span: tracing::Span,
     span_output: tracing::Span,
+    /// Fixed resident-weight VRAM (bytes), measured at load as the driver-used
+    /// delta across weight loading. Dense model: all weights stay VRAM-resident.
+    /// `0` on non-CUDA.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    base_weight_bytes: usize,
 }
 
 /// Implementation of `BatchedModelCore` for use with `BatchedInference` wrapper.
@@ -521,6 +526,11 @@ impl BatchedModelCore for ModelWeights {
 
     fn output_proj(&self) -> &QMatMul {
         &self.output
+    }
+
+    fn resident_weight_bytes(&self) -> Option<usize> {
+        // Dense model: all weights are fixed and fully VRAM-resident.
+        Some(self.base_weight_bytes)
     }
 
     fn rope_interleaved(&self) -> bool {
@@ -619,6 +629,10 @@ impl ModelWeights {
         // Parse GGUF metadata from mmap (23x faster than reading from File!)
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // Driver-used VRAM baseline before any weights load (delta = weight footprint).
+        #[cfg(feature = "cuda")]
+        let used_before = super::batched_model::driver_used_bytes(device);
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -808,6 +822,11 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        #[cfg(feature = "cuda")]
+        let base_weight_bytes =
+            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        #[cfg(not(feature = "cuda"))]
+        let base_weight_bytes = 0usize;
 
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,
@@ -817,6 +836,7 @@ impl ModelWeights {
             device: device.clone(),
             span,
             span_output,
+            base_weight_bytes,
         })
     }
 
@@ -826,6 +846,9 @@ impl ModelWeights {
         device: &Device,
         max_kv_cache_len: Option<usize>,
     ) -> Result<Self> {
+        // Driver-used VRAM baseline before any weights load (delta = weight footprint).
+        #[cfg(feature = "cuda")]
+        let used_before = super::batched_model::driver_used_bytes(device);
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
@@ -989,6 +1012,11 @@ impl ModelWeights {
 
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        #[cfg(feature = "cuda")]
+        let base_weight_bytes =
+            super::batched_model::driver_used_bytes(device).saturating_sub(used_before);
+        #[cfg(not(feature = "cuda"))]
+        let base_weight_bytes = 0usize;
 
         Ok(Self {
             embeddings: Embedding::new(tok_embeddings, embedding_length)?,
@@ -998,6 +1026,7 @@ impl ModelWeights {
             device: device.clone(),
             span,
             span_output,
+            base_weight_bytes,
         })
     }
 

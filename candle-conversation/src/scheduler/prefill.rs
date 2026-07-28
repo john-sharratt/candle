@@ -556,7 +556,18 @@ impl Scheduler {
         ) {
             (Some((free, total)), Some((used, reserved))) => {
                 let reuse_headroom = reserved.saturating_sub(used);
-                free < (total / 10).max(1usize << 30) && reuse_headroom < VRAM_REUSE_BAND
+                // Trip on low physical free when EITHER the reusable pool is small
+                // (the original case — genuine pressure, nothing to reuse) OR the
+                // pool has OVER-SUBSCRIBED the card (`reserved > total`). In the
+                // over-subscription case the "reuse" gap lives in WDDM host memory,
+                // so it's un-usable for a contiguous activation allocation — which
+                // spills and degrades throughput (the 62→65 GiB grind) while the
+                // budget/reuse accounting still reads GiBs "free". Eviction must fire
+                // regardless of the gap's size, shedding whole arenas until reserved
+                // drops back under the card. Without the `reserved > total` arm, a
+                // large un-returnable gap silently suppresses all relief here.
+                free < (total / 10).max(1usize << 30)
+                    && (reuse_headroom < VRAM_REUSE_BAND || reserved > total)
             }
             _ => false,
         };
@@ -1543,7 +1554,9 @@ impl Scheduler {
     /// Returns the kept members (aligned with `seq_ids`/`inputs`) plus the
     /// `active_prefills` positions of the prefill members (for OOM/error routing).
     #[allow(clippy::type_complexity)]
-    fn build_wave_group_inputs(&mut self) -> (Vec<WaveMember>, Vec<usize>, Vec<Tensor>, Vec<usize>) {
+    fn build_wave_group_inputs(
+        &mut self,
+    ) -> (Vec<WaveMember>, Vec<usize>, Vec<Tensor>, Vec<usize>) {
         let members = self.wave_prefill_members.clone();
         let mut kept: Vec<WaveMember> = Vec::with_capacity(members.len());
         let mut seq_ids: Vec<usize> = Vec::with_capacity(members.len());
@@ -1599,8 +1612,7 @@ impl Scheduler {
                             inputs.push(t);
                         }
                         Err(e) => {
-                            self.active_section_ingests[i].error =
-                                Some(ConversationError::Model(e))
+                            self.active_section_ingests[i].error = Some(ConversationError::Model(e))
                         }
                     }
                 }
@@ -1632,7 +1644,11 @@ impl Scheduler {
                         continue;
                     }
                     let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
-                    super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &all_tokens);
+                    super::Scheduler::record_slot_tokens(
+                        &mut self.slot_tokens,
+                        seq_id,
+                        &all_tokens,
+                    );
                     self.active_prefills[i].offset = total;
                     // Staged calibration prefill: emit every segment's pinned
                     // projection here at completion (a wave processes the whole
@@ -1651,13 +1667,14 @@ impl Scheduler {
                         }
                         self.active_prefills[i].next_projection = offs.len();
                     }
-                    let _ = self.active_prefills[i]
-                        .work
-                        .event_tx
-                        .send(TurnEvent::PrefillProgress {
-                            tokens_done: total,
-                            tokens_total: total,
-                        });
+                    let _ =
+                        self.active_prefills[i]
+                            .work
+                            .event_tx
+                            .send(TurnEvent::PrefillProgress {
+                                tokens_done: total,
+                                tokens_total: total,
+                            });
                     if let Some(l) = member_logits.get(k) {
                         // DEEP-copy the final-logits row at capture. `Tensor::clone`
                         // is shallow (shared storage), and this tensor is HELD until
@@ -1678,7 +1695,10 @@ impl Scheduler {
                         self.active_prefills[i].final_logits = Some(owned);
                     }
                 }
-                WaveMember::Section { seq_id: sid, advance } => {
+                WaveMember::Section {
+                    seq_id: sid,
+                    advance,
+                } => {
                     let Some(i) = self
                         .active_section_ingests
                         .iter()
@@ -1694,7 +1714,11 @@ impl Scheduler {
                     let off = self.active_section_ingests[i].offset;
                     let end = (off + advance).min(self.active_section_ingests[i].tokens.len());
                     let chunk_tokens = self.active_section_ingests[i].tokens[off..end].to_vec();
-                    super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
+                    super::Scheduler::record_slot_tokens(
+                        &mut self.slot_tokens,
+                        seq_id,
+                        &chunk_tokens,
+                    );
                     self.active_section_ingests[i].offset = end;
                 }
             }
@@ -2074,11 +2098,8 @@ impl Scheduler {
         // residual caller order `[decode | creep | glue]`; at cursor 0 all embed
         // fresh (None).
         let pf_res = self.wave_prefill_residual.take();
-        let seg2_in = Self::cat_caller_residual(&[
-            seg1_dec.as_ref(),
-            pf_res.as_ref(),
-            seg1_glue.as_ref(),
-        ])?;
+        let seg2_in =
+            Self::cat_caller_residual(&[seg1_dec.as_ref(), pf_res.as_ref(), seg1_glue.as_ref()])?;
         if let Some(p) = glue_pending {
             self.session.set_pending_glue(p.clone());
         }

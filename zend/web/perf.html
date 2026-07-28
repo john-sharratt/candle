@@ -216,12 +216,12 @@
 
     <div class="card">
       <h3>VRAM decomposition</h3>
-      <div class="cap">Whole-card VRAM over time (GiB), stacked to the driver total. <span style="color:var(--quant)">KV quant</span> + <span style="color:var(--float)">KV float</span> are the pool's reserved KV; <span style="color:var(--slack)">slack</span> is reserved-but-free pool fragmentation; <span style="color:var(--weights)">weights + runtime</span> is everything resident outside the KV pool (weights, scratch, CUDA context); the rest is <span style="color:var(--ink-faint)">free</span>. Weights and scratch aren't separately instrumented, so they share one band.</div>
+      <div class="cap">Whole-card VRAM over time (GiB), stacked to the driver total. <span style="color:var(--quant)">KV quant</span> + <span style="color:var(--float)">KV float</span> are the pool's reserved KV; <span style="color:var(--weights)">weights</span> is the model's resident weight VRAM — fixed base weights plus the live resident-expert footprint (MoE experts page VRAM↔RAM under pressure), sampled from the model each wave; <span style="color:var(--slack)">slack + runtime</span> is reserved-but-free pool fragmentation plus non-pool CUDA context/scratch; the rest is <span style="color:var(--ink-faint)">free</span>.</div>
       <div class="legend">
         <span style="color:var(--quant)"><i style="background:var(--quant)"></i>KV quant</span>
         <span style="color:var(--float)"><i style="background:var(--float)"></i>KV float</span>
         <span style="color:var(--slack)"><i style="background:var(--slack)"></i>slack</span>
-        <span style="color:var(--weights)"><i style="background:var(--weights)"></i>weights + runtime</span>
+        <span style="color:var(--weights)"><i style="background:var(--weights)"></i>weights</span>
         <span style="color:var(--ink-faint)"><i style="background:var(--freevram)"></i>free</span>
       </div>
       <canvas id="c_vramdecomp" height="190"></canvas>
@@ -655,21 +655,24 @@ function createCharts(){
       tip:i=>[{t:ageStr(FM1[i].t)},{t:'quant '+gib(FM1[i].ql).toFixed(1)+' GiB / '+Math.round(FM1[i].qa)+' arenas',c:cssvar('--quant')},
         {t:'float '+gib(FM1[i].fl).toFixed(1)+' GiB / '+Math.round(FM1[i].fa)+' arenas',c:cssvar('--float')}]})),
     // Whole-card VRAM stacked to the driver total. Bands are cumulative tops:
-    // quant → +float → +slack(=res) → +weights/runtime(=used_total) → +free(=total).
+    // quant → +float → +weights(=qkv+fkv+wt) → +slack/runtime(=used_total) → +free.
+    // `wt` is the model's live resident-weight VRAM (base weights + resident MoE
+    // experts), sampled per wave — it rises/falls as experts page VRAM↔RAM, and
+    // carves the weights out of what would otherwise inflate the grey slack band.
     // Drawn top-band first so the small KV bands paint last (on top).
     makeChart('c_vramdecomp', ()=>({
       xs:W1.map(w=>w.t), ymax:Math.max(1,...W1.map(w=>gib(w.tot)))*1.02, yFmt:v=>v.toFixed(0),
       series:[
         {data:W1.map(w=>gib(w.tot)),color:cssvar('--freevram'),type:'area',baseData:W1.map(w=>gib(w.tot-w.free)),lw:1},
-        {data:W1.map(w=>gib(w.tot-w.free)),color:cssvar('--weights'),type:'area',baseData:W1.map(w=>gib(w.res)),lw:1},
-        {data:W1.map(w=>gib(w.res)),color:cssvar('--slack'),type:'area',baseData:W1.map(w=>gib(w.qkv+w.fkv)),lw:1},
+        {data:W1.map(w=>gib(w.tot-w.free)),color:cssvar('--slack'),type:'area',baseData:W1.map(w=>gib(w.qkv+w.fkv+w.wt)),lw:1},
+        {data:W1.map(w=>gib(w.qkv+w.fkv+w.wt)),color:cssvar('--weights'),type:'area',baseData:W1.map(w=>gib(w.qkv+w.fkv)),lw:1},
         {data:W1.map(w=>gib(w.qkv+w.fkv)),color:cssvar('--float'),type:'area',baseData:W1.map(w=>gib(w.qkv)),lw:1.2},
         {data:W1.map(w=>gib(w.qkv)),color:cssvar('--quant'),type:'area',lw:1.4}],
       tip:i=>{ const w=W1[i]; return [{t:ageStr(w.t)},
         {t:'quant   '+gib(w.qkv).toFixed(1)+' GiB',c:cssvar('--quant')},
         {t:'float   '+gib(w.fkv).toFixed(1)+' GiB',c:cssvar('--float')},
-        {t:'slack   '+gib(Math.max(0,w.res-w.qkv-w.fkv)).toFixed(1)+' GiB',c:cssvar('--slack')},
-        {t:'weights '+gib(Math.max(0,(w.tot-w.free)-w.res)).toFixed(1)+' GiB',c:cssvar('--weights')},
+        {t:'weights '+gib(w.wt).toFixed(1)+' GiB',c:cssvar('--weights')},
+        {t:'slack+rt '+gib(Math.max(0,(w.tot-w.free)-w.qkv-w.fkv-w.wt)).toFixed(1)+' GiB',c:cssvar('--slack')},
         {t:'free    '+gib(w.free).toFixed(1)+' GiB',c:cssvar('--ink-faint')},
         {t:'total   '+gib(w.tot).toFixed(1)+' GiB'}]; }})),
     // Projection decomposition (per-minute avg ms/wave), stacked to pdrain+reproj.
