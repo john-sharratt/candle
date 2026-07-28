@@ -406,12 +406,18 @@ impl Scheduler {
         };
         let token_str: String = if want_token_str {
             let skip = !self.show_special_tokens;
+            // Slot-labelled (`seq:token`): each fragment attributes to its slot
+            // so a cross-slot row swap (one stream continuing another's text)
+            // is directly visible in the trace instead of an anonymous mixture.
             next_tokens
                 .iter()
-                .map(|&t| {
-                    self.tokenizer
+                .zip(seq_ids.iter())
+                .map(|(&t, id)| {
+                    let frag = self
+                        .tokenizer
                         .decode(&[t], skip)
-                        .unwrap_or_else(|_| "<?>".to_string())
+                        .unwrap_or_else(|_| "<?>".to_string());
+                    format!("{}:{}", id.0, frag)
                 })
                 .collect::<Vec<_>>()
                 .join("|")

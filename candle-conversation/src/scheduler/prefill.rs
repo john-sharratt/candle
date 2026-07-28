@@ -1289,6 +1289,15 @@ impl Scheduler {
     ///   prefill creeps `~N/R` layers per wave while decode keeps its experts hot.
     pub(super) fn wave_prefill_layer_budget(&self) -> usize {
         let n = self.model.num_layers().max(1);
+        // ABLATION (diagnostic, temporary): full-depth windows — a prefill
+        // always sweeps all N layers in ONE wave (no creep pause/resume, no
+        // held residual). Tests whether the windowed creep's resume path is
+        // the stored-drift ingredient (KV written across window boundaries at
+        // subtly wrong offsets/rope ⇒ garbled turn context ⇒ greedy off-language
+        // summaries that start mid-sentence).
+        if std::env::var("ZEND_ABLATE_CREEP").is_ok() {
+            return n;
+        }
         if self.foreground_decode_width() == 0 {
             return n;
         }
