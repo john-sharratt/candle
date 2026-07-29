@@ -36,13 +36,14 @@ pub mod test_util;
 pub mod types;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem};
+use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use sha2::{Digest, Sha256};
 
@@ -87,6 +88,30 @@ impl CodeReadState {
         }
         out
     }
+}
+
+/// Rebuild the [`CodeReadState`] from what the substrate has ALREADY ingested,
+/// joining each conversation's `path` and `content_sha256` metadata by timeline.
+///
+/// This is the durable record of the last (partial or complete) ingest: on a
+/// restart it lets the load path SKIP re-prefilling files that drifted while the
+/// daemon was down — attaching the substrate's turns as-is so `ready` is reached
+/// fast — and hand the new/changed/deleted reconcile to the background refresh,
+/// which diffs the freshly-walked files against this state off the critical path.
+/// Empty ⇒ nothing ingested yet ⇒ the first load does the full blocking ingest.
+pub fn code_read_state_from_substrate(engine: &Mutex<ConversationEngine>) -> CodeReadState {
+    let eng = engine.lock().unwrap();
+    let hashes: HashMap<TimelineId, String> = eng
+        .conversations_with_metadata_key("content_sha256")
+        .into_iter()
+        .collect();
+    let mut state = CodeReadState::default();
+    for (tl, path) in eng.conversations_with_metadata_key("path") {
+        if let Some(hash) = hashes.get(&tl) {
+            state.file_hashes.insert(path, hash.clone());
+        }
+    }
+    state
 }
 
 /// Max tokens for a scope's decoded two-sentence summary (the response turn).
@@ -281,6 +306,11 @@ fn carve_workspace(
                 continue;
             }
         };
+        // Split over-long lines (a minified / one-line file) at safe points so the
+        // line-based carve can chunk it and no turn blows the token budget. Normal
+        // files pass through untouched. The split bytes flow to carve, the resume
+        // hash, AND emit_file_turns so line numbers and shown content stay in sync.
+        let bytes = carve::split_long_lines(&bytes);
         let is_tsx = file.path.ends_with(".tsx");
         let scopes = carve::carve(&bytes, file.language, is_tsx);
         if !scopes.is_empty() {
@@ -468,6 +498,12 @@ pub fn ingest_code_reading(
     let group = proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    // Append-only ingest layer (in-memory flag, re-applied every load): scope
+    // summaries score self-local during ingest, and the normalization warm-up
+    // recognises the layer as an ingest layer so it learns each file's hit level
+    // by self-match. Mirrors `ingest_files`; also re-applied on the restart path
+    // that skips this ingest (see `session.rs`).
+    engine.lock().unwrap().mark_layer_append_only(layer);
     let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
     let n_workers = parallelism();
@@ -680,6 +716,26 @@ fn process_one_file(
         conv
     };
 
+    // Tag the `path` IMMEDIATELY — before the decode-heavy emit below that can
+    // fail (GPU OOM mid-prefill, a decode error). A partial left by such a failure
+    // then still carries its path, so it (a) shows in the substrate as the file it
+    // covers rather than "(untitled)", and (b) is found by the path-invalidation
+    // scan above on the next run, which tombstones it and retries the file. The
+    // resume-cache key (`content_sha256`) is deliberately withheld until success
+    // (below), so a partial is never mistaken for a completed ingest and skipped.
+    {
+        let mut early = std::collections::BTreeMap::new();
+        early.insert("kind".to_string(), "code_read".to_string());
+        early.insert("path".to_string(), file.path.clone());
+        if let Err(e) = conv.set_metadata_many(&early) {
+            tracing::warn!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "failed to tag path metadata at conversation creation: {e:#}",
+            );
+        }
+    }
+
     // Shape the file's turns (per-part prefills + final summary decode),
     // bumping shared progress after each part so the bar moves during the
     // ingest (a single-file upload otherwise sits at 0% until the whole file
@@ -725,10 +781,11 @@ fn process_one_file(
             let d = done.fetch_add(missing, Ordering::Relaxed) + missing;
             progress.set_step_progress(d as u64, total as u64);
         }
-        // Prefill/decode failed. Do NOT tag the conversation: leaving it
-        // untagged means the next run misses the resume cache and retries
-        // this file (the stale partial is tombstoned by the path scan
-        // above), rather than caching it as permanently summary-less.
+        // Prefill/decode failed. The `path` tag written at creation stays (so the
+        // partial is titled and the next run's path scan finds + tombstones it),
+        // but the resume-cache key (`content_sha256`) is NOT written here: without
+        // it the next run misses the cache and retries this file rather than
+        // caching the partial as permanently summary-less.
         let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             target: "zend::code_read::ingest",

@@ -571,6 +571,22 @@ impl ConversationEngine {
         self.conversation.mark_layer_append_only(layer);
     }
 
+    /// Re-arm the score-normalization warm-up so the next projection re-learns
+    /// per-file hit levels — call after an ingest reconcile mints fresh timelines
+    /// the prior warm never scanned. See
+    /// [`crate::projection::Conversation::reset_normalization_warm`].
+    pub fn reset_normalization_warm(&self) {
+        self.conversation.reset_normalization_warm();
+    }
+
+    /// Warm the ingest layers' per-file hit levels from their own turns. Call
+    /// AFTER an ingest pass / reconcile finishes (never concurrently — it would
+    /// starve the ingest writer). See
+    /// [`crate::projection::Conversation::warm_ingest_normalization`].
+    pub fn warm_ingest_normalization(&self, schema: &crate::projection::Schema) {
+        self.conversation.warm_ingest_normalization(schema);
+    }
+
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
     /// metadata bag and persist it. Used by utility ingests to tag each
     /// conversation with a content hash + descriptive fields for the

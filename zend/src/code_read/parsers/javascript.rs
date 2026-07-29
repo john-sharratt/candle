@@ -217,7 +217,8 @@ mod tests {
         let src = "// header\nfunction alpha() {\n  return 1;\n}\n";
         let scopes = verify(src, &[("function alpha", "function alpha")]);
         let alpha = find_scope(&scopes, "function alpha").unwrap();
-        assert_eq!(alpha.start_line, 2);
+        // Leading `// header` comment now attached — scope starts at line 1.
+        assert_eq!(alpha.start_line, 1);
         assert_eq!(alpha.end_line, 4);
     }
 

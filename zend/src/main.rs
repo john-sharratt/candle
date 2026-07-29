@@ -317,7 +317,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("draining complete — flushing substrate…");
     shutdown_session.shutdown().await;
     tracing::info!("zend stopped");
-    Ok(())
+    // Force-exit rather than falling out of `main`. The substrate is already
+    // flushed durably above, so the only work left is process teardown — and the
+    // detached background threads (the scheduler, the GPU/CUDA worker + context,
+    // the persistence pipeline) are not all cleanly joinable, so dropping the tokio
+    // runtime and tearing down the CUDA context otherwise hangs the process until a
+    // manual Ctrl-C. Nothing durable is lost by exiting now.
+    std::process::exit(0)
 }
 
 // ── Shutdown signal ───────────────────────────────────────────────────────────

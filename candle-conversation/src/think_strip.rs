@@ -45,6 +45,53 @@ pub fn strip_think_blocks_keep_layout(text: &str) -> String {
     strip_to_raw(text).trim().to_string()
 }
 
+/// Remove only the **empty** `<think></think>` blocks — those whose inner
+/// content is whitespace-only — while preserving every non-empty reasoning block
+/// and all surrounding text verbatim.
+///
+/// A `/no_think` decode collapses its reasoning to a bare `<think></think>`; that
+/// empty block is pure noise in a stored/displayed turn, but a turn carrying
+/// *real* reasoning should keep it. Unlike [`strip_think_blocks`], this leaves a
+/// non-empty block untouched. The whitespace hugging a removed empty block is
+/// collapsed (so a leading `<think></think>` doesn't leave a blank gap); a single
+/// space is inserted only between two surviving non-empty runs so words never
+/// merge. Tags are matched case-sensitively — the models emit lowercase `<think>`,
+/// matching the turn-layout splitter's own convention.
+pub fn strip_empty_think_blocks(text: &str) -> String {
+    if !text.contains("<think>") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(open) = rest.find("<think>") else {
+            out.push_str(rest);
+            break;
+        };
+        let after_open = open + "<think>".len();
+        let Some(rel_close) = rest[after_open..].find("</think>") else {
+            // Unterminated — not a block we can classify; leave the tail verbatim.
+            out.push_str(rest);
+            break;
+        };
+        let after_close = after_open + rel_close + "</think>".len();
+        let inner = &rest[after_open..after_open + rel_close];
+        if inner.trim().is_empty() {
+            let before = rest[..open].trim_end();
+            out.push_str(before);
+            let tail = rest[after_close..].trim_start();
+            if !out.is_empty() && !tail.is_empty() {
+                out.push(' ');
+            }
+            rest = tail;
+        } else {
+            out.push_str(&rest[..after_close]);
+            rest = &rest[after_close..];
+        }
+    }
+    out
+}
+
 /// Remove every `<think>…</think>` block (and stray unmatched `</think>` tags),
 /// inserting a single space at each removal seam. Returns the raw result with
 /// no whitespace normalization — the caller decides whether to collapse.
@@ -149,7 +196,55 @@ fn collapse_whitespace(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_think_blocks, strip_think_blocks_keep_layout};
+    use super::{strip_empty_think_blocks, strip_think_blocks, strip_think_blocks_keep_layout};
+
+    // ── Empty-only variant ─────────────────────────────────────────────────
+
+    #[test]
+    fn empty_only_no_think_unchanged() {
+        let s = "Just a summary sentence.";
+        assert_eq!(strip_empty_think_blocks(s), s);
+    }
+
+    #[test]
+    fn empty_only_drops_leading_bare_block() {
+        assert_eq!(
+            strip_empty_think_blocks("<think></think>The summary."),
+            "The summary."
+        );
+    }
+
+    #[test]
+    fn empty_only_drops_leading_block_and_collapses_whitespace() {
+        assert_eq!(
+            strip_empty_think_blocks("<think>\n\n</think>\n\nThe summary."),
+            "The summary."
+        );
+    }
+
+    #[test]
+    fn empty_only_keeps_real_reasoning_verbatim() {
+        let s = "<think>real reasoning here</think>The answer.";
+        assert_eq!(strip_empty_think_blocks(s), s);
+    }
+
+    #[test]
+    fn empty_only_removes_empty_keeps_nonempty() {
+        assert_eq!(
+            strip_empty_think_blocks("<think></think>A<think>keep me</think>B"),
+            "A<think>keep me</think>B"
+        );
+    }
+
+    #[test]
+    fn empty_only_separates_runs_around_a_mid_text_empty_block() {
+        assert_eq!(strip_empty_think_blocks("A<think></think>B"), "A B");
+    }
+
+    #[test]
+    fn empty_only_all_empty_becomes_empty() {
+        assert_eq!(strip_empty_think_blocks("<think>   \n  </think>"), "");
+    }
 
     // ── Layout-preserving variant ──────────────────────────────────────────
 

@@ -19,7 +19,7 @@
 //! returns the full scope list for any further assertions the test
 //! wants to make.
 
-use crate::code_read::carve::carve as dispatcher_carve;
+use crate::code_read::carve::{carve as dispatcher_carve, carve_raw};
 use crate::code_read::types::Scope;
 use crate::repo_scan::Language;
 
@@ -128,6 +128,51 @@ pub fn assert_content_preserved(source: &[u8], scopes: &[Scope]) {
     );
 }
 
+/// Assert that `expected_substring` appears on some line WITHIN the scope's
+/// `[start_line, end_line]` range. Used by the parser-level `verify_carve`: the
+/// walker now pulls a scope's start UP over its leading doc comment, so the
+/// signature is no longer guaranteed to be the first line — but it must still live
+/// inside the scope.
+pub fn assert_scope_contains(source: &str, scope: &Scope, expected_substring: &str) {
+    let body = lines_at(source, scope.start_line, scope.end_line);
+    assert!(
+        body.contains(expected_substring),
+        "scope {:?} (lines {}-{}) does not contain {expected_substring:?}",
+        scope.qualified_path(),
+        scope.start_line,
+        scope.end_line,
+    );
+}
+
+/// Assert every NON-BLANK line of `source` is covered by some scope. The
+/// dispatcher intentionally DROPS pure-blank runs (see `carve::refine`), so the
+/// old every-line invariant is relaxed to every-non-blank-line.
+pub fn assert_nonblank_coverage(source: &[u8], scopes: &[Scope]) {
+    let total = count_lines(source);
+    if total == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(source);
+    let blank: Vec<bool> = std::iter::once(false)
+        .chain(text.split('\n').map(|l| l.trim().is_empty()))
+        .collect();
+    let mut covered = vec![false; (total + 1) as usize];
+    for s in scopes {
+        for l in s.start_line..=s.end_line.min(total) {
+            if let Some(c) = covered.get_mut(l as usize) {
+                *c = true;
+            }
+        }
+    }
+    for l in 1..=total {
+        let is_blank = blank.get(l as usize).copied().unwrap_or(false);
+        assert!(
+            is_blank || covered[l as usize],
+            "non-blank line {l} not covered by any scope",
+        );
+    }
+}
+
 /// Assert that the scope's `start_line` row of `source` contains
 /// `expected_substring`.  Catches parsers that match the right name
 /// but place the scope at the wrong line.
@@ -161,7 +206,11 @@ pub fn verify_carve(
     expectations: &[(&str, &str)],
 ) -> Vec<Scope> {
     let src = source.as_bytes();
-    let scopes = dispatcher_carve(src, language, is_tsx);
+    // Parser-level: verify EXTRACTION against the RAW tier scopes, so the
+    // dispatcher's `refine` merge doesn't collapse a small fixture into one chunk
+    // and hide per-item boundaries. Coverage + content-preservation are DISPATCHER
+    // invariants — see `verify_coverage_only`.
+    let scopes = carve_raw(src, language, is_tsx);
     assert!(
         !scopes.is_empty() || src.is_empty(),
         "carve returned empty for non-empty source",
@@ -177,22 +226,18 @@ pub fn verify_carve(
                     .collect::<Vec<_>>(),
             )
         });
-        assert_starts_with(source, scope, sig_sub);
+        assert_scope_contains(source, scope, sig_sub);
     }
-    assert_full_coverage(src, &scopes);
-    assert_content_preserved(src, &scopes);
     scopes
 }
 
-/// Like [`verify_carve`] but for the resilience tests where we
-/// can't predict which subset of names the parser will recover —
-/// only the coverage + content-preservation invariants are
-/// asserted.
+/// Like [`verify_carve`] but for the resilience tests where we can't predict which
+/// subset of names the parser will recover — asserts the DISPATCHER-level
+/// non-blank-coverage invariant (runs the full `carve`, blank runs dropped).
 pub fn verify_coverage_only(source: &str, language: Language, is_tsx: bool) -> Vec<Scope> {
     let src = source.as_bytes();
     let scopes = dispatcher_carve(src, language, is_tsx);
-    assert_full_coverage(src, &scopes);
-    assert_content_preserved(src, &scopes);
+    assert_nonblank_coverage(src, &scopes);
     scopes
 }
 

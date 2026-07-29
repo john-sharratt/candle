@@ -4234,6 +4234,17 @@ impl Scheduler {
         no_think: bool,
         ethereal_thinking: bool,
     ) -> TurnLayout {
+        // A `/no_think` decode (dialogue turns under ThinkMode::Off, and every
+        // code_read scope summary) collapses its reasoning to a bare
+        // `<think></think>`. The sealed K/V is already reasoning-free via the clean
+        // re-prefill, but the DISPLAY text still carries that empty block. Drop
+        // empty think blocks from the display text here — before it is split into
+        // segments — so neither the tool-exchange confirmation nor a dialogue
+        // Thinking segment surfaces an empty `<think></think>`. Real (non-empty)
+        // reasoning is left intact for the dialogue Thinking segment. Segment text
+        // is display-only (KV spans come from explicit offsets), so this never
+        // affects tiling.
+        let assistant_text = crate::think_strip::strip_empty_think_blocks(&assistant_text);
         let im_end_len = self.boundary_markers.user_end.len() as u32;
         let assistant_start_len = self.boundary_markers.assistant_start.len() as u32;
         let layout = TurnLayout::from_flat_grid(

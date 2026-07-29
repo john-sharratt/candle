@@ -251,17 +251,53 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                         .map(|h| h.join().expect("scope ingest thread panicked"))
                         .collect()
                 });
-            // Splice the sealed pairs onto the file timeline in scope order.
+            // Splice the sealed pairs onto the file timeline in scope order. On the
+            // first failure (a scope round-trip that errored, or a splice that
+            // failed) STOP and tombstone every fork from that point on. The forks
+            // before it were adopted + tombstoned by `splice_scope_turns`, but the
+            // failing fork and every later one ran their round-trip WITHOUT being
+            // spliced — and `Sequence`'s `Drop` frees only the slot, leaving their
+            // registered timeline + sealed turns behind as orphaned, path-less
+            // "(untitled)" scope conversations. Tombstoning them means a failed
+            // chunk leaves nothing behind before the file is retried whole.
+            let mut spliced = 0usize;
+            let mut chunk_err: Option<anyhow::Error> = None;
             for (fork, res) in forks.iter().zip(results) {
-                let (call_idx, resp_idx, tokens) =
-                    res.map_err(|e| anyhow::anyhow!("scope round-trip: {e}"))?;
-                self.inner
-                    .splice_scope_turns(fork.timeline_id(), call_idx, resp_idx, tags.clone())
-                    .map_err(|e| anyhow::anyhow!("splice_scope_turns: {e}"))?;
-                on_prefilled(tokens);
+                match res {
+                    Ok((call_idx, resp_idx, tokens)) => {
+                        match self.inner.splice_scope_turns(
+                            fork.timeline_id(),
+                            call_idx,
+                            resp_idx,
+                            tags.clone(),
+                        ) {
+                            Ok(_) => {
+                                spliced += 1;
+                                on_prefilled(tokens);
+                            }
+                            Err(e) => {
+                                chunk_err = Some(anyhow::anyhow!("splice_scope_turns: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        chunk_err = Some(anyhow::anyhow!("scope round-trip: {e}"));
+                        break;
+                    }
+                }
             }
-            // Drop the forks → frees their scheduler slots (their timelines are
-            // already tombstoned by `splice_scope_turns`).
+            if let Some(e) = chunk_err {
+                // Every fork at or after `spliced` was never adopted onto the file
+                // timeline — tombstone so no orphan scope timeline survives.
+                for fork in forks.iter().skip(spliced) {
+                    self.inner.tombstone_fork(fork.timeline_id());
+                }
+                drop(forks);
+                return Err(e);
+            }
+            // All spliced → their timelines are already tombstoned by
+            // `splice_scope_turns`; dropping frees the scheduler slots.
             drop(forks);
         }
         Ok(())

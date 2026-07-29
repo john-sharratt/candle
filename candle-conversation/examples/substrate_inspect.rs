@@ -344,6 +344,15 @@ enum Cmd {
         /// live reproject window.
         #[arg(long, default_value_t = 0)]
         probe_tokens: usize,
+        /// Apply the production per-scope hit-level normalization (the 0–1000
+        /// band, `NormalizationCache`) on top of the raw scan before ranking.
+        /// A corpus-order learning pass first folds each file's own-match score
+        /// into its hit level (mirroring the once-per-seal `observe`); ranking
+        /// then divides every candidate by its learned level, so a promiscuous
+        /// "stopword" file can't dominate on raw magnitude alone. Off = the raw
+        /// `score_slots` lower bound.
+        #[arg(long)]
+        normalize: bool,
     },
     /// §80.3 production-faithful replay: unlike `belief-eval` (which scores ONE
     /// window per turn), this replays each turn's recorded reprojection sequence
@@ -586,7 +595,16 @@ fn main() -> Result<()> {
             max_budget,
             scorer,
             probe_tokens,
-        } => belief_eval(&mut log, &tag, min_score, max_budget, &scorer, probe_tokens)?,
+            normalize,
+        } => belief_eval(
+            &mut log,
+            &tag,
+            min_score,
+            max_budget,
+            &scorer,
+            probe_tokens,
+            normalize,
+        )?,
         Cmd::BeliefReplay {
             tag,
             probe_tokens,
@@ -1307,7 +1325,9 @@ fn belief_eval(
     max_budget: usize,
     scorer: &str,
     probe_tokens: usize,
+    normalize: bool,
 ) -> Result<()> {
+    use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
     use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
     use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
     use rayon::prelude::*;
@@ -1374,11 +1394,14 @@ fn belief_eval(
     }
 
     // Leave-one-out, parallel over probes. Each rebuilds its gallery from all
-    // corpus windows except its own — the probe never matches itself.
-    let trials: Vec<Trial> = (0..corpus.len())
+    // corpus windows except its own — the probe never matches itself. Compute the
+    // raw per-slot scores for every probe FIRST, so the (order-dependent)
+    // normalization learning pass and the ranking pass share one scan instead of
+    // recomputing it.
+    let all_fresh: Vec<Vec<f32>> = (0..corpus.len())
         .into_par_iter()
         .map(|pi| {
-            let (sid, gt_slot, full) = &corpus[pi];
+            let (_, _, full) = &corpus[pi];
             // Match the live reproject window when requested: the last N tokens.
             let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
                 &full[full.len() - probe_tokens..]
@@ -1393,41 +1416,84 @@ fn belief_eval(
                     gslot.push(*s);
                 }
             }
-            let fresh = match scorer {
+            match scorer {
                 "margin" | "margin-id" => {
                     score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
                 }
                 "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
                 _ => score_slots(probe, &gwin, &gslot, n_slots),
-            };
-            let gt_score = fresh[*gt_slot];
-            let rank = 1 + fresh.iter().filter(|&&s| s > gt_score).count();
-
-            let mut ranked: Vec<(usize, f32)> = fresh.iter().copied().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let (best_slot, best_score) = ranked[0];
-            let mut selected: Vec<usize> = ranked
-                .iter()
-                .filter(|(_, s)| *s >= min_score)
-                .take(max_budget)
-                .map(|(i, _)| *i)
-                .collect();
-            if selected.is_empty() {
-                selected.push(ranked[0].0); // budget min = 1: force-fill the top
-            }
-
-            Trial {
-                sid: *sid,
-                gt_slot: *gt_slot,
-                rank,
-                hit: gt_score > 0.0,
-                gt_score,
-                best_slot,
-                best_score,
-                selected,
             }
         })
         .collect();
+
+    // Rank one probe's per-slot scores into a Trial (shared by the raw and
+    // normalized paths). `fresh[s]` is slot `s`'s score on whatever scale the
+    // caller passes (raw or normalized 0–1000).
+    let build_trial = |pi: usize, fresh: &[f32]| -> Trial {
+        let (sid, gt_slot, _) = &corpus[pi];
+        let gt_score = fresh[*gt_slot];
+        let rank = 1 + fresh.iter().filter(|&&s| s > gt_score).count();
+        let mut ranked: Vec<(usize, f32)> = fresh.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let (best_slot, best_score) = ranked[0];
+        let mut selected: Vec<usize> = ranked
+            .iter()
+            .filter(|(_, s)| *s >= min_score)
+            .take(max_budget)
+            .map(|(i, _)| *i)
+            .collect();
+        if selected.is_empty() {
+            selected.push(ranked[0].0); // budget min = 1: force-fill the top
+        }
+        Trial {
+            sid: *sid,
+            gt_slot: *gt_slot,
+            rank,
+            hit: gt_score > 0.0,
+            gt_score,
+            best_slot,
+            best_score,
+            selected,
+        }
+    };
+
+    let trials: Vec<Trial> = if normalize {
+        // Production per-scope hit-level normalization (docs/provenance_score_normalization.md),
+        // measured CAUSALLY to avoid a probe informing its own hit level. Walk the
+        // corpus in order; each probe is normalized against ONLY the levels learned
+        // from earlier turns, then folds its own-match score in — the exact ordering
+        // of the live path (`normalize` reads past seals; the turn then `observe`s at
+        // its own seal). Learning each file's own-match score mirrors the ingest-time
+        // scan, which is self-local so it only ever folds a file's own match. The
+        // whole gallery is one stable scope offline, keyed by file name. Sequential
+        // by necessity — the EWMA is order-dependent — but n is small and the O(n²)
+        // scan already ran in `all_fresh`. Cold-start: the first turns of each file
+        // normalize against the prior until their level accrues (as in production
+        // before a scope warms).
+        let scope = ScopeKey::collection(0, tag);
+        let mut cache = NormalizationCache::new(NormConfig::default());
+        let mut out = Vec::with_capacity(corpus.len());
+        for pi in 0..corpus.len() {
+            let raw: Vec<(ChildKey, f32)> = (0..n_slots)
+                .map(|s| (ChildKey::named(slot_names[s].clone()), all_fresh[pi][s]))
+                .collect();
+            // `normalize` preserves input order ⇒ index `s` is still slot `s`.
+            let normed: Vec<f32> = cache
+                .normalize(&scope, &raw)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            out.push(build_trial(pi, &normed));
+            let gt = corpus[pi].1;
+            cache.observe(&scope, &[(ChildKey::named(slot_names[gt].clone()), all_fresh[pi][gt])]);
+        }
+        out
+    } else {
+        (0..corpus.len())
+            .into_par_iter()
+            .map(|pi| build_trial(pi, &all_fresh[pi]))
+            .collect()
+    };
 
     let n = trials.len();
     let pct = |k: usize| 100.0 * k as f64 / n as f64;
@@ -1453,6 +1519,15 @@ fn belief_eval(
 
     println!("\n══ §80 tool-selection eval (leave-one-out over current substrate) ══\n");
     println!("scorer:  {scorer}");
+    println!(
+        "normalize: {}   (min_score {min_score} is on the {} scale)",
+        if normalize {
+            "ON — per-file hit-level 0–1000 band"
+        } else {
+            "off — raw score_slots (lower bound)"
+        },
+        if normalize { "0–1000 band" } else { "raw" },
+    );
     println!("corpus:  {n} tagged turns over {n_slots} tools   (tag scope {tag:?})",);
     println!(
         "gallery: leave-one-out — each probe scored against the other {} turns\n",

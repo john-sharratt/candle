@@ -1067,20 +1067,78 @@ impl BatchedInferenceSession {
     /// across layers) and the first valid slot of the gap's tail window, into
     /// which the glue forward scatters the island's K/V.
     pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
+        // `reserve_glue_gap_chunk` MUTATES each layer (pushes a gap chunk + a writer
+        // chunk). This loop must therefore be ATOMIC: if it bails mid-way — because a
+        // later layer's gap index diverges, or a per-layer reservation errors — the
+        // layers already pushed must be ROLLED BACK, or the slot is left one chunk
+        // longer on those layers and EVERY subsequent reservation diverges harder,
+        // permanently wedging the sequence. Each layer's returned `idx` is its
+        // PRE-push block count (gap_idx = block_count-1 taken right after the gap
+        // push), so truncating a pushed layer back to `idx` blocks restores it
+        // exactly. (The primary fix is deferring the pinned working set from the
+        // warm→cold gather so a live slot's layers stay uniform; this keeps a
+        // residual divergence a clean, retryable turn error instead of corruption.)
+        // Reconcile per-layer block counts BEFORE reserving. During a windowed creep
+        // prefill, layer 0 pushes an empty (0-token) writer chunk for the next window
+        // ahead of the layers still pending resume, so the layers' block counts differ
+        // by one even though their materialised token counts match (cf. dcd075e0, which
+        // fixed the same incremental-fill skew for `sequence_backing_tokens`). A section
+        // unit sealed while a slot was mid-creep persists that skew, so even a FRESH
+        // conversation re-injecting it hits uneven layers at its very first glue
+        // reservation ("layer gap index diverged 33 != 32"). The reservation needs ONE
+        // gap index across every layer, so first pad each lagging layer up to the max
+        // with the SAME empty writer chunk: it carries 0 tokens, so it shifts no
+        // position (contributes 0 to every later chunk's cumulative-usage `rope_base`)
+        // and only equalises the block count. Truncating the ahead layer instead would
+        // drop a writer chunk a co-batched decode may target, so pad-to-max is safer.
+        let max_blocks = (0..self.backings.len())
+            .filter_map(|li| self.backings[li].sequence_block_count(seq_idx))
+            .max()
+            .unwrap_or(0);
+        for li in 0..self.backings.len() {
+            // `None` (unallocated) reads as `max_blocks`, so the loop is skipped and
+            // never spins; a successful push raises the count by one toward `max`.
+            while self.backings[li]
+                .sequence_block_count(seq_idx)
+                .unwrap_or(max_blocks)
+                < max_blocks
+            {
+                self.backings[li].push_empty_writer_chunk(seq_idx)?;
+            }
+        }
+
         let mut gap: Option<(usize, u32)> = None;
-        for backing in &self.backings {
-            let (idx, in_blk_base) = backing.reserve_glue_gap_chunk(seq_idx, n_tokens)?;
+        let mut pre_counts: Vec<usize> = Vec::with_capacity(self.backings.len());
+        let rollback = |backings: &[ChunkedKvBacking], pre: &[usize]| {
+            for (li, &c) in pre.iter().enumerate() {
+                let _ = backings[li].truncate_sequence_to_blocks(seq_idx, c);
+            }
+        };
+        for li in 0..self.backings.len() {
+            let (idx, in_blk_base) = match self.backings[li].reserve_glue_gap_chunk(seq_idx, n_tokens)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    rollback(&self.backings, &pre_counts);
+                    return Err(e);
+                }
+            };
+            pre_counts.push(idx);
             match gap {
                 None => gap = Some((idx, in_blk_base)),
-                Some((g, _)) if g != idx => candle::bail!(
-                    "reserve_glue_gap: layer gap index diverged ({g} != {idx}) for slot {seq_idx}"
-                ),
+                Some((g, _)) if g != idx => {
+                    rollback(&self.backings, &pre_counts);
+                    candle::bail!(
+                        "reserve_glue_gap: layer gap index diverged ({g} != {idx}) for slot {seq_idx}"
+                    );
+                }
                 _ => {}
             }
         }
         if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
             state.offset += n_tokens as usize;
         } else {
+            rollback(&self.backings, &pre_counts);
             candle::bail!("reserve_glue_gap: sequence {seq_idx} not allocated");
         }
         gap.ok_or_else(|| candle::Error::Msg("reserve_glue_gap: no layers".into()))
@@ -1546,10 +1604,22 @@ impl BatchedInferenceSession {
     /// silently drops up to `(sections - 1) * (CHUNK_SIZE - 1)`
     /// tokens of context.
     pub fn sequence_block_count(&self, idx: usize) -> Option<usize> {
-        // All backings share the same chunk metadata layout (number
-        // of chunks and per-chunk usages are uniform across layers),
-        // so reading from layer 0 is authoritative.
-        self.backings.first()?.sequence_block_count(idx)
+        // The backings are NOT always uniform: a windowed creep prefill can leave
+        // layer 0 one empty (0-token) writer chunk AHEAD of the layers still
+        // pending resume, so a section unit sealed mid-creep persists that skew.
+        // Reading layer 0 would over-report by that phantom block and make a borrow
+        // range (`create_view_sequence`) or seal range ask a lagging layer for a
+        // block it doesn't have ("parent slot N has M blocks but range requests M").
+        // The MIN across layers is the block count every layer actually holds — the
+        // safe common prefix, and since the extra block is always the 0-token writer
+        // chunk it carries no context to lose. This mirrors dcd075e0, which moved
+        // the TOKEN reader (`sequence_backing_tokens`) to the min for the same skew;
+        // the block-count reader was left on layer 0 and is the residual half of it.
+        // Returns None only when the slot is unallocated on every layer.
+        self.backings
+            .iter()
+            .filter_map(|b| b.sequence_block_count(idx))
+            .min()
     }
 
     /// Get mutable access to a sequence's KvCaches.

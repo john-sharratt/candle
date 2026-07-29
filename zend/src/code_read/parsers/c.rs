@@ -186,7 +186,8 @@ mod tests {
         let src = "// header\nint hello(void) {\n    return 1;\n}\n";
         let scopes = verify(src, &[("hello()", "hello")]);
         let hello = find_scope(&scopes, "hello()").unwrap();
-        assert_eq!(hello.start_line, 2);
+        // Leading `// header` comment now attached — scope starts at line 1.
+        assert_eq!(hello.start_line, 1);
         assert_eq!(hello.end_line, 4);
     }
 

@@ -76,3 +76,7 @@ uploads/
 
 # BDP tool-selection debug dump (large; written by the tool-selection probes).
 /tool_select_debug.json
+
+# Provenance eval query fixture — contains the literal query strings, so it must
+# not be ingested into the code_read corpus (it would match every query).
+zend/examples/provenance_queries.json

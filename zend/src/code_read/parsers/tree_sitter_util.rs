@@ -65,7 +65,11 @@ fn walk(
         if !label.is_empty() {
             full_path.push(label);
         }
-        let start_line = (node.start_position().row as u32) + 1;
+        // Pull the start UP over the item's leading doc comment / attributes:
+        // tree-sitter keeps those as siblings, so the raw node range begins at the
+        // `fn`/`struct` keyword and would orphan the `/// doc` above it into the
+        // previous gap.
+        let start_line = start_with_leading_comments(&node);
         let end_line = (node.end_position().row as u32) + 1;
         // Split oversize functions / impls at their inner block
         // boundaries — tree-sitter gives us a clean inner-statement
@@ -119,6 +123,38 @@ fn emit_split(path: &[String], kind: ChunkKind, node: Node, scopes: &mut Vec<Sco
         chunk_start = chunk_end + 1;
         part += 1;
     }
+}
+
+/// The scope's start line, pulled UP over any contiguous leading doc-comment /
+/// attribute / decorator lines that sit immediately above the declaration.
+///
+/// tree-sitter keeps an item's leading comments (and, in most grammars, its
+/// attributes/decorators) as SIBLINGS of the item node, so the raw node range
+/// begins at the `fn`/`struct`/`def` keyword — orphaning the `/// doc` above it
+/// into the previous gap (or the previous scope). Walk the preceding siblings
+/// while each is a comment/attribute/decorator AND ends on the line directly above
+/// the current earliest start (a blank line or real code breaks the run), and take
+/// the earliest — so the summary sees the comment that documents the scope.
+fn start_with_leading_comments(node: &Node) -> u32 {
+    let mut earliest = (node.start_position().row as u32) + 1;
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        let k = p.kind();
+        let attachable = k.contains("comment") || k.contains("attribute") || k == "decorator";
+        if !attachable {
+            break;
+        }
+        let p_end = (p.end_position().row as u32) + 1;
+        // Contiguous only: the sibling must end on the line directly above the
+        // current earliest — a blank line or intervening code breaks attachment so
+        // an unrelated earlier comment is never swept in.
+        if p_end + 1 != earliest {
+            break;
+        }
+        earliest = (p.start_position().row as u32) + 1;
+        prev = p.prev_sibling();
+    }
+    earliest
 }
 
 /// Convenience: read the text of a node's child with `field_name`,
