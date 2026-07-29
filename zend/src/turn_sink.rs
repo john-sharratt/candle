@@ -16,6 +16,13 @@
 //! model.
 
 use candle_conversation::Sequence;
+use std::sync::Arc;
+
+/// Per-scope progress callback, invoked with a scope's ingested token count as it
+/// lands so the upload/code-read path can climb its progress bar per scope rather
+/// than only when the whole file completes. `Arc<dyn Fn>` so it's `'static` +
+/// `Send` and cheap to clone across a file's scopes.
+pub type ScopeProgressFn = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// Concurrent scopes per chunk in the parallel per-file ingest
 /// ([`SequenceTurnSink::ingest_scopes`]). Chunks run sequentially, so this bounds
@@ -96,7 +103,7 @@ pub trait InsertTurnSink {
         prepared: Vec<(String, String, String)>,
         tags: Vec<String>,
         max_summary_tokens: usize,
-        on_prefilled: &candle_conversation::ScopeProgressFn,
+        on_prefilled: &crate::turn_sink::ScopeProgressFn,
     ) -> anyhow::Result<()> {
         for (call_user, call_assistant, response_user) in prepared {
             let tokens = self.ingest_scope_roundtrip(
@@ -207,7 +214,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         prepared: Vec<(String, String, String)>,
         tags: Vec<String>,
         max_summary_tokens: usize,
-        on_prefilled: &candle_conversation::ScopeProgressFn,
+        on_prefilled: &crate::turn_sink::ScopeProgressFn,
     ) -> anyhow::Result<()> {
         for chunk in prepared.chunks(SCOPE_PARALLELISM) {
             // Fork one throwaway timeline per scope in this chunk.

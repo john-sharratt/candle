@@ -27,24 +27,19 @@ impl Scheduler {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
-    /// Active *foreground* decode sequences — excludes compression passes and
-    /// code-scope summary decodes.
+    /// Active *foreground* decode sequences — excludes compression passes.
     ///
     /// Count the active foreground dialogue decodes that feed the
-    /// prefill/decode flip heuristic. Compression half-passes and scope-summary
-    /// decodes ride `active_decodes` and the decode wave like any decode, but are
-    /// excluded here so they never hold the loop in decode-first mode at the
-    /// expense of dialogue prefills (both are off the critical path — a scope
-    /// summary is background ingest work that co-batches opportunistically).
+    /// prefill/decode flip heuristic. Compression half-passes ride
+    /// `active_decodes` and the decode wave like any decode, but are excluded
+    /// here so they never hold the loop in decode-first mode at the expense of
+    /// dialogue prefills (they're off the critical path — background work that
+    /// co-batches opportunistically).
     pub(super) fn foreground_decode_width(&self) -> usize {
         self.active_decodes
             .iter()
             .filter(|(_, s)| {
-                !s.finished
-                    && !matches!(
-                        s.seal_action,
-                        super::SealAction::CompressionPass { .. } | super::SealAction::ScopeSummary
-                    )
+                !s.finished && !matches!(s.seal_action, super::SealAction::CompressionPass { .. })
             })
             .count()
     }
@@ -159,7 +154,6 @@ impl Scheduler {
             }
             let t_promote = Instant::now();
             self.promote_new_prefills();
-            self.pump_scope_prefills();
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
         }
@@ -279,11 +273,6 @@ impl Scheduler {
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
             let t_promote = Instant::now();
             self.promote_new_prefills();
-            // Admit queued scope prefills onto freshly-available scratch slots.
-            // Submit + completion already pump; this catches scopes re-queued when
-            // the model was at sequence capacity, retrying once other sequences
-            // (live turns) free a slot.
-            self.pump_scope_prefills();
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
 

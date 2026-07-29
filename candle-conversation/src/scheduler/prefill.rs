@@ -2193,12 +2193,8 @@ impl Scheduler {
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
     /// wide for the card. Narrow the admission window (so subsequent waves run
-    /// smaller forwards), then — rather than failing the whole batch — **requeue**
-    /// its scope-ingest prefills (upload / code-read) so their content isn't lost;
-    /// a freed slot re-pumps them later at the narrower width, and the process
-    /// self-tunes toward a sustainable batch size. Non-scope prefills (live
-    /// dialogue turns) can't be transparently retried, so they surface the error
-    /// on their caller channel as before.
+    /// smaller forwards) and surface the error on each in-batch prefill's caller
+    /// channel.
     ///
     /// `group_idxs` are the `active_prefills` positions that were in this forward;
     /// they're still valid because nothing mutates `active_prefills` between the
@@ -2207,45 +2203,11 @@ impl Scheduler {
         self.shrink_admit_window();
         let in_batch: HashSet<usize> = group_idxs.iter().copied().collect();
         let msg = format!("batched prefill forward failed: {err}");
-        let drained = std::mem::take(&mut self.active_prefills);
-        let mut kept = Vec::with_capacity(drained.len());
-        for (i, mut p) in drained.into_iter().enumerate() {
+        for (i, p) in self.active_prefills.iter_mut().enumerate() {
             if in_batch.contains(&i) {
-                if matches!(p.work.seal_action, SealAction::ScopeIngest) {
-                    // Requeued via scope_pending — dropped from active_prefills.
-                    self.requeue_scope_slot(p.work.sequence_id);
-                    continue;
-                }
                 p.error = Some(ConversationError::Channel(msg.clone()));
             }
-            kept.push(p);
         }
-        self.active_prefills = kept;
-    }
-
-    /// Return a scope-ingest scratch slot to the pending queue so a later pump
-    /// retries it (at the current, narrower admission window). Frees the slot's
-    /// partial KV, undoes the fairness increment applied at admission, and pushes
-    /// the scope back to the front of its file's queue. Mirrors the
-    /// sequence-capacity requeue path in [`Scheduler::pump_scope_prefills`].
-    fn requeue_scope_slot(&mut self, slot: SequenceId) {
-        self.active_scope_slots = self.active_scope_slots.saturating_sub(1);
-        if let Some(p) = self.pending_scope_prefills.remove(&slot) {
-            if let Some(n) = self.scope_submitted.get_mut(&p.timeline) {
-                *n = n.saturating_sub(1);
-            }
-            self.scope_pending
-                .entry(p.timeline)
-                .or_default()
-                .push_front(QueuedScope {
-                    scope_index: p.scope_index,
-                    tokens: p.token_ids,
-                    layout_inputs: p.layout_inputs,
-                    token_count: p.token_count,
-                    tags: p.tags.clone(),
-                });
-        }
-        self.free_summary_slot(slot);
     }
 
     /// Drain finished or errored entries from `active_prefills`. Errored
@@ -2292,30 +2254,6 @@ impl Scheduler {
                         self.free_summary_slot(slot);
                     }
                     None => self.complete_compression_turn(slot, job_id),
-                }
-                continue;
-            }
-            // A code-scope's cold-prefill (excerpt + tool exchange) finished on the
-            // wave. Frame `assistant_start` and register the bounded summary decode
-            // on the same slot; the decode's completion (`complete_scope_summary_decoded`)
-            // snapshots the excerpt + summary into the file batch. On prefill error,
-            // fail just that scope so its siblings still flush.
-            if let SealAction::ScopeIngest = &work.seal_action {
-                let slot = work.sequence_id;
-                match error {
-                    Some(e) => self.fail_scope_ingest(slot, e),
-                    None => self.begin_scope_summary_decode(slot),
-                }
-                continue;
-            }
-            // A code-scope's reasoning-free re-prefill (post-summary-decode) landed:
-            // snapshot the clean K/V into its file batch. On error, fail just that
-            // scope so its siblings still flush.
-            if let SealAction::ScopeReprefill = &work.seal_action {
-                let slot = work.sequence_id;
-                match error {
-                    Some(e) => self.fail_scope_ingest(slot, e),
-                    None => self.complete_scope_summary_sealed(slot),
                 }
                 continue;
             }

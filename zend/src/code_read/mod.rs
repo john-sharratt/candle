@@ -111,7 +111,7 @@ fn emit_file_turns<S: InsertTurnSink>(
     language: Language,
     scopes: &[Scope],
     bytes: &[u8],
-    on_prefilled: candle_conversation::ScopeProgressFn,
+    on_prefilled: crate::turn_sink::ScopeProgressFn,
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
     // Gather-scope tags `["code", <path>]` scope every turn into a code-tagged
@@ -180,7 +180,7 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 
     // This reference path drives its own coarse per-file progress below, so the
     // per-scope callback is a no-op.
-    let noop: candle_conversation::ScopeProgressFn = Arc::new(|_| {});
+    let noop: crate::turn_sink::ScopeProgressFn = Arc::new(|_| {});
     let mut done = 0usize;
     for (file, scopes, bytes, _fhash) in &per_file {
         emit_file_turns(
@@ -692,7 +692,7 @@ fn process_one_file(
     // than jumping when the whole file's batch flushes. `fired` counts scopes
     // that actually reported, so a tolerated failure can reconcile the rest.
     let fired = Arc::new(AtomicUsize::new(0));
-    let on_prefilled: candle_conversation::ScopeProgressFn = {
+    let on_prefilled: crate::turn_sink::ScopeProgressFn = {
         let done = Arc::clone(done);
         let fired = Arc::clone(&fired);
         let progress = Arc::clone(progress);

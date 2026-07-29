@@ -156,8 +156,8 @@ That cadence matters because the top of the loop is where the creep cohort
 re-forms. Two consequences:
 
 - **Mid-wave admission.** After every step the quantum runs the same admission it
-  runs at the loop top — `drain_submissions` → `promote_new_prefills` →
-  `pump_scope_prefills`, under the identical `admit_window`/VRAM entry criteria —
+  runs at the loop top — `drain_submissions` → `promote_new_prefills`, under the
+  identical `admit_window`/VRAM entry criteria —
   so a conversation that queues *while a wave is executing* is projected and
   seated in `active_prefills` immediately rather than waiting for the whole
   in-flight generation to finish. It joins the creep at the next quantum boundary,

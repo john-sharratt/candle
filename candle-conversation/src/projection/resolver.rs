@@ -852,8 +852,8 @@ impl Conversation {
     /// `["code", <path>]`). The source turn must be HOT — splice right after the
     /// fork completes, before the persistence thread migrates it warm.
     ///
-    /// Persists the same three records `record_scope_turn` does: the `TurnDecl`
-    /// (via [`Self::record_turn`]), the token ids, and the wide-Q provenance sigs
+    /// Persists three records for the adopted turn: the `TurnDecl` (via
+    /// [`Self::record_turn`]), the token ids, and the wide-Q provenance sigs
     /// (re-keyed onto the new stream so a provenance scan of the file timeline
     /// admits the turn).
     pub fn adopt_turn(
