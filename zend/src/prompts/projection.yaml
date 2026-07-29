@@ -311,39 +311,6 @@ system_prompt:
       # selection path; once the belief loop drives selection the policy's
       # budget is the single source of truth.
       selection: { kind: top_k, k: 3 }
-      # Config only this pass — the section-group compression *execution* path
-      # is a follow-up. When built it is TWO stages, not a single prompt: the
-      # model can reliably propose categories but cannot bulk-assign ~90 tools
-      # in one shot (it fabricates names, melts down, or re-proposes). The
-      # working recipe (see `zend/examples/compress_tools.rs`):
-      #   1. model proposes 6–8 category labels (this `system_prompt`);
-      #   2. assign tools to those FIXED categories in small numbered chunks,
-      #      mapping numbers back to the real names (no model-written names, so
-      #      no hallucination), with a deterministic name-token fallback for any
-      #      tool the model leaves unplaced.
-      summary:
-        chunk: 8
-        categorize:
-          max_tokens: 512
-          system_prompt: |
-            You organize a tool catalog into functional categories. Given a
-            numbered list of tools, propose 6 to 8 categories that together
-            cover them all. Output ONLY a numbered list, one category per line
-            as `<n>. <label>` — no tools, no descriptions, no other text.
-          user_prompt: |
-            Propose 6 to 8 categories as a numbered list, and nothing else.
-        assign:
-          max_tokens: 256
-          system_prompt: |
-            You assign tools to a FIXED set of categories given in each message.
-            You never invent, propose, or list categories — they are already
-            decided. For each tool you output exactly one bracket
-            [<tool-number>=<category-number>]. You output ONLY brackets: no
-            category names, no lists, no prose.
-          user_prompt: |
-            For each tool above output exactly one bracket
-            [<tool-number>=<category-number>], using only the given category
-            numbers. Do NOT write category names or a list — only brackets.
       sections: []
 
     - kind: template

@@ -66,10 +66,10 @@ use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, GroupSummary,
-    GroupSummaryStage, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection,
-    SectionSchema, SectionTree, SelectionDefault, SelectionRule, SystemPromptItem,
-    SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
+    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, LayerDials,
+    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
+    SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
+    TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
 use crate::summary_tree::scope::Scope;
 
@@ -246,30 +246,6 @@ struct YamlLayerSummary {
     summaries: Option<YamlTurnSummary>,
 }
 
-/// A section group's `summary:` block — a two-stage categorize→assign workflow
-/// (a group is a catalog, summarised by grouping its sections rather than by a
-/// single compression pass). All fields mandatory.
-#[derive(Deserialize)]
-struct YamlGroupSummary {
-    /// Sections per stage-2 assignment chunk.
-    chunk: usize,
-    /// Stage 1 — the model proposes the categories.
-    categorize: YamlGroupSummaryStage,
-    /// Stage 2 — assign each section to one of the categories.
-    assign: YamlGroupSummaryStage,
-}
-
-/// One stage of a group summary: a system/user prompt pair + decode cap.
-#[derive(Deserialize)]
-struct YamlGroupSummaryStage {
-    /// System-prompt framing for the pass.
-    system_prompt: String,
-    /// Instruction, prefilled after the content.
-    user_prompt: String,
-    /// Hard decode-token ceiling for this stage.
-    max_tokens: usize,
-}
-
 /// One entry in a YAML `items:` list — tagged via the `kind` discriminator.
 ///
 /// ```yaml
@@ -331,8 +307,6 @@ enum YamlSystemPromptItem {
         /// Its budget/thresholds subsume `selection`/`score_threshold`.
         #[serde(default)]
         policy: Option<YamlPolicy>,
-        /// Required — how this section group is compressed (config only for now).
-        summary: YamlGroupSummary,
         #[serde(default)]
         sections: Vec<YamlSection>,
         /// Glue string emitted (live-tokenised) BETWEEN consecutive selected
@@ -440,7 +414,6 @@ enum YamlTreeNode {
         selection: YamlSelection,
         #[serde(default)]
         score_threshold: f32,
-        summary: YamlGroupSummary,
         #[serde(default)]
         sections: Vec<YamlSection>,
         /// Glue string emitted (live-tokenised) BETWEEN consecutive selected
@@ -985,7 +958,6 @@ fn build_system_prompt(
                 selection,
                 score_threshold,
                 policy: coll_policy_yaml,
-                summary,
                 sections,
                 member_glue,
                 default: coll_default,
@@ -1041,12 +1013,6 @@ fn build_system_prompt(
                     }
                     _ => parse_policy(&label, coll_policy_yaml.as_ref(), base_policy)?,
                 };
-                let coll_summary = build_group_summary(
-                    &label,
-                    summary,
-                    format!("__summary__{name}"),
-                    section_alloc,
-                )?;
                 items.push(SystemPromptItem::Collection(SectionCollection {
                     id: cid,
                     name: name.clone(),
@@ -1054,7 +1020,6 @@ fn build_system_prompt(
                     selection: coll_selection,
                     score_threshold: *score_threshold,
                     policy: coll_policy,
-                    summary: coll_summary,
                     summary_section: None,
                     member_glue: member_glue.clone().unwrap_or_default(),
                     member_glue_tokens: None,
@@ -1188,46 +1153,6 @@ fn build_layer_summary(
     Ok(LayerSummary { turns, summaries })
 }
 
-/// Build a section group's [`GroupSummary`] — a single compression prompt and
-/// decode cap. Validates `max_tokens >= 1` and non-empty prompts.
-fn build_group_summary(
-    owner_label: &str,
-    yg: &YamlGroupSummary,
-    section_base: String,
-    section_alloc: &mut SectionIdAlloc,
-) -> Result<GroupSummary, ConstructionError> {
-    if yg.chunk == 0 || yg.categorize.max_tokens == 0 || yg.assign.max_tokens == 0 {
-        return Err(ConstructionError::InvalidSummary {
-            owner: owner_label.to_string(),
-        });
-    }
-    let build_stage = |stage: &YamlGroupSummaryStage,
-                       suffix: &str,
-                       alloc: &mut SectionIdAlloc|
-     -> Result<GroupSummaryStage, ConstructionError> {
-        let prompt = build_compression_prompt(
-            owner_label,
-            &YamlCompressionPrompt {
-                system_prompt: stage.system_prompt.clone(),
-                user_prompt: stage.user_prompt.clone(),
-            },
-            format!("{section_base}_{suffix}"),
-            alloc,
-        )?;
-        Ok(GroupSummaryStage {
-            prompt,
-            max_tokens: stage.max_tokens,
-        })
-    };
-    let categorize = build_stage(&yg.categorize, "categorize", section_alloc)?;
-    let assign = build_stage(&yg.assign, "assign", section_alloc)?;
-    Ok(GroupSummary {
-        categorize,
-        assign,
-        chunk: yg.chunk,
-    })
-}
-
 /// Mixed-radix pack of `selection[0..radices.len()]` — the variant key for a
 /// node whose ancestor dims have the given option counts.
 fn pack_assignment(selection: &[u8], radices: &[u8]) -> u32 {
@@ -1342,7 +1267,6 @@ enum TreeSpec<'a> {
         name: &'a str,
         selection: &'a YamlSelection,
         score_threshold: f32,
-        summary: &'a YamlGroupSummary,
         sections: &'a [YamlSection],
         member_glue: Option<&'a str>,
     },
@@ -1487,7 +1411,6 @@ fn flatten_tree_specs<'a>(
                 name,
                 selection,
                 score_threshold,
-                summary,
                 sections,
                 member_glue,
             } => {
@@ -1495,7 +1418,6 @@ fn flatten_tree_specs<'a>(
                     name,
                     selection,
                     score_threshold: *score_threshold,
-                    summary,
                     sections,
                     member_glue: member_glue.as_deref(),
                 });
@@ -1750,7 +1672,6 @@ fn build_section_tree<'a>(
                 name,
                 selection,
                 score_threshold,
-                summary,
                 sections,
                 member_glue,
             } => {
@@ -1772,12 +1693,6 @@ fn build_section_tree<'a>(
                         value: *score_threshold,
                     });
                 }
-                let coll_summary = build_group_summary(
-                    &label,
-                    summary,
-                    format!("__summary__{name}"),
-                    section_alloc,
-                )?;
 
                 let default_key = pack_assignment(&default_selection, &radices);
                 let mut member_variants: Vec<Vec<TreeVariant>> = Vec::with_capacity(sections.len());
@@ -1826,7 +1741,6 @@ fn build_section_tree<'a>(
                     // (`section_score`), not the belief loop, so their policy is
                     // inert — a default satisfies the schema.
                     policy: SelectionPolicy::default_policy(),
-                    summary: coll_summary,
                     summary_section: None,
                     member_glue: member_glue.map(str::to_string).unwrap_or_default(),
                     member_glue_tokens: None,

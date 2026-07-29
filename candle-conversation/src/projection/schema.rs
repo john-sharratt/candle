@@ -462,10 +462,6 @@ pub struct SectionCollection {
     /// budget/thresholds subsume the collection's `selection`/`score_threshold`
     /// for belief-driven selection.
     pub policy: SelectionPolicy,
-    /// How this section group is compressed. Parsed, stored, and validated; no
-    /// compression path reads a group summary yet (only layer summaries drive
-    /// the live compression).
-    pub summary: GroupSummary,
     /// The runtime-sealed summary section ([`Reserved::ToolSummary`](super::Reserved::ToolSummary)),
     /// set once the catalog summary is generated. When `Some` and the collection's
     /// selection is a *proper subset* of its members (top-k dropped at least one),
@@ -497,7 +493,6 @@ impl Default for SectionCollection {
             selection: SelectionRule::AlwaysVisible,
             score_threshold: 0.0,
             policy: SelectionPolicy::default_policy(),
-            summary: GroupSummary::default(),
             summary_section: None,
             member_glue: String::new(),
             member_glue_tokens: None,
@@ -689,51 +684,6 @@ impl LayerSummary {
 impl TurnSummary {
     fn push_section_ids(&self, out: &mut Vec<u32>) {
         out.push(self.assistant.system_prompt.id.raw());
-    }
-}
-
-/// How a section group (collection) is compressed.
-///
-/// A group is a catalog of sections, so it is summarised by a two-stage
-/// **categorize → assign** workflow rather than a single compression pass (a
-/// model cannot faithfully reproduce dozens of section names in one shot — see
-/// `zend/examples/compress_tools.rs`): stage 1 the model proposes the category
-/// labels; stage 2 it assigns each section to one by number, over chunks. The
-/// numbers map back to the real section names in code, with a deterministic
-/// name-token fallback, so no name can be invented. Parsed, stored, and
-/// validated; the execution path that reads it is a follow-up.
-#[derive(Debug, Clone)]
-pub struct GroupSummary {
-    /// Stage 1 — the model proposes the categories.
-    pub categorize: GroupSummaryStage,
-    /// Stage 2 — assign each section to one of the fixed categories, over chunks
-    /// of [`Self::chunk`] sections.
-    pub assign: GroupSummaryStage,
-    /// Sections per stage-2 assignment chunk.
-    pub chunk: usize,
-}
-
-/// One stage of a group's categorize→assign workflow: a compression prompt plus
-/// its decode-token ceiling.
-#[derive(Debug, Clone)]
-pub struct GroupSummaryStage {
-    pub prompt: CompressionPrompt,
-    pub max_tokens: usize,
-}
-
-impl Default for GroupSummary {
-    fn default() -> Self {
-        Self {
-            categorize: GroupSummaryStage {
-                prompt: CompressionPrompt::placeholder("__categorize__"),
-                max_tokens: 0,
-            },
-            assign: GroupSummaryStage {
-                prompt: CompressionPrompt::placeholder("__assign__"),
-                max_tokens: 0,
-            },
-            chunk: 0,
-        }
     }
 }
 
@@ -1156,23 +1106,6 @@ impl Schema {
             .all_section_ids()
             .map(|id| id.raw())
             .collect();
-        let push_summary = |c: &SectionCollection, ids: &mut Vec<u32>| {
-            ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
-            ids.push(c.summary.assign.prompt.system_prompt.id.raw());
-        };
-        for item in &self.system_prompt.items {
-            match item {
-                SystemPromptItem::Collection(c) => push_summary(c, &mut ids),
-                SystemPromptItem::SectionTree(t) => {
-                    for n in &t.nodes {
-                        if let Some(tc) = &n.collection {
-                            push_summary(&tc.collection, &mut ids);
-                        }
-                    }
-                }
-                SystemPromptItem::Section(_) => {}
-            }
-        }
         for layer in &self.layers {
             ids.extend(layer.all_section_ids());
         }

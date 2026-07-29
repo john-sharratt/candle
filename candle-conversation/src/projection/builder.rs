@@ -45,8 +45,8 @@ use super::project::{
     run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
 };
 use super::schema::{
-    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, GroupSummary,
-    LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
+    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, LayerDials,
+    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
     SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
@@ -684,9 +684,6 @@ impl Builder {
                 selection,
                 score_threshold,
                 policy,
-                // Runtime-added collections carry a placeholder summary; no
-                // compression path reads a group summary.
-                summary: GroupSummary::default(),
                 summary_section: None,
                 member_glue: String::new(),
                 member_glue_tokens: None,
