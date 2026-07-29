@@ -1510,6 +1510,22 @@ impl Substrate {
                 if slot.warm.is_some() {
                     return None;
                 }
+                // Skip residences pinned into the current wave's working set: a
+                // slot the in-flight decode is actively attending is about to be
+                // (or is being) elevated warm→hot on the shared copy stream and
+                // under the same `enter_migrate()` guard this drain holds. Backing
+                // it up hot→warm right now is redundant work that MONOPOLISES the
+                // persistence thread + guard + stream against the very elevation
+                // the decode is blocked on — the tier-migration livelock where the
+                // same working set churns hot→warm every pass while the decode
+                // lands zero forwards. Defer its warm copy until it leaves the
+                // working set (mirrors the pinned hot-drop defer in
+                // `mark_timeline_evict_when_cold`). Durability is only deferred,
+                // not lost: the authoritative hot copy stays resident while pinned,
+                // and the next unpinned pass makes the warm copy.
+                if self.working_set_pins.contains(&idx) {
+                    return None;
+                }
                 slot.hot
                     .as_ref()
                     .map(|hot| (idx, hot.clone(), slot.compression))
@@ -1529,9 +1545,40 @@ impl Substrate {
             .iter()
             .filter_map(|&idx| {
                 let slot = &self.residence[idx.0];
+                // Match `snapshot_pending_warm`'s pin skip: a pinned residence is
+                // NOT drainable this pass, so counting it would report a backlog
+                // the drain intentionally never clears — the admission
+                // backpressure would then throttle forever on a phantom deficit.
+                if self.working_set_pins.contains(&idx) {
+                    return None;
+                }
                 (slot.hot.is_some() && slot.warm.is_none()).then_some(slot.byte_size)
             })
             .sum()
+    }
+
+    /// Diagnostic split of the hot-without-warm set into (drainable, pinned-skip):
+    /// `(drainable_count, drainable_bytes, pinned_count, pinned_bytes)`. The
+    /// persistence thread logs it each pass so the tier-migration livelock is
+    /// legible: a large `pinned_*` with near-zero `drainable_*` is the working set
+    /// correctly deferred (the fix engaged); a large `drainable_*` that never
+    /// falls is a genuine drain that the migrate can't keep up with.
+    pub fn warm_backlog_split(&self) -> (usize, u64, usize, u64) {
+        let (mut dc, mut db, mut pc, mut pb) = (0usize, 0u64, 0usize, 0u64);
+        for &idx in &self.hot_lru {
+            let slot = &self.residence[idx.0];
+            if slot.hot.is_none() || slot.warm.is_some() {
+                continue;
+            }
+            if self.working_set_pins.contains(&idx) {
+                pc += 1;
+                pb += slot.byte_size;
+            } else {
+                dc += 1;
+                db += slot.byte_size;
+            }
+        }
+        (dc, db, pc, pb)
     }
 
     /// Snapshot indices of warm-resident slots that lack a cold (on-

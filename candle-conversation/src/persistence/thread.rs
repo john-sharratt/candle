@@ -803,6 +803,23 @@ fn run_pass(
             total_ms,
         ));
     }
+    // Backlog split: how much of the hot-without-warm set was DEFERRED because it
+    // is the in-flight decode's pinned working set (the tier-livelock fix) vs. a
+    // genuine drain the migrate must still catch up on. Fires only when something
+    // was pin-deferred, so a healthy idle pass stays quiet.
+    {
+        let (dc, db, pc, pb) = conversation.read().warm_backlog_split();
+        if pc > 0 {
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                pinned_skipped = pc,
+                pinned_mib = pb / (1 << 20),
+                drainable = dc,
+                drainable_mib = db / (1 << 20),
+                "hot→warm backlog split (pinned working set deferred from drain)"
+            );
+        }
+    }
 
     // ── Phase 2: warm → cold ────────────────────────────────────────────
     //
