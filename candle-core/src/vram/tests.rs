@@ -28,6 +28,9 @@ fn test_config() -> GovernorConfig {
             LadderTier::new(0, 0.0),
         ],
         balloon_target_frac: 0.90,
+        // Small enough not to bind on the 64 GiB test cards (the 0.90 fraction
+        // stays the binding term), so existing target assertions hold.
+        balloon_headroom_abs: 512 * MIB,
         balloon_floor: 512 * MIB,
         balloon_chunk: 256 * MIB,
         critical_min_interval_ms: 0, // deterministic: every Critical proceeds
@@ -162,6 +165,32 @@ fn balloon_loop_claims_to_target() -> Result<()> {
     assert_eq!(claimed, target);
     // Balloon freed: headroom restored.
     assert_eq!(vram.headroom(), total);
+    Ok(())
+}
+
+#[test]
+fn balloon_target_combines_fraction_and_absolute() -> Result<()> {
+    // C = min(frac × total, total − headroom_abs): the absolute reserve binds on
+    // a small card, the fraction on a large one — so neither the 16 GiB minimum
+    // (which needs an absolute scratch reserve larger than 5%) nor a 72 GiB card
+    // (which must not surrender a fixed slice of a huge card) is penalised.
+    let mut cfg = test_config();
+    cfg.balloon_target_frac = 0.95;
+    cfg.balloon_headroom_abs = 2560 * MIB; // 2.5 GiB
+
+    // 16 GiB: 0.95 × 16 = 15.2 GiB, but 16 − 2.5 = 13.5 GiB is smaller ⇒ abs binds.
+    let total = 16 * GIB;
+    let vram = FakeVram::new(total, total);
+    let mut alloc = FakeBalloonAllocator::new(vram.clone(), total);
+    let c = super::balloon::balloon_measure(&vram.probe(), &mut alloc, &cfg)?;
+    assert_eq!(c, total - 2560 * MIB);
+
+    // 72 GiB: 0.95 × 72 = 68.4 GiB, 72 − 2.5 = 69.5 GiB ⇒ the fraction binds.
+    let total = 72 * GIB;
+    let vram = FakeVram::new(total, total);
+    let mut alloc = FakeBalloonAllocator::new(vram.clone(), total);
+    let c = super::balloon::balloon_measure(&vram.probe(), &mut alloc, &cfg)?;
+    assert_eq!(c, (0.95 * total as f64) as u64);
     Ok(())
 }
 
@@ -1345,6 +1374,7 @@ mod real_cuda {
                 LadderTier::new(0, 0.0),         // Critical == floor
             ],
             balloon_target_frac: 0.95,
+            balloon_headroom_abs: 512 * MIB,
             balloon_floor: 512 * MIB,
             balloon_chunk: 256 * MIB,
             critical_min_interval_ms: 0,

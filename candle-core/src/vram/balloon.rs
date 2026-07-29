@@ -18,16 +18,24 @@ pub trait BalloonAllocator {
     fn free_all(&mut self);
 }
 
-/// Grow the balloon until it reaches `balloon_target_frac × total`, the probe's
+/// Grow the balloon until it reaches the capacity target `C`, the probe's
 /// headroom hits `balloon_floor`, or an allocation fails — whichever comes first.
 /// Returns the resident high-water we claimed (`C`), having freed the balloon.
+///
+/// The target combines a fractional and an absolute reserve as
+/// `C = min(balloon_target_frac × total, total − balloon_headroom_abs)`: the
+/// fraction governs large cards and the absolute headroom protects small ones
+/// (see [`GovernorConfig::balloon_headroom_abs`]). `balloon_floor` remains a
+/// separate, deeper safety net for the growth loop itself.
 pub fn balloon_measure(
     probe: &dyn VramProbe,
     alloc: &mut dyn BalloonAllocator,
     config: &GovernorConfig,
 ) -> Result<u64> {
     let total = probe.read()?.total;
-    let target = (config.balloon_target_frac * total as f64) as u64;
+    let frac_target = (config.balloon_target_frac * total as f64) as u64;
+    let abs_target = total.saturating_sub(config.balloon_headroom_abs);
+    let target = frac_target.min(abs_target);
     let chunk = config.balloon_chunk.max(1);
     let mut reserved = 0u64;
     while reserved < target {

@@ -48,6 +48,18 @@ pub struct GovernorConfig {
     pub ladder: [LadderTier; 5],
     /// Fraction of total VRAM the balloon tries to claim (default 0.95).
     pub balloon_target_frac: f64,
+    /// Absolute headroom (bytes) the balloon always leaves below `total`,
+    /// combined with [`Self::balloon_target_frac`] as
+    /// `C = min(frac × total, total − headroom_abs)` (default 2.5 GiB). The
+    /// transient prefill/reprojection scratch peak a forward needs above the
+    /// resident set is driven by the model's activation footprint, NOT the card
+    /// size, so expressing it purely as a fraction is scale-wrong: 5% of a 16 GiB
+    /// card is only ~0.8 GiB (too little — the scratch peak pages under WDDM),
+    /// while lowering the fraction to fix that would waste ~10 GiB on a 72 GiB
+    /// card. The absolute term binds on small cards (16 GiB, the minimum we
+    /// support) and the fraction binds on large cards (5% > 2.5 GiB past ~50 GiB),
+    /// so neither case is penalised.
+    pub balloon_headroom_abs: u64,
     /// Headroom floor at which the balloon stops growing (default 512 MiB).
     pub balloon_floor: u64,
     /// Balloon growth granularity in bytes (default 256 MiB).
@@ -73,6 +85,7 @@ impl Default for GovernorConfig {
                 LadderTier::new(0, 0.0),             // Critical
             ],
             balloon_target_frac: env_f64("CANDLE_VRAM_BALLOON_FRAC", 0.95),
+            balloon_headroom_abs: env_bytes_mb("CANDLE_VRAM_BALLOON_HEADROOM_MB", 2560),
             balloon_floor: env_bytes_mb("CANDLE_VRAM_BALLOON_FLOOR_MB", 512),
             balloon_chunk: env_bytes_mb("CANDLE_VRAM_BALLOON_CHUNK_MB", 256),
             critical_min_interval_ms: 250,
