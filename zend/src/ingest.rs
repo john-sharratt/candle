@@ -31,6 +31,12 @@ use crate::repo_scan::ClusterState;
 /// registry), so it is never treated as a folder-backed section sink.
 const TOOLS_COLLECTION: &str = "tools";
 
+/// The identity collections. Filled by the dedicated two-level identity loader
+/// (`identities/<name>/*.yaml`, see [`crate::response_section`]), not the flat
+/// section-sink loader, so they are excluded from [`section_sinks`].
+const IDENTITY_COLLECTION: &str = "identity";
+const IDENTITY_ANCHOR_COLLECTION: &str = "identity_anchor";
+
 /// How a turn-sink layer is populated — derived from the layer's declared
 /// identity, never annotated in the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +181,11 @@ pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
         let SystemPromptItem::Collection(c) = item else {
             continue;
         };
-        if c.name == TOOLS_COLLECTION || !c.sections.is_empty() {
+        if c.name == TOOLS_COLLECTION
+            || c.name == IDENTITY_COLLECTION
+            || c.name == IDENTITY_ANCHOR_COLLECTION
+            || !c.sections.is_empty()
+        {
             continue;
         }
         out.push(SectionSink {
@@ -186,14 +196,27 @@ pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
     out
 }
 
-/// Content-folder name for a section collection: append `s` unless it already
-/// ends in one (`response` → `responses`, `mood` → `moods`).
+/// Content-folder name for a section collection: pluralise the collection name
+/// (`response` → `responses`, `mood` → `moods`, `identity` → `identities`).
+/// A trailing consonant + `y` becomes `ies`; a name already ending in `s` is
+/// left as-is.
 fn pluralize(name: &str) -> String {
     if name.ends_with('s') {
-        name.to_string()
-    } else {
-        format!("{name}s")
+        return name.to_string();
     }
+    // `<consonant>y` → `<consonant>ies` (identity → identities), but keep a
+    // vowel + `y` as a simple `+s` (key → keys).
+    if let Some(stem) = name.strip_suffix('y') {
+        let vowel_before_y = stem
+            .chars()
+            .next_back()
+            .map(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+            .unwrap_or(false);
+        if !vowel_before_y {
+            return format!("{stem}ies");
+        }
+    }
+    format!("{name}s")
 }
 
 #[cfg(test)]
@@ -206,5 +229,9 @@ mod tests {
         assert_eq!(pluralize("mood"), "moods");
         // Already plural — left as-is.
         assert_eq!(pluralize("responses"), "responses");
+        // Consonant + y → ies (the identity collection's folder).
+        assert_eq!(pluralize("identity"), "identities");
+        // Vowel + y → +s (not "keies").
+        assert_eq!(pluralize("key"), "keys");
     }
 }

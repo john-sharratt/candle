@@ -43,6 +43,7 @@ impl Scope {
     /// Joined nesting path — `mod cache > impl KvCache > fn
     /// seal_chunk`.  Names the scope in the carve/AST layer and in parser unit
     /// tests asserted against expected nesting shapes.
+    #[allow(dead_code)]
     pub fn qualified_path(&self) -> String {
         self.path.join(" > ")
     }

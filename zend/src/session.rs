@@ -120,6 +120,11 @@ struct ConvState {
     /// the tool summary that was actually injected — the restricted (safe-subset)
     /// summary in Restricted mode, the full one in Comprehensive, none in None.
     tool_mode: ToolMode,
+    /// The identity this conversation speaks as (a sub-folder of `identities/`),
+    /// or `None` for the default / no identity. Seeded from the substrate on
+    /// fork, overridden when a request carries an explicit `identity`, and used
+    /// each turn to scope the projection's identity collection.
+    identity: Option<String>,
 }
 
 /// Map a turn's `thinking_effort` dial to the steering [`ThinkMode`].  Mirrors
@@ -218,6 +223,10 @@ struct InferenceState {
     /// drops the high-risk tools; None drops the whole catalog). Each turn hands
     /// out the matching one as a cheap `Arc` clone via [`ModeBuilders::get`].
     mode_builders: ModeBuilders,
+    /// Lazy per-`(identity, tool_mode)` projection builders. Scopes a
+    /// conversation's projection to its identity's anchor + facets over the
+    /// tools-mode view. Empty `keeps` (no `identities/` folder) makes it a no-op.
+    identity_builders: IdentityBuilders,
     /// Tokenizer shared with the engine — used by `head_tail_truncate`
     /// to bound the titler's prefill at first 50 + last 50 tokens.
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -490,6 +499,48 @@ impl InferenceState {
                 "installed calibrated section collection",
             );
         }
+
+        // Identity sections: the two-level `identities/<name>/*.yaml` tree, one
+        // sub-folder per identity (its `anchor.yaml` + detail facets). Members are
+        // namespaced `<name>::<stem>` and installed into the `identity_anchor`
+        // (always-visible) and `identity` (top-k) collections so every identity's
+        // KV seals once here; a conversation scopes to its own identity at
+        // projection time (see `IdentityBuilders`). No-op when the schema declares
+        // neither collection (the coding-assistant schema) or `identities/` is
+        // absent.
+        let identity_sections = crate::response_section::load_identity_sections(
+            &workspace.join("identities"),
+            &identity,
+        );
+        for (collection, sections) in [
+            ("identity_anchor", &identity_sections.anchors),
+            ("identity", &identity_sections.facets),
+        ] {
+            if sections.is_empty() {
+                continue;
+            }
+            // Only install into a collection the schema actually declares — a
+            // workspace with an `identities/` folder but a schema that doesn't
+            // declare these collections (e.g. the coding-assistant schema) is a
+            // no-op, not a startup failure.
+            if proj_builder.id_for_system_collection(collection).is_none() {
+                tracing::warn!(
+                    collection,
+                    n = sections.len(),
+                    "identities/ present but schema declares no '{collection}' collection — skipping",
+                );
+                continue;
+            }
+            let installed =
+                crate::response_section::install_sections(&mut proj_builder, collection, sections)
+                    .map_err(|e| anyhow::anyhow!("install '{collection}' sections: {e}"))?;
+            tracing::info!(
+                collection,
+                n = installed.len(),
+                "installed identity collection",
+            );
+        }
+        let default_identity = identity.default_identity.clone();
 
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
@@ -1213,6 +1264,15 @@ impl InferenceState {
         let mode_builders =
             ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names())
                 .map_err(|e| anyhow::anyhow!("tools-mode projection builders: {e}"))?;
+        // Identity scoping rides the tools-mode builders (see `IdentityBuilders`).
+        // Empty when the schema has no `identities/` content — then it's a no-op
+        // and conversations use the plain tools-mode projection.
+        let identity_builders = IdentityBuilders::new(&identity_sections, default_identity);
+        tracing::info!(
+            n_identities = identity_builders.keeps.len(),
+            default = ?identity_builders.default_identity,
+            "identity projection scoping ready",
+        );
         let think_closer_phrase = tokenizer
             .encode(THINK_CLOSER_PHRASE, false)
             .map(|e| e.get_ids().to_vec())
@@ -1231,6 +1291,7 @@ impl InferenceState {
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             mode_builders,
+            identity_builders,
             workspace,
             think_closer_phrase,
             tokenizer,
@@ -1624,6 +1685,163 @@ impl ModeBuilders {
     }
 }
 
+/// The `identity_anchor` + `identity` members that belong to one identity
+/// (namespaced `<name>::…`). The keep-sets a `retain_collection_sections` scopes
+/// a conversation down to.
+#[derive(Default)]
+struct IdentityKeep {
+    anchor: HashSet<String>,
+    facets: HashSet<String>,
+}
+
+/// Which identity scope a turn's projection uses — the three genuine states the
+/// resolver distinguishes so an unresolved identity never falls through to the
+/// unscoped builder (which would emit every persona's always-visible anchor).
+enum IdentityScope {
+    /// No identities are installed at all (e.g. the coding-assistant schema whose
+    /// projection has no `identity`/`identity_anchor` collections). Use the plain
+    /// tools-mode builder; nothing identity-shaped exists to emit.
+    Unscoped,
+    /// Scope both identity collections to this identity's members.
+    Named(String),
+    /// Identities ARE installed but none resolved (the conversation set none and
+    /// `mind.yaml` declares no default). Scope both collections to empty so no
+    /// anchor emits — a mind schema with identities should set a default.
+    Empty,
+}
+
+/// Lazy per-`(identity, ToolMode)` projection builders. Each is a [`ModeBuilders`]
+/// view further scoped — via `retain_collection_sections`, which drops members
+/// from projection but never re-seals KV — to a single identity's anchor + facets,
+/// so a conversation projects only its own identity. Built on first use and
+/// cached; bounded by identities-in-use × tool modes. KV is shared across all of
+/// them (every identity's sections seal once on the base conv).
+struct IdentityBuilders {
+    /// Per-identity keep-sets, computed once at load from the installed members.
+    keeps: HashMap<String, IdentityKeep>,
+    /// The `mind.yaml` default identity, used when a conversation names none.
+    default_identity: Option<String>,
+    cache: Mutex<HashMap<(String, ToolMode), Arc<Builder>>>,
+}
+
+impl IdentityBuilders {
+    /// Build the keep-sets from the loaded identity sections (member ids
+    /// `<name>::<stem>`). `default_identity` comes from `mind.yaml`.
+    fn new(
+        sections: &crate::response_section::IdentitySections,
+        default_identity: Option<String>,
+    ) -> Self {
+        let mut keeps: HashMap<String, IdentityKeep> = HashMap::new();
+        for s in &sections.anchors {
+            if let Some((name, _)) = s.id.split_once("::") {
+                keeps
+                    .entry(name.to_string())
+                    .or_default()
+                    .anchor
+                    .insert(s.id.clone());
+            }
+        }
+        for s in &sections.facets {
+            if let Some((name, _)) = s.id.split_once("::") {
+                keeps
+                    .entry(name.to_string())
+                    .or_default()
+                    .facets
+                    .insert(s.id.clone());
+            }
+        }
+        Self {
+            keeps,
+            default_identity,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve which identity scope a turn's projection uses: the conversation's
+    /// identity, else the `mind.yaml` default. Three genuine states — collapsing
+    /// them onto `Option` is what leaked every anchor: an unresolved identity when
+    /// identities ARE installed must scope to empty, NOT fall through to the
+    /// unscoped builder (whose AlwaysVisible `identity_anchor` collection emits
+    /// every persona's anchor at once).
+    fn resolve(&self, conv_identity: Option<&str>) -> IdentityScope {
+        if self.keeps.is_empty() {
+            return IdentityScope::Unscoped;
+        }
+        match conv_identity
+            .map(str::to_string)
+            .or_else(|| self.default_identity.clone())
+        {
+            Some(name) => IdentityScope::Named(name),
+            None => IdentityScope::Empty,
+        }
+    }
+
+    /// Retain both identity collections on `b` to `name`'s installed members. An
+    /// unknown name — including the reserved empty sentinel — scopes to empty. The
+    /// single home of the identity retain, shared by `get`, `get_empty`, and the
+    /// hires capture path so scoping can never diverge between them.
+    fn scope_to(&self, b: &mut Builder, name: &str) {
+        let empty = HashSet::new();
+        let (anchor_keep, facet_keep) = match self.keeps.get(name) {
+            Some(k) => (&k.anchor, &k.facets),
+            None => (&empty, &empty),
+        };
+        if let Err(e) = b.retain_collection_sections("identity_anchor", anchor_keep) {
+            tracing::warn!("scope identity_anchor to {name}: {e}");
+        }
+        if let Err(e) = b.retain_collection_sections("identity", facet_keep) {
+            tracing::warn!("scope identity to {name}: {e}");
+        }
+    }
+
+    /// Scope BOTH identity collections to empty — no anchor, no facets. Used when
+    /// identities are installed but none resolved (see [`IdentityScope::Empty`]).
+    /// Cached under a reserved key that no real identity name can collide with.
+    fn get_empty(&self, mode_builders: &ModeBuilders, mode: ToolMode) -> Arc<Builder> {
+        let key = ("\0empty".to_string(), mode);
+        if let Some(b) = self.cache.lock().unwrap().get(&key) {
+            return Arc::clone(b);
+        }
+        let mut b = (*mode_builders.get(mode)).clone();
+        self.scope_to(&mut b, "\0empty"); // sentinel is not a real identity → empty
+        let arc = Arc::new(b);
+        self.cache.lock().unwrap().insert(key, Arc::clone(&arc));
+        arc
+    }
+
+    /// Apply the conversation's identity scope to an arbitrary builder. The hires
+    /// capture path clones the UNSCOPED base, so without this a capture would emit
+    /// every persona's always-visible anchor. No-op when no identities are
+    /// installed (the coding-assistant schema).
+    fn scope_hires(&self, b: &mut Builder, conv_identity: Option<&str>) {
+        match self.resolve(conv_identity) {
+            IdentityScope::Named(name) => self.scope_to(b, &name),
+            IdentityScope::Empty => self.scope_to(b, "\0empty"),
+            IdentityScope::Unscoped => {}
+        }
+    }
+
+    /// The projection scoped to `name` for `mode` — cloned from the tools-mode
+    /// builder and retained on first use, then cached. An unknown `name` scopes
+    /// both identity collections to EMPTY (no identity surfaces) with a warning,
+    /// never the unscoped builder — which would leak every identity's
+    /// always-visible anchor at once.
+    fn get(&self, mode_builders: &ModeBuilders, name: &str, mode: ToolMode) -> Arc<Builder> {
+        let key = (name.to_string(), mode);
+        if let Some(b) = self.cache.lock().unwrap().get(&key) {
+            return Arc::clone(b);
+        }
+        if !self.keeps.contains_key(name) {
+            tracing::warn!(identity = %name, "unknown identity — scoping to empty (no identity surfaced)");
+        }
+        let mut b = (*mode_builders.get(mode)).clone();
+        self.scope_to(&mut b, name);
+        let arc = Arc::new(b);
+        self.cache.lock().unwrap().insert(key, Arc::clone(&arc));
+        arc
+    }
+}
+
 /// Clone the live projection builder with a high-resolution capture override.
 ///
 /// `spec` selects what to force:
@@ -1632,7 +1850,11 @@ impl ModeBuilders {
 ///
 /// The clone shares all section ids with the base, so a forked sequence's
 /// already-sealed section KV is reused unchanged.
-fn build_hires_projection(state: &InferenceState, spec: &str) -> anyhow::Result<Arc<Builder>> {
+fn build_hires_projection(
+    state: &InferenceState,
+    spec: &str,
+    conv_identity: Option<&str>,
+) -> anyhow::Result<Arc<Builder>> {
     let mut b = state.refresh_builder.clone();
     if let Some((collection, section)) = spec.split_once('/') {
         b.set_collection_single_section(collection, section)
@@ -1641,6 +1863,11 @@ fn build_hires_projection(state: &InferenceState, spec: &str) -> anyhow::Result<
         b.set_collection_selection(spec, SelectionRule::AlwaysVisible)
             .map_err(|e| anyhow::anyhow!("force-hires '{spec}': {e}"))?;
     }
+    // Scope to the conversation's identity so a capture reflects its real
+    // projection, not every persona's always-visible anchor — the base
+    // `refresh_builder` this clones is unscoped. Independent of the forced
+    // collection above, so order does not matter.
+    state.identity_builders.scope_hires(&mut b, conv_identity);
     Ok(Arc::new(b))
 }
 
@@ -1654,6 +1881,7 @@ fn run_inference_stream(
     assistant_prefill: Option<String>,
     lossless_kv: bool,
     tools_mode: ToolMode,
+    identity: Option<String>,
     selection: candle_conversation::SelectionState,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
@@ -1669,6 +1897,15 @@ fn run_inference_stream(
         );
 
         let timeline = timeline_for(&conv_id);
+        // Read any stored identity BEFORE locking the conversations map (so the
+        // engine lock is never nested inside the map lock). Only a freshly-forked
+        // conv uses it; a reused conv keeps its in-memory identity.
+        let stored_identity = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get("identity").cloned());
         let conv_arc: Arc<Mutex<ConvState>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -1691,6 +1928,7 @@ fn run_inference_stream(
                 let arc = Arc::new(Mutex::new(ConvState {
                     conv,
                     tool_mode: ToolMode::default(),
+                    identity: stored_identity.clone(),
                 }));
                 map.insert(conv_id.clone(), Arc::clone(&arc));
                 arc
@@ -1709,6 +1947,31 @@ fn run_inference_stream(
             .set_conversation_conv_id(timeline, &conv_id)
         {
             tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
+        }
+
+        // An explicit request `identity` overrides and is persisted, so later
+        // turns (and a daemon restart) keep it. Only writes when it actually
+        // changes, to avoid a substrate write every turn.
+        if let Some(req_id) = identity {
+            let changed = {
+                let mut cs = conv_arc.lock().unwrap();
+                if cs.identity.as_deref() == Some(req_id.as_str()) {
+                    false
+                } else {
+                    cs.identity = Some(req_id.clone());
+                    true
+                }
+            };
+            if changed {
+                if let Err(e) = state
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .set_conversation_metadata(timeline, "identity", &req_id)
+                {
+                    tracing::warn!(conv_id = %conv_id, "persist identity failed: {e}");
+                }
+            }
         }
 
         // Lossless capture: seal this conversation's turns WITHOUT KV
@@ -1767,7 +2030,7 @@ fn run_inference_stream(
         // `cs.tool_mode` records the mode actually applied, so the projection
         // panel shows the matching tool summary.
         if let Some(ref coll) = force_hires {
-            match build_hires_projection(&state, coll) {
+            match build_hires_projection(&state, coll, cs.identity.as_deref()) {
                 Ok(b) => {
                     cs.conv.set_projection(b);
                     // The capture override forces the full catalog (AllVisible),
@@ -1781,12 +2044,34 @@ fn run_inference_stream(
                 }
             }
         } else {
-            // Cheap `Arc` clone of the prebuilt mode projection (no per-turn
-            // schema clone). Applied every turn so a mid-conversation dial change
-            // takes effect, and both projection and reprojection use it.
-            cs.conv.set_projection(state.mode_builders.get(tools_mode));
+            // Cheap `Arc` clone of the prebuilt projection (no per-turn schema
+            // clone). Applied every turn so a mid-conversation dial change takes
+            // effect, and both projection and reprojection use it. When the
+            // conversation has an identity, the tools-mode view is further scoped
+            // to that identity's anchor + facets (`IdentityBuilders`); otherwise
+            // the plain tools-mode view.
+            let scope = state.identity_builders.resolve(cs.identity.as_deref());
+            let (proj, applied) = match &scope {
+                IdentityScope::Named(name) => (
+                    state
+                        .identity_builders
+                        .get(&state.mode_builders, name, tools_mode),
+                    Some(name.as_str()),
+                ),
+                IdentityScope::Empty => {
+                    tracing::warn!(conv_id = %conv_id,
+                        "conversation names no identity and mind.yaml sets no default — \
+                         scoping identity collections to empty (no anchor emitted)");
+                    (
+                        state.identity_builders.get_empty(&state.mode_builders, tools_mode),
+                        None,
+                    )
+                }
+                IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
+            };
+            cs.conv.set_projection(proj);
             cs.tool_mode = tools_mode;
-            tracing::info!(conv_id = %conv_id, ?tools_mode, "tools mode applied");
+            tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
         }
 
         let original_user_message = user_message.clone();
@@ -2481,14 +2766,6 @@ impl ZendSession {
     /// somehow not under the workspace. This is the form persisted in the
     /// upload event — a portable, workspace-relative reference, not an
     /// absolute host path.
-    /// Path of the daemon's rolling tracing log (`<workspace>/.substrate/zend.log`),
-    /// the source the `/v1/telemetry` endpoint tail-parses for the live dashboard.
-    /// The file name mirrors `log_file::LOG_NAME` (that module lives in the binary
-    /// crate, so it can't be referenced from here).
-    pub fn tracing_log_path(&self) -> PathBuf {
-        self.config.workspace.join(SUBSTRATE_DIR).join("zend.log")
-    }
-
     pub fn workspace_relative(&self, path: &std::path::Path) -> String {
         path.strip_prefix(&self.config.workspace)
             .ok()
@@ -3621,6 +3898,7 @@ impl ZendSession {
         assistant_prefill: Option<String>,
         lossless_kv: bool,
         tools_mode: ToolMode,
+        identity: Option<String>,
         selection: candle_conversation::SelectionState,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         self.submit_with_sampling(
@@ -3632,6 +3910,7 @@ impl ZendSession {
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            identity,
             selection,
         )
         .await
@@ -3655,6 +3934,7 @@ impl ZendSession {
         assistant_prefill: Option<String>,
         lossless_kv: bool,
         tools_mode: ToolMode,
+        identity: Option<String>,
         selection: candle_conversation::SelectionState,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         let last_user = messages
@@ -3723,6 +4003,7 @@ impl ZendSession {
                     assistant_prefill,
                     lossless_kv,
                     tools_mode,
+                    identity,
                     selection,
                 );
                 while let Some(item) = ts.next().await {

@@ -87,6 +87,7 @@ mod tool_scenarios {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                None,
                 candle_conversation::SelectionState::default(),
             )
             .await;

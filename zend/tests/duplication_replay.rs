@@ -106,6 +106,7 @@ mod replay {
                 None,
                 false,
                 ToolMode::None,
+                None,
                 no_think_standard_selection(),
             )
             .await;

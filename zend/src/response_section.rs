@@ -69,6 +69,10 @@ pub struct ResponseSection {
     pub description: Option<String>,
     /// The frozen structural mode — installed as the collection section's content.
     pub template: String,
+    /// Provenance lead-ins. Required for `mood`/`response` sections (enforced by
+    /// [`validate`]); optional for identity facets (see [`validate_identity`]),
+    /// whose baseline provenance comes from the template's own prefill.
+    #[serde(default)]
     pub examples: Vec<Example>,
 }
 
@@ -77,11 +81,16 @@ pub struct ResponseSection {
 pub struct Identity {
     pub char_name: String,
     pub user_name: String,
+    /// Default identity name (a sub-folder of `identities/`) a conversation uses
+    /// when its request carries no `identity` and it has none stored. `None`
+    /// leaves the resolver's built-in fallback in charge.
+    pub default_identity: Option<String>,
 }
 
 impl Identity {
-    /// Load `char_name` / `user_name` from `<workspace>/mind.yaml`, falling back
-    /// to neutral defaults when the file is absent or a field is unset.
+    /// Load `char_name` / `user_name` / `identity` from `<workspace>/mind.yaml`,
+    /// falling back to neutral defaults when the file is absent or a field is
+    /// unset.
     pub fn load(workspace: &Path) -> Self {
         #[derive(Deserialize, Default)]
         struct Raw {
@@ -89,6 +98,8 @@ impl Identity {
             char_name: Option<String>,
             #[serde(default)]
             user_name: Option<String>,
+            #[serde(default)]
+            identity: Option<String>,
         }
         let raw = std::fs::read_to_string(workspace.join("mind.yaml"))
             .ok()
@@ -97,6 +108,7 @@ impl Identity {
         Self {
             char_name: raw.char_name.unwrap_or_else(|| "Assistant".to_string()),
             user_name: raw.user_name.unwrap_or_else(|| "User".to_string()),
+            default_identity: raw.identity,
         }
     }
 
@@ -110,13 +122,22 @@ impl Identity {
 /// match the filename stem, and each example must end at a decode point — a final
 /// `assistant` turn carrying `thinking` and no `content`. Also enforces that
 /// `thinking` appears only on assistant turns and every turn has content or
-/// thinking (the schema's `anyOf`).
+/// thinking (the schema's `anyOf`). Requires at least one example — for the
+/// examples-optional identity path use [`validate_identity`].
 pub fn validate(section: &ResponseSection, stem: &str) -> anyhow::Result<()> {
-    if section.id != stem {
-        anyhow::bail!("id {:?} must match filename stem {:?}", section.id, stem);
-    }
     if section.examples.is_empty() {
         anyhow::bail!("section {:?}: needs at least one example", section.id);
+    }
+    validate_identity(section, stem)
+}
+
+/// Like [`validate`], but permits an empty `examples` list — identity facets take
+/// their baseline provenance from the template's own prefill, so authoring
+/// decode-point examples for every facet is optional. Any examples that ARE
+/// present are still validated to the same decode-point shape.
+pub fn validate_identity(section: &ResponseSection, stem: &str) -> anyhow::Result<()> {
+    if section.id != stem {
+        anyhow::bail!("id {:?} must match filename stem {:?}", section.id, stem);
     }
     for (i, ex) in section.examples.iter().enumerate() {
         if ex.turns.len() < 2 {
@@ -172,6 +193,19 @@ pub fn validate(section: &ResponseSection, stem: &str) -> anyhow::Result<()> {
 /// filename order. A file that fails to parse or validate is logged and skipped —
 /// one bad section never bricks daemon load. Missing `dir` yields an empty list.
 pub fn load_sections(dir: &Path, identity: &Identity) -> Vec<ResponseSection> {
+    load_sections_with(dir, identity, validate)
+}
+
+/// Shared core of the flat section loaders: read + parse + `validate_fn` +
+/// `{CHAR_NAME}`/`{USER_NAME}` substitution over `<dir>/*.yaml`, sorted, skipping
+/// any file that fails. The validator distinguishes the strict `mood`/`response`
+/// path ([`validate`]) from the examples-optional identity path
+/// ([`validate_identity`]).
+fn load_sections_with(
+    dir: &Path,
+    identity: &Identity,
+    validate_fn: fn(&ResponseSection, &str) -> anyhow::Result<()>,
+) -> Vec<ResponseSection> {
     let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
@@ -203,7 +237,7 @@ pub fn load_sections(dir: &Path, identity: &Identity) -> Vec<ResponseSection> {
                 continue;
             }
         };
-        if let Err(e) = validate(&section, &stem) {
+        if let Err(e) = validate_fn(&section, &stem) {
             tracing::warn!(file = %path.display(), "response section invalid: {e:#}");
             continue;
         }
@@ -222,6 +256,58 @@ pub fn load_sections(dir: &Path, identity: &Identity) -> Vec<ResponseSection> {
         out.push(section);
     }
     out
+}
+
+/// Anchor filename stem: an identity folder's always-present compressed self.
+/// Every other `*.yaml` in the folder is a detail facet.
+pub const IDENTITY_ANCHOR_STEM: &str = "anchor";
+
+/// The sections of every identity, split into the two collections they install
+/// into. Members are namespaced `<identity>::<stem>` so the projection can scope
+/// a conversation to one identity by retaining that prefix.
+pub struct IdentitySections {
+    /// `identity_anchor` members — one `<name>::anchor` per identity.
+    pub anchors: Vec<ResponseSection>,
+    /// `identity` members — `<name>::<facet>` for every non-anchor facet.
+    pub facets: Vec<ResponseSection>,
+}
+
+/// Load the two-level `identities/<name>/*.yaml` tree: each sub-folder is one
+/// identity, its `anchor.yaml` the always-on compressed self and every other
+/// yaml a detail facet. Each section is validated with the examples-optional
+/// [`validate_identity`], substituted, then re-keyed to the namespaced member id
+/// `<name>::<stem>`. A missing `identities_dir`, or a sub-entry that isn't a
+/// directory, is skipped — never a hard failure.
+pub fn load_identity_sections(identities_dir: &Path, identity: &Identity) -> IdentitySections {
+    let mut anchors = Vec::new();
+    let mut facets = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(identities_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => return IdentitySections { anchors, facets },
+    };
+    dirs.sort();
+
+    for dir in dirs {
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        for mut section in load_sections_with(&dir, identity, validate_identity) {
+            let is_anchor = section.id == IDENTITY_ANCHOR_STEM;
+            // Re-key `<stem>` → `<name>::<stem>`: the member id the projection
+            // scopes on. The stem was already validated against the filename.
+            section.id = format!("{name}::{}", section.id);
+            if is_anchor {
+                anchors.push(section);
+            } else {
+                facets.push(section);
+            }
+        }
+    }
+    IdentitySections { anchors, facets }
 }
 
 /// Install each section's `template` as a member of `collection` in the shared
@@ -272,6 +358,7 @@ mod tests {
         let id = Identity {
             char_name: "Aria".to_string(),
             user_name: "John".to_string(),
+            default_identity: None,
         };
         section.template = id.substitute(&section.template);
         assert_eq!(section.template, "Aria greets John warmly.");
@@ -309,5 +396,76 @@ mod tests {
     fn unknown_field_is_rejected() {
         let bad = "id: s\ncategory: c\ntemplate: t\nbogus: x\nexamples:\n  - turns:\n      - role: user\n        content: hi\n      - role: assistant\n        thinking: r\n";
         assert!(serde_yaml::from_str::<ResponseSection>(bad).is_err());
+    }
+
+    #[test]
+    fn identity_facet_may_omit_examples() {
+        // No `examples:` field at all — permitted on the identity path, rejected
+        // on the mood/response path.
+        let yaml = "id: emotions\ncategory: identity\ntemplate: \"{CHAR_NAME} carries three centuries of witness.\"\n";
+        let section: ResponseSection = serde_yaml::from_str(yaml).unwrap();
+        assert!(section.examples.is_empty());
+        validate_identity(&section, "emotions").expect("identity path permits empty examples");
+        assert!(
+            validate(&section, "emotions").is_err(),
+            "mood/response path still requires examples"
+        );
+    }
+
+    #[test]
+    fn identity_facet_with_examples_is_still_validated() {
+        // An identity facet MAY carry examples; when it does they must still be
+        // well-formed decode-point examples.
+        let good: ResponseSection = serde_yaml::from_str(valid_yaml()).unwrap();
+        validate_identity(&good, "greet_warmly").unwrap();
+        let bad = "id: s\ncategory: identity\ntemplate: t\nexamples:\n  - turns:\n      - role: user\n        content: hi\n";
+        let bad: ResponseSection = serde_yaml::from_str(bad).unwrap();
+        assert!(
+            validate_identity(&bad, "s").is_err(),
+            "final turn must be an assistant decode point"
+        );
+    }
+
+    #[test]
+    fn two_level_loader_namespaces_and_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("identities");
+        let keeper = root.join("keeper");
+        std::fs::create_dir_all(&keeper).unwrap();
+        std::fs::write(
+            keeper.join("anchor.yaml"),
+            "id: anchor\ncategory: identity\ntemplate: \"You are Keeper.\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            keeper.join("emotions.yaml"),
+            "id: emotions\ncategory: identity\ntemplate: \"Measured melancholy.\"\n",
+        )
+        .unwrap();
+
+        let id = Identity {
+            char_name: "Keeper".to_string(),
+            user_name: "Warden".to_string(),
+            default_identity: Some("keeper".to_string()),
+        };
+        let sections = load_identity_sections(&root, &id);
+        assert_eq!(sections.anchors.len(), 1);
+        assert_eq!(sections.anchors[0].id, "keeper::anchor");
+        assert_eq!(sections.facets.len(), 1);
+        assert_eq!(sections.facets[0].id, "keeper::emotions");
+    }
+
+    #[test]
+    fn missing_identities_dir_is_empty_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let sections = load_identity_sections(
+            &dir.path().join("nope"),
+            &Identity {
+                char_name: "A".to_string(),
+                user_name: "B".to_string(),
+                default_identity: None,
+            },
+        );
+        assert!(sections.anchors.is_empty() && sections.facets.is_empty());
     }
 }

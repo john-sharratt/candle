@@ -74,12 +74,19 @@ pub struct ChatCompletionRequest {
     /// default (`Comprehensive`).
     #[serde(default)]
     pub tools: Option<ToolMode>,
+    /// Which identity this conversation speaks as — a sub-folder of
+    /// `identities/` (e.g. `"keeper"`). Selects the anchor + facets the system
+    /// prompt scopes to. Absent → the conversation's stored identity, else the
+    /// `mind.yaml` default. Persisted on the conversation the first time it is
+    /// set, so later turns need not repeat it.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 /// Which slice of the tool catalog a conversation projects. Maps to the GUI
 /// "tools" dial. Drives both projection (which tool sections materialise) and
 /// which tool summary is injected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
     /// No tools: every tool section and the tool summary are omitted.

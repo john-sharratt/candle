@@ -59,6 +59,9 @@ pub async fn completions(
     // Composer "tools" dial — which slice of the catalog this conversation
     // projects. Absent → Comprehensive (full catalog).
     let tools_mode = req.tools.unwrap_or_default();
+    // Which identity this conversation speaks as. Absent → the conversation's
+    // stored identity, else the `mind.yaml` default (resolved in the session).
+    let identity = req.identity;
     // The composer dials drive the dialogue layer's section-tree selectors — the
     // projection emits the matching thinking-effort / response-length directive
     // sections (and the `/no_think` node) on this and every subsequent turn until
@@ -87,6 +90,7 @@ pub async fn completions(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            identity,
             model,
             id,
             created,
@@ -103,6 +107,7 @@ pub async fn completions(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            identity,
             model,
             id,
             created,
@@ -189,6 +194,7 @@ async fn stream_sse(
     assistant_prefill: Option<String>,
     lossless_kv: bool,
     tools_mode: crate::types::ToolMode,
+    identity: Option<String>,
     model: String,
     id: String,
     created: u64,
@@ -203,6 +209,7 @@ async fn stream_sse(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            identity,
             selection,
         )
         .await;
@@ -298,6 +305,7 @@ async fn collect_completion(
     assistant_prefill: Option<String>,
     lossless_kv: bool,
     tools_mode: crate::types::ToolMode,
+    identity: Option<String>,
     model: String,
     id: String,
     created: u64,
@@ -312,6 +320,7 @@ async fn collect_completion(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            identity,
             selection,
         )
         .await;
