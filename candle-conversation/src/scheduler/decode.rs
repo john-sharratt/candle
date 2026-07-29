@@ -216,6 +216,21 @@ impl Scheduler {
             .collect();
 
         if seq_ids.is_empty() {
+            // Every active decode is deferred-glue-pending, so there is no decode
+            // row to run this wave — but the glue that is BLOCKING them must still
+            // fire, or the slots stay excluded forever. The glue drains only in
+            // `take_wave_glue` inside `decode_forward_cobatched` (below, past the
+            // early return); `run_prefill_until_budget`'s glue drain is gated
+            // behind `decode_width() == 0`, which these excluded-but-live slots
+            // hold `> 0`. So without this, neither path fires the glue: a hard
+            // deadlock — 0 forwards, `decode_ms` spinning, the turn never decodes.
+            // Drive a glue-only wave (no decode/prefill rows) to drain the deferred
+            // fire, materialising the gap so the slot decodes next wave.
+            if !self.deferred_glue_fires.is_empty() {
+                if let Err(e) = self.decode_forward_cobatched(&[], &[]) {
+                    tracing::error!("decode: deferred-glue drain wave failed: {e}");
+                }
+            }
             return;
         }
 
