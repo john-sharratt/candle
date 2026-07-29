@@ -2262,14 +2262,31 @@ impl BatchedInferenceSession {
     /// hold sealed tokens, so it cannot serve as the backing length.
     pub fn sequence_backing_tokens(&self, idx: usize) -> Option<usize> {
         let caches = self.sequence_caches(idx)?;
-        let cache = caches.caches.first()?;
-        let mut cum: usize = 0;
-        cache.k_cache().chunked_visit_live_chunks(|it| {
-            for c in it {
-                cum += c.token_count as usize;
-            }
-        });
-        Some(cum)
+        if caches.caches.is_empty() {
+            return None;
+        }
+        // The token count the live block table covers, taken as the MINIMUM
+        // across layers — not layer 0 alone. During a windowed wave the creep
+        // prefill advances layers incrementally (layer 0 first), so layer 0 runs
+        // AHEAD of the layers still pending resume. Reading only layer 0 would
+        // let the forward-entry reconciler advance the slot's offset past those
+        // lagging layers; a decode that then reads a lagging layer trips the
+        // slot-header count invariant ("block table lost chunks"). The minimum is
+        // the token prefix EVERY layer has materialised, so an offset clamped to
+        // it is valid on every layer, and as the wave completes and the layers
+        // converge the minimum rises to the true length. For a uniform (settled)
+        // slot every layer is equal, so this is identical to reading layer 0.
+        let mut min_cum: Option<usize> = None;
+        for cache in &caches.caches {
+            let mut cum: usize = 0;
+            cache.k_cache().chunked_visit_live_chunks(|it| {
+                for c in it {
+                    cum += c.token_count as usize;
+                }
+            });
+            min_cum = Some(min_cum.map_or(cum, |m: usize| m.min(cum)));
+        }
+        min_cum
     }
 
     /// Set a sequence's logical offset outright. Used by the wave-boundary
