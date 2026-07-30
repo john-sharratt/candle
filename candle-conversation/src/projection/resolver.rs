@@ -1,7 +1,10 @@
 //! [`Conversation`] — the workspace-shared substrate handle, and
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -16,7 +19,9 @@ use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::{decode_wide_sigs, score_slots_weighted, WideQSig};
+use crate::provenance::{
+    decode_wide_sigs, score_slots_weighted, BatchedGpuGallery, SegmentInput, WideQSig,
+};
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
@@ -27,6 +32,7 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
+use candle::Device;
 use candle_nn::kv_cache::SealedSequence;
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
@@ -124,7 +130,24 @@ pub struct Conversation {
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
     writer: Arc<SubstrateWriter>,
+    /// Resident per-belief-group GPU gallery, keyed by a content fingerprint of
+    /// the group's timelines/windows. Page-locking the full-substrate gallery
+    /// (~250 ms) is the reproject scan's dominant cost, so it is paid once per
+    /// gallery change (a turn seal bumps the fingerprint) and reused across the
+    /// many reprojections within a turn — the "resident RAM mirror" the design
+    /// describes. A fingerprint miss rebuilds, so a stale gallery is never served.
+    /// Shared across clones (the fingerprint keys correctness, not the handle).
+    ///
+    /// Value is a small MRU set (not a single entry): one belief group has two
+    /// legitimate galleries — an append-only ingest scan masked to one timeline vs
+    /// a dialogue scan over all timelines — and keying by `GroupId` alone would
+    /// evict one every time the other ran. See [`GPU_GALLERY_PER_GROUP`].
+    gpu_gallery_cache: Arc<Mutex<HashMap<GroupId, Vec<(u64, Arc<BatchedGpuGallery>)>>>>,
 }
+
+/// Resident GPU galleries retained per belief group (a small MRU set). Two covers
+/// the ingest-masked vs dialogue-full pair; older entries evict on insert.
+const GPU_GALLERY_PER_GROUP: usize = 2;
 
 impl Default for Conversation {
     /// An ephemeral conversation — see [`Conversation::ephemeral`].
@@ -165,6 +188,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            gpu_gallery_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -186,6 +210,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            gpu_gallery_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -514,6 +539,7 @@ impl Conversation {
         target: ProjectionTarget,
         probe: &[WideQSig],
         observe: bool,
+        device: Option<&Device>,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
         let mut scores = ProjectionScores::new();
         let mut candidates: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
@@ -525,7 +551,14 @@ impl Conversation {
         scores = self.score_belief_collections(&schema.system_prompt, probe);
         // Belief-driven turn groups live across every layer.
         for layer in &schema.layers {
-            candidates.extend(self.score_belief_groups(layer, target, probe, &mut scores, observe));
+            candidates.extend(self.score_belief_groups(
+                layer,
+                target,
+                probe,
+                &mut scores,
+                observe,
+                device,
+            ));
         }
         (scores, candidates)
     }
@@ -611,7 +644,8 @@ impl Conversation {
         for (_, _, probe) in &probes[start..] {
             let mut throwaway = ProjectionScores::new();
             for layer in &schema.layers {
-                let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true);
+                // Background warm-up runs off the hot path → CPU (no device).
+                let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true, None);
             }
         }
 
@@ -677,12 +711,16 @@ impl Conversation {
                             continue;
                         }
                         let mut throwaway = ProjectionScores::new();
+                        // CPU fallback (`device: None`): the warm-up runs off the
+                        // reproject hot path and only needs the learned hit level,
+                        // which the CPU and GPU scans agree on up to fast-math ULP.
                         let _ = self.score_belief_groups(
                             layer,
                             self_target,
                             sig.as_slice(),
                             &mut throwaway,
                             true,
+                            None,
                         );
                     }
                     warmed_timelines += 1;
@@ -715,6 +753,7 @@ impl Conversation {
         probe: &[WideQSig],
         scores: &mut ProjectionScores,
         observe: bool,
+        device: Option<&Device>,
     ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
         use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
@@ -744,7 +783,22 @@ impl Conversation {
             } else {
                 sub.active_timelines_for_group(group.id).collect()
             };
-            let mut cands: Vec<(TurnKey, f32)> = Vec::new();
+            // ── Phase A: assemble every file's exchanges + gallery windows ───────
+            // All files in the group are built first so the whole group can be scored
+            // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
+            // fallback — the two paths are numerically equivalent up to fast-math ULP
+            // (same ranking; see `examples/gpu_belief_parity.rs`). `arcs_kept` holds
+            // the referenced sig windows alive so the scan can borrow slices out of them.
+            struct FileScan {
+                timeline: TimelineId,
+                arc_turn: Vec<TurnIndex>,
+                ex_ranges: Vec<Range<usize>>,
+                n_slots: usize,
+                arcs_kept: Vec<Arc<Vec<WideQSig>>>,
+                // (arc index into `arcs_kept`, window start, window end, exchange slot)
+                windows: Vec<(usize, usize, usize, usize)>,
+            }
+            let mut files: Vec<FileScan> = Vec::new();
             for timeline in timelines {
                 // Enumerate the group's turns exactly as selection does — the whole
                 // resolved timeline, `0..turn_count`, fetched by stream id — instead
@@ -822,50 +876,208 @@ impl Conversation {
                 }
                 let n_slots = ex_ranges.len();
                 // Flatten every turn's sub-windows into gallery windows, all tagged with
-                // their EXCHANGE slot (`wslot[i] = exchange index`). So `score_slots`
+                // their EXCHANGE slot (`wslot[i] = exchange index`). So the scan
                 // aggregates a whole round-trip — every sub-window of the call AND the
                 // response — into ONE case (best-token agreement across the pair),
                 // rather than letting the halves (or a turn's own regions) compete as
                 // separate cases and split the scope's vote. The seams still bound the
                 // windows, ready for the diverse-window step, but never fight each
-                // other. Then the L46-weighted vote (§83) decides the exchange.
-                let mut wref: Vec<&[WideQSig]> = Vec::new();
-                let mut wslot: Vec<usize> = Vec::new();
+                // other. Then the L46-weighted vote (§83) decides the exchange. Only the
+                // arcs actually referenced by a window are kept alive.
+                let mut arcs_kept: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+                let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
                 for (ai, arc) in arcs.iter().enumerate() {
                     let Some(arc) = arc else {
                         continue; // sig-less turn: no window, but keeps its exchange slot
                     };
+                    let mut ki: Option<usize> = None;
                     for &(s, e) in &arc_bounds[ai] {
                         if e > s {
-                            wref.push(&arc[s..e]);
-                            wslot.push(ex_slot[ai]);
+                            let k = *ki.get_or_insert_with(|| {
+                                arcs_kept.push(arc.clone());
+                                arcs_kept.len() - 1
+                            });
+                            windows.push((k, s, e, ex_slot[ai]));
                         }
                     }
                 }
-                if wref.is_empty() {
+                if windows.is_empty() {
                     continue;
                 }
-                // Per-layer-group vote weights from the group's `policy.layer_weights`
-                // (empty ⇒ uniform). Repo_map peaks on L46 (§83); other groups inherit
-                // uniform. Configured in the schema YAML, not hard-coded.
-                let fresh = score_slots_weighted(
-                    probe,
-                    &wref,
-                    &wslot,
+                files.push(FileScan {
+                    timeline,
+                    arc_turn,
+                    ex_ranges,
                     n_slots,
-                    &group.policy.layer_weights,
-                );
-                // Normalize the raw scores against each EXCHANGE's learned hit level so
-                // selection compares candidates on a common 0-1000 band, not a shared
-                // absolute scale (docs/provenance_score_normalization.md). Scope =
-                // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
-                // resetting learning for the regenerated clusters; child = the
-                // exchange's head-turn index (stable across scans).
+                    arcs_kept,
+                    windows,
+                });
+            }
+            if files.is_empty() {
+                continue;
+            }
+
+            // ── Phase B: score every file. GPU = ONE segmented launch (per-file z /
+            // margin / needle gate, numerically equivalent to the CPU per-file scan
+            // up to fast-math ULP — same ranking); CPU fallback = the identical
+            // `score_slots_weighted` per file. Per-layer-group vote weights come from
+            // the group's `policy.layer_weights` (empty ⇒ uniform — repo_map peaks on
+            // L46 (§83), configured in the schema YAML). ──
+            let weights = &group.policy.layer_weights;
+            let gpu_scores: Option<Vec<Vec<f32>>> = device.and_then(|dev| {
+                // Content fingerprint of the group's gallery: file order + each file's
+                // exchange count + every window's (sig-arc identity, len, bounds, slot)
+                // AND a content sample (first/last words). The decoded-sig memo serves a
+                // STABLE `Arc` that changes identity only when a turn's blob is rewritten
+                // (and keeps unchanged Arcs alive), so the Arc pointer is a cheap content
+                // key — a seal bumps it, a reprojection against unchanged turns does not.
+                // The word sample is the ABA guard: if an in-place re-seal or a substrate
+                // reset (`sig_cache.clear`) frees an Arc and the allocator hands the new
+                // (different) content the same address with the same window structure,
+                // the sampled words still differ, so the stale gallery is never served.
+                let mut hasher = DefaultHasher::new();
+                for f in &files {
+                    f.timeline.raw().hash(&mut hasher);
+                    f.n_slots.hash(&mut hasher);
+                    for &(k, s, e, slot) in &f.windows {
+                        let win = &f.arcs_kept[k][s..e];
+                        (Arc::as_ptr(&f.arcs_kept[k]) as usize).hash(&mut hasher);
+                        f.arcs_kept[k].len().hash(&mut hasher);
+                        s.hash(&mut hasher);
+                        e.hash(&mut hasher);
+                        slot.hash(&mut hasher);
+                        if let Some(first) = win.first().and_then(|sig| sig.words.first()) {
+                            first.hash(&mut hasher);
+                        }
+                        if let Some(last) = win.last().and_then(|sig| sig.words.last()) {
+                            last.hash(&mut hasher);
+                        }
+                    }
+                }
+                let fp = hasher.finish();
+
+                // Fast path: a fingerprint hit in the group's small MRU set. Lock only
+                // for the lookup + clone, never across a build.
+                let hit = {
+                    let cache = self.gpu_gallery_cache.lock().unwrap();
+                    cache.get(&group.id).and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(cfp, _)| *cfp == fp)
+                            .map(|(_, g)| g.clone())
+                    })
+                };
+                let gallery = match hit {
+                    Some(g) => g,
+                    None => {
+                        // Build OUTSIDE the lock — the ~250 ms page-lock must not
+                        // serialize other groups / forks sharing this cache. A rare
+                        // concurrent double-build is harmless (identical gallery).
+                        let segments: Vec<SegmentInput> = files
+                            .iter()
+                            .map(|f| SegmentInput {
+                                windows: f
+                                    .windows
+                                    .iter()
+                                    .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
+                                    .collect(),
+                                window_case: f
+                                    .windows
+                                    .iter()
+                                    .map(|&(_, _, _, slot)| slot)
+                                    .collect(),
+                                n_cases: f.n_slots,
+                            })
+                            .collect();
+                        let built = match BatchedGpuGallery::from_segments(&segments) {
+                            Ok(g) => Arc::new(g),
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "provenance",
+                                    "GPU belief gallery build failed, CPU per-file scan: {e}"
+                                );
+                                return None;
+                            }
+                        };
+                        let mut cache = self.gpu_gallery_cache.lock().unwrap();
+                        let entries = cache.entry(group.id).or_default();
+                        // Prefer a peer's gallery if it raced us to the same fingerprint.
+                        if let Some((_, existing)) = entries.iter().find(|(cfp, _)| *cfp == fp) {
+                            existing.clone()
+                        } else {
+                            entries.push((fp, built.clone()));
+                            if entries.len() > GPU_GALLERY_PER_GROUP {
+                                entries.remove(0); // evict oldest
+                            }
+                            built
+                        }
+                    }
+                };
+                match gallery.scan_weighted(dev, &[probe], weights) {
+                    Ok(mut out) => {
+                        // One probe in ⇒ one per-GLOBAL-case vote vector out, in segment
+                        // (file) order. Split it back per file by cumulative `n_slots`.
+                        let votes = out.pop().unwrap_or_default();
+                        let mut cum = 0usize;
+                        Some(
+                            files
+                                .iter()
+                                .map(|f| {
+                                    let end = (cum + f.n_slots).min(votes.len());
+                                    let mut v = votes.get(cum..end).unwrap_or(&[]).to_vec();
+                                    v.resize(f.n_slots, 0.0);
+                                    cum += f.n_slots;
+                                    v
+                                })
+                                .collect(),
+                        )
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "provenance",
+                            "GPU belief scan unavailable, using CPU per-file scan: {e}"
+                        );
+                        None
+                    }
+                }
+            });
+            let fresh_per_file: Vec<Vec<f32>> = gpu_scores.unwrap_or_else(|| {
+                files
+                    .iter()
+                    .map(|f| {
+                        let wref: Vec<&[WideQSig]> = f
+                            .windows
+                            .iter()
+                            .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
+                            .collect();
+                        let wslot: Vec<usize> =
+                            f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
+                        score_slots_weighted(probe, &wref, &wslot, f.n_slots, weights)
+                    })
+                    .collect()
+            });
+
+            // ── Phase C: per-file normalize + stamp (unchanged behaviour) ────────
+            // Normalize the raw scores against each EXCHANGE's learned hit level so
+            // selection compares candidates on a common 0-1000 band, not a shared
+            // absolute scale (docs/provenance_score_normalization.md). Scope =
+            // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
+            // resetting learning for the regenerated clusters; child = the exchange's
+            // head-turn index (stable across scans).
+            let mut cands: Vec<(TurnKey, f32)> = Vec::new();
+            for (f, fresh) in files.iter().zip(&fresh_per_file) {
+                let timeline = f.timeline;
                 let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
-                let raw_pairs: Vec<(ChildKey, f32)> = ex_ranges
+                let raw_pairs: Vec<(ChildKey, f32)> = f
+                    .ex_ranges
                     .iter()
                     .enumerate()
-                    .map(|(slot, r)| (ChildKey::turn(arc_turn[r.start].0 as u64), fresh[slot]))
+                    .map(|(slot, r)| {
+                        (
+                            ChildKey::turn(f.arc_turn[r.start].0 as u64),
+                            fresh.get(slot).copied().unwrap_or(0.0),
+                        )
+                    })
                     .collect();
                 // One lock for the read-then-(maybe)-write, so no other thread mutates
                 // the levels between this turn's normalize and observe. Learning only
@@ -881,10 +1093,10 @@ impl Conversation {
                 // Stamp EVERY member turn of an exchange with its (shared) normalized
                 // score, so provenance selecting either half brings in the whole
                 // round-trip — never half a tool call.
-                for (slot, r) in ex_ranges.iter().enumerate() {
+                for (slot, r) in f.ex_ranges.iter().enumerate() {
                     let sc = normed.get(slot).map(|(_, s)| *s).unwrap_or(0.0);
                     for ai in r.clone() {
-                        let idx = arc_turn[ai];
+                        let idx = f.arc_turn[ai];
                         scores.set_turn(timeline, idx, sc);
                         cands.push((TurnKey::new(timeline, idx), sc));
                     }

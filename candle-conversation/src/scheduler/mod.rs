@@ -6922,10 +6922,19 @@ impl Scheduler {
         let schema = policy.projection.schema();
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
-        let (projection_scores, group_candidates) =
-            policy
-                .substrate
-                .score_beliefs(schema, policy.target, &probe, false);
+        // The hot reproject path scans on the GPU (segmented BDP, per-file z) —
+        // one launch for the whole group, numerically equivalent to the CPU
+        // per-file scan up to fast-math ULP / same ranking (see
+        // `examples/gpu_belief_parity.rs`). Seal-time learning still runs CPU
+        // (`last_turn_belief_scores`, device=None), so learned normalization levels
+        // and live GPU scores differ by ~1e-3 — negligible for the 0-1000 bands.
+        let (projection_scores, group_candidates) = policy.substrate.score_beliefs(
+            schema,
+            policy.target,
+            &probe,
+            false,
+            Some(&self.device),
+        );
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
