@@ -729,6 +729,7 @@ mod tests {
             0,
             &TombstonePayload {
                 timeline_id: dead_tl,
+                reason: None,
             }
             .encode(),
         ));

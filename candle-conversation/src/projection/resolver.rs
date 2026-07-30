@@ -1212,12 +1212,18 @@ impl Conversation {
                     skipped_corrupt += 1;
                     if let Some(timeline) = TimelineId::from_raw(decl.timeline_id) {
                         self.write().tombstone_timeline(timeline);
-                        // Best-effort durable mark — failures here
-                        // just mean the next reload will encounter
-                        // the same turn and skip it again, which is
-                        // still correct, so we don't propagate.
+                        // Durable mark WITH a reason, so the tombstone records WHY
+                        // this timeline was dropped (a corrupt-partial turn), not
+                        // just that it was. The code_read background refresh then
+                        // re-ingests the file: this conversation is now absent from
+                        // the live `content_sha256` set, so `code_read_state_from_substrate`
+                        // omits it, `changed_files` flags it, and `process_one_file`
+                        // rebuilds it. Best-effort — a failure here just means the
+                        // next reload skips the same turn again, still correct.
+                        let reason =
+                            format!("corrupt reload (turn {}): {e}", decl.turn_index);
                         if let Ok(mut p) = self.persistence.lock() {
-                            let _ = p.write_tombstone(timeline.raw());
+                            let _ = p.write_tombstone(timeline.raw(), Some(&reason));
                         }
                     }
                     continue;
@@ -1590,7 +1596,7 @@ impl Conversation {
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
         self.write().tombstone_timeline(timeline);
         let mut p = self.persistence.lock().unwrap();
-        p.write_tombstone(timeline.raw())
+        p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
     }

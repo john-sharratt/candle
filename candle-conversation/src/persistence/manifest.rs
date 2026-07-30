@@ -420,7 +420,7 @@ mod tests {
             RecordType::Tombstone,
             0,
             0,
-            &TombstonePayload { timeline_id: 77 }.encode(),
+            &TombstonePayload { timeline_id: 77, reason: None }.encode(),
         ));
         let mut mem = MemLog::with_records(&blob);
         let (_, substrate, _) = Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();

@@ -2977,6 +2977,15 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
+        // Surface the reason on replay so a reload shows WHY a timeline was
+        // dropped (e.g. a corrupt-partial turn), not just that it vanished.
+        if let Some(reason) = &payload.reason {
+            tracing::debug!(
+                timeline_id = payload.timeline_id,
+                reason = %reason,
+                "replaying tombstone with recorded reason",
+            );
+        }
         self.tombstoned_timelines.insert(timeline);
     }
 
@@ -6559,6 +6568,7 @@ mod tests {
 
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: timeline.raw(),
+            reason: None,
         });
         assert!(sub.is_tombstoned(timeline));
 
@@ -6579,6 +6589,7 @@ mod tests {
         sub.tombstone_timeline(registered);
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: unregistered.raw(),
+            reason: None,
         });
 
         let set = sub.tombstoned_timelines();

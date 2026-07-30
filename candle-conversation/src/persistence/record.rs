@@ -793,6 +793,15 @@ impl DebugIdPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TombstonePayload {
     pub timeline_id: u64,
+    /// Why the timeline was tombstoned, when known — e.g.
+    /// `"corrupt reload (turn N): <detail>"` for a turn dropped during substrate
+    /// reconstruction because its persisted state was inconsistent. Diagnostic
+    /// only: the runtime treats any tombstone as dead regardless. `None` for the
+    /// ordinary deletions (file removed, superseded generation, spliced fork).
+    /// Skipped from the serialized record when `None`, so a reason-less tombstone
+    /// stays byte-identical to the pre-reason format on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl TombstonePayload {
@@ -803,6 +812,52 @@ impl TombstonePayload {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_json::from_slice(buf)
             .map_err(|e| PersistenceError::Corrupt(format!("Tombstone JSON parse: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tombstone_payload_tests {
+    use super::TombstonePayload;
+
+    #[test]
+    fn reasonless_tombstone_is_byte_identical_to_pre_reason_format() {
+        // A None reason must serialise to exactly `{"timeline_id":N}` so existing
+        // on-disk tombstone records (written before the reason field) read back
+        // identically and new reason-less tombstones don't change the byte layout.
+        let p = TombstonePayload {
+            timeline_id: 77,
+            reason: None,
+        };
+        assert_eq!(p.encode(), br#"{"timeline_id":77}"#.to_vec());
+    }
+
+    #[test]
+    fn reason_is_serialised_when_present() {
+        let p = TombstonePayload {
+            timeline_id: 42,
+            reason: Some("corrupt reload (turn 1): chunk mismatch".to_string()),
+        };
+        assert_eq!(
+            p.encode(),
+            br#"{"timeline_id":42,"reason":"corrupt reload (turn 1): chunk mismatch"}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn old_record_without_reason_decodes_to_none() {
+        // A record persisted before the field existed still decodes cleanly.
+        let decoded = TombstonePayload::decode(br#"{"timeline_id":9}"#).unwrap();
+        assert_eq!(decoded.timeline_id, 9);
+        assert_eq!(decoded.reason, None);
+    }
+
+    #[test]
+    fn round_trips_with_reason() {
+        let p = TombstonePayload {
+            timeline_id: 5,
+            reason: Some("corrupt reload".to_string()),
+        };
+        assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
     }
 }
 

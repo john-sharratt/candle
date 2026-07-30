@@ -627,9 +627,14 @@ impl SubstratePersistence {
     /// `timeline_id` as logically deleted.  Walker replay applies it
     /// to the substrate; the compactor drops every record bound to
     /// the timeline on the next compaction pass.  Idempotent —
-    /// duplicate tombstones replay identically.
-    pub fn write_tombstone(&mut self, timeline_id: u64) -> Result<()> {
-        let payload = record::TombstonePayload { timeline_id };
+    /// duplicate tombstones replay identically. `reason` is a diagnostic
+    /// note (e.g. the corrupt-reload detail) recorded in the payload; pass
+    /// `None` for an ordinary deletion.
+    pub fn write_tombstone(&mut self, timeline_id: u64, reason: Option<&str>) -> Result<()> {
+        let payload = record::TombstonePayload {
+            timeline_id,
+            reason: reason.map(str::to_string),
+        };
         let bytes = payload.encode();
         self.append_record(RecordType::Tombstone, 0, 0, 0, 0, &bytes)?;
         Ok(())

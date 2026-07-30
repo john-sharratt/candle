@@ -390,6 +390,7 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             chunk_index: 0,
             payload: TombstonePayload {
                 timeline_id: t.raw(),
+                reason: None,
             }
             .encode(),
         });
@@ -1197,7 +1198,7 @@ mod tests {
             sp.write_chunk(sid, 0, 32, 4, &chunk_payload(1)).unwrap();
             sp.commit().unwrap();
             sp.seal_active().unwrap(); // seg 1: the tombstoned-to-be turn's decl + chunk
-            sp.write_tombstone(tid).unwrap(); // marker lands in seg 2 (active)
+            sp.write_tombstone(tid, None).unwrap(); // marker lands in seg 2 (active)
             sp.commit().unwrap();
         }
         {
