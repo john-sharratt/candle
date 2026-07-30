@@ -32,7 +32,7 @@ pub mod wide_sig;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
 pub use gather::{belief_step, score_slots, score_slots_weighted, SlotBelief};
-pub use gpu::{score_batched_gpu, BatchedGpuGallery};
+pub use gpu::{score_batched_gpu, BatchedGpuGallery, SegmentInput};
 pub use packed::{score_packed, PackedGallery};
 pub use raw_store::extract_q_vector_r16;
 pub use scan::{score_provenance_late_fusion, score_provenance_late_fusion_weighted};

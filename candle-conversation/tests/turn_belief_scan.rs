@@ -103,6 +103,7 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         &probe,
         &mut scores,
         false,
+        None,
     );
 
     // The scan reported all three candidate turns for the group.
@@ -181,6 +182,7 @@ fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
         &probe,
         &mut scores,
         false,
+        None,
     );
 
     // Every member turn is still reported (both halves + the singleton).
@@ -293,7 +295,7 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
 
     // The non-target clusters group was scored, and the probed turn wins.
     let s0 = scores.turn(mem_tl, TurnIndex(0));
@@ -365,7 +367,7 @@ fn append_only_target_masks_belief_groups_self_local() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
 
     // The clusters group's turns (on mem_tl) are masked to the target timeline
     // (dlg_tl), which has none — so nothing is scored and no candidates surface.
@@ -440,7 +442,7 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
 
     // The probed turn (index 1) wins in EVERY file — including `file_b`, the
     // second-registered one, which the old collapse never scored.
@@ -471,6 +473,114 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
     assert!(cluster_cands.iter().any(|(k, _)| k.timeline == file_b));
 }
 
+/// The wired reproject path (`device = Some`) must produce the SAME per-turn
+/// scores as the CPU per-file scan (`device = None`) — the GPU segmented scan is
+/// a proven-equivalent accelerator, not a behaviour change. This drives the
+/// resolver's actual GPU branch (build → cache → segmented `scan_weighted` →
+/// per-file split → normalize) rather than the raw primitive, and calls it TWICE
+/// so the second call exercises the resident-gallery cache-hit branch. Skips
+/// cleanly when no CUDA device is present.
+#[test]
+fn score_belief_groups_gpu_matches_cpu_and_caches() {
+    use candle_conversation::projection::{TimelineId, TurnIndex};
+
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return, // no GPU here — skip
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(TWO_LAYER_YAML).unwrap();
+    let mem_layer = builder.id_for_layer("mem").unwrap();
+    let clusters = builder.id_for_group("clusters").unwrap();
+    let dialogue_layer = builder.id_for_layer("dialogue").unwrap();
+    let convo = builder.id_for_group("convo").unwrap();
+
+    // Two files under `clusters`, three turns each with distinct sign patterns.
+    let file_a = TimelineId::from_raw(401).unwrap();
+    let file_b = TimelineId::from_raw(402).unwrap();
+    conv.register_timeline(file_a, mem_layer, clusters);
+    conv.register_timeline(file_b, mem_layer, clusters);
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xF0F0_F0F0_0F0F_0F0Fu64,
+    ];
+    for tl in [file_a, file_b] {
+        for fill in fills {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: 4,
+                        tags: vec!["repo_map".to_string()],
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(
+                turn_stream_id(tl.raw(), idx.0),
+                &encode_wide_sigs(&[sig(fill)]),
+            )
+            .expect("persist sigs");
+        }
+    }
+
+    // Non-target group so both files are scored (not masked to one timeline).
+    let dlg_tl = TimelineId::from_raw(499).unwrap();
+    conv.register_timeline(dlg_tl, dialogue_layer, convo);
+    let target = ProjectionTarget {
+        layer: dialogue_layer,
+        group: convo,
+        timeline: dlg_tl,
+    };
+    let probe = vec![sig(fills[1]), sig(fills[2])];
+
+    let all_scores = |device: Option<&candle::Device>| {
+        let mut scores = ProjectionScores::new();
+        conv.score_belief_groups(
+            &builder.schema().layers[0],
+            target,
+            &probe,
+            &mut scores,
+            false,
+            device,
+        );
+        let mut v = Vec::new();
+        for tl in [file_a, file_b] {
+            for i in 0..3 {
+                v.push(scores.turn(tl, TurnIndex(i)));
+            }
+        }
+        v
+    };
+
+    let cpu = all_scores(None);
+    let gpu1 = all_scores(Some(&device)); // first: builds + caches the gallery
+    let gpu2 = all_scores(Some(&device)); // second: cache hit (same fingerprint)
+
+    // Same normalized scores on the CPU and GPU paths (fast-math ⇒ ~ULP).
+    for (i, (c, g)) in cpu.iter().zip(&gpu1).enumerate() {
+        assert!(
+            (c - g).abs() <= 1e-3 * (1.0 + c.abs().max(g.abs())),
+            "turn {i}: CPU {c} vs GPU {g} exceeds tolerance"
+        );
+    }
+    // The cache-hit scan is bit-identical to the build scan (same gallery).
+    assert_eq!(
+        gpu1, gpu2,
+        "cached-gallery scan must equal the freshly-built scan"
+    );
+    // Sanity: the scored turns aren't all zero (the scan actually ran on GPU).
+    assert!(
+        gpu1.iter().any(|&s| s > 0.0),
+        "GPU scan produced non-zero scores"
+    );
+}
+
 #[test]
 fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,7 +598,13 @@ fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
         group,
         timeline,
     };
-    let candidates =
-        conv.score_belief_groups(&builder.schema().layers[0], target, &[], &mut scores, false);
+    let candidates = conv.score_belief_groups(
+        &builder.schema().layers[0],
+        target,
+        &[],
+        &mut scores,
+        false,
+        None,
+    );
     assert!(candidates.is_empty(), "empty probe → no scan");
 }

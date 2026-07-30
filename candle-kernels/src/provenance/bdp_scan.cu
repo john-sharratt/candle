@@ -36,23 +36,37 @@
 // Query tokens per block tile — the gallery-reuse / ILP factor.
 #define BDP_TQ 8
 
+// Segmented form: the gallery tokens are sorted by SEGMENT (a code-read file /
+// timeline), and each segment owns a contiguous token range AND a contiguous
+// case (exchange) range. The block grid gains a segment dimension (`blockIdx.y`),
+// and each block scans ONLY its segment's tokens — so `case_max`, the agreement
+// mean/std, and the leader/runner-up are all computed WITHIN the segment. That is
+// exactly the belief scan's per-file z / margin, done in one launch. The
+// non-segmented case is just `n_segments == 1` (one segment spanning everything),
+// which reproduces the original global-z behaviour bit-for-bit.
+//
+// The popcount hot loop is UNCHANGED — only the token range, the (segment-local)
+// case index, the z's `n_gal`, and the output index differ.
 extern "C" __global__ void bdp_scan_kernel(
-    const unsigned long long *__restrict__ gallery_words, // GROUP-major: [g][token][gw]
-    const unsigned int *__restrict__ gallery_case,        // n_tokens
+    const unsigned long long *__restrict__ gallery_words, // GROUP-major: [g][token][gw], tokens sorted by segment
+    const unsigned int *__restrict__ gallery_case,        // n_tokens (GLOBAL case id)
     const unsigned long long *__restrict__ probe_words,   // token-major: n_probe_tokens * wpt
-    int n_tokens,
+    const int *__restrict__ seg_tok_start,                // n_segments+1 (token range per segment)
+    const int *__restrict__ seg_case_start,               // n_segments+1 (case range per segment)
     int n_probe_tokens,
     int n_groups,
-    int gw,  // words per layer-group (<= BDP_MAX_GW)
-    int wpt, // words per token (n_groups * gw)
-    int n_cases,
-    int *__restrict__ out_case,   // n_probe_tokens * n_groups
-    float *__restrict__ out_vote) // n_probe_tokens * n_groups
+    int n_segments,
+    int max_seg_cases, // shared-mem case stride (>= every segment's case count)
+    int gw,            // words per layer-group (<= BDP_MAX_GW)
+    int wpt,           // words per token (n_groups * gw)
+    int *__restrict__ out_case,   // n_probe_tokens * n_groups * n_segments
+    float *__restrict__ out_vote) // n_probe_tokens * n_groups * n_segments
 {
     const int tile = blockIdx.x / n_groups;
     const int g = blockIdx.x % n_groups;
+    const int s = blockIdx.y;
     const int q0 = tile * BDP_TQ;
-    if (q0 >= n_probe_tokens) {
+    if (q0 >= n_probe_tokens || s >= n_segments) {
         return;
     }
     int tq = n_probe_tokens - q0;
@@ -60,16 +74,34 @@ extern "C" __global__ void bdp_scan_kernel(
         tq = BDP_TQ;
     }
 
-    // Dynamic shared: per-query-token per-case best agreement — [BDP_TQ][n_cases].
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int tok0 = seg_tok_start[s];
+    const int tok1 = seg_tok_start[s + 1];
+    const int case0 = seg_case_start[s];
+    const int seg_nc = seg_case_start[s + 1] - case0;
+
+    // Output index for this (tile, group, segment): query token i is at
+    // ((q0+i)*n_groups + g)*n_segments + s.
+    // Empty segment ⇒ no vote.
+    if (seg_nc <= 0 || tok1 <= tok0) {
+        for (int i = tid; i < tq; i += nthreads) {
+            const int oi = ((q0 + i) * n_groups + g) * n_segments + s;
+            out_case[oi] = -1;
+            out_vote[oi] = 0.0f;
+        }
+        return;
+    }
+
+    // Dynamic shared: per-query-token per-(segment-local)-case best agreement —
+    // [BDP_TQ][max_seg_cases]. Sized once at launch to the largest segment.
     extern __shared__ unsigned int s_case_max[];
     __shared__ unsigned long long s_sum[BDP_TQ];
     __shared__ unsigned long long s_sumsq[BDP_TQ];
     __shared__ unsigned long long qg[BDP_TQ * BDP_MAX_GW];
 
-    const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
-
-    for (int i = tid; i < tq * n_cases; i += nthreads) {
+    for (int i = tid; i < tq * max_seg_cases; i += nthreads) {
         s_case_max[i] = 0u;
     }
     for (int i = tid; i < tq; i += nthreads) {
@@ -84,7 +116,7 @@ extern "C" __global__ void bdp_scan_kernel(
     }
     __syncthreads();
 
-    const unsigned long long *g_base = gallery_words + (size_t)g * n_tokens * gw;
+    const unsigned long long *g_base = gallery_words + (size_t)g * seg_tok_start[n_segments] * gw;
     unsigned long long lsum[BDP_TQ];
     unsigned long long lsumsq[BDP_TQ];
     for (int i = 0; i < tq; i++) {
@@ -92,7 +124,7 @@ extern "C" __global__ void bdp_scan_kernel(
         lsumsq[i] = 0ull;
     }
 
-    for (int j = tid; j < n_tokens; j += nthreads) {
+    for (int j = tok0 + tid; j < tok1; j += nthreads) {
         // Load the gallery token's group words ONCE, reuse across the tile. The
         // locked 8-word group is two vectorized 32-byte (ulonglong4) loads.
         unsigned long long tw[BDP_MAX_GW];
@@ -111,7 +143,8 @@ extern "C" __global__ void bdp_scan_kernel(
                 }
             }
         }
-        const unsigned int c = gallery_case[j];
+        // Segment-local case index (cases are contiguous per segment).
+        const unsigned int c = gallery_case[j] - (unsigned int)case0;
         // Full unroll over the compile-time tile: keeps `lsum`/`lsumsq`
         // register-resident and issues BDP_TQ independent popcount chains (ILP).
 #pragma unroll
@@ -127,7 +160,7 @@ extern "C" __global__ void bdp_scan_kernel(
                     ag += __popcll(~(qi[k] ^ tw[k]));
                 }
             }
-            atomicMax(&s_case_max[(size_t)i * n_cases + c], ag);
+            atomicMax(&s_case_max[(size_t)i * max_seg_cases + c], ag);
             lsum[i] += ag;
             lsumsq[i] += (unsigned long long)ag * (unsigned long long)ag;
         }
@@ -138,12 +171,13 @@ extern "C" __global__ void bdp_scan_kernel(
     }
     __syncthreads();
 
-    // One thread per query token in the tile: leader/runner-up → z*margin vote.
+    // One thread per query token in the tile: leader/runner-up (WITHIN the
+    // segment) → z*margin vote, z's mean/std over the segment's tokens.
     for (int i = tid; i < tq; i += nthreads) {
-        const unsigned int *cmax = s_case_max + (size_t)i * n_cases;
+        const unsigned int *cmax = s_case_max + (size_t)i * max_seg_cases;
         unsigned int top1 = 0u, top2 = 0u;
         int top1c = -1;
-        for (int c = 0; c < n_cases; c++) {
+        for (int c = 0; c < seg_nc; c++) {
             const unsigned int m = cmax[c];
             if (m > top1) {
                 top2 = top1;
@@ -153,12 +187,12 @@ extern "C" __global__ void bdp_scan_kernel(
                 top2 = m;
             }
         }
-        const int out_idx = (q0 + i) * n_groups + g;
+        const int oi = ((q0 + i) * n_groups + g) * n_segments + s;
         if (top1c < 0) {
-            out_case[out_idx] = -1;
-            out_vote[out_idx] = 0.0f;
+            out_case[oi] = -1;
+            out_vote[oi] = 0.0f;
         } else {
-            const float n_gal = (float)n_tokens;
+            const float n_gal = (float)(tok1 - tok0);
             const float mean = (float)s_sum[i] / n_gal;
             float var = (float)s_sumsq[i] / n_gal - mean * mean;
             if (var < 1e-6f) {
@@ -169,38 +203,43 @@ extern "C" __global__ void bdp_scan_kernel(
                 z = 0.0f;
             }
             const float margin = (float)(top1 - top2);
-            out_case[out_idx] = top1c;
-            out_vote[out_idx] = z * margin;
+            out_case[oi] = case0 + top1c; // GLOBAL case id
+            out_vote[oi] = z * margin;
         }
     }
 }
 
-// Host launcher: one block per (query-token tile, group), `threads` per block,
-// dynamic shared = BDP_TQ * n_cases * sizeof(u32). Launched on the caller's stream.
+// Host launcher: one block per (query-token tile × group, segment), `threads`
+// per block, dynamic shared = BDP_TQ * max_seg_cases * sizeof(u32). Launched on
+// the caller's stream. The non-segmented (global-z) scan is `n_segments == 1`
+// with `seg_tok_start = {0, n_tokens}` and `seg_case_start = {0, n_cases}`.
 extern "C" void run_batched_bdp_scan(
     const unsigned long long *gallery_words,
     const unsigned int *gallery_case,
     const unsigned long long *probe_words,
-    int n_tokens,
+    const int *seg_tok_start,
+    const int *seg_case_start,
     int n_probe_tokens,
     int n_groups,
+    int n_segments,
+    int max_seg_cases,
     int gw,
     int wpt,
-    int n_cases,
     int *out_case,
     float *out_vote,
     void *stream)
 {
-    if (n_probe_tokens <= 0 || n_tokens <= 0 || n_groups <= 0) {
+    if (n_probe_tokens <= 0 || n_groups <= 0 || n_segments <= 0 || max_seg_cases <= 0) {
         return;
     }
     const int n_tiles = (n_probe_tokens + BDP_TQ - 1) / BDP_TQ;
-    const int blocks = n_tiles * n_groups;
+    dim3 blocks(n_tiles * n_groups, n_segments);
     const int threads = 128;
-    const size_t shmem = (size_t)BDP_TQ * n_cases * sizeof(unsigned int);
+    const size_t shmem = (size_t)BDP_TQ * max_seg_cases * sizeof(unsigned int);
     cudaStream_t s = (cudaStream_t)stream;
     bdp_scan_kernel<<<blocks, threads, shmem, s>>>(
         gallery_words, gallery_case, probe_words,
-        n_tokens, n_probe_tokens, n_groups, gw, wpt, n_cases,
+        seg_tok_start, seg_case_start,
+        n_probe_tokens, n_groups, n_segments, max_seg_cases, gw, wpt,
         out_case, out_vote);
 }

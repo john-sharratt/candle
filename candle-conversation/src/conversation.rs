@@ -2100,8 +2100,10 @@ impl Sequence {
         let (scores, _) = self
             .substrate
             // observe = true: the seal scan is the once-per-turn learning
-            // point for the score-normalization hit levels.
-            .score_beliefs(self.projection.schema(), self.target, &probe, true);
+            // point for the score-normalization hit levels. No device here (this
+            // struct holds none) → the CPU per-file scan; the hot reproject path
+            // runs the GPU scan.
+            .score_beliefs(self.projection.schema(), self.target, &probe, true, None);
         scores
     }
 
@@ -3048,9 +3050,13 @@ impl ProbeCtx {
     pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, usize)> {
         let probe = self.probe_wide_q(text)?;
         let query_tokens = probe.len();
-        let (scores, _) =
-            self.substrate
-                .score_beliefs(self.projection.schema(), self.target, &probe, false);
+        let (scores, _) = self.substrate.score_beliefs(
+            self.projection.schema(),
+            self.target,
+            &probe,
+            false,
+            None,
+        );
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let projection = self.projection.project_with_selection(
             self.target,
