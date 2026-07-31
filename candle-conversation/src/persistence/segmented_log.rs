@@ -616,16 +616,19 @@ mod tests {
         p
     }
 
+    // A generic record for exercising cross-segment read routing. Uses `Tokens`
+    // (crc32 over the whole payload) so the raw test payloads need not be valid
+    // `ChunkPayload` encodings, which is what `Chunk` records now verify.
     fn chunk_bytes(stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
         encode_record(
             &RecordHeader {
-                record_type: RecordType::Chunk,
+                record_type: RecordType::Tokens,
                 format: 0,
                 payload_len: payload.len() as u64,
                 crc: 0,
                 stream_id,
                 chunk_index,
-                token_count: 32,
+                token_count: 0,
             },
             payload,
         )

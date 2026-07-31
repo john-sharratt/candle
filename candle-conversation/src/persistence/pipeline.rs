@@ -49,7 +49,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
 use super::cold_load::ColdLoadStager;
 use super::direct_io::DirectFile;
-use super::record::{decode_record, verify_record_crc, ChunkPayload};
+use super::record::{decode_record, ChunkPayload};
 use super::segment::SegmentId;
 use super::SubstratePersistence;
 
@@ -494,16 +494,26 @@ fn allocator_worker(
                 // of re-decoding the header.
                 let (header, payload, _total) = decode_record(record_bytes)
                     .map_err(|e| candle::Error::Msg(format!("pipeline decode_record: {e}")))?;
-                // Bit-rot check at the consumption point: the bytes were
-                // just read off disk and are about to be scattered into
-                // GPU arenas — a corrupt chunk must fail loudly here, not
-                // decode into garbage KV.
-                verify_record_crc(&header, payload)
-                    .map_err(|e| candle::Error::Msg(format!("pipeline chunk CRC: {e}")))?;
                 let header_bytes = payload.as_ptr() as usize - record_bytes.as_ptr() as usize;
                 let payload_buf_offset = rec.buf_offset + header_bytes;
                 let (meta, kv_range) = ChunkPayload::decode_with_kv_range(payload)
                     .map_err(|e| candle::Error::Msg(format!("pipeline payload: {e}")))?;
+                // Read-into-VRAM golden check at the consumption point: the KV
+                // bytes were just read off disk and are about to scatter into GPU
+                // arenas. Recompute the golden and compare to the stored value —
+                // NON-fatal: a mismatch warns (possible on-disk / read-path
+                // corruption) but still loads, so the latency-sensitive cold-load
+                // never hard-fails on it.
+                let recomputed = candle::fletcher::fletcher32(&payload[kv_range.start..kv_range.end]);
+                if recomputed != header.crc {
+                    tracing::warn!(
+                        target: "candle_conversation::persistence::golden",
+                        chunk_idx = rec.chunk_idx,
+                        stored = header.crc,
+                        recomputed,
+                        "chunk golden mismatch on cold-load into VRAM — possible on-disk/read corruption"
+                    );
+                }
                 let src_offset = (payload_buf_offset + kv_range.start) as i64;
 
                 let layer = (rec.chunk_idx as usize) / chunks_per_layer;

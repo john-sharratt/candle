@@ -504,7 +504,7 @@ impl SubstratePersistence {
         if !plan.resident.is_empty() {
             let reemit_floor = self.segments.active_id();
             for r in &plan.resident {
-                self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, &r.payload)?;
+                self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, 0, &r.payload)?;
             }
             self.resident_reemit_floor = Some(reemit_floor);
         }
@@ -597,7 +597,7 @@ impl SubstratePersistence {
             let rec = self
                 .segments
                 .read_record_at(old.segment, old.offset, old.record_size)?;
-            self.append_record(rt, 0, 0, 0, 0, &rec.payload)?;
+            self.append_record(rt, 0, 0, 0, 0, 0, &rec.payload)?;
         }
 
         // Durability barrier: relocated copies are fsynced before any source is
@@ -910,14 +910,14 @@ mod tests {
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             // Seg 1: LIVE + DEAD chunks.
             for i in 0..(LIVE + DEAD) {
-                sp.write_chunk(sid, i, 32, 4, &filled_payload(i as u32, KV_BYTES))
+                sp.write_chunk(sid, i, 32, 4, None, &filled_payload(i as u32, KV_BYTES))
                     .unwrap();
             }
             sp.commit().unwrap();
             sp.seal_active().unwrap(); // seg 1 sealed
                                        // Active (seg 2) supersedes the DEAD half.
             for i in LIVE..(LIVE + DEAD) {
-                sp.write_chunk(sid, i, 32, 4, &filled_payload(i as u32 + 1, KV_BYTES))
+                sp.write_chunk(sid, i, 32, 4, None, &filled_payload(i as u32 + 1, KV_BYTES))
                     .unwrap();
             }
             sp.commit().unwrap();
@@ -990,10 +990,10 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            sp.write_chunk(sid, 0, 32, 4, &chunk_payload(1)).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1)).unwrap();
             sp.commit().unwrap();
             sp.seal_active().unwrap(); // seg 1 sealed, holds chunk-0 v1
-            sp.write_chunk(sid, 0, 32, 4, &chunk_payload(2)).unwrap(); // seg 2 supersedes
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2)).unwrap(); // seg 2 supersedes
             sp.commit().unwrap();
         }
         {
@@ -1109,11 +1109,11 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            sp.write_chunk(sid, 0, 32, 4, &chunk_payload(10)).unwrap(); // seg 1, live
-            sp.write_chunk(sid, 1, 32, 4, &chunk_payload(11)).unwrap(); // seg 1, will be superseded
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10)).unwrap(); // seg 1, live
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(11)).unwrap(); // seg 1, will be superseded
             sp.commit().unwrap();
             sp.seal_active().unwrap();
-            sp.write_chunk(sid, 1, 32, 4, &chunk_payload(12)).unwrap(); // seg 2 supersedes chunk-1
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(12)).unwrap(); // seg 2 supersedes chunk-1
             sp.commit().unwrap();
         }
         {
@@ -1195,7 +1195,7 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.declare_stream(&turn).unwrap();
-            sp.write_chunk(sid, 0, 32, 4, &chunk_payload(1)).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1)).unwrap();
             sp.commit().unwrap();
             sp.seal_active().unwrap(); // seg 1: the tombstoned-to-be turn's decl + chunk
             sp.write_tombstone(tid, None).unwrap(); // marker lands in seg 2 (active)

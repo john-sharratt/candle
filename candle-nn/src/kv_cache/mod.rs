@@ -43,6 +43,8 @@ pub use cache::{Cache, CacheIntegrityResult, KvCache};
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
 #[cfg(feature = "cuda")]
+pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
+#[cfg(feature = "cuda")]
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;

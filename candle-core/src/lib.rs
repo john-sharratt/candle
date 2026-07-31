@@ -64,6 +64,7 @@ mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
+pub mod fletcher;
 #[cfg(feature = "cuda")]
 pub mod gpu_keepalive;
 pub mod gpu_memory;

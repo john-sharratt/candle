@@ -513,15 +513,19 @@ mod tests {
         p
     }
 
+    // A generic metadata record for exercising the read/CRC plumbing. Uses
+    // `Tokens` (crc32 over the whole payload) so the raw test payloads need not
+    // be valid `ChunkPayload` encodings — `Chunk` records verify a golden over
+    // their decoded KV slice instead.
     fn rec(stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
         let header = RecordHeader {
-            record_type: RecordType::Chunk,
+            record_type: RecordType::Tokens,
             format: 0,
             payload_len: payload.len() as u64,
             crc: 0, // overwritten by encode_record
             stream_id,
             chunk_index,
-            token_count: 32,
+            token_count: 0,
         };
         encode_record(&header, payload)
     }
@@ -813,7 +817,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let record = read_record_at(&mut mem, SUPERBLOCK_SIZE, r0.len() as u64).unwrap();
         assert_eq!(record.header.stream_id, 5);
-        assert_eq!(record.header.record_type, RecordType::Chunk);
+        assert_eq!(record.header.record_type, RecordType::Tokens);
         assert_eq!(record.payload, b"alpha");
     }
 
