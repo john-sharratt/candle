@@ -2100,9 +2100,9 @@ impl Sequence {
         let (scores, _) = self
             .substrate
             // observe = true: the seal scan is the once-per-turn learning
-            // point for the score-normalization hit levels. No device here (this
-            // struct holds none) → the CPU per-file scan; the hot reproject path
-            // runs the GPU scan.
+            // point for the score-normalization hit levels. No arena here (the
+            // scheduler owns it) → the CPU per-file scan; the hot reproject path
+            // runs the paged GPU scan over the resident arena.
             .score_beliefs(self.projection.schema(), self.target, &probe, true, None);
         scores
     }

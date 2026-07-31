@@ -33,7 +33,9 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey, NO_THINK_SELECTOR,
 };
-use crate::provenance::{encode_wide_sigs, extract_q_vector_r16, fold_provenance, WideQSig};
+use crate::provenance::{
+    encode_wide_sigs, extract_q_vector_r16, fold_provenance, GalleryArena, WideQSig,
+};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL};
 use crate::substrate::{ResidenceIndex, TurnPartWrite};
@@ -1943,6 +1945,14 @@ pub(crate) struct Scheduler {
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
     device: Device,
+    /// Resident VRAM gallery arena for the paged belief scan (one per device,
+    /// shared across conversations). `None` on non-CUDA devices — the reproject
+    /// then falls back to the CPU per-file scan. See `docs/paged_gallery_arena.md`.
+    gallery_arena: Option<Arc<GalleryArena>>,
+    /// Keeps the gallery arena's VRAM-governor relief registration alive (dropping
+    /// it unregisters). The arena is registered at a cheap relief rung so the
+    /// governor sheds resident galleries before it ever evicts model KV.
+    _gallery_relief: Option<candle::vram::ReliefHandle>,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
     /// Persistent sampling state per sequence ID (survives across turns).
@@ -2275,6 +2285,32 @@ impl Scheduler {
             let _ = d.cuda_context().bind_to_thread();
         }
 
+        // Resident gallery arena for the paged belief scan. Folded-signature
+        // geometry: 12 heads × 2 words (head_dim 128) = wpt 24, 3 layer-groups.
+        // `new` errors (→ None) on a non-CUDA device; it allocates no VRAM until
+        // the first turn is made resident.
+        let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
+        // Register the arena with the VRAM governor at a CHEAP relief rung so the
+        // governor sheds resident galleries before it ever evicts model KV (a
+        // Costly rung). The relief closure evicts LRU turns (skipping the active
+        // scan's pinned working set); dropped pages recycle and rebuild on demand
+        // from the substrate blob, so eviction is lossless. See §9 of the design.
+        let _gallery_relief = gallery_arena.as_ref().and_then(|arena| {
+            let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
+                return None;
+            };
+            candle::vram::get(gpu_id).map(|gov| {
+                let evict = arena.clone();
+                let report = arena.clone();
+                gov.register_relief(
+                    candle::vram::AllocClass::Kv,
+                    candle::vram::Criticality::Cheap,
+                    move |req| candle::vram::ReliefOutcome::new(evict.evict_lru(req.want)),
+                    move || report.resident_bytes(),
+                )
+            })
+        });
+
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
@@ -2288,6 +2324,8 @@ impl Scheduler {
             rx,
             model,
             session,
+            gallery_arena,
+            _gallery_relief,
             tokenizer,
             eos_tokens,
             device,
@@ -6911,18 +6949,19 @@ impl Scheduler {
         let schema = policy.projection.schema();
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
-        // The hot reproject path scans on the GPU (segmented BDP, per-file z) —
-        // one launch for the whole group, numerically equivalent to the CPU
-        // per-file scan up to fast-math ULP / same ranking (see
-        // `examples/gpu_belief_parity.rs`). Seal-time learning still runs CPU
-        // (`last_turn_belief_scores`, device=None), so learned normalization levels
-        // and live GPU scores differ by ~1e-3 — negligible for the 0-1000 bands.
+        // The hot reproject path scans on the GPU (paged segmented BDP over the
+        // resident gallery arena, per-file z) — one launch for the whole group,
+        // numerically equivalent to the CPU per-file scan up to fast-math ULP /
+        // same ranking (see `examples/gpu_belief_parity.rs`). Seal-time learning
+        // still runs CPU (`last_turn_belief_scores`, arena=None), so learned
+        // normalization levels and live GPU scores differ by ~1e-3 — negligible for
+        // the 0-1000 bands.
         let (projection_scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
             policy.target,
             &probe,
             false,
-            Some(&self.device),
+            self.gallery_arena.as_deref(),
         );
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;

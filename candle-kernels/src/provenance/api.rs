@@ -20,6 +20,10 @@ extern "C" {
     /// - `seg_tok_start` / `seg_case_start`: `n_segments+1` prefix boundaries —
     ///   segment `s` owns tokens `[seg_tok_start[s], seg_tok_start[s+1])` and cases
     ///   `[seg_case_start[s], seg_case_start[s+1])`, device ptrs.
+    /// - `page_ptr` / `pos_map`: the PAGED gallery (resident arena). `page_ptr` is
+    ///   `n_pages` absolute device addresses; `pos_map[j] = (page<<5)|in_pg` maps
+    ///   scanned-token `j` to its resident page. Both null ⇒ the CONTIGUOUS layout
+    ///   in `gallery_words` (with `gallery_words` null in the paged case).
     /// - `n_groups` / `gw` / `wpt`: folded-signature geometry (`wpt = n_groups*gw`).
     /// - `max_seg_cases`: the largest segment's case count (shared-mem stride).
     /// - `out_case` / `out_vote`: `n_probe_tokens * n_groups * n_segments` outputs
@@ -32,6 +36,8 @@ extern "C" {
         probe_words: *const u64,
         seg_tok_start: *const i32,
         seg_case_start: *const i32,
+        page_ptr: *const u64,
+        pos_map: *const u32,
         n_probe_tokens: i32,
         n_groups: i32,
         n_segments: i32,

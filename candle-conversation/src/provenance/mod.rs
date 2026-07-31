@@ -22,6 +22,7 @@
 //! ([`belief_step`]) that drives selection — the live sequence is its own probe.
 
 pub mod belief;
+pub mod gallery_arena;
 pub mod gather;
 pub mod gpu;
 pub mod packed;
@@ -31,6 +32,7 @@ pub mod selection;
 pub mod wide_sig;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
+pub use gallery_arena::GalleryArena;
 pub use gather::{belief_step, score_slots, score_slots_weighted, SlotBelief};
 pub use gpu::{score_batched_gpu, BatchedGpuGallery, SegmentInput};
 pub use packed::{score_packed, PackedGallery};

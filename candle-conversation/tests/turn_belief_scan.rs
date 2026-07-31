@@ -539,7 +539,10 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
     };
     let probe = vec![sig(fills[1]), sig(fills[2])];
 
-    let all_scores = |device: Option<&candle::Device>| {
+    // The paged gallery arena (folded geometry: wpt 24, 3 groups).
+    let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
+
+    let all_scores = |arena: Option<&candle_conversation::provenance::GalleryArena>| {
         let mut scores = ProjectionScores::new();
         conv.score_belief_groups(
             &builder.schema().layers[0],
@@ -547,7 +550,7 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
             &probe,
             &mut scores,
             false,
-            device,
+            arena,
         );
         let mut v = Vec::new();
         for tl in [file_a, file_b] {
@@ -559,25 +562,28 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
     };
 
     let cpu = all_scores(None);
-    let gpu1 = all_scores(Some(&device)); // first: builds + caches the gallery
-    let gpu2 = all_scores(Some(&device)); // second: cache hit (same fingerprint)
+    let gpu1 = all_scores(Some(&arena)); // first: makes the turns resident + scans
+    let gpu2 = all_scores(Some(&arena)); // second: all-resident hit (no upload)
 
-    // Same normalized scores on the CPU and GPU paths (fast-math ⇒ ~ULP).
+    // Same normalized scores on the CPU and paged-GPU paths (fast-math ⇒ ~ULP).
     for (i, (c, g)) in cpu.iter().zip(&gpu1).enumerate() {
         assert!(
             (c - g).abs() <= 1e-3 * (1.0 + c.abs().max(g.abs())),
-            "turn {i}: CPU {c} vs GPU {g} exceeds tolerance"
+            "turn {i}: CPU {c} vs paged-GPU {g} exceeds tolerance"
         );
     }
-    // The cache-hit scan is bit-identical to the build scan (same gallery).
+    // The resident-hit scan is bit-identical to the first (same resident pages).
+    assert_eq!(gpu1, gpu2, "resident-hit scan must equal the first scan");
+    // The second scan must not have grown residency (all turns already resident).
     assert_eq!(
-        gpu1, gpu2,
-        "cached-gallery scan must equal the freshly-built scan"
+        arena.resident_turns(),
+        6,
+        "six turns resident, no re-upload"
     );
     // Sanity: the scored turns aren't all zero (the scan actually ran on GPU).
     assert!(
         gpu1.iter().any(|&s| s > 0.0),
-        "GPU scan produced non-zero scores"
+        "paged-GPU scan produced non-zero scores"
     );
 }
 

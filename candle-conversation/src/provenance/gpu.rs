@@ -21,12 +21,12 @@ use candle_kernels::provenance::run_batched_bdp_scan;
 use rayon::prelude::*;
 
 use super::packed::PackedGallery;
-use super::scan::{needle_gate_tally, HEADS_PER_GROUP};
+use super::scan::{HEADS_PER_GROUP, NEEDLE_KEEP_FRAC};
 use super::WideQSig;
 
-/// Query-token tile width — mirrors `BDP_TQ` in `bdp_scan.cu`. The kernel's
+/// Query-token tile width — MUST mirror `BDP_TQ` in `bdp_scan.cu`. The kernel's
 /// dynamic shared memory is `BDP_TQ * max_seg_cases * sizeof(u32)`.
-const BDP_TQ: usize = 8;
+pub(crate) const BDP_TQ: usize = 8;
 
 /// Conservative dynamic-shared-memory ceiling (bytes). Blocks default to 48 KB of
 /// dynamic shared without an opt-in launch attribute; a gallery whose largest
@@ -346,6 +346,8 @@ impl BatchedGpuGallery {
                     p_probe as *const u64,
                     p_seg_tok as *const i32,
                     p_seg_case as *const i32,
+                    std::ptr::null(), // page_ptr — contiguous mode
+                    std::ptr::null(), // pos_map — contiguous mode
                     n_probe_tokens as i32,
                     n_groups as i32,
                     n_segments as i32,
@@ -370,54 +372,105 @@ impl BatchedGpuGallery {
             .memcpy_dtov(&d_out_vote)
             .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: DtoH out_vote: {e}")))?;
 
-        // ── Host per-SEGMENT needle gate + tally, per request ───────────────
-        // Each segment (file) needle-gates its own query tokens (top-25% by their
-        // vote against that segment) and tallies into that segment's cases — the
-        // exact per-file behaviour of the CPU scan. With `n_segments == 1` this is
-        // the original global needle gate.
-        //
-        // Parallel over segments, each writing ONLY its own contiguous case range
-        // `[case0, case0+seg_nc)` (the kernel emits a GLOBAL `case0 + top1c` within
-        // the segment). The ranges partition `0..n_cases`, so the results are
-        // disjoint — a plain scatter, no cross-segment summation, order-independent.
-        // Each segment tallies in its OWN local case space (width `seg_nc`), so the
-        // parallel map never allocates a global-width vector per segment.
-        let mut results = Vec::with_capacity(probes.len());
-        let mut tok_base = 0usize;
-        for &cnt in &per_req_tokens {
-            let base = tok_base;
-            let locals: Vec<(usize, Vec<f32>)> = (0..n_segments)
-                .into_par_iter()
-                .map(|s| {
-                    let case0 = self.seg_case[s] as usize;
-                    let seg_nc = self.seg_case[s + 1] as usize - case0;
-                    let per_query: Vec<Vec<(usize, f32)>> = (0..cnt)
-                        .map(|qt| {
-                            let gqt = base + qt;
-                            (0..n_groups)
-                                .filter_map(|g| {
-                                    let idx = (gqt * n_groups + g) * n_segments + s;
-                                    let c = out_case[idx];
-                                    let w = group_weights.get(g).copied().unwrap_or(1.0);
-                                    // Kernel emits a GLOBAL case in this segment's
-                                    // range → tally in segment-local space.
-                                    (c >= 0).then_some((c as usize - case0, out_vote[idx] * w))
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    (case0, needle_gate_tally(&per_query, seg_nc))
-                })
-                .collect();
-            let mut votes = vec![0f32; n_cases];
-            for (case0, local) in locals {
-                votes[case0..case0 + local.len()].copy_from_slice(&local);
-            }
-            results.push(votes);
-            tok_base += cnt;
-        }
-        Ok(results)
+        // Host per-segment needle gate + tally (shared with the paged path).
+        Ok(needle_tally_segments(
+            &out_case,
+            &out_vote,
+            &per_req_tokens,
+            &self.seg_case,
+            n_groups,
+            n_segments,
+            n_cases,
+            group_weights,
+        ))
     }
+}
+
+/// The host per-SEGMENT needle gate + tally, shared by the contiguous
+/// ([`BatchedGpuGallery::scan_weighted`]) and paged
+/// ([`super::gallery_arena`]) scan paths — so both produce identical votes from
+/// the kernel's `(out_case, out_vote)` output.
+///
+/// Each segment (file) needle-gates its own query tokens (top-25% by vote
+/// magnitude) and tallies into that segment's cases — the exact per-file
+/// behaviour of the CPU scan (`n_segments == 1` reproduces the global gate).
+/// Parallel over segments, each writing ONLY its own contiguous case range
+/// `[case0, case0+seg_nc)` (the kernel emits a GLOBAL `case0 + top1c` within the
+/// segment). The ranges partition `0..n_cases`, so the results are disjoint — a
+/// plain scatter, no cross-segment summation, order-independent and bit-identical
+/// to a serial fold. Each segment tallies in its OWN local case space (width
+/// `seg_nc`). `seg_case` is the `n_segments+1` case-prefix array.
+pub(crate) fn needle_tally_segments(
+    out_case: &[i32],
+    out_vote: &[f32],
+    per_req_tokens: &[usize],
+    seg_case: &[i32],
+    n_groups: usize,
+    n_segments: usize,
+    n_cases: usize,
+    group_weights: &[f32],
+) -> Vec<Vec<f32>> {
+    let mut results = Vec::with_capacity(per_req_tokens.len());
+    let mut tok_base = 0usize;
+    for &cnt in per_req_tokens {
+        let base = tok_base;
+        let locals: Vec<(usize, Vec<f32>)> = (0..n_segments)
+            .into_par_iter()
+            .map(|s| {
+                // Fused, allocation-light form of `needle_gate_tally` over the flat
+                // kernel output — bit-identical (same `qt`-then-`g` accumulation
+                // order), but without the per-query `Vec<Vec<_>>` (was ~200k tiny
+                // allocations per scan, the tally's dominant cost).
+                let case0 = seg_case[s] as usize;
+                let seg_nc = seg_case[s + 1] as usize - case0;
+                let mut local = vec![0f32; seg_nc];
+                if cnt == 0 {
+                    return (case0, local);
+                }
+                let wof = |g: usize| group_weights.get(g).copied().unwrap_or(1.0);
+                // Pass 1: per-query magnitude (sum of weighted votes over groups).
+                let mut mags = vec![0f32; cnt];
+                for (qt, m) in mags.iter_mut().enumerate() {
+                    let gqt = base + qt;
+                    let mut acc = 0f32;
+                    for g in 0..n_groups {
+                        let idx = (gqt * n_groups + g) * n_segments + s;
+                        if out_case[idx] >= 0 {
+                            acc += out_vote[idx] * wof(g);
+                        }
+                    }
+                    *m = acc;
+                }
+                // Needle gate: keep the top NEEDLE_KEEP_FRAC query tokens by magnitude.
+                let keep_n = ((NEEDLE_KEEP_FRAC * cnt as f32).ceil() as usize).clamp(1, cnt);
+                let mut sorted = mags.clone();
+                sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+                let thresh = sorted[keep_n - 1];
+                // Pass 2: tally the kept tokens' votes into this segment's cases.
+                for (qt, &mag) in mags.iter().enumerate() {
+                    if mag < thresh {
+                        continue;
+                    }
+                    let gqt = base + qt;
+                    for g in 0..n_groups {
+                        let idx = (gqt * n_groups + g) * n_segments + s;
+                        let c = out_case[idx];
+                        if c >= 0 {
+                            local[c as usize - case0] += out_vote[idx] * wof(g);
+                        }
+                    }
+                }
+                (case0, local)
+            })
+            .collect();
+        let mut votes = vec![0f32; n_cases];
+        for (case0, local) in locals {
+            votes[case0..case0 + local.len()].copy_from_slice(&local);
+        }
+        results.push(votes);
+        tok_base += cnt;
+    }
+    results
 }
 
 /// Convenience one-shot: stage `gallery` to pinned memory and scan `probes` in a

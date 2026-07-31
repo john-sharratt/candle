@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,9 +18,8 @@ use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::{
-    decode_wide_sigs, score_slots_weighted, BatchedGpuGallery, SegmentInput, WideQSig,
-};
+use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
+use crate::provenance::{decode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig};
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
@@ -31,7 +30,6 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
-use candle::Device;
 use candle_nn::kv_cache::SealedSequence;
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
@@ -122,24 +120,7 @@ pub struct Conversation {
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
     writer: Arc<SubstrateWriter>,
-    /// Resident per-belief-group GPU gallery, keyed by a content fingerprint of
-    /// the group's timelines/windows. Page-locking the full-substrate gallery
-    /// (~250 ms) is the reproject scan's dominant cost, so it is paid once per
-    /// gallery change (a turn seal bumps the fingerprint) and reused across the
-    /// many reprojections within a turn — the "resident RAM mirror" the design
-    /// describes. A fingerprint miss rebuilds, so a stale gallery is never served.
-    /// Shared across clones (the fingerprint keys correctness, not the handle).
-    ///
-    /// Value is a small MRU set (not a single entry): one belief group has two
-    /// legitimate galleries — an append-only ingest scan masked to one timeline vs
-    /// a dialogue scan over all timelines — and keying by `GroupId` alone would
-    /// evict one every time the other ran. See [`GPU_GALLERY_PER_GROUP`].
-    gpu_gallery_cache: Arc<Mutex<HashMap<GroupId, Vec<(u64, Arc<BatchedGpuGallery>)>>>>,
 }
-
-/// Resident GPU galleries retained per belief group (a small MRU set). Two covers
-/// the ingest-masked vs dialogue-full pair; older entries evict on insert.
-const GPU_GALLERY_PER_GROUP: usize = 2;
 
 impl Default for Conversation {
     /// An ephemeral conversation — see [`Conversation::ephemeral`].
@@ -180,7 +161,6 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
             writer,
-            gpu_gallery_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -202,7 +182,6 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(Once::new()),
             writer,
-            gpu_gallery_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -531,7 +510,7 @@ impl Conversation {
         target: ProjectionTarget,
         probe: &[WideQSig],
         observe: bool,
-        device: Option<&Device>,
+        arena: Option<&GalleryArena>,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
         let mut scores = ProjectionScores::new();
         let mut candidates: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
@@ -549,7 +528,7 @@ impl Conversation {
                 probe,
                 &mut scores,
                 observe,
-                device,
+                arena,
             ));
         }
         (scores, candidates)
@@ -638,7 +617,7 @@ impl Conversation {
         probe: &[WideQSig],
         scores: &mut ProjectionScores,
         observe: bool,
-        device: Option<&Device>,
+        arena: Option<&GalleryArena>,
     ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
         use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
@@ -680,6 +659,8 @@ impl Conversation {
                 ex_ranges: Vec<Range<usize>>,
                 n_slots: usize,
                 arcs_kept: Vec<Arc<Vec<WideQSig>>>,
+                // Stream id of each kept arc's turn — the arena residency key.
+                arc_sids: Vec<StreamId>,
                 // (arc index into `arcs_kept`, window start, window end, exchange slot)
                 windows: Vec<(usize, usize, usize, usize)>,
             }
@@ -770,16 +751,19 @@ impl Conversation {
                 // other. Then the L46-weighted vote (§83) decides the exchange. Only the
                 // arcs actually referenced by a window are kept alive.
                 let mut arcs_kept: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+                let mut arc_sids: Vec<StreamId> = Vec::new();
                 let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
                 for (ai, arc) in arcs.iter().enumerate() {
                     let Some(arc) = arc else {
                         continue; // sig-less turn: no window, but keeps its exchange slot
                     };
+                    let sid = turn_stream_id(timeline.raw(), arc_turn[ai].0);
                     let mut ki: Option<usize> = None;
                     for &(s, e) in &arc_bounds[ai] {
                         if e > s {
                             let k = *ki.get_or_insert_with(|| {
                                 arcs_kept.push(arc.clone());
+                                arc_sids.push(sid);
                                 arcs_kept.len() - 1
                             });
                             windows.push((k, s, e, ex_slot[ai]));
@@ -795,6 +779,7 @@ impl Conversation {
                     ex_ranges,
                     n_slots,
                     arcs_kept,
+                    arc_sids,
                     windows,
                 });
             }
@@ -802,103 +787,53 @@ impl Conversation {
                 continue;
             }
 
-            // ── Phase B: score every file. GPU = ONE segmented launch (per-file z /
-            // margin / needle gate, numerically equivalent to the CPU per-file scan
-            // up to fast-math ULP — same ranking); CPU fallback = the identical
-            // `score_slots_weighted` per file. Per-layer-group vote weights come from
-            // the group's `policy.layer_weights` (empty ⇒ uniform — repo_map peaks on
-            // L46 (§83), configured in the schema YAML). ──
+            // ── Phase B: score every file. GPU = ONE paged segmented launch over the
+            // resident gallery arena (per-file z / margin / needle gate, numerically
+            // equivalent to the CPU per-file scan up to fast-math ULP — same ranking);
+            // CPU fallback = the identical `score_slots_weighted` per file. Per-layer-
+            // group vote weights come from the group's `policy.layer_weights` (empty ⇒
+            // uniform — repo_map peaks on L46 (§83), configured in the schema YAML). ──
             let weights = &group.policy.layer_weights;
-            let gpu_scores: Option<Vec<Vec<f32>>> = device.and_then(|dev| {
-                // Content fingerprint of the group's gallery: file order + each file's
-                // exchange count + every window's (sig-arc identity, len, bounds, slot)
-                // AND a content sample (first/last words). The decoded-sig memo serves a
-                // STABLE `Arc` that changes identity only when a turn's blob is rewritten
-                // (and keeps unchanged Arcs alive), so the Arc pointer is a cheap content
-                // key — a seal bumps it, a reprojection against unchanged turns does not.
-                // The word sample is the ABA guard: if an in-place re-seal or a substrate
-                // reset (`sig_cache.clear`) frees an Arc and the allocator hands the new
-                // (different) content the same address with the same window structure,
-                // the sampled words still differ, so the stale gallery is never served.
-                let mut hasher = DefaultHasher::new();
-                for f in &files {
-                    f.timeline.raw().hash(&mut hasher);
-                    f.n_slots.hash(&mut hasher);
-                    for &(k, s, e, slot) in &f.windows {
-                        let win = &f.arcs_kept[k][s..e];
-                        (Arc::as_ptr(&f.arcs_kept[k]) as usize).hash(&mut hasher);
-                        f.arcs_kept[k].len().hash(&mut hasher);
-                        s.hash(&mut hasher);
-                        e.hash(&mut hasher);
-                        slot.hash(&mut hasher);
-                        if let Some(first) = win.first().and_then(|sig| sig.words.first()) {
-                            first.hash(&mut hasher);
-                        }
-                        if let Some(last) = win.last().and_then(|sig| sig.words.last()) {
-                            last.hash(&mut hasher);
-                        }
+            let gpu_scores: Option<Vec<Vec<f32>>> = arena.and_then(|arena| {
+                // Per-turn residency fingerprint: the decoded-sig `Arc` identity + a
+                // content sample (first/last words). The memo serves a STABLE `Arc`
+                // that changes identity only when a turn's blob is rewritten (and keeps
+                // unchanged Arcs alive), so the pointer is a cheap content key — a seal
+                // bumps it, a reprojection against unchanged turns does not. The word
+                // sample is the ABA guard against an in-place re-seal / substrate reset
+                // reusing an address. Keyed per turn, so a seal re-uploads only that
+                // turn's pages; unchanged turns stay resident (no upload).
+                let fp_of = |arc: &Arc<Vec<WideQSig>>| -> u64 {
+                    let mut h = DefaultHasher::new();
+                    (Arc::as_ptr(arc) as usize).hash(&mut h);
+                    arc.len().hash(&mut h);
+                    if let Some(first) = arc.first().and_then(|s| s.words.first()) {
+                        first.hash(&mut h);
                     }
-                }
-                let fp = hasher.finish();
-
-                // Fast path: a fingerprint hit in the group's small MRU set. Lock only
-                // for the lookup + clone, never across a build.
-                let hit = {
-                    let cache = self.gpu_gallery_cache.lock().unwrap();
-                    cache.get(&group.id).and_then(|entries| {
-                        entries
-                            .iter()
-                            .find(|(cfp, _)| *cfp == fp)
-                            .map(|(_, g)| g.clone())
-                    })
+                    if let Some(last) = arc.last().and_then(|s| s.words.last()) {
+                        last.hash(&mut h);
+                    }
+                    h.finish()
                 };
-                let gallery = match hit {
-                    Some(g) => g,
-                    None => {
-                        // Build OUTSIDE the lock — the ~250 ms page-lock must not
-                        // serialize other groups / forks sharing this cache. A rare
-                        // concurrent double-build is harmless (identical gallery).
-                        let segments: Vec<SegmentInput> = files
+                let segments: Vec<PagedSegment> = files
+                    .iter()
+                    .map(|f| PagedSegment {
+                        windows: f
+                            .windows
                             .iter()
-                            .map(|f| SegmentInput {
-                                windows: f
-                                    .windows
-                                    .iter()
-                                    .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
-                                    .collect(),
-                                window_case: f
-                                    .windows
-                                    .iter()
-                                    .map(|&(_, _, _, slot)| slot)
-                                    .collect(),
-                                n_cases: f.n_slots,
+                            .map(|&(k, s, e, slot)| PagedWindow {
+                                sid: f.arc_sids[k],
+                                fingerprint: fp_of(&f.arcs_kept[k]),
+                                turn: f.arcs_kept[k].as_slice(),
+                                start: s,
+                                end: e,
+                                case: slot,
                             })
-                            .collect();
-                        let built = match BatchedGpuGallery::from_segments(&segments) {
-                            Ok(g) => Arc::new(g),
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "provenance",
-                                    "GPU belief gallery build failed, CPU per-file scan: {e}"
-                                );
-                                return None;
-                            }
-                        };
-                        let mut cache = self.gpu_gallery_cache.lock().unwrap();
-                        let entries = cache.entry(group.id).or_default();
-                        // Prefer a peer's gallery if it raced us to the same fingerprint.
-                        if let Some((_, existing)) = entries.iter().find(|(cfp, _)| *cfp == fp) {
-                            existing.clone()
-                        } else {
-                            entries.push((fp, built.clone()));
-                            if entries.len() > GPU_GALLERY_PER_GROUP {
-                                entries.remove(0); // evict oldest
-                            }
-                            built
-                        }
-                    }
-                };
-                match gallery.scan_weighted(dev, &[probe], weights) {
+                            .collect(),
+                        n_cases: f.n_slots,
+                    })
+                    .collect();
+                match arena.scan_weighted(&segments, &[probe], weights) {
                     Ok(mut out) => {
                         // One probe in ⇒ one per-GLOBAL-case vote vector out, in segment
                         // (file) order. Split it back per file by cumulative `n_slots`.
@@ -920,7 +855,7 @@ impl Conversation {
                     Err(e) => {
                         tracing::debug!(
                             target: "provenance",
-                            "GPU belief scan unavailable, using CPU per-file scan: {e}"
+                            "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
                         );
                         None
                     }
