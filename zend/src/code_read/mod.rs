@@ -115,7 +115,11 @@ pub fn code_read_state_from_substrate(engine: &Mutex<ConversationEngine>) -> Cod
 }
 
 /// Max tokens for a scope's decoded two-sentence summary (the response turn).
-const SCOPE_SUMMARY_MAX_TOKENS: usize = 100;
+/// This is a hard `max_tokens` on the decode, so a summary that runs longer is
+/// cut mid-sentence. 100 clipped the longer, enumerated summaries the model
+/// produces for the larger merged/multi-member scopes; 200 gives that headroom to
+/// finish while still bounding the per-scope decode cost.
+const SCOPE_SUMMARY_MAX_TOKENS: usize = 200;
 
 /// Emit one file's scopes into `sink` — each scope as a TOOL ROUND-TRIP of two
 /// coupled turns:

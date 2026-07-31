@@ -2965,6 +2965,9 @@ impl ZendSession {
                         .collect(),
                     conv_count,
                     tokens,
+                    disabled: candle_conversation::projection::layer_toggle::is_layer_disabled(
+                        &l.name,
+                    ),
                 }
             })
             .collect();
@@ -2980,6 +2983,26 @@ impl ZendSession {
             target_layer,
             layers,
         })
+    }
+
+    /// Flip a projection layer's runtime kill switch (in-memory, non-persistent).
+    /// Returns the layer's NEW disabled state, or `None` if `name` isn't a
+    /// declared layer. The exclusion takes effect on the next (re)projection; a
+    /// restart clears every toggle. Diagnostic only — for isolating which layer's
+    /// projected content is breaking coherence.
+    pub fn toggle_projection_layer(&self, name: &str) -> Option<bool> {
+        let known = self
+            .projection_builder
+            .schema()
+            .layers
+            .iter()
+            .any(|l| l.name == name);
+        if !known {
+            return None;
+        }
+        Some(candle_conversation::projection::layer_toggle::toggle_layer(
+            name,
+        ))
     }
 
     /// `GET /v1/substrate/layer/{name}` — the conversations (timelines) that

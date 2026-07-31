@@ -1036,6 +1036,10 @@ pub fn run_with_sink<R: ContentResolver>(
         .filter_map(|(li, layer)| {
             // All groups in lower layers are visible; on the target
             // layer, groups are filtered individually further below.
+            // NOTE: this stays a contiguous prefix (visible index == schema
+            // index) so `li == target_layer_idx` below is correct — the
+            // diagnostic kill switch is applied INSIDE the loop, not here, to
+            // preserve that correspondence.
             if li <= target_layer_idx {
                 Some(layer)
             } else {
@@ -1065,6 +1069,13 @@ pub fn run_with_sink<R: ContentResolver>(
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
+        // Runtime diagnostic kill switch: a non-target layer toggled off
+        // contributes nothing to the assembly (its groups are never scored or
+        // selected). The target layer is never skipped — that would leave the
+        // projection with nothing to emit. See `super::layer_toggle`.
+        if !layer_is_target && super::layer_toggle::is_layer_disabled(&layer.name) {
+            continue;
+        }
         for group in &layer.groups {
             // Masking: for the target layer, only the target group is visible.
             if layer_is_target && group.id != target.group {

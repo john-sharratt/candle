@@ -262,6 +262,17 @@ enum Cmd {
     Summary,
     /// Every record in append order: offset, type, ids, sizes.
     Headers,
+    /// Validate the substrate end-to-end (read-only). Two passes: (1) re-verify
+    /// EVERY record's CRC — catches disk / torn-write corruption; (2) check every
+    /// turn's chunk-count consistency (`layers × chunks_per_layer`) — catches
+    /// partial / interrupted writes. Prints a CLEAN / CORRUPTION verdict and
+    /// exits non-zero if anything failed.
+    Validate {
+        /// Layer count for the chunk-count check — a turn stream stores
+        /// `layers × chunks_per_layer` chunks (the primary model has 48).
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+    },
     /// Per-stream manifest view (turns and prompt sections).
     Streams,
     /// Per-conversation lifecycle, reconstructed the way the substrate does it:
@@ -568,6 +579,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::Headers => headers(&mut log)?,
+        Cmd::Validate { layers } => validate(&mut log, layers)?,
         Cmd::Streams => streams(&mut log)?,
         Cmd::Conversations { filter } => {
             let seg_id = segment_id_of(&log_path);
@@ -3520,6 +3532,96 @@ fn headers(log: &mut LogFile) -> Result<()> {
         );
     }
     println!("\n{} records walked", outcome.records);
+    Ok(())
+}
+
+/// `validate` — substrate integrity check. Read-only, streaming (safe on a
+/// multi-hundred-GB log).
+///
+/// Pass 1 streams every record and CRC-verifies the ones the walker loads by
+/// value — the decls / labels / wide-Q signatures / projection events that
+/// structure the corpus. The bulk `Chunk` / `Tokens` payloads are referenced by
+/// `(offset, len)` and never read here (the walker hands them back EMPTY), so
+/// they are skipped — verifying an empty payload would false-fail every KV
+/// chunk. It also reports a torn tail (framing corruption). Pass 2 rebuilds the
+/// full substrate and re-runs the reload's exact per-turn chunk-count check
+/// (`layers × chunks_per_layer`), catching the partial / interrupted writes that
+/// surface as skipped-corrupt turns on reload. Prints a verdict and exits
+/// non-zero on any failure so it drops into a script / CI check.
+///
+/// The host CRC catches corruption AFTER the DtoH copy (disk, torn writes) but
+/// not kernel-side value corruption baked in before persist. Per-chunk KV
+/// verification against a golden checksum computed on-GPU (which does catch that)
+/// is the follow-on work; this same command verifies it once the golden lands.
+fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
+    use candle_conversation::persistence::record::verify_record_crc;
+    use candle_conversation::persistence::resume::{recover_turn_cold_refs, recovered_turn_decls};
+
+    // ── Pass 1: metadata-record CRC (streaming — no full-log RAM load) ────────
+    let mut crc_ok = 0usize;
+    let mut crc_bad = 0usize;
+    let outcome = walker::walk(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |e| {
+        // Chunk/Tokens payloads are not walked by value — they arrive empty.
+        if e.record.payload.is_empty() {
+            return;
+        }
+        match verify_record_crc(&e.record.header, &e.record.payload) {
+            Ok(()) => crc_ok += 1,
+            Err(err) => {
+                crc_bad += 1;
+                if crc_bad <= 30 {
+                    let h = &e.record.header;
+                    println!(
+                        "  CRC FAIL  off={} type={:?} stream={}: {err}",
+                        e.offset,
+                        h.record_type,
+                        stream_hex(h.stream_id),
+                    );
+                }
+            }
+        }
+    })?;
+    println!("── metadata-record CRC ──");
+    print!("   {crc_ok} verified · {crc_bad} FAILED");
+    if outcome.torn {
+        print!(" · WALK TORN at offset {} (framing corruption)", outcome.tail_offset);
+    }
+    println!();
+
+    // ── Pass 2: per-turn chunk-count consistency (full substrate) ────────────
+    let substrate = build_substrate(log)?;
+    let decls = recovered_turn_decls(&substrate);
+    let mut turns_ok = 0usize;
+    let mut turns_bad = 0usize;
+    for decl in &decls {
+        match recover_turn_cold_refs(&substrate, decl, n_layers) {
+            Ok(_) => turns_ok += 1,
+            Err(err) => {
+                turns_bad += 1;
+                if turns_bad <= 30 {
+                    println!(
+                        "  CHUNK MISMATCH timeline={} turn={}: {err}",
+                        decl.timeline_id, decl.turn_index,
+                    );
+                }
+            }
+        }
+    }
+    println!("── turn chunk counts (×{n_layers} layers, {} turns) ──", decls.len());
+    println!("   {turns_ok} consistent · {turns_bad} corrupt");
+
+    let clean = crc_bad == 0 && turns_bad == 0 && !outcome.torn;
+    println!(
+        "\nsubstrate validation: {}",
+        if clean {
+            "CLEAN"
+        } else {
+            "CORRUPTION DETECTED"
+        }
+    );
+    if !clean {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

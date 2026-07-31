@@ -1,5 +1,12 @@
 use super::*;
 
+/// Max number of LOW-priority (bulk-ingest) decodes allowed to co-batch into a
+/// wave that also carries a HIGH-priority (interactive dialogue) decode. Keeps
+/// the forward small enough that a dialogue token isn't stuck behind dozens of
+/// ingest sequences, while still amortizing per-layer expert loads across a
+/// handful of ingest rows. Deferred ingest decodes run on the next wave.
+const MAX_INGEST_COBATCH_WITH_DIALOGUE: usize = 8;
+
 impl Scheduler {
     /// Emit the steering finish trace: a one-line summary of the path the
     /// stencil walk took (so a malformed tool call is diagnosable — e.g.
@@ -207,13 +214,56 @@ impl Scheduler {
             .iter()
             .map(|p| p.parent_id.0)
             .collect();
-        let seq_ids: Vec<SequenceId> = self
+        let mut seq_ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
             .map(|(&id, _)| id)
             .filter(|id| !glue_pending.contains(&id.0))
             .collect();
+
+        // ── Interactive-decode priority ──────────────────────────────────────
+        // A HIGH-priority (interactive dialogue) decode must not be trapped
+        // behind a large bulk-INGEST co-batch — a single dialogue token stuck in
+        // a 40-sequence forward is what collapses interactive latency. When a
+        // high-priority decode is present this wave, move the high-priority
+        // decodes to the FRONT of the batch and cap how many LOW-priority
+        // (ingest) decodes ride along, so the forward stays small and the
+        // dialogue token lands fast. The deferred ingest decodes are still active
+        // — they simply run on the next wave — so this is pure scheduling, no
+        // correctness impact. `decode_layer_priority` returns `None` for an
+        // unresolvable slot; treat those as `High` (protective) so a real decode
+        // is never wrongly demoted into the ingest cap.
+        if seq_ids.len() > 1 {
+            let prio: std::collections::HashMap<SequenceId, crate::projection::DecodePriority> =
+                seq_ids
+                    .iter()
+                    .map(|&id| {
+                        (
+                            id,
+                            self.decode_layer_priority(id)
+                                .unwrap_or(crate::projection::DecodePriority::High),
+                        )
+                    })
+                    .collect();
+            let has_high = prio
+                .values()
+                .any(|p| *p == crate::projection::DecodePriority::High);
+            if has_high {
+                // High (ratio 64) → Normal (16) → Low (1): dialogue at the front.
+                seq_ids.sort_by_key(|id| std::cmp::Reverse(prio[id].ratio()));
+                let mut low_kept = 0usize;
+                seq_ids.retain(|id| {
+                    if prio[id] == crate::projection::DecodePriority::Low {
+                        low_kept += 1;
+                        low_kept <= MAX_INGEST_COBATCH_WITH_DIALOGUE
+                    } else {
+                        // High/Normal always ride — never capped.
+                        true
+                    }
+                });
+            }
+        }
 
         if seq_ids.is_empty() {
             // Every active decode is deferred-glue-pending, so there is no decode

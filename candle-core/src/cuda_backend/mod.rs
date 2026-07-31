@@ -9,35 +9,76 @@ pub use cudarc;
 // ── Kernel breadcrumb ─────────────────────────────────────────────────────────
 //
 // Written immediately before every kernel FFI call (one thread-local store,
-// ~1 ns).  The panic hook reads it when a CUDA DriverError surfaces — even
-// though CUDA errors are asynchronous, the last breadcrumb on the scheduler
-// thread is almost always the kernel that triggered the fault.
+// ~1 ns) — HOST-SIDE, before the launch, so the kernels themselves are never
+// touched and there is zero kernel-side perf cost.
+//
+// CUDA errors are ASYNCHRONOUS: a faulting kernel surfaces its error at a LATER
+// synchronization point (the next launch's error check, a device sync, a memcpy)
+// — often on a DIFFERENT wrapper, sometimes a different thread. A single
+// "last kernel" slot therefore names the wrong kernel much of the time. We keep
+// a short RING of recent launches per thread instead, so the error hook can dump
+// the recent history and the true culprit is visible even when the point of
+// detection drifts a few launches past the point of fault.
+//
+// For EXACT attribution during a debug session, run with `CUDA_LAUNCH_BLOCKING=1`
+// (driver-level: every launch synchronizes, so the error surfaces AT the faulting
+// launch and breadcrumb #0 is the culprit), and/or `compute-sanitizer` — the
+// kernels are built with `--generate-line-info` (see `candle-kernels/build_utils`),
+// so the sanitizer reports the exact `.cu` file and line of the out-of-bounds
+// access at no runtime cost.
 //
 // Usage: call `cuda_breadcrumb!("run_foo")` at the top of each wrapper that
 // dispatches to a kernel.  The macro captures `file!()` / `line!()` at the
 // actual call site so the recorded location is meaningful.
 
+/// How many recent launches to keep per thread. Small — the fault is nearly
+/// always within the last handful of launches ahead of the detection point.
+const KERNEL_RING_LEN: usize = 16;
+
 thread_local! {
-    static LAST_KERNEL_LAUNCH: std::cell::RefCell<(&'static str, &'static str, u32)> =
-        const { std::cell::RefCell::new(("", "", 0)) };
+    static KERNEL_RING: std::cell::RefCell<[(&'static str, &'static str, u32); KERNEL_RING_LEN]> =
+        const { std::cell::RefCell::new([("", "", 0); KERNEL_RING_LEN]) };
+    /// Index of the NEXT slot to write (ring is `[pos-1, pos-2, …]` newest→oldest).
+    static KERNEL_RING_POS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Set the breadcrumb for the current thread's last kernel launch.
+/// Record a breadcrumb for the current thread's latest kernel launch.
 /// Called via the `cuda_breadcrumb!` macro before each kernel FFI call.
 #[inline(always)]
 pub fn set_kernel_breadcrumb(name: &'static str, file: &'static str, line: u32) {
-    LAST_KERNEL_LAUNCH.with(|k| *k.borrow_mut() = (name, file, line));
+    let pos = KERNEL_RING_POS.with(|p| {
+        let i = p.get();
+        p.set((i + 1) % KERNEL_RING_LEN);
+        i
+    });
+    KERNEL_RING.with(|r| r.borrow_mut()[pos] = (name, file, line));
 }
 
-/// Return a human-readable description of the last kernel launched on this
-/// thread.  Called from the panic hook installed in the binary.
+/// Dump the recent kernel-launch breadcrumbs on this thread, newest first.
+/// Because CUDA errors are asynchronous, the faulting kernel is usually `#0`
+/// but may be a few entries back — the history is what makes that visible.
+/// Read from the panic hook / CUDA error sites when a `DriverError` surfaces.
 pub fn last_cuda_kernel_launch() -> String {
-    LAST_KERNEL_LAUNCH.with(|k| {
-        let (name, file, line) = *k.borrow();
-        if name.is_empty() {
-            "(no kernel recorded on this thread)".to_string()
+    let pos = KERNEL_RING_POS.with(|p| p.get());
+    KERNEL_RING.with(|r| {
+        let ring = r.borrow();
+        let mut out = Vec::new();
+        for k in 0..KERNEL_RING_LEN {
+            let i = (pos + KERNEL_RING_LEN - 1 - k) % KERNEL_RING_LEN;
+            let (name, file, line) = ring[i];
+            if name.is_empty() {
+                continue;
+            }
+            out.push(format!("    #{k} '{name}' ({file}:{line})"));
+        }
+        if out.is_empty() {
+            "(no kernels recorded on this thread)".to_string()
         } else {
-            format!("'{name}' ({file}:{line})")
+            format!(
+                "recent CUDA kernel launches on this thread, newest first — async \
+                 error, fault is usually #0 but can be a few back:\n{}",
+                out.join("\n")
+            )
         }
     })
 }
