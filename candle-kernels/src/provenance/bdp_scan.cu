@@ -11,11 +11,16 @@
 // with a shared gallery and scalar accumulators, and a broadcast-read variant,
 // both measured ~3x slower): a **query-token tile per block** with the tile loop
 // **fully unrolled**, issuing `BDP_TQ` independent popcount chains per gallery
-// token (high ILP). The paged scan is **latency-bound** (Nsight: ~55% memory-pipe,
-// most stalls waiting on shared-memory `qg` reads, DRAM idle), so occupancy — not
-// raw ILP — is the lever: `__launch_bounds__(128, 8)` caps registers to fit 8
-// blocks/SM, which measured faster than the uncapped ~116-register / ~4-block
-// footprint. (Enlarging the tile past 8 spills and regresses.)
+// token (high ILP). The paged scan is **latency-bound** (Nsight: ~63% memory-pipe,
+// ~48% of stalls waiting on the shared-memory `qg` reads, DRAM idle / L2-resident).
+// Two tuned knobs mitigate that: `BDP_GTOK` register-blocks the gallery dimension
+// so each `qg` word is read from shared once and reused across BDP_GTOK tokens,
+// and `__launch_bounds__(128, 6)` trades a little ILP for occupancy. The tuned
+// point is `BDP_TQ=8, BDP_GTOK=2, minBlocks=6`; a sweep found `BDP_GTOK>2` spills
+// registers and `minBlocks=4`/`BDP_TQ=16` regress. The remaining wall is the
+// shared-`qg` broadcast throughput, which further tuning does not crack — a
+// ground-up redesign (query words in registers via warp-shuffle, or a
+// register-tiled binary GEMM) is the path below this.
 //
 // Layout tricks:
 //  * **Group-major** gallery `[group][token][gw]` → consecutive threads read
@@ -36,6 +41,11 @@
 #define BDP_MAX_GW 8
 // Query tokens per block tile — the gallery-reuse / ILP factor.
 #define BDP_TQ 8
+// Gallery tokens processed per thread per iteration (register blocking): each
+// query word `qg[i][k]` is read from shared ONCE and reused across BDP_GTOK
+// gallery tokens, cutting the dominant shared-memory (`qg`) MIO traffic
+// ~BDP_GTOK×. Each thread carries BDP_GTOK tokens' words in registers.
+#define BDP_GTOK 2
 // Tokens per gallery page in the paged path (mirrors the arena's PAGE_TOKENS).
 #define BDP_PAGE_TOKENS 32
 
@@ -60,7 +70,7 @@
 //    that page's absolute device address (the paged-KV `k_ptr` precedent). The
 //    coalesced load is identical — group-major pages keep a group's tokens
 //    contiguous, so only the base address per token differs.
-extern "C" __global__ void __launch_bounds__(128, 8) bdp_scan_kernel(
+extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const unsigned long long *__restrict__ gallery_words, // GROUP-major buffer, or null (paged)
     const unsigned int *__restrict__ gallery_case,        // n_tokens (GLOBAL case id)
     const unsigned long long *__restrict__ probe_words,   // token-major: n_probe_tokens * wpt
@@ -151,34 +161,46 @@ extern "C" __global__ void __launch_bounds__(128, 8) bdp_scan_kernel(
         lsumsq[i] = 0ull;
     }
 
-    for (int j = tok0 + tid; j < tok1; j += nthreads) {
-        // Load the gallery token's group words ONCE, reuse across the tile. The
-        // locked 8-word group is two vectorized 32-byte (ulonglong4) loads.
-        unsigned long long tw[BDP_MAX_GW];
-        const unsigned long long *tok;
-        if (paged) {
-            const unsigned int pm = pos_map[j];
-            tok = (const unsigned long long *)page_ptr[pm >> 5] + group_page_off +
-                  (size_t)(pm & (BDP_PAGE_TOKENS - 1)) * gw;
-        } else {
-            tok = g_base + (size_t)j * gw;
-        }
-        if (gw == BDP_MAX_GW) {
-            const ulonglong4 *t4 = reinterpret_cast<const ulonglong4 *>(tok);
-            const ulonglong4 a = t4[0];
-            const ulonglong4 b = t4[1];
-            tw[0] = a.x; tw[1] = a.y; tw[2] = a.z; tw[3] = a.w;
-            tw[4] = b.x; tw[5] = b.y; tw[6] = b.z; tw[7] = b.w;
-        } else {
+    // Register-blocked over BDP_GTOK gallery tokens per thread: threads still read
+    // consecutive tokens per stripe (coalesced), but each stripe is `nthreads`
+    // apart so a thread carries BDP_GTOK tokens' words at once. The per-query word
+    // `qg[i][k]` is then loaded from shared once and reused across all BDP_GTOK,
+    // which is the whole point (shared-`qg` reads were the dominant stall).
+    for (int j0 = tok0 + tid; j0 < tok1; j0 += nthreads * BDP_GTOK) {
+        unsigned long long tw[BDP_GTOK][BDP_MAX_GW];
+        unsigned int cc[BDP_GTOK];
+        bool ok[BDP_GTOK];
 #pragma unroll
-            for (int k = 0; k < BDP_MAX_GW; k++) {
-                if (k < gw) {
-                    tw[k] = tok[k];
+        for (int b = 0; b < BDP_GTOK; b++) {
+            const int j = j0 + b * nthreads;
+            ok[b] = (j < tok1);
+            if (!ok[b]) {
+                continue;
+            }
+            const unsigned long long *tok;
+            if (paged) {
+                const unsigned int pm = pos_map[j];
+                tok = (const unsigned long long *)page_ptr[pm >> 5] + group_page_off +
+                      (size_t)(pm & (BDP_PAGE_TOKENS - 1)) * gw;
+            } else {
+                tok = g_base + (size_t)j * gw;
+            }
+            if (gw == BDP_MAX_GW) {
+                const ulonglong4 *t4 = reinterpret_cast<const ulonglong4 *>(tok);
+                const ulonglong4 a = t4[0];
+                const ulonglong4 c4 = t4[1];
+                tw[b][0] = a.x; tw[b][1] = a.y; tw[b][2] = a.z; tw[b][3] = a.w;
+                tw[b][4] = c4.x; tw[b][5] = c4.y; tw[b][6] = c4.z; tw[b][7] = c4.w;
+            } else {
+#pragma unroll
+                for (int k = 0; k < BDP_MAX_GW; k++) {
+                    if (k < gw) {
+                        tw[b][k] = tok[k];
+                    }
                 }
             }
+            cc[b] = gallery_case[j] - (unsigned int)case0;
         }
-        // Segment-local case index (cases are contiguous per segment).
-        const unsigned int c = gallery_case[j] - (unsigned int)case0;
         // Full unroll over the compile-time tile: keeps `lsum`/`lsumsq`
         // register-resident and issues BDP_TQ independent popcount chains (ILP).
 #pragma unroll
@@ -187,16 +209,29 @@ extern "C" __global__ void __launch_bounds__(128, 8) bdp_scan_kernel(
                 continue;
             }
             const unsigned long long *qi = qg + (size_t)i * gw;
-            unsigned int ag = 0u;
+            unsigned int ag[BDP_GTOK];
+#pragma unroll
+            for (int b = 0; b < BDP_GTOK; b++) {
+                ag[b] = 0u;
+            }
 #pragma unroll
             for (int k = 0; k < BDP_MAX_GW; k++) {
                 if (k < gw) {
-                    ag += __popcll(~(qi[k] ^ tw[k]));
+                    const unsigned long long qw = qi[k]; // ONE shared read
+#pragma unroll
+                    for (int b = 0; b < BDP_GTOK; b++) {
+                        ag[b] += __popcll(~(qw ^ tw[b][k]));
+                    }
                 }
             }
-            atomicMax(&s_case_max[(size_t)i * max_seg_cases + c], ag);
-            lsum[i] += ag;
-            lsumsq[i] += (unsigned long long)ag * (unsigned long long)ag;
+#pragma unroll
+            for (int b = 0; b < BDP_GTOK; b++) {
+                if (ok[b]) {
+                    atomicMax(&s_case_max[(size_t)i * max_seg_cases + cc[b]], ag[b]);
+                    lsum[i] += ag[b];
+                    lsumsq[i] += (unsigned long long)ag[b] * (unsigned long long)ag[b];
+                }
+            }
         }
     }
     for (int i = 0; i < tq; i++) {
