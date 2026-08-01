@@ -121,10 +121,12 @@ fn scopes_are_isolated() {
 }
 
 #[test]
-fn re_scan_evicts_the_groups_stale_timeline_scope() {
-    // Same group, two timelines (a re-scan). Observing the new timeline drops the
-    // old scope so the cache stays bounded at one scope per active group; a
-    // different group's scope is untouched.
+fn observe_retains_the_groups_sibling_timeline_scopes() {
+    // Same group, two timelines. A belief group like `code_reading` has MANY
+    // simultaneously-active timelines (one per file), each with its own learned
+    // hit levels — observing one timeline must NOT evict the group's others.
+    // (An earlier eviction-on-observe wiped every file's scope but the last,
+    // degenerating normalization to a flat multiple of the raw score.)
     let old = ScopeKey::turn_group(7, 100);
     let new = ScopeKey::turn_group(7, 200);
     let other = ScopeKey::turn_group(9, 100);
@@ -138,12 +140,12 @@ fn re_scan_evicts_the_groups_stale_timeline_scope() {
     cache.observe(&new, &[(c.clone(), 1000.0)]);
     assert!(cache.level_of(&new, &c).is_some());
     assert!(
-        cache.level_of(&old, &c).is_none(),
-        "stale-timeline scope evicted"
+        cache.level_of(&old, &c).is_some(),
+        "sibling-timeline scope must be retained (one scope per active file)"
     );
     assert!(
         cache.level_of(&other, &c).is_some(),
-        "a different group must not be evicted"
+        "a different group's scope must be retained"
     );
 }
 

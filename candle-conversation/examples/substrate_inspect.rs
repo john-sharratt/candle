@@ -1497,7 +1497,10 @@ fn belief_eval(
                 .collect();
             out.push(build_trial(pi, &normed));
             let gt = corpus[pi].1;
-            cache.observe(&scope, &[(ChildKey::named(slot_names[gt].clone()), all_fresh[pi][gt])]);
+            cache.observe(
+                &scope,
+                &[(ChildKey::named(slot_names[gt].clone()), all_fresh[pi][gt])],
+            );
         }
         out
     } else {
@@ -3584,7 +3587,10 @@ fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
     println!("── metadata-record CRC ──");
     print!("   {crc_ok} verified · {crc_bad} FAILED");
     if outcome.torn {
-        print!(" · WALK TORN at offset {} (framing corruption)", outcome.tail_offset);
+        print!(
+            " · WALK TORN at offset {} (framing corruption)",
+            outcome.tail_offset
+        );
     }
     println!();
 
@@ -3607,7 +3613,10 @@ fn validate(log: &mut LogFile, n_layers: usize) -> Result<()> {
             }
         }
     }
-    println!("── turn chunk counts (×{n_layers} layers, {} turns) ──", decls.len());
+    println!(
+        "── turn chunk counts (×{n_layers} layers, {} turns) ──",
+        decls.len()
+    );
     println!("   {turns_ok} consistent · {turns_bad} corrupt");
 
     let clean = crc_bad == 0 && turns_bad == 0 && !outcome.torn;
