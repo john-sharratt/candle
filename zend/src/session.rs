@@ -1221,19 +1221,45 @@ impl InferenceState {
                     ingest_convs.insert(il.name.clone(), IngestConv::Folders { sequence, state });
                 }
                 IngestMode::Files => {
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
-                    let state = crate::code_read::ingest_code_reading(
-                        &engine,
-                        proj_builder_refresh.clone(),
-                        &content_root,
-                        map,
-                        conv_config.clone(),
-                        &progress,
-                        &il.name,
-                        &il.group,
-                    )?;
+                    // Only the FIRST load ingests on the blocking critical path. Once
+                    // the substrate holds an ingest, a restart attaches it as-is and
+                    // defers reconciling files that drifted while the daemon was down
+                    // (new / changed / deleted) to the post-load background refresh —
+                    // so a large workspace no longer re-prefills its way to `ready`.
+                    let prior = crate::code_read::code_read_state_from_substrate(&engine);
+                    let state = if prior.file_hashes.is_empty() {
+                        let map = walk_cache
+                            .entry(il.folder.clone())
+                            .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                        crate::code_read::ingest_code_reading(
+                            &engine,
+                            proj_builder_refresh.clone(),
+                            &content_root,
+                            map,
+                            conv_config.clone(),
+                            &progress,
+                            &il.name,
+                            &il.group,
+                        )?
+                    } else {
+                        // The blocking ingest is skipped, but its per-load layer setup
+                        // must still run: mark the layer append-only (in-memory flag,
+                        // lost on restart) so belief scoring stays self-local and the
+                        // normalization warm-up recognises it as an ingest layer and
+                        // learns each file's hit level. Without this the warm-up skips
+                        // the layer and every query collapses onto the promiscuous
+                        // low-entropy files at an un-normalized (cold) score.
+                        if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
+                            engine.lock().unwrap().mark_layer_append_only(layer_id);
+                        }
+                        tracing::info!(
+                            layer = %il.name,
+                            files = prior.file_hashes.len(),
+                            "code_read: prior ingest present in substrate — skipping the blocking \
+                             load ingest; new/changed/deleted files reconcile in the background",
+                        );
+                        prior
+                    };
                     ingest_convs.insert(il.name.clone(), IngestConv::Files { state });
                 }
                 IngestMode::Raw => {
@@ -2939,6 +2965,9 @@ impl ZendSession {
                         .collect(),
                     conv_count,
                     tokens,
+                    disabled: candle_conversation::projection::layer_toggle::is_layer_disabled(
+                        &l.name,
+                    ),
                 }
             })
             .collect();
@@ -2954,6 +2983,26 @@ impl ZendSession {
             target_layer,
             layers,
         })
+    }
+
+    /// Flip a projection layer's runtime kill switch (in-memory, non-persistent).
+    /// Returns the layer's NEW disabled state, or `None` if `name` isn't a
+    /// declared layer. The exclusion takes effect on the next (re)projection; a
+    /// restart clears every toggle. Diagnostic only — for isolating which layer's
+    /// projected content is breaking coherence.
+    pub fn toggle_projection_layer(&self, name: &str) -> Option<bool> {
+        let known = self
+            .projection_builder
+            .schema()
+            .layers
+            .iter()
+            .any(|l| l.name == name);
+        if !known {
+            return None;
+        }
+        Some(candle_conversation::projection::layer_toggle::toggle_layer(
+            name,
+        ))
     }
 
     /// `GET /v1/substrate/layer/{name}` — the conversations (timelines) that
@@ -3836,6 +3885,39 @@ impl ZendSession {
                             Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
                             Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
                         }
+
+                        // One-shot startup reconcile, in the BACKGROUND. The load path
+                        // only ingests on the very first run (empty substrate); on every
+                        // later start it attaches the substrate as-is, so the files that
+                        // drifted while the daemon was down are caught up HERE — off the
+                        // load critical path, after `ready`, exactly like a watcher burst.
+                        // A no filesystem event fires for down-time edits, so this is what
+                        // covers them.
+                        let state_for_reconcile = Arc::clone(&state);
+                        std::thread::spawn(move || {
+                            match state_for_reconcile.refresh_ingest_layers() {
+                                Ok(true) => tracing::info!(
+                                    "startup background reconcile: ingest layers updated"
+                                ),
+                                Ok(false) => tracing::debug!(
+                                    "startup background reconcile: no ingest-layer changes"
+                                ),
+                                Err(e) => {
+                                    tracing::warn!("startup background reconcile failed: {e:#}")
+                                }
+                            }
+                            // The ingest/reconcile is now DONE (refresh_ingest_layers is
+                            // synchronous), so warm the per-file normalization hit levels
+                            // HERE — off the load path and, crucially, with no concurrent
+                            // ingest writer to starve (running the heavy self-match scan
+                            // during ingest freezes the scheduler). Covers the first-run
+                            // ingest and every restart's reconcile. Grab a cheap
+                            // conversation handle so the ~1-2 min scan never holds the
+                            // engine lock.
+                            let conv = { state_for_reconcile.engine.lock().unwrap().conversation() };
+                            let schema = state_for_reconcile.refresh_builder.schema().clone();
+                            conv.warm_ingest_normalization(&schema);
+                        });
                     }
                     Err(e) => {
                         tracing::error!("inference engine failed to load: {e:#}; exiting");

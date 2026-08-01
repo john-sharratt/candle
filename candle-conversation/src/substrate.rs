@@ -1602,6 +1602,21 @@ impl Substrate {
             .iter()
             .filter_map(|&idx| {
                 let slot = &self.residence[idx.0];
+                // Skip the in-flight decode's pinned working set — the warm→cold
+                // analogue of the hot→warm skip in `snapshot_pending_warm` (the fix
+                // 47a9c5ba applied only to the hot→warm leg). A just-cold-recalled
+                // working set lands warm-resident and would be gathered warm→cold on
+                // the very next pass; that GPU gather runs OUTSIDE the `enter_migrate`
+                // guard and shares the copy stream + the sealed arenas the in-flight
+                // decode is still creeping into (Arc-shared via `inject_arc_sealed`),
+                // so it de-syncs the slot's per-layer fill (layer 0 races a chunk
+                // ahead) and the concurrent reproject's `reserve_glue_gap` trips
+                // "layer gap index diverged". Durability is only deferred: the hot +
+                // warm copies stay resident while pinned, and the next unpinned pass
+                // writes cold.
+                if self.working_set_pins.contains(&idx) {
+                    return None;
+                }
                 // Skip a turn whose cold copy already landed OR whose async cold
                 // write is still queued on the writer — re-selecting the latter
                 // would double-write the same KV.
@@ -2962,6 +2977,15 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
+        // Surface the reason on replay so a reload shows WHY a timeline was
+        // dropped (e.g. a corrupt-partial turn), not just that it vanished.
+        if let Some(reason) = &payload.reason {
+            tracing::debug!(
+                timeline_id = payload.timeline_id,
+                reason = %reason,
+                "replaying tombstone with recorded reason",
+            );
+        }
         self.tombstoned_timelines.insert(timeline);
     }
 
@@ -6544,6 +6568,7 @@ mod tests {
 
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: timeline.raw(),
+            reason: None,
         });
         assert!(sub.is_tombstoned(timeline));
 
@@ -6564,6 +6589,7 @@ mod tests {
         sub.tombstone_timeline(registered);
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: unregistered.raw(),
+            reason: None,
         });
 
         let set = sub.tombstoned_timelines();

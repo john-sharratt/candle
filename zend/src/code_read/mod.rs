@@ -36,13 +36,14 @@ pub mod test_util;
 pub mod types;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem};
+use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use sha2::{Digest, Sha256};
 
@@ -89,8 +90,36 @@ impl CodeReadState {
     }
 }
 
+/// Rebuild the [`CodeReadState`] from what the substrate has ALREADY ingested,
+/// joining each conversation's `path` and `content_sha256` metadata by timeline.
+///
+/// This is the durable record of the last (partial or complete) ingest: on a
+/// restart it lets the load path SKIP re-prefilling files that drifted while the
+/// daemon was down — attaching the substrate's turns as-is so `ready` is reached
+/// fast — and hand the new/changed/deleted reconcile to the background refresh,
+/// which diffs the freshly-walked files against this state off the critical path.
+/// Empty ⇒ nothing ingested yet ⇒ the first load does the full blocking ingest.
+pub fn code_read_state_from_substrate(engine: &Mutex<ConversationEngine>) -> CodeReadState {
+    let eng = engine.lock().unwrap();
+    let hashes: HashMap<TimelineId, String> = eng
+        .conversations_with_metadata_key("content_sha256")
+        .into_iter()
+        .collect();
+    let mut state = CodeReadState::default();
+    for (tl, path) in eng.conversations_with_metadata_key("path") {
+        if let Some(hash) = hashes.get(&tl) {
+            state.file_hashes.insert(path, hash.clone());
+        }
+    }
+    state
+}
+
 /// Max tokens for a scope's decoded two-sentence summary (the response turn).
-const SCOPE_SUMMARY_MAX_TOKENS: usize = 100;
+/// This is a hard `max_tokens` on the decode, so a summary that runs longer is
+/// cut mid-sentence. 100 clipped the longer, enumerated summaries the model
+/// produces for the larger merged/multi-member scopes; 200 gives that headroom to
+/// finish while still bounding the per-scope decode cost.
+const SCOPE_SUMMARY_MAX_TOKENS: usize = 200;
 
 /// Emit one file's scopes into `sink` — each scope as a TOOL ROUND-TRIP of two
 /// coupled turns:
@@ -281,6 +310,11 @@ fn carve_workspace(
                 continue;
             }
         };
+        // Split over-long lines (a minified / one-line file) at safe points so the
+        // line-based carve can chunk it and no turn blows the token budget. Normal
+        // files pass through untouched. The split bytes flow to carve, the resume
+        // hash, AND emit_file_turns so line numbers and shown content stay in sync.
+        let bytes = carve::split_long_lines(&bytes);
         let is_tsx = file.path.ends_with(".tsx");
         let scopes = carve::carve(&bytes, file.language, is_tsx);
         if !scopes.is_empty() {
@@ -468,6 +502,12 @@ pub fn ingest_code_reading(
     let group = proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
+    // Append-only ingest layer (in-memory flag, re-applied every load): scope
+    // summaries score self-local during ingest, and the normalization warm-up
+    // recognises the layer as an ingest layer so it learns each file's hit level
+    // by self-match. Mirrors `ingest_files`; also re-applied on the restart path
+    // that skips this ingest (see `session.rs`).
+    engine.lock().unwrap().mark_layer_append_only(layer);
     let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
     let n_workers = parallelism();
@@ -647,19 +687,34 @@ fn process_one_file(
         return Ok(());
     }
 
-    // Cache miss → new / changed / crashed-partial file. Tombstone any
-    // stale conversation for this path (a prior generation, or a partial
-    // left by a crash before its tag was written), then mint the fresh
-    // conversation. The engine lock covers only these quick ops and is
-    // released before the decode-heavy body below.
-    let mut conv = {
+    // Cache miss → new / changed / crashed-partial file. Reconcile the existing
+    // conversations for this path WITHOUT invalidating good content up front — a
+    // DEFERRED tombstone:
+    //   * a PARTIAL (has `path` but no `content_sha256` — a crashed/failed prior
+    //     attempt) carries nothing to lose, so tombstone it now; and
+    //   * a GOOD generation (has `content_sha256`) is DEFERRED into `superseded`:
+    //     it stays live as the file's fallback content, and its resume hash stays
+    //     in the cache, so a failed re-ingest below (e.g. a VRAM OOM) leaves the
+    //     prior generation intact instead of destroying it. Its tombstone
+    //     ACTIVATES only after this ingest commits its own `content_sha256` (see
+    //     the success path below) — an atomic swap, "stale-but-present" over
+    //     "gone", mirroring the repo_map refresh's keep-old-until-new-ready.
+    // The engine lock covers only these quick ops and is released before the
+    // decode-heavy body below.
+    let (mut conv, superseded) = {
         let e = engine.lock().unwrap();
+        let mut superseded = Vec::new();
         for tl in e.find_conversations_by_metadata("path", &file.path) {
-            if let Err(err) = e.tombstone_timeline(tl) {
+            let is_good = e
+                .conversation_metadata(tl)
+                .is_some_and(|m| m.contains_key("content_sha256"));
+            if is_good {
+                superseded.push(tl);
+            } else if let Err(err) = e.tombstone_timeline(tl) {
                 tracing::warn!(
                     target: "zend::code_read::ingest",
                     file = %file.path,
-                    "tombstone of stale conversation failed: {err:#}",
+                    "tombstone of stale partial conversation failed: {err:#}",
                 );
             }
         }
@@ -677,8 +732,28 @@ fn process_one_file(
         // so the AVL summariser must not also compress these turns into a separate
         // summary tree — disable summarisation for this per-file conversation.
         e.set_timeline_summarize(conv.timeline_id(), false);
-        conv
+        (conv, superseded)
     };
+
+    // Tag the `path` IMMEDIATELY — before the decode-heavy emit below that can
+    // fail (GPU OOM mid-prefill, a decode error). A partial left by such a failure
+    // then still carries its path, so it (a) shows in the substrate as the file it
+    // covers rather than "(untitled)", and (b) is found by the path-invalidation
+    // scan above on the next run, which tombstones it and retries the file. The
+    // resume-cache key (`content_sha256`) is deliberately withheld until success
+    // (below), so a partial is never mistaken for a completed ingest and skipped.
+    {
+        let mut early = std::collections::BTreeMap::new();
+        early.insert("kind".to_string(), "code_read".to_string());
+        early.insert("path".to_string(), file.path.clone());
+        if let Err(e) = conv.set_metadata_many(&early) {
+            tracing::warn!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "failed to tag path metadata at conversation creation: {e:#}",
+            );
+        }
+    }
 
     // Shape the file's turns (per-part prefills + final summary decode),
     // bumping shared progress after each part so the bar moves during the
@@ -725,15 +800,29 @@ fn process_one_file(
             let d = done.fetch_add(missing, Ordering::Relaxed) + missing;
             progress.set_step_progress(d as u64, total as u64);
         }
-        // Prefill/decode failed. Do NOT tag the conversation: leaving it
-        // untagged means the next run misses the resume cache and retries
-        // this file (the stale partial is tombstoned by the path scan
-        // above), rather than caching it as permanently summary-less.
+        // Prefill/decode failed. The deferred tombstone is the safety net here: the
+        // prior good generation in `superseded` was NEVER tombstoned, so it stays
+        // live as the file's content and its resume hash stays in the cache — this
+        // failed attempt invalidates nothing. Drop only THIS attempt's partial
+        // (its sealed-so-far turns are an incomplete file); the retry re-mints
+        // cleanly. `content_sha256` is withheld (never written on the failure
+        // path), so the file still misses the resume cache and is retried.
+        {
+            let e = engine.lock().unwrap();
+            if let Err(err) = e.tombstone_timeline(conv.timeline_id()) {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    "tombstone of failed-attempt partial failed: {err:#}",
+                );
+            }
+        }
         let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             target: "zend::code_read::ingest",
             file = %file.path,
-            "file ingest failed (will retry next run): {e:#}",
+            superseded_kept = superseded.len(),
+            "file ingest failed (will retry next run; prior generation kept live): {e:#}",
         );
         if n > MAX_DECODE_FAILURES {
             return Err(anyhow::anyhow!(
@@ -741,7 +830,7 @@ fn process_one_file(
                  (cap = {MAX_DECODE_FAILURES}); aborting",
             ));
         }
-        return Ok(()); // conv drops → slot freed; no tag written.
+        return Ok(()); // conv drops → slot freed; superseded generation still live.
     }
 
     // Tag the conversation: `content_sha256` is the resume-cache key,
@@ -753,12 +842,36 @@ fn process_one_file(
     tags.insert("lang".to_string(), format!("{:?}", file.language));
     tags.insert("scopes".to_string(), scopes.len().to_string());
     tags.insert("size".to_string(), bytes.len().to_string());
-    if let Err(e) = conv.set_metadata_many(&tags) {
-        tracing::warn!(
-            target: "zend::code_read::ingest",
-            file = %file.path,
-            "failed to tag conversation metadata (resume cache): {e:#}",
-        );
+    let committed = match conv.set_metadata_many(&tags) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "failed to tag conversation metadata (resume cache): {e:#}",
+            );
+            false
+        }
+    };
+
+    // Deferred tombstone ACTIVATES — but ONLY once the new generation is truly
+    // committed (its `content_sha256` landed above). If that tag write failed the
+    // replacement isn't resume-cached, so treat it as not-yet-committed and KEEP
+    // the prior generation live (exactly as the failure path does) rather than
+    // swapping to an untagged replacement. On success the atomic swap completes
+    // here: until this instant a projection saw the prior generation (stale but
+    // present); from here it sees this one.
+    if committed && !superseded.is_empty() {
+        let e = engine.lock().unwrap();
+        for tl in &superseded {
+            if let Err(err) = e.tombstone_timeline(*tl) {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    "deferred tombstone of superseded generation failed: {err:#}",
+                );
+            }
+        }
     }
 
     // The file's conversation is now complete: every scope's tool round-trip is

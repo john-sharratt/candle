@@ -1310,7 +1310,10 @@ impl Scheduler {
     /// Resolve the `decode_priority` of a decode slot's target layer, or `None`
     /// when the slot's target/timeline isn't resolvable (the caller then defaults
     /// to the protective `High`).
-    fn decode_layer_priority(&self, sid: SequenceId) -> Option<crate::projection::DecodePriority> {
+    pub(super) fn decode_layer_priority(
+        &self,
+        sid: SequenceId,
+    ) -> Option<crate::projection::DecodePriority> {
         // A decode runs on a VIEW sequence, but the projection target (which
         // carries the layer's decode_priority) is pinned on the view's PARENT
         // slot. Resolve view → parent first, falling back to the sid itself for a

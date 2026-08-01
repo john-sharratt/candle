@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
@@ -37,6 +38,13 @@ use candle_nn::kv_cache::SealedSequence;
 /// converge in a few dozen steps, so this caps the one-time cost without changing
 /// the warmed levels materially.
 const WARM_REPLAY_MAX_TURNS: usize = 512;
+
+/// Self-probes per ingested timeline (file / cluster) when warming the append-only
+/// belief groups' hit levels from their own turns (see
+/// [`Conversation::warm_normalization_from_substrate`]). The asymmetric EWMA is
+/// ~94% converged after 8 observes and each probe already scores against the whole
+/// timeline, so this bounds the one-time warm cost over a large corpus.
+const WARM_INGEST_PROBES_PER_TIMELINE: usize = 8;
 
 /// Contiguous `[start, end)` sub-window bounds over a `len`-token sig, split at
 /// sorted, deduped `seams`. An empty `seams` yields one window `[0, len)` — the
@@ -103,7 +111,7 @@ pub struct Conversation {
     /// still-warming cache — best-effort by construction, since the levels are
     /// runtime-derived and seal-observe keeps warming them. See
     /// [`Self::ensure_normalization_warm`].
-    normalization_warm: Arc<Once>,
+    normalization_warm: Arc<AtomicBool>,
     /// Cached `(segment_count, last_op)` for the `/v1/status` maintenance
     /// indicator — refreshed by the persistence thread after each maintenance
     /// pass. Read through this **separate** lock so the status endpoint never
@@ -181,7 +189,7 @@ impl Conversation {
             maintenance,
             persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
-            normalization_warm: Arc::new(Once::new()),
+            normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
         }
     }
@@ -202,7 +210,7 @@ impl Conversation {
             maintenance,
             persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
-            normalization_warm: Arc::new(Once::new()),
+            normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
         }
     }
@@ -617,13 +625,36 @@ impl Conversation {
     /// quickly generic candidates get discounted. The handle is all-`Arc`, so the
     /// clone moved into the thread shares the same substrate + normalization cache.
     fn ensure_normalization_warm(&self, schema: &Schema, target: ProjectionTarget) {
-        self.normalization_warm.call_once(|| {
-            let this = self.clone();
-            let schema = schema.clone();
-            std::thread::spawn(move || {
-                this.warm_normalization_from_substrate(&schema, target);
-            });
+        // Never trigger the warm-up from an ingest-time (append-only target) scoring
+        // pass. During corpus load the per-scope ingest reprojections score against an
+        // append-only target; firing the heavy self-match warm-up there launches its
+        // substrate read-lock storm alongside the ingest writer, and on an unfair
+        // reader/writer lock that STARVES the writer — the scheduler stops draining its
+        // backlog and load stalls. A real query projects against a non-append-only
+        // (dialogue) target, by which point the corpus is stable; warm then.
+        if self.inner.read().unwrap().is_append_only_layer(target.layer) {
+            return;
+        }
+        // Fire once, but RE-ARMABLE: `reset_normalization_warm` clears the flag after
+        // an ingest reconcile so the next projection re-learns the newly-ingested
+        // files' hit levels. A plain `Once` would warm only the corpus present at the
+        // first query — files the background reconcile adds afterwards would stay cold
+        // and dominate every query at an un-normalized score.
+        if self.normalization_warm.swap(true, AtomicOrdering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        let schema = schema.clone();
+        std::thread::spawn(move || {
+            this.warm_normalization_from_substrate(&schema, target);
         });
+    }
+
+    /// Re-arm the normalization warm-up (see [`Self::ensure_normalization_warm`]) so
+    /// the next projection re-learns per-file hit levels. Called after an ingest
+    /// reconcile mints fresh file timelines the prior warm never scanned.
+    pub fn reset_normalization_warm(&self) {
+        self.normalization_warm.store(false, AtomicOrdering::SeqCst);
     }
 
     /// The warm-replay body (see [`Self::ensure_normalization_warm`]). Scores the
@@ -663,6 +694,90 @@ impl Conversation {
                 let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true, None);
             }
         }
+
+    }
+
+    /// Warm the append-only INGEST groups' per-file / per-cluster hit levels from
+    /// their OWN persisted turns (self-match). Call this EXPLICITLY after an ingest
+    /// pass or reconcile has finished — NEVER lazily during a live query. The scan
+    /// holds the substrate read lock across a `score_belief_groups` call per
+    /// (file × probe); run CONCURRENTLY with an ingest writer it starves that writer
+    /// on the unfair reader/writer lock and freezes the scheduler (no forwards,
+    /// backlog stuck). Run once the ingest is done the corpus is stable, there is no
+    /// writer to starve, and concurrent live queries (also readers) share the lock
+    /// fine.
+    ///
+    /// Each ingest layer is append-only, so `score_belief_groups` runs self_local: a
+    /// turn scores against its own timeline's exchanges, folding that file's hit
+    /// level under the SAME `scope = turn_group(group, file_timeline)` the live
+    /// cross-file query reads back. Without this every ingested file stays COLD —
+    /// `normalize` degenerates to a flat `scale/prior` multiple of the raw score, and
+    /// a promiscuous low-entropy file (a class/language list whose repetitive tokens
+    /// agree with almost any probe) tops every query.
+    pub fn warm_ingest_normalization(&self, schema: &Schema) {
+        use crate::persistence::content_hash::turn_stream_id;
+        let mut warmed_timelines = 0usize;
+        for layer in &schema.layers {
+            let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
+            if !is_ingest {
+                continue;
+            }
+            for group in &layer.groups {
+                if !group.is_belief_driven() {
+                    continue;
+                }
+                let timelines: Vec<TimelineId> = self
+                    .inner
+                    .read()
+                    .unwrap()
+                    .active_timelines_for_group(group.id)
+                    .collect();
+                for tl in timelines {
+                    // This file's / cluster's own turn signatures. Gathered under a
+                    // short-lived read lock so the per-turn `score_belief_groups`
+                    // calls below (which take the lock themselves) never re-enter it.
+                    let sigs: Vec<Arc<Vec<WideQSig>>> = {
+                        let sub = self.inner.read().unwrap();
+                        let count = sub.turn_count(tl);
+                        (0..count)
+                            .filter_map(|i| sub.decoded_wide_sig(turn_stream_id(tl.raw(), i)))
+                            .collect()
+                    };
+                    let self_target = ProjectionTarget {
+                        layer: layer.id,
+                        group: group.id,
+                        timeline: tl,
+                    };
+                    // A handful of self-probes is enough: the asymmetric EWMA
+                    // (alpha_up 0.30) is ~94% converged after 8 observes, and each
+                    // call already scores against ALL the file's exchanges, so this
+                    // caps the one-time warm cost without materially moving the level.
+                    for sig in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
+                        if sig.is_empty() {
+                            continue;
+                        }
+                        let mut throwaway = ProjectionScores::new();
+                        // CPU fallback (`device: None`): the warm-up runs off the
+                        // reproject hot path and only needs the learned hit level,
+                        // which the CPU and GPU scans agree on up to fast-math ULP.
+                        let _ = self.score_belief_groups(
+                            layer,
+                            self_target,
+                            sig.as_slice(),
+                            &mut throwaway,
+                            true,
+                            None,
+                        );
+                    }
+                    warmed_timelines += 1;
+                }
+            }
+        }
+        tracing::info!(
+            timelines = warmed_timelines,
+            "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
+             (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
+        );
     }
 
     /// Score every belief-driven **turn group** in `layer` against its own turns
@@ -1299,12 +1414,18 @@ impl Conversation {
                     skipped_corrupt += 1;
                     if let Some(timeline) = TimelineId::from_raw(decl.timeline_id) {
                         self.write().tombstone_timeline(timeline);
-                        // Best-effort durable mark — failures here
-                        // just mean the next reload will encounter
-                        // the same turn and skip it again, which is
-                        // still correct, so we don't propagate.
+                        // Durable mark WITH a reason, so the tombstone records WHY
+                        // this timeline was dropped (a corrupt-partial turn), not
+                        // just that it was. The code_read background refresh then
+                        // re-ingests the file: this conversation is now absent from
+                        // the live `content_sha256` set, so `code_read_state_from_substrate`
+                        // omits it, `changed_files` flags it, and `process_one_file`
+                        // rebuilds it. Best-effort — a failure here just means the
+                        // next reload skips the same turn again, still correct.
+                        let reason =
+                            format!("corrupt reload (turn {}): {e}", decl.turn_index);
                         if let Ok(mut p) = self.persistence.lock() {
-                            let _ = p.write_tombstone(timeline.raw());
+                            let _ = p.write_tombstone(timeline.raw(), Some(&reason));
                         }
                     }
                     continue;
@@ -1677,7 +1798,7 @@ impl Conversation {
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
         self.write().tombstone_timeline(timeline);
         let mut p = self.persistence.lock().unwrap();
-        p.write_tombstone(timeline.raw())
+        p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
     }

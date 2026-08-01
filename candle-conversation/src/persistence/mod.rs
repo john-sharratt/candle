@@ -59,8 +59,8 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, verify_record_crc, ChunkPayload, DebugIdPayload, Record,
-    RecordHeader, RecordType, TreeMetadataPayload,
+    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
+    TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -200,6 +200,23 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
+}
+
+/// Read-into-RAM/VRAM golden check (non-fatal). Recompute a chunk's golden over
+/// the KV bytes just read off disk and warn on mismatch — flagging on-disk or
+/// read-path corruption without failing the latency-sensitive load. The
+/// restart/recovery read never reaches here: it reads only metadata records.
+fn warn_on_chunk_golden_mismatch(header: &RecordHeader, payload: &ChunkPayload, chunk_idx: u64) {
+    let recomputed = candle::fletcher::fletcher32(&payload.kv_bytes);
+    if recomputed != header.crc {
+        tracing::warn!(
+            target: "candle_conversation::persistence::golden",
+            chunk_idx,
+            stored = header.crc,
+            recomputed,
+            "chunk golden mismatch on batched read into RAM — possible on-disk/read corruption"
+        );
+    }
 }
 
 /// Dead-byte ratio at which [`SubstratePersistence::should_compact`] fires
@@ -398,17 +415,47 @@ impl SubstratePersistence {
         stream_id: u64,
         chunk_index: u64,
         token_count: u64,
+        golden: u32,
         payload: &[u8],
     ) -> Result<(SegmentId, u64, u64)> {
         let header = RecordHeader {
             record_type,
             format,
             payload_len: payload.len() as u64,
-            crc: 0, // overwritten by encode_record
+            // `Chunk` records store the GPU-computed golden (Fletcher-32 over the
+            // arena bytes, before the DtoH copy) here; `encode_record` keeps it.
+            // Every other type ignores `golden` — `encode_record` fills `crc`
+            // with crc32 over the payload.
+            crc: golden,
             stream_id,
             chunk_index,
             token_count,
         };
+        // Write-boundary validation: recompute the chunk's golden over the host
+        // bytes we are about to write and compare against the golden the seal
+        // computed on the GPU (before the DtoH copy). A mismatch means the copy
+        // or host handling corrupted the KV bytes — a real byte-movement fault.
+        // Log it (a rebuild regenerates the substrate; this proves the pipeline)
+        // and still write what we have.
+        if record_type == RecordType::Chunk && golden != 0 {
+            match crate::persistence::record::recompute_chunk_golden(payload) {
+                Ok(recomputed) if recomputed != golden => tracing::error!(
+                    target: "candle_conversation::persistence::golden",
+                    stream_id,
+                    chunk_index,
+                    golden,
+                    recomputed,
+                    "chunk golden mismatch before write — KV bytes changed between GPU seal and disk (DtoH/host corruption)"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::persistence::golden",
+                    stream_id,
+                    chunk_index,
+                    "chunk payload undecodable before write: {e}"
+                ),
+            }
+        }
         let bytes = encode_record(&header, payload);
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
@@ -482,7 +529,7 @@ impl SubstratePersistence {
             let batch: Vec<IndexEntry> = self.pending_index.drain(..take).collect();
             let payload = encode_index_payload(self.last_index.unwrap_or((0, 0)), &batch);
             let (_seg, offset, size) =
-                self.append_record(RecordType::HeaderIndex, 0, 0, 0, 0, &payload)?;
+                self.append_record(RecordType::HeaderIndex, 0, 0, 0, 0, 0, &payload)?;
             self.last_index = Some((offset, size));
         }
         self.segments.commit()?;
@@ -521,7 +568,7 @@ impl SubstratePersistence {
     /// stream's derived id.
     pub fn declare_stream(&mut self, decl: &StreamDecl) -> Result<StreamId> {
         let id = decl.stream_id();
-        self.append_record(RecordType::StreamDecl, 0, id.0, 0, 0, &decl.encode())?;
+        self.append_record(RecordType::StreamDecl, 0, id.0, 0, 0, 0, &decl.encode())?;
         Ok(id)
     }
 
@@ -549,26 +596,26 @@ impl SubstratePersistence {
 
     /// Append a stream's `Tokens` record.
     pub fn append_tokens(&mut self, stream_id: StreamId, tokens: &[u8]) -> Result<()> {
-        self.append_record(RecordType::Tokens, 0, stream_id.0, 0, 0, tokens)?;
+        self.append_record(RecordType::Tokens, 0, stream_id.0, 0, 0, 0, tokens)?;
         Ok(())
     }
 
     /// Append a turn's `ProjectionEvents` record (opaque JSON payload).
     pub fn append_projection_events(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(RecordType::ProjectionEvents, 0, stream_id.0, 0, 0, payload)?;
+        self.append_record(RecordType::ProjectionEvents, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(())
     }
 
     /// Append a turn's `WideQSig` record (opaque wide-Q window payload), keyed by stream id.
     pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, payload)?;
+        self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(())
     }
 
     /// Append a `Commit` record marking `stream_id` durable through
     /// `through_index`.
     pub fn commit_stream(&mut self, stream_id: StreamId, through_index: u64) -> Result<()> {
-        self.append_record(RecordType::Commit, 0, stream_id.0, through_index, 0, &[])?;
+        self.append_record(RecordType::Commit, 0, stream_id.0, through_index, 0, 0, &[])?;
         Ok(())
     }
 
@@ -601,7 +648,7 @@ impl SubstratePersistence {
         // substrate and passes them through — a partial write would drop
         // the others on reload/compaction.
         let payload = manifest::encode_label_payload(timeline_id, conv_id, label, custom);
-        self.append_record(RecordType::Label, 0, 0, 0, 0, &payload)?;
+        self.append_record(RecordType::Label, 0, 0, 0, 0, 0, &payload)?;
         Ok(())
     }
 
@@ -610,7 +657,7 @@ impl SubstratePersistence {
     /// `write_conv_meta`).
     pub fn write_conv_state(&mut self, timeline_id: u64, state: manifest::ConvState) -> Result<()> {
         let payload = manifest::encode_conv_state_payload(timeline_id, state);
-        self.append_record(RecordType::ConvState, 0, 0, 0, 0, &payload)?;
+        self.append_record(RecordType::ConvState, 0, 0, 0, 0, 0, &payload)?;
         Ok(())
     }
 
@@ -619,7 +666,7 @@ impl SubstratePersistence {
     /// Callers check idempotency against substrate state.
     pub fn write_tree_metadata(&mut self, payload: TreeMetadataPayload) -> Result<()> {
         let bytes = payload.encode();
-        self.append_record(RecordType::TreeMetadata, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::TreeMetadata, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -627,11 +674,16 @@ impl SubstratePersistence {
     /// `timeline_id` as logically deleted.  Walker replay applies it
     /// to the substrate; the compactor drops every record bound to
     /// the timeline on the next compaction pass.  Idempotent —
-    /// duplicate tombstones replay identically.
-    pub fn write_tombstone(&mut self, timeline_id: u64) -> Result<()> {
-        let payload = record::TombstonePayload { timeline_id };
+    /// duplicate tombstones replay identically. `reason` is a diagnostic
+    /// note (e.g. the corrupt-reload detail) recorded in the payload; pass
+    /// `None` for an ordinary deletion.
+    pub fn write_tombstone(&mut self, timeline_id: u64, reason: Option<&str>) -> Result<()> {
+        let payload = record::TombstonePayload {
+            timeline_id,
+            reason: reason.map(str::to_string),
+        };
         let bytes = payload.encode();
-        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -647,7 +699,7 @@ impl SubstratePersistence {
             from_turn,
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -658,7 +710,7 @@ impl SubstratePersistence {
     pub fn write_distill(&mut self, timeline_id: u64, mode: record::DistillMode) -> Result<()> {
         let payload = record::DistillPayload { timeline_id, mode };
         let bytes = payload.encode();
-        self.append_record(RecordType::Distilled, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::Distilled, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -670,7 +722,7 @@ impl SubstratePersistence {
             debug_id: debug_id.to_string(),
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::DebugId, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::DebugId, 0, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -684,14 +736,22 @@ impl SubstratePersistence {
         chunk_index: u64,
         token_count: u64,
         format: u8,
+        golden: Option<u32>,
         payload: &ChunkPayload,
     ) -> Result<u64> {
+        // `Some(g)` is the seal path's GPU-computed golden (Fletcher-32 over the
+        // arena bytes before the DtoH copy). `None` means no precomputed golden
+        // is available, so take it host-side over these bytes now — the same
+        // host-truth the CPU gather path uses.
+        let golden =
+            golden.unwrap_or_else(|| candle::fletcher::fletcher32(&payload.kv_bytes));
         let (_seg, offset, _) = self.append_record(
             RecordType::Chunk,
             format,
             stream_id.0,
             chunk_index,
             token_count,
+            golden,
             &payload.encode(),
         )?;
         Ok(offset)
@@ -900,11 +960,8 @@ impl SubstratePersistence {
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
                     let (header, payload_bytes, _) = decode_record(&buf[start..end])?;
-                    // Bit-rot check at the consumption point (see
-                    // `verify_record_crc`) — corrupt KV must fail
-                    // loudly, not dequantise into garbage.
-                    verify_record_crc(&header, payload_bytes)?;
                     let payload = ChunkPayload::decode(payload_bytes)?;
+                    warn_on_chunk_golden_mismatch(&header, &payload, c.chunk_idx);
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
                 }
@@ -928,8 +985,8 @@ impl SubstratePersistence {
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
                     let (header, payload_bytes, _) = decode_record(&buf[start..end])?;
-                    verify_record_crc(&header, payload_bytes)?;
                     let payload = ChunkPayload::decode(payload_bytes)?;
+                    warn_on_chunk_golden_mismatch(&header, &payload, c.chunk_idx);
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
                 }
@@ -1073,7 +1130,7 @@ impl SubstratePersistence {
         if self.model_spec.as_deref() == Some(spec) {
             return Ok(false);
         }
-        self.append_record(RecordType::ModelSpec, 0, 0, 0, 0, spec)?;
+        self.append_record(RecordType::ModelSpec, 0, 0, 0, 0, 0, spec)?;
         self.model_spec = Some(spec.to_vec());
         Ok(true)
     }
@@ -1084,7 +1141,7 @@ impl SubstratePersistence {
         if self.template.as_deref() == Some(template) {
             return Ok(false);
         }
-        self.append_record(RecordType::Template, 0, 0, 0, 0, template)?;
+        self.append_record(RecordType::Template, 0, 0, 0, 0, 0, template)?;
         self.template = Some(template.to_vec());
         Ok(true)
     }
@@ -1104,7 +1161,7 @@ impl SubstratePersistence {
         if self.tokenizer_sha256 == Some(hash) {
             return Ok(false);
         }
-        self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, tokenizer)?;
+        self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, 0, tokenizer)?;
         self.tokenizer_sha256 = Some(hash);
         Ok(true)
     }
@@ -1646,7 +1703,7 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            sp.write_chunk(sid, 0, 32, 4, &payload).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &payload).unwrap();
             sp.commit().unwrap();
             // After write, repoen so the walker rebuilds substrate.streams.
             drop(sp);
@@ -1666,7 +1723,7 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             for (i, c) in chunks.iter().enumerate() {
-                sp.write_chunk(sid, i as u64, 32, 4, c).unwrap();
+                sp.write_chunk(sid, i as u64, 32, 4, None, c).unwrap();
             }
             sp.commit_stream(sid, 2).unwrap();
             sp.commit().unwrap();
@@ -1685,6 +1742,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The write- and read-side golden checks are non-blocking. A chunk stored
+    /// with a deliberately WRONG golden still writes (`append_record` logs an
+    /// error but proceeds) and still reads back (`read_stream_chunks_batched`'s
+    /// check warns, not errors) — so a bad byte-movement pipeline is flagged in
+    /// the log without ever aborting a write or a load. (The mismatch detection
+    /// itself is unit-tested in `record::tests::recompute_chunk_golden_*`.)
+    #[test]
+    fn wrong_golden_is_nonfatal_on_write_and_read() {
+        let dir = tmp_dir("golden_nonfatal");
+        let sid = StreamId(555);
+        let payload = chunk_payload(9);
+        // Sanity: the bogus golden really doesn't match the KV bytes.
+        assert_ne!(
+            candle::fletcher::fletcher32(&payload.kv_bytes),
+            0xBAD0_C0DE,
+            "test's bogus golden must differ from the true one"
+        );
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            // Some(wrong) forces the stored golden to mismatch the bytes.
+            sp.write_chunk(sid, 0, 32, 4, Some(0xBAD0_C0DE), &payload).unwrap();
+            sp.commit_stream(sid, 0).unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            // Read is non-fatal despite the golden mismatch — payload comes back.
+            let read = sp.read_stream_chunks(&substrate, sid).unwrap();
+            assert_eq!(read.len(), 1);
+            assert_eq!(read[0].1, payload);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// End-to-end index chain: appending past the flush threshold
     /// writes `HeaderIndex` records and publishes the superblock hint;
     /// a reopen recovers through the chain to identical state, seeds
@@ -1699,7 +1792,7 @@ mod tests {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             assert!(sp.last_index().is_none(), "fresh log has no chain");
             for i in 0..n {
-                sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i as u32))
+                sp.write_chunk(sid, i as u64, 32, 4, None, &chunk_payload(i as u32))
                     .unwrap();
             }
             assert!(
@@ -1752,7 +1845,7 @@ mod tests {
         // Write a batch far larger than the target with NO intervening commit.
         let n = 2000u32;
         for i in 0..n {
-            sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i))
+            sp.write_chunk(sid, i as u64, 32, 4, None, &chunk_payload(i))
                 .unwrap();
         }
         // Rotation already fired on the append path — before we ever commit.
@@ -1791,7 +1884,7 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             for i in 0..n {
-                sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i as u32))
+                sp.write_chunk(sid, i as u64, 32, 4, None, &chunk_payload(i as u32))
                     .unwrap();
             }
             sp.commit().unwrap();
@@ -1849,9 +1942,9 @@ mod tests {
             sp.set_model_spec(b"qwen3-235b-live").unwrap();
             sp.set_template(b"the-template").unwrap();
             for seed in [97, 98, 99] {
-                sp.write_chunk(sid, 0, 32, 4, &chunk_payload(seed)).unwrap();
+                sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(seed)).unwrap();
             }
-            sp.write_chunk(sid, 0, 32, 4, &live_chunk).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &live_chunk).unwrap();
             sp.commit_stream(sid, 0).unwrap();
             sp.commit().unwrap();
             // Re-walk so substrate.streams sees the freshly-written
@@ -1918,7 +2011,7 @@ mod tests {
         {
             let mut base =
                 SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
-            base.write_chunk(sid, 0, 32, 4, &payload).unwrap();
+            base.write_chunk(sid, 0, 32, 4, None, &payload).unwrap();
             base.commit().unwrap();
         }
         let child_log = child_dir.join(SUBSTRATE_DIR);

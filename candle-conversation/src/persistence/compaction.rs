@@ -566,6 +566,37 @@ mod tests {
         )
     }
 
+    // A valid `Chunk` record whose KV bytes carry `content`, with the golden set
+    // (Fletcher-32 over the KV bytes) — so `read_record_at`'s chunk verification
+    // passes. Used where a test reads a chunk's payload back; the header-only
+    // liveness tests can keep the opaque `record(RecordType::Chunk, …)`.
+    fn chunk_record(stream_id: u64, chunk_index: u64, content: &[u8]) -> Vec<u8> {
+        use crate::persistence::record::ChunkPayload;
+        let cp = ChunkPayload {
+            offset: 0,
+            k_formats: vec![4],
+            v_formats: vec![5],
+            k_pal: vec![],
+            v_pal: vec![],
+            k_scale: vec![],
+            v_scale: vec![],
+            kv_bytes: content.to_vec(),
+        };
+        let payload = cp.encode();
+        encode_record(
+            &RecordHeader {
+                record_type: RecordType::Chunk,
+                format: 4,
+                payload_len: payload.len() as u64,
+                crc: candle::fletcher::fletcher32(&cp.kv_bytes),
+                stream_id,
+                chunk_index,
+                token_count: 32,
+            },
+            &payload,
+        )
+    }
+
     #[test]
     fn collect_keeps_only_the_live_winners() {
         let mut blob = Vec::new();
@@ -573,8 +604,8 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v1-stale"));
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v2-live"));
         // A stream: a 20-token partial chunk, then the sealed winner.
-        blob.extend_from_slice(&record(RecordType::Chunk, 5, 0, b"partial-20tok-dead"));
-        blob.extend_from_slice(&record(RecordType::Chunk, 5, 0, b"sealed-final-live"));
+        blob.extend_from_slice(&chunk_record(5, 0, b"partial-20tok-dead"));
+        blob.extend_from_slice(&chunk_record(5, 0, b"sealed-final-live"));
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
@@ -601,9 +632,11 @@ mod tests {
             .find(|it| it.header().record_type == RecordType::Chunk)
             .unwrap();
         let (off, size) = raw_loc(chunk);
+        let chunk_rec = read_record_at(&mut mem, off, size).unwrap();
+        let chunk_cp =
+            crate::persistence::record::ChunkPayload::decode(&chunk_rec.payload).unwrap();
         assert_eq!(
-            read_record_at(&mut mem, off, size).unwrap().payload,
-            b"sealed-final-live",
+            chunk_cp.kv_bytes, b"sealed-final-live",
             "the dead partial chunk is dropped"
         );
     }
@@ -729,6 +762,7 @@ mod tests {
             0,
             &TombstonePayload {
                 timeline_id: dead_tl,
+                reason: None,
             }
             .encode(),
         ));

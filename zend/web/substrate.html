@@ -390,6 +390,24 @@ function renderLayers(d){
 }
 function layerCard(l, d){
   const isTarget = l.name===d.target_layer;
+  // Diagnostic kill switch: exclude this layer from projection assembly
+  // (in-memory only, clears on restart). `card` is referenced at click time,
+  // by which point the const below is assigned.
+  const tbtn = h('button',{
+    title:'Toggle this layer in the projection (diagnostic, in-memory — clears on restart)',
+    style:'cursor:pointer;font:inherit;font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid #555;color:#fff;background:'+(l.disabled?'#b04a4a':'#2f6f4f'),
+    onclick: async (e)=>{
+      e.stopPropagation();
+      try{
+        const r = await fetch('/v1/substrate/layer/'+encodeURIComponent(l.name)+'/toggle',{method:'POST'});
+        const j = await r.json();
+        l.disabled = j.disabled;
+        tbtn.style.background = j.disabled ? '#b04a4a' : '#2f6f4f';
+        tbtn.textContent = j.disabled ? 'disabled' : 'enabled';
+        card.style.opacity = j.disabled ? '0.45' : '';
+      }catch(err){ console.error('layer toggle failed', err); }
+    }
+  },[document.createTextNode(l.disabled?'disabled':'enabled')]);
   const head=[
     h('span',{class:'title mono'},[document.createTextNode(l.name)]),
     h('div',{class:'meta'},[
@@ -398,6 +416,7 @@ function layerCard(l, d){
       isTarget?badge('peak','target'):null,
       badge('', 'win '+fmtTok(l.window)),
       badge('', 'pri '+l.priority),
+      tbtn,
     ].filter(Boolean)),
   ];
   const card = group(head, async (body)=>{
@@ -421,6 +440,7 @@ function layerCard(l, d){
     ld.conversations.forEach(c=> listHost.appendChild(convCard(c)));
   });
   if(isTarget) card.style.borderLeftColor='var(--accent)';
+  if(l.disabled) card.style.opacity='0.45';
   return card;
 }
 

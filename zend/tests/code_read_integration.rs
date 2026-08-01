@@ -49,11 +49,19 @@ fn is_call_turn(i: usize) -> bool {
 fn code_read_emits_two_coupled_turns_per_scope() {
     let dir = fixture("per_file_shape");
     let root = dir.path().to_path_buf();
-    write(
-        &root,
-        "src/lib.rs",
-        b"pub fn alpha() {}\npub fn beta() {}\n",
-    );
+    // Two functions each wider than MIN_SCOPE_LINES so the carve's granularity
+    // (refine) pass keeps them as SEPARATE scopes — two tiny adjacent fns would
+    // merge into one chunk. This test is about the per-scope turn SHAPE, so it
+    // needs ≥2 scopes; the fn bodies are just filler to clear the merge floor.
+    let mut src = String::new();
+    for (name, prefix) in [("alpha", 'a'), ("beta", 'b')] {
+        src.push_str(&format!("pub fn {name}() {{\n"));
+        for i in 0..55 {
+            src.push_str(&format!("    let {prefix}{i} = {i};\n"));
+        }
+        src.push_str("}\n");
+    }
+    write(&root, "src/lib.rs", src.as_bytes());
     let map = walk_workspace(&root);
 
     let mut sink = RecordingTurnSink::new();
@@ -62,7 +70,7 @@ fn code_read_emits_two_coupled_turns_per_scope() {
         ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
     assert!(
         n_scopes >= 2,
-        "expected ≥2 scopes (alpha + beta), got {n_scopes}"
+        "expected ≥2 scopes (alpha + beta stay separate above the merge floor), got {n_scopes}"
     );
 
     // Each scope is a tool round-trip = TWO turns (call + response).

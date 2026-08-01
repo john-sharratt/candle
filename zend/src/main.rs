@@ -198,6 +198,40 @@ async fn main() -> anyhow::Result<()> {
         .with(file_layer)
         .init();
 
+    // ── GPU poison watchdog ──────────────────────────────────────────────────
+    //
+    // A sticky CUDA fault (illegal address, launch failure, device assert, ECC)
+    // permanently kills the CUDA context — every later call returns the same
+    // error, it can't be cleared on this context, and recreating it in-process is
+    // unreliable on WDDM. The CUDA backend flags `candle::gpu_poison` on the first
+    // such fault; this watchdog turns that into a clean, fast restart instead of
+    // an endless cascade of identical downstream errors: log the ONE root fault
+    // (with the recent-launch breadcrumb), then exit for a supervisor to relaunch.
+    // The substrate redo log is crash-safe, so nothing durable is lost.
+    //
+    // Exit code 75 (distinct from clean-shutdown 0 and Ctrl-C 130) tells a
+    // relaunch wrapper "GPU died — restart me".
+    const GPU_POISON_EXIT_CODE: i32 = 75;
+    std::thread::Builder::new()
+        .name("gpu-poison-watchdog".into())
+        .spawn(|| loop {
+            // Poll tightly so the window in which other threads can pile identical
+            // downstream errors onto the dead context stays small.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if candle::gpu_poison::is_gpu_poisoned() {
+                tracing::error!(
+                    root = %candle::gpu_poison::root_fault().unwrap_or_default(),
+                    "GPU context poisoned by an unrecoverable CUDA fault — exiting for \
+                     a clean restart (substrate redo log is durable, nothing lost)",
+                );
+                // Brief pause so the root log line reaches the file/console sinks
+                // before the hard exit, then go.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                std::process::exit(GPU_POISON_EXIT_CODE);
+            }
+        })
+        .expect("spawn gpu-poison-watchdog");
+
     let disabled_layers: std::collections::HashSet<String> =
         cli.disable_layer.iter().cloned().collect();
 
@@ -317,7 +351,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("draining complete — flushing substrate…");
     shutdown_session.shutdown().await;
     tracing::info!("zend stopped");
-    Ok(())
+    // Force-exit rather than falling out of `main`. The substrate is already
+    // flushed durably above, so the only work left is process teardown — and the
+    // detached background threads (the scheduler, the GPU/CUDA worker + context,
+    // the persistence pipeline) are not all cleanly joinable, so dropping the tokio
+    // runtime and tearing down the CUDA context otherwise hangs the process until a
+    // manual Ctrl-C. Nothing durable is lost by exiting now.
+    std::process::exit(0)
 }
 
 // ── Shutdown signal ───────────────────────────────────────────────────────────

@@ -1877,6 +1877,17 @@ impl Sequence {
         Ok((new_call.0, new_resp.0))
     }
 
+    /// Tombstone a per-scope fork that will NOT be spliced onto the file
+    /// timeline — its chunk failed before its ordered [`Self::splice_scope_turns`]
+    /// ran, so its round-trip either errored or completed-but-unadopted.
+    /// [`Sequence`]'s `Drop` only frees the scheduler slot; without this the
+    /// fork's registered timeline and any sealed round-trip turns linger in the
+    /// substrate as an orphaned, path-less "(untitled)" scope conversation.
+    /// Mirrors the tombstone `splice_scope_turns` performs after adopting.
+    pub fn tombstone_fork(&self, fork_timeline: TimelineId) {
+        let _ = self.substrate.tombstone_timeline(fork_timeline);
+    }
+
     /// Blocking convenience: submit + wait.
     ///
     /// Automatically records the assistant response, prefills the next

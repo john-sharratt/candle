@@ -256,7 +256,14 @@ pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
          not recognise, not a writable type"
     );
     let mut effective = *header;
-    effective.crc = crc32(payload);
+    // `Chunk` records carry the GPU-computed golden (Fletcher-32 over the arena
+    // bytes, taken before the device→host copy) in `crc`; the caller has already
+    // set it. Recomputing host-side here would checksum the post-copy bytes and
+    // reintroduce the very blind spot the golden exists to close, so leave it be.
+    // Every other record type is host-authored — crc32 over the payload.
+    if header.record_type != RecordType::Chunk {
+        effective.crc = crc32(payload);
+    }
 
     let header_line = serde_json::to_string(&effective)
         .expect("RecordHeader serialization is infallible for the supported field set");
@@ -344,17 +351,28 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordHeader, &[u8], usize)> {
     Ok((header, payload, total))
 }
 
-/// CRC-verify the payload of a record against the header's stored CRC.
+/// CRC-verify the payload of a metadata record against the header's stored CRC.
 ///
 /// Called at every payload **consumption point** — the pipelined
 /// cold-load decode, the batched stream read, and `read_record_at` —
 /// so latent bit rot fails loudly exactly where the bytes are about to
-/// be used, at the cost of one CRC pass over bytes just read from
+/// be used, at the cost of one checksum pass over bytes just read from
 /// disk. `RecordType::Unknown` records are skipped — the payload
 /// format may not be readable in our world view and the walker has
 /// already decided to advance past them.
+///
+/// `Chunk` records are **skipped here**. Their `header.crc` holds the GPU golden
+/// (a Fletcher-32 over the arena bytes taken *before* the device→host copy, see
+/// candle-kernels `simple/fletcher32.cu`), not a crc32 over the payload — so this
+/// crc32 comparison never applies. Chunk integrity is checked against that golden
+/// separately, with the severity each site warrants: a hard error at the write
+/// boundary ([`SubstratePersistence::append_record`]) and a non-fatal warning
+/// when the bytes are read into RAM/VRAM (cold-load / elevation). Keeping chunks
+/// off this path also keeps the restart/recovery read — which only verifies
+/// metadata — from ever putting chunk bytes on the golden path, protecting
+/// restart time.
 pub fn verify_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
-    if header.record_type == RecordType::Unknown {
+    if header.record_type == RecordType::Unknown || header.record_type == RecordType::Chunk {
         return Ok(());
     }
     let computed = crc32(payload);
@@ -365,6 +383,16 @@ pub fn verify_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Recompute a `Chunk` record's golden — Fletcher-32 over the KV-bytes slice of
+/// its payload — to compare against the golden stored in `RecordHeader.crc`
+/// (computed on the GPU at seal, before the DtoH copy). The metadata prefix
+/// (`offset` / formats / palettes / scales) is host-authored and deliberately
+/// not covered. Errors only if `payload` isn't a decodable `ChunkPayload`.
+pub fn recompute_chunk_golden(payload: &[u8]) -> Result<u32> {
+    let (_, kv_range) = ChunkPayload::decode_with_kv_range(payload)?;
+    Ok(candle::fletcher::fletcher32(&payload[kv_range]))
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +821,15 @@ impl DebugIdPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TombstonePayload {
     pub timeline_id: u64,
+    /// Why the timeline was tombstoned, when known — e.g.
+    /// `"corrupt reload (turn N): <detail>"` for a turn dropped during substrate
+    /// reconstruction because its persisted state was inconsistent. Diagnostic
+    /// only: the runtime treats any tombstone as dead regardless. `None` for the
+    /// ordinary deletions (file removed, superseded generation, spliced fork).
+    /// Skipped from the serialized record when `None`, so a reason-less tombstone
+    /// stays byte-identical to the pre-reason format on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl TombstonePayload {
@@ -803,6 +840,52 @@ impl TombstonePayload {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_json::from_slice(buf)
             .map_err(|e| PersistenceError::Corrupt(format!("Tombstone JSON parse: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tombstone_payload_tests {
+    use super::TombstonePayload;
+
+    #[test]
+    fn reasonless_tombstone_is_byte_identical_to_pre_reason_format() {
+        // A None reason must serialise to exactly `{"timeline_id":N}` so existing
+        // on-disk tombstone records (written before the reason field) read back
+        // identically and new reason-less tombstones don't change the byte layout.
+        let p = TombstonePayload {
+            timeline_id: 77,
+            reason: None,
+        };
+        assert_eq!(p.encode(), br#"{"timeline_id":77}"#.to_vec());
+    }
+
+    #[test]
+    fn reason_is_serialised_when_present() {
+        let p = TombstonePayload {
+            timeline_id: 42,
+            reason: Some("corrupt reload (turn 1): chunk mismatch".to_string()),
+        };
+        assert_eq!(
+            p.encode(),
+            br#"{"timeline_id":42,"reason":"corrupt reload (turn 1): chunk mismatch"}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn old_record_without_reason_decodes_to_none() {
+        // A record persisted before the field existed still decodes cleanly.
+        let decoded = TombstonePayload::decode(br#"{"timeline_id":9}"#).unwrap();
+        assert_eq!(decoded.timeline_id, 9);
+        assert_eq!(decoded.reason, None);
+    }
+
+    #[test]
+    fn round_trips_with_reason() {
+        let p = TombstonePayload {
+            timeline_id: 5,
+            reason: Some("corrupt reload".to_string()),
+        };
+        assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
     }
 }
 
@@ -1014,9 +1097,12 @@ mod tests {
         assert_eq!(padded_record_len(100, 100_000), 102_400);
     }
 
+    // A generic record header for the codec / CRC tests. Uses `Tokens` (crc32
+    // over the whole payload) — `Chunk` records store a Fletcher golden instead
+    // and are verified separately, so they are not meaningful for these tests.
     fn sample_header(payload_len: u64, payload: &[u8]) -> RecordHeader {
         RecordHeader {
-            record_type: RecordType::Chunk,
+            record_type: RecordType::Tokens,
             format: 7,
             payload_len,
             crc: crc32(payload),
@@ -1039,7 +1125,7 @@ mod tests {
         let newline_pos = bytes.iter().position(|&b| b == b'\n').unwrap();
         let header_str = std::str::from_utf8(&bytes[..newline_pos]).unwrap();
         let parsed: RecordHeader = serde_json::from_str(header_str).unwrap();
-        assert_eq!(parsed.record_type, RecordType::Chunk);
+        assert_eq!(parsed.record_type, RecordType::Tokens);
         assert_eq!(parsed.format, 7);
         assert_eq!(parsed.payload_len, 4);
         assert_eq!(parsed.stream_id, 0xDEAD_BEEF_0000_0001);
@@ -1178,10 +1264,20 @@ mod tests {
 
     #[test]
     fn flipped_payload_byte_caught_by_verify_record_crc() {
+        // A metadata (non-chunk) record: crc32 over the whole payload catches
+        // any flipped byte.
         let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let mut bytes = encode_record(&sample_header(payload.len() as u64, &payload), &payload);
-        // Flip a byte inside the payload — find it just after the
-        // header newline.
+        let header = RecordHeader {
+            record_type: RecordType::Tokens,
+            format: 0,
+            payload_len: payload.len() as u64,
+            crc: 0, // filled by encode_record
+            stream_id: 1,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let mut bytes = encode_record(&header, &payload);
+        // Flip a byte inside the payload — find it just after the header newline.
         let newline_pos = bytes.iter().position(|&b| b == b'\n').unwrap();
         bytes[newline_pos + 2] ^= 0x01;
         // decode_record itself no longer CRC-verifies; the parse succeeds.
@@ -1191,6 +1287,63 @@ mod tests {
             verify_record_crc(&header, payload_slice),
             Err(PersistenceError::BadChecksum { .. })
         ));
+    }
+
+    #[test]
+    fn recompute_chunk_golden_tracks_kv_not_prefix() {
+        // The golden is Fletcher-32 over the KV bytes only.
+        let cp = ChunkPayload {
+            offset: 3,
+            k_formats: vec![4, 4, 4, 4],
+            v_formats: vec![5, 5, 5, 5],
+            k_pal: vec![0xAA; 3],
+            v_pal: vec![0x55; 3],
+            k_scale: vec![1.0, 2.0],
+            v_scale: vec![3.0],
+            kv_bytes: (0..96u32).map(|i| (i * 7 + 1) as u8).collect(),
+        };
+        let payload = cp.encode();
+        let golden = candle::fletcher::fletcher32(&cp.kv_bytes);
+        assert_eq!(recompute_chunk_golden(&payload).unwrap(), golden);
+
+        // Flipping a KV byte changes the golden (a mismatch would be flagged).
+        let (_, kv_range) = ChunkPayload::decode_with_kv_range(&payload).unwrap();
+        let mut kv_flip = payload.clone();
+        kv_flip[kv_range.start] ^= 0x01;
+        assert_ne!(recompute_chunk_golden(&kv_flip).unwrap(), golden);
+
+        // Flipping the host-authored prefix (the `offset` low byte) leaves the
+        // golden unchanged — it covers only the arena KV bytes.
+        let mut prefix_flip = payload.clone();
+        prefix_flip[0] ^= 0x01;
+        assert_eq!(recompute_chunk_golden(&prefix_flip).unwrap(), golden);
+    }
+
+    #[test]
+    fn verify_record_crc_skips_chunk_records() {
+        // Chunk integrity is the golden's job (checked at write/read), not this
+        // metadata verifier — a chunk with a deliberately wrong crc still passes.
+        let cp = ChunkPayload {
+            offset: 0,
+            k_formats: vec![4],
+            v_formats: vec![5],
+            k_pal: vec![],
+            v_pal: vec![],
+            k_scale: vec![],
+            v_scale: vec![],
+            kv_bytes: vec![1, 2, 3, 4],
+        };
+        let payload = cp.encode();
+        let header = RecordHeader {
+            record_type: RecordType::Chunk,
+            format: 4,
+            payload_len: payload.len() as u64,
+            crc: 0xDEAD_BEEF,
+            stream_id: 1,
+            chunk_index: 0,
+            token_count: 32,
+        };
+        assert!(verify_record_crc(&header, &payload).is_ok());
     }
 
     /// The digest wire tag is the enum discriminant — pinned by raw

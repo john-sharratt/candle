@@ -233,7 +233,8 @@ mod tests {
         let src = "// header\nclass Foo {\n    int x;\n    void run() {}\n};\n";
         let scopes = verify(src, &[("class Foo", "class Foo")]);
         let foo = find_scope(&scopes, "class Foo").unwrap();
-        assert_eq!(foo.start_line, 2);
+        // Leading `// header` comment now attached — scope starts at line 1.
+        assert_eq!(foo.start_line, 1);
         assert!(foo.end_line >= 5);
     }
 

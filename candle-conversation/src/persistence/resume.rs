@@ -35,6 +35,11 @@ use crate::substrate::{StoredChunk, StoredSequence, Substrate};
 pub struct ChunkImage {
     /// Valid token count in this chunk (≤ 32).
     pub token_count: u16,
+    /// The GPU-computed golden — Fletcher-32 over `payload.kv_bytes`, taken on
+    /// the device before the DtoH copy (see candle-kernels `simple/fletcher32.cu`).
+    /// Stored in the `Chunk` record's `crc` field; the reload recomputes it over
+    /// the on-disk KV bytes to catch DtoH- or storage-corrupted values.
+    pub golden: u32,
     /// Per-chunk K/V formats, palettes, scales, and gathered KV bytes.
     pub payload: ChunkPayload,
 }
@@ -206,6 +211,7 @@ pub fn persist_turn_chunks(
                 flat,
                 image.token_count as u64,
                 header_fmt,
+                Some(image.golden),
                 &image.payload,
             )?;
         }
@@ -255,6 +261,7 @@ pub fn persist_turn_chunks_capture(
                 stream_id.0,
                 flat,
                 image.token_count as u64,
+                image.golden,
                 &encoded,
             )?;
             stored.push(StoredChunk {
@@ -405,10 +412,15 @@ pub fn recover_turn_grid(
     let mut flat: Vec<(u64, ChunkImage)> = Vec::with_capacity(chunks_with_payload.len());
     for (idx, payload) in chunks_with_payload {
         let token_count = token_counts.get(&idx).copied().unwrap_or(0) as u16;
+        // The batched read already verified this payload against its stored
+        // golden, so a host recompute over the KV bytes reproduces it — keeping
+        // the `ChunkImage` self-consistent were it ever re-persisted.
+        let golden = candle::fletcher::fletcher32(&payload.kv_bytes);
         flat.push((
             idx,
             ChunkImage {
                 token_count,
+                golden,
                 payload,
             },
         ));
@@ -645,8 +657,10 @@ mod tests {
     }
 
     fn chunk_image(seed: u8, token_count: u16) -> ChunkImage {
+        let kv_bytes: Vec<u8> = (0..64u32).map(|i| (i as u8) ^ seed).collect();
         ChunkImage {
             token_count,
+            golden: candle::fletcher::fletcher32(&kv_bytes),
             payload: ChunkPayload {
                 offset: 0,
                 k_formats: vec![4, 4, 4, 4],
@@ -655,7 +669,7 @@ mod tests {
                 v_pal: vec![seed ^ 0xFF; 3],
                 k_scale: vec![seed as f32, seed as f32 + 0.5],
                 v_scale: vec![seed as f32 - 0.25],
-                kv_bytes: (0..64u32).map(|i| (i as u8) ^ seed).collect(),
+                kv_bytes,
             },
         }
     }

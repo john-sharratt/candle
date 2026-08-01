@@ -19,7 +19,8 @@ mod cuda_impl {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{Device, Result};
     use candle_nn::kv_cache::{
-        kv_migrate, ArenaLocation, ChunkedKvBacking, MigrationPlan, SealedSequence,
+        fletcher32_golden, kv_migrate, ArenaLocation, ChunkedKvBacking, GoldenRecord,
+        MigrationPlan, SealedSequence,
     };
 
     use crate::persistence::cold_load::{ColdLoadStager, PINNED_PREALLOC_BYTES};
@@ -65,6 +66,70 @@ mod cuda_impl {
 
         dev.memcpy_dtov(&staging)
             .map_err(|e| candle::Error::Msg(format!("transfer: staging DtoH: {e}")))
+    }
+
+    /// Gather like [`gather_chunks`], but also compute a Fletcher-32 **golden**
+    /// per output chunk on the GPU — over the staging buffer, *before* the DtoH
+    /// copy. `split_sizes` partitions the gathered blob into the per-`ChunkImage`
+    /// KV spans (each `SealedChunk.byte_size`); their sum must equal the total
+    /// gathered byte count. Returns the host blob and one golden per split, in
+    /// order.
+    ///
+    /// Computing the golden on the device here — not host-side after the copy —
+    /// is the point: it captures the bytes exactly as the GPU produced them, so
+    /// a later CPU recompute over the warm/cold copy (at reload) detects
+    /// corruption introduced by the DtoH copy or on storage.
+    pub fn gather_chunks_with_goldens(
+        device: &Device,
+        chunks: &[(i64, i64)],
+        split_sizes: &[usize],
+    ) -> Result<(Vec<u8>, Vec<u32>)> {
+        let dev = cuda_device(device)?;
+        let total: i64 = chunks.iter().map(|&(_, len)| len).sum();
+        let split_total: usize = split_sizes.iter().sum();
+        if split_total as i64 != total {
+            return Err(candle::Error::Msg(format!(
+                "gather_chunks_with_goldens: splits sum to {split_total}, blob is {total} bytes"
+            )));
+        }
+        if total == 0 {
+            return Ok((Vec::new(), vec![0u32; split_sizes.len()]));
+        }
+
+        let staging = unsafe {
+            dev.alloc::<u8>(total as usize)
+                .map_err(|e| candle::Error::Msg(format!("transfer: staging alloc: {e}")))?
+        };
+        let staging_base = {
+            let stream = dev.cuda_stream();
+            let base = staging.device_ptr(&stream).0 as i64;
+            base
+        };
+
+        let mut plan = MigrationPlan::new();
+        let mut offset = 0i64;
+        for &(ptr, len) in chunks {
+            plan.push(ptr, staging_base + offset, len);
+            offset += len;
+        }
+        kv_migrate(device, &plan)?;
+
+        // Golden per output chunk, over the staging buffer, before the DtoH copy.
+        let mut records = Vec::with_capacity(split_sizes.len());
+        let mut goff = 0i64;
+        for &n in split_sizes {
+            records.push(GoldenRecord {
+                src_ptr: staging_base + goff,
+                byte_len: n as i64,
+            });
+            goff += n as i64;
+        }
+        let goldens = fletcher32_golden(device, &records)?;
+
+        let blob = dev
+            .memcpy_dtov(&staging)
+            .map_err(|e| candle::Error::Msg(format!("transfer: staging DtoH: {e}")))?;
+        Ok((blob, goldens))
     }
 
     /// Scatter a contiguous host buffer back into scattered VRAM `chunks`.
@@ -130,10 +195,14 @@ mod cuda_impl {
         use crate::persistence::record::ChunkPayload;
 
         let ptrs = backing.resolve_sealed_chunk_ptrs(&seq.chunks)?;
-        let blob = gather_chunks(device, &ptrs)?;
+        let split_sizes: Vec<usize> = seq.chunks.iter().map(|sc| sc.byte_size as usize).collect();
+        // Golden computed on-GPU over the staging buffer before the DtoH copy —
+        // `goldens[i]` is the Fletcher-32 of chunk `i`'s KV bytes as the device
+        // produced them, the ground truth the reload verifies the on-disk copy against.
+        let (blob, goldens) = gather_chunks_with_goldens(device, &ptrs, &split_sizes)?;
         let mut cursor = 0usize;
         let mut images = Vec::with_capacity(seq.chunks.len());
-        for sc in &seq.chunks {
+        for (i, sc) in seq.chunks.iter().enumerate() {
             let n = sc.byte_size as usize;
             if cursor + n > blob.len() {
                 return Err(candle::Error::Msg(format!(
@@ -146,6 +215,7 @@ mod cuda_impl {
             let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
+                golden: goldens[i],
                 payload: ChunkPayload {
                     offset: sc.offset,
                     k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
@@ -218,9 +288,14 @@ mod cuda_impl {
             }
             let kv_bytes = blob[cursor..cursor + n].to_vec();
             cursor += n;
+            // The CPU gather reads the arena bytes directly host-side (no GPU
+            // round trip), so a host-side Fletcher is itself the ground truth —
+            // there is no DtoH copy between the read and this checksum.
+            let golden = candle::fletcher::fletcher32(&kv_bytes);
             let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
+                golden,
                 payload: ChunkPayload {
                     offset: sc.offset,
                     k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
@@ -1108,6 +1183,47 @@ mod cuda_impl {
             for (i, c) in chunks.iter().enumerate() {
                 let back = dev.memcpy_dtov(&dst_gpus[i]).unwrap();
                 assert_eq!(&back, c, "chunk {i} round-trips byte-identical");
+            }
+        }
+
+        /// The GPU golden path: gather scattered VRAM chunks and compute a
+        /// Fletcher-32 per output chunk on the device, then check each against
+        /// the CPU reference over the same bytes. Covers even/odd lengths.
+        #[test]
+        fn gather_with_goldens_matches_cpu_fletcher() {
+            let device = match candle::Device::cuda_if_available(0) {
+                Ok(d @ candle::Device::Cuda(_)) => d,
+                _ => return, // no GPU — skip
+            };
+            let dev = cuda_device(&device).unwrap();
+
+            let chunks: Vec<Vec<u8>> = vec![
+                (0..320u32).map(|i| (i % 256) as u8).collect(),
+                (0..513u32).map(|i| ((i * 5 + 7) % 256) as u8).collect(), // odd length
+                (0..208u32).map(|i| ((i * 11 + 2) % 256) as u8).collect(),
+            ];
+            let src_gpus: Vec<_> = chunks.iter().map(|c| dev.memcpy_stod(c).unwrap()).collect();
+            let src_ptrs: Vec<(i64, i64)> = {
+                let stream = dev.cuda_stream();
+                src_gpus
+                    .iter()
+                    .zip(&chunks)
+                    .map(|(g, c)| (g.device_ptr(&stream).0 as i64, c.len() as i64))
+                    .collect()
+            };
+            let split: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+
+            let (blob, goldens) =
+                gather_chunks_with_goldens(&device, &src_ptrs, &split).unwrap();
+            let concatenated: Vec<u8> = chunks.iter().flatten().copied().collect();
+            assert_eq!(blob, concatenated, "gather concatenates the chunks");
+            assert_eq!(goldens.len(), chunks.len());
+            for (i, c) in chunks.iter().enumerate() {
+                assert_eq!(
+                    goldens[i],
+                    candle::fletcher::fletcher32(c),
+                    "chunk {i} GPU golden != CPU reference"
+                );
             }
         }
 

@@ -35,6 +35,7 @@ mod gpu_chunks;
 mod head_gids;
 mod io;
 mod meta_pool;
+pub mod fletcher_golden;
 pub mod migrate;
 pub mod migrate_guard;
 pub mod sampled_selection;

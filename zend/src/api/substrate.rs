@@ -62,6 +62,26 @@ pub async fn layer(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `POST /v1/substrate/layer/:name/toggle` — flip a layer's runtime projection
+/// kill switch (in-memory, non-persistent). Excluding a populated layer from
+/// assembly lets you A/B whether it's the source of an incoherent response.
+pub async fn toggle_layer(
+    State(session): State<Arc<ZendSession>>,
+    Path(name): Path<String>,
+) -> Result<Json<LayerToggleResult>, StatusCode> {
+    session
+        .toggle_projection_layer(&name)
+        .map(|disabled| Json(LayerToggleResult { name, disabled }))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Serialize)]
+pub struct LayerToggleResult {
+    pub name: String,
+    /// The layer's new state after the flip (`true` = now excluded).
+    pub disabled: bool,
+}
+
 pub async fn project(
     State(session): State<Arc<ZendSession>>,
     Json(req): Json<ProjectReq>,
@@ -152,6 +172,9 @@ pub struct LayerView {
     pub conv_count: usize,
     /// Total sealed tokens across every conversation in this layer.
     pub tokens: usize,
+    /// Runtime projection kill switch: `true` while this layer is toggled OFF
+    /// (excluded from projection assembly). In-memory only — clears on restart.
+    pub disabled: bool,
 }
 
 #[derive(Serialize)]

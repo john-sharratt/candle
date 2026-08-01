@@ -37,6 +37,10 @@ fn cluster_tags(cluster: &Cluster) -> Vec<String> {
     vec!["repo_map".to_string(), root]
 }
 
+/// Sidebar/substrate-viewer label for the repo_map timeline — it has no conv_id
+/// or `path` metadata, so this is what keeps it from rendering as "(untitled)".
+const REPO_MAP_LABEL: &str = "repo overview";
+
 /// Text marker inserted at each sub-window seam of a cluster listing. Stripped
 /// before prefill (pure text op in `insert_turn_staged_windowed`), so its exact
 /// value only needs to never occur naturally in a file listing.
@@ -292,7 +296,7 @@ pub fn ingest_repo_map(
     // consumers keep running for the duration of the scan.
     let mut sequence = {
         let engine = engine.lock().unwrap();
-        engine
+        let seq = engine
             .new_conversation_with_projection(
                 &system_prompt,
                 proj_builder,
@@ -300,7 +304,14 @@ pub fn ingest_repo_map(
                 group,
                 utility_config(config),
             )
-            .map_err(|e| anyhow::anyhow!("{layer_name} conv create: {e}"))?
+            .map_err(|e| anyhow::anyhow!("{layer_name} conv create: {e}"))?;
+        // Give the repo_map timeline a stable label. It carries no conv_id (it is
+        // not a dialogue) and no `path` (it spans the whole workspace), so without
+        // one the substrate viewer would render it as "(untitled)".
+        if let Err(e) = engine.set_conversation_label(seq.timeline_id(), REPO_MAP_LABEL) {
+            tracing::warn!(target: "zend::repo_scan", "repo_map label set failed: {e:#}");
+        }
+        seq
     };
 
     let mut sink = SequenceTurnSink::new(&mut sequence);
@@ -383,7 +394,7 @@ pub fn refresh_repo_map(
 
     let mut new_sequence = {
         let engine = ctx.engine.lock().unwrap();
-        engine
+        let seq = engine
             .new_conversation_with_projection(
                 &system_prompt,
                 ctx.proj_builder.clone(),
@@ -391,7 +402,12 @@ pub fn refresh_repo_map(
                 group,
                 utility_config(ctx.config.clone()),
             )
-            .map_err(|e| anyhow::anyhow!("repo_map refresh: new conv create: {e}"))?
+            .map_err(|e| anyhow::anyhow!("repo_map refresh: new conv create: {e}"))?;
+        // Same stable label on the refreshed timeline (see `ingest_repo_map`).
+        if let Err(e) = engine.set_conversation_label(seq.timeline_id(), REPO_MAP_LABEL) {
+            tracing::warn!(target: "zend::repo_scan", "repo_map label set failed: {e:#}");
+        }
+        seq
     };
 
     // Lock-free prefill window — concurrent engine consumers (chat

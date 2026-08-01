@@ -114,8 +114,11 @@ mod tests {
 
     #[test]
     fn extracts_multiple_sections() {
-        let scopes = verify_cov(
+        // Extraction check → use `verify` (raw parser scopes); `verify_cov` runs the
+        // full dispatcher, whose refine pass would merge the two tiny sections.
+        let scopes = verify(
             "<html><body>\n<section>one</section>\n<section>two</section>\n</body></html>\n",
+            &[("<section>", "<section>")],
         );
         let count = scopes
             .iter()

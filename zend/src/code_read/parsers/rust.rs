@@ -406,7 +406,9 @@ mod tests {
         let src = "// header\nstruct Foo {\n    x: u32,\n    y: u32,\n}\n";
         let scopes = verify(src, &[("struct Foo", "struct Foo")]);
         let foo = find_scope(&scopes, "struct Foo").unwrap();
-        assert_eq!(foo.start_line, 2);
+        // The leading `// header` doc comment is now attached to the scope, so the
+        // range starts at the comment (line 1), not the `struct` keyword (line 2).
+        assert_eq!(foo.start_line, 1);
         assert_eq!(foo.end_line, 5);
     }
 

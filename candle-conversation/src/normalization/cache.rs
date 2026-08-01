@@ -42,25 +42,23 @@ impl NormalizationCache {
     /// the scope on first observation. Call once per turn at seal, with the scope's
     /// full current membership.
     ///
-    /// A turn group's gallery lives on one timeline; a re-scan mints a new
-    /// `(group, timeline)` scope. After observing one, drop that group's
-    /// stale-timeline scopes so the cache stays bounded at one scope per active
-    /// group instead of leaking a `ScopeState` per historical re-scan. The scan is
-    /// once per turn and over a handful of scopes, so this is cheap.
+    /// Every `(group, timeline)` scope is retained independently. A belief group
+    /// like `code_reading` has MANY simultaneously-active timelines — one per
+    /// ingested file — and each needs its own learned hit levels so a cross-file
+    /// query can rescale them onto the common 0–1000 band and compare them fairly.
+    /// (An earlier version evicted a group's *other* timelines on every observe,
+    /// assuming one active timeline per group. That holds for a re-scanned single
+    /// cluster but is catastrophic for code_read: it wiped every file but the last,
+    /// leaving the cache empty for all the others, so normalization degenerated to a
+    /// flat `scale/prior` multiple of the raw score and a promiscuous low-entropy
+    /// file won every query.) Stale scopes from a repo_map re-scan are left in place
+    /// — dead once their timeline is inactive, bounded by the re-scan count, and a
+    /// single small `ScopeState` each.
     pub fn observe(&mut self, scope: &ScopeKey, raw: &[(ChildKey, f32)]) {
         self.scopes
             .entry(scope.clone())
             .or_default()
             .observe(raw, &self.cfg);
-        if let ScopeKey::TurnGroup { group, timeline } = scope {
-            self.scopes.retain(|k, _| match k {
-                ScopeKey::TurnGroup {
-                    group: g,
-                    timeline: t,
-                } => g != group || t == timeline,
-                _ => true,
-            });
-        }
     }
 
     #[cfg(test)]
