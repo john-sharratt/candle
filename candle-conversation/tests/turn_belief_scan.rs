@@ -587,6 +587,137 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
     );
 }
 
+const COLLECTION_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: frame
+      content: "frame"
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      policy:
+        tags: ["alpha", "beta"]
+      sections:
+        - id: alpha
+          content: "alpha tool"
+        - id: beta
+          content: "beta tool"
+        - id: gamma
+          content: "gamma tool"
+layers:
+  - name: mem
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: clusters
+        selection: { kind: top_k, k: 2 }
+"#;
+
+/// The COLLECTION belief scan (tools/moods/responses — the reproject's other
+/// scan besides the turn groups) must produce the same per-section scores on
+/// the GPU arena path as on the CPU `score_slots_weighted` path. The gallery is
+/// tag-scoped turns whose tag names a section; the arena scans it as one
+/// global-z segment. Skips without CUDA.
+#[test]
+fn score_belief_collections_gpu_matches_cpu() {
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return, // no GPU here — skip
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    let timeline = candle_conversation::projection::TimelineId::from_raw(21).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+
+    // Gallery: turns tagged with a section name become that section's exemplars.
+    // Multi-token windows (40 tokens = two arena pages; 17 = partial page).
+    let fills: [(&str, u64, usize); 4] = [
+        ("alpha", 0xAAAA_AAAA_AAAA_AAAA, 40),
+        ("alpha", 0xABAB_ABAB_ABAB_ABAB, 17),
+        ("beta", 0x5555_5555_5555_5555, 33),
+        ("beta", 0x1234_5678_9ABC_DEF0, 8),
+    ];
+    for (tag, fill, len) in fills {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec![tag.to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        let window: Vec<WideQSig> = (0..len).map(|_| sig(fill)).collect();
+        conv.persist_wide_q_sigs(
+            turn_stream_id(timeline.raw(), idx.0),
+            &encode_wide_sigs(&window),
+        )
+        .expect("persist sigs");
+    }
+
+    // Probe matching the alpha pattern → alpha must win on both paths.
+    let probe: Vec<WideQSig> = (0..6).map(|_| sig(0xAAAA_AAAA_AAAA_AAAA)).collect();
+    let sp = &builder.schema().system_prompt;
+    let coll = sp.collection_named("tools").expect("tools collection");
+
+    let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
+    let cpu = conv.score_belief_collections(sp, &probe, None);
+    let gpu = conv.score_belief_collections(sp, &probe, Some(&arena));
+
+    let mut cpu_scores = Vec::new();
+    let mut gpu_scores = Vec::new();
+    for s in &coll.sections {
+        let c = cpu.section(s.id);
+        let g = gpu.section(s.id);
+        assert!(
+            (c - g).abs() <= 1e-3 * (1.0 + c.abs().max(g.abs())),
+            "section {}: CPU {c} vs GPU {g} exceeds tolerance",
+            s.name
+        );
+        cpu_scores.push((s.name.clone(), c));
+        gpu_scores.push((s.name.clone(), g));
+    }
+    // Alpha dominates on both paths; gamma (no gallery) reads zero.
+    for scores in [&cpu_scores, &gpu_scores] {
+        let alpha = scores.iter().find(|(n, _)| n == "alpha").unwrap().1;
+        let beta = scores.iter().find(|(n, _)| n == "beta").unwrap().1;
+        let gamma = scores.iter().find(|(n, _)| n == "gamma").unwrap().1;
+        assert!(
+            alpha > beta && alpha > 0.0,
+            "alpha must dominate: alpha={alpha}, beta={beta}"
+        );
+        assert_eq!(gamma, 0.0, "gamma has no gallery exemplars");
+    }
+    // A second GPU scan hits the arena's index cache and must be identical.
+    let gpu2 = conv.score_belief_collections(sp, &probe, Some(&arena));
+    for s in &coll.sections {
+        assert_eq!(
+            gpu.section(s.id).to_bits(),
+            gpu2.section(s.id).to_bits(),
+            "cached collection scan must be bit-identical"
+        );
+    }
+}
+
 #[test]
 fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
     let dir = tempfile::tempdir().unwrap();

@@ -122,6 +122,28 @@ pub struct Conversation {
     writer: Arc<SubstrateWriter>,
 }
 
+/// Per-turn residency fingerprint for a decoded sig window: the memo's stable
+/// `Arc` identity + length + a content sample. The `decoded_wide_sig` memo
+/// serves an `Arc` whose identity changes only when the turn's blob is
+/// rewritten (and keeps unchanged Arcs alive), so the pointer is a cheap
+/// content key — a seal bumps it, a reprojection against unchanged turns does
+/// not. The word sample is the ABA guard: if a re-seal or substrate reset
+/// frees an Arc and the allocator reuses the address with the same window
+/// structure, the sampled words still differ, so stale arena pages are never
+/// served. Shared by the group and collection scans.
+fn sig_fingerprint(arc: &Arc<Vec<WideQSig>>) -> u64 {
+    let mut h = DefaultHasher::new();
+    (Arc::as_ptr(arc) as usize).hash(&mut h);
+    arc.len().hash(&mut h);
+    if let Some(first) = arc.first().and_then(|s| s.words.first()) {
+        first.hash(&mut h);
+    }
+    if let Some(last) = arc.last().and_then(|s| s.words.last()) {
+        last.hash(&mut h);
+    }
+    h.finish()
+}
+
 impl Default for Conversation {
     /// An ephemeral conversation — see [`Conversation::ephemeral`].
     fn default() -> Self {
@@ -346,16 +368,19 @@ impl Conversation {
     /// are labelled directly — no cold-start bootstrap); otherwise the turn is
     /// labelled by the section its own last projection selected in `collection`
     /// (self-reinforcing). Turns that resolve to no slot are skipped. Returns
-    /// `(windows, slot_per_window)` for [`crate::provenance::score_slots`].
+    /// `(windows, slot_per_window, stream_per_window)` — the windows and slots
+    /// feed [`crate::provenance::score_slots`]; the stream ids key the windows'
+    /// residency in the GPU gallery arena.
     pub fn belief_gallery(
         &self,
         collection: &str,
         tags: &[String],
         slot_of: impl Fn(&str) -> Option<usize>,
-    ) -> (Vec<Arc<Vec<WideQSig>>>, Vec<usize>) {
+    ) -> (Vec<Arc<Vec<WideQSig>>>, Vec<usize>, Vec<StreamId>) {
         let sub = self.inner.read().unwrap();
         let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
+        let mut sids: Vec<StreamId> = Vec::new();
         for (sid, e) in sub.all_streams() {
             let Some(StreamDecl::Turn(d)) = &e.decl else {
                 continue;
@@ -390,8 +415,9 @@ impl Conversation {
             };
             windows.push(window);
             slots.push(slot);
+            sids.push(sid);
         }
-        (windows, slots)
+        (windows, slots, sids)
     }
 
     /// Score every belief-driven collection in the shared system prompt against
@@ -403,10 +429,17 @@ impl Conversation {
     /// the post-turn projection event (probe = the finished turn's stored
     /// signature). A collection with an empty gallery or no sections contributes
     /// nothing — its sections read `0.0`.
+    ///
+    /// With an `arena`, each collection scans as ONE global-z segment on the GPU
+    /// gallery arena (numerically equivalent to the CPU `score_slots_weighted`
+    /// up to fast-math ULP — same ranking); collection windows are the same turn
+    /// streams the turn-group scan touches, so their arena residency is shared.
+    /// Without one (seal-time learning, non-CUDA), the CPU path runs unchanged.
     pub fn score_belief_collections(
         &self,
         sp: &SystemPromptSchema,
         probe: &[WideQSig],
+        arena: Option<&GalleryArena>,
     ) -> ProjectionScores {
         let mut scores = ProjectionScores::new();
         if probe.is_empty() {
@@ -421,7 +454,8 @@ impl Conversation {
                 continue;
             }
             let slot_of = |name: &str| coll.sections.iter().position(|s| s.name == name);
-            let (windows, slots) = self.belief_gallery(&coll.name, &coll.policy.tags, slot_of);
+            let (windows, slots, sids) =
+                self.belief_gallery(&coll.name, &coll.policy.tags, slot_of);
             if windows.is_empty() {
                 // The belief loop has nothing to score against, so selection falls
                 // back to declaration order (the first tool in the catalog) and
@@ -458,10 +492,43 @@ impl Conversation {
                 }
                 continue;
             }
-            let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
             // Per-layer-group weights from the collection's `policy.layer_weights`
             // (empty ⇒ uniform — the tool default). Configured in the schema YAML.
-            let fresh = score_slots_weighted(probe, &wref, &slots, n, &coll.policy.layer_weights);
+            // GPU: the collection is ONE global-z segment over the resident arena
+            // (windows keyed by their turn stream ids — shared with the group
+            // scan's residency). CPU fallback preserves today's behaviour.
+            let gpu_fresh: Option<Vec<f32>> = arena.and_then(|arena| {
+                let segment = PagedSegment {
+                    windows: windows
+                        .iter()
+                        .zip(&slots)
+                        .zip(&sids)
+                        .map(|((w, &slot), &sid)| PagedWindow {
+                            sid,
+                            fingerprint: sig_fingerprint(w),
+                            turn: w.as_slice(),
+                            start: 0,
+                            end: w.len(),
+                            case: slot,
+                        })
+                        .collect(),
+                    n_cases: n,
+                };
+                match arena.scan_weighted(&[segment], &[probe], &coll.policy.layer_weights) {
+                    Ok(mut out) => Some(out.pop().unwrap_or_default()),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "provenance",
+                            "GPU collection scan unavailable, using CPU: {e}"
+                        );
+                        None
+                    }
+                }
+            });
+            let fresh = gpu_fresh.unwrap_or_else(|| {
+                let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                score_slots_weighted(probe, &wref, &slots, n, &coll.policy.layer_weights)
+            });
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let nonzero = fresh.iter().filter(|&&s| s != 0.0).count();
                 let top = fresh
@@ -519,7 +586,7 @@ impl Conversation {
         }
         self.ensure_normalization_warm(schema, target);
         // Collections (the tool catalog) live in the shared system prompt.
-        scores = self.score_belief_collections(&schema.system_prompt, probe);
+        scores = self.score_belief_collections(&schema.system_prompt, probe, arena);
         // Belief-driven turn groups live across every layer.
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
@@ -803,18 +870,6 @@ impl Conversation {
                 // sample is the ABA guard against an in-place re-seal / substrate reset
                 // reusing an address. Keyed per turn, so a seal re-uploads only that
                 // turn's pages; unchanged turns stay resident (no upload).
-                let fp_of = |arc: &Arc<Vec<WideQSig>>| -> u64 {
-                    let mut h = DefaultHasher::new();
-                    (Arc::as_ptr(arc) as usize).hash(&mut h);
-                    arc.len().hash(&mut h);
-                    if let Some(first) = arc.first().and_then(|s| s.words.first()) {
-                        first.hash(&mut h);
-                    }
-                    if let Some(last) = arc.last().and_then(|s| s.words.last()) {
-                        last.hash(&mut h);
-                    }
-                    h.finish()
-                };
                 let segments: Vec<PagedSegment> = files
                     .iter()
                     .map(|f| PagedSegment {
@@ -823,7 +878,7 @@ impl Conversation {
                             .iter()
                             .map(|&(k, s, e, slot)| PagedWindow {
                                 sid: f.arc_sids[k],
-                                fingerprint: fp_of(&f.arcs_kept[k]),
+                                fingerprint: sig_fingerprint(&f.arcs_kept[k]),
                                 turn: f.arcs_kept[k].as_slice(),
                                 start: s,
                                 end: e,
