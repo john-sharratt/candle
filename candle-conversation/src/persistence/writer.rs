@@ -240,7 +240,8 @@ fn process_one(
         WriteJob::Shutdown(ack) => return Some(ack),
         WriteJob::StreamDecl { stream_id, payload } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_record(RecordType::StreamDecl, 0, stream_id, 0, 0, 0, &payload) {
+            if let Err(e) = p.append_record(RecordType::StreamDecl, 0, stream_id, 0, 0, 0, &payload)
+            {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     "stream-decl append failed: {e}"

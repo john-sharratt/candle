@@ -5,8 +5,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
@@ -632,7 +632,12 @@ impl Conversation {
         // reader/writer lock that STARVES the writer — the scheduler stops draining its
         // backlog and load stalls. A real query projects against a non-append-only
         // (dialogue) target, by which point the corpus is stable; warm then.
-        if self.inner.read().unwrap().is_append_only_layer(target.layer) {
+        if self
+            .inner
+            .read()
+            .unwrap()
+            .is_append_only_layer(target.layer)
+        {
             return;
         }
         // Fire once, but RE-ARMABLE: `reset_normalization_warm` clears the flag after
@@ -694,7 +699,6 @@ impl Conversation {
                 let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true, None);
             }
         }
-
     }
 
     /// Warm the append-only INGEST groups' per-file / per-cluster hit levels from
@@ -1422,8 +1426,7 @@ impl Conversation {
                         // omits it, `changed_files` flags it, and `process_one_file`
                         // rebuilds it. Best-effort — a failure here just means the
                         // next reload skips the same turn again, still correct.
-                        let reason =
-                            format!("corrupt reload (turn {}): {e}", decl.turn_index);
+                        let reason = format!("corrupt reload (turn {}): {e}", decl.turn_index);
                         if let Ok(mut p) = self.persistence.lock() {
                             let _ = p.write_tombstone(timeline.raw(), Some(&reason));
                         }

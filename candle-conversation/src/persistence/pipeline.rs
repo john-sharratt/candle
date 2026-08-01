@@ -504,7 +504,8 @@ fn allocator_worker(
                 // NON-fatal: a mismatch warns (possible on-disk / read-path
                 // corruption) but still loads, so the latency-sensitive cold-load
                 // never hard-fails on it.
-                let recomputed = candle::fletcher::fletcher32(&payload[kv_range.start..kv_range.end]);
+                let recomputed =
+                    candle::fletcher::fletcher32(&payload[kv_range.start..kv_range.end]);
                 if recomputed != header.crc {
                     tracing::warn!(
                         target: "candle_conversation::persistence::golden",

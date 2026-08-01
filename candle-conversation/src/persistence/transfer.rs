@@ -1213,8 +1213,7 @@ mod cuda_impl {
             };
             let split: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
 
-            let (blob, goldens) =
-                gather_chunks_with_goldens(&device, &src_ptrs, &split).unwrap();
+            let (blob, goldens) = gather_chunks_with_goldens(&device, &src_ptrs, &split).unwrap();
             let concatenated: Vec<u8> = chunks.iter().flatten().copied().collect();
             assert_eq!(blob, concatenated, "gather concatenates the chunks");
             assert_eq!(goldens.len(), chunks.len());

@@ -602,7 +602,15 @@ impl SubstratePersistence {
 
     /// Append a turn's `ProjectionEvents` record (opaque JSON payload).
     pub fn append_projection_events(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(RecordType::ProjectionEvents, 0, stream_id.0, 0, 0, 0, payload)?;
+        self.append_record(
+            RecordType::ProjectionEvents,
+            0,
+            stream_id.0,
+            0,
+            0,
+            0,
+            payload,
+        )?;
         Ok(())
     }
 
@@ -743,8 +751,7 @@ impl SubstratePersistence {
         // arena bytes before the DtoH copy). `None` means no precomputed golden
         // is available, so take it host-side over these bytes now — the same
         // host-truth the CPU gather path uses.
-        let golden =
-            golden.unwrap_or_else(|| candle::fletcher::fletcher32(&payload.kv_bytes));
+        let golden = golden.unwrap_or_else(|| candle::fletcher::fletcher32(&payload.kv_bytes));
         let (_seg, offset, _) = self.append_record(
             RecordType::Chunk,
             format,
@@ -1762,7 +1769,8 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             // Some(wrong) forces the stored golden to mismatch the bytes.
-            sp.write_chunk(sid, 0, 32, 4, Some(0xBAD0_C0DE), &payload).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, Some(0xBAD0_C0DE), &payload)
+                .unwrap();
             sp.commit_stream(sid, 0).unwrap();
             sp.commit().unwrap();
         }
@@ -1942,7 +1950,8 @@ mod tests {
             sp.set_model_spec(b"qwen3-235b-live").unwrap();
             sp.set_template(b"the-template").unwrap();
             for seed in [97, 98, 99] {
-                sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(seed)).unwrap();
+                sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(seed))
+                    .unwrap();
             }
             sp.write_chunk(sid, 0, 32, 4, None, &live_chunk).unwrap();
             sp.commit_stream(sid, 0).unwrap();

@@ -16,8 +16,7 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
 
-static DISABLED: LazyLock<RwLock<HashSet<String>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
+static DISABLED: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// True while `name` is toggled OFF (excluded from projection assembly).
 pub fn is_layer_disabled(name: &str) -> bool {
