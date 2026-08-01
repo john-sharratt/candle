@@ -25,7 +25,7 @@ pub use scan::{PagedSegment, PagedWindow};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::{Device, Result};
 
@@ -102,6 +102,11 @@ pub struct GalleryArena {
     /// a page, so an unchanged generation guarantees the cached device addresses
     /// still hold.
     residency_gen: AtomicU64,
+    /// This arena's device tensor capabilities `(b1 BMMA, INT8 IMMA)`, queried
+    /// once on first scan. Cached PER ARENA (not per process) so heterogeneous
+    /// multi-GPU setups — e.g. mixed Ada/Blackwell — resolve each arena's
+    /// backend ladder against its own device.
+    tensor_caps: OnceLock<(bool, bool)>,
     /// Per-scan indices (page_ptr / pos_map / case / seg prefixes) keyed by segment
     /// fingerprint, reused when the same segment set is rescanned under an
     /// unchanged residency generation — skipping the O(scanned-tokens) rebuild each
@@ -132,6 +137,7 @@ impl GalleryArena {
             lru_clock: AtomicU64::new(0),
             residency_gen: AtomicU64::new(0),
             index_cache: Mutex::new(HashMap::new()),
+            tensor_caps: OnceLock::new(),
             device: device.clone(),
             wpt,
             n_groups,

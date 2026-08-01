@@ -184,6 +184,41 @@ fn main() {
     }
     let steady_ms = t.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
+    // The other two backends on the same resident gallery — verified against
+    // the auto path's votes bit-for-bit before timing, so the printed line is a
+    // checked claim, not an assumption. A backend the device lacks reports so.
+    let bench_backend = |name: &str, scan: &dyn Fn() -> candle::Result<Vec<Vec<f32>>>| -> String {
+        match scan() {
+            Ok(votes) => {
+                for (i, (a, b)) in gpu.iter().zip(&votes[0]).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "case {i}: {name} votes diverge from the auto backend"
+                    );
+                }
+                let t = Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(scan().unwrap());
+                }
+                format!(
+                    "{name} {:.2} ms",
+                    t.elapsed().as_secs_f64() * 1000.0 / reps as f64
+                )
+            }
+            Err(e) => format!("{name} unavailable ({e})"),
+        }
+    };
+    let imma_line = bench_backend("IMMA (Hopper/Blackwell path)", &|| {
+        arena.scan_weighted_imma(&segments, &[query.as_slice()], &[])
+    });
+    let scalar_line = bench_backend("scalar fallback", &|| {
+        arena.scan_weighted_scalar(&segments, &[query.as_slice()], &[])
+    });
+    println!(
+        "backends on the same gallery (votes verified identical): {imma_line} | {scalar_line}"
+    );
+
     // ── Compare ─────────────────────────────────────────────────────────────
     assert_eq!(gpu.len(), cpu.len(), "case count mismatch");
     let mut max_abs = 0.0f32;

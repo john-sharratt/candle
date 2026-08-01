@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle::{Device, Result};
-use candle_kernels::provenance::run_batched_bdp_scan;
+use candle_kernels::provenance::{
+    bdp_bmma_supported, bdp_imma_supported, run_batched_bdp_scan, run_bmma_bdp_scan,
+    run_imma_bdp_scan,
+};
 use core::ffi::c_void;
 
 use crate::persistence::streams::StreamId;
@@ -63,6 +66,18 @@ pub(super) struct PagedIndex {
 pub(super) struct CachedIndex {
     pub(super) gen: u64,
     pub(super) idx: Arc<PagedIndex>,
+}
+
+/// One scan backend. The auto ladder resolves per DEVICE, fastest first: b1
+/// BMMA where the hardware has it (sm_75..sm_89), then INT8 IMMA (sm_80+ —
+/// Hopper/Blackwell, which dropped b1), then the scalar kernel. The forced
+/// variants keep every backend first-class for differential testing and
+/// benchmarking — all three produce bit-identical votes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PagedBackend {
+    Bmma,
+    Imma,
+    Scalar,
 }
 
 /// Fingerprint the segment structure the built index depends on — file order,
@@ -115,7 +130,15 @@ impl GalleryArena {
         // Turns pinned so far — released on error so a failed build never leaks pins.
         let mut pinned_sids: Vec<StreamId> = Vec::new();
         for seg in segments {
-            for w in &seg.windows {
+            // Emit each segment's windows in CASE order, so gallery case ids are
+            // non-decreasing over the scan order. The scan math is order-independent
+            // (per-case max/sum), but the BMMA backend dense-ranks each chunk's
+            // cases with a single monotone walk — this ordering is its invariant.
+            // The resolver's exchange slots already arrive sorted (stable no-op).
+            let mut order: Vec<usize> = (0..seg.windows.len()).collect();
+            order.sort_by_key(|&i| seg.windows[i].case);
+            for &wi in &order {
+                let w = &seg.windows[wi];
                 // Mirror `PackedGallery::from_windows`: drop an out-of-range case.
                 if w.case >= seg.n_cases {
                     continue;
@@ -175,12 +198,60 @@ impl GalleryArena {
     /// index, launches the paged kernel, and tallies — one per-case vote vector
     /// per probe. Numerically equivalent to the contiguous
     /// [`BatchedGpuGallery::scan_weighted`](super::super::gpu::BatchedGpuGallery)
-    /// on the same windows (only the byte layout differs).
+    /// on the same windows (only the byte layout differs). Runs on the b1
+    /// tensor-core (BMMA) backend when the device has it (sm_75..sm_89) and the
+    /// geometry is the locked fold (`gw == 8`); the scalar kernel otherwise.
     pub fn scan_weighted(
         &self,
         segments: &[PagedSegment],
         probes: &[&[WideQSig]],
         group_weights: &[f32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.scan_weighted_impl(segments, probes, group_weights, None)
+    }
+
+    /// [`Self::scan_weighted`] forced onto the scalar kernel — the universal
+    /// fallback backend, kept first-class for differential testing and
+    /// benchmarking (all backends' integer statistics are identical).
+    pub fn scan_weighted_scalar(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        group_weights: &[f32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Scalar))
+    }
+
+    /// [`Self::scan_weighted`] forced onto the INT8 tensor-core (IMMA) kernel —
+    /// the backend the auto ladder selects on devices without b1 BMMA (Hopper/
+    /// Blackwell). Forcing it keeps the path benchmarkable and differential-
+    /// tested on b1 hardware too. Errors on devices without INT8 MMA (below
+    /// sm_80).
+    pub fn scan_weighted_imma(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        group_weights: &[f32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Imma))
+    }
+
+    /// This arena device's tensor capabilities `(b1 BMMA, INT8 IMMA)`, queried
+    /// once per arena. The FFI probes the calling thread's current CUDA device,
+    /// which is the arena's device on every scan path (scans run on threads
+    /// holding the arena's context).
+    fn tensor_caps(&self) -> (bool, bool) {
+        *self
+            .tensor_caps
+            .get_or_init(|| unsafe { (bdp_bmma_supported() != 0, bdp_imma_supported() != 0) })
+    }
+
+    fn scan_weighted_impl(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        group_weights: &[f32],
+        force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
         // Reuse the cached index if the same segment set is rescanned under an
         // unchanged residency generation (the common within-turn case) — this
@@ -195,7 +266,7 @@ impl GalleryArena {
                 built
             }
         };
-        let result = self.launch_paged(&idx, probes, group_weights);
+        let result = self.launch_paged(&idx, probes, group_weights, force);
         // Release the scan's pins whether or not the launch succeeded — the pages
         // are no longer being read once the launch has synchronized (or failed).
         for &sid in &idx.pinned_sids {
@@ -209,6 +280,7 @@ impl GalleryArena {
         idx: &PagedIndex,
         probes: &[&[WideQSig]],
         group_weights: &[f32],
+        force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
         let dev = match self.device() {
             Device::Cuda(d) => d,
@@ -227,13 +299,25 @@ impl GalleryArena {
             return Ok(vec![vec![0.0; n_cases]; probes.len()]);
         }
 
-        // Shared-memory budget guard (mirror BatchedGpuGallery).
-        let shmem = BDP_TQ * idx.max_seg_cases * std::mem::size_of::<u32>();
-        if shmem > 48 * 1024 {
-            return Err(candle::Error::Msg(format!(
-                "paged scan: largest segment has {} cases ({shmem} B shared > 48 KiB)",
-                idx.max_seg_cases
-            )));
+        // Backend candidates — see [`PagedBackend`]. A forced backend is exactly
+        // one candidate; auto lists every rung this arena's device might run,
+        // fastest first, so a runtime gate mismatch (launcher rc == 1 — a
+        // host-side pre-check, nothing enqueued) degrades to the next rung
+        // instead of failing the scan. The scalar rung's largest-segment
+        // shared-memory guard is checked when that rung is reached.
+        let (has_bmma, has_imma) = self.tensor_caps();
+        let mut candidates: Vec<PagedBackend> = Vec::with_capacity(3);
+        match force {
+            Some(b) => candidates.push(b),
+            None => {
+                if gw == 8 && has_bmma {
+                    candidates.push(PagedBackend::Bmma);
+                }
+                if gw == 8 && has_imma {
+                    candidates.push(PagedBackend::Imma);
+                }
+                candidates.push(PagedBackend::Scalar);
+            }
         }
 
         // Batch probes (token-major, full-width only — the reference's filter).
@@ -291,25 +375,99 @@ impl GalleryArena {
             let (p_pos_map, _g6) = d_pos_map.device_ptr(&stream);
             let (p_out_case, _g7) = d_out_case.device_ptr_mut(&stream);
             let (p_out_vote, _g8) = d_out_vote.device_ptr_mut(&stream);
-            unsafe {
-                run_batched_bdp_scan(
-                    std::ptr::null(), // gallery_words — paged mode
-                    p_case as *const u32,
-                    p_probe as *const u64,
-                    p_seg_tok as *const i32,
-                    p_seg_case as *const i32,
-                    p_page_ptr as *const u64,
-                    p_pos_map as *const u32,
-                    n_probe_tokens as i32,
-                    n_groups as i32,
-                    n_segments as i32,
-                    idx.max_seg_cases as i32,
-                    gw as i32,
-                    wpt as i32,
-                    p_out_case as *mut i32,
-                    p_out_vote as *mut f32,
-                    stream.cu_stream() as *mut c_void,
-                );
+            let mut launched = false;
+            for &backend in &candidates {
+                match backend {
+                    PagedBackend::Bmma | PagedBackend::Imma => {
+                        // The two tensor launchers share one signature and contract.
+                        let launcher = if backend == PagedBackend::Bmma {
+                            run_bmma_bdp_scan
+                        } else {
+                            run_imma_bdp_scan
+                        };
+                        let rc = unsafe {
+                            launcher(
+                                p_case as *const u32,
+                                p_probe as *const u64,
+                                p_seg_tok as *const i32,
+                                p_seg_case as *const i32,
+                                p_page_ptr as *const u64,
+                                p_pos_map as *const u32,
+                                idx.pos_map.len() as i32,
+                                n_probe_tokens as i32,
+                                n_groups as i32,
+                                n_segments as i32,
+                                n_cases as i32,
+                                gw as i32,
+                                wpt as i32,
+                                p_out_case as *mut i32,
+                                p_out_vote as *mut f32,
+                                stream.cu_stream() as *mut c_void,
+                            )
+                        };
+                        if rc == 0 {
+                            launched = true;
+                            break;
+                        }
+                        if rc == 1 {
+                            // The launcher's host-side gate declined (device or
+                            // geometry) — nothing was enqueued; try the next rung.
+                            tracing::debug!(
+                                target: "provenance",
+                                "paged scan: {backend:?} gate declined, next rung"
+                            );
+                            continue;
+                        }
+                        // Negative rc: a CUDA error mid-sequence — work may
+                        // already be in flight, so drain the stream BEFORE
+                        // surfacing (the caller unpins the scanned turns on
+                        // return, and the governor must never free pages a
+                        // still-running kernel is reading).
+                        let _ = stream.synchronize();
+                        return Err(candle::Error::Msg(format!(
+                            "paged scan: {backend:?} launch failed (rc {rc})"
+                        )));
+                    }
+                    PagedBackend::Scalar => {
+                        // Shared-memory budget guard: the scalar kernel's dynamic
+                        // shared scales with the largest segment's case count.
+                        let shmem = BDP_TQ * idx.max_seg_cases * std::mem::size_of::<u32>();
+                        if shmem > 48 * 1024 {
+                            return Err(candle::Error::Msg(format!(
+                                "paged scan: largest segment has {} cases \
+                                 ({shmem} B shared > 48 KiB)",
+                                idx.max_seg_cases
+                            )));
+                        }
+                        unsafe {
+                            run_batched_bdp_scan(
+                                std::ptr::null(), // gallery_words — paged mode
+                                p_case as *const u32,
+                                p_probe as *const u64,
+                                p_seg_tok as *const i32,
+                                p_seg_case as *const i32,
+                                p_page_ptr as *const u64,
+                                p_pos_map as *const u32,
+                                n_probe_tokens as i32,
+                                n_groups as i32,
+                                n_segments as i32,
+                                idx.max_seg_cases as i32,
+                                gw as i32,
+                                wpt as i32,
+                                p_out_case as *mut i32,
+                                p_out_vote as *mut f32,
+                                stream.cu_stream() as *mut c_void,
+                            );
+                        }
+                        launched = true;
+                        break;
+                    }
+                }
+            }
+            if !launched {
+                return Err(candle::Error::Msg(
+                    "paged scan: no backend available for this device/geometry".into(),
+                ));
             }
             stream
                 .synchronize()
@@ -452,12 +610,14 @@ mod tests {
         let probe = vec![sig(0x1000), sig(0x3000 + 25), sig(0xBEEF), sig(0x4000 + 10)];
         let weights = [0.25f32, 1.0, 3.0];
 
+        // Scalar-paged vs scalar-contiguous: the strict oracle (same kernel, only
+        // the physical layout differs — must be bit-for-bit equal).
         let contiguous = BatchedGpuGallery::from_segments(&contig_segs)
             .unwrap()
             .scan_weighted(&device, &[probe.as_slice()], &weights)
             .unwrap();
         let paged = arena
-            .scan_weighted(&paged_segs, &[probe.as_slice()], &weights)
+            .scan_weighted_scalar(&paged_segs, &[probe.as_slice()], &weights)
             .unwrap();
 
         assert_eq!(paged.len(), contiguous.len());
@@ -476,13 +636,27 @@ mod tests {
             .scan(&device, &[probe.as_slice()])
             .unwrap();
         let paged_u = arena
-            .scan_weighted(&paged_segs, &[probe.as_slice()], &[])
+            .scan_weighted_scalar(&paged_segs, &[probe.as_slice()], &[])
             .unwrap();
         for (i, (p, c)) in paged_u[0].iter().zip(&contiguous_u[0]).enumerate() {
             assert_eq!(
                 p.to_bits(),
                 c.to_bits(),
                 "unweighted case {i} must be bit-identical"
+            );
+        }
+
+        // The auto backend (BMMA on this hardware) must agree with the scalar
+        // oracle on the same fixture — full bit equality (integer statistics are
+        // identical by construction; the float finalize is the shared bdp_vote).
+        let auto = arena
+            .scan_weighted(&paged_segs, &[probe.as_slice()], &weights)
+            .unwrap();
+        for (i, (a, c)) in auto[0].iter().zip(&contiguous[0]).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                c.to_bits(),
+                "case {i}: auto backend {a} vs scalar {c} must be bit-identical"
             );
         }
     }
@@ -625,5 +799,147 @@ mod tests {
             assert_eq!(b1, b2, "group B cached result must be stable");
         }
         assert_eq!(arena.resident_turns(), 2, "both turns resident, no churn");
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn rand_sig(state: &mut u64) -> WideQSig {
+        WideQSig {
+            n_heads: 12,
+            words: (0..24).map(|_| xorshift(state)).collect(),
+        }
+    }
+
+    /// Adversarial BMMA-vs-scalar parity over a large randomized corpus that
+    /// hits every structural edge at once: 1-token exchanges, case-id GAPS
+    /// (empty cases), windows supplied in DESCENDING case order (exercises the
+    /// build_index sort the BMMA dense-rank relies on), out-of-range cases
+    /// (dropped), seam sub-windows of one multi-page turn split across cases,
+    /// segments that straddle 64-token chunk boundaries, and probe/token counts
+    /// that are not multiples of the 8/32/64 tile shapes. The two backends'
+    /// integer statistics are identical by construction and the float finalize
+    /// is shared, so the votes must be bit-for-bit equal. Skips without CUDA
+    /// or on hardware without b1 BMMA.
+    #[test]
+    fn bmma_matches_scalar_on_adversarial_corpus() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let (has_bmma, has_imma) = arena.tensor_caps();
+        if !has_bmma || !has_imma {
+            return; // needs both tensor backends for the 3-way comparison
+        }
+
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        // Turn lengths spanning page boundaries and tile tails.
+        let lens = [1usize, 3, 7, 8, 31, 32, 33, 40, 63, 64, 65, 100, 129, 200];
+        let turns: Vec<Vec<WideQSig>> = (0..40)
+            .map(|i| {
+                let n = lens[i % lens.len()];
+                (0..n).map(|_| rand_sig(&mut rng)).collect()
+            })
+            .collect();
+
+        let mut segs: Vec<PagedSegment> = Vec::new();
+        let mut next_turn = 0usize;
+        for si in 0..14usize {
+            let n_cases = 2 + (si % 7); // 2..8 cases per segment
+            let mut windows = Vec::new();
+            // 2-4 turns per segment.
+            for wi in 0..(2 + si % 3) {
+                let ti = (next_turn + wi) % turns.len();
+                let t = &turns[ti];
+                // DESCENDING case ids (build_index must sort), with deliberate
+                // gaps (cases that never receive a window stay empty).
+                let case = (n_cases - 1).saturating_sub(wi * 2 % n_cases);
+                if t.len() > 8 {
+                    // Seam split: two sub-windows of one turn, different cases.
+                    let mid = t.len() / 2;
+                    windows.push(PagedWindow {
+                        sid: turn_stream_id(500 + si as u64, ti as u32),
+                        fingerprint: (si * 100 + ti) as u64,
+                        turn: t,
+                        start: 0,
+                        end: mid,
+                        case,
+                    });
+                    windows.push(PagedWindow {
+                        sid: turn_stream_id(500 + si as u64, ti as u32),
+                        fingerprint: (si * 100 + ti) as u64,
+                        turn: t,
+                        start: mid,
+                        end: t.len(),
+                        case: case.saturating_sub(1),
+                    });
+                } else {
+                    windows.push(PagedWindow {
+                        sid: turn_stream_id(500 + si as u64, ti as u32),
+                        fingerprint: (si * 100 + ti) as u64,
+                        turn: t,
+                        start: 0,
+                        end: t.len(),
+                        case,
+                    });
+                }
+            }
+            // An out-of-range case that must be dropped by both backends.
+            let tdrop = &turns[next_turn % turns.len()];
+            windows.push(PagedWindow {
+                sid: turn_stream_id(500 + si as u64, (next_turn % turns.len()) as u32),
+                fingerprint: (si * 100 + next_turn % turns.len()) as u64,
+                turn: tdrop,
+                start: 0,
+                end: tdrop.len().min(4),
+                case: n_cases + 3,
+            });
+            next_turn += 3;
+            segs.push(PagedSegment { windows, n_cases });
+        }
+
+        // Probes exercising tile tails: 1, 9, and 100 query tokens.
+        let probes_owned: Vec<Vec<WideQSig>> = [1usize, 9, 100]
+            .iter()
+            .map(|&n| (0..n).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+
+        for (pi, probe) in probes_owned.iter().enumerate() {
+            for weights in [&[] as &[f32], &[0.25, 1.0, 3.0]] {
+                let scalar = arena
+                    .scan_weighted_scalar(&segs, &[probe.as_slice()], weights)
+                    .unwrap();
+                let auto = arena
+                    .scan_weighted(&segs, &[probe.as_slice()], weights)
+                    .unwrap();
+                assert_eq!(scalar[0].len(), auto[0].len(), "probe {pi}: case count");
+                for (ci, (s, b)) in scalar[0].iter().zip(&auto[0]).enumerate() {
+                    assert_eq!(
+                        s.to_bits(),
+                        b.to_bits(),
+                        "probe {pi} case {ci}: scalar {s} vs auto {b} must be bit-identical"
+                    );
+                }
+                // The INT8 (IMMA) backend — the Blackwell production path,
+                // parity-proven here on Ada — must also match bit-for-bit.
+                let imma = arena
+                    .scan_weighted_imma(&segs, &[probe.as_slice()], weights)
+                    .unwrap();
+                for (ci, (s, m)) in scalar[0].iter().zip(&imma[0]).enumerate() {
+                    assert_eq!(
+                        s.to_bits(),
+                        m.to_bits(),
+                        "probe {pi} case {ci}: scalar {s} vs IMMA {m} must be bit-identical"
+                    );
+                }
+            }
+        }
     }
 }

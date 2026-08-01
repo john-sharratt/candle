@@ -137,9 +137,16 @@ const FLASH_KERNELS: [&str; 12] = [
     "src/paged-glue/paged_glue_api_bf16.cu",
 ];
 
-/// Provenance BDP scan — compiled WITHOUT `--use_fast_math` so its float math is
-/// IEEE round-to-nearest and bit-matches the CPU `score_packed` reference.
-const PROVENANCE_KERNELS: [&str; 1] = ["src/provenance/bdp_scan.cu"];
+/// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
+/// (sm_75..sm_89), and the INT8 tensor-core (IMMA) backend (sm_80+, incl.
+/// Blackwell). All compile with the sampling args (fast-math): the scan result
+/// is a relevance ranking, and the backends share `bdp_vote.cuh` so their float
+/// finalize is one code path.
+const PROVENANCE_KERNELS: [&str; 3] = [
+    "src/provenance/bdp_scan.cu",
+    "src/provenance/bdp_bmma.cu",
+    "src/provenance/bdp_imma.cu",
+];
 
 // ============================================================================
 // Archive group definition and construction

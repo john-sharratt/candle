@@ -1,22 +1,27 @@
 # Paged Gallery Arena — a resident VRAM store for the provenance scan
 
-> **Status — BUILT (all 5 phases, 2026-07). Live behind the reproject path.**
+> **Status — BUILT, TARGET MET (2026-07). Live behind the reproject path.**
 > A purpose-built VRAM arena holds the wide-Q provenance gallery *resident on the
 > GPU* between reprojections; each turn's folded signatures are a run of fixed-size
-> group-major pages from a free-list; the paged BDP kernel reads a page-base +
-> per-token page map (nullable `page_ptr`/`pos_map` on the existing kernel); a
-> re-seal re-uploads only the changed turn; the arena is registered with the VRAM
-> governor at a cheap relief rung so KV always wins. **Measured on the real
+> group-major pages from a free-list; a re-seal re-uploads only the changed turn;
+> a fingerprint-keyed per-scan index cache (§13.Q4 — built) skips the
+> O(scanned-tokens) rebuild across a turn's reprojections; the arena is registered
+> with the VRAM governor at a cheap relief rung so KV always wins. The scan runs
+> on **two backends** sharing one float finalize (`bdp_vote.cuh`): the production
+> **b1 tensor-core kernel** (`bdp_bmma.cu`, §14 — `BMMA.88128.XOR.POPC`,
+> sm_75..sm_89) and the **scalar kernel** (`bdp_scan.cu`, nullable
+> `page_ptr`/`pos_map`), which is both the fallback for devices without b1 BMMA
+> (Hopper/Blackwell dropped it — the 2×5090 box runs scalar until an IMMA INT8
+> variant exists) and the differential-testing oracle. **Measured on the real
 > substrate** (788 files, 2548 exchanges, 591 481 tokens, 128 MB resident):
-> selection overlap **1.000**, max-rel **6.5e-5**, steady-state scan **~30 ms**
-> (**12.9×** over the CPU per-file scan, up from 8.9× with the old per-scan
-> upload), cold first scan ~174 ms. The paged path is **bit-identical** to the
-> contiguous oracle (kept for differential testing). **Remaining, deferred:** the
-> ~25 ms kernel is now the wall for the 3–10 ms target (a separate kernel effort,
-> §13); empty-slab reclamation (§13.Q3) and per-scan index caching (§13.Q4) are
-> not built. The rest of this document is the as-designed spec it was built to,
-> grounded in the chunked-KV `GidPool`, the paged-KV pointer interface, and the
-> VRAM governor's relief ladder, with file:line references throughout.
+> selection overlap **1.000**, max-rel **6.5e-5** vs CPU, steady-state scan
+> **~9.5 ms** — inside the 3–10 ms flat-scan target — at **~41×** over the CPU
+> per-file scan (BMMA accumulate ~5.7 ms; the scalar fallback runs the same scan
+> in ~20.6 ms with bit-identical votes); cold first scan ~170 ms. **Remaining,
+> deferred:** empty-slab reclamation (§13.Q3). The rest of this document is the
+> as-designed spec it was built to, grounded in the chunked-KV `GidPool`, the
+> paged-KV pointer interface, and the VRAM governor's relief ladder, with
+> file:line references throughout; §14 documents the tensor-core backend.
 
 ---
 
@@ -605,3 +610,96 @@ the whole gallery (788 turns) costs one transpose+upload pass (~the current
 build, ~150 ms). This hits only on a cold conversation or after a full
 governor sweep, amortised over the turn's reprojections. Acceptable; note it in
 the timing story so it isn't mistaken for per-scan cost.
+
+---
+
+## 14. The tensor-core backend (`bdp_bmma.cu`) — built
+
+The scan's inner operation — `popcount(XNOR(query, token))` over 512-bit group
+signatures — is *literally* the 1-bit tensor-core instruction:
+`BMMA.88128.XOR.POPC` computes an 8×8 tile of `popcount(A XOR B)` over 128-bit
+K-chunks in one warp op, and `agreement = 512 − xor_popc` is an exact integer
+transform. The b1 path exists on **sm_75..sm_89** (Turing/Ampere/Ada — the dev
+4090 is sm_89, instruction confirmed in SASS); **Hopper and Blackwell dropped
+it**, so the 2×5090 production box runs the scalar backend until an INT8 IMMA
+(±1 encoding) variant exists. `bdp_bmma_supported()` gates at runtime; device
+code is `__CUDA_ARCH__`-guarded so the sm_120 compilation is a stub.
+
+### Structure — two kernels, fused segmented reduction
+
+- **`bdp_bmma_accum_kernel`** — grid `(64-token chunk, group)`; 256 threads = 8
+  warps (4 query-blocks × 2 token-halves). Per CTA: stage the gallery chunk once
+  in shared (K-chunk-major, so every wmma fragment pointer is 32-byte aligned at
+  ldm = 128 bits), dense-rank the chunk's cases (two warp ballots — cases are
+  non-decreasing over the scan order because the index builder sorts each
+  segment's windows by case), hoist the warp's 16 gallery fragments into
+  registers, then **loop the query tiles inside the CTA** (staging and ranks
+  amortise across all tiles). Per tile: 4 `bmma_sync` per 8×8 output tile, a
+  **run-merged epilogue** (16 lanes each merge a half-row's consecutive
+  same-rank columns in registers → one shared atomic triple per run, not per
+  element), and a per-(query, rank) flush to global `case_max`/`case_sum`/
+  `case_sumsq` accumulators. Rank windows of 32 cap the shared accumulators at
+  12 KB (4 CTAs/SM); a chunk with more distinct cases (all-tiny exchanges)
+  reruns its tiles per window.
+- **`bdp_bmma_finalize_kernel`** — one thread per (query, group, segment): scans
+  the segment's case range for leader/runner-up (same ascending order and strict
+  comparisons as the scalar kernel) and emits `(out_case, z*margin)` through the
+  shared `bdp_vote` — so the two backends' votes **bit-match** (verified: the
+  adversarial parity test asserts full bit equality across 1-token exchanges,
+  case-id gaps, unsorted window input, dropped out-of-range cases, seam
+  sub-windows, chunk-straddling segments, and non-tile-multiple probe/token
+  counts).
+
+The flattened chunk grid also removes both scalar structural limits: no
+per-segment block tail (a 3-token file no longer occupies a whole CTA) and no
+shared-memory dependence on the largest segment's case count — the 48 KB
+`max_seg_cases` guard applies only when the scalar backend actually runs.
+
+### Optimisation history (measured on the real substrate, Nsight-guided)
+
+| step | accum kernel | scan steady | limiter addressed |
+|------|-------------|-------------|-------------------|
+| first correct version | 22.4 ms | 23.6 ms | — (per-element epilogue atomics, 8-way same-address serialization) |
+| run-merged epilogue | 14.8 ms | 17.7 ms | shared-atomic contention |
+| query-loop-in-CTA + ballot ranks | 7.4 ms | 10.6 ms | CTA-barrier stalls (45%) + 8× gallery re-staging |
+| B-fragments hoisted to registers | 7.1 ms | ~10.6 ms | (neutral; kept — strictly less shared traffic) |
+| rank windows → 4 CTAs/SM | **5.7 ms** | **~9.5 ms** | occupancy (76% no-eligible at 2 CTAs/SM) |
+
+Final profile: memory-pipe 93% (saturated on fragment staging + store — the
+structural floor of this design), DRAM ~5%, occupancy 66%. The remaining ~4 ms
+of scan time outside the kernel is index upload (~0.7), result download (~1.5),
+host tally (~1.3), finalize (~0.15) — candidates only if the target ever
+tightens (on-GPU tally would remove ~2.8 ms).
+
+### 14.1 The INT8 (IMMA) backend (`bdp_imma.cu`) — the Blackwell production path
+
+Because Hopper/Blackwell dropped b1 BMMA, a third backend covers the 2×5090 box:
+`mma.m16n8k32.s8` via inline PTX (documented fragment↔thread mappings, which is
+what makes register-side bit expansion legitimate) — **built, parity-proven, and
+ncu-optimized on the Ada dev card by forcing it over the locally-faster b1 path**
+(`scan_weighted_imma`), and compiled as real SASS for sm_120 by the project's
+gencode set, so the build itself is the Blackwell compile-check.
+
+Structure: identical to the b1 backend (same chunk grid, ballot ranks, rank
+windows, global accumulators, shared finalize kernel) with the MMA core swapped:
+a warp computes a 16×8 tile over 16 K-steps; the sign bits stay **packed** in
+the arena and each thread expands the nibbles it needs into fragment lanes in
+registers — the 8× inflation never exists in memory. The winning encoding is
+**0/1 (not ±1)**: the MMA then accumulates `m11 = popc(q AND t)` and
+
+```
+agreement = 512 − popc(q) − popc(t) + 2·m11
+```
+
+with the per-row popcounts staged next to the bits — exact integers, two ops
+cheaper per fragment (measured ~25% off the whole kernel: accum 13.8 → 10.6 ms
+on sm_89; a ±1 register-caching variant was tried and REVERTED — 93 regs halved
+occupancy). The register epilogue run-merges each thread's 4 accumulator
+elements (adjacent-token pairs) with no staging buffer at all.
+
+Measured on the dev card (sm_89, real substrate): IMMA scan ~14–18 ms — slower
+than b1 (~10 ms) as expected, faster than scalar (~18–21 ms), votes bit-identical
+to both (the 3-way adversarial parity test asserts full bit equality). Projected
+on one RTX 5090 (~2.9× SM×clock, PCIe 5, 7970X host): accum ~3.5 ms, **scan
+~6 ms — inside the 3–10 ms target on the production hardware**. Backend ladder:
+b1 (sm_75..89) → IMMA (sm_80+, incl. Hopper/Blackwell) → scalar (universal).

@@ -48,4 +48,68 @@ extern "C" {
         out_vote: *mut f32,
         stream: *mut c_void,
     );
+
+    /// Whether the BMMA backend can run on the current device: b1 tensor-core
+    /// hardware (sm_75..sm_89) AND a loadable kernel image in the embedded
+    /// fatbin (probed via `cudaFuncGetAttributes` — SASS is minor-version
+    /// specific, so capability alone over-promises). The caller falls down its
+    /// backend ladder when this reports 0.
+    pub fn bdp_bmma_supported() -> i32;
+
+    /// Launch the tensor-core (b1 BMMA) BDP scan on `stream` — the PAGED gallery
+    /// only (`page_ptr`/`pos_map` required, `gw == 8`). Emits the same
+    /// `(out_case, out_vote)` layout as [`run_batched_bdp_scan`]; the integer
+    /// per-case statistics are identical to the scalar kernel's, and the float
+    /// finalize is the shared `bdp_vote`. Requires each segment's gallery cases
+    /// to be non-decreasing over the scan order (the index builder sorts its
+    /// windows by case). Returns 0 on success, 1 when this device/geometry
+    /// cannot run the BMMA path, or a negative cudaError code.
+    pub fn run_bmma_bdp_scan(
+        gallery_case: *const u32,
+        probe_words: *const u64,
+        seg_tok_start: *const i32,
+        seg_case_start: *const i32,
+        page_ptr: *const u64,
+        pos_map: *const u32,
+        n_tokens: i32,
+        n_probe_tokens: i32,
+        n_groups: i32,
+        n_segments: i32,
+        n_cases: i32,
+        gw: i32,
+        wpt: i32,
+        out_case: *mut i32,
+        out_vote: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Whether the IMMA backend can run on the current device: INT8 MMA
+    /// hardware (sm_80+) AND a loadable kernel image in the embedded fatbin
+    /// (the build ships sm_89 and sm_120 SASS + compute_120 PTX — probed via
+    /// `cudaFuncGetAttributes`, so the answer tracks the build's arch set).
+    pub fn bdp_imma_supported() -> i32;
+
+    /// Launch the INT8 tensor-core (IMMA) BDP scan — the Blackwell-portable
+    /// twin of [`run_bmma_bdp_scan`]: identical inputs, contract, and integer
+    /// statistics (0/1-encoded operands accumulate `m11 = popc(q AND t)`, and
+    /// `agreement = 512 - popc(q) - popc(t) + 2*m11` exactly), with the shared
+    /// finalize emitting bit-matching votes.
+    pub fn run_imma_bdp_scan(
+        gallery_case: *const u32,
+        probe_words: *const u64,
+        seg_tok_start: *const i32,
+        seg_case_start: *const i32,
+        page_ptr: *const u64,
+        pos_map: *const u32,
+        n_tokens: i32,
+        n_probe_tokens: i32,
+        n_groups: i32,
+        n_segments: i32,
+        n_cases: i32,
+        gw: i32,
+        wpt: i32,
+        out_case: *mut i32,
+        out_vote: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
 }

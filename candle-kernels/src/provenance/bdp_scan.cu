@@ -7,20 +7,26 @@
 // gate + per-case tally run on the host, identical to the CPU path — so this
 // kernel only produces the per-(query-token, group) `(leading_case, vote)` pairs.
 //
-// This design is the empirically-fastest of several tried (thread-per-query-token
-// with a shared gallery and scalar accumulators, and a broadcast-read variant,
-// both measured ~3x slower): a **query-token tile per block** with the tile loop
-// **fully unrolled**, issuing `BDP_TQ` independent popcount chains per gallery
-// token (high ILP). The paged scan is **latency-bound** (Nsight: ~63% memory-pipe,
-// ~48% of stalls waiting on the shared-memory `qg` reads, DRAM idle / L2-resident).
-// Two tuned knobs mitigate that: `BDP_GTOK` register-blocks the gallery dimension
-// so each `qg` word is read from shared once and reused across BDP_GTOK tokens,
-// and `__launch_bounds__(128, 6)` trades a little ILP for occupancy. The tuned
-// point is `BDP_TQ=8, BDP_GTOK=2, minBlocks=6`; a sweep found `BDP_GTOK>2` spills
+// This is the SCALAR backend — the fallback for devices without b1 BMMA tensor
+// cores (Hopper/Blackwell dropped them) and the differential-testing oracle for
+// the production tensor-core backend in `bdp_bmma.cu` (which computes the same
+// integer statistics ~2-3x faster and shares `bdp_vote.cuh`, so their votes
+// bit-match).
+//
+// The design is the empirically-fastest scalar form of several tried
+// (thread-per-query-token with a shared gallery and scalar accumulators, and a
+// broadcast-read variant, both measured ~3x slower): a **query-token tile per
+// block** with the tile loop **fully unrolled**, issuing `BDP_TQ` independent
+// popcount chains per gallery token (high ILP). The paged scan is
+// **latency-bound** (Nsight: ~63% memory-pipe, ~48% of stalls waiting on the
+// shared-memory `qg` reads, DRAM idle / L2-resident). Two tuned knobs mitigate
+// that: `BDP_GTOK` register-blocks the gallery dimension so each `qg` word is
+// read from shared once and reused across BDP_GTOK tokens, and
+// `__launch_bounds__(128, 6)` trades a little ILP for occupancy. The tuned point
+// is `BDP_TQ=8, BDP_GTOK=2, minBlocks=6`; a sweep found `BDP_GTOK>2` spills
 // registers and `minBlocks=4`/`BDP_TQ=16` regress. The remaining wall is the
-// shared-`qg` broadcast throughput, which further tuning does not crack — a
-// ground-up redesign (query words in registers via warp-shuffle, or a
-// register-tiled binary GEMM) is the path below this.
+// shared-`qg` broadcast volume, inherent to scalar issue — the tensor-core
+// backend removes it entirely by folding the broadcast into the BMMA operand.
 //
 // Layout tricks:
 //  * **Group-major** gallery `[group][token][gw]` → consecutive threads read
@@ -36,6 +42,8 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+
+#include "bdp_vote.cuh"
 
 // Locked folded-signature group width (4 heads x 128 bits = 8 u64).
 #define BDP_MAX_GW 8
@@ -261,19 +269,8 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
             out_case[oi] = -1;
             out_vote[oi] = 0.0f;
         } else {
-            const float n_gal = (float)(tok1 - tok0);
-            const float mean = (float)s_sum[i] / n_gal;
-            float var = (float)s_sumsq[i] / n_gal - mean * mean;
-            if (var < 1e-6f) {
-                var = 1e-6f;
-            }
-            float z = ((float)top1 - mean) / sqrtf(var);
-            if (z < 0.0f) {
-                z = 0.0f;
-            }
-            const float margin = (float)(top1 - top2);
             out_case[oi] = case0 + top1c; // GLOBAL case id
-            out_vote[oi] = z * margin;
+            out_vote[oi] = bdp_vote(top1, top2, s_sum[i], s_sumsq[i], tok1 - tok0);
         }
     }
 }
