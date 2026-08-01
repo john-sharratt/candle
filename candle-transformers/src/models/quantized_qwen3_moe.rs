@@ -1346,6 +1346,20 @@ impl ModelWeights {
         };
         #[cfg(feature = "cuda")]
         if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
+            // Guard the governor's Critical-rung pool trim against the hot→warm
+            // migrate's captured arena base pointers. The trim's `cuMemPoolTrimTo`
+            // synchronously unmaps pool memory process-wide, and the sync-hook lives
+            // in candle-core (below candle-nn) so it can't reach candle-nn's
+            // arena-topology relief guard. Registered here (candle-transformers is
+            // above candle-nn): the wrapper holds `try_enter_relief` across the trim,
+            // and skips it while a migrate is capturing pointers — otherwise the
+            // in-flight select/quantize/kv_migrate kernels read an unmapped base
+            // pointer (`CUDA_ERROR_ILLEGAL_ADDRESS`).
+            candle::vram::set_pool_trim_guard(Box::new(|trim| {
+                if let Some(_relief) = candle_nn::kv_cache::try_enter_relief() {
+                    trim();
+                }
+            }));
             match candle::vram::VramGovernor::from_device(device, gpu_id) {
                 Ok(gov) => {
                     let mut balloon =

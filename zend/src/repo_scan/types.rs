@@ -178,4 +178,9 @@ pub struct RepoMap {
     pub files_skipped_oversize: usize,
     /// Files skipped because their extension wasn't allowlisted.
     pub files_skipped_extension: usize,
+    /// Files skipped because their content is binary (a NUL byte in the sniff
+    /// prefix) despite carrying an allowlisted extension — e.g. a compiled CUDA
+    /// fatbin ELF dump checked in as `*.txt`. Carving one produces hundreds of
+    /// garbage scopes that blow the ingest co-batch's VRAM budget.
+    pub files_skipped_binary: usize,
 }

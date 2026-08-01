@@ -762,6 +762,7 @@ mod tests {
             0,
             &TombstonePayload {
                 timeline_id: dead_tl,
+                turn_index: None,
                 reason: None,
             }
             .encode(),

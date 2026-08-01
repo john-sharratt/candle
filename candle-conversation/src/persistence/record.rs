@@ -821,6 +821,15 @@ impl DebugIdPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TombstonePayload {
     pub timeline_id: u64,
+    /// When `Some`, this tombstone kills only ONE TURN — the
+    /// `(timeline_id, turn_index)` pair — instead of the whole timeline. Used by
+    /// the per-layer `drop_turn` corrupt-turn policy so a single unrecoverable
+    /// turn (e.g. a partial write) doesn't take its whole conversation with it.
+    /// `None` tombstones the entire timeline (the default, and every pre-existing
+    /// tombstone). Skipped from the serialized record when `None`, so a
+    /// timeline-level tombstone stays byte-identical to the pre-`turn_index` format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u32>,
     /// Why the timeline was tombstoned, when known — e.g.
     /// `"corrupt reload (turn N): <detail>"` for a turn dropped during substrate
     /// reconstruction because its persisted state was inconsistent. Diagnostic
@@ -854,6 +863,7 @@ mod tombstone_payload_tests {
         // identically and new reason-less tombstones don't change the byte layout.
         let p = TombstonePayload {
             timeline_id: 77,
+            turn_index: None,
             reason: None,
         };
         assert_eq!(p.encode(), br#"{"timeline_id":77}"#.to_vec());
@@ -863,6 +873,7 @@ mod tombstone_payload_tests {
     fn reason_is_serialised_when_present() {
         let p = TombstonePayload {
             timeline_id: 42,
+            turn_index: None,
             reason: Some("corrupt reload (turn 1): chunk mismatch".to_string()),
         };
         assert_eq!(
@@ -883,6 +894,7 @@ mod tombstone_payload_tests {
     fn round_trips_with_reason() {
         let p = TombstonePayload {
             timeline_id: 5,
+            turn_index: None,
             reason: Some("corrupt reload".to_string()),
         };
         assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);

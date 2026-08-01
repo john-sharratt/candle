@@ -95,7 +95,7 @@ pub enum ModelArch {
 /// | `Qwen2_0_5B` | 0.5 B | Q4_0 | Qwen2 | ChatML | ~0.4 GB |
 /// | `Hermes3_3B_Q6` | 3 B | Q6_K | Llama | ChatML | ~3 GB |
 /// | `Hermes3_70B_Q4` | 70 B | Q4_K_M | Llama | ChatML | ~40 GB |
-/// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~16 GB (LRU) |
+/// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
@@ -113,8 +113,8 @@ pub enum Model {
     Qwen3_14B_Q6,
 
     // ── Qwen3 MoE ──────────────────────────────────────────────────────
-    /// Qwen3-30B-A3B Q4_K_M — MoE, 128 experts, 8 active (~16 GB with LRU).
-    Qwen3_30B_A3B_Q4,
+    /// Qwen3-30B-A3B Q6_K — MoE, 128 experts, 8 active (~25 GB with LRU).
+    Qwen3_30B_A3B_Q6,
 
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
@@ -216,7 +216,7 @@ impl Model {
             Model::Qwen3_14B_Q5 => qwen3::qwen3_14b_q5(),
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
-            Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
+            Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2
             Model::Qwen2_0_5B => qwen2::qwen2_0_5b(),
             // Hermes-3 / Llama

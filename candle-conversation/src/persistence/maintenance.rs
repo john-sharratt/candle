@@ -390,6 +390,7 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             chunk_index: 0,
             payload: TombstonePayload {
                 timeline_id: t.raw(),
+                turn_index: None,
                 reason: None,
             }
             .encode(),

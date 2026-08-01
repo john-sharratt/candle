@@ -342,10 +342,17 @@ impl VramGovernor {
         let reuse_dev = device.clone();
         let gov = Self::new(gpu_id, probe, config)
             .with_sync_hook(Box::new(move || {
-                let _ = sync_dev.synchronize();
-                if let crate::Device::Cuda(d) = &sync_dev {
-                    let _ = d.trim_pool(0);
-                }
+                // Trim under the registered arena-topology guard: `trim_pool(0)`
+                // (`cuMemPoolTrimTo`) synchronously unmaps freed pool memory, which
+                // would fault an in-flight hot→warm migrate's captured base pointers.
+                // Skipped (freed bytes stay pooled, returned on a later pass) while a
+                // migrate holds the topology. No guard registered → runs directly.
+                guarded_pool_trim(|| {
+                    let _ = sync_dev.synchronize();
+                    if let crate::Device::Cuda(d) = &sync_dev {
+                        let _ = d.trim_pool(0);
+                    }
+                });
             }))
             // Reusable pool free-list: freed KV memory the pool holds but a new
             // allocation reuses with no new OS allocation (§ vram_budget_available).
@@ -395,6 +402,39 @@ pub fn install(governor: Arc<VramGovernor>) {
 /// The governor for `gpu_id`, if installed.
 pub fn get(gpu_id: usize) -> Option<Arc<VramGovernor>> {
     registry().lock().unwrap().get(&gpu_id).cloned()
+}
+
+/// A process-global guard wrapper for the async-pool trim. `cuMemPoolTrimTo`
+/// (via [`crate::CudaDevice::trim_pool`]) **synchronously unmaps** freed pool
+/// memory process-wide, which is unsafe while another subsystem has captured raw
+/// device base pointers with no lock held — candle-nn's hot→warm KV migrate
+/// builds a dense per-arena base-pointer table and launches kernels that
+/// dereference it, unlocked, on the persistence thread. candle-nn's own trim
+/// paths hold its arena-topology relief guard, but the governor's Critical-rung
+/// sync-hook lives HERE in candle-core — below candle-nn — and cannot reach that
+/// guard. So the hot→warm layer registers a wrapper that acquires the guard
+/// *around* the trim; unregistered (tests / non-KV use), the trim runs directly.
+///
+/// The wrapper receives the trim closure and decides whether / when to run it,
+/// holding the guard for the trim's whole duration. (A bare "is a migrate in
+/// flight?" pre-check is a TOCTOU race — a migrate can start right after the
+/// check; safety needs the guard held across the trim.)
+type PoolTrimGuard = Box<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
+static POOL_TRIM_GUARD: OnceLock<PoolTrimGuard> = OnceLock::new();
+
+/// Register the arena-topology guard wrapper for the governor's pool trim (see
+/// [`PoolTrimGuard`]). Idempotent — the first registration wins.
+pub fn set_pool_trim_guard(guard: PoolTrimGuard) {
+    let _ = POOL_TRIM_GUARD.set(guard);
+}
+
+/// Run `trim` under the registered pool-trim guard, or directly if none is set.
+#[allow(dead_code)] // the only caller (the governor sync-hook trim) degenerates on non-CUDA builds
+fn guarded_pool_trim(mut trim: impl FnMut()) {
+    match POOL_TRIM_GUARD.get() {
+        Some(g) => g(&mut trim),
+        None => trim(),
+    }
 }
 
 /// Remove the governor for `gpu_id` (test cleanup).

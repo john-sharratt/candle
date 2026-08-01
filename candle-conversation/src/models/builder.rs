@@ -7,10 +7,12 @@ use crate::config::{
 };
 use crate::error::ConversationError;
 use crate::models::DialectType;
+use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tree::ConversationTreeConfig;
 use candle::Device;
 use candle_nn::{arena_chunks_for_format, CHUNK_SIZE};
 use candle_transformers::models::batched_model::BatchedInference;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -109,6 +111,11 @@ pub struct ModelBuilder {
     /// new conversations are not registered for summarisation (the AVL summary
     /// forest is left un-extended). Off by default.
     disable_summariser: bool,
+    /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
+    /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
+    /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
+    /// by default ⇒ every layer defaults to `DropConversation`.
+    layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
 }
 
 impl ModelBuilder {
@@ -134,8 +141,20 @@ impl ModelBuilder {
             max_hot_turns: 0,
             workspace_path: None,
             disable_summariser: false,
+            layer_corrupt_turn: HashMap::new(),
             spec,
         }
+    }
+
+    /// Set the per-layer corrupt-turn policy map (from the projection schema).
+    /// Forwarded to the engine so the startup reload applies the right policy per
+    /// layer — `drop_conversation` for ingest layers, `drop_turn` for dialogue.
+    pub fn corrupt_turn_policies(
+        mut self,
+        policies: HashMap<LayerId, CorruptTurnPolicy>,
+    ) -> ModelBuilder {
+        self.layer_corrupt_turn = policies;
+        self
     }
 
     /// Disable the background summariser thread (and the per-conversation
@@ -564,6 +583,7 @@ impl ModelBuilder {
 
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.disable_summariser = self.disable_summariser;
+        ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Stress test: uniform-K pin REMOVED — both K and V now use fully
         // adaptive per-(head,palette) selection with non-identity pal_maps,

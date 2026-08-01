@@ -20,10 +20,10 @@ use tokio::io::AsyncWriteExt;
 // each dropped one half of that toggle, so neither can do both. Keep these in
 // sync with the library spec in `candle-conversation/src/models/qwen3_moe.rs`.
 const MODEL_REPO: &str = "unsloth/Qwen3-30B-A3B-GGUF";
-const MODEL_FILE: &str = "Qwen3-30B-A3B-Q4_K_M.gguf";
+const MODEL_FILE: &str = "Qwen3-30B-A3B-Q6_K.gguf";
 const TOK_REPO: &str = "Qwen/Qwen3-30B-A3B";
 const TOK_FILE: &str = "tokenizer.json";
-const MODEL_BYTES: u64 = 17_100_000_000; // ~17 GB; fallback when Content-Length absent
+const MODEL_BYTES: u64 = 25_092_532_800; // ~25 GB (Q6_K); fallback when Content-Length absent
 
 // ── Public API ────────────────────────────────────────────────────────────────
 

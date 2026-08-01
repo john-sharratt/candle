@@ -66,8 +66,9 @@ use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, LayerDials,
-    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
+    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
+    SectionTree,
     SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
@@ -494,6 +495,11 @@ struct YamlLayer {
     /// tokens land per completed prefill (the dialogue layer is `high`).
     #[serde(default)]
     decode_priority: YamlDecodePriority,
+    /// What to do with a turn that's unrecoverable on reload. `drop_conversation`
+    /// (default) tombstones the whole conversation; `drop_turn` tombstones only the
+    /// corrupt turn — set on the dialogue layer so one bad turn doesn't drop the chat.
+    #[serde(default)]
+    on_corrupt_turn: YamlCorruptTurnPolicy,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -519,6 +525,23 @@ impl From<YamlDecodePriority> for DecodePriority {
             YamlDecodePriority::Low => DecodePriority::Low,
             YamlDecodePriority::Normal => DecodePriority::Normal,
             YamlDecodePriority::High => DecodePriority::High,
+        }
+    }
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum YamlCorruptTurnPolicy {
+    #[default]
+    DropConversation,
+    DropTurn,
+}
+
+impl From<YamlCorruptTurnPolicy> for CorruptTurnPolicy {
+    fn from(y: YamlCorruptTurnPolicy) -> Self {
+        match y {
+            YamlCorruptTurnPolicy::DropConversation => CorruptTurnPolicy::DropConversation,
+            YamlCorruptTurnPolicy::DropTurn => CorruptTurnPolicy::DropTurn,
         }
     }
 }
@@ -781,6 +804,7 @@ fn build(
             policy: layer_policy,
             gather_scope: yl.gather_scope.into(),
             decode_priority: yl.decode_priority.into(),
+            on_corrupt_turn: yl.on_corrupt_turn.into(),
         });
     }
 

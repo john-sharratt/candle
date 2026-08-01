@@ -688,6 +688,27 @@ impl SubstratePersistence {
     pub fn write_tombstone(&mut self, timeline_id: u64, reason: Option<&str>) -> Result<()> {
         let payload = record::TombstonePayload {
             timeline_id,
+            turn_index: None,
+            reason: reason.map(str::to_string),
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Append a **turn-scoped** tombstone — kill only `(timeline_id, turn_index)`,
+    /// leaving the rest of the timeline live. Used by the per-layer `drop_turn`
+    /// corrupt-turn policy so one unrecoverable turn (e.g. a partial write) does
+    /// not drop its whole conversation the way a timeline tombstone would.
+    pub fn write_turn_tombstone(
+        &mut self,
+        timeline_id: u64,
+        turn_index: u32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let payload = record::TombstonePayload {
+            timeline_id,
+            turn_index: Some(turn_index),
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();

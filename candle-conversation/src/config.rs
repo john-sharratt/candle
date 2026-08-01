@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
 use crate::models::Dialect;
+use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::ConversationTreeConfig;
 
@@ -1334,6 +1337,14 @@ pub struct EngineConfig {
     /// forest is left un-extended (provenance scans still work on raw turns).
     /// Off by default; set via `ModelBuilder::disable_summariser`.
     pub disable_summariser: bool,
+
+    /// Per-layer [`CorruptTurnPolicy`] (keyed by `LayerId`), applied when a turn
+    /// is unrecoverable during the startup substrate reload. Set on the substrate
+    /// in `ConversationEngine::new` *before* the reload thread is spawned, so the
+    /// reload sees the right policy per layer (empty ⇒ every layer defaults to
+    /// `DropConversation`). Populated by `ModelBuilder::corrupt_turn_policies`
+    /// from the projection schema. Empty by default.
+    pub layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
 }
 
 impl EngineConfig {
@@ -1361,6 +1372,7 @@ impl EngineConfig {
             tokenizer: None,
             dialect: Dialect::chat_ml(),
             disable_summariser: false,
+            layer_corrupt_turn: HashMap::new(),
         }
     }
 }

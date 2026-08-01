@@ -1476,4 +1476,31 @@ mod real_cuda {
         }
         Ok(())
     }
+
+    /// The pool trim routes through the registered arena-topology guard: the
+    /// wrapper decides whether the trim runs. Here it records the call and SKIPS
+    /// the trim (as it would while a migrate holds the topology). OnceLock —
+    /// first registration wins, so this is the only test that sets the guard.
+    #[test]
+    fn guarded_pool_trim_routes_through_the_registered_guard() {
+        static GUARD_CALLS: AtomicU64 = AtomicU64::new(0);
+        static TRIM_RUNS: AtomicU64 = AtomicU64::new(0);
+        set_pool_trim_guard(Box::new(|_trim| {
+            GUARD_CALLS.fetch_add(1, Ordering::SeqCst);
+            // Deliberately do NOT call `_trim` — the trim is skipped this pass.
+        }));
+        guarded_pool_trim(|| {
+            TRIM_RUNS.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            GUARD_CALLS.load(Ordering::SeqCst),
+            1,
+            "the registered guard wrapper was invoked"
+        );
+        assert_eq!(
+            TRIM_RUNS.load(Ordering::SeqCst),
+            0,
+            "the guard skipped the underlying trim"
+        );
+    }
 }

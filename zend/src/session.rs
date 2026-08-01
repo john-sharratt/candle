@@ -551,7 +551,7 @@ impl InferenceState {
         // expanded by `preemptive_prefill` itself.
         let before_text: String = pre_collection_prelude(&proj_builder);
 
-        let mut builder = Model::Qwen3_30B_A3B_Q4
+        let mut builder = Model::Qwen3_30B_A3B_Q6
             .builder()
             .system_prompt(&before_text)
             .model_path(model_path)
@@ -567,7 +567,18 @@ impl InferenceState {
             .thinking(true)
             // `--disable-summariser`: bring the engine up without the AVL
             // summary-forest thread (e.g. for bulk corpus prefill).
-            .disable_summariser(disable_summariser);
+            .disable_summariser(disable_summariser)
+            // Per-layer corrupt-turn policy (from the projection schema): the
+            // startup reload drops the whole conversation for ingest layers and
+            // only the corrupt turn for dialogue.
+            .corrupt_turn_policies(
+                proj_builder
+                    .schema()
+                    .layers
+                    .iter()
+                    .map(|l| (l.id, l.on_corrupt_turn))
+                    .collect(),
+            );
         let conv_config = builder.conversation_config();
 
         // Per-layer progress callback — the library reports
@@ -1221,16 +1232,47 @@ impl InferenceState {
                     ingest_convs.insert(il.name.clone(), IngestConv::Folders { sequence, state });
                 }
                 IngestMode::Files => {
-                    // Only the FIRST load ingests on the blocking critical path. Once
-                    // the substrate holds an ingest, a restart attaches it as-is and
-                    // defers reconciling files that drifted while the daemon was down
+                    // The blocking critical-path ingest runs on the first load AND
+                    // whenever a prior ingest is INCOMPLETE. Only once the substrate
+                    // holds a *complete* ingest does a restart attach it as-is and
+                    // defer reconciling files that drifted while the daemon was down
                     // (new / changed / deleted) to the post-load background refresh —
-                    // so a large workspace no longer re-prefills its way to `ready`.
+                    // so a large, fully-ingested workspace no longer re-prefills its
+                    // way to `ready`.
+                    //
+                    // Completeness is measured against the walk: `content_sha256` (the
+                    // key behind `file_hashes`) is withheld until a file's ingest
+                    // *succeeds*, so any currently-walked file missing from
+                    // `file_hashes` is genuinely un-ingested — e.g. a prior run that
+                    // aborted mid-ingest (out of VRAM). Those files MUST ingest on the
+                    // blocking load path, not silently defer to the background refresh
+                    // (which would let the daemon reach `ready` with a half-populated
+                    // substrate). The walk is a cheap filesystem listing (cached per
+                    // folder); the expensive prefill is still skipped for the files
+                    // already covered.
                     let prior = crate::code_read::code_read_state_from_substrate(&engine);
-                    let state = if prior.file_hashes.is_empty() {
-                        let map = walk_cache
-                            .entry(il.folder.clone())
-                            .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache
+                        .entry(il.folder.clone())
+                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let uncovered = map
+                        .files
+                        .iter()
+                        .filter(|f| !prior.file_hashes.contains_key(&f.path))
+                        .count();
+                    let state = if uncovered > 0 {
+                        // First load OR an incomplete prior ingest: run the blocking
+                        // ingest. It is incremental — files already carrying
+                        // `content_sha256` are skipped via the resume cache, so only
+                        // the uncovered / changed files actually re-prefill.
+                        if !prior.file_hashes.is_empty() {
+                            tracing::info!(
+                                layer = %il.name,
+                                ingested = prior.file_hashes.len(),
+                                uncovered,
+                                "code_read: prior ingest is INCOMPLETE — resuming the blocking \
+                                 load ingest for the uncovered files (not bypassing to ready)",
+                            );
+                        }
                         crate::code_read::ingest_code_reading(
                             &engine,
                             proj_builder_refresh.clone(),
@@ -1242,21 +1284,23 @@ impl InferenceState {
                             &il.group,
                         )?
                     } else {
-                        // The blocking ingest is skipped, but its per-load layer setup
-                        // must still run: mark the layer append-only (in-memory flag,
-                        // lost on restart) so belief scoring stays self-local and the
-                        // normalization warm-up recognises it as an ingest layer and
-                        // learns each file's hit level. Without this the warm-up skips
-                        // the layer and every query collapses onto the promiscuous
-                        // low-entropy files at an un-normalized (cold) score.
+                        // Complete prior ingest: skip the blocking ingest, but its
+                        // per-load layer setup must still run: mark the layer
+                        // append-only (in-memory flag, lost on restart) so belief
+                        // scoring stays self-local and the normalization warm-up
+                        // recognises it as an ingest layer and learns each file's hit
+                        // level. Without this the warm-up skips the layer and every
+                        // query collapses onto the promiscuous low-entropy files at an
+                        // un-normalized (cold) score.
                         if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
                             engine.lock().unwrap().mark_layer_append_only(layer_id);
                         }
                         tracing::info!(
                             layer = %il.name,
                             files = prior.file_hashes.len(),
-                            "code_read: prior ingest present in substrate — skipping the blocking \
-                             load ingest; new/changed/deleted files reconcile in the background",
+                            "code_read: prior ingest present and complete in substrate — skipping \
+                             the blocking load ingest; new/changed/deleted files reconcile in the \
+                             background",
                         );
                         prior
                     };

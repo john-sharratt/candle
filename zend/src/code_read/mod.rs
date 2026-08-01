@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::{utility_config, FileEntry, Language, RepoMap};
+use crate::repo_scan::{is_binary_sample, utility_config, FileEntry, Language, RepoMap, MAX_FILE_BYTES};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use types::Scope;
@@ -303,6 +303,25 @@ fn carve_workspace(
     let mut state = CodeReadState::default();
     for file in &map.files {
         let path = workspace.join(&file.path);
+        // Size guard (defense-in-depth with `walk_workspace`): the explicit-path
+        // ingest builds its own `FileEntry` list and bypasses the walk's size cap,
+        // so re-enforce it here — a huge file carves into thousands of scopes and
+        // is never worth reading into RAM in the first place.
+        match fs::metadata(&path) {
+            Ok(m) if m.len() > MAX_FILE_BYTES => {
+                tracing::debug!(
+                    file = %file.path,
+                    bytes = m.len(),
+                    "code_read: skip oversize file (> MAX_FILE_BYTES)",
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(file = %file.path, "code_read: skip unreadable file: {e}");
+                continue;
+            }
+        }
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -310,6 +329,15 @@ fn carve_workspace(
                 continue;
             }
         };
+        // Content guard (defense-in-depth with `walk_workspace`'s sniff): a binary
+        // blob that reached here via the explicit-path ingest — which builds its
+        // own `FileEntry` list and bypasses the walk — is rejected before it carves
+        // into hundreds of garbage scopes. Statistical, not just a NUL check (see
+        // `is_binary_sample`), so NUL-free binaries are caught too.
+        if is_binary_sample(&bytes) {
+            tracing::debug!(file = %file.path, "code_read: skip binary file (content sniff)");
+            continue;
+        }
         // Split over-long lines (a minified / one-line file) at safe points so the
         // line-based carve can chunk it and no turn blows the token budget. Normal
         // files pass through untouched. The split bytes flow to carve, the resume

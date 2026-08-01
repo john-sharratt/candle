@@ -940,6 +940,10 @@ layers:
     # most — a co-running background prefill is throttled to 1 layer of progress
     # per ~64 decode tokens (docs/continuous_fair_waves.md).
     decode_priority: high
+    # If one dialogue turn is unrecoverable on reload (e.g. a partial write), drop
+    # only that turn — never the whole conversation (unlike the ingest layers,
+    # where one file is one timeline and dropping it triggers a clean re-ingest).
+    on_corrupt_turn: drop_turn
     budget:
       priority: 100
       min_percent: 50    # dialogue keeps at least half its own window

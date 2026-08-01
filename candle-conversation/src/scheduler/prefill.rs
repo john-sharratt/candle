@@ -50,6 +50,53 @@ fn vram_decode_band() -> usize {
     })
 }
 
+/// Per-**sequence** transient-activation reserve for a LOAD-phase (prefill /
+/// ingest) forward, in bytes. The reserve band grows by this coefficient for
+/// each sequence co-batched into the imminent forward (see `vram_band_for`),
+/// so a wide batch — which a large card admits — reserves in proportion to its
+/// peak instead of a flat card fraction. Default 384 MiB: a prefill/ingest
+/// sequence's activation buffers plus its share of the MoE expert gather.
+/// Override with `CANDLE_VRAM_PER_SEQ_LOAD_MB` (the true value depends on the
+/// model's per-token activation footprint and prefill width). Cached on first read.
+const DEFAULT_VRAM_PER_SEQ_LOAD_MB: usize = 384;
+fn per_seq_load_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb = std::env::var("CANDLE_VRAM_PER_SEQ_LOAD_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(DEFAULT_VRAM_PER_SEQ_LOAD_MB);
+        mb * 1024 * 1024
+    })
+}
+
+/// Per-sequence reserve for a DECODE-phase forward, in bytes. Much smaller than
+/// the load coefficient — a decode step advances ~1 token per sequence, so the
+/// activation buffers are tiny and only the MoE expert gather is shared across
+/// the batch. Default 48 MiB; override with `CANDLE_VRAM_PER_SEQ_DECODE_MB`.
+const DEFAULT_VRAM_PER_SEQ_DECODE_MB: usize = 48;
+fn per_seq_decode_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb = std::env::var("CANDLE_VRAM_PER_SEQ_DECODE_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(DEFAULT_VRAM_PER_SEQ_DECODE_MB);
+        mb * 1024 * 1024
+    })
+}
+
+/// Combine the card-fraction `base` band with the width-scaled term
+/// (`width × per_seq`), clamping the width term to a third of `capacity` so a
+/// width spike can never strand the whole device. Pure — the arithmetic core of
+/// `vram_band_for`, unit-tested in isolation.
+fn combine_band(base: usize, width: usize, per_seq: usize, capacity: usize) -> usize {
+    let width_term = width.saturating_mul(per_seq).min(capacity / 3);
+    base.max(width_term)
+}
+
 /// The phase a VRAM pressure/relief decision is made in. The freed-float
 /// free-list (`pool_reserved − pool_used`) is genuinely reusable working space,
 /// but *what it is available FOR* differs by phase, so the reserve band does too:
@@ -526,15 +573,41 @@ impl Scheduler {
     /// The pressure/relief reserve band for `phase`. `Load` keeps the wide
     /// transient-peak reserve; `Decode` keeps only a thin safety margin so the
     /// freed-float free-list counts as available and KV stays maximally resident.
-    /// See [`VramPhase`]. Without a governor, both fall back to the fixed load
-    /// band (the capacity term needs the governor).
+    /// See [`VramPhase`]. Without a governor, falls back to the fixed load band
+    /// (the capacity + width terms need the governor).
+    ///
+    /// The band is the larger of two adaptive terms:
+    /// - a **card fraction** (`capacity/10` load, `/20` decode) — scales with the
+    ///   device, and
+    /// - a **width term** (`co-batched sequences × per-seq activation`) — scales
+    ///   with the batch actually in flight.
+    ///
+    /// The width term is the fix for wide-batch OOM: a big card admits a wide
+    /// ingest co-batch whose transient activation peak exceeds the flat card
+    /// fraction (with larger model weights leaving less spare, that peak spills →
+    /// `CUDA_ERROR_OUT_OF_MEMORY`). Reserving in proportion to the width in flight
+    /// makes real headroom before the forward competes for it. A small card only
+    /// admits a narrow batch, so the width term stays under the card fraction and
+    /// the reserve is unchanged there. Clamped to a third of the card so a width
+    /// spike can never strand the whole device.
     fn vram_band_for(&self, phase: VramPhase) -> usize {
-        let cap = self.session.vram_governor().map(|g| g.capacity() as usize);
-        match (phase, cap) {
-            (VramPhase::Load, Some(c)) => (c / 10).max(vram_budget_band()),
-            (VramPhase::Decode, Some(c)) => (c / 20).max(vram_decode_band()),
-            (_, None) => vram_budget_band(),
-        }
+        let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
+            // No governor (legacy / non-WDDM path): fixed band, no capacity or
+            // width term to reason against.
+            return vram_budget_band();
+        };
+        let base = match phase {
+            VramPhase::Load => (c / 10).max(vram_budget_band()),
+            VramPhase::Decode => (c / 20).max(vram_decode_band()),
+        };
+        let (width, per_seq) = match phase {
+            VramPhase::Load => (
+                self.prefill_width() + self.section_ingest_width(),
+                per_seq_load_bytes(),
+            ),
+            VramPhase::Decode => (self.decode_width(), per_seq_decode_bytes()),
+        };
+        combine_band(base, width, per_seq, c)
     }
 
     /// Phase-aware VRAM pressure signal — see [`VramPhase`] for why the band
@@ -2913,6 +2986,51 @@ mod host_ram_floor_tests {
             assert!(
                 floor >= 2 * GIB,
                 "floor must keep at least 2 GiB of migration headroom"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vram_band_tests {
+    use super::combine_band;
+
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+
+    #[test]
+    fn width_scales_the_band_and_clamps_to_a_third_of_the_card() {
+        let cap = 72 * GIB;
+        let per_seq = 384 * MIB;
+        let base = cap / 10; // 7.2 GiB card fraction (Load)
+
+        // Narrow batch (small-card / laptop-like admission): the card fraction
+        // dominates — the reserve is unchanged.
+        assert_eq!(combine_band(base, 4, per_seq, cap), base);
+
+        // Wide batch (big card admits 30 seqs): the width term dominates, so the
+        // reserve grows to cover the wider transient peak.
+        let wide = combine_band(base, 30, per_seq, cap);
+        assert_eq!(wide, 30 * per_seq);
+        assert!(wide > base);
+
+        // A width spike can never strand more than a third of the device.
+        assert_eq!(combine_band(base, 100_000, per_seq, cap), cap / 3);
+    }
+
+    #[test]
+    fn small_card_narrow_batch_keeps_the_floor_unchanged() {
+        // 16 GiB laptop: the Load base floors at 2 GiB (16/10 < 2). A narrow
+        // admitted batch keeps the width term under that floor, so the laptop's
+        // headroom is the same as before the width term existed.
+        let cap = 16 * GIB;
+        let base = (cap / 10).max(2 * GIB); // = 2 GiB floor
+        let per_seq = 384 * MIB;
+        for width in [1usize, 2, 4] {
+            assert_eq!(
+                combine_band(base, width, per_seq, cap),
+                base,
+                "narrow width {width} must not raise the small-card band"
             );
         }
     }

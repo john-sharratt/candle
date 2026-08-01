@@ -7,6 +7,7 @@
 //! file-name hashes so a filesystem event triggers
 //! [`refresh_repo_map`] only when something actually changed.
 
+pub mod binary_sniff;
 pub mod cluster;
 pub mod types;
 pub mod walk;
@@ -21,9 +22,10 @@ use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
+pub use binary_sniff::is_binary_sample;
 pub use cluster::{build_clusters, Cluster};
 pub use types::{FileEntry, Language, RepoMap};
-pub use walk::walk_workspace;
+pub use walk::{walk_workspace, MAX_FILE_BYTES};
 
 /// Gather-scope tags for a cluster turn: `["repo_map", <root_dir>]`, with the
 /// workspace-root cluster's empty `root_dir` mapped to `"."` so the tag is a
@@ -205,6 +207,7 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
         n_clusters = clusters.len(),
         skipped_extension = map.files_skipped_extension,
         skipped_oversize = map.files_skipped_oversize,
+        skipped_binary = map.files_skipped_binary,
         "repo map walk + cluster complete",
     );
 
