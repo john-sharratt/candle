@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let tmp = tempfile::tempdir()?;
-    let mut builder = Model::Qwen3_30B_A3B_Q4
+    let mut builder = Model::Qwen3_30B_A3B_Q6
         .builder()
         .sampling(SamplingConfig::top_k_top_p(40, 0.9, 0.5).with_repeat_penalty(1.1))
         .seed(42)
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         .workspace_path(tmp.path());
     let config = builder.conversation_config();
 
-    eprintln!("=== Loading {} ===", Model::Qwen3_30B_A3B_Q4);
+    eprintln!("=== Loading {} ===", Model::Qwen3_30B_A3B_Q6);
     let t0 = Instant::now();
     let engine = builder
         .engine(&device)

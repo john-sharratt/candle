@@ -65,7 +65,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     );
     let start = std::time::Instant::now();
 
-    let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
+    let dialect = Model::Qwen3_30B_A3B_Q6.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
     let mut proj_builder = projection::Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_YAML,
@@ -87,7 +87,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
         tool_sections.len()
     );
 
-    let mut builder = Model::Qwen3_30B_A3B_Q4
+    let mut builder = Model::Qwen3_30B_A3B_Q6
         .builder()
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())

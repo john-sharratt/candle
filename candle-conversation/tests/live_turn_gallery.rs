@@ -71,7 +71,7 @@ fn live_recorded_turn_feeds_tag_scoped_gallery_without_reload() {
     }
 
     // And the tag-scoped gallery admits it immediately.
-    let (windows, slots) = conv.belief_gallery("tools", &["tool".to_string()], |name| {
+    let (windows, slots, _sids) = conv.belief_gallery("tools", &["tool".to_string()], |name| {
         if name == "calculator" {
             Some(7)
         } else {

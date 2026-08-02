@@ -82,7 +82,7 @@ fn load_engine(
     device: &candle::Device,
     ws: &std::path::Path,
 ) -> anyhow::Result<ConversationEngine> {
-    Model::Qwen3_30B_A3B_Q4
+    Model::Qwen3_30B_A3B_Q6
         .builder()
         .seed(42)
         .max_concurrent(4)
@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
     // ── Load 1: seal the summary section, verify it pins KV.
     {
         let engine = load_engine(&device, ws.path())?;
-        let cfg = Model::Qwen3_30B_A3B_Q4.builder().conversation_config();
+        let cfg = Model::Qwen3_30B_A3B_Q6.builder().conversation_config();
         let (proj, dialogue, group, formatted, prelude) = build_projection(&engine, &cfg)?;
         println!("prefix sections before tools: {}", prelude.len());
 
@@ -130,7 +130,7 @@ fn main() -> anyhow::Result<()> {
     // ── Load 2 (restart): re-seal with the same text → restored from disk.
     {
         let engine = load_engine(&device, ws.path())?;
-        let cfg = Model::Qwen3_30B_A3B_Q4.builder().conversation_config();
+        let cfg = Model::Qwen3_30B_A3B_Q6.builder().conversation_config();
         let (proj, dialogue, group, formatted, prelude) = build_projection(&engine, &cfg)?;
         let mut base = engine
             .new_conversation_with_projection(&formatted, proj, dialogue, group, cfg)
