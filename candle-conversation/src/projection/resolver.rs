@@ -14,6 +14,7 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -1393,6 +1394,13 @@ impl Conversation {
         tracing::info!(turns = total, "substrate reconstruct: begin replay loop");
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
+        // Startup integrity repair (`persistence::integrity`): completeness is
+        // judged here — and only here — because reconstruct is the one moment
+        // with no live writer, so on-disk state is final and a half-written
+        // conversation cannot be mistaken for a damaged one.
+        let corpus_has_kv = self.read().any_stream_has_chunks();
+        let mut repaired_integrity = 0usize;
+        let mut integrity_dropped: HashSet<TimelineId> = HashSet::new();
         for (i, mut decl) in decls.into_iter().enumerate() {
             // Report turns processed so far (restored + skipped) so the daemon's
             // loading bar advances steadily even across corrupt-turn skips.
@@ -1558,6 +1566,75 @@ impl Conversation {
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
+            // A timeline already tombstoned by integrity repair this pass:
+            // its remaining turns are dead with it — skip the restore work.
+            if integrity_dropped.contains(&timeline) {
+                continue;
+            }
+            // Completeness verdict — the CRC guards bytes that were written;
+            // this guards records that were never written at all (the async
+            // writer's `Tokens`/sig records can be lost to a hard kill while
+            // the decl and KV chunks landed durably through other channels).
+            let verdict = {
+                let read = self.read();
+                classify_turn(
+                    read.distill_mode(timeline),
+                    decl.block_end > decl.block_start,
+                    !recovered.token_ids.is_empty(),
+                    corpus_has_kv,
+                    cold_refs.is_some(),
+                )
+            };
+            if verdict != TurnIntegrity::Ok {
+                let policy = LayerId::from_raw(decl.layer_id)
+                    .map(|l| self.read().corrupt_turn_policy_for(l))
+                    .unwrap_or_default();
+                match policy {
+                    CorruptTurnPolicy::DropConversation => {
+                        // Regenerable content (code_read files, repo_map
+                        // clusters): tombstone the timeline durably; the owning
+                        // layer's refresh re-ingests it complete. One tombstone
+                        // per timeline per pass — later turns skip above.
+                        repaired_integrity += 1;
+                        integrity_dropped.insert(timeline);
+                        let reason = format!(
+                            "integrity repair (turn {}): {}",
+                            decl.turn_index,
+                            verdict.describe()
+                        );
+                        self.write().tombstone_timeline(timeline);
+                        if let Ok(mut p) = self.persistence.lock() {
+                            match p.write_tombstone(timeline.raw(), Some(&reason)) {
+                                Ok(_) => tracing::info!(
+                                    timeline_id = decl.timeline_id,
+                                    turn_index = decl.turn_index,
+                                    reason = %reason,
+                                    "integrity repair: tombstoned incomplete conversation \
+                                     — the owning layer re-ingests it",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    timeline_id = decl.timeline_id,
+                                    turn_index = decl.turn_index,
+                                    "integrity repair tombstone write failed: {e}",
+                                ),
+                            }
+                        }
+                        continue;
+                    }
+                    CorruptTurnPolicy::DropTurn => {
+                        // Dialogue is user history — never auto-deleted for
+                        // incompleteness. Restore what survived: layout text
+                        // still renders, present KV still attends.
+                        tracing::warn!(
+                            timeline_id = decl.timeline_id,
+                            turn_index = decl.turn_index,
+                            "incomplete turn restored (user history is never \
+                             auto-deleted): {}",
+                            verdict.describe(),
+                        );
+                    }
+                }
+            }
             let token_count = recovered.token_count;
             let mut view = self.write();
             if let (Some(layer), Some(group)) = (
@@ -1624,6 +1701,7 @@ impl Conversation {
             conversations = n_conversations,
             turns = restored,
             skipped_corrupt = skipped_corrupt,
+            repaired_integrity = repaired_integrity,
             "substrate reload complete",
         );
         Ok(restored)
@@ -2219,8 +2297,12 @@ impl Conversation {
     /// record time, so this NEVER blocks the seal on the persistence lock (which a
     /// compaction holds across its whole relocation I/O). Metadata-class: exempt
     /// from the writer's KV byte cap, so a warm→cold backlog can't stall it either.
-    /// Async is crash-safe — a `Tokens` record lost on crash yields an absent turn
-    /// (reconstruct is order-independent + per-turn fault-isolated), never corruption.
+    /// Async loss window: a `Tokens` record that never lands (hard kill before the
+    /// writer drains) does NOT remove the turn — reconstruct restores it from its
+    /// decl with an empty token buffer, since the layout text, KV chunks, and sigs
+    /// persist through their own channels. The startup integrity check
+    /// (`persistence::integrity`) then repairs regenerable layers by re-ingest;
+    /// dialogue turns restore with a warning and render from layout text.
     pub fn enqueue_tokens(&self, stream_id: StreamId, token_ids: Vec<u32>) {
         self.writer.enqueue(WriteJob::Tokens {
             stream_id,

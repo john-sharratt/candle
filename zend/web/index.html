@@ -254,7 +254,7 @@
     substrateUserMsg: null,        // the user message preceding it (the active turn body)
     substrateHistory: [],          // prior conversation messages (verbatim, with roles)
     substrateContent: null,        // name → authored section text (fetched lazily)
-    substrateTurnContent: {},      // "group::index" → { user, assistant } memory-tier body
+    substrateTurnContent: {},      // "group::timeline::index" → { text?, user, assistant, layout } memory-tier body
     substrateTargetLayer: '',      // the dialogue/target layer name (for message prefixes)
     substrateGlue: null,           // dialect framing markers (system/user/assistant start/end)
     substrateGroupOpen: {},        // group key → open? (default closed/collapsed)
@@ -2155,7 +2155,7 @@
     // intra-turn boundary baked in) — never split-and-re-glued. Inter-turn glue
     // comes from the spine. Falls back to the old halves only if `text` is absent.
     const turnInner = (t) => {
-      const tc = TC[t.group + '::' + t.index] || {};
+      const tc = TC[t.group + '::' + t.timeline + '::' + t.index] || {};
       if (tc.text != null) { add(tc.text); return; }
       if (t.kind && t.kind !== 'normal') { add(tc.assistant || tc.user || ''); return; }
       add(tc.user); add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
@@ -2468,11 +2468,11 @@
     // colorized text when a turn has no vector. `noGlue`: the card emits no glue
     // rows of its own; all glue lives inside the segment vector.
     const renderTurn = (t) => {
-      const tc = TCd[t.group + '::' + t.index] || {};
+      const tc = TCd[t.group + '::' + t.timeline + '::' + t.index] || {};
       const isSummary = t.kind && t.kind !== 'normal';
       const full = tc.text != null ? tc.text
         : (isSummary ? (tc.assistant || tc.user || '') : ((tc.user || '') + (tc.assistant || '')));
-      pushMsg('assistant', full, { layer: t.layer || targetLayer, key: 'conv::' + t.group + '::' + t.index, kind: t.kind, reason: t.reason, noGlue: true, colorize: true, layout: tc.layout, label: isSummary ? 'summary' : 'turn', tokens: t.tokens });
+      pushMsg('assistant', full, { layer: t.layer || targetLayer, key: 'conv::' + t.group + '::' + t.timeline + '::' + t.index, kind: t.kind, reason: t.reason, noGlue: true, colorize: true, layout: tc.layout, label: isSummary ? 'summary' : 'turn', tokens: t.tokens });
     };
     const materialized = (node && node.materialized) || [];
     if (materialized.length) {

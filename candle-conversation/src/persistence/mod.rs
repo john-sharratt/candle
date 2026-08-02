@@ -30,6 +30,7 @@ pub mod direct_io;
 pub mod elevate;
 pub mod header_index;
 pub mod inherit;
+pub mod integrity;
 pub mod log_file;
 pub mod maintenance;
 pub mod manifest;

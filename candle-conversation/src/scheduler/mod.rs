@@ -9,6 +9,7 @@ pub mod phase_ring;
 mod prefill;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
+pub mod relief_trace;
 mod run;
 mod sample;
 

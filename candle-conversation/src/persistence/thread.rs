@@ -45,6 +45,7 @@ use super::cold_load::preallocate_pinned_scratch;
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
+use crate::scheduler::relief_trace;
 use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
 use std::collections::HashMap;
 use sysinfo::System;
@@ -792,6 +793,14 @@ fn run_pass(
             "hot→warm pass timing"
         );
     }
+    if hot_to_warm_count > 0 {
+        relief_trace::note(
+            "tier",
+            "hot_to_warm",
+            hot_to_warm_count as u64,
+            hot_to_warm_bytes,
+        );
+    }
     // Feed the instrumented migration panel straight from the pass (no log tail).
     if hot_to_warm_count > 0 {
         crate::scheduler::phase_ring::push_migrate(crate::scheduler::phase_ring::migrate_sample(
@@ -1005,6 +1014,7 @@ fn run_pass(
         Ok(false)
     } {
         Ok(true) => {
+            relief_trace::note("tier", "segment_reclaim", 0, 0);
             tracing::info!(
                 target: "candle_conversation::persistence::tier",
                 "persist: substrate maintenance op applied (segment reclaim)"

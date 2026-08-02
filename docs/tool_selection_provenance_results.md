@@ -6,6 +6,12 @@
 the workspace `.substrate/substrate.log`. Companion to the idea catalogue in
 [`tool_selection_provenance_ideas.md`](tool_selection_provenance_ideas.md). §§1–22 are the
 research record that led here; the shipped design is §23–§24.8, summarised next.
+**§25 (added 2026-08-02):** the content-axis generalization — harness
+`candle-conversation/examples/selection_experiments.rs` over the checked-in selection-replay
+fixture; overturns additive fusion and tail-only probing for content collections
+(`content_gated` fusion + question-anchored probe, both targets #1), confirms tools stay
+additive, and feeds the design in
+[`provenance_adaptive_projection.md`](provenance_adaptive_projection.md).
 
 ---
 
@@ -1936,3 +1942,221 @@ the §80.2 thresholds (min 1000 / evict 750 / max 3) are unchanged — the gate 
 drop-in. Because it keys on signal quality, not domain, it is left **on for all collections**; for a
 content collection (code) the same gate keeps the sharp relevant reference and mutes the boilerplate.
 Validated only on tools so far — the content case awaits a labelled code-section corpus.
+
+## 25. Content-axis generalization — the selection-replay corpus and the fusion/probe redesign
+
+**Measured 2026-08-02.** Harness: `candle-conversation/examples/selection_experiments.rs`
+(experiment rounds `1|2|3` by CLI arg; pure CPU over stored sigs, deterministic, ~40 s/round)
+over the checked-in fixture `candle-conversation/tests/selection_replay_data/` — captured from
+the live daemon before the startup integrity repair: **624 sig blobs / 229 862 tokens**, 30
+dialogue turns across 6 conversations with all **310 recorded projection points**, target
+galleries `models/builder.rs` (42 exchanges), `repo_map` (177 cluster turns), `tool` (190 turns,
+95 tools × 2 exemplars). This is §24.8's awaited content-corpus measurement — and it overturned
+two assumptions and produced the shipped-design successor for content axes. Design consumer:
+`docs/provenance_adaptive_projection.md` (evidence table §2.4, F1–F11).
+
+### 25.1 The failure baseline + selection inertia
+
+The captured tour conversation is the adversarial corpus: under the shipped scorer the
+ModelBuilder probe ranks a `.builder()` **call site** (`zend/src/session.rs`) at **2004** vs the
+definition's best exchange at **351**; a tour probe ranks a promiscuous fixture file
+(`test_config.json`) at **2653** above every repo_map cluster; and a history probe generates
+**more** raw code-slot mass than a code probe (**6122 vs 3576** — inverted). Separately, replaying
+all 310 recorded projection points showed only **~7 %** of the daemon's recorded winners re-rank
+near the top under instantaneous raw scoring — recorded selection is dominated by belief/hysteresis
+**retention**, not fresh signal. These are pinned as red TDD tests + a golden digest
+(`tests/selection_replay.rs`, `baseline_golden.json`).
+
+### 25.2 Anatomy — the junk is single-group spikes; the gallery is healthy
+
+Fold-group decomposition of the dominating junk: `session.rs`'s 2004 = **L0–45: 0.0**, L46:
+1159.8, L47: 861.4 — a pure identity-group spike with *zero* content-group agreement, admitted
+because late fusion **sums** group votes. The true definition scores a balanced 22.6 / 57.5 / 58.2.
+The gallery side is sound: builder.rs self-match is **8/8 top-1** against the full junk pool — the
+call→def miss is probe- and fusion-side, not storage. And the §22.5-style group weighting **does
+not transfer to content**: repo_map's tour signal lives in **L0–45** (structure best #2 under
+`[1,0,0]`) and scores exactly **0** under the tools-derived `[0,1,1]` — per-axis `layer_weights`
+must be re-derived, not inherited.
+
+### 25.3 Probe contamination — the question is right, the tail is wrong
+
+Scoring at each recorded reprojection point: at t = 0 the probe is the user's question — weak in
+magnitude but correct (structure already #2). As decode proceeds the trailing 256-token window
+evicts the question and fills with the model narrating the *currently projected junk*, whose score
+grows monotonically (**415 → 3663** across one turn) while the target sinks to ~#21 — a
+self-reinforcing retrieval loop. Failure also shortens probes (the failed ModelBuilder turn sealed
+only 88 sig tokens: bad projection → short refusal → weak probe). **Offline trap:** recorded event
+`start_token`s count *view* tokens and exceed the sig length on long turns, so deriving the
+user-prefix boundary from them degenerates to a **1-token window** (round-2's "question probe"
+results were 1-token probes). The fixture uses the turn's head-64 sigs; production must **persist
+the question-boundary token index at turn open**.
+
+### 25.4 Normalization — promiscuity fixed, quiet slots amplified
+
+Dividing each slot's score by its level (mean over the 30 captured dialogue probes — the offline
+stand-in for the production EWMA hit-level) flips the tour ranking from #23 to **#1**… and makes
+the ModelBuilder winner `ops.rs` **lines 1275–1276** — the *same two-line fragment the daemon
+actually selected live*. Near-zero-level children explode under level division: **the recorded
+junk selections are largely this mechanism**, not raw-score error. A flat floor cannot fix both
+cases (tour wants ≤ 2, ModelBuilder ~10); the design answer is a size-aware level prior
+(`floor ∝ T_ref / tokens`), though under the §25.5 content gate the fixture ranking is
+floor-insensitive across `base ∈ [0.5, 5] × cap ∈ [1, 16]` (the gate already mutes the fragment
+spikes — `ops.rs` sits ~#74 everywhere), so the prior's constants await the production-corpus
+sweep.
+
+### 25.5 Fusion operators — consensus dies at scale; the content gate wins; tools stay additive
+
+Round 2's per-slot **min** across the three fold groups looked decisive (junk #1 → #227, builder
+#10 → #2, and with a question probe both red cases rank **#1**). Round 3 broke it twice. On the
+full 406-slot pool min **zeroes every true target** — leading all three groups simultaneously
+becomes vanishingly rare as candidates grow (recall-fragility at pool scale). And on tools
+(190-probe leave-one-out over 95 tools) **every** non-additive operator collapses:
+
+| operator | Tool-1 | Tool-5 |
+|---|--:|--:|
+| additive (production) | **83.7 %** | **98.4 %** |
+| additive (per-group gates) | **84.2 %** | 98.4 % |
+| consensus_min | 34.2 % | 81.1 % |
+| consensus_geo | 48.9 % | 83.2 % |
+| content_gated | 26.3 % | 26.8 % |
+| min(content, id-sum) | 13.7 % | 51.1 % |
+
+Tool identity **is** an id-group spike by fold design (§23.2) — the shape the gate suppresses on
+content is the signal on tools. Verdict: fusion is a **per-policy config value** (`fusion: {mode,
+gate_group}`), tools keep `additive`, content axes use **`content_gated`** — identity-group votes
+count only when the gate (content) group agrees at all (`score = g0 > 0 ? g0+g1+g2 : 0`) — which
+kills pure spikes while preserving additive magnitude *and* recall. (A "2-of-3 groups above τ"
+form was tested and rejected: the spike clears τ in two groups.)
+
+### 25.6 The composed pipeline — both targets #1, mass un-inverted, generalizes
+
+The locked content-axis pipeline: **content-gated fusion → hit-level normalization → per-slot
+`max` over the pinned question window and the decode tail.** Measured on the fixture:
+
+- **tour probe → a repo_map cluster ranks #1; ModelBuilder probe → a `builder.rs` exchange ranks
+  #1**, over every junk slot the daemon actually selected;
+- rank **#1 holds across the whole decode trajectory** (t = 128 … end) — the §25.3 contamination
+  takeover is gone;
+- an extra per-window unit-max scaling step **degrades** both targets (#1 → #2): level
+  normalization alone is the correct window equalizer;
+- attention mass on the pipeline's scores satisfies **all three ideal orderings at every swept
+  `k ∈ {1,3,5} × ρ ∈ {0,0.5,1,2}`** — tour: structure > code, ModelBuilder: code > structure, and
+  the history-vs-code contrast collapses **8.9×** (9.18 vs 81.66) where raw scoring had it
+  inverted; the concentration term widens margins rather than creating them (robustness dial);
+- **generalizes across the corpus**: structure ranks **1–5 on 28 of 30** dialogue turns spanning
+  all six captured conversations (shipped scorer: 3–230).
+
+Open after round 3: the 372-turn full-corpus tools confirmation (needs the `belief-*`
+multi-segment port — the segmented store shows 0 tagged turns to the single-segment loader); and
+a short-probe residual (~24-token probes promote quiet code slots). Both are addressed in §25.7.
+Delivery plan, YAML surface, and unit-test matrix: `docs/provenance_adaptive_projection.md`
+§10–§12.
+
+### 25.7 The closure round — momentum rejected, root answered, boundary found, probes labeled
+
+**Measured 2026-08-02 (round 4 + static analysis).**
+
+**Momentum (Concept E) — rejected.** Simulating each tour-conversation turn's recorded
+reprojection sequence under the full pipeline with `v ← 0.5·v + max(0, Δs)`,
+`seed = s + μ·v`: at μ ∈ {0.5, 1.0} target-top1 never improves (tour 16/18 unchanged),
+**drops on the ModelBuilder turn (4/7 → 3/7** — velocity locks in an early junk riser), and
+top-1 churn on the no-target recall turn grows **1 → 4**. The rising-interest-lost pattern the
+mechanism exists to fix does not occur once F + G + A stabilize the target (the pre-pipeline
+instability was the §25.3 contamination loop, which Concept F removes at the source). No
+plumbing ships; the negative is recorded in the design doc §7.
+
+**Root cluster — never organic, and that's fine.** Under the full pipeline the workspace-root
+cluster's within-structure rank is **2–22 (median ~10) across all 30 dialogue turns**; topical
+clusters win, correctly, even on tour probes. `default {tag "."}` is therefore the load-bearing
+root mechanism (floor + `k = 2` organic picks = the tour composition), not a safety net.
+
+**Q-window boundary — already persisted.** Static analysis: `TurnDecl.segments` (the persisted
+`TurnLayout`) carries `User { kv: KvSpan }` — the user half's exact span in the turn's real-KV
+grid — and `gather_wide_sigs`' contract emits one signature per real token, **1:1 with that
+grid**. `Q-window = sigs[user_span.range()]`, live and offline; no new record.
+`export-replay` now emits `user_spans` per turn. (The offline head-64 stand-in and the
+view-token trap of §25.3 are thereby retired.)
+
+**Short probes — labeled.** The ~24-token turns that promote quiet `builder.rs` exchanges are
+all **tool-shaped questions** ("what time is it?") — no code slot is correct for them, and
+their absolute offline scores overlap genuine code hits (top1 19–30 vs ModelBuilder's 15), so
+within-axis gating cannot separate them. The production discriminators are **cross-axis**: the
+tools collection wins the mass for these probes (the guards prove the signal), and the real
+0–1000 band separates one-off matches from learned strong-match levels. Encoded as a Phase-1
+harness acceptance criterion rather than a new mechanism.
+
+### 25.8 The multi-segment port + full-corpus snapshot battery
+
+**Measured 2026-08-02/03.** The `belief-*` suite was ported off the single-segment loader: all
+six commands now build the **merged all-segment substrate** (ascending segment id,
+last-writer-wins — `build_substrate_merged`, the same walk `export-replay` uses; a single-file
+target runs the identical code path with one segment). `belief-eval` gained `--scorer gated`
+(the §25.5 content-gate through per-group `score_slots_weighted` scans) and `--limit` (bounded
+sampling for quadratic content corpora); `belief-sweep` gained `--normalize` (the causal
+corpus-order hit-level pass, so thresholds are derived on the production 0–1000 band). Runs
+against the pre-repair snapshot (`D:\prog\substrate_pre_repair_20260802`, ~100 sealed
+segments; the walk costs ~12 min per invocation, the eval 1–2 min):
+
+**Tools, leave-one-out, 745 tagged turns / 93 tools** (the corpus **doubled** since the §23
+372-turn baseline via the self-reinforcing gallery; probe = last 256 tokens):
+
+| run | Tool-1 | Tool-3 | Tool-5 | MRR | notes |
+|---|--:|--:|--:|--:|---|
+| additive (shipped scorer) | **97.3 %** | 99.6 % | **100 %** | 0.985 | baseline reproduced at 2× corpus |
+| `content_gated` | 32.9 % | 33.3 % | 33.3 % | 0.331 | **66.7 % of probes score 0 for their own tool** |
+| additive + `--normalize` | **97.3 %** | 99.3 % | 99.9 % | 0.984 | exact-1 1.2 % → **35.3 %**, mean set 2.95 → **2.04** at the same nominal gate |
+
+The gated collapse is the definitive per-axis proof: two-thirds of tool turns have *zero*
+content-group agreement with their own tool's gallery — tool identity is purely an id-group
+phenomenon (§23.2's fold design working as intended), and the fusion mode must remain a
+per-policy value. The normalized run is the Concept A migration proof: ranking untouched,
+selection sharply better once scores are comparable across tools.
+
+**Normalized threshold sweep** (745 × 93 matrix, scorer fused): true-tool scores on the band
+sit at min 17 / p5 370 / **p25 949 / p50 1394** — sustained matches land at or above the band
+top, as normalization is designed to arrange. Operating points at budget 3: `min ≈ 60–80` →
+recall 99.2 % (the budget-3 ceiling at this corpus size), exact-1 ~49–56 %, mean FP ~0.6–0.75;
+`min ≈ 112–186` → recall ~99 %, exact-1 65–77 %; `min ≈ 949` → recall 97.2 %, exact-1
+**94.8 %**, mean FP 0.06. Budget 5 recovers 100 % recall at `min 0`. The §80.2 raw-scale
+thresholds (min 800 / evict 600) migrate by picking a row of this table (plus possibly
+`budget.max` 4–5 for the grown corpus) — a policy decision, no further measurement needed.
+
+**Code corpus, bounded 600-turn LOO self-match (raw vs normalized).** A first pass exposed a
+protocol flaw the harness now fixes: **unanswerable probes** — under `--limit`, most files
+contribute a single turn, so leave-one-out leaves *no same-file window in the gallery* and the
+probe cannot succeed structurally (46 % of the sample); those are now skipped and reported.
+A second flaw is fixed for future runs: the stream map iterates in hash order, so `--limit`
+sampled *different* turns per invocation — candidates are now sorted by stream id before the
+cap (the raw/normalized pair below predates the fix and therefore compares *overlapping but
+not identical* samples; read it as two independent draws, not a paired diff):
+
+| run | answerable probes | Tool-1 | Tool-3 | Tool-5 | MRR | zero-self |
+|---|--:|--:|--:|--:|--:|--:|
+| raw | 324 (276 skipped) | **57.1 %** | 66.4 % | 69.8 % | 0.627 | 20.4 % |
+| `--normalize` | 345 (255 skipped) | 47.5 % | 58.8 % | 64.6 % | 0.547 | 20.0 % |
+
+Interpretation — three findings, none of which contradicts the design and one of which
+sharpens it:
+
+1. **This is a different regime from the 95–99 % code baseline**, which was measured over
+   complete file conversations (a probe scope had its file's whole neighborhood in the
+   gallery). Here a probe's own file typically has ONE other sampled exchange — often a
+   distant, content-unrelated scope — so "self-match" is cross-scope retrieval at its
+   hardest. One scope-of-measurement caveat: in these two runs the skip removed
+   single-turn files from the *gallery* as well as the probe set, so the effective
+   competitor pool is the multi-turn files (≈160 file slots; chance ≈ 0.6 %, not the
+   nominal 378/0.3 %) — the harness now keeps unanswerable turns as gallery distractors
+   for future runs. Raw Top-1 57 % at ≈ 0.6 % chance remains strong signal for the hard
+   task; the 20 % zero-self floor is same-file scopes that genuinely share no signature.
+2. **Normalization *hurts* on cold levels** (47.5 % vs 57.1 %): with each file observed once
+   or twice, the causal pass divides by learning-starved levels — §25.4's quiet-slot
+   amplification at corpus scale. This is not a Concept A refutation (the tools axis, with
+   warm observation density, held 97.3 % exactly; production warm-replays levels at boot) —
+   it is the measured demonstration that **A.4's level prior is load-bearing for cold
+   scopes**: newly ingested files sit in exactly this regime until their levels accrue.
+3. **Cross-scope difficulty independently validates Concepts C + D**: scopes of the same file
+   frequently do not match each other, which is precisely why a hit must *drag in* its
+   neighbors (locality) and its file header (anchor) rather than expect them to score.
+
+The definitive warm-level code-side verification belongs to the §11 selection-replay harness
+(full `ensure_normalization_warm` chain over the snapshot) — the Phase-1 deliverable.

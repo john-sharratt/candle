@@ -312,15 +312,17 @@
       const tps = 36 + Math.random() * 18;
       // The selected turns (memory tiers, then dialogue with two summary nodes in
       // place of older spans). One entry per turn; bodies come from turnContent.
+      // Timelines are stable fakes: one per conversation (code_read = one per
+      // file), because the panel keys bodies by group::timeline::index.
       const convTurns = [
-        { layer: 'repo_map', group: 'files', index: 0, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
-        { layer: 'repo_map', group: 'files', index: 1, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
-        { layer: 'code_reading', group: 'scopes', index: 0, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
-        { layer: 'code_reading', group: 'scopes', index: 1, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
-        { layer: 'code_reading', group: 'scopes', index: 2, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'coverage_fill' },
-        { layer: 'dialogue', group: 'primary_conversation', index: 3, role: 'assistant', tokens: rnd(120, 240), kind: 'summary_of_summaries', reason: 'coverage_fill' },
-        { layer: 'dialogue', group: 'primary_conversation', index: 5, role: 'assistant', tokens: rnd(90, 160), kind: 'summary_of_turns', reason: 'provenance_score' },
-        { layer: 'dialogue', group: 'primary_conversation', index: 6, role: 'assistant', tokens: rnd(300, 900), kind: 'normal', reason: 'recent' },
+        { layer: 'repo_map', group: 'files', timeline: 101, index: 0, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
+        { layer: 'repo_map', group: 'files', timeline: 101, index: 1, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
+        { layer: 'code_reading', group: 'scopes', timeline: 201, index: 0, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
+        { layer: 'code_reading', group: 'scopes', timeline: 202, index: 1, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
+        { layer: 'code_reading', group: 'scopes', timeline: 203, index: 2, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'coverage_fill' },
+        { layer: 'dialogue', group: 'primary_conversation', timeline: 900, index: 3, role: 'assistant', tokens: rnd(120, 240), kind: 'summary_of_summaries', reason: 'coverage_fill' },
+        { layer: 'dialogue', group: 'primary_conversation', timeline: 900, index: 5, role: 'assistant', tokens: rnd(90, 160), kind: 'summary_of_turns', reason: 'provenance_score' },
+        { layer: 'dialogue', group: 'primary_conversation', timeline: 900, index: 6, role: 'assistant', tokens: rnd(300, 900), kind: 'normal', reason: 'recent' },
       ];
       // The materialized spine: real boundary-glue islands (user_start, and
       // assistant_end + user_start between turns) interleaved with the turns —
@@ -507,20 +509,21 @@
         user_start: '<|im_start|>user\n', user_end: '<|im_end|>\n',
         assistant_start: '<|im_start|>assistant\n', assistant_end: '<|im_end|>\n',
       };
-      // Memory-tier turn bodies, keyed by `group::index` (matches mkProjEvent),
-      // each split into its user + assistant halves (the GUI frames them).
+      // Memory-tier turn bodies, keyed by `group::timeline::index` (matches
+      // mkProjEvent's fake timelines), each split into its user + assistant
+      // halves (the GUI frames them).
       const turnContent = {
-        'files::0': { user: 'Repository index — `crates/`:', assistant: J(['crates/candle-core/src/  →  lib.rs, tensor.rs, device.rs, ops/', 'crates/candle-nn/src/   →  kv_cache/, layers.rs']) },
-        'files::1': { user: 'Repository index — `crates/` (cont.):', assistant: J(['crates/candle-transformers/src/  →  batched_inference.rs, models/', 'crates/candle-kernels/src/       →  paged-decode/, quantized/']) },
-        'scopes::0': { user: 'Scope: substrate/src/lib.rs :: Substrate::recover', assistant: J(['pub fn recover(path: &Path) -> Result<Self> {', '    let mut s = Substrate::open(path)?;', '    for frame in s.log.iter()? { s.apply(frame?)?; }', '    Ok(s)', '}']) },
-        'scopes::1': { user: 'Scope: substrate/src/redo.rs :: FrameIter::next', assistant: J(['fn next(&mut self) -> Option<Result<Frame>> {', '    let len = self.read_len().ok()??;', '    if self.remaining() < len { return None; }', '    Some(self.read_frame(len))', '}']) },
-        'scopes::2': { user: 'Scope: substrate/src/tensor.rs :: Tensor::matmul', assistant: J(['pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {', '    self.backend.matmul(self, rhs)', '}']) },
+        'files::101::0': { user: 'Repository index — `crates/`:', assistant: J(['crates/candle-core/src/  →  lib.rs, tensor.rs, device.rs, ops/', 'crates/candle-nn/src/   →  kv_cache/, layers.rs']) },
+        'files::101::1': { user: 'Repository index — `crates/` (cont.):', assistant: J(['crates/candle-transformers/src/  →  batched_inference.rs, models/', 'crates/candle-kernels/src/       →  paged-decode/, quantized/']) },
+        'scopes::201::0': { user: 'Scope: substrate/src/lib.rs :: Substrate::recover', assistant: J(['pub fn recover(path: &Path) -> Result<Self> {', '    let mut s = Substrate::open(path)?;', '    for frame in s.log.iter()? { s.apply(frame?)?; }', '    Ok(s)', '}']) },
+        'scopes::202::1': { user: 'Scope: substrate/src/redo.rs :: FrameIter::next', assistant: J(['fn next(&mut self) -> Option<Result<Frame>> {', '    let len = self.read_len().ok()??;', '    if self.remaining() < len { return None; }', '    Some(self.read_frame(len))', '}']) },
+        'scopes::203::2': { user: 'Scope: substrate/src/tensor.rs :: Tensor::matmul', assistant: J(['pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {', '    self.backend.matmul(self, rhs)', '}']) },
         // Dialogue bodies: summary nodes (3, 5) carry the summary text they
         // injected in place of the turns they cover; the recent raw turn (6) has
         // both halves. The panel renders these as the materialized KV.
-        'primary_conversation::3': { user: '', assistant: J(['[summary of turns 0–3] The user asked for a codebase tour; the assistant walked the crate layout (core/nn/transformers/kernels) and the KV-cache subsystem.']) },
-        'primary_conversation::5': { user: '', assistant: J(['[summary of turn 4] The user asked how the redo log replays on boot; the assistant traced Substrate::recover iterating frames.']) },
-        'primary_conversation::6': { user: 'so what triggers a reprojection mid-decode?', assistant: J(['A reprojection fires when the BDP scan’s top-k selection changes during decode — the scheduler rebuilds the slot from the substrate with the newly-selected turns.']) },
+        'primary_conversation::900::3': { user: '', assistant: J(['[summary of turns 0–3] The user asked for a codebase tour; the assistant walked the crate layout (core/nn/transformers/kernels) and the KV-cache subsystem.']) },
+        'primary_conversation::900::5': { user: '', assistant: J(['[summary of turn 4] The user asked how the redo log replays on boot; the assistant traced Substrate::recover iterating frames.']) },
+        'primary_conversation::900::6': { user: 'so what triggers a reprojection mid-decode?', assistant: J(['A reprojection fires when the BDP scan’s top-k selection changes during decode — the scheduler rebuilds the slot from the substrate with the newly-selected turns.']) },
       };
       // A turn is stored as ONE continuous block; synthesize `text` (the whole
       // turn, with the baked intra-turn boundary) so the panel renders one card

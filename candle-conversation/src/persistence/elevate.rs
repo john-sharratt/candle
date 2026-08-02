@@ -31,6 +31,7 @@ use candle_nn::kv_cache::ChunkedKvBacking;
 
 use super::cold_load::ColdLoadStager;
 use crate::projection::{Conversation, SectionId, TurnKey};
+use crate::scheduler::relief_trace;
 use crate::substrate::{
     ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, PurgeReport, ResidenceIndex,
     WarmLift, WarmToHotEntry,
@@ -497,6 +498,14 @@ pub fn elevate_to_hot(
         conversation.write().install_promoted(recalls, lifts);
     }
 
+    if report.warm_to_hot > 0 || report.cold_to_hot > 0 {
+        relief_trace::note(
+            "sched",
+            "elevate_to_hot",
+            (report.warm_to_hot + report.cold_to_hot) as u64,
+            report.bytes_warm_to_hot + report.bytes_cold_to_hot,
+        );
+    }
     // Aggregate summary — RUST_LOG=substrate::tier=info catches just
     // these lines without the per-item detail.
     if report.total() > 0 {

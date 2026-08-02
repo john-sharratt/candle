@@ -31,6 +31,7 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Tensor};
 use candle_conversation::persistence::cold_load::ColdLoadStager;
+use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::persistence::elevate::{elevate_to_hot, evict_from_hot};
 use candle_conversation::persistence::thread::PersistenceThread;
 use candle_conversation::persistence::transfer::seal_to_chunk_images;
@@ -131,18 +132,25 @@ fn seed_turn(
     }
     // Total tokens = 32, block_size = 32 ⇒ 1 chunk per layer.
     let block_end = (N_TOKENS_PER_TURN / CHUNK_SIZE) as u64;
-    conv.record_turn(
-        timeline,
-        Role::User,
-        candle_conversation::substrate::TurnPartWrite {
-            token_count: N_TOKENS_PER_TURN,
-            block_end,
-            sealed_gpu: Some(Arc::new(sealed_per_layer)),
-            ..Default::default()
-        },
-        |seqs| Ok(seqs.to_vec()),
-    )
-    .unwrap()
+    let idx = conv
+        .record_turn(
+            timeline,
+            Role::User,
+            candle_conversation::substrate::TurnPartWrite {
+                token_count: N_TOKENS_PER_TURN,
+                block_end,
+                sealed_gpu: Some(Arc::new(sealed_per_layer)),
+                ..Default::default()
+            },
+            |seqs| Ok(seqs.to_vec()),
+        )
+        .unwrap();
+    // Persist the Tokens record as every production seal path does — the
+    // startup integrity check treats a token-less turn as damage to repair.
+    let ids: Vec<u32> = (0..N_TOKENS_PER_TURN as u32).collect();
+    conv.persist_tokens_only(turn_stream_id(timeline.raw(), idx.0), &ids)
+        .unwrap();
+    idx
 }
 
 /// Seed a synthetic section (pinned-hot KV) so we can verify it
@@ -597,18 +605,25 @@ fn seed_turn_with_format(
         sealed_per_layer.push(sealed);
     }
     let block_end = (n_tokens / CHUNK_SIZE) as u64;
-    conv.record_turn(
-        timeline,
-        Role::User,
-        candle_conversation::substrate::TurnPartWrite {
-            token_count: n_tokens,
-            block_end,
-            sealed_gpu: Some(Arc::new(sealed_per_layer)),
-            ..Default::default()
-        },
-        |seqs| Ok(seqs.to_vec()),
-    )
-    .unwrap()
+    let idx = conv
+        .record_turn(
+            timeline,
+            Role::User,
+            candle_conversation::substrate::TurnPartWrite {
+                token_count: n_tokens,
+                block_end,
+                sealed_gpu: Some(Arc::new(sealed_per_layer)),
+                ..Default::default()
+            },
+            |seqs| Ok(seqs.to_vec()),
+        )
+        .unwrap();
+    // Tokens record — production seals always persist it; the startup
+    // integrity check treats a token-less turn as damage to repair.
+    let ids: Vec<u32> = (0..n_tokens as u32).collect();
+    conv.persist_tokens_only(turn_stream_id(timeline.raw(), idx.0), &ids)
+        .unwrap();
+    idx
 }
 
 /// Same as the BF16 byte-snapshot helper, but parameterised on the
@@ -2281,18 +2296,25 @@ fn seed_turn_varied_per_sub_band(
         sealed_per_layer.push(backing.record_turn(slot).unwrap());
     }
     let block_end = (n_tokens / CHUNK_SIZE) as u64;
-    conv.record_turn(
-        timeline,
-        Role::User,
-        candle_conversation::substrate::TurnPartWrite {
-            token_count: n_tokens,
-            block_end,
-            sealed_gpu: Some(Arc::new(sealed_per_layer)),
-            ..Default::default()
-        },
-        |seqs| Ok(seqs.to_vec()),
-    )
-    .unwrap()
+    let idx = conv
+        .record_turn(
+            timeline,
+            Role::User,
+            candle_conversation::substrate::TurnPartWrite {
+                token_count: n_tokens,
+                block_end,
+                sealed_gpu: Some(Arc::new(sealed_per_layer)),
+                ..Default::default()
+            },
+            |seqs| Ok(seqs.to_vec()),
+        )
+        .unwrap();
+    // Tokens record — production seals always persist it; the startup
+    // integrity check treats a token-less turn as damage to repair.
+    let ids: Vec<u32> = (0..n_tokens as u32).collect();
+    conv.persist_tokens_only(turn_stream_id(timeline.raw(), idx.0), &ids)
+        .unwrap();
+    idx
 }
 
 /// Full hot → warm → hot → cold → warm → hot round-trip with

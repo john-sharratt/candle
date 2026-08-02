@@ -399,6 +399,9 @@ impl Scheduler {
                 (released as u64, None, flushed, evicted, 0, released)
             };
         let still = self.vram_under_pressure_for(phase);
+        if freed > 0 || evicted.count > 0 || compressed > 0 {
+            relief_trace::note("sched", "governor_relieve", freed, evicted.bytes as u64);
+        }
         // (Eviction volume is accounted at the `evict_cold_tail` chokepoint, not
         // here, so the governor driver's evictions aren't double-counted.)
         if let Some((free, total)) = self.session.vram_free_total() {
@@ -793,6 +796,7 @@ impl Scheduler {
                 let budget = compact_base_moves().saturating_mul(mult10) / 10;
                 let t = std::time::Instant::now();
                 compact_moves = self.session.defragment_bounded(budget).unwrap_or(0);
+                relief_trace::note("sched", "defrag", budget as u64, compact_moves as u64);
                 let _ = self.session.release_empty_arenas();
                 super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
@@ -825,9 +829,14 @@ impl Scheduler {
             let target = target.min(deep).max(1) as u64;
             let t = std::time::Instant::now();
             evicted = self.evict_cold_tail(target);
+            relief_trace::note("sched", "evict_cold_tail", target, evicted.bytes as u64);
             if evicted.count > 0 {
                 if self.session.can_reclaim_arena() {
-                    let _ = self.session.defragment_bounded(compact_base_moves());
+                    let moves = self
+                        .session
+                        .defragment_bounded(compact_base_moves())
+                        .unwrap_or(0);
+                    relief_trace::note("sched", "defrag_post_evict", 0, moves as u64);
                 }
                 let _ = self.session.release_empty_arenas();
                 super::timed_synchronize(&self.device);

@@ -43,6 +43,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -145,7 +146,10 @@ async fn main() -> anyhow::Result<()> {
         let bt = std::backtrace::Backtrace::force_capture();
         // zend always links candle with the "cuda" feature — call unconditionally.
         let kernel = candle::last_cuda_kernel_launch();
-        eprintln!("\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n\n{bt}\n=============\n");
+        let relief = relief_trace::dump();
+        eprintln!(
+            "\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}\n=============\n"
+        );
     }));
 
     // ── CLI (parsed first so we know verbosity before init) ──────────────────
@@ -243,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
                     "GPU context poisoned by an unrecoverable CUDA fault — exiting for \
                      a clean restart (substrate redo log is durable, nothing lost)",
                 );
+                // Cross-thread VRAM-lifecycle interleaving around the fault —
+                // the attribution the per-thread kernel ring can't give.
+                eprintln!("{}", relief_trace::dump());
                 // Brief pause so the root log line reaches the file/console sinks
                 // before the hard exit, then go.
                 std::thread::sleep(std::time::Duration::from_millis(80));

@@ -2662,6 +2662,13 @@ impl Substrate {
         self.streams.get(&stream_id)
     }
 
+    /// Whether ANY indexed stream carries KV chunk records. `false` means this
+    /// workspace never persists KV (e.g. `compression_policy = None`), so the
+    /// startup integrity check must not treat chunk absence as damage.
+    pub fn any_stream_has_chunks(&self) -> bool {
+        self.streams.values().any(|s| !s.chunks.is_empty())
+    }
+
     /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
     ///
     /// The belief scan reads the same static gallery on every reprojection;

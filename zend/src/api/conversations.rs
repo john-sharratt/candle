@@ -171,7 +171,7 @@ pub async fn get(
     // materialized KV exactly as selected (summaries shown in place of the turns
     // they replaced), not the raw message history. Deduped across spans. The live
     // user message (`u32::MAX`) has no sealed body and is skipped.
-    let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, u64, u32)> = std::collections::HashSet::new();
     let mut turn_content: Vec<TurnContent> = Vec::new();
     for span_list in &buckets {
         for ev in span_list {
@@ -179,28 +179,39 @@ pub async fn get(
                 if t.index == u32::MAX {
                     continue;
                 }
-                if seen.insert((t.group.clone(), t.index)) {
-                    // Resolve the body by the turn's STAMPED timeline identity
-                    // (`SelectedTurn::timeline`), never by group: the shared
-                    // substrate registers many conversations under one group, so a
-                    // group→timeline lookup is non-deterministic. A turn with no
-                    // stamped timeline (only the live user message) is skipped.
-                    let Some(timeline) = t
-                        .timeline
-                        .and_then(candle_conversation::projection::TimelineId::from_raw)
-                    else {
-                        continue;
-                    };
-                    // The whole turn, continuous (what the panel renders). Fall
-                    // back to the split halves only to populate the legacy fields.
+                // Resolve the body by the turn's STAMPED timeline identity
+                // (`SelectedTurn::timeline`), never by group: the shared
+                // substrate registers many conversations under one group, so a
+                // group→timeline lookup is non-deterministic — and the dedup /
+                // panel key MUST carry the timeline too, because one group's
+                // events routinely hold same-index turns from different file
+                // conversations. A turn with no stamped timeline (only the
+                // live user message) is skipped.
+                let Some(timeline) = t
+                    .timeline
+                    .and_then(candle_conversation::projection::TimelineId::from_raw)
+                else {
+                    continue;
+                };
+                if seen.insert((t.group.clone(), timeline.raw(), t.index)) {
+                    // The whole turn, continuous (what the panel renders). A
+                    // turn whose `Tokens` record was lost (async writer + hard
+                    // kill) decodes no full text but still carries its layout
+                    // text — emit the entry whenever ANY body source resolves,
+                    // and let the panel fall back from `text` to the halves.
                     let text = session.resolve_turn_full_text(timeline, t.index);
                     let (user, assistant) = session
                         .resolve_turn_text(timeline, t.index)
                         .unwrap_or_default();
                     let layout = session.turn_layout(timeline, t.index);
-                    if let Some(text) = text {
+                    if text.is_some()
+                        || !user.is_empty()
+                        || !assistant.is_empty()
+                        || layout.is_some()
+                    {
                         turn_content.push(TurnContent {
                             group: t.group.clone(),
+                            timeline: timeline.raw(),
                             index: t.index,
                             text,
                             user,
@@ -250,7 +261,8 @@ pub struct HistoryBody {
     /// a section's text when it is expanded.
     pub section_content: Vec<SectionContent>,
     /// Verbatim bodies of projected memory-tier turns (non-dialogue layers),
-    /// keyed by `(group, index)`; the panel expands a turn to show its text.
+    /// keyed by `(group, timeline, index)`; the panel expands a turn to show
+    /// its text.
     pub turn_content: Vec<TurnContent>,
     /// The target layer's name (e.g. `dialogue`) — the panel prefixes the
     /// conversation messages with it.
@@ -264,13 +276,18 @@ pub struct HistoryBody {
 /// ENTIRE turn as one continuous string — the full sealed token range decoded
 /// verbatim (user content, the baked intra-turn boundary, and assistant content)
 /// — which the panel renders as a single card; the turn is stored continuously,
-/// so this is the truth, not two re-glued halves. `user`/`assistant` are the
-/// legacy split halves, retained only for the pre-materialized fallback.
+/// so this is the truth, not two re-glued halves. `text` is absent when the
+/// turn's `Tokens` record was lost (async writer + hard kill) — the panel then
+/// renders the layout-derived `user`/`assistant` halves instead.
 #[derive(Serialize)]
 pub struct TurnContent {
     pub group: String,
+    /// The turn's resolved timeline identity — part of the panel key, because
+    /// one group holds many conversations and indices repeat across them.
+    pub timeline: u64,
     pub index: u32,
-    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     pub user: String,
     pub assistant: String,
     /// The turn's segment-vector layout (real/ethereal glue, user, thinking,

@@ -1,0 +1,81 @@
+{
+  "comment": "Hand-authored ideal projections for the captured tour conversation (tour_overview.json). Each case names one dialogue turn (= one probe shape), what the recorded projection actually did (observed_today, from the captured events), and what a correct provenance-adaptive projection must do (ideal). The TDD suite in tests/selection_replay.rs asserts the ideal against the exported sig fixture; cases marked failing_today are #[ignore]d red tests until docs/provenance_adaptive_projection.md lands.",
+  "conversation": "tour_overview",
+  "dialogue_timeline": "10454652321042114835",
+  "cases": [
+    {
+      "name": "codebase_tour",
+      "dialogue_turn": 0,
+      "intent": "Give me a tour of the codebase — main crates, key files, and how everything connects.",
+      "observed_today": {
+        "structure_selected": false,
+        "scopes_selected": [
+          "candle-examples/examples/glm4/main.rs (2 exchanges)",
+          "zend/web/index.html 1370-1486",
+          "candle-pyo3/src/lib.rs 754-803"
+        ],
+        "outcome": "model narrated the tools catalog + random scopes as the codebase"
+      },
+      "ideal": {
+        "layer_mass_order": ["repo_map", "code_reading"],
+        "must_select_groups": ["structure"],
+        "structure_notes": "workspace-root cluster (tag \".\") plus top-level crate clusters",
+        "scopes_max_selected": 2,
+        "no_selected_scope_may_outrank_best_structure": true
+      },
+      "failing_today": true
+    },
+    {
+      "name": "datetime_tool",
+      "dialogue_turn": 1,
+      "intent": "what time is it?",
+      "observed_today": { "outcome": "datetime tool selected and called correctly" },
+      "ideal": { "collection_top1": "datetime" },
+      "failing_today": false
+    },
+    {
+      "name": "calculator_tool",
+      "dialogue_turn": 3,
+      "intent": "what is the sqrt of 23489723892479823744987123498?",
+      "observed_today": { "outcome": "calculator tool selected and called correctly (the answer's exponent error is model-level, not selection)" },
+      "ideal": { "collection_top1": "calculator" },
+      "failing_today": false
+    },
+    {
+      "name": "modelbuilder_definition",
+      "dialogue_turn": 5,
+      "intent": "tell me what the ModelBuilder struct does",
+      "observed_today": {
+        "scopes_selected": [
+          "candle-nn/src/ops.rs 1275-1276 (two-line #[cfg] fragment)",
+          "zend/src/session.rs 1285-1380 (a .builder() call site)",
+          "candle-conversation/src/projection/selection.rs 1-51"
+        ],
+        "builder_rs_selected": false,
+        "outcome": "model answered 'no codebase context has been provided'"
+      },
+      "ideal": {
+        "must_select_file": "candle-conversation/src/models/builder.rs",
+        "builder_scope_must_outrank_observed_junk": true,
+        "anchor_present": "first exchange of the builder.rs conversation (file header: module doc + imports)",
+        "layer_mass_order": ["code_reading", "repo_map"]
+      },
+      "failing_today": true
+    },
+    {
+      "name": "self_recall",
+      "dialogue_turn": 6,
+      "intent": "what questions did i ask during this conversation - list them",
+      "observed_today": {
+        "scope_turns_in_projection": 12,
+        "outcome": "model listed 4 of 5 questions, dropping the tour question; irrelevant scopes diluted dialogue attention"
+      },
+      "ideal": {
+        "dialogue_turns_all_present": true,
+        "scopes_max_selected": 4,
+        "code_mass_low": "a history question carries no code attention; adaptive budget should shrink the scopes share toward its floor"
+      },
+      "failing_today": true
+    }
+  ]
+}
