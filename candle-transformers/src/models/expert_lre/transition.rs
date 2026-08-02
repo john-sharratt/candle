@@ -23,14 +23,16 @@
 //! ## Prefetch — confidence-gated, diversity-adaptive depth
 //!
 //! [`predict_prefetch`](TransitionMatrix::predict_prefetch) does not emit a fixed
-//! top-K.  It keeps each candidate ranked by PMI whose confidence
-//! (`max_from P(to|from)`, the strongest single active source's conditional) is
-//! within [`PREFETCH_REL_CONF`] of the most confident candidate, capped at
-//! [`PREFETCH_MAX_K`].  Using the relative max makes depth **scale- and
-//! batch-invariant** and tie it to demand *diversity*: a homogeneous batch (one
-//! prompt × N) implies a couple of sticky successors so prefetch stays shallow
-//! and precise; diverse demand (many distinct prompts) implies many, so it
-//! deepens toward the cap.
+//! top-K.  It keeps each candidate ranked by PMI whose *per-source-relative*
+//! confidence (its conditional normalized by its best source's strongest
+//! conditional — see `score_and_conf`) clears [`PREFETCH_REL_CONF`], capped at
+//! [`PREFETCH_MAX_K`].  Per-source normalization keeps depth **scale- and
+//! batch-invariant** and ties it to demand *diversity*: a homogeneous batch
+//! (one prompt × N) implies a couple of sticky successors so prefetch stays
+//! shallow and precise; diverse demand implies many — each source nominates
+//! the successors it genuinely implies, without one sticky pair gating
+//! everyone else out — and the fixed cap then bounds the DMA volume (see
+//! [`PREFETCH_MAX_K`] for why the cap must not scale with demand).
 //!
 //! ## Safety
 //!
@@ -44,19 +46,24 @@ const ALPHA: f32 = 0.5;
 /// single-observation noise in the first tokens.
 const MIN_OBS: u32 = 64;
 
-/// Upper bound on prefetch fan-out — the paper's bandwidth-knee cap.  The
-/// confidence gate keeps the effective depth well below this on homogeneous
-/// demand; the cap only bounds the diverse-demand case.
+/// Upper bound on prefetch fan-out — the paper's bandwidth-knee cap, and the
+/// volume-control knob for a capacity-bound resident set: prefetching more
+/// than a handful of experts per layer evicts experts the wave needs later,
+/// moving misses around instead of removing them (measured on the 16 GB dev
+/// card: demand-width prefetch doubled the glue wave's wall time).  The
+/// confidence gate keeps the effective depth below this on homogeneous demand.
 const PREFETCH_MAX_K: usize = 8;
 
-/// Relative confidence floor for prefetch: an expert is prefetched only if its
-/// confidence (`max_from P(to|from)`) is within this factor of the *most*
-/// confident candidate's.  Relative rather than absolute so it is invariant to
-/// the routing fan-out's scale — a top-8 router dilutes every per-source
-/// conditional, which an absolute floor would wrongly gate to nothing.  Combined
-/// with the batch-invariant max, prefetch depth then tracks demand *diversity*:
-/// a sharp confidence drop (homogeneous demand) keeps only the top one or two; a
-/// flat distribution (diverse demand) keeps more, up to the cap.
+/// Relative confidence floor for prefetch: an expert is prefetched only if some
+/// active source routes to it at ≥ this fraction of that source's *own*
+/// strongest successor rate (the per-source-relative confidence from
+/// `score_and_conf`).  Relative rather than absolute so it is invariant to the
+/// routing fan-out's scale — a top-8 router dilutes every per-source
+/// conditional, which an absolute floor would wrongly gate to nothing — and
+/// per-source so a single sticky pair cannot raise the bar for every other
+/// source's successors.  Prefetch depth then tracks demand *diversity*: a
+/// sharp per-source drop (homogeneous demand) keeps only each source's top one
+/// or two; flat routing (diverse demand) keeps more, up to the cap.
 const PREFETCH_REL_CONF: f32 = 0.5;
 
 /// The `[pairs × E × E]` co-occurrence matrix plus its row / column / group
@@ -172,11 +179,15 @@ impl TransitionMatrix {
     ///
     /// - `scores[to]` is the PMI rank signal — what to prefer when choosing
     ///   *which* experts to prefetch.
-    /// - `conf[to]` is the strongest single conditional `max_from P(to|from)`
-    ///   over the active sources — "is any active expert strongly routing to
-    ///   `to`?", i.e. how *confident* the model is that `to` is genuinely coming.
-    ///   The max (not a sum) keeps it batch-invariant; it decides *how many*
-    ///   experts are worth prefetching.
+    /// - `conf[to]` is the strongest *per-source-relative* conditional over the
+    ///   active sources: `max_from P(to|from) / max_to' P(to'|from)` — "does some
+    ///   active expert route to `to` at close to that expert's own strongest
+    ///   rate?".  Normalizing within each source keeps the gate batch-invariant
+    ///   AND source-local: one sticky pair (a source with a near-certain
+    ///   successor) cannot raise the bar for every other source's successors,
+    ///   which matters for wide waves where dozens of sources each imply their
+    ///   own cold arrivals.  The max (not a sum) across sources keeps it
+    ///   batch-invariant; it decides *how many* experts are worth prefetching.
     fn score_and_conf(
         &self,
         moe_layer_idx: usize,
@@ -206,6 +217,16 @@ impl TransitionMatrix {
             if rt <= 0.0 {
                 continue;
             }
+            // This source's strongest successor count — the normalizer that
+            // makes its confidences source-relative (its argmax successor is
+            // always confidence 1.0, however flat its routing is).
+            let mut row_max = 0.0f32;
+            for to in 0..e {
+                row_max = row_max.max(self.table.counts[base + to]);
+            }
+            if row_max <= 0.0 {
+                continue;
+            }
             for to in 0..e {
                 let c = self.table.counts[base + to];
                 if c <= 0.0 {
@@ -214,7 +235,7 @@ impl TransitionMatrix {
                 let cond = c / rt; // P(to | from)
                 let p_to = (self.table.col[rbase + to] / tot).max(1e-9);
                 scores[to] += cond / p_to.powf(ALPHA);
-                conf[to] = conf[to].max(cond);
+                conf[to] = conf[to].max(c / row_max);
             }
         }
 
@@ -242,10 +263,16 @@ impl TransitionMatrix {
 
     /// Predict the experts worth *prefetching* for layer `moe_layer_idx + 1`.
     ///
-    /// The fan-out is not fixed: an expert is returned only if its confidence is
-    /// within [`PREFETCH_REL_CONF`] of the most confident candidate's, capped at
-    /// [`PREFETCH_MAX_K`] and ranked by PMI.  Depth therefore tracks demand
-    /// diversity (see the module docs).
+    /// The fan-out is not fixed: an expert is returned only if its
+    /// per-source-relative confidence clears [`PREFETCH_REL_CONF`], ranked by
+    /// PMI and capped at [`PREFETCH_MAX_K`]. The cap is deliberately FIXED, not
+    /// demand-scaled: on a card whose resident set is capacity-bound, prefetch
+    /// beyond a few experts per layer does not reduce total DMA volume — every
+    /// speculative load evicts another expert the wave needs later, so a wide
+    /// wave's misses just move rather than disappear (measured: demand-width
+    /// caps doubled the glue wave's wall time via eviction thrash and pipe
+    /// serialization). Depth tracks demand diversity via the confidence gate
+    /// (see the module docs); volume control is the cap's job.
     pub(crate) fn predict_prefetch(
         &self,
         moe_layer_idx: usize,
@@ -292,7 +319,10 @@ fn top_k_excluding(scores: &[f32], active: &[usize], k: usize) -> Vec<usize> {
 }
 
 /// Like [`top_k_excluding`], but additionally drops any expert whose confidence
-/// `conf[idx]` is below `rel_conf` times the *most* confident candidate's.  The
+/// `conf[idx]` is below `rel_conf` times the *most* confident candidate's.
+/// `conf` is per-source-relative (each source's argmax successor scores 1.0 —
+/// see `score_and_conf`), so the bar is effectively `rel_conf` itself and each
+/// active source's genuinely-implied successors clear it independently.  The
 /// cap `max_k` bounds the result; the relative gate is what makes the effective
 /// count adapt to how many experts the active set genuinely implies, without any
 /// dependence on the absolute confidence scale.
@@ -459,13 +489,43 @@ mod tests {
 
     #[test]
     fn prefetch_is_capped_at_max_k() {
-        // More high-confidence successors than the cap → bounded to PREFETCH_MAX_K.
+        // More high-confidence successors than the cap → bounded to
+        // PREFETCH_MAX_K, regardless of how wide the demand is. The cap is the
+        // DMA volume-control knob: on a capacity-bound resident set, deeper
+        // prefetch evicts experts the wave needs later instead of removing
+        // misses.
         let mut m = TransitionMatrix::new(L, 32);
         let sources: Vec<usize> = (1..=9).collect();
         for &s in &sources {
             train(&mut m, 0, &[s], &[s + 15], 80); // distinct target per source
         }
         assert_eq!(m.predict_prefetch(0, &sources).len(), PREFETCH_MAX_K);
+
+        // Narrow demand with many implied successors is bounded the same way.
+        let mut m2 = TransitionMatrix::new(L, 32);
+        for t in 16..=25 {
+            train(&mut m2, 0, &[1], &[t], 20); // ten equal-confidence targets
+        }
+        assert_eq!(m2.predict_prefetch(0, &[1]).len(), PREFETCH_MAX_K);
+    }
+
+    #[test]
+    fn sticky_source_does_not_gate_other_sources_successors() {
+        // Source 1 is sticky (one near-certain successor). Source 2 routes
+        // flatly to three successors, each under half of 1's conditional. A
+        // global confidence bar set by the sticky pair would gate source 2's
+        // successors out entirely; the per-source-relative gate keeps each
+        // source's own genuinely-implied successors — the wide-wave case, where
+        // dozens of sources each imply their own cold arrivals.
+        let mut m = TransitionMatrix::new(L, E);
+        train(&mut m, 0, &[1], &[7], 95);
+        train(&mut m, 0, &[2], &[8], 30);
+        train(&mut m, 0, &[2], &[9], 30);
+        train(&mut m, 0, &[2], &[10], 30);
+        let got = m.predict_prefetch(0, &[1, 2]);
+        for want in [7, 8, 9, 10] {
+            assert!(got.contains(&want), "missing {want} in {got:?}");
+        }
     }
 
     #[test]
