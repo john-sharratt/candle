@@ -1,3 +1,11 @@
+//! FLUX.1 text-to-image diffusion example (schnell/dev).
+//!
+//! Encodes `--prompt` with T5-XXL and CLIP, denoises through `flux::model::Flux`
+//! (or the GGUF-quantized `flux::quantized_model::Flux` with `--quantized`),
+//! then decodes with the FLUX autoencoder. `--model` picks `schnell` (4-step)
+//! or `dev` (50-step); `--decode-only <file>` skips straight to decoding a
+//! saved latent. Output is saved as a JPEG.
+
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 

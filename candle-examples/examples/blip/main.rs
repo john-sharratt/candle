@@ -1,3 +1,13 @@
+//! Image captioning with BLIP (`candle_transformers::models::blip` /
+//! `quantized_blip`, `Config::image_captioning_large`).
+//!
+//! `--image` is required (resized/center-cropped to 384x384, OpenAI CLIP-style
+//! normalization). `--quantized` switches to the GGUF `quantized_blip` decoder
+//! (weights `lmz/candle-blip/blip-image-captioning-large-q4k.gguf`, forced onto
+//! CPU) instead of the F32 safetensors model from
+//! `Salesforce/blip-image-captioning-large`. Greedy decode of the caption
+//! starting from BOS token 30522, stopping at SEP token 102.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

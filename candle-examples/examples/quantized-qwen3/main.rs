@@ -1,3 +1,12 @@
+//! ChatML text generation with GGUF-quantized Qwen3 (`quantized_qwen3::ModelWeights`,
+//! Q4_K_M builds from `unsloth/Qwen3-*-GGUF`), one of Zen Code's primary
+//! development/benchmarking model families (this repo targets Qwen3-30B-A3B).
+//!
+//! `--which` selects dense Qwen3 sizes 0.6b through 32b. `--split-prompt`
+//! exercises the same `KvCaches` partial/full-truncate self-test as the
+//! quantized-qwen2-instruct example (batched 100-token prefill, truncate to
+//! 300, then reset) with CUDA-synchronized per-batch timing.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

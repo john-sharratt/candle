@@ -1,5 +1,14 @@
-//! Depth Anything V2
+//! Monocular depth estimation with Depth Anything V2, on a DINOv2 (ViT-S) backbone.
 //! https://huggingface.co/spaces/depth-anything/Depth-Anything-V2
+//!
+//! Two-stage load: `--dinov2-model` (default `lmz/candle-dino-v2`) builds the
+//! frozen `dinov2::vit_small` feature extractor, then `--depth-anything-v2-model`
+//! (default `jeroenvlek/depth-anything-v2-safetensors`, `DepthAnythingV2Config::vit_small`)
+//! builds the DPT depth head on top of it. `--image` is required (resized to
+//! 518x518 for the DINOv2 patch grid); `--color-map` renders the depth map
+//! through a Spectral-R colormap (`color_map.rs`) instead of grayscale, and the
+//! output is written next to the input as `depth_<name>` (or under
+//! `--output-dir`).
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;

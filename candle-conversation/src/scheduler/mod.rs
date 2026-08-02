@@ -1,7 +1,20 @@
-//! The scheduler: single thread that owns all GPU resources.
+//! The scheduler: a single thread owning every GPU resource (`Scheduler`,
+//! driven by `run.rs`'s `Scheduler::run`), running the continuous fair-wave
+//! loop (`docs/continuous_fair_waves.md`). Each wave drains submitted work,
+//! runs VRAM-governor admission/relief (`docs/vram_governor_design.md`), then
+//! fires one co-batched forward: a fast decode cursor sweeps every layer once
+//! per token while a large prefill/glue cursor creeps through the layers at a
+//! throttled rate, sharing each layer's expert load with decode — so decode
+//! never goes cold behind a big prefill. Sealing, cold-tail eviction, and
+//! KV-pool trim run at the wave tail.
 //!
-//! Runs a continuous loop alternating between prefill and decode.
-//! Phase 1 uses single-mode prefill (no small/large split).
+//! Submodules: `decode.rs` (decode quantum), `prefill.rs` (prefill/section
+//! ingest + VRAM budget-band admission), `run.rs` (top-level wave loop + wave
+//! relief), `sample.rs` (batched sampler), `projection_assembler.rs`
+//! (rebuilds a slot's prefix K/V from the substrate every projection, per
+//! `docs/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
+//! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
+//! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod decode;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;

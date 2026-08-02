@@ -1,3 +1,14 @@
+//! SegFormer vision transformer, run in one of two modes via subcommand:
+//! `segment` for semantic segmentation (`SemanticSegmentationModel`, produces
+//! a per-pixel class mask PNG colored from a JSON label/color table) or
+//! `classify` for whole-image classification (`ImageClassificationModel`,
+//! defaults to a 7-class food classifier).
+//!
+//! `--model-name` picks the HF repo per subcommand (default
+//! `nvidia/segformer-b0-finetuned-ade-512-512` for segmentation,
+//! `paolinox/segformer-finetuned-food101` for classification); config and
+//! weights are always fetched together from that repo.
+
 use candle::Device;
 use candle::Module;
 use candle_nn::VarBuilder;

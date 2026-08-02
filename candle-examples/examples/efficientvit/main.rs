@@ -1,3 +1,10 @@
+//! EfficientViT image classification example.
+//!
+//! Loads `efficientvit::efficientvit` with a `Config` selected by `--which`
+//! (M0..M5), fetching `model.safetensors` from `timm/efficientvit_mN.r224_in1k`
+//! on the HF hub (or `--model` for a local file). Classifies a `--image`
+//! against the 1000 ImageNet classes and prints the top-5 predictions.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

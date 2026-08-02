@@ -1,3 +1,14 @@
+//! Generic ONNX vision model runner (not a native candle model).
+//!
+//! `Which` selects one of three unrelated ONNX graphs, each evaluated once
+//! via `candle_onnx::simple_eval`: `SqueezeNet` (ImageNet-1k classification,
+//! `squeezenet1.1-7.onnx`), `EfficientNet` (ImageNet-1k classification,
+//! `efficientnet-lite4-11.onnx`, NHWC input via an extra permute), and
+//! `EsrGan` (Real-ESRGAN x4 super-resolution — writes an upscaled
+//! `super_<input>` PNG via `candle_examples::save_image` instead of
+//! printing class probabilities). Preprocessing (resize/normalize) differs
+//! per variant.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

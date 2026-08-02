@@ -1,3 +1,16 @@
+//! Metal compute-kernel crate backing `candle-core`'s `metal_backend`
+//! (`feature = "metal"`) — the Apple-GPU counterpart to `candle-kernels`'
+//! AOT CUDA path, not part of this fork's primary CUDA production target.
+//!
+//! `Kernels` (in `kernel`) compiles and caches `.metal` source (`source`) into
+//! `ComputePipeline`s on demand rather than embedding precompiled binaries.
+//! `kernels/` holds one module per op family (`affine`, `convolution`,
+//! `indexing`, `quantized`, `reduce`, `sdpa`, `sort`, ...), each exposing
+//! `call_*` entry points that `metal_backend` dispatches into. `metal/` wraps
+//! the raw Metal API surface (`Buffer`, `Device`, `CommandQueue`, encoders,
+//! `Library`) used to build and run those pipelines. `DType` here mirrors
+//! `candle_core::DType` for the subset Metal buffers actually carry.
+
 pub mod err;
 pub mod kernel;
 pub mod kernels;

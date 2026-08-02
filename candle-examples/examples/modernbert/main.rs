@@ -1,3 +1,13 @@
+//! ModernBERT masked-language-model fill-mask.
+//!
+//! Loads `ModernBertForMaskedLM` (Base or Large, via `Model`/`--model-id`)
+//! and fills `[MASK]` tokens in `--prompt`, or a built-in batch of four
+//! example sentences if none is given. Batches prompts with
+//! `PaddingStrategy::BatchLongest`, builds an explicit attention mask, and
+//! prints the argmax-decoded sentence per input. Falls back to
+//! `pytorch_model.bin` (`VarBuilder::from_pth`) if `model.safetensors` is
+//! not present in the repo.
+
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};

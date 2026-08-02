@@ -1,5 +1,9 @@
-//! EVA-02: Explore the limits of Visual representation at scAle
-//! https://github.com/baaivision/EVA
+//! EVA-02 vision transformer image classification example.
+//!
+//! https://github.com/baaivision/EVA — loads `eva2::vit_base` weights from
+//! `vincent-espitalier/candle-eva2` (or `--model` for a local file), resizes
+//! the input `--image` to 448x448 with OpenAI CLIP normalization, and prints
+//! the top-5 of 1000 ImageNet-class predictions.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

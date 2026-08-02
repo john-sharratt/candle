@@ -1,3 +1,12 @@
+//! Text generation across the Qwen family: Qwen1.5 (0.5b-72b), Qwen2 (0.5b-72b),
+//! Qwen2-MoE-A2.7B, and dense/MoE Qwen3 (0.6b-8b dense, 30B-A3B MoE) — the
+//! latter two backed by `qwen3`/`qwen3_moe`'s `InstanceForCausalLM` wrapper.
+//!
+//! `--model` (`WhichModel`) picks the version+size and resolves the matching
+//! `Qwen/Qwen{version}-{size}` HF repo. BF16 on CUDA/Metal, F32 elsewhere.
+//! `--use-flash-attn` is accepted but unused by this dispatch path. EOS is
+//! either `<|endoftext|>` or `<|im_end|>`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,3 +1,12 @@
+//! ImageNet-1k classification with RepVGG (`candle_transformers::models::repvgg`),
+//! a re-parameterizable CNN with a multi-branch train-time topology that
+//! collapses to a plain VGG-style stack at inference.
+//!
+//! `--which` selects one of ten RepVGG variants (A0-A2, B0-B3, and grouped-conv
+//! B1G4/B2G4/B3G4), fetched by default from `timm/repvgg_<name>.rvgg_in1k` on
+//! the HF hub. `--image` is a single 224x224 input file; prints the top-5
+//! predicted ImageNet classes with softmax probabilities.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

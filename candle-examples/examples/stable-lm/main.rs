@@ -1,3 +1,13 @@
+//! StableLM autoregressive text generation, greedy/top-p sampling with
+//! repeat penalty, streamed token-by-token to stdout.
+//!
+//! `--which` selects among `v1-orig`/`v1`/`v1-zephyr`/`v2`/`v2-zephyr`/`code`
+//! (`stabilityai/stablelm-*` and `stable-code-3b` repos), each with its own
+//! default `Config`; `--quantized` switches to a GGUF checkpoint through
+//! `quantized_stable_lm::Model` (only the `v1`/`v1-orig`/`v2`/`v2-zephyr`
+//! variants ship quantized weights). `--use-flash-attn` toggles flash
+//! attention in the unquantized path.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

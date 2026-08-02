@@ -1,3 +1,13 @@
+//! Moondream vision-language model: image-grounded question answering.
+//!
+//! Encodes `--image` (resized/cropped to 378x378) through the vision
+//! encoder, then autoregressively answers `--prompt` by feeding the image
+//! embedding into `text_model.forward_with_img` on the first step and
+//! plain `forward` afterward. `--quantized` swaps in the GGUF
+//! `quantized_moondream::Model`; `--f16` forces half precision for the
+//! float path (incompatible with `--quantized`). Uses the async
+//! `hf_hub::api::tokio` client under a `#[tokio::main]` entry point.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

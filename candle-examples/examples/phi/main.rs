@@ -1,3 +1,12 @@
+//! Text generation for Microsoft's Phi family (Phi-1, 1.5, 2, 3, 3-medium, 4-mini)
+//! and the legacy PuffinPhi/Phi-Hermes MixFormer checkpoints.
+//!
+//! `--model` selects the `WhichModel` variant, which drives repo/revision/tokenizer
+//! lookup on the HF hub; `--quantized` switches to GGUF weights via `QMixFormer`.
+//! `Model` enum dispatches forward calls across `MixFormer`, `Phi`, `Phi3`, and
+//! `QMixFormer`. `--mmlu-dir` runs MMLU multiple-choice evaluation instead of
+//! free-form generation from `--prompt`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

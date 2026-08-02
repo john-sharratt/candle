@@ -1,3 +1,12 @@
+//! DistilBERT masked-language-model and embedding example.
+//!
+//! Loads `DistilBertModel` (bare encoder, prints pooled embeddings) or
+//! `DistilBertForMaskedLM` (predicts top-k tokens for each `[MASK]` in the
+//! prompt), selected via `--model` (`Which::DistilBert` /
+//! `DistilbertForMaskedLM`). Downloads config/tokenizer/safetensors from the
+//! HF hub (default `distilbert-base-uncased`) or `--use-pth` for PyTorch
+//! weights.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

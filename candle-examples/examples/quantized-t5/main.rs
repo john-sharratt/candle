@@ -1,3 +1,12 @@
+//! Sequence-to-sequence generation with GGUF-quantized T5/Flan-T5
+//! (`quantized_t5::T5ForConditionalGeneration`), encoder-decoder rather than a
+//! decoder-only causal LM. Runs CPU-only (`Device::Cpu` is hardcoded).
+//!
+//! `--which` selects T5-small or a Flan-T5 size (small/base/large/xl/xxl),
+//! resolving the matching GGUF weight file and JSON config from
+//! `lmz/candle-quantized-t5` by default. `--disable-cache` turns off decoder
+//! KV caching for a slower but simpler decode loop. `--prompt` is required.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

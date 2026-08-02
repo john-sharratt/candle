@@ -1,3 +1,8 @@
+//! Image classification dataset loaders.
+//!
+//! Defines the shared [`Dataset`] struct (train/test image and label
+//! tensors, plus the label count) returned by each loader in [`cifar`],
+//! [`fashion_mnist`], and [`mnist`].
 use candle::Tensor;
 
 pub struct Dataset {

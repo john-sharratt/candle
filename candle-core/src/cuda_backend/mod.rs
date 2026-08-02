@@ -1,5 +1,18 @@
-//! Implementation of Backend traits for CUDA device
+//! `BackendStorage` implementation for the CUDA backend (`feature = "cuda"`),
+//! the production inference path for this fork.
 //!
+//! `CudaStorage` wraps a `CudaStorageSlice` (one `CudaSlice<T>` variant per
+//! dtype) plus a `CudaDevice`; `BackendDevice for CudaDevice` lives in the
+//! sibling `device.rs`. Generic tensor ops (elementwise, affine, reduce,
+//! indexing, conv, matmul via `cublas`) are each a small unit struct
+//! implementing `Map1`/`Map2`/`Map1Any`/`Map2InPlace`/`Map2Any`, which launch
+//! the AOT-compiled PTX kernels re-exported here as `kernels`
+//! (`candle_kernels::simple::*`) — PTX is embedded at compile time by
+//! `candle-kernels/build.rs`, so no NVCC is needed at runtime. Quantized
+//! matmul dispatches separately from `candle-core/src/quantized/cuda.rs`, and
+//! the paged-decode/paged-prefill/paged-glue/provenance kernels backing the
+//! three-tier KV cache are called directly from `candle-transformers` and
+//! `candle-nn::kv_cache`, bypassing this generic dispatch entirely.
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, WithDType};

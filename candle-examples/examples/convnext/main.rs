@@ -1,3 +1,11 @@
+//! ConvNeXt / ConvNeXt-V2 ImageNet-1k classification (`candle_transformers::models::convnext`).
+//!
+//! `--which` selects among 17 timm checkpoint variants (`atto`..`huge`, both
+//! V1 and V2 depths/widths, default `tiny`), each mapped to a
+//! `timm/convnext(v2)_<variant>...` HF repo and a matching `convnext::Config`.
+//! Loads a single `--image` (224x224 ImageNet preprocessing) and prints the
+//! top-5 class probabilities.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

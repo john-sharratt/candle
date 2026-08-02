@@ -1,4 +1,10 @@
 //! Helpers shared across candle-conversation integration tests.
+//!
+//! Currently just [`open_conversation`]: reopen a redo log the way the `zend`
+//! daemon does at startup (walk every record into a fresh [`Substrate`], then
+//! bind it to a [`Conversation`]) so tests exercise the same recovery path as
+//! production instead of `Conversation::with_persistence`'s empty-substrate
+//! shortcut, which recovers nothing.
 
 use std::path::Path;
 

@@ -1,5 +1,10 @@
-//! BEiT: BERT Pre-Training of Image Transformers
+//! BEiT (BERT Pre-Training of Image Transformers) ImageNet-1k classification.
 //! https://github.com/microsoft/unilm/tree/master/beit
+//!
+//! Loads a single `--image`, resizes/center-crops to 384x384 with BEiT
+//! normalization (mean/std 0.5), runs `candle_transformers::models::beit::vit_base`,
+//! and prints the top-5 ImageNet class probabilities. `--model` overrides the
+//! default weights fetched from `vincent-espitalier/candle-beit` on the HF Hub.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

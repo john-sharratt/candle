@@ -1,3 +1,13 @@
+//! YOLOv3 object detection, parsing the original Darknet `.cfg` format
+//! (local `darknet` module) rather than a candle-native model definition.
+//!
+//! Defaults to the `lmz/candle-yolo-v3` hub repo for both `yolo-v3.cfg` and
+//! `yolo-v3.safetensors`; runs CPU-only. Takes one or more `images` paths,
+//! resizes each to the network's configured input size, runs a forward
+//! pass, applies `--confidence-threshold` filtering and
+//! `non_maximum_suppression` at `--nms-threshold`, draws red bounding boxes
+//! (`draw_rect`) over COCO class labels, and writes `<name>.pp.jpg`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

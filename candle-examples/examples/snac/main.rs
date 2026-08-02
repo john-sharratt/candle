@@ -1,3 +1,14 @@
+//! SNAC neural audio codec: encode/decode/round-trip audio through its
+//! hierarchical codebooks.
+//!
+//! `--action` selects `audio-to-audio` (encode then decode, i.e. compress),
+//! `audio-to-code` (dump codebook indices to `codes.safetensors`), or
+//! `code-to-audio` (resynthesize from saved codes). `--which` picks the
+//! 24/32/44 kHz checkpoint (`hubertsiuzdak/snac_*khz`), which fixes the
+//! model sample rate; input is resampled if it doesn't match. `in_file`/
+//! `out_file` of `-` records from/plays to the live microphone/speaker via
+//! the local `audio_io` module instead of a file.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

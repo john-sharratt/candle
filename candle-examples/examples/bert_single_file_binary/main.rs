@@ -1,3 +1,12 @@
+//! Self-contained BERT sentence-embedding binary with weights baked in via `include_bytes!`.
+//!
+//! Unlike `bert`, this example never touches the HF Hub or filesystem at
+//! runtime: `build_model_and_tokenizer_from_bytes` embeds the MiniLM-L6-v2
+//! config/tokenizer/safetensors produced by the sibling
+//! `bert_single_file_binary_builder` build script directly into the executable.
+//! Same `--prompt` (single-sentence forward pass) vs. default (8-sentence
+//! demo batch + cosine-similarity ranking) behavior as the `bert` example.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

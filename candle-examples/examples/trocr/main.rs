@@ -1,3 +1,14 @@
+//! TrOCR: transformer OCR (ViT image encoder + TrOCR autoregressive text
+//! decoder) reading printed or handwritten text out of an image.
+//!
+//! `--which` selects `base`/`large` handwritten or `base-printed`/
+//! `large-printed` Microsoft checkpoints (`Which::repo_and_branch_name`),
+//! which also fixes the paired `vit::Config`/`trocr::TrOCRConfig` loaded
+//! from the repo's `config.json`. `--image` is the input file, preprocessed
+//! by the local `image_processor` module (`ViTImageProcessor`) before the
+//! encoder forward pass; decoding then runs token-by-token with a
+//! `TokenOutputStream`, greedy/no-penalty sampling, up to 1000 tokens or EOS.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,3 +1,13 @@
+//! Sentence embeddings with BERT/sentence-transformers models (`candle_transformers::models::bert`).
+//!
+//! With `--prompt`, encodes that single string and prints the raw hidden states.
+//! Without it, encodes a fixed batch of 8 demo sentences, mean-pools token
+//! embeddings, optionally L2-normalizes (`--normalize-embeddings`, default true),
+//! and prints the top-5 most similar sentence pairs by cosine similarity.
+//! Defaults to `sentence-transformers/all-MiniLM-L6-v2`; `--use-pth` loads
+//! PyTorch weights instead of safetensors; `--approximate-gelu` swaps in the
+//! tanh-based Gelu approximation.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

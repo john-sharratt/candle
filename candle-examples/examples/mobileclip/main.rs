@@ -1,3 +1,12 @@
+//! MobileCLIP (Apple, OpenCLIP-format) image/text similarity.
+//!
+//! Computes CLIP-style softmax similarity between `--images` (default: the
+//! stable-diffusion-xl and yolo-v8 sample jpgs) and `--sequences` (default:
+//! three example captions), printing a per-image probability over the
+//! candidate captions. `Which` selects the S1 or S2 checkpoint size from
+//! `apple/MobileCLIP-{S1,S2}-OpenCLIP`. `--use-pth` loads the original
+//! PyTorch `.bin` weights instead of the safetensors export.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

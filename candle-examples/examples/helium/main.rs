@@ -1,3 +1,11 @@
+//! Helium (Kyutai) causal-LM text generation example, two model families.
+//!
+//! `--which` selects `v1-preview` (`kyutai/helium-1-preview-2b`, routed through
+//! `llama::Llama`/`Cache` since it shares the Llama architecture) or `v1`
+//! (`kyutai/helium-1-2b`, `helium::Model`), unified behind a `Model`/`Config`
+//! enum. Sampling supports Gumbel-softmax, top-k, and top-p with a repeat
+//! penalty.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

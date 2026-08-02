@@ -1,3 +1,13 @@
+//! Marian encoder-decoder machine translation.
+//!
+//! Greedy-decodes a translation for `--text` using
+//! `candle_transformers::models::marian::MTModel`: the encoder runs once,
+//! then the decoder is stepped autoregressively via `model.decode`.
+//! `Which` picks the Base or Big Opus-MT variant, `LanguagePair` selects
+//! among fr-en/en-zh/en-hi/en-es/en-fr/en-ru (Big is only available for
+//! fr-en). A `--quantized` flag exists on `Args` but the current weight-load
+//! path always mmaps F32 safetensors regardless of it.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

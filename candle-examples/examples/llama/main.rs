@@ -1,3 +1,11 @@
+//! Llama 1/2/3(.1/.2)/SmolLM2/TinyLlama/Solar causal-LM text generation example.
+//!
+//! `--which` selects among ~18 checkpoints (Llama v1/v2/v3/v3.1/v3.2 base and
+//! instruct, SmolLM2 135M/360M/1.7B, TinyLlama-1.1B-Chat, SOLAR-10.7B), each
+//! mapped to a default HF repo id. Manual decode loop using `llama::Cache` and
+//! `Sampling` (top-k/top-p/temperature) with a repeat penalty;
+//! `--use-flash-attn` and `--no-kv-cache` are supported.
+
 // An implementation of LLaMA https://github.com/facebookresearch/llama
 //
 // This is based on nanoGPT in a similar way to:

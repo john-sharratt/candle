@@ -1,3 +1,13 @@
+//! Browser demo: BERT sentence embeddings compiled to WebAssembly.
+//!
+//! This crate root re-exports `BertModel`/`Config`/`DTYPE` from
+//! `candle_transformers::models::bert` and the `tokenizers` types the wasm
+//! binary needs, plus a `console_log!` macro bound to the browser's
+//! `console.log`. The actual `#[wasm_bindgen]` surface — `Model::load(weights,
+//! tokenizer, config)` and `Model::get_embeddings(params) -> Embeddings`
+//! (mean-pooled, optionally L2-normalized) — lives in `src/bin/m.rs`; weight,
+//! tokenizer and config bytes are fetched by JS and passed in, none are
+//! embedded in the wasm binary. Consumed from `bertWorker.js` in a WebWorker.
 use candle_transformers::models::bert;
 use wasm_bindgen::prelude::*;
 

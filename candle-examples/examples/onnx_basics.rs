@@ -1,3 +1,11 @@
+//! ONNX model inspection and evaluation via `candle-onnx`.
+//!
+//! Two subcommands over an `.onnx` protobuf file: `print --file <p>` dumps the
+//! parsed `ModelProto` and every graph node, and `simple-eval --file <p>` builds
+//! zero-filled inputs from the graph's declared input shapes (skipping names
+//! that are graph initializers) and runs the ONNX interpreter over them.
+//! Requires the `onnx` feature.
+
 use anyhow::Result;
 use candle::{Device, Tensor};
 

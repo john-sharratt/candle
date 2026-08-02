@@ -1,3 +1,10 @@
+//! VGG (13/16/19) ImageNet classification.
+//!
+//! `--which` selects the `timm/vgg{13,16,19}.tv_in1k` checkpoint; `--image`
+//! is a 224x224-preprocessed ImageNet input (`candle_examples::imagenet::
+//! load_image224`). Runs a single forward pass and prints the top-5 class
+//! labels with softmax probabilities.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,3 +1,11 @@
+//! GLM-4 causal-LM text generation example, old and new architectures.
+//!
+//! `--which` picks `glm4-old` (`THUDM/glm-4-9b`, `models::glm4::Model`) or
+//! `glm4-new` (`THUDM/GLM-4-9B-0414`, `models::glm4_new::ModelForCausalLM`),
+//! which differ enough that `--which` is required rather than defaulted.
+//! Prompts are wrapped in the ChatGLM `[gMASK]<sop><|user|>...<|assistant|>`
+//! template; EOS is read from config or falls back to a per-variant token.
+
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;

@@ -1,3 +1,16 @@
+//! CUDA flash-attention v2 bindings, exposed as Candle custom ops.
+//!
+//! [`ffi`] declares the `extern "C"` link to the vendored flash-attention
+//! CUDA/C++ kernels (built by `build.rs` from the `flash-attention` git
+//! submodule). [`FlashAttn`] and [`FlashAttnVarLen`] implement
+//! `candle::CustomOp3`, dispatching `(q, k, v)` to `ffi::run_mha` for f16/bf16
+//! CUDA tensors only (no CPU fallback). The public entry points —
+//! [`flash_attn`], [`flash_attn_windowed`], [`flash_attn_alibi`],
+//! [`flash_attn_alibi_windowed`], [`flash_attn_alibi_windowed_softcap`],
+//! [`flash_attn_varlen`], [`flash_attn_varlen_windowed`] — compute
+//! `softmax(Q @ K^T * softmax_scale) @ V` with optional causal masking,
+//! sliding-window limits, ALiBi slopes, softcap, and (for the varlen
+//! variants) ragged batching via cumulative sequence-length tensors.
 mod ffi;
 
 use candle::backend::BackendStorage;

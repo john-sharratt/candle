@@ -1,3 +1,15 @@
+//! Multi-speaker conversational speech synthesis with Sesame CSM-1B
+//! (`candle_transformers::models::csm::Model` + `candle_transformers::models::mimi`
+//! neural audio codec).
+//!
+//! `--prompt` uses `|` to separate speaker turns (alternating speaker index
+//! 0/1); `--voices` is a required safetensors file with `tokens`/`mask`
+//! reference-voice conditioning. Weights default to `sesame/csm-1b`
+//! (`--which 1b` is currently the only option), tokenizer to
+//! `meta-llama/Llama-3.2-1B`, codec weights to `kyutai/mimi`. Generates audio
+//! codebook frames autoregressively, decodes them through Mimi, normalizes
+//! loudness, and writes 24kHz PCM to `--out-file` (default `out.wav`).
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

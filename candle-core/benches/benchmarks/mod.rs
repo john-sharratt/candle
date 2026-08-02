@@ -1,3 +1,14 @@
+//! Shared Criterion benchmark plumbing plus one submodule per benchmarked op
+//! (`affine`, `conv_transpose2d`, `copy`, `matmul`, `qmatmul`, `random`,
+//! `reduce`, `unary`, `where_cond`).
+//!
+//! `BenchDevice` (implemented for `Device`) supplies `sync()` — a per-backend
+//! barrier (`cudaDeviceSynchronize`/`waitUntilCompleted`/no-op on CPU) so
+//! timings measure real device work — and `bench_name()`, which prefixes
+//! results with the active backend (`cuda_`/`metal_`/`accelerate_`/`mkl_`/
+//! `cpu_`). `BenchDeviceHandler::new()` picks the single device to benchmark
+//! by feature flag: `metal` > `cuda` > CPU fallback.
+
 pub(crate) mod affine;
 pub(crate) mod conv_transpose2d;
 pub(crate) mod copy;

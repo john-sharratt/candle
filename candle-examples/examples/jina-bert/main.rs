@@ -1,3 +1,11 @@
+//! Jina-BERT embedding example: sentence embeddings and pairwise similarity.
+//!
+//! Loads `BertModel` (default `jinaai/jina-embeddings-v2-base-en`, ALiBi
+//! position embeddings) via `--model`/`--model-file`/`--tokenizer` overrides.
+//! With `--prompt`, prints the mean-pooled (optionally L2-normalized)
+//! embedding; otherwise encodes a built-in batch of example sentences and
+//! prints the top-5 most similar pairs by cosine similarity.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

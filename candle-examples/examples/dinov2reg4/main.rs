@@ -1,7 +1,13 @@
-//! DINOv2 reg4 finetuned on PlantCLEF 2024
+//! DINOv2-with-registers (reg4), ViT-B/14, finetuned for PlantCLEF 2024 plant species ID.
 //! https://arxiv.org/abs/2309.16588
 //! https://huggingface.co/spaces/BVRA/PlantCLEF2024
 //! https://zenodo.org/records/10848263
+//!
+//! Loads a single `--image` (518x518 preprocessing) plus the bundled
+//! `species_id_mapping.txt` class list, runs
+//! `candle_transformers::models::dinov2reg4::vit_base`, and prints the top-5
+//! species probabilities. `--model` overrides the default weights fetched
+//! from `vincent-espitalier/dino-v2-reg4-with-plantclef2024-weights`.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

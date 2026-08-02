@@ -1,3 +1,13 @@
+//! OLMo / OLMo2 text generation.
+//!
+//! `Which` covers `1b`/`7b`/`7b-twin-2t`/`1.7-7b` (all served by
+//! `models::olmo::Model`) and `2-1b` (`models::olmo2::Model`, a distinct
+//! architecture with its own `Config2`) — `--model` picks which of the two
+//! model enums and config schema get used. Weights load as BF16 on CUDA /
+//! F32 on CPU; single-file checkpoints for the two `1b` variants, sharded
+//! safetensors (via the HF index) for the `7b` ones. Standard
+//! temperature/top-p sampling with repeat penalty.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

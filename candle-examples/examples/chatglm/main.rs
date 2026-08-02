@@ -1,3 +1,12 @@
+//! Text generation with ChatGLM3-6B (`candle_transformers::models::chatglm::Model`,
+//! `Config::glm3_6b`).
+//!
+//! Defaults to `THUDM/chatglm3-6b` weights (`--model-id`/`--revision` override,
+//! `--weight-file` for a local safetensors path) with a dedicated tokenizer
+//! fetched from `lmz/candle-chatglm`. `--verbose-prompt` dumps the tokenized
+//! prompt before generation. Standard temperature/top-p/repeat-penalty sampling
+//! loop over `--prompt`, stopping at the `</s>` token.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

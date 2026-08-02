@@ -1,3 +1,12 @@
+//! PDF page retrieval with ColPali (`candle_transformers::models::colpali::Model`,
+//! a PaliGemma-based vision-language retriever, `paligemma::Config::paligemma_3b_448`).
+//!
+//! `--pdf` and `--prompt` are required; renders PDF pages to images via
+//! `pdf2image` (requires the system `poppler` utilities), embeds each page and
+//! the text query with the model's late-interaction MaxSim scoring, and prints
+//! the `--top-k` best-matching page numbers. `--start`/`--end` restrict the
+//! page range rendered; weights default to `vidore/colpali-v1.2-merged`.
+
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;

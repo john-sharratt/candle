@@ -1,3 +1,13 @@
+//! Mistral text generation, float or quantized GGUF weights.
+//!
+//! `Which` covers Mistral-7B v0.1/v0.2, their Instruct variants, Mathstral
+//! 7B, and Mistral-Nemo (base + instruct, 2407). `--quantized` swaps in
+//! `quantized_mistral::Model` loaded from a `model-q4k.gguf` (only supported
+//! for `7b-v0.1`); the float path mmaps safetensors as BF16 on CUDA / F32
+//! elsewhere. `--use-flash-attn` and `--force-dmmv` (CUDA dequant-matvec
+//! kernel choice) are supported. Sampling is temperature + top-k/top-p via
+//! `generation::Sampling`, falling back to argmax at temperature 0.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

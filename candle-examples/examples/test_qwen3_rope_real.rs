@@ -1,3 +1,11 @@
+//! RoPE correctness probe for quantized Qwen3 at long context.
+//!
+//! Loads the official `Qwen/Qwen3-8B-GGUF` Q5_K_M checkpoint through
+//! `quantized_qwen3::ModelWeights`, builds a synthetic conversation past 4000
+//! tokens, and decodes through it to confirm rotary position embeddings stay
+//! coherent well beyond short-context ranges. Downloads weights and tokenizer
+//! from the HF hub on first run and prefers the GPU device.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

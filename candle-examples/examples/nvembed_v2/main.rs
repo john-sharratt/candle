@@ -1,3 +1,13 @@
+//! NV-Embed-v2 (NVIDIA) instruction-tuned text embeddings.
+//!
+//! With `--prompt`, embeds that single string and prints the vector. Without
+//! it, runs a query/passage retrieval demo: queries get an instruction
+//! prefix, passages do not, and a latent-attention pooling mask
+//! (`pool_mask`) zeroes out the instruction span so it doesn't contribute to
+//! pooling. Embeddings are L2-normalized (`div_l2_norm`) and scored via
+//! query @ passage^T * 100. Tokenizer uses right-padding (pad id 2, `</s>`)
+//! and truncates at 32768 tokens.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

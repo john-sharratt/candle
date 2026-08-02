@@ -1,3 +1,15 @@
+//! Orpheus TTS: Llama backbone generating SNAC-codec audio tokens.
+//!
+//! Runs `canopylabs/orpheus-3b-0.1-ft` (a `candle_transformers::models::
+//! llama::Llama`, `Which::ThreeB0_1Ft` only) autoregressively over a
+//! `voice: prompt`-formatted string (`Voice` selects one of 8 named
+//! speakers: tara/leah/jess/leo/dan/mia/zac/zoe) until `STOP_TOKEN_ID` or
+//! 2000 steps. Generated `<custom_token_N>` ids are decoded and
+//! de-interleaved into 3 codebook streams (7-token groups), then rendered
+//! to PCM by the separately-downloaded SNAC model
+//! (`hubertsiuzdak/snac_24khz`) and written as a wav. Supports
+//! `--use-flash-attn`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

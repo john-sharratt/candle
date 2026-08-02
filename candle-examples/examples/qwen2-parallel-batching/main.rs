@@ -1,3 +1,14 @@
+//! Demonstrates GPU continuous-batching decode for GGUF-quantized Qwen2 (0.5B
+//! Instruct) using `BatchedInference`/`SequenceContext`/`BatchedPrefillMeta`
+//! from `candle_transformers::models::batched_{model,layer}` — the same
+//! machinery the daemon's scheduler uses to step many sessions through a
+//! shared `ChunkedKvBacking` together.
+//!
+//! Runs two prompts of different lengths through a padded shared prefill, then
+//! 100 decode steps via `forward_batch`, then re-measures the same 100 steps
+//! sequentially (separate `forward` calls) vs. batched to report the speedup.
+//! No CLI arguments; uses `PinnedStager` for host-pinned staging buffers.
+
 /// Parallel Continuous Batching Example for Qwen2
 use candle::quantized::pinned_staging::PinnedStager;
 use candle::{Device, Result, Tensor};

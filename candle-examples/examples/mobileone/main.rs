@@ -1,3 +1,12 @@
+//! MobileOne (reparameterizable CNN) ImageNet-1k image classification.
+//!
+//! `Which` selects one of five timm checkpoints S0-S4
+//! (`timm/mobileone_<variant>.apple_in1k`), all at fixed 224x224 input
+//! (`imagenet::load_image224`). Loads F32 safetensors, runs a single
+//! forward pass, and prints the top-5 `imagenet::CLASSES` predictions.
+//! Structurally identical to the `mobilenetv4` example, just a different
+//! backbone/config table.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

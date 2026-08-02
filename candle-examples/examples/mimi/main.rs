@@ -1,3 +1,14 @@
+//! Mimi (Kyutai) neural audio codec: encode/decode round-trip.
+//!
+//! `Action` selects `audio-to-audio` (encode then decode, a compression
+//! round-trip), `audio-to-code` (encode to discrete codes saved as
+//! safetensors), or `code-to-audio` (decode codes back to a wav). `--in-file
+//! -` records live from the microphone via the local `audio_io` module
+//! (cpal input stream) until Enter is pressed; `--out-file -` streams
+//! decoded audio to the speakers instead of a file. `--streaming <N>` runs
+//! the codec chunk-by-chunk instead of on the whole clip at once. Input
+//! audio is resampled to the required 24kHz if needed.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

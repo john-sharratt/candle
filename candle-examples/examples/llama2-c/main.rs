@@ -1,3 +1,11 @@
+//! llama2.c (Karpathy) text generation, evaluation, and training example.
+//!
+//! Subcommands: `Inference` (autoregressive sampling from `.bin`/safetensors/
+//! GGUF checkpoints, dispatching to `model::Llama` or the quantized
+//! `qmodel::QLlama`), `Eval` (cross-entropy loss over a pretokenized or
+//! TinyStories dataset), and `Train` (delegates to the local `training`
+//! module). Default weights are the `karpathy/tinyllamas` `stories15M.bin`.
+
 // https://github.com/karpathy/llama2.c
 
 #[cfg(feature = "accelerate")]

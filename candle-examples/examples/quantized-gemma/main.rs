@@ -1,3 +1,12 @@
+//! Text generation with GGUF-quantized Gemma 3 (`quantized_gemma3::ModelWeights`),
+//! defaulting to the `google/gemma-3-4b-it-qat-q4_0-gguf` Q4_0 checkpoint.
+//!
+//! `--which` currently offers only `gemma3-4b-it`. `--prompt` accepts a literal
+//! string, `interactive` (repeated one-shot prompts), or `chat` (multi-turn with
+//! accumulated history and the `<start_of_turn>`/`<end_of_turn>` template).
+//! Sampling is `Sampling::{ArgMax,All,TopK,TopP,TopKThenTopP}` chosen from
+//! `--temperature`/`--top-k`/`--top-p`; context is capped at 8192 tokens.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

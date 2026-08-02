@@ -1,3 +1,15 @@
+//! HTTP API surface: builds the axum [`Router`] zend serves and hosts the
+//! embedded web UI.
+//!
+//! [`router`] wires the OpenAI-compatible `/v1/chat/completions` endpoint plus
+//! zend's own REST surface to per-resource submodules — `chat`, `conversations`,
+//! `files` (conversation-attached uploads), `models`, `status`
+//! (telemetry/maintenance), `substrate` (layer/timeline inspection + projection
+//! debug), `telemetry`, and `ws_logs` (the log websocket). UI assets are
+//! embedded at compile time via `include_dir!` and served with `no-store`
+//! caching plus a content [`build_id`] the frontend uses to force a reload
+//! after a hot rebuild changes the UI/JS pairing.
+
 use std::sync::Arc;
 
 use axum::{

@@ -1,3 +1,13 @@
+//! StarCoder2 code-generation text example (`bigcode/starcoder2-3b` by
+//! default).
+//!
+//! Straightforward greedy/top-p autoregressive loop over
+//! `candle_transformers::models::starcoder2::Model`, streaming decoded
+//! tokens to stdout via `TokenOutputStream` and applying a repeat penalty
+//! over the last `--repeat-last-n` tokens. `--use-flash-attn` enables flash
+//! attention; weights load as BF16 on CUDA, F32 otherwise, from
+//! safetensors only (no quantized path).
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

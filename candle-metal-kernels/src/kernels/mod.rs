@@ -1,3 +1,12 @@
+//! One submodule per Metal op family, each exposing the `call_*` functions
+//! re-exported here that `candle-core`'s `metal_backend` calls to encode and
+//! dispatch a compute pass: `affine`/`binary`/`unary`/`ternary`/`cast`
+//! (elementwise), `reduce`/`sort`/`multinomial`, `indexing`/`div_at_indices`/
+//! `sub_at_indices`/`fill`, `convolution`, `mlx_gemm`/`quantized` (dense and
+//! GGML-quantized matmul), and `sdpa` (scaled dot-product attention).
+//! `macros` holds the shared `EncoderParam`/argument-binding boilerplate used
+//! across all of them.
+
 pub mod affine;
 pub mod binary;
 pub mod cast;

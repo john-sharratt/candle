@@ -1,3 +1,10 @@
+//! MusicGen (Facebook) text-to-music: text-encoder stage only.
+//!
+//! Loads `musicgen_model::MusicgenForConditionalGeneration` (small config)
+//! and runs just the T5-style `text_encoder` over `--prompt`, printing the
+//! resulting embedding tensor. The audio-generation decode loop (acoustic
+//! token sampling + codec decode to wav) is not wired up in this example.
+
 #![allow(dead_code)]
 // https://huggingface.co/facebook/musicgen-small/tree/main
 // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/models/musicgen/modeling_musicgen.py

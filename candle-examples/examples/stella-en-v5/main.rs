@@ -1,3 +1,16 @@
+//! Stella-en-v5 text embeddings (`dunzhang/stella_en_1.5B_v5` /
+//! `_400M_v5`), with a separate dense projection head selecting the output
+//! dimension.
+//!
+//! `--which` picks the 1.5B (`Large`) or 400M (`Small`) base model;
+//! `--embed-dim` (256..8192) selects which `2_Dense_<dim>` projection head
+//! to load on top of it (`EmbedDim::embed_dim_default_dir`). `--task`
+//! chooses the `s2p` (retrieval) or `s2s` (similarity) instruction prefix
+//! applied to queries only. The 1.5B variant left-pads, others right-pad
+//! (`create_tokenizer`). With no `--query`, runs a demo retrieval over two
+//! fixed queries against two fixed documents and prints the best-scoring
+//! doc per query.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

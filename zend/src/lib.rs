@@ -1,3 +1,14 @@
+//! `zend` — the Zen Code daemon library: an OpenAI-compatible HTTP surface in
+//! front of a persistent `candle_conversation` substrate, plus everything that
+//! turns a workspace into that substrate's content.
+//!
+//! Grouped by concern: HTTP surface (`api`, `chatml`, `session`,
+//! `log_broadcast`, `log_line`, `projection_event`); model bring-up
+//! (`loading`, `model_choice`, `download`, `config`); workspace ingestion
+//! (`ingest`, `repo_scan`, `code_read`, `raw_read`, `refresh_ctx`, `watcher`,
+//! `turn_sink`); tool orchestration (`tools`, `tool_def`, `tool_summary`);
+//! conversation-attached files (`conv_files`, `conv_file_store`); and shared
+//! wire types (`types`, `response_section`).
 pub mod api;
 pub mod chatml;
 pub mod code_read;

@@ -1,3 +1,16 @@
+//! Wuerstchen text-to-image generation: a two-stage prior + decoder
+//! diffusion pipeline (`warp-ai/wuerstchen*`) with a separate VQGAN decode.
+//!
+//! Stage 1 (`WPrior`, `stable_diffusion::clip::Config::wuerstchen_prior`)
+//! denoises low-resolution image embeddings conditioned on the prompt with
+//! classifier-free guidance (`PRIOR_GUIDANCE_SCALE`); stage 2 (`WDiffNeXt`)
+//! upsamples those embeddings into VQGAN latent space
+//! (`RESOLUTION_MULTIPLE`/`LATENT_DIM_SCALE`), which `PaellaVQ` decodes to
+//! pixels. `ModelFile` resolves each of the 7 weight/tokenizer files
+//! (prior vs. main CLIP, prior, decoder, VQGAN) individually, all
+//! independently overridable by flag. `--num-samples` batches images to
+//! `sd_final.<n>.png`; `--use-flash-attn` applies to both diffusion nets.
+
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 

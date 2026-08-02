@@ -1,3 +1,16 @@
+//! YOLOv8 object detection and pose estimation, sharing one CLI over two
+//! model heads via the generic `Task` trait (`YoloV8`/`YoloV8Pose`, defined
+//! in the local `model` module).
+//!
+//! `--which` selects the n/s/m/l/x size (`Multiples::{n,s,m,l,x}`);
+//! `--task detect` (COCO 80-class boxes, `report_detect`, with an optional
+//! text legend via `--legend-size`) or `--task pose` (17-keypoint human
+//! pose skeleton, `report_pose`, connections in `KP_CONNECTIONS`) selects
+//! which of `YoloV8`/`YoloV8Pose` loads and which report/render path runs.
+//! Weights default to `lmz/candle-yolo-v8` (`yolov8<size>[-pose].safetensors`).
+//! Images are letterboxed to a side of 640 (divisible by 32) before the
+//! forward pass; annotated output is written to `<name>.pp.jpg`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

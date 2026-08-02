@@ -1,3 +1,10 @@
+//! Falcon-7B causal-LM text generation example.
+//!
+//! Loads `Falcon` (`tiiuae/falcon-7b` by default, pinned to `refs/pr/43`) via
+//! `TextGeneration`, sampling with temperature/top-p and a repeat penalty over
+//! `--repeat-last-n` tokens. `--use-f32` forces F32 weights instead of the
+//! default BF16.
+
 // TODO: Add an offline mode.
 
 #[cfg(feature = "accelerate")]

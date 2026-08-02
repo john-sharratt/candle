@@ -1,4 +1,12 @@
-//! Traits and methods for CPU-backed Tensors
+//! SIMD dot-product/reduction primitives shared by the CPU backend.
+//!
+//! Defines the `Cpu`/`CpuF16`/`CpuBF16` traits (load/fma/reduce over a fixed
+//! `ARR`-wide register array) and re-exports whichever architecture module
+//! (`avx`, `neon`, `simd128`) implements `CurrentCpu`/`CurrentCpuF16`/
+//! `CurrentCpuBF16` for the target, selected purely by `cfg(target_feature)`.
+//! `vec_dot_f32`/`vec_dot_f16`/`vec_dot_bf16`/`vec_sum` are the row-wise
+//! kernels `cpu_backend`'s `MatMul`/`ReduceSum` call into; each has a scalar
+//! fallback compiled in when no SIMD feature is enabled.
 
 pub mod erf;
 pub mod kernels;

@@ -1,3 +1,17 @@
+//! Live-microphone Whisper transcription: captures audio via `cpal`,
+//! resamples to 16 kHz with `rubato`, and transcribes continuously.
+//!
+//! `--model` selects the Whisper size/variant (`tiny`..`large-v3-turbo`,
+//! `.en`-suffixed or multilingual, distil variants); `--quantized` loads a
+//! GGUF checkpoint from `lmz/candle-whisper` (only tiny/tiny.en supported
+//! quantized). `--language`/`--task` (transcribe/translate) override
+//! auto-detected language on multilingual models (`multilingual` module).
+//! `--device` picks the input audio device by name. Buffers ~10s of audio
+//! per decode pass, computes the log-mel spectrogram
+//! (`candle_transformers::models::whisper::audio::pcm_to_mel`), and prints
+//! each segment's decoded text, with `--timestamps`/`--verbose` for more
+//! detail.
+
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 

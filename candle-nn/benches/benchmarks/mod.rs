@@ -1,3 +1,13 @@
+//! Shared harness for the `candle-nn` criterion benchmarks.
+//!
+//! [`BenchDevice`] gives each [`Device`] a synchronize call (needed before
+//! stopping the timer on CUDA/Metal) and a name prefix (`cpu`/`mkl`/`accelerate`
+//! /`cuda`/`metal`) so results from different backends don't collide.
+//! [`BenchDeviceHandler`] builds the device list a benchmark runs against —
+//! CPU always, plus CUDA or Metal when the matching feature is enabled.
+//! Submodules `conv`, `layer_norm`, and `softmax` each benchmark one
+//! `candle-nn` op across that device list.
+
 pub(crate) mod conv;
 pub(crate) mod layer_norm;
 pub(crate) mod softmax;

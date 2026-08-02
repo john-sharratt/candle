@@ -1,3 +1,11 @@
+//! ImageNet-1k classification with the classic ResNet family
+//! (`candle_transformers::models::resnet`), variants 18/34/50/101/152.
+//!
+//! `--which` selects the depth; weights default to `lmz/candle-resnet` on the
+//! HF hub (`resnet<N>.safetensors`). `--image` is a single 224x224 input file;
+//! prints the top-5 predicted ImageNet classes with softmax probabilities. F32
+//! only, no quantized path.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
