@@ -1247,8 +1247,10 @@ impl InferenceState {
                     // aborted mid-ingest (out of VRAM). Those files MUST ingest on the
                     // blocking load path, not silently defer to the background refresh
                     // (which would let the daemon reach `ready` with a half-populated
-                    // substrate). The walk is a cheap filesystem listing (cached per
-                    // folder); the expensive prefill is still skipped for the files
+                    // substrate). The walk reads each allowlisted file once (the
+                    // binary-content sniff needs the bytes) — one corpus read per
+                    // restart, the accepted price of a correct completeness probe;
+                    // the expensive GPU prefill is still skipped for the files
                     // already covered.
                     let prior = crate::code_read::code_read_state_from_substrate(&engine);
                     let map = walk_cache

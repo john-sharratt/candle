@@ -172,24 +172,7 @@ async fn main() -> anyhow::Result<()> {
     // the wipe is complete before anything re-creates the directory. Only the
     // resolved working dir's own `.substrate` is touched.
     if cli.wipe_substrate {
-        let substrate_dir = workspace.join(".substrate");
-        if substrate_dir.exists() {
-            eprintln!(
-                "--wipe-substrate: deleting {} (persistent substrate)",
-                substrate_dir.display()
-            );
-            if let Err(e) = std::fs::remove_dir_all(&substrate_dir) {
-                anyhow::bail!(
-                    "--wipe-substrate: failed to delete {}: {e}",
-                    substrate_dir.display()
-                );
-            }
-        } else {
-            eprintln!(
-                "--wipe-substrate: {} does not exist — nothing to delete",
-                substrate_dir.display()
-            );
-        }
+        wipe_substrate(&workspace)?;
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -445,4 +428,58 @@ fn scan_workspace(root: &std::path::Path) {
         top_level_files = file_count,
         "workspace scan placeholder",
     );
+}
+
+/// Delete `workspace/.substrate` — the daemon's entire persistent memory —
+/// scoped strictly to the RESOLVED working dir's own `.substrate`. The only
+/// caller is the explicit `--wipe-substrate` flag; scripts and harnesses go
+/// through it so no shell ever `rm -rf`s a substrate path itself. Missing
+/// directory is a no-op (a fresh mind dir), failure aborts boot rather than
+/// half-deleting.
+fn wipe_substrate(workspace: &std::path::Path) -> anyhow::Result<()> {
+    let substrate_dir = workspace.join(".substrate");
+    if substrate_dir.exists() {
+        eprintln!(
+            "--wipe-substrate: deleting {} (persistent substrate)",
+            substrate_dir.display()
+        );
+        if let Err(e) = std::fs::remove_dir_all(&substrate_dir) {
+            anyhow::bail!(
+                "--wipe-substrate: failed to delete {}: {e}",
+                substrate_dir.display()
+            );
+        }
+    } else {
+        eprintln!(
+            "--wipe-substrate: {} does not exist — nothing to delete",
+            substrate_dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::wipe_substrate;
+
+    #[test]
+    fn wipes_only_the_workspaces_own_substrate() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("mind");
+        std::fs::create_dir_all(ws.join(".substrate")).unwrap();
+        std::fs::write(ws.join(".substrate").join("seg-0.log"), b"data").unwrap();
+        // A sibling workspace's substrate must be untouched.
+        let other = root.path().join("other");
+        std::fs::create_dir_all(other.join(".substrate")).unwrap();
+        std::fs::write(other.join(".substrate").join("seg-0.log"), b"keep").unwrap();
+
+        wipe_substrate(&ws).unwrap();
+        assert!(!ws.join(".substrate").exists(), "own substrate deleted");
+        assert!(
+            other.join(".substrate").join("seg-0.log").exists(),
+            "sibling substrate untouched"
+        );
+        // Idempotent: a second wipe of the now-missing dir is a no-op.
+        wipe_substrate(&ws).unwrap();
+    }
 }

@@ -29,9 +29,11 @@ use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
 use super::record::{
     encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
+    TombstonePayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::Result;
+use crate::projection::TimelineId;
 use crate::substrate::Substrate;
 
 /// Bytes staged into the compacted log before an incremental flush to disk —
@@ -167,18 +169,27 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
         // gallery reads only the sig), TextOnly also drops sig + projections
         // (keep tokens — a plain read-only text record). Tombstoned timelines
         // drop entirely, as before.
+        let mut turn_dead = false;
         let distill: Option<DistillMode> =
             if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
                 if tombstoned.contains(&t.timeline_id) {
                     continue;
                 }
+                // A turn-scoped tombstone on a LIVE timeline sheds the turn's
+                // bulk records (chunks/tokens/sig/projections) but keeps its
+                // StreamDecl: the reload restores the turn as an empty
+                // placeholder from the decl, preserving the timeline's turn
+                // indexing (a fully-dropped decl would renumber every later
+                // turn away from its persisted stream ids).
+                turn_dead = TimelineId::from_raw(t.timeline_id)
+                    .is_some_and(|tl| substrate.tombstoned_turns().contains(&(tl, t.turn_index)));
                 distilled.get(&t.timeline_id).copied()
             } else {
                 None
             };
-        let keep_chunks = distill.is_none();
-        let keep_tokens = distill != Some(DistillMode::ProvenanceOnly);
-        let keep_sig = distill != Some(DistillMode::TextOnly);
+        let keep_chunks = !turn_dead && distill.is_none();
+        let keep_tokens = !turn_dead && distill != Some(DistillMode::ProvenanceOnly);
+        let keep_sig = !turn_dead && distill != Some(DistillMode::TextOnly);
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
             out.push(CompactItem::synth(
@@ -282,6 +293,35 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
                 Vec::new(),
             ));
         }
+    }
+    // Turn-scoped tombstones on LIVE timelines are re-emitted: the compacted
+    // log keeps the dead turn's StreamDecl (index preservation) but sheds its
+    // bulk records, and the reload's placeholder logic keys off this tombstone
+    // to restore the turn as an empty hole instead of re-hitting the (now
+    // absent) content. Timeline tombstones need no re-emission — their records
+    // vanish wholesale above.
+    for &(tl, turn_index) in substrate.tombstoned_turns() {
+        if tombstoned.contains(&tl.raw()) {
+            continue;
+        }
+        let payload = TombstonePayload {
+            timeline_id: tl.raw(),
+            turn_index: Some(turn_index),
+            reason: None,
+        }
+        .encode();
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::Tombstone,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        ));
     }
     // Per-timeline Label / ConvState records — synthesised from
     // the substrate's live state.  Tombstoned timelines are

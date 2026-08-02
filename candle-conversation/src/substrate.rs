@@ -237,9 +237,12 @@ pub struct Substrate {
     tombstoned_timelines: HashSet<TimelineId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
-    /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy;
-    /// filtered from projection and skipped on reload just like
-    /// [`Self::tombstoned_timelines`], but at turn granularity.
+    /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
+    /// Consumers: the reload restores a flagged turn as an EMPTY PLACEHOLDER
+    /// (occupying its index so later turns keep their persisted stream ids),
+    /// the belief galleries and group-default tag resolution skip it, and
+    /// compaction sheds its bulk records while keeping its `StreamDecl` +
+    /// re-emitting the tombstone.
     tombstoned_turns: HashSet<(TimelineId, u32)>,
     /// Per-layer policy for an unrecoverable turn on reload
     /// ([`CorruptTurnPolicy`]), resolved from the projection schema at engine
@@ -3121,14 +3124,18 @@ impl Substrate {
     /// disk I/O; the compaction trigger adds this to the incremental
     /// dead-byte counter.
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() {
+        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
             return 0;
         }
         self.streams
             .values()
             .filter(|s| match &s.decl {
-                Some(StreamDecl::Turn(t)) => TimelineId::from_raw(t.timeline_id)
-                    .is_some_and(|tl| self.tombstoned_timelines.contains(&tl)),
+                Some(StreamDecl::Turn(t)) => {
+                    TimelineId::from_raw(t.timeline_id).is_some_and(|tl| {
+                        self.tombstoned_timelines.contains(&tl)
+                            || self.tombstoned_turns.contains(&(tl, t.turn_index))
+                    })
+                }
                 _ => false,
             })
             .map(|s| {
@@ -3136,6 +3143,13 @@ impl Substrate {
                     + s.tokens.map_or(0, |l| l.record_size)
             })
             .sum()
+    }
+
+    /// The `(timeline, turn)` pairs dead by turn-scoped tombstones — consulted
+    /// by compaction, which sheds their bulk records while re-emitting the
+    /// tombstone itself (the reload's placeholder logic needs it).
+    pub fn tombstoned_turns(&self) -> &HashSet<(TimelineId, u32)> {
+        &self.tombstoned_turns
     }
 
     /// Re-point every residence's cold-tier references at the current
@@ -3805,8 +3819,12 @@ impl Substrate {
             let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
                 return None;
             };
-            (d.timeline_id == timeline.raw() && d.tags.iter().any(|t| t == tag))
-                .then(|| TurnIndex(d.turn_index))
+            // A tombstoned turn is a dead placeholder whose KV can never
+            // materialise — it must not resolve as a group default.
+            (d.timeline_id == timeline.raw()
+                && !self.is_turn_tombstoned(timeline, d.turn_index)
+                && d.tags.iter().any(|t| t == tag))
+            .then(|| TurnIndex(d.turn_index))
         })
     }
 

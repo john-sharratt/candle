@@ -22,7 +22,12 @@ mkdir -p "$STEP_DIR"
 
 # Stop any running daemon FIRST — it locks target/release/zend.exe, which
 # would fail the relink (and silently leave a stale binary if unchecked).
-taskkill //F //IM zend.exe >/dev/null 2>&1
+# This is the ONE image-wide kill (the relink needs the exe unlocked, whoever
+# holds it); it is loud so a production daemon death is never silent.
+if tasklist //FI "IMAGENAME eq zend.exe" 2>/dev/null | grep -qi zend; then
+    echo "[harness:$LABEL] WARNING: killing ALL running zend.exe to unlock the build target"
+    taskkill //F //IM zend.exe >/dev/null 2>&1
+fi
 sleep 3
 
 echo "[harness:$LABEL] building zend (release)…"
@@ -33,12 +38,14 @@ if ! (cd "$ROOT" && cargo build -p zend --release >"$STEP_DIR/build.log" 2>&1); 
 fi
 
 echo "[harness:$LABEL] starting daemon (blank substrate, code_reading off)…"
-(cd "$ROOT" && nohup ./target/release/zend.exe \
+cd "$ROOT"
+nohup ./target/release/zend.exe \
     -v --disable-summariser --wipe-substrate \
     --working-dir "$STEP_DIR/mind" \
     --disable-layer code_reading \
     --ingest-dir "repo_map=$ROOT" \
-    --port "$PORT" "$ROOT" >"$STEP_DIR/daemon.out" 2>&1 &)
+    --port "$PORT" "$ROOT" >"$STEP_DIR/daemon.out" 2>&1 &
+DAEMON_PID=$!
 
 ready=0
 dead_strikes=0
@@ -89,5 +96,6 @@ done
 # Decode-speed snapshot for the step (raw forward avg from the wave log).
 grep -aoE "kv/fwd avg=[0-9]+ fwd avg=[0-9]+ms" "$STEP_DIR/mind/.substrate/zend.log" 2>/dev/null | tail -5 >"$STEP_DIR/decode_ms.txt"
 
-taskkill //F //IM zend.exe >/dev/null 2>&1
+# Teardown is scoped to the daemon THIS harness spawned — never other zends.
+taskkill //F //PID "$DAEMON_PID" >/dev/null 2>&1
 echo "[harness:$LABEL] done — transcripts in $STEP_DIR"

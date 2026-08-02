@@ -4697,6 +4697,14 @@ pub fn dequantize_q8a128(
 /// and a divergence silently mis-strides the kernel's batch slices.
 pub const GROUPED_GEMM_TILE_W: usize = 32;
 
+/// Kernel bounds of the MoE bucketize, re-exported so every gate that decides
+/// "can this routing take the device-table path?" reads the SAME constants the
+/// kernel and its wrapper validate against — a hand-copied bound here is the
+/// one place the mirrored-constant scheme couldn't reach.
+pub use candle_kernels::simple::moe_bucketize::{
+    MAX_EXPERTS as MOE_MAX_EXPERTS, MAX_TOPK as MOE_MAX_TOPK,
+};
+
 fn grouped_matmul_gemx_q8a128(
     act_ptr: u64,
     weight_ptrs: &[u64],

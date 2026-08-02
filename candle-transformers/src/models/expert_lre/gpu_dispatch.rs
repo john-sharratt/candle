@@ -96,10 +96,24 @@ impl GpuDispatchTables {
                 let (gp, gs, gd) = extract_weight_info(&slot.gate_proj).ok()?;
                 let (upp, us, ud) = extract_weight_info(&slot.up_proj).ok()?;
                 let (dp, ds, dd) = extract_weight_info(&slot.down_proj).ok()?;
-                let (g_rows, _) = gs.dims2().ok()?;
+                let (g_rows, g_cols) = gs.dims2().ok()?;
                 let (u_rows, _) = us.dims2().ok()?;
-                let (d_rows, _) = ds.dims2().ok()?;
+                let (d_rows, d_cols) = ds.dims2().ok()?;
                 if u_rows != g_rows || ud != gd {
+                    return None;
+                }
+                // Dimensional contract of the device-table pipeline, enforced
+                // HERE so exotic model dims keep the host path instead of
+                // erroring on every forward: the q8a1024 byte-row gather needs
+                // hidden (gate K) % 1024, the grouped GEMM needs N % 32 and
+                // K % 128 for both projections.
+                if g_cols % 1024 != 0 || g_rows % 32 != 0 || d_rows % 32 != 0 || d_cols % 128 != 0 {
+                    tracing::warn!(
+                        hidden = g_cols,
+                        inter = g_rows,
+                        "expert cache: dims outside the device-table GEMM contract — \
+                         GPU-native dispatch disabled (host path)"
+                    );
                     return None;
                 }
                 match dims {

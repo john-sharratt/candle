@@ -347,11 +347,14 @@ fn carve_workspace(
         let bytes = carve::split_long_lines(&bytes);
         let is_tsx = file.path.ends_with(".tsx");
         let scopes = carve::carve(&bytes, file.language, is_tsx);
-        if !scopes.is_empty() {
-            let fhash = file_content_hash(&file.path, &bytes);
-            state.file_hashes.insert(file.path.clone(), fhash.clone());
-            per_file.push((file.clone(), scopes, bytes, fhash));
-        }
+        // Zero-scope files (empty / all-blank) ride along too: they must still
+        // land a durable `content_sha256` marker, or the restart completeness
+        // check counts them uncovered FOREVER and every startup takes the
+        // blocking re-ingest path instead of attaching the prior ingest as-is.
+        // `process_one_file` records the marker without emitting any turns.
+        let fhash = file_content_hash(&file.path, &bytes);
+        state.file_hashes.insert(file.path.clone(), fhash.clone());
+        per_file.push((file.clone(), scopes, bytes, fhash));
     }
     (per_file, state)
 }

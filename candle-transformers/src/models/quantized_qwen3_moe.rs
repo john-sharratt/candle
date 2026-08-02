@@ -24,17 +24,19 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
+use crate::models::routing_capture;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
     moe_bucketize, moe_route, silu_mul_q8a128, DynamicActs, Q8a128Operand, GROUPED_GEMM_TILE_W,
+    MOE_MAX_TOPK,
 };
 #[cfg(feature = "cuda")]
 use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::try_enter_relief, kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -291,35 +293,33 @@ impl SparseMoeBlock {
         }
         #[cfg(feature = "cuda")]
         if let DynamicActs::Int8(op) = &acts {
-            if let Some(gd) = self.cache.gpu_dispatch() {
-                // Every condition here degrades to the host path, never to an
-                // error: the layer must be covered by the tables, the ROUTER
-                // width must equal the table row width (a mismatch would index
-                // other layers' experts), k must fit the bucketize kernel's
-                // per-token sort bound, routing-trace capture needs the
-                // CPU-side expert sets, and the cache's pipeline thread must be
-                // alive (its death frees the slot weights the tables point at).
-                if gd.expert_base(self.moe_layer_idx).is_some()
-                    && gd.n_experts == num_experts
-                    && k <= 32
-                    && !crate::models::routing_capture::is_enabled()
-                    && !host_dispatch_forced()
-                    && !self.cache.pipeline_dead()
-                {
-                    return self.forward_gpu_native(
-                        op,
-                        &router_logits,
-                        num_tokens,
-                        b_size,
-                        seq_len,
-                        hidden_dim,
-                        k,
-                        num_experts,
-                        gd,
-                        out_dtype,
-                        t,
-                    );
-                }
+            // Every condition here degrades to the host path, never to an
+            // error. The cache-owned safety chain (table coverage, router
+            // width == table width, live pipeline thread) is
+            // `live_gpu_dispatch`; the model-level conditions are k inside
+            // the bucketize kernel's per-token sort bound, routing-trace
+            // capture (needs the CPU-side expert sets), and the diagnostic
+            // env override.
+            if let Some(gd) = self
+                .cache
+                .live_gpu_dispatch(self.moe_layer_idx, num_experts)
+                .filter(|_| {
+                    k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced()
+                })
+            {
+                return self.forward_gpu_native(
+                    op,
+                    &router_logits,
+                    num_tokens,
+                    b_size,
+                    seq_len,
+                    hidden_dim,
+                    k,
+                    num_experts,
+                    gd,
+                    out_dtype,
+                    t,
+                );
             }
         }
 
@@ -346,7 +346,7 @@ impl SparseMoeBlock {
     /// indices stay on the device from `moe_route` through the scatter.
     ///
     ///   1. `moe_route` — fused softmax + top-k (weights + indices, both GPU);
-    ///   2. `moe_bucketize` — the counting-sort the CPU used to do, on-device
+    ///   2. `moe_bucketize` — the expert counting-sort, on-device
     ///      (bit-identical grouping, proven by its unit tests), into this
     ///      layer's reusable workspace;
     ///   3. `fused_moe_gather_q8a128` → gate/up/down `grouped_qmatmul_dev_q8a128`
@@ -1541,7 +1541,7 @@ impl ModelWeights {
             // in-flight select/quantize/kv_migrate kernels read an unmapped base
             // pointer (`CUDA_ERROR_ILLEGAL_ADDRESS`).
             candle::vram::set_pool_trim_guard(Box::new(|trim| {
-                if let Some(_relief) = candle_nn::kv_cache::try_enter_relief() {
+                if let Some(_relief) = try_enter_relief() {
                     trim();
                 }
             }));

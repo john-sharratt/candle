@@ -32,7 +32,7 @@ use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
@@ -821,8 +821,35 @@ impl ExpertCache {
     /// tables' captured weight pointers are dangling and the GPU-native path
     /// must not run. Always `false` in inline mode.
     pub fn pipeline_dead(&self) -> bool {
-        self.pipeline_dead
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.pipeline_dead.load(Ordering::Acquire)
+    }
+
+    /// The dispatch tables IF the GPU-native path is safe for `moe_layer_idx`
+    /// with a router `n_experts` wide — the cache-owned safety conditions in
+    /// one place so no caller can skip part of the chain:
+    /// * tables built (all-resident, KO weights, null-stream compute),
+    /// * the layer inside the covered row range,
+    /// * router width == table row width (a mismatch would index other
+    ///   layers' experts),
+    /// * the pipeline thread alive (its death frees the slot weights the
+    ///   tables point at — dangling-pointer dispatch).
+    ///
+    /// Callers still gate their own model-level conditions (top-k bound,
+    /// routing capture, diagnostic env overrides).
+    #[cfg(feature = "cuda")]
+    pub fn live_gpu_dispatch(
+        &self,
+        moe_layer_idx: usize,
+        n_experts: usize,
+    ) -> Option<&GpuDispatchTables> {
+        let gd = self.gpu_dispatch.as_ref()?;
+        if gd.expert_base(moe_layer_idx).is_none()
+            || gd.n_experts != n_experts
+            || self.pipeline_dead()
+        {
+            return None;
+        }
+        Some(gd)
     }
 
     /// Get mutable access to the pinned routing buffer.

@@ -404,6 +404,16 @@ impl Conversation {
             let Some(StreamDecl::Turn(d)) = &e.decl else {
                 continue;
             };
+            // A tombstoned turn (or timeline) must not keep voting in
+            // retrieval: its walker-replayed sig blob still exists, but the
+            // turn itself is a dead placeholder whose KV can never
+            // materialise — selecting it would point projection at content
+            // that cannot be elevated.
+            if let Some(tl) = TimelineId::from_raw(d.timeline_id) {
+                if sub.is_tombstoned(tl) || sub.is_turn_tombstoned(tl, d.turn_index) {
+                    continue;
+                }
+            }
             let in_scope = if tags.is_empty() {
                 d.tags.is_empty()
             } else {
@@ -1390,10 +1400,33 @@ impl Conversation {
                 p(i, total);
             }
             // A turn already dropped by a prior `drop_turn` tombstone is dead —
-            // skip it quietly (no recover attempt, no warn) instead of re-hitting
-            // the same corruption every reload.
+            // restore it as an EMPTY PLACEHOLDER (no recover attempt, no warn)
+            // instead of skipping. The placeholder matters: `restore_turn`
+            // assigns indices densely, so a plain skip would renumber every
+            // subsequent turn of this LIVE timeline away from the persisted
+            // stream ids they are keyed by (wide-Q sigs, seams, residences),
+            // and the next appended turn would collide with an existing turn's
+            // stream records. A zero-token placeholder occupies the original
+            // index — never selected (no content), never materialisable (no
+            // cold refs) — keeping every later turn aligned.
             if let Some(tl) = TimelineId::from_raw(decl.timeline_id) {
                 if self.read().is_turn_tombstoned(tl, decl.turn_index) {
+                    let mut view = self.write();
+                    if let (Some(layer), Some(group)) = (
+                        LayerId::from_raw(decl.layer_id),
+                        GroupId::from_raw(decl.group_id),
+                    ) {
+                        view.register_timeline(tl, layer, group);
+                    }
+                    view.restore_turn(
+                        tl,
+                        TurnLayout::new(Vec::new()),
+                        TokenBuffer::default(),
+                        0,
+                        None,
+                        decl.block_start,
+                        decl.block_end,
+                    );
                     continue;
                 }
             }
@@ -1494,6 +1527,28 @@ impl Conversation {
                                         ),
                                     }
                                 }
+                                // Occupy the dropped turn's index with an empty
+                                // placeholder so the timeline's LATER turns keep
+                                // their persisted indices (`restore_turn` assigns
+                                // densely; a bare skip renumbers them away from
+                                // their stream ids and the next appended turn
+                                // collides with an existing turn's records).
+                                let mut view = self.write();
+                                if let (Some(layer), Some(group)) = (
+                                    LayerId::from_raw(decl.layer_id),
+                                    GroupId::from_raw(decl.group_id),
+                                ) {
+                                    view.register_timeline(timeline, layer, group);
+                                }
+                                view.restore_turn(
+                                    timeline,
+                                    TurnLayout::new(Vec::new()),
+                                    TokenBuffer::default(),
+                                    0,
+                                    None,
+                                    decl.block_start,
+                                    decl.block_end,
+                                );
                             }
                         }
                     }

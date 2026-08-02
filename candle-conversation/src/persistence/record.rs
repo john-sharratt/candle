@@ -899,6 +899,33 @@ mod tombstone_payload_tests {
         };
         assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
     }
+
+    #[test]
+    fn turn_scoped_tombstone_bytes_are_pinned() {
+        // The turn-scoped form is the reload's ONLY signal to hole-restore the
+        // turn instead of renumbering the timeline — pin its exact on-disk key
+        // and layout so a serde tweak can't silently demote it to a
+        // timeline-level tombstone (which drops the whole conversation).
+        let p = TombstonePayload {
+            timeline_id: 77,
+            turn_index: Some(2),
+            reason: None,
+        };
+        assert_eq!(p.encode(), br#"{"timeline_id":77,"turn_index":2}"#.to_vec());
+        assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
+        // And a reasoned turn tombstone keeps field order stable.
+        let q = TombstonePayload {
+            timeline_id: 3,
+            turn_index: Some(9),
+            reason: Some("corrupt reload (turn 9): chunk mismatch".to_string()),
+        };
+        assert_eq!(
+            q.encode(),
+            br#"{"timeline_id":3,"turn_index":9,"reason":"corrupt reload (turn 9): chunk mismatch"}"#
+                .to_vec()
+        );
+        assert_eq!(TombstonePayload::decode(&q.encode()).unwrap(), q);
+    }
 }
 
 /// The degree to which a distilled timeline's turns shed content at compaction.
