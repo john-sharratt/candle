@@ -5,12 +5,11 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::FileError;
-use crate::state::vfs::VfsError;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct EditRequest {
-    /// VFS path of the file to edit (session-relative, e.g. `src/main.rs`). Required.
+    /// Path of the file to edit — a project file from the working directory, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
     /// Substring to replace; must match exactly once in the file (multiple matches are rejected as ambiguous). Required.
@@ -43,9 +42,12 @@ impl Tool for FileEdit {
     type Error = FileError;
 
     fn run(ctx: &ToolContext, req: EditRequest) -> Result<EditResponse, FileError> {
+        // Read through the overlay, so a file that lives only in the workspace is
+        // editable. The write below is what copies it up — doing it here instead
+        // would leave a rejected edit having dirtied the file for no reason.
         let content = ctx
             .vfs
-            .read(&req.path)
+            .read(&req.path)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
 
         let count = content.matches(&req.old_str).count();
@@ -61,9 +63,7 @@ impl Tool for FileEdit {
 
         let new_content = content.replacen(&req.old_str, &req.new_str, 1);
         let bytes = new_content.len();
-        ctx.vfs.write(&req.path, new_content).map_err(|e| match e {
-            VfsError::Full => FileError::VfsFull,
-        })?;
+        ctx.vfs.write(&req.path, new_content)?;
         Ok(EditResponse {
             path: req.path,
             bytes,

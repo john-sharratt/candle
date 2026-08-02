@@ -251,7 +251,9 @@ system_prompt:
         Never guess what a tool can tell you — call it. A request for something a tool
         provides (the time, a calculation, a file, a lookup) is a request to call that
         tool, and the call is your entire reply:
-          <tool_call>{"name": "<tool>", "arguments": { ... }}</tool_call>
+          <tool_call>{"name": "file_read", "arguments": {"path": "src/main.rs"}}</tool_call>
+        The tags are what run it — bare JSON, or a description of the call you would
+        make, runs nothing. Emit the call rather than describing it.
         Fill the arguments with the concrete values from the request. The real result
         arrives inside <tool_response></tool_response> tags, and only then do you
         answer — never invent a result, and never say you called a tool unless the call
@@ -507,11 +509,14 @@ layers:
           # substrate_inspect) and retune; the raw-scale ranking problem is now
           # solved upstream by normalization, so the threshold's only job is to
           # separate a real hit from the noise floor.
-          min_score: 600
-          evict_score: 400
+          min_score: 250
+          evict_score: 250
           early_window_tokens: 24
-          early_min_score: 400
-          early_evict_score: 280
+          # The early band must sit AT OR BELOW the steady one — it is a grace
+          # window, so a bar above `min_score` would make the opening stricter
+          # than the rest of the turn, which is backwards.
+          early_min_score: 250
+          early_evict_score: 187.5
         budget:
           priority: 100
 
@@ -572,7 +577,7 @@ layers:
     groups:
       - id: scopes
         selection: { kind: top_k, k: 4 }
-        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
+        score_threshold: 100.0  # cuts the near-zero inter-file floor; TopK ranks above it
         budget:
           priority: 100
 

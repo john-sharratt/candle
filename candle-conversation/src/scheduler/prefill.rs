@@ -2115,8 +2115,10 @@ impl Scheduler {
         let has_fullsweep = n_dec > 0 || has_glue;
 
         let budget = self.wave_prefill_layer_budget();
-        let cursor = self.wave_prefill_cursor;
-        let win_end = (cursor + budget).min(n);
+        // Not `let`: a residual/group mismatch below restarts the creep at layer 0
+        // in place (see the check after `creep_tok`), which moves both.
+        let mut cursor = self.wave_prefill_cursor;
+        let mut win_end = (cursor + budget).min(n);
 
         // Form/resume the creep group (dialogue prefills + section chunks) unless it
         // was already advanced this wave. A fresh group folds section chunks in to
@@ -2207,6 +2209,54 @@ impl Scheduler {
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
+
+        // The held residual is a slice of a PREVIOUS wave's activations, sized by
+        // that wave's creep membership. `build_wave_group_inputs` rebuilds the
+        // group each wave and silently drops members that errored or completed, so
+        // a mid-creep drop leaves a residual wider than the tokens it is about to
+        // be paired with — the rows would then be attributed to the wrong members
+        // for the remaining layers, and wrong activations are exactly what makes
+        // the sampler emit token 0 forever.
+        //
+        // Recover rather than abort: the creep re-forms from layer 0 next wave.
+        // That is idempotent — a prefill member re-feeds its whole token block
+        // (`work.tokens[..]`, never a chunk) and its slot offset is only advanced
+        // at completion, so re-running `[0, cursor)` rewrites the same KV at the
+        // same positions. Deliberately NOT an assert: a hard assert on this path
+        // is what aborted the whole wave at 42553ca3 (see `reconcile_wave_offsets`),
+        // and a panic on the scheduler thread takes the daemon with it.
+        if cursor > 0 {
+            if let Some(res) = self.wave_prefill_residual.as_ref() {
+                let held = res.dims().get(1).copied().unwrap_or(0);
+                if held != creep_tok {
+                    tracing::error!(
+                        held_residual_tokens = held,
+                        creep_tokens = creep_tok,
+                        cursor,
+                        members = members.len(),
+                        "wave creep membership changed mid-sweep — the held residual \
+                         no longer matches the group. Restarting the creep from \
+                         layer 0; the affected prefill re-runs the layers it had \
+                         already done.",
+                    );
+                    // Restart IN PLACE rather than re-entering: the wave's deferred
+                    // glue was already drained by `take_wave_glue` above, so a
+                    // recursive call would find an empty queue and silently drop it.
+                    // Dropping the residual and rewinding the cursor gives the same
+                    // fresh start — the group already rebuilt this wave is the
+                    // consistent one, and seg1 is skipped once `cursor == 0`.
+                    //
+                    // Idempotent: a prefill member re-feeds its whole token block
+                    // (`work.tokens[..]`, never a chunk) and its slot offset only
+                    // advances at completion, so re-running `[0, cursor)` rewrites
+                    // the same K/V at the same positions.
+                    self.wave_prefill_residual = None;
+                    self.wave_prefill_cursor = 0;
+                    cursor = 0;
+                    win_end = budget.min(n);
+                }
+            }
+        }
 
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes

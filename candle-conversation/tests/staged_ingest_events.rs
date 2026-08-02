@@ -45,6 +45,7 @@ fn record_tagged_turn(
 
 fn sel_turn(timeline: TimelineId, index: u32) -> SelectedTurn {
     SelectedTurn {
+        qualified: false,
         layer: "code_reading".to_string(),
         group: "scopes".to_string(),
         index,

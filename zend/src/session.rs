@@ -830,14 +830,45 @@ impl InferenceState {
             // calibration trajectory from the tool's definition file — prompt +
             // `<|im_end|><|im_start|>assistant` + think→call with projection markers.
             // The prefill path splits it on the assistant header (below).
-            let cases: Vec<(&str, &str)> = defs
+            // Each case carries its content marker, computed once here from the
+            // tool's whole projected definition plus the example.
+            let cases: Vec<(&str, &str, String)> = defs
                 .iter()
                 .flat_map(|d| {
                     d.examples
                         .iter()
-                        .map(move |ex| (d.name.as_str(), ex.as_str()))
+                        .map(move |ex| (d.name.as_str(), ex.as_str(), d.calibration_marker(ex)))
                 })
                 .collect();
+
+            // Retire exemplars that no longer match any current case. A tool whose
+            // description, parameters, or example changed keeps its old
+            // conversation ARCHIVED under the *previous* marker, where the
+            // by-marker lookup below can never find it — so without this sweep it
+            // stays tagged `["tool", name]` and keeps answering the belief scan
+            // with signatures captured against wording that no longer exists,
+            // alongside the freshly calibrated ones. Tombstoning drops it from the
+            // gather (`resolver.rs` skips tombstoned timelines), leaving exactly
+            // the current corpus.
+            let current: HashSet<&str> = cases.iter().map(|(_, _, m)| m.as_str()).collect();
+            let mut retired = 0usize;
+            for (timeline, marker) in engine.conversations_with_metadata_key(CALIB_MARKER_KEY) {
+                if current.contains(marker.as_str()) {
+                    continue;
+                }
+                match engine.tombstone_timeline(timeline) {
+                    Ok(()) => retired += 1,
+                    Err(e) => {
+                        tracing::warn!(%marker, "retiring stale calibration exemplar failed: {e}")
+                    }
+                }
+            }
+            if retired > 0 {
+                tracing::info!(
+                    retired,
+                    "calibration: retired stale exemplars whose tool definition or example changed",
+                );
+            }
 
             // A calibration case is "done" only once its conversation is
             // ARCHIVED — the atomic commit. Each conversation is tagged with its
@@ -856,18 +887,14 @@ impl InferenceState {
             // is created lazily as the window refills (below), bounding the live
             // slot count to `CALIBRATION_BATCH` — the concurrency the decode/prefill
             // window can actually keep busy.
-            // A case's resume marker: the tool name plus a content hash of its
-            // ChatML example, so editing an example (in its tool file) changes the
-            // marker and the case regenerates automatically.
-            let calib_marker = |name: &str, example: &str| -> String {
-                use sha2::{Digest, Sha256};
-                format!("{name}|{:x}", Sha256::digest(example.as_bytes()))
-            };
+            // A case's resume marker is `ToolDef::calibration_marker` — the tool
+            // name plus a hash of its projected definition and this example — so
+            // rewording a description or a parameter, or editing the example,
+            // changes the marker and the case regenerates against the current text.
             let mut done = 0usize;
-            let mut to_run: Vec<(&str, &str)> = Vec::new();
-            for (name, example) in cases.iter() {
-                let marker = calib_marker(name, example);
-                let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, &marker);
+            let mut to_run: Vec<(&str, &str, &str)> = Vec::new();
+            for (name, example, marker) in cases.iter() {
+                let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, marker);
                 // Done iff a prior conversation for this case is archived.
                 if prior.iter().any(|t| engine.is_conversation_archived(*t)) {
                     // The completed corpus only needs its wide-Q sigs, so mark the
@@ -892,7 +919,7 @@ impl InferenceState {
                         tracing::warn!(tool = name, "tombstone partial calibration failed: {e}");
                     }
                 }
-                to_run.push((*name, *example));
+                to_run.push((*name, *example, marker.as_str()));
             }
 
             // Non-blocking sweep: archive + retire every case finished since the
@@ -1000,7 +1027,7 @@ impl InferenceState {
                 } else {
                     1
                 };
-                let batch: Vec<(&str, &str)> =
+                let batch: Vec<(&str, &str, &str)> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
                 let convs = if created_any {
@@ -1015,7 +1042,7 @@ impl InferenceState {
                 } else {
                     Vec::new()
                 };
-                for ((name, example), conv_res) in batch.into_iter().zip(convs) {
+                for ((name, example, marker), conv_res) in batch.into_iter().zip(convs) {
                     let mut conv = match conv_res {
                         Ok(conv) => conv,
                         Err(e) => {
@@ -1026,11 +1053,10 @@ impl InferenceState {
                         }
                     };
                     // Tag at creation so a half-finished case is findable next load.
-                    let marker = calib_marker(name, example);
                     if let Err(e) = engine.set_conversation_metadata(
                         conv.timeline_id(),
                         CALIB_MARKER_KEY,
-                        &marker,
+                        marker,
                     ) {
                         tracing::warn!(tool = name, "calibration tag failed: {e}");
                     }
@@ -1368,10 +1394,10 @@ impl InferenceState {
             refresh_config: conv_config.clone(),
             mode_builders,
             identity_builders,
-            workspace,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::new(),
+            tool_host: ToolHost::new(&workspace),
+            workspace,
             tool_stencil,
             think_steering,
         });

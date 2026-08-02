@@ -1728,6 +1728,7 @@ fn belief_replay(
 
             let mut prior_scores: Vec<f32> = Vec::new();
             let mut prior_selected: Vec<bool> = Vec::new();
+            let mut prior_qualified: Vec<bool> = Vec::new();
             let mut ever = false;
             let mut first_pt = None;
             for &p in &points {
@@ -1745,12 +1746,14 @@ fn belief_replay(
                     &fresh,
                     &prior_scores,
                     &prior_selected,
+                    &prior_qualified,
                     wcfg.section_policy(0),
                     wcfg.budget(),
                     floor,
                 );
                 prior_scores = beliefs.iter().map(|b| b.score).collect();
                 prior_selected = beliefs.iter().map(|b| b.selected).collect();
+                prior_qualified = beliefs.iter().map(|b| b.qualified).collect();
                 let sel = prior_selected.get(owner.slot).copied().unwrap_or(false);
                 if sel {
                     ever = true;

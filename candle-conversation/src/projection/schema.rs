@@ -885,11 +885,21 @@ pub struct GroupSchema {
     /// Which turns survive into the projection.
     pub selection: SelectionRule,
     /// Turns whose score is below this threshold are invisible to selection.
-    /// Default `0.0` (no gate).
-    pub score_threshold: f32,
+    /// `None` when the YAML omits it — distinct from an explicit `0.0`, because
+    /// this value doubles as the belief gate in [`Self::belief_config`]: a group
+    /// that declares no threshold must fall through to its `policy`'s band
+    /// rather than have it overwritten by a default that admits everything.
+    pub score_threshold: Option<f32>,
     /// Selection policy (belief-update + budget + tag scope) for this group,
     /// resolved from the group's `policy:` or inherited from the enclosing layer.
     pub policy: SelectionPolicy,
+    /// Whether the score band in `policy` was **explicitly declared** (a
+    /// `min_score:` in the group's or its layer's `policy:` block) rather than
+    /// inherited from the schema default. Only a declared band may stand in for
+    /// an absent `score_threshold` in [`Self::belief_config`] — the default
+    /// preset is a tool-scope policy whose 800 bar would silently gate every
+    /// turn group that simply omitted both fields.
+    pub policy_band_declared: bool,
     pub budget: Budget,
     /// Fallback turn (by decl tag) brought in when belief/scores select nothing,
     /// so the group — and its layer — never drops out of the projection. `None`
@@ -908,13 +918,19 @@ impl GroupSchema {
     }
 
     /// The belief [`PolicyConfig`] for a belief-driven group: the group's policy
-    /// (β leak rate, inherited) with the **budget** and **score gates** taken
-    /// from the selection *rule* and `score_threshold`, so the belief step
-    /// selects exactly the rule's cap — `top_k(k)` → at most `k`, `single` → 1,
-    /// `always_visible` → all `n_candidates`. This keeps the belief path's
-    /// surviving set identical to what `apply_selection` would rank, just
-    /// carried across reprojections. `n_candidates` bounds the unbounded
-    /// `always_visible` case.
+    /// (β leak rate, inherited) with the **budget** taken from the selection
+    /// *rule* — `top_k(k)` → at most `k`, `single` → 1, `always_visible` → all
+    /// `n_candidates` — so the belief path's surviving set matches what
+    /// `apply_selection` would rank, just carried across reprojections.
+    /// `n_candidates` bounds the unbounded `always_visible` case.
+    ///
+    /// The score gates come from `score_threshold` **only when the group
+    /// declares one**. Most groups do, and it is their belief gate. A group that
+    /// instead declares a `policy:` band keeps it: overwriting with the `0.0`
+    /// default would make every candidate eligible at zero evidence, and
+    /// selection would then degenerate to the score-tie order (ascending turn
+    /// index) — picking the first turns in the group and presenting them as the
+    /// most relevant thing in the corpus.
     pub fn belief_config(&self, n_candidates: usize) -> PolicyConfig {
         let mut cfg = self.policy.config;
         cfg.budget_min = 0;
@@ -927,8 +943,21 @@ impl GroupSchema {
                 self.policy.config.budget_max
             }
         };
-        cfg.min_score = self.score_threshold;
-        cfg.evict_score = self.score_threshold;
+        match (self.score_threshold, self.policy_band_declared) {
+            // Declared threshold: the group's own gate, as most groups configure it.
+            (Some(threshold), _) => {
+                cfg.min_score = threshold;
+                cfg.evict_score = threshold;
+            }
+            // No threshold, but a declared policy band — keep it.
+            (None, true) => {}
+            // Neither declared: no gate. (An inherited default band must not
+            // become one; it is a tool-scope preset, not this group's intent.)
+            (None, false) => {
+                cfg.min_score = 0.0;
+                cfg.evict_score = 0.0;
+            }
+        }
         cfg
     }
 }
@@ -1130,5 +1159,100 @@ impl Schema {
             ids.extend(layer.all_section_ids());
         }
         ids
+    }
+}
+
+#[cfg(test)]
+mod belief_config_tests {
+    use super::{Budget, GroupSchema, SelectionPolicy, SelectionRule};
+    use crate::projection::ids::GroupId;
+    use crate::projection::policy::PolicyPreset;
+
+    fn group(score_threshold: Option<f32>, min: f32, evict: f32) -> GroupSchema {
+        group_with(score_threshold, min, evict, true)
+    }
+
+    fn group_with(
+        score_threshold: Option<f32>,
+        min: f32,
+        evict: f32,
+        policy_band_declared: bool,
+    ) -> GroupSchema {
+        let mut config = PolicyPreset::CommittedToolScope.config();
+        config.min_score = min;
+        config.evict_score = evict;
+        GroupSchema {
+            id: GroupId::new(1),
+            name: "structure".into(),
+            selection: SelectionRule::TopK { k: 3 },
+            score_threshold,
+            policy_band_declared,
+            policy: SelectionPolicy {
+                config,
+                tags: Vec::new(),
+                layer_weights: Vec::new(),
+            },
+            budget: Budget::default(),
+            default: None,
+        }
+    }
+
+    /// A declared threshold IS the group's belief gate — most groups configure
+    /// selection that way and must keep doing so.
+    #[test]
+    fn a_declared_threshold_governs_the_belief_gate() {
+        let g = group(Some(250.0), 600.0, 400.0);
+        let cfg = g.belief_config(20);
+        assert_eq!(cfg.min_score, 250.0);
+        assert_eq!(cfg.evict_score, 250.0);
+    }
+
+    /// An explicit `0.0` still means "no gate" — it is a real choice, not an
+    /// absence, and must not silently fall through to the policy band.
+    #[test]
+    fn an_explicit_zero_threshold_still_disables_the_gate() {
+        let g = group(Some(0.0), 600.0, 400.0);
+        let cfg = g.belief_config(20);
+        assert_eq!(cfg.min_score, 0.0);
+        assert_eq!(cfg.evict_score, 0.0);
+    }
+
+    /// The regression: with no declared threshold the policy's band survives.
+    /// Previously the `0.0` default overwrote it, so every candidate was
+    /// eligible at zero evidence and selection fell through to the score-tie
+    /// order — the first turns in the group, presented as the most relevant
+    /// content in the corpus.
+    #[test]
+    fn an_absent_threshold_leaves_the_policy_band_in_force() {
+        let g = group(None, 600.0, 400.0);
+        let cfg = g.belief_config(20);
+        assert_eq!(cfg.min_score, 600.0, "policy min_score must survive");
+        assert_eq!(cfg.evict_score, 400.0, "policy evict_score must survive");
+    }
+
+    /// The safety property: a group that declares NEITHER a threshold nor a
+    /// policy band gets no gate. Its inherited band is the schema default — a
+    /// tool-scope preset whose 800 bar would silently swallow every turn.
+    #[test]
+    fn an_undeclared_band_does_not_become_a_gate() {
+        let g = group_with(None, 800.0, 600.0, false);
+        let cfg = g.belief_config(20);
+        assert_eq!(cfg.min_score, 0.0);
+        assert_eq!(cfg.evict_score, 0.0);
+    }
+
+    /// Budget still comes from the selection rule either way.
+    #[test]
+    fn budget_always_comes_from_the_selection_rule() {
+        for threshold in [None, Some(0.0), Some(600.0)] {
+            let cfg = group(threshold, 600.0, 400.0).belief_config(20);
+            assert_eq!(cfg.budget_max, 3, "top_k(3)");
+            assert_eq!(cfg.budget_min, 0);
+        }
+        let mut g = group(None, 600.0, 400.0);
+        g.selection = SelectionRule::Single;
+        assert_eq!(g.belief_config(20).budget_max, 1);
+        g.selection = SelectionRule::AlwaysVisible;
+        assert_eq!(g.belief_config(20).budget_max, 20);
     }
 }

@@ -1,6 +1,6 @@
 name: file_present
 category: Files
-description: Surface one or more virtual-filesystem files to the user in the chat interface, reporting which paths were found and shown versus missing.
+description: Surface one or more files to the user in the chat interface, resolving session edits first and then the project's working directory, and reporting which paths were found and shown versus missing.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -10,7 +10,7 @@ parameters:
       - string
       - 'null'
     paths:
-      description: VFS paths to surface to the user (1–10 entries, session-relative). Required.
+      description: Paths to surface to the user (1–10 entries; project or session files). Required.
       items:
         type: string
       maxItems: 10
@@ -171,4 +171,24 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_present", "arguments": {"paths": ["/workspace/reports/coverage.html"]}}
+  </tool_call><|projection|>
+- |-
+  show me README.md and Cargo.toml<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants these two files surfaced in the chat. file_present takes a list of paths and resolves each against the session's edits first, then the project's working<|projection|> directory, reporting which were found and which were missing. Both of these are project files at the root.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["README.md", "Cargo.toml"]}}
+  </tool_call><|projection|>
+- |-
+  present the files you changed<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants the deliverables surfaced explicitly rather than just described. file_present is the foreground gesture for that — it takes the paths and draws the user's attention<|projection|> to them. I pass the files edited during this session.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_present", "arguments": {"paths": ["src/main.rs", "notes.md"]}}
   </tool_call><|projection|>

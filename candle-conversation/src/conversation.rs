@@ -2046,6 +2046,7 @@ impl Sequence {
                     timeline: Some(timeline.raw()),
                     selected: true,
                     score: 0.0,
+                    qualified: false,
                 })
             };
             let mut turns = Vec::with_capacity(2);
@@ -2104,7 +2105,15 @@ impl Sequence {
                 .wide_q_sigs_blob(timeline, TurnIndex(count - 1))
                 .and_then(decode_wide_sigs)
             {
-                Some(p) => p,
+                // Same head+tail window the live reproject scans (see
+                // `scheduler`'s `QUERY_HEAD_CHUNKS` / `max_probe_tokens`). Without
+                // the cap this scan probes with the WHOLE turn, and a turn can be
+                // arbitrarily large — a single `file_list` result ran to 5.7k
+                // tokens, taking ~7s of scan and scoring every tool in the catalog
+                // nonzero (the listing happened to name every tool's own
+                // definition file), which then carried into the next turn's
+                // opening belief.
+                Some(p) => cap_probe_window(p, self.config.reproject_max_probe_tokens),
                 None => return empty,
             }
         };
@@ -3212,6 +3221,31 @@ impl ProbeCtx {
     }
 }
 
+/// Cap a whole-turn probe to the same head + trailing window the live
+/// reproject scan uses: the turn's first `HEAD` signatures (the user query —
+/// the strongest intent signal in the gallery domain) followed by its most
+/// recent `max_tail`.
+///
+/// A turn is not bounded by anything the engine controls — a tool result goes
+/// into it verbatim — so an uncapped probe is both a cost and a correctness
+/// problem: the scan is O(probe × gallery), and the tail of a large tool
+/// payload is not a query, so scoring it dilutes the turn's actual intent
+/// across whatever the payload happens to mention.
+fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
+    /// Head signatures kept regardless of how far the tail window has slid —
+    /// mirrors the scheduler's `QUERY_HEAD_CHUNKS` (2 chunks of 32).
+    const HEAD: usize = 64;
+    let max_tail = max_tail.max(1);
+    if probe.len() <= HEAD + max_tail {
+        return probe;
+    }
+    let tail_lo = probe.len() - max_tail;
+    let mut out = Vec::with_capacity(HEAD + max_tail);
+    out.extend_from_slice(&probe[..HEAD]);
+    out.extend_from_slice(&probe[tail_lo..]);
+    out
+}
+
 #[cfg(test)]
 mod windowed_ingest_tests {
     use super::windowed_ingest_ranges_impl as w;
@@ -3242,7 +3276,9 @@ mod windowed_ingest_tests {
 
 #[cfg(test)]
 mod window_sealed_tokens_tests {
+    use super::cap_probe_window;
     use super::window_sealed_tokens;
+    use crate::provenance::WideQSig;
     use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
 
     /// Build a one-layer sealed turn with the given per-chunk token
@@ -3360,5 +3396,43 @@ mod window_sealed_tokens_tests {
         assert_eq!(asst[0].chunks[0].offset, 24);
         assert_eq!(asst[0].chunks[0].token_count, 8);
         assert_eq!(asst[0].chunks[1].token_count, 20);
+    }
+
+    /// A probe within the window is untouched — the common case is a normal turn.
+    #[test]
+    fn cap_probe_window_leaves_a_normal_turn_whole() {
+        let probe = vec![WideQSig::default(); 200];
+        assert_eq!(cap_probe_window(probe.clone(), 256).len(), 200);
+        // Exactly at the boundary (HEAD 64 + tail 256) is still whole.
+        let probe = vec![WideQSig::default(); 320];
+        assert_eq!(cap_probe_window(probe, 256).len(), 320);
+    }
+
+    /// The failure case: a turn carrying a large tool payload. The probe becomes
+    /// head + tail rather than the whole 5.7k-token turn.
+    #[test]
+    fn cap_probe_window_bounds_an_oversized_turn() {
+        let mut probe: Vec<WideQSig> = (0..5702)
+            .map(|i| WideQSig {
+                n_heads: i as u16,
+                words: Vec::new(),
+            })
+            .collect();
+        probe.truncate(5702);
+        let capped = cap_probe_window(probe, 256);
+        assert_eq!(capped.len(), 64 + 256);
+        // The head is the turn's opening — the query — not the payload's tail.
+        assert_eq!(capped[0].n_heads, 0);
+        assert_eq!(capped[63].n_heads, 63);
+        // …followed by the most recent window, ending at the turn's last token.
+        assert_eq!(capped[64].n_heads, (5702 - 256) as u16);
+        assert_eq!(capped.last().unwrap().n_heads, 5701);
+    }
+
+    /// A zero cap must not panic or produce an empty probe.
+    #[test]
+    fn cap_probe_window_tolerates_a_zero_cap() {
+        let probe = vec![WideQSig::default(); 1000];
+        assert_eq!(cap_probe_window(probe, 0).len(), 65);
     }
 }

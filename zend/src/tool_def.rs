@@ -8,11 +8,13 @@
 //! constrained-decode stencil, the safe-subset for Restricted mode, and the
 //! per-tool trajectories.
 //!
-//! This is the definition half of the tool system. Execution stays in
-//! [`zend_tools::registry`], bound to a definition by `name`. The definitions
-//! were generated from the registry (see `cargo run -p zend --example
-//! export_tools`), so the two agree field-for-field — asserted by
-//! `defs_match_registry` in the tests.
+//! This is the definition half of the tool system, and the only half the model
+//! ever sees: the `description` and `parameters` here are what get rendered into
+//! the prompt. Execution stays in [`zend_tools::registry`], bound to a definition
+//! by `name` — the registry carries no description of its own, so a behaviour
+//! change in a tool has to be reflected here to reach the model.
+//! `every_tool_has_definition_and_executor` in the tests asserts every executable
+//! tool has a definition and that no definition names a tool that cannot run.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -61,6 +63,25 @@ impl ToolDef {
             "parameters": self.parameters,
         });
         serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Content marker for one calibration case: this tool paired with one of its
+    /// examples. Covers **everything that shapes the exemplar** — the projected
+    /// [`Self::json_line`] (name, description, parameters: exactly the text the
+    /// model reads when choosing a tool) and the example trajectory itself.
+    ///
+    /// The calibration phase keys its resume cache on this, so editing a
+    /// description, a parameter's description, or an example changes the marker
+    /// and the case re-runs against the current text. Hashing the example alone
+    /// would leave a reworded tool answering the belief scan with signatures
+    /// captured against wording that no longer exists.
+    pub fn calibration_marker(&self, example: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.json_line().as_bytes());
+        h.update([0u8]);
+        h.update(example.as_bytes());
+        format!("{}|{:x}", self.name, h.finalize())
     }
 }
 
@@ -170,6 +191,67 @@ pub fn category_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn def(description: &str, params: Value) -> ToolDef {
+        ToolDef {
+            name: "file_list".to_string(),
+            category: "Files".to_string(),
+            description: description.to_string(),
+            high_risk: false,
+            parameters: params,
+            examples: vec!["list the files<|im_end|>".to_string()],
+        }
+    }
+
+    /// The calibration marker must move whenever anything the model reads about
+    /// the tool moves. Hashing only the example (the earlier behaviour) let a
+    /// reworded description resume its old exemplars, so the belief gallery kept
+    /// answering with signatures captured against text that no longer existed.
+    #[test]
+    fn calibration_marker_covers_the_whole_projected_definition() {
+        let params = serde_json::json!({"properties": {"prefix": {"type": "string"}}});
+        let base = def("List the files.", params.clone());
+        let example = &base.examples[0];
+        let baseline = base.calibration_marker(example);
+
+        // Same definition, same example → same marker (the resume cache hits).
+        assert_eq!(base.calibration_marker(example), baseline);
+
+        // Description reworded → marker moves, so the case re-runs.
+        let reworded = def("List the files visible to this session.", params.clone());
+        assert_ne!(reworded.calibration_marker(example), baseline);
+
+        // A *parameter's* description is projected too — it is part of the
+        // rendered schema the model reads when choosing arguments.
+        let reparam = def(
+            "List the files.",
+            serde_json::json!({
+                "properties": {"prefix": {"type": "string", "description": "project root"}}
+            }),
+        );
+        assert_ne!(reparam.calibration_marker(example), baseline);
+
+        // A different example under an unchanged definition is its own case.
+        assert_ne!(base.calibration_marker("something else"), baseline);
+
+        // The marker stays name-prefixed so it is greppable per tool.
+        assert!(baseline.starts_with("file_list|"));
+    }
+
+    /// Two tools sharing a description and example must not collide.
+    #[test]
+    fn calibration_markers_are_per_tool() {
+        let params = serde_json::json!({});
+        let mut a = def("same text", params.clone());
+        let mut b = def("same text", params);
+        a.name = "file_read".into();
+        b.name = "file_delete".into();
+        assert_ne!(
+            a.calibration_marker("ex"),
+            b.calibration_marker("ex"),
+            "the name must participate in the marker",
+        );
+    }
 
     /// Execution (the registry) and definition (this folder) must agree on the
     /// tool set: every executable tool has a bundled definition, and every

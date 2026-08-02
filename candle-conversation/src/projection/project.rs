@@ -323,25 +323,39 @@ pub enum GroupKey {
 /// belief for this projection.
 #[derive(Debug, Clone, Default)]
 pub struct PriorBelief {
-    beliefs: HashMap<GroupKey, HashMap<String, (f32, bool)>>,
+    beliefs: HashMap<GroupKey, HashMap<String, (f32, bool, bool)>>,
 }
 
 impl PriorBelief {
     /// Record a section's prior belief (score + whether it was selected).
-    pub fn set(&mut self, collection: &str, section: &str, score: f32, selected: bool) {
+    pub fn set(
+        &mut self,
+        collection: &str,
+        section: &str,
+        score: f32,
+        selected: bool,
+        qualified: bool,
+    ) {
         self.beliefs
             .entry(GroupKey::Collection(collection.to_string()))
             .or_default()
-            .insert(section.to_string(), (score, selected));
+            .insert(section.to_string(), (score, selected, qualified));
     }
 
     /// Record a turn's prior belief in a belief-driven turn group (repo_map
     /// clusters, code scopes). The turn-axis analogue of [`Self::set`].
-    pub fn set_turn(&mut self, group: &str, turn: TurnKey, score: f32, selected: bool) {
+    pub fn set_turn(
+        &mut self,
+        group: &str,
+        turn: TurnKey,
+        score: f32,
+        selected: bool,
+        qualified: bool,
+    ) {
         self.beliefs
             .entry(GroupKey::TurnGroup(group.to_string()))
             .or_default()
-            .insert(turn_belief_key(turn), (score, selected));
+            .insert(turn_belief_key(turn), (score, selected, qualified));
     }
 
     /// Rebuild the prior belief from a completed projection's selection — every
@@ -364,7 +378,7 @@ impl PriorBelief {
         for item in &sel.system {
             if let super::SystemItem::Collection { name, sections } = item {
                 for s in sections {
-                    pb.set(name, &s.name, s.score, s.selected);
+                    pb.set(name, &s.name, s.score, s.selected, s.qualified);
                 }
             }
         }
@@ -380,6 +394,7 @@ impl PriorBelief {
                         TurnKey::new(tl, TurnIndex(t.index)),
                         t.score,
                         true,
+                        t.qualified,
                     );
                 }
             }
@@ -417,7 +432,7 @@ impl PriorBelief {
     /// on. See `docs/tool_selection_provenance_results.md` §24.
     pub fn decay_scores(&mut self, factor: f32) {
         for members in self.beliefs.values_mut() {
-            for (score, _selected) in members.values_mut() {
+            for (score, _selected, _qualified) in members.values_mut() {
                 *score *= factor;
             }
         }
@@ -449,7 +464,7 @@ impl PriorBelief {
             return;
         }
         let members = self.beliefs.entry(key).or_default();
-        let is_selected = |name: &str| members.get(name).map(|&(_, sel)| sel).unwrap_or(false);
+        let is_selected = |name: &str| members.get(name).map(|&(_, sel, _)| sel).unwrap_or(false);
         // The challenger: strongest fresh signal not already selected.
         let challenger = fresh
             .iter()
@@ -462,54 +477,73 @@ impl PriorBelief {
         // Currently-selected incumbents, by carried score.
         let selected: Vec<(String, f32)> = members
             .iter()
-            .filter(|(_, (_, sel))| *sel)
-            .map(|(name, (score, _))| (name.clone(), *score))
+            .filter(|(_, (_, sel, _))| *sel)
+            .map(|(name, (score, _, _))| (name.clone(), *score))
             .collect();
         if selected.len() >= budget_max {
             if let Some((low, _)) = selected
                 .iter()
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             {
-                members.insert(low.clone(), (0.0, false));
+                members.insert(low.clone(), (0.0, false, false));
             }
         }
-        members.insert(challenger, (seed_score, true));
+        // Seated, but NOT qualified: the challenger is deliberately placed below
+        // the selection threshold ("break in without lowering `min_score`"), so it
+        // has shown no evidence of crossing a bar. Marking it qualified would hand
+        // it to the early-decode carry floor, which would pin it at the seed score
+        // for the whole grace window — turning a speculative slot into a lock-on
+        // and squatting the budget the real tool needs. It has to earn the floor by
+        // reaching `min_score` on its own belief, like any other member.
+        members.insert(challenger, (seed_score, true, false));
     }
 
     /// Aligned `(scores, selected)` for a collection's sections in declaration
     /// order — the seed for [`crate::provenance::belief_step`]. Unknown sections
     /// read `(0.0, false)`.
-    fn collection(&self, name: &str, sections: &[SectionSchema]) -> (Vec<f32>, Vec<bool>) {
+    fn collection(
+        &self,
+        name: &str,
+        sections: &[SectionSchema],
+    ) -> (Vec<f32>, Vec<bool>, Vec<bool>) {
         let map = self.beliefs.get(&GroupKey::Collection(name.to_string()));
         let mut scores = vec![0.0f32; sections.len()];
         let mut selected = vec![false; sections.len()];
+        let mut qualified = vec![false; sections.len()];
         if let Some(m) = map {
             for (i, s) in sections.iter().enumerate() {
-                if let Some(&(sc, sel)) = m.get(&s.name) {
+                if let Some(&(sc, sel, q)) = m.get(&s.name) {
                     scores[i] = sc;
                     selected[i] = sel;
+                    qualified[i] = q;
                 }
             }
         }
-        (scores, selected)
+        (scores, selected, qualified)
     }
 
     /// Aligned `(scores, selected)` for a turn group's candidate turns, in the
     /// given order — the seed for [`crate::provenance::belief_step`] on the turn
     /// axis. Unknown turns read `(0.0, false)`.
-    fn turn_group(&self, group: &str, turns: &[(TurnKey, f32)]) -> (Vec<f32>, Vec<bool>) {
+    fn turn_group(
+        &self,
+        group: &str,
+        turns: &[(TurnKey, f32)],
+    ) -> (Vec<f32>, Vec<bool>, Vec<bool>) {
         let map = self.beliefs.get(&GroupKey::TurnGroup(group.to_string()));
         let mut scores = vec![0.0f32; turns.len()];
         let mut selected = vec![false; turns.len()];
+        let mut qualified = vec![false; turns.len()];
         if let Some(m) = map {
             for (i, (key, _)) in turns.iter().enumerate() {
-                if let Some(&(sc, sel)) = m.get(&turn_belief_key(*key)) {
+                if let Some(&(sc, sel, q)) = m.get(&turn_belief_key(*key)) {
                     scores[i] = sc;
                     selected[i] = sel;
+                    qualified[i] = q;
                 }
             }
         }
-        (scores, selected)
+        (scores, selected, qualified)
     }
 }
 
@@ -527,11 +561,11 @@ pub(crate) fn turn_belief_key(turn: TurnKey) -> String {
 #[cfg(test)]
 impl PriorBelief {
     /// A collection's member map (test-only readable view over `beliefs`).
-    fn coll(&self, name: &str) -> &HashMap<String, (f32, bool)> {
+    fn coll(&self, name: &str) -> &HashMap<String, (f32, bool, bool)> {
         &self.beliefs[&GroupKey::Collection(name.to_string())]
     }
     /// A turn group's member map (test-only readable view over `beliefs`).
-    fn tgroup(&self, name: &str) -> &HashMap<String, (f32, bool)> {
+    fn tgroup(&self, name: &str) -> &HashMap<String, (f32, bool, bool)> {
         &self.beliefs[&GroupKey::TurnGroup(name.to_string())]
     }
     fn is_empty(&self) -> bool {
@@ -556,41 +590,41 @@ mod prior_belief_tests {
     fn merge_from_overlays_present_collections_and_preserves_absent_ones() {
         // The carried belief holds a tools lock-on from earlier turns.
         let mut carried = PriorBelief::default();
-        carried.set("tools", "calculator", 2500.0, true);
-        carried.set("tools", "datetime", 400.0, false);
+        carried.set("tools", "calculator", 2500.0, true, true);
+        carried.set("tools", "datetime", 400.0, false, false);
 
         // A tools-off turn harvests a belief WITHOUT the tools key (the
         // collection materialised nothing, so the selection omitted it) but
         // with fresh state for another collection.
         let mut newer = PriorBelief::default();
-        newer.set("notes", "pinned", 40.0, true);
+        newer.set("notes", "pinned", 40.0, true, true);
 
         carried.merge_from(&newer);
 
         // The absent collection survives untouched — the tools lock-on is
         // NOT erased by a turn that said nothing about tools...
-        assert_eq!(carried.coll("tools")["calculator"], (2500.0, true));
-        assert_eq!(carried.coll("tools")["datetime"], (400.0, false));
+        assert_eq!(carried.coll("tools")["calculator"], (2500.0, true, true));
+        assert_eq!(carried.coll("tools")["datetime"], (400.0, false, false));
         // ...and the present collection is overlaid.
-        assert_eq!(carried.coll("notes")["pinned"], (40.0, true));
+        assert_eq!(carried.coll("notes")["pinned"], (40.0, true, true));
     }
 
     #[test]
     fn merge_from_replaces_a_present_collection_wholesale() {
         let mut carried = PriorBelief::default();
-        carried.set("tools", "calculator", 2500.0, true);
-        carried.set("tools", "datetime", 400.0, false);
+        carried.set("tools", "calculator", 2500.0, true, true);
+        carried.set("tools", "datetime", 400.0, false, false);
 
         // A newer turn re-projected tools with a different member set: the
         // collection entry is replaced, not unioned — sections absent from the
         // newer selection are gone (their belief genuinely ended).
         let mut newer = PriorBelief::default();
-        newer.set("tools", "web_search", 900.0, true);
+        newer.set("tools", "web_search", 900.0, true, true);
 
         carried.merge_from(&newer);
 
         let tools = carried.coll("tools");
-        assert_eq!(tools.get("web_search"), Some(&(900.0, true)));
+        assert_eq!(tools.get("web_search"), Some(&(900.0, true, true)));
         assert_eq!(tools.get("calculator"), None);
         assert_eq!(tools.len(), 1);
     }
@@ -600,11 +634,11 @@ mod prior_belief_tests {
         // A projection-skipped turn harvests a default belief: merging it must
         // not disturb the carry.
         let mut carried = PriorBelief::default();
-        carried.set("tools", "calculator", 2500.0, true);
+        carried.set("tools", "calculator", 2500.0, true, true);
 
         carried.merge_from(&PriorBelief::default());
 
-        assert_eq!(carried.coll("tools")["calculator"], (2500.0, true));
+        assert_eq!(carried.coll("tools")["calculator"], (2500.0, true, true));
     }
 
     #[test]
@@ -612,18 +646,18 @@ mod prior_belief_tests {
         let mut carried = PriorBelief::default();
         // A carried tool lock-on (sub_run) plus a runner-up (datetime), as at
         // a topic-changed turn boundary.
-        carried.set("tools", "sub_run", 1009.0, true);
-        carried.set("tools", "datetime", 0.0, false);
-        carried.set("notes", "pinned", 40.0, true);
+        carried.set("tools", "sub_run", 1009.0, true, true);
+        carried.set("tools", "datetime", 0.0, false, false);
+        carried.set("notes", "pinned", 40.0, true, true);
 
         carried.decay_scores(0.5);
 
         // Scores halve so the fresh decode-Q of a new query can overtake the
         // stale leader early; the `selected` flags are the ranking input, not
         // the lever, so they carry unchanged.
-        assert_eq!(carried.coll("tools")["sub_run"], (504.5, true));
-        assert_eq!(carried.coll("tools")["datetime"], (0.0, false));
-        assert_eq!(carried.coll("notes")["pinned"], (20.0, true));
+        assert_eq!(carried.coll("tools")["sub_run"], (504.5, true, true));
+        assert_eq!(carried.coll("tools")["datetime"], (0.0, false, false));
+        assert_eq!(carried.coll("notes")["pinned"], (20.0, true, true));
     }
 
     #[test]
@@ -639,6 +673,9 @@ mod prior_belief_tests {
     fn from_selection_carries_only_selected_memory_turns_by_group() {
         use crate::projection::event::{ProjectionSelection, SelectedTurn};
         let mk = |group: &str, index: u32, selected: bool, score: f32| SelectedTurn {
+            // These fixtures stand for turns that won their slot on their own
+            // belief, so qualification tracks selection.
+            qualified: selected,
             layer: "repo_map".to_string(),
             group: group.to_string(),
             index,
@@ -660,7 +697,7 @@ mod prior_belief_tests {
         };
         let pb = PriorBelief::from_selection(&sel);
         let group = pb.tgroup("structure");
-        assert_eq!(group.get(&tkey(0)), Some(&(500.0, true)));
+        assert_eq!(group.get(&tkey(0)), Some(&(500.0, true, true)));
         assert_eq!(group.get(&tkey(1)), None);
         assert_eq!(group.len(), 1, "only the selected memory turn is carried");
     }
@@ -668,12 +705,12 @@ mod prior_belief_tests {
     #[test]
     fn turn_group_aligns_carried_belief_to_candidate_order() {
         let mut pb = PriorBelief::default();
-        pb.set_turn("structure", tk(3), 500.0, true);
-        pb.set_turn("structure", tk(7), 200.0, false);
+        pb.set_turn("structure", tk(3), 500.0, true, true);
+        pb.set_turn("structure", tk(7), 200.0, false, false);
         // Candidates in a different order than they were carried; the seed must
         // realign by turn index, and unknown turns read (0.0, false).
         let turns = vec![(tk(7), 0.0), (tk(3), 0.0), (tk(5), 0.0)];
-        let (scores, selected) = pb.turn_group("structure", &turns);
+        let (scores, selected, _qualified) = pb.turn_group("structure", &turns);
         assert_eq!(scores, vec![200.0, 500.0, 0.0]);
         assert_eq!(selected, vec![false, true, false]);
     }
@@ -682,7 +719,7 @@ mod prior_belief_tests {
     fn challenger_seats_a_turn_group_member_by_index_key() {
         let mut pb = PriorBelief::default();
         // One carried cluster; a spare slot at budget_max 3.
-        pb.set_turn("clusters", tk(0), 900.0, true);
+        pb.set_turn("clusters", tk(0), 900.0, true, true);
         pb.seat_turn_boundary_challenger(
             GroupKey::TurnGroup("clusters".into()),
             &[(tkey(4), 246.0), (tkey(9), 30.0)],
@@ -690,33 +727,37 @@ mod prior_belief_tests {
             100.0,
         );
         let g = pb.tgroup("clusters");
-        assert_eq!(g[&tkey(0)], (900.0, true), "incumbent survives");
-        assert_eq!(g[&tkey(4)], (100.0, true), "strongest fresh turn seated");
+        assert_eq!(g[&tkey(0)], (900.0, true, true), "incumbent survives");
+        assert_eq!(
+            g[&tkey(4)],
+            (100.0, true, false),
+            "strongest fresh turn seated, but unqualified — it never crossed the bar"
+        );
         assert!(g.get(&tkey(9)).is_none(), "weaker rival not seated");
     }
 
     #[test]
     fn merge_from_and_decay_span_both_axes() {
         let mut carried = PriorBelief::default();
-        carried.set("tools", "calc", 400.0, true);
-        carried.set_turn("structure", tk(2), 800.0, true);
+        carried.set("tools", "calc", 400.0, true, true);
+        carried.set_turn("structure", tk(2), 800.0, true, true);
         // decay scales scores on both the collection and turn-group axes.
         carried.decay_scores(0.5);
-        assert_eq!(carried.coll("tools")["calc"], (200.0, true));
-        assert_eq!(carried.tgroup("structure")[&tkey(2)], (400.0, true));
+        assert_eq!(carried.coll("tools")["calc"], (200.0, true, true));
+        assert_eq!(carried.tgroup("structure")[&tkey(2)], (400.0, true, true));
         // merge overlays a turn group wholesale, leaving the collection intact.
         let mut newer = PriorBelief::default();
-        newer.set_turn("structure", tk(5), 900.0, true);
+        newer.set_turn("structure", tk(5), 900.0, true, true);
         carried.merge_from(&newer);
         assert_eq!(
             carried.tgroup("structure").get(&tkey(2)),
             None,
             "replaced wholesale"
         );
-        assert_eq!(carried.tgroup("structure")[&tkey(5)], (900.0, true));
+        assert_eq!(carried.tgroup("structure")[&tkey(5)], (900.0, true, true));
         assert_eq!(
             carried.coll("tools")["calc"],
-            (200.0, true),
+            (200.0, true, true),
             "other axis intact"
         );
     }
@@ -726,7 +767,7 @@ mod prior_belief_tests {
         // Carried a single (topic-stale) tool from the previous turn; the new
         // query's strongest fresh signal is a below-threshold datetime.
         let mut b = PriorBelief::default();
-        b.set("tools", "sub_run", 350.0, true);
+        b.set("tools", "sub_run", 350.0, true, true);
         // budget_max 3 with one incumbent → room for the challenger, no eviction.
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
@@ -735,8 +776,9 @@ mod prior_belief_tests {
             1000.0,
         );
         // The incumbent survives; datetime is seated selected at the seed score.
-        assert_eq!(b.coll("tools")["sub_run"], (350.0, true));
-        assert_eq!(b.coll("tools")["datetime"], (1000.0, true));
+        assert_eq!(b.coll("tools")["sub_run"], (350.0, true, true));
+        // Seated selected, but unqualified: it is below the bar by construction.
+        assert_eq!(b.coll("tools")["datetime"], (1000.0, true, false));
         // A weaker fresh rival is NOT seated — only the single strongest.
         assert!(b.coll("tools").get("weather").is_none());
     }
@@ -744,9 +786,9 @@ mod prior_belief_tests {
     #[test]
     fn challenger_evicts_the_weakest_incumbent_when_full() {
         let mut b = PriorBelief::default();
-        b.set("tools", "http_request", 1800.0, true);
-        b.set("tools", "sub_run", 400.0, true); // weakest incumbent
-        b.set("tools", "code_run", 1200.0, true);
+        b.set("tools", "http_request", 1800.0, true, true);
+        b.set("tools", "sub_run", 400.0, true, true); // weakest incumbent
+        b.set("tools", "code_run", 1200.0, true, true);
         // At budget_max=3 → the challenger displaces the lowest-scored incumbent.
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
@@ -754,11 +796,11 @@ mod prior_belief_tests {
             3,
             1000.0,
         );
-        assert_eq!(b.coll("tools")["sub_run"], (0.0, false)); // evicted
-        assert_eq!(b.coll("tools")["datetime"], (1000.0, true)); // seated
-                                                                 // The strong incumbents survive.
-        assert_eq!(b.coll("tools")["http_request"], (1800.0, true));
-        assert_eq!(b.coll("tools")["code_run"], (1200.0, true));
+        assert_eq!(b.coll("tools")["sub_run"], (0.0, false, false)); // evicted
+        assert_eq!(b.coll("tools")["datetime"], (1000.0, true, false)); // seated, unqualified
+                                                                        // The strong incumbents survive.
+        assert_eq!(b.coll("tools")["http_request"], (1800.0, true, true));
+        assert_eq!(b.coll("tools")["code_run"], (1200.0, true, true));
     }
 
     #[test]
@@ -766,14 +808,14 @@ mod prior_belief_tests {
         // Continuation: the strongest fresh signal is the carried tool itself,
         // and no other fresh signal exists → nothing to seat, carry untouched.
         let mut b = PriorBelief::default();
-        b.set("tools", "datetime", 1500.0, true);
+        b.set("tools", "datetime", 1500.0, true, true);
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
             &[("datetime".into(), 900.0)],
             3,
             1000.0,
         );
-        assert_eq!(b.coll("tools")["datetime"], (1500.0, true));
+        assert_eq!(b.coll("tools")["datetime"], (1500.0, true, true));
         assert_eq!(b.coll("tools").len(), 1);
     }
 
@@ -781,14 +823,14 @@ mod prior_belief_tests {
     fn challenger_does_not_apply_below_top_3() {
         // A top-1/top-2 collection has no spare slot to lend a challenger.
         let mut b = PriorBelief::default();
-        b.set("tools", "sub_run", 350.0, true);
+        b.set("tools", "sub_run", 350.0, true, true);
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
             &[("datetime".into(), 246.0)],
             2,
             1000.0,
         );
-        assert_eq!(b.coll("tools")["sub_run"], (350.0, true));
+        assert_eq!(b.coll("tools")["sub_run"], (350.0, true, true));
         assert!(b.coll("tools").get("datetime").is_none());
     }
 }
@@ -1155,7 +1197,8 @@ pub fn run_with_sink<R: ContentResolver>(
                 // so a locked-on cluster/scope survives across the turn's
                 // reprojections. The turn-axis analogue of `select_collection_sections`'s
                 // TopK arm — same `belief_step`, keyed by turn instead of section.
-                let (prior_scores, prior_selected) = prior.turn_group(&group.name, &all_turns);
+                let (prior_scores, prior_selected, prior_qualified) =
+                    prior.turn_group(&group.name, &all_turns);
                 let fresh: Vec<f32> = all_turns.iter().map(|(_, s)| *s).collect();
                 // Early-decode grace: within the opening window the selection band
                 // is lowered and carried picks are floored (see `PolicyConfig::windowed`).
@@ -1164,6 +1207,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     &fresh,
                     &prior_scores,
                     &prior_selected,
+                    &prior_qualified,
                     cfg.section_policy(0),
                     cfg.budget(),
                     floor,
@@ -1172,7 +1216,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 for ((key, _), b) in all_turns.iter().zip(&beliefs) {
                     // Record every candidate's belief so `build_selection` stamps
                     // it and the next reprojection can seed from it.
-                    selection_scores.set_turn(*key, b.score);
+                    selection_scores.set_turn(*key, b.score, b.qualified);
                     if b.selected {
                         out.push((*key, b.score));
                         selection_origins.insert(*key, SelectionOrigin::Belief);
@@ -1182,7 +1226,7 @@ pub fn run_with_sink<R: ContentResolver>(
             } else {
                 let selected_indices = apply_selection(
                     &group.selection,
-                    group.score_threshold,
+                    group.score_threshold.unwrap_or(0.0),
                     &all_turns,
                     None,
                     &tc,
@@ -1237,7 +1281,9 @@ pub fn run_with_sink<R: ContentResolver>(
             if selected.is_empty() {
                 if let Some(key) = resolve_default_turn(group.default.as_ref(), group.id, resolver)
                 {
-                    let sentinel = layer.score_threshold.max(group.score_threshold);
+                    let sentinel = layer
+                        .score_threshold
+                        .max(group.score_threshold.unwrap_or(0.0));
                     selected.push((key, sentinel));
                     selection_origins.insert(key, SelectionOrigin::Fallback);
                 }
@@ -1486,7 +1532,7 @@ pub fn run_with_sink<R: ContentResolver>(
             } else {
                 apply_selection(
                     &gs.schema.selection,
-                    gs.schema.score_threshold,
+                    gs.schema.score_threshold.unwrap_or(0.0),
                     &gs.selected,
                     Some(group_budget),
                     &tc,
@@ -1990,7 +2036,7 @@ fn select_collection_sections<R: ContentResolver>(
                 if let Some(s) = coll.sections.iter().find(|s| s.name == target) {
                     let mut out = Vec::new();
                     push_section_segment(&mut out, s);
-                    scores.set_section(s.id, coll.score_threshold.max(1.0));
+                    scores.set_section(s.id, coll.score_threshold.max(1.0), true);
                     return out;
                 }
             }
@@ -2003,7 +2049,8 @@ fn select_collection_sections<R: ContentResolver>(
                 .iter()
                 .map(|s| resolver.section_score(s.id))
                 .collect();
-            let (prior_scores, prior_selected) = prior.collection(&coll.name, &coll.sections);
+            let (prior_scores, prior_selected, prior_qualified) =
+                prior.collection(&coll.name, &coll.sections);
             // Early-decode grace: within the opening window the selection band is
             // lowered and carried picks are floored (see `PolicyConfig::windowed`),
             // so the submit guess and a still-accruing correct tool stay in scope.
@@ -2012,6 +2059,7 @@ fn select_collection_sections<R: ContentResolver>(
                 &fresh,
                 &prior_scores,
                 &prior_selected,
+                &prior_qualified,
                 cfg.section_policy(0),
                 cfg.budget(),
                 floor,
@@ -2035,7 +2083,7 @@ fn select_collection_sections<R: ContentResolver>(
             }
             let mut out = Vec::new();
             for (s, b) in coll.sections.iter().zip(&beliefs) {
-                scores.set_section(s.id, b.score);
+                scores.set_section(s.id, b.score, b.qualified);
                 if b.selected {
                     push_section_segment(&mut out, s);
                 }

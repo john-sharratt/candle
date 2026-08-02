@@ -24,6 +24,8 @@ rand = { workspace = true }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+# ripgrep's git-aware file walker — backs the VFS overlay's workspace layer.
+ignore = "0.4"
 sha2 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
@@ -55,3 +57,4 @@ boa_engine = "0.21.1"
 tokio     = { version = "1", features = ["macros", "rt"] }
 wiremock  = "0.6"
 pretty_assertions = "1"
+tempfile  = "3"

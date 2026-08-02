@@ -22,7 +22,7 @@
 //! [`from_projection`] adapter that classifies real [`ProjectionSegment`]s
 //! against the live [`Schema`] + [`ContentResolver`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,11 @@ use crate::summary_tree::{SelectionOrigin, TurnKind};
 pub struct SelectionScores {
     sections: HashMap<SectionId, f32>,
     turns: HashMap<TurnKey, f32>,
+    /// Sections/turns that reached the selection threshold on their own belief
+    /// rather than entering scope via the min-budget force-fill. Absent ⇒ not
+    /// qualified.
+    section_qualified: HashSet<SectionId>,
+    turn_qualified: HashSet<TurnKey>,
 }
 
 impl SelectionScores {
@@ -54,14 +59,30 @@ impl SelectionScores {
         self.turns.get(&turn).copied().unwrap_or(0.0)
     }
 
-    /// Record a section's belief score.
-    pub fn set_section(&mut self, id: SectionId, score: f32) {
-        self.sections.insert(id, score);
+    /// Whether a section qualified on its own belief this turn.
+    pub fn section_qualified(&self, id: SectionId) -> bool {
+        self.section_qualified.contains(&id)
     }
 
-    /// Record a turn's belief score.
-    pub fn set_turn(&mut self, turn: TurnKey, score: f32) {
+    /// Whether a turn qualified on its own belief this turn.
+    pub fn turn_qualified(&self, turn: TurnKey) -> bool {
+        self.turn_qualified.contains(&turn)
+    }
+
+    /// Record a section's belief score and whether it qualified.
+    pub fn set_section(&mut self, id: SectionId, score: f32, qualified: bool) {
+        self.sections.insert(id, score);
+        if qualified {
+            self.section_qualified.insert(id);
+        }
+    }
+
+    /// Record a turn's belief score and whether it qualified.
+    pub fn set_turn(&mut self, turn: TurnKey, score: f32, qualified: bool) {
         self.turns.insert(turn, score);
+        if qualified {
+            self.turn_qualified.insert(turn);
+        }
     }
 }
 
@@ -111,6 +132,13 @@ pub struct SelectedSection {
     /// section carried no belief score.
     #[serde(default)]
     pub score: f32,
+    /// Whether this section reached the selection threshold on its own belief at
+    /// some point this turn, as opposed to entering scope through the min-budget
+    /// force-fill. Carried into the next reprojection's
+    /// [`PriorBelief`](super::project::PriorBelief) so the early-decode carry
+    /// floor only ever protects a pick that showed real evidence.
+    #[serde(default)]
+    pub qualified: bool,
 }
 
 /// One item of the system prompt, in materialized (declaration) order. Carries
@@ -161,6 +189,12 @@ pub struct SelectedTurn {
     /// `historical` from the rule-based path. `None` for the live user message.
     #[serde(default)]
     pub reason: Option<SelectionOrigin>,
+    /// Whether this turn reached the selection threshold on its own belief,
+    /// rather than entering scope through the min-budget force-fill. Gates the
+    /// early-decode carry floor on the turn axis (mirrors
+    /// [`SelectedSection::qualified`]).
+    #[serde(default)]
+    pub qualified: bool,
     /// The resolved source timeline (raw id) this turn belongs to — stamped from
     /// [`ResolvedTurn::timeline`], which the projection fixed unambiguously at
     /// selection time. A turn's identity is `(timeline, index)`; consumers resolve
@@ -411,6 +445,7 @@ pub fn summary_node_event(
         // belief score (compression frames run no belief scan).
         selected: true,
         score: 0.0,
+        qualified: false,
     });
     for (idx, kind, tokens) in children {
         turns.push(SelectedTurn {
@@ -424,6 +459,7 @@ pub fn summary_node_event(
             timeline: Some(timeline),
             selected: true,
             score: 0.0,
+            qualified: false,
         });
     }
     let total: u32 = turns.iter().map(|t| t.tokens).sum();
@@ -575,6 +611,7 @@ fn build_selection(
                     // so the next reprojection can seed its turn-group carry.
                     selected: true,
                     score: t.key().map_or(0.0, |k| scores.turn(k)),
+                    qualified: t.key().is_some_and(|k| scores.turn_qualified(k)),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -591,6 +628,7 @@ fn build_selection(
                     timeline: None,
                     selected: false,
                     score: 0.0,
+                    qualified: false,
                 });
             }
             // Compression-internal turn-half — not a displayed dialogue turn.
@@ -682,6 +720,7 @@ fn build_selection(
                                 tokens: resolver.section_token_count(s.id) as u32,
                                 selected: selected.contains(&s.id),
                                 score: scores.section(s.id),
+                                qualified: scores.section_qualified(s.id),
                             })
                             .collect(),
                     });
@@ -1514,6 +1553,7 @@ layers:
 
     fn sel_turn(index: u32, tokens: u32, timeline: u64) -> SelectedTurn {
         SelectedTurn {
+            qualified: false,
             layer: "code_reading".to_string(),
             group: "scopes".to_string(),
             index,

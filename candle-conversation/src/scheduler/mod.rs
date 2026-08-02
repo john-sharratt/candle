@@ -8117,7 +8117,7 @@ mod tests {
     /// A carried belief for a slot.
     fn seeded_belief() -> PriorBelief {
         let mut b = PriorBelief::default();
-        b.set("tools", "calculator", 2500.0, true);
+        b.set("tools", "calculator", 2500.0, true, true);
         b
     }
 

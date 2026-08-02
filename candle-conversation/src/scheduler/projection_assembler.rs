@@ -385,11 +385,13 @@ pub(crate) fn materialize_conversation(
                         kind: key.map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
                         reason: key.and_then(|k| origins.get(&k)).copied(),
                         timeline: timeline.map(|tl| tl.raw()),
-                        // Materialized display spine — the turn is shown, and the
-                        // belief score isn't threaded here (the carry reads
+                        // Materialized display spine — the turn is shown, and
+                        // neither the belief score nor its qualification is
+                        // threaded here (the carry reads
                         // `ProjectionSelection::turns`, not the materialized pieces).
                         selected: true,
                         score: 0.0,
+                        qualified: false,
                     },
                 })
             }

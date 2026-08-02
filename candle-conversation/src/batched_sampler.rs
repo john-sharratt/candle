@@ -17,6 +17,13 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 /// Per-sequence sampling state.
 ///
 /// Tracks token counts and recent history for penalty calculations.
+/// Consecutive token-0 emissions that mark a decode as degenerate rather than
+/// merely repetitive. Comfortably above anything language produces — token 0 is
+/// `!` in the Qwen vocab and no real text repeats it eight times — while short
+/// enough that a broken forward is caught in a few steps instead of running to
+/// the length cap.
+pub const DEGENERATE_TOKEN_RUN: u32 = 8;
+
 /// This struct persists across turns (owned by the Scheduler) so that
 /// DRY penalty can see a rolling window of recent tokens spanning
 /// turn boundaries.  Per-turn state (token_counts, current_len) is
@@ -80,6 +87,13 @@ pub struct SequenceSamplingState {
     /// unsteered blocks and terminal spans.
     pub close_would_continue: bool,
 
+    /// Consecutive emissions of token id 0 this turn. Degenerate logits — all
+    /// equal, or non-finite — make argmax return index 0, which every vocab this
+    /// engine runs maps to a printable character (`!` in Qwen), so the failure
+    /// looks like output rather than an error. A run of them is the signature of
+    /// a broken forward, not of language; [`DEGENERATE_TOKEN_RUN`] bounds it.
+    pub degenerate_run: u32,
+
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
 }
@@ -99,6 +113,7 @@ impl SequenceSamplingState {
             in_tool_call: false,
             close_script_pos: None,
             close_would_continue: false,
+            degenerate_run: 0,
             rng_offset: 0,
         }
     }
@@ -112,6 +127,13 @@ impl SequenceSamplingState {
 
         self.recent_tokens.push(token as i32);
         self.current_len += 1;
+        // Token 0 is what argmax yields from an all-equal or non-finite logit
+        // row, so a run of it means the forward produced nothing usable.
+        if token == 0 {
+            self.degenerate_run += 1;
+        } else {
+            self.degenerate_run = 0;
+        }
 
         // Advance the segment length while inside a segment.
         if self.in_segment {
@@ -196,6 +218,7 @@ impl SequenceSamplingState {
         self.segment_len = 0;
         self.close_script_pos = None;
         self.close_would_continue = false;
+        self.degenerate_run = 0;
     }
 
     /// Advance RNG offset (called after each sampling).
@@ -580,6 +603,22 @@ impl BatchedSampler {
             let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
             if segment_override.is_some() {
                 // Segment close in progress; EOS failsafes wait for the next step.
+            } else if state.degenerate_run >= DEGENERATE_TOKEN_RUN {
+                // Degenerate decode: the forward is producing token 0 repeatedly,
+                // which is what argmax returns from an all-equal or non-finite
+                // logit row. Left alone this runs to the length cap and lands
+                // hundreds of `!` in the conversation AND in the substrate, where
+                // the turn's signatures then pollute retrieval. Stop at the first
+                // sign of it and say so loudly — this is a fault, not an answer.
+                token = eos_token_id;
+                tracing::error!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    run = state.degenerate_run,
+                    "degenerate decode: token 0 emitted {} times consecutively —                      forcing EOS. The forward pass produced unusable logits                      (all-equal or non-finite); the turn is truncated here.",
+                    state.degenerate_run,
+                );
             } else if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
                 token = eos_token_id;
@@ -1459,6 +1498,53 @@ mod tests {
     const VOCAB_SIZE: usize = 100;
     const MAX_RECENT: usize = 32;
     const EOS_TOKEN: u32 = 2;
+
+    /// A run of token 0 is counted, and any other token clears it — the guard
+    /// must fire on a *consecutive* run, not on token 0 being frequent.
+    #[test]
+    fn degenerate_run_counts_consecutive_zero_tokens() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        assert_eq!(st.degenerate_run, 0);
+        for expected in 1..=DEGENERATE_TOKEN_RUN {
+            st.record_token(0, MAX_RECENT);
+            assert_eq!(st.degenerate_run, expected);
+        }
+        // A real token breaks the run.
+        st.record_token(7, MAX_RECENT);
+        assert_eq!(st.degenerate_run, 0);
+        // Interleaved zeros never accumulate to the bar.
+        for _ in 0..50 {
+            st.record_token(0, MAX_RECENT);
+            st.record_token(7, MAX_RECENT);
+        }
+        assert_eq!(st.degenerate_run, 0);
+    }
+
+    /// The run is per-turn: a fresh turn must not inherit a previous turn's tail.
+    #[test]
+    fn degenerate_run_resets_at_turn_end() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        for _ in 0..DEGENERATE_TOKEN_RUN {
+            st.record_token(0, MAX_RECENT);
+        }
+        assert_eq!(st.degenerate_run, DEGENERATE_TOKEN_RUN);
+        st.end_turn();
+        assert_eq!(st.degenerate_run, 0);
+    }
+
+    /// The bar has to be low enough to stop a broken forward promptly, and high
+    /// enough that ordinary text can never reach it.
+    #[test]
+    fn degenerate_run_bar_is_small_but_out_of_language_range() {
+        assert!(
+            DEGENERATE_TOKEN_RUN >= 4,
+            "must tolerate a brief coincidence"
+        );
+        assert!(
+            DEGENERATE_TOKEN_RUN <= 16,
+            "must fire long before the length cap: the observed failure ran 1219 tokens",
+        );
+    }
 
     fn make_sampler() -> BatchedSampler {
         BatchedSampler::new(

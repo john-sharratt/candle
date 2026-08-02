@@ -463,3 +463,60 @@ fn format_tool_responses_escapes_nested_json_correctly() {
     assert!(formatted.contains("</tool_response>"));
     assert!(formatted.contains("\"nested\""));
 }
+
+/// The bundled schema's belief gates, resolved the way projection does it.
+/// `repo_map/structure` declares a `policy:` band and no `score_threshold`; the
+/// gate must be that band (600/400), not the `0.0` default that previously
+/// overwrote it and made every cluster eligible at zero evidence. Every other
+/// group declares a `score_threshold` and must keep it verbatim.
+#[test]
+fn bundled_schema_belief_gates_resolve_from_the_right_source() {
+    use candle_conversation::models::Dialect;
+    use candle_conversation::projection::Builder;
+    const YAML: &str = include_str!("../src/prompts/projection.yaml");
+    let dialect = Dialect::chat_ml();
+    let builder =
+        Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "proj")], Some(&dialect))
+            .expect("bundled projection.yaml parses");
+    let schema = builder.schema();
+    let mut seen = std::collections::BTreeMap::new();
+    for layer in &schema.layers {
+        for group in &layer.groups {
+            let cfg = group.belief_config(32);
+            seen.insert(
+                format!("{}/{}", layer.name, group.name),
+                (cfg.min_score, cfg.evict_score),
+            );
+        }
+    }
+    assert_eq!(
+        seen.get("repo_map/structure"),
+        Some(&(250.0, 250.0)),
+        "repo_map must use its declared policy band, not the 0.0 default; got {seen:?}",
+    );
+    assert_eq!(seen.get("bug_analysis/bugs"), Some(&(250.0, 250.0)));
+    assert_eq!(seen.get("dream_log/dreams"), Some(&(100.0, 100.0)));
+    assert_eq!(seen.get("code_reading/scopes"), Some(&(100.0, 100.0)));
+
+    // The early band is a GRACE window: it must never sit above the steady one,
+    // or the opening tokens of a turn are gated harder than the rest. Only
+    // repo_map currently enables an early window (`early_window_tokens: 24`);
+    // the rest inherit `early_window_tokens: 0`, which makes their early band
+    // inert — so this guards repo_map today and any group that turns one on.
+    for layer in &schema.layers {
+        for group in &layer.groups {
+            let cfg = group.belief_config(32);
+            if cfg.early_window_tokens == 0 {
+                continue;
+            }
+            assert!(
+                cfg.early_min_score <= cfg.min_score,
+                "{}/{}: early_min_score {} > min_score {}",
+                layer.name,
+                group.name,
+                cfg.early_min_score,
+                cfg.min_score,
+            );
+        }
+    }
+}
