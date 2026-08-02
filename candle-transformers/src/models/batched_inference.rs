@@ -1115,14 +1115,14 @@ impl BatchedInferenceSession {
             }
         };
         for li in 0..self.backings.len() {
-            let (idx, in_blk_base) = match self.backings[li].reserve_glue_gap_chunk(seq_idx, n_tokens)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    rollback(&self.backings, &pre_counts);
-                    return Err(e);
-                }
-            };
+            let (idx, in_blk_base) =
+                match self.backings[li].reserve_glue_gap_chunk(seq_idx, n_tokens) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        rollback(&self.backings, &pre_counts);
+                        return Err(e);
+                    }
+                };
             pre_counts.push(idx);
             match gap {
                 None => gap = Some((idx, in_blk_base)),

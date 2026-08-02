@@ -46,9 +46,8 @@ use super::project::{
 };
 use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
-    GroupSchema, LayerDials,
-    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
-    SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
+    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;

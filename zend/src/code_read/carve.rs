@@ -352,7 +352,10 @@ fn make_fill(start: u32, end: u32, idx: usize) -> Scope {
 /// comments), which disables the split for that language.
 fn comment_syntax(
     language: Language,
-) -> (&'static [&'static str], Option<(&'static str, &'static str)>) {
+) -> (
+    &'static [&'static str],
+    Option<(&'static str, &'static str)>,
+) {
     match language {
         Language::Rust
         | Language::TypeScript
@@ -676,7 +679,10 @@ mod tests {
         // The quoted payload's characters are all preserved (content not lost).
         let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         let orig: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(stripped, orig, "splitting must preserve every non-whitespace char");
+        assert_eq!(
+            stripped, orig,
+            "splitting must preserve every non-whitespace char"
+        );
     }
 
     #[test]
@@ -985,7 +991,10 @@ func main() {
     fn file_header_end_detects_line_comment_block() {
         assert_eq!(file_header_end(b"// a\n// b\ncode\n", Language::Rust), 2);
         assert_eq!(
-            file_header_end(b"//! doc 1\n//! doc 2\n\nuse x;\nfn a(){}\n", Language::Rust),
+            file_header_end(
+                b"//! doc 1\n//! doc 2\n\nuse x;\nfn a(){}\n",
+                Language::Rust
+            ),
             2
         );
     }
@@ -994,7 +1003,10 @@ func main() {
     fn file_header_end_detects_block_comment() {
         // Multi-line `/* … */` header: ends on the closing-delimiter line.
         assert_eq!(
-            file_header_end(b"/*\n * Copyright.\n * MIT.\n */\nfn a(){}\n", Language::Rust),
+            file_header_end(
+                b"/*\n * Copyright.\n * MIT.\n */\nfn a(){}\n",
+                Language::Rust
+            ),
             4
         );
     }
@@ -1002,7 +1014,10 @@ func main() {
     #[test]
     fn file_header_end_zero_without_code_after() {
         // A file that is nothing but comments has no header/body split.
-        assert_eq!(file_header_end(b"//! doc 1\n//! doc 2\n", Language::Rust), 0);
+        assert_eq!(
+            file_header_end(b"//! doc 1\n//! doc 2\n", Language::Rust),
+            0
+        );
     }
 
     #[test]
@@ -1013,7 +1028,10 @@ func main() {
 
     #[test]
     fn file_header_end_zero_when_file_opens_with_code() {
-        assert_eq!(file_header_end(b"fn a(){}\n// mid-file\n", Language::Rust), 0);
+        assert_eq!(
+            file_header_end(b"fn a(){}\n// mid-file\n", Language::Rust),
+            0
+        );
     }
 
     #[test]
@@ -1036,7 +1054,9 @@ func main() {
             .iter()
             .skip(1)
             .any(|s| s.path.last().is_some_and(|p| p.contains("alpha"))));
-        assert!(scopes.iter().all(|s| s.start_line >= 3 || s.kind == ChunkKind::FileHeader));
+        assert!(scopes
+            .iter()
+            .all(|s| s.start_line >= 3 || s.kind == ChunkKind::FileHeader));
         assert!(every_line_covered(&scopes, count_lines(src)));
     }
 
@@ -1057,7 +1077,8 @@ func main() {
 
     #[test]
     fn carve_splits_python_hash_header() {
-        let src = b"# Tool for X.\n# Handles Y.\n\nimport os\n\ndef run():\n    return os.getpid()\n";
+        let src =
+            b"# Tool for X.\n# Handles Y.\n\nimport os\n\ndef run():\n    return os.getpid()\n";
         let scopes = carve(src, Language::Python, false);
         assert_eq!(scopes[0].kind, ChunkKind::FileHeader);
         assert_eq!(scopes[0].end_line, 2);
@@ -1106,7 +1127,12 @@ func main() {
                 s.path
             );
             // Every boundary lands on a 10-line member edge — nothing cut in half.
-            assert_eq!((s.start_line - 1) % 10, 0, "starts mid-member: {}", s.start_line);
+            assert_eq!(
+                (s.start_line - 1) % 10,
+                0,
+                "starts mid-member: {}",
+                s.start_line
+            );
             assert_eq!(s.end_line % 10, 0, "ends mid-member: {}", s.end_line);
         }
     }
@@ -1164,7 +1190,11 @@ func main() {
         for p in &out {
             assert!(p.end_line - p.start_line + 1 <= MAX_SCOPE_LINES);
         }
-        assert_eq!(out.first().unwrap().end_line, MAX_SCOPE_LINES, "first window is a full 150 lines");
+        assert_eq!(
+            out.first().unwrap().end_line,
+            MAX_SCOPE_LINES,
+            "first window is a full 150 lines"
+        );
     }
 
     #[test]

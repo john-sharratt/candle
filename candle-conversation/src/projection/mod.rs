@@ -238,8 +238,7 @@ pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
-    GroupSchema, LayerDials,
-    LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection, SectionSchema, SectionTree,
-    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode, TreeOption,
-    TreeVariant, TurnSummary,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,
+    SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
+    TreeNode, TreeOption, TreeVariant, TurnSummary,
 };

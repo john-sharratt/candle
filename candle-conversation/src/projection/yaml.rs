@@ -68,9 +68,8 @@ use super::project::OptionalState;
 use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
-    SectionTree,
-    SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
-    TreeNode, TreeOption, TreeVariant, TurnSummary,
+    SectionTree, SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema,
+    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
 use crate::summary_tree::scope::Scope;
 

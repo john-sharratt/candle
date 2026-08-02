@@ -60,8 +60,7 @@ use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, ProjectionTarget, SectionId,
-    TimelineAllocator, TimelineId,
-    TurnIndex, TurnKey,
+    TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -6683,7 +6682,10 @@ mod tests {
             "an unset layer defaults to drop_conversation"
         );
         sub.set_layer_corrupt_turn_policy(layer, CorruptTurnPolicy::DropTurn);
-        assert_eq!(sub.corrupt_turn_policy_for(layer), CorruptTurnPolicy::DropTurn);
+        assert_eq!(
+            sub.corrupt_turn_policy_for(layer),
+            CorruptTurnPolicy::DropTurn
+        );
     }
 
     /// Regression: `snapshot_promotion_state` used to misclassify

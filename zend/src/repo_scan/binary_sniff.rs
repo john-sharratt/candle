@@ -141,7 +141,9 @@ mod tests {
     #[test]
     fn nul_dense_blob_is_binary() {
         // The shape of a fatbin `*.txt`: ELF magic + lots of NULs + some ASCII.
-        assert!(is_binary_sample(b"\x7fELF\x00\x00\x00\x00fatbin\x00\x00 code"));
+        assert!(is_binary_sample(
+            b"\x7fELF\x00\x00\x00\x00fatbin\x00\x00 code"
+        ));
     }
 
     #[test]
@@ -196,7 +198,10 @@ mod tests {
         // A 4-byte emoji sliced after its first 3 bytes must not read as binary.
         let full = "ok 🚀".as_bytes();
         let cut = &full[..full.len() - 1];
-        assert!(std::str::from_utf8(cut).is_err(), "precondition: cut is invalid");
+        assert!(
+            std::str::from_utf8(cut).is_err(),
+            "precondition: cut is invalid"
+        );
         assert!(!is_binary_sample(cut));
     }
 }

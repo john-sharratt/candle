@@ -2133,7 +2133,9 @@ fn run_inference_stream(
                         "conversation names no identity and mind.yaml sets no default — \
                          scoping identity collections to empty (no anchor emitted)");
                     (
-                        state.identity_builders.get_empty(&state.mode_builders, tools_mode),
+                        state
+                            .identity_builders
+                            .get_empty(&state.mode_builders, tools_mode),
                         None,
                     )
                 }
@@ -3958,7 +3960,8 @@ impl ZendSession {
                             // ingest and every restart's reconcile. Grab a cheap
                             // conversation handle so the ~1-2 min scan never holds the
                             // engine lock.
-                            let conv = { state_for_reconcile.engine.lock().unwrap().conversation() };
+                            let conv =
+                                { state_for_reconcile.engine.lock().unwrap().conversation() };
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
                             conv.warm_ingest_normalization(&schema);
                         });

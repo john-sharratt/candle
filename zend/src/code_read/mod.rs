@@ -49,7 +49,9 @@ use sha2::{Digest, Sha256};
 
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::{is_binary_sample, utility_config, FileEntry, Language, RepoMap, MAX_FILE_BYTES};
+use crate::repo_scan::{
+    is_binary_sample, utility_config, FileEntry, Language, RepoMap, MAX_FILE_BYTES,
+};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use types::Scope;

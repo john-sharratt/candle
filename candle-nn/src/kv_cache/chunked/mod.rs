@@ -26,6 +26,7 @@ mod chunk_ops;
 mod compress;
 mod compression_policy;
 pub(super) mod cpu_selection;
+pub mod fletcher_golden;
 mod gid_pool;
 #[cfg(feature = "cuda")]
 mod gpu_chunks;
@@ -35,7 +36,6 @@ mod gpu_chunks;
 mod head_gids;
 mod io;
 mod meta_pool;
-pub mod fletcher_golden;
 pub mod migrate;
 pub mod migrate_guard;
 pub mod sampled_selection;
