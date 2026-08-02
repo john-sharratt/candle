@@ -1115,14 +1115,14 @@ impl BatchedInferenceSession {
             }
         };
         for li in 0..self.backings.len() {
-            let (idx, in_blk_base) = match self.backings[li].reserve_glue_gap_chunk(seq_idx, n_tokens)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    rollback(&self.backings, &pre_counts);
-                    return Err(e);
-                }
-            };
+            let (idx, in_blk_base) =
+                match self.backings[li].reserve_glue_gap_chunk(seq_idx, n_tokens) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        rollback(&self.backings, &pre_counts);
+                        return Err(e);
+                    }
+                };
             pre_counts.push(idx);
             match gap {
                 None => gap = Some((idx, in_blk_base)),
@@ -2527,6 +2527,29 @@ impl BatchedInferenceSession {
                 backing
                     .record_turn(idx)
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// [`Self::snapshot_sequence_per_layer`] restricted to the block-index range
+    /// `[start_block, end_block)` on every layer. Cost scales with the range —
+    /// the glue-island capture snapshots a couple of chunks out of a
+    /// multi-hundred-block slot. The caller guarantees the layers' block tables
+    /// are aligned over the range (the projection walk builds them uniformly;
+    /// same contract as `slice_per_layer_sealed` over a full snapshot).
+    pub fn snapshot_sequence_blocks(
+        &self,
+        idx: usize,
+        start_block: usize,
+        end_block: usize,
+    ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
+        let mut out = Vec::with_capacity(self.backings.len());
+        for backing in &self.backings {
+            out.push(
+                backing
+                    .record_turn_blocks(idx, start_block, end_block)
+                    .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_blocks: {e}")))?,
             );
         }
         Ok(out)

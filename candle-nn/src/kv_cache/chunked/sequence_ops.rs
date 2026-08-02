@@ -1659,6 +1659,23 @@ impl ChunkedKvBacking {
     /// # Parameters
     /// * `batch_idx` — slot index of the sequence
     pub fn record_turn(&self, batch_idx: usize) -> Result<SealedSequence> {
+        self.record_turn_blocks(batch_idx, 0, usize::MAX)
+    }
+
+    /// Like [`Self::record_turn`] but restricted to the block-index range
+    /// `[start_block, end_block)` (clamped to the slot's block count). The walk
+    /// cost scales with the RANGE, not the slot — the projection assembler's
+    /// glue-island capture snapshots a couple of chunks out of a
+    /// multi-hundred-block slot, where a whole-slot record per layer costs tens
+    /// of milliseconds per wave. Per-chunk sealed metadata is self-contained
+    /// (un-rotated K, positions recomputed from the destination's cumulative
+    /// usage), so a ranged record equals the full record sliced to the range.
+    pub fn record_turn_blocks(
+        &self,
+        batch_idx: usize,
+        start_block: usize,
+        end_block: usize,
+    ) -> Result<SealedSequence> {
         let chunk_size = CHUNK_SIZE;
 
         let state = self
@@ -1672,14 +1689,17 @@ impl ChunkedKvBacking {
                 candle::bail!("record_turn: batch_idx {} is not allocated", batch_idx)
             }
         };
+        let all_chunks = slot.chunks_slice();
+        let end = end_block.min(all_chunks.len());
+        let start = start_block.min(end);
+        let range_chunks = &all_chunks[start..end];
 
         // Pre-compute per-arena byte strides once for the whole record call — but
-        // only for the arenas this sequence's chunks actually reference (a
+        // only for the arenas this range's chunks actually reference (a
         // couple), not the whole arena table. The full `to_arena_entry` walk per
         // layer dominated the snapshot's per-scope cost.
         let n_kv_head = self.inner.n_kv_head;
-        let needed: std::collections::HashSet<usize> = slot
-            .chunks_slice()
+        let needed: std::collections::HashSet<usize> = range_chunks
             .iter()
             .flat_map(|cw| {
                 (0..n_kv_head).flat_map(move |h| {
@@ -1697,15 +1717,14 @@ impl ChunkedKvBacking {
             .resolve_arena_info_for(&needed)
             .unwrap_or_default();
 
-        // Build SealedChunks from every block in the slot's block
-        // table, including the trailing partial.  No positional state
-        // is captured — K bytes in the chunks are un-rotated, and
+        // Build SealedChunks from every block in the requested range of the
+        // slot's block table, including a trailing partial.  No positional
+        // state is captured — K bytes in the chunks are un-rotated, and
         // RoPE is applied at the latest responsible moment by the
         // attention kernel using a slice_rope recomputed from the
         // destination slot's cumulative usage.  See `SealedChunk`
         // docs.
-        let sealed_chunks: Vec<SealedChunk> = slot
-            .chunks_slice()
+        let sealed_chunks: Vec<SealedChunk> = range_chunks
             .iter()
             .map(|cw| {
                 let byte_size = cw.gids.arena_byte_size(&arena_infos);
