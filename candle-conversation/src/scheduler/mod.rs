@@ -541,6 +541,13 @@ static DRAIN_PREFILL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static DRAIN_GLUE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DRAIN_PREFILL_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// MONOTONE count of prefill tokens successfully forwarded (never reset — the
+/// wave-stats swap must not disturb it). The ingest admission regulator reads
+/// the delta between its ticks as the "forwards are completing OOM-free at this
+/// width" evidence that lets the window reopen under chronic nominal VRAM
+/// pressure (see `evidence_admit_grow`).
+static PREFILL_OK_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Add `us` to a drain sub-timer, but only during a submission drain (so the
 /// shared assembler helpers don't miscount reproject-path work). Used by
 /// `projection_assembler`.
@@ -1083,6 +1090,52 @@ fn backlog_admit_action(
         BacklogAction::Hold
     }
 }
+
+/// Evidence-based reopen under chronic nominal VRAM pressure — the escape hatch
+/// from the admission wedge on a card whose steady state reads as "pressured"
+/// forever (a reserved-but-unreclaimable pool gap, a tight budget band). The
+/// AIMD contract says grow only when pressure clears; on such a card it never
+/// does, the window pins at the floor, and prefill runs single-sequence
+/// mini-forwards at a fraction of batched throughput. The counter-evidence is
+/// throughput itself: when growth is blocked ONLY by the pressure bit (backlog
+/// low, window below the ceiling) yet forwards keep completing OOM-free tick
+/// after tick, the current width is proven sustainable — after `need`
+/// consecutive such ticks, grow one notch and re-arm. A genuinely unsustainable
+/// width surfaces as device-OOM/eviction-survival, whose shrink resets the
+/// streak (multiplicative decrease still wins instantly).
+///
+/// Returns `(grow_now, new_streak)`.
+fn evidence_admit_grow(
+    backlog: usize,
+    target: usize,
+    window: usize,
+    ceil: usize,
+    progressed: bool,
+    streak: usize,
+    need: usize,
+) -> (bool, usize) {
+    if window >= ceil || backlog >= target / 2 || !progressed {
+        return (false, 0);
+    }
+    let streak = streak + 1;
+    if streak >= need {
+        (true, 0)
+    } else {
+        (false, streak)
+    }
+}
+
+/// Consecutive evidence ticks (one per ~2 s regulator cadence) required before
+/// [`evidence_admit_grow`] reopens the window a notch: ~6 s of proven OOM-free
+/// throughput per step, so a wedged window walks back up in minutes while a
+/// transient spike still shrinks it instantly.
+const INGEST_EVIDENCE_GROW_TICKS: usize = 3;
+
+/// Minimum NEW prefill tokens per evidence tick. A tick certifies "the current
+/// width survives this pressure", which a handful of tiny interactive turns
+/// cannot — one chunk-sized batch per tick is the floor. Small forwards
+/// accumulate toward it rather than being discarded.
+const EVIDENCE_MIN_PREFILL_TOKENS: u64 = 256;
 
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
@@ -2176,6 +2229,41 @@ pub(crate) struct Scheduler {
     /// See `Scheduler::reclaim_footprint` / `vram_under_pressure_for`.
     last_footprint_relief: Option<std::time::Instant>,
 
+    /// Futile-defrag latch: `(reserved, used, futile_streak)` observed when a
+    /// defrag pass moved chunks but shed ~nothing — the reserved gap is
+    /// fragmented across arenas that pinned chunks (hot sections, working
+    /// sets, cached glue islands) keep from ever emptying, so compaction
+    /// cannot lower `reserved` no matter how often it runs. While the pool
+    /// stats sit within the latch's re-probe bar (one hysteresis band,
+    /// doubling per consecutive futile pass up to 8×), the defrag arm neither
+    /// re-fires nor reports footprint pressure. Cleared when a pass sheds or
+    /// the landscape moves past the bar.
+    defrag_futile_at: Option<(usize, usize, u32)>,
+
+    /// Consecutive progress observations (new prefill tokens forwarded
+    /// OOM-free) while growth was blocked ONLY by the VRAM-pressure bit — the
+    /// evidence streak that reopens a wedged window. Consumed by BOTH reopen
+    /// paths (the ingest regulator via [`evidence_admit_grow`], and the
+    /// non-ingest run-loop reopen); the phases are mutually exclusive, so one
+    /// streak serves both. Reset by any window shrink.
+    admit_grow_streak: usize,
+
+    /// [`PREFILL_OK_TOKENS`] as of the last evidence check.
+    admit_ok_tokens_seen: u64,
+
+    /// [`PREFILL_OK_TOKENS`] as of the last promote-side pressure episode —
+    /// the "forwards are still completing" evidence that distinguishes chronic
+    /// nominal pressure (hold the width) from a genuine stall (halve it). See
+    /// `promote_new_prefills`.
+    promote_ok_tokens_seen: u64,
+
+    /// When prefill throughput last advanced, as observed by the promote path.
+    /// A shrink fires only after [`PROMOTE_STALL_GRACE`] of complete silence —
+    /// promote runs many times per second while forwards take seconds, so a
+    /// per-pass "no progress" reading is meaningless. `None` until the first
+    /// completed forward (never shrink a pipeline that hasn't started).
+    promote_last_progress: Option<std::time::Instant>,
+
     /// Timelines being ingested append-only (`disable_reprojection` submits, e.g.
     /// `code_reading` / `repo_map`). Their sealed turns are never re-attended
     /// until query time, so the gentle-early ladder rung
@@ -2365,6 +2453,11 @@ impl Scheduler {
             next_turn_seal_id: 0,
             admit_window: Self::MAX_PREFILL_WIDTH,
             host_ram_probe: None,
+            defrag_futile_at: None,
+            admit_grow_streak: 0,
+            admit_ok_tokens_seen: 0,
+            promote_ok_tokens_seen: 0,
+            promote_last_progress: None,
             last_footprint_relief: None,
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
@@ -4766,6 +4859,8 @@ impl Scheduler {
     /// current width is unsustainable, so back off hard and let the additive
     /// reopen ([`Self::grow_admit_window`]) probe back up once pressure clears.
     fn shrink_admit_window(&mut self) {
+        // Any shrink invalidates the sustainable-width evidence.
+        self.admit_grow_streak = 0;
         let before = self.admit_window;
         self.admit_window = narrow_window(self.admit_window, Self::MIN_PREFILL_WIDTH);
         if self.admit_window != before {
@@ -5025,10 +5120,8 @@ impl Scheduler {
         // eviction can protect it (see `evict_cold_tail`). Same as the single-slot
         // `apply_projection`; the wave path threads build/finish separately, so we
         // stamp it here where the segments are in hand.
-        self.slot_projection_state
-            .entry(parent_id)
-            .or_default()
-            .working_set = projection_assembler::working_set_from_segments(segments);
+        let state = self.slot_projection_state.entry(parent_id).or_default();
+        state.working_set = projection_assembler::working_set_from_segments(segments);
         profile::reset();
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
@@ -5043,7 +5136,7 @@ impl Scheduler {
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
         };
-        projection_assembler::apply_segments_build(&mut ctx, segments)
+        projection_assembler::apply_segments_build(state, &mut ctx, segments)
     }
 
     /// Finish phase of [`Self::apply_projection`] for the wave: prefill the
@@ -5078,7 +5171,9 @@ impl Scheduler {
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
         };
-        let r = projection_assembler::apply_segments_finish(state, &mut ctx, plan);
+        // The wave path fires the batched gap-fill BEFORE this finish, so the
+        // fresh islands' K/V is in the gaps and capturable.
+        let r = projection_assembler::apply_segments_finish(state, &mut ctx, plan, true);
         profile::report("apply_projection");
         r
     }
@@ -7704,6 +7799,22 @@ mod tests {
         // A shrink is undone by exactly `n` grows for an n-halving descent — the
         // window is a plain saturating counter with no hidden state.
         assert_eq!(widen_window(narrow_window(2, floor), ceil), 2);
+    }
+
+    #[test]
+    fn evidence_grow_requires_streak_and_progress() {
+        use super::evidence_admit_grow as g;
+        let (ceil, need) = (24, 3);
+        // Streak builds one tick at a time, grows on the third, then re-arms.
+        assert_eq!(g(10, 100, 1, ceil, true, 0, need), (false, 1));
+        assert_eq!(g(10, 100, 1, ceil, true, 1, need), (false, 2));
+        assert_eq!(g(10, 100, 1, ceil, true, 2, need), (true, 0));
+        // No forward progress → evidence resets (a stalled pump proves nothing).
+        assert_eq!(g(10, 100, 1, ceil, false, 2, need), (false, 0));
+        // Backlog out of the grow band → not a pressure-only block; reset.
+        assert_eq!(g(60, 100, 1, ceil, true, 2, need), (false, 0));
+        // Window already at the ceiling → nothing to reopen.
+        assert_eq!(g(10, 100, ceil, ceil, true, 2, need), (false, 0));
     }
 
     #[test]

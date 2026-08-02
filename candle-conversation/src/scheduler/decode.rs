@@ -1,4 +1,5 @@
 use super::*;
+use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 
 /// Max number of LOW-priority (bulk-ingest) decodes allowed to co-batch into a
 /// wave that also carries a HIGH-priority (interactive dialogue) decode. Keeps
@@ -27,6 +28,60 @@ impl Scheduler {
             bailed = s.bailed,
             "stencil steering finished",
         );
+    }
+
+    /// Log the expert-pipeline cost of one gap-fill wave as a before/after
+    /// counter delta: expert activations routed by the forward, VRAM hit rate,
+    /// DMA traffic, and Markov-prediction precision. This is the ground truth
+    /// for why a glue forward costs what it does — a low hit rate means the
+    /// wave paid PCIe latency to stream the missing experts in.
+    fn log_glue_expert_telemetry(
+        before: &PipelineStats,
+        after: &PipelineStats,
+        glue_ms: u64,
+        glue_tokens: usize,
+    ) {
+        let hits = after.expert_hits.saturating_sub(before.expert_hits);
+        let misses = after.expert_misses.saturating_sub(before.expert_misses);
+        let activations = hits + misses;
+        let predicted_hits = after.predicted_hits.saturating_sub(before.predicted_hits);
+        let predicted_total = after.predicted_total.saturating_sub(before.predicted_total);
+        let pct = |num: usize, den: usize| {
+            if den == 0 {
+                100.0
+            } else {
+                100.0 * num as f64 / den as f64
+            }
+        };
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            glue_ms,
+            glue_tokens,
+            activations,
+            hits,
+            misses,
+            hit_rate_pct = format!("{:.1}", pct(hits, activations)).as_str(),
+            dma_loads = after.dma_loads.saturating_sub(before.dma_loads),
+            prefetch_loads = after.prefetch_loads.saturating_sub(before.prefetch_loads),
+            hint_loads = after.hint_loads.saturating_sub(before.hint_loads),
+            pred_precision_pct =
+                format!("{:.1}", pct(predicted_hits, predicted_total)).as_str(),
+            fence_stalls = after.fence_stalls.saturating_sub(before.fence_stalls),
+            resident_mb = after.resident_vram_bytes >> 20,
+            "gap-fill wave: expert telemetry",
+        );
+    }
+
+    /// Render a profile snapshot as one compact `name=totalms/count` list,
+    /// sorted by total time descending, for a single trace line.
+    fn format_profile_spans(snap: &ProfileSnapshot) -> String {
+        let mut entries = snap.entries.clone();
+        entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+        entries
+            .iter()
+            .map(|(name, total_ms, count)| format!("{name}={total_ms:.1}ms/{count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     // ── Stencil static-run prefill (Layer 3) ───────────────────────────
@@ -1163,6 +1218,24 @@ impl Scheduler {
             glue_total,
             "gap-fill wave: batched multi-slot forward",
         );
+        // Snapshot the expert-pipeline counters so the wave's cost can be
+        // reported as a delta: how many expert activations this forward routed,
+        // how many were VRAM-resident (hits) vs DMA'd in (misses), and how well
+        // the Markov predictor pre-staged them. `None` on dense models.
+        let expert_before = self.model.expert_stats();
+        // With `--features profile`, drain the kernel-span accumulators built up
+        // by decode waves since the last drain, so the post-forward snapshot
+        // attributes spans to this glue forward alone.
+        if cfg!(feature = "profile") {
+            let decode_spans = self.model.snapshot_profiles();
+            if !decode_spans.entries.is_empty() {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::reproject",
+                    spans = %Self::format_profile_spans(&decode_spans),
+                    "decode kernel spans since last wave",
+                );
+            }
+        }
         let t_fire = std::time::Instant::now();
         if let Err(e) = super::projection_assembler::fire_gap_fill_batch(
             &mut self.session,
@@ -1189,6 +1262,23 @@ impl Scheduler {
             t_fire.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        if let (Some(before), Some(after)) = (expert_before, self.model.expert_stats()) {
+            Self::log_glue_expert_telemetry(&before, &after, glue_ms, glue_total);
+        }
+        // Kernel-span breakdown of the glue forward — populated only when built
+        // with `--features profile` (snapshot also clears the accumulators, so
+        // each wave reports its own spans).
+        if cfg!(feature = "profile") {
+            let glue_spans = self.model.snapshot_profiles();
+            if !glue_spans.entries.is_empty() {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::reproject",
+                    glue_ms,
+                    spans = %Self::format_profile_spans(&glue_spans),
+                    "gap-fill wave: kernel spans",
+                );
+            }
+        }
 
         // Phase 3 — complete each view: finish (deferred user + restore tail) +
         // carve the new view + re-key. Independent per view.

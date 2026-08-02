@@ -362,11 +362,46 @@ impl Scheduler {
             // is excluded here: its window is driven from the drain backlog at the
             // wave cadence below (`regulate_ingest_admission`), and a per-loop
             // reopen would fight that throttle.
-            if self.admit_window < Self::MAX_PREFILL_WIDTH
-                && self.ingest_timelines.is_empty()
-                && !self.vram_under_pressure()
-            {
-                self.grow_admit_window();
+            //
+            // Under CHRONIC nominal pressure (a card whose steady-state
+            // availability sits just under the band — e.g. the expert-resident
+            // budget leaves KV a couple hundred MiB short of it), the
+            // pressure-clear path never fires and the window wedges at the
+            // floor, serializing e.g. section calibration into single-sequence
+            // mini-forwards. The evidence path reopens it anyway: every check
+            // that finds NEW prefill tokens forwarded OOM-free counts one
+            // streak tick (idle loop iterations neither count nor reset — the
+            // loop spins far faster than forwards complete), and a full streak
+            // grows the window one notch. Any shrink (real OOM, eviction
+            // survival) resets the streak — multiplicative decrease still wins.
+            if self.admit_window < Self::MAX_PREFILL_WIDTH && self.ingest_timelines.is_empty() {
+                if !self.vram_under_pressure() {
+                    self.admit_grow_streak = 0;
+                    self.grow_admit_window();
+                } else {
+                    // A tick requires a real VOLUME of new tokens, not just
+                    // any completion: three 25-token interactive turns are not
+                    // evidence that a wider window survives this pressure.
+                    // Small forwards accumulate toward the floor rather than
+                    // being discarded (`admit_ok_tokens_seen` advances only
+                    // when a tick fires).
+                    let ok = PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+                    if ok >= self.admit_ok_tokens_seen + EVIDENCE_MIN_PREFILL_TOKENS {
+                        self.admit_ok_tokens_seen = ok;
+                        self.admit_grow_streak += 1;
+                        if self.admit_grow_streak >= INGEST_EVIDENCE_GROW_TICKS {
+                            self.admit_grow_streak = 0;
+                            let before = self.admit_window;
+                            self.grow_admit_window();
+                            tracing::info!(
+                                target: "candle_conversation::scheduler::timing",
+                                admit_window = self.admit_window,
+                                was = before,
+                                "admission window reopened on throughput evidence under nominal pressure"
+                            );
+                        }
+                    }
+                }
             }
 
             // Flush the wave summary + phase breakdown if its 2 s window

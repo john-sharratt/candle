@@ -113,6 +113,14 @@ const FOOTPRINT_RELIEF_COOLDOWN: std::time::Duration = std::time::Duration::from
 /// it's a "don't sweat a tiny overage" band, small on any card.
 const FOOTPRINT_HYSTERESIS: usize = 256 * 1024 * 1024;
 
+/// How long prefill throughput must be COMPLETELY silent (no forward
+/// completing) under surviving VRAM pressure before the promote path halves
+/// the admission window. Longer than any healthy forward (the widest
+/// calibration forwards run ~7 s), so completions keep the width; a genuine
+/// wedge still backs off, one halving per grace period. Device-OOM shrinks at
+/// its own site instantly.
+const PROMOTE_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn env_pct(var: &str, default: usize, max: usize) -> usize {
     std::env::var(var)
         .ok()
@@ -452,10 +460,33 @@ impl Scheduler {
             // VRAM budget gate (which compacts/fails fast rather than spilling).
             if !self.active_prefills.is_empty() && self.vram_under_pressure() {
                 if self.relieve_vram_pressure("promote", VramPhase::Load) {
-                    // Pressure survived eviction — back off the admission window
-                    // (so subsequent waves run narrower forwards) and stop piling
-                    // on. The `!is_empty` guard already kept ≥1 in flight.
-                    self.shrink_admit_window();
+                    // Pressure survived eviction — stop piling on this pass
+                    // (the `!is_empty` guard keeps ≥1 in flight). The window
+                    // halves only on a genuine THROUGHPUT STALL, never on the
+                    // mere presence of nominal pressure: multiplicative
+                    // decrease is failure evidence, and a card whose steady
+                    // state sits just under the pressure band would otherwise
+                    // pin every bulk-prefill phase at the floor width.
+                    //
+                    // Stall detection is time-aware because this branch runs
+                    // many times a second while `PREFILL_OK_TOKENS` advances
+                    // only when a forward completes (seconds apart for wide
+                    // forwards): a stall is real only when NO forward has
+                    // completed for a full [`PROMOTE_STALL_GRACE`]. Each
+                    // elapsed grace period backs off one halving and re-arms;
+                    // a device-OOM still shrinks instantly at its own site.
+                    let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+                    if ok > self.promote_ok_tokens_seen {
+                        self.promote_ok_tokens_seen = ok;
+                        self.promote_last_progress = Some(std::time::Instant::now());
+                    }
+                    let stalled = self
+                        .promote_last_progress
+                        .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
+                    if stalled {
+                        self.shrink_admit_window();
+                        self.promote_last_progress = Some(std::time::Instant::now());
+                    }
                     break;
                 }
             }
@@ -521,6 +552,22 @@ impl Scheduler {
     /// that know their phase (the decode loop passes `Decode` for a thinner band).
     pub(super) fn vram_under_pressure(&self) -> bool {
         self.vram_under_pressure_for(VramPhase::Load)
+    }
+
+    /// Whether the futile-defrag latch holds for the CURRENT pool stats: a
+    /// prior defrag pass moved chunks but shed ~nothing, and neither `used`
+    /// nor `reserved` has moved by more than the hysteresis band since — the
+    /// allocation landscape compaction already failed against. See
+    /// [`Scheduler::defrag_futile_at`].
+    fn defrag_futile(&self, used: usize, reserved: usize) -> bool {
+        self.defrag_futile_at.is_some_and(|(r0, u0, streak)| {
+            // The re-probe bar doubles with each consecutive futile pass (one
+            // hysteresis band up to 8x), so ordinary KV drift does not re-run
+            // a ~100 ms proven-futile compaction every 256 MiB forever; a
+            // successful shed resets the latch entirely.
+            let bar = FOOTPRINT_HYSTERESIS << streak.min(3);
+            reserved.abs_diff(r0) < bar && used.abs_diff(u0) < bar
+        })
     }
 
     /// The pressure/relief reserve band for `phase`. `Load` keeps the wide
@@ -597,7 +644,13 @@ impl Scheduler {
                     vram_evict_high_pct(),
                     VRAM_EVICT_HIGH_FLOOR_MB,
                 ));
-                (reserved > compact_ceiling && self.session.can_reclaim_arena())
+                // The defrag arm is silenced while the futile latch holds: a
+                // gap compaction has PROVEN it cannot lower must not read as
+                // pressure every wave (that pinned the admission window at the
+                // floor and throttled prefill to single-sequence forwards).
+                (reserved > compact_ceiling
+                    && self.session.can_reclaim_arena()
+                    && !self.defrag_futile(used, reserved))
                     || used > evict_high
             }
             _ => false,
@@ -673,7 +726,8 @@ impl Scheduler {
         // without touching the cooldown so a genuine future trigger isn't
         // suppressed. (Empty-arena release still runs per-wave in the run loop.)
         let defrag_actionable = reserved > compact_ceiling.saturating_add(FOOTPRINT_HYSTERESIS)
-            && self.session.can_reclaim_arena();
+            && self.session.can_reclaim_arena()
+            && !self.defrag_futile(used, reserved);
         let evict_actionable = used > evict_high;
         if !defrag_actionable && !evict_actionable {
             return 0;
@@ -769,6 +823,25 @@ impl Scheduler {
             .map(|(_, r)| r)
             .unwrap_or(before);
         let shed = before.saturating_sub(after) as u64;
+        // Futility latch: a defrag that moved chunks yet shed ~nothing proves
+        // the gap is unreclaimable in this allocation landscape (pinned chunks
+        // hold every arena open) — stop re-running it, and stop reporting it as
+        // pressure, until the landscape moves. Any real shed (or eviction)
+        // re-arms the controller.
+        if shed >= FOOTPRINT_HYSTERESIS as u64 || evicted.count > 0 {
+            self.defrag_futile_at = None;
+        } else if compact_moves > 0 {
+            let used_after = self
+                .session
+                .vram_pool_stats()
+                .map(|(u, _)| u)
+                .unwrap_or(used);
+            let streak = self
+                .defrag_futile_at
+                .map(|(_, _, n)| n.saturating_add(1))
+                .unwrap_or(0u32);
+            self.defrag_futile_at = Some((after, used_after, streak));
+        }
         // Always log once we're in the pressure path (past the early-return),
         // including the case where we couldn't lower `reserved` (compact_ms=0,
         // shed=0) — that "attempted but stuck" state is exactly what the rapid-fire
@@ -1024,6 +1097,16 @@ impl Scheduler {
         };
         let target = capacity / 100 * ingest_warm_backlog_pct();
         let backlog = self.persist_trigger.pending_warm_bytes() as usize;
+        // Volume-floored progress: a tick certifies the current width, which a
+        // trickle of tiny forwards cannot (see `EVIDENCE_MIN_PREFILL_TOKENS`).
+        // Sub-floor volume accumulates — `admit_ok_tokens_seen` advances only
+        // when the floor is cleared.
+        let ok_tokens = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+        let progressed =
+            ok_tokens >= self.admit_ok_tokens_seen + super::EVIDENCE_MIN_PREFILL_TOKENS;
+        if progressed {
+            self.admit_ok_tokens_seen = ok_tokens;
+        }
         match super::backlog_admit_action(
             backlog,
             target,
@@ -1034,9 +1117,36 @@ impl Scheduler {
             // Drain falling behind the seal rate — throttle admission.
             super::BacklogAction::Shrink => self.shrink_admit_window(),
             // Drain caught up and VRAM is clear — reopen a notch.
-            super::BacklogAction::Grow => self.grow_admit_window(),
-            // Deadband — hold the window steady (no flapping).
-            super::BacklogAction::Hold => {}
+            super::BacklogAction::Grow => {
+                self.admit_grow_streak = 0;
+                self.grow_admit_window();
+            }
+            // Deadband — or growth blocked only by the pressure bit. The
+            // evidence path reopens a wedged window on proven OOM-free
+            // throughput (see `evidence_admit_grow`); a real spike still
+            // shrinks instantly and resets the streak.
+            super::BacklogAction::Hold => {
+                let (grow, streak) = super::evidence_admit_grow(
+                    backlog,
+                    target,
+                    self.admit_window,
+                    Self::MAX_PREFILL_WIDTH,
+                    progressed,
+                    self.admit_grow_streak,
+                    super::INGEST_EVIDENCE_GROW_TICKS,
+                );
+                self.admit_grow_streak = streak;
+                if grow {
+                    let before = self.admit_window;
+                    self.grow_admit_window();
+                    tracing::info!(
+                        target: "candle_conversation::scheduler::timing",
+                        admit_window = self.admit_window,
+                        was = before,
+                        "admission window reopened on throughput evidence under nominal pressure"
+                    );
+                }
+            }
         }
     }
 
@@ -2006,6 +2116,10 @@ impl Scheduler {
                     sec_kv,
                     t_wave.elapsed().as_millis() as u64,
                 );
+                super::PREFILL_OK_TOKENS.fetch_add(
+                    sec_adv.iter().sum::<usize>() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.complete_section_chunk(&sec_gidx, &sec_adv);
             }
             return Ok(dec_logits);
@@ -2127,6 +2241,17 @@ impl Scheduler {
             }
             if sc_seqs > 0 {
                 self.wave_stats.record_section(sc_seqs, sc_tok, sc_kv, ms);
+            }
+            // Every completed wave forward is OOM-free prefill throughput —
+            // the progress signal the stall-grace gate and evidence reopen
+            // read. Without this, pump-driven phases (scope ingest, section
+            // creep) look stalled to the admission regulator even at full
+            // throughput, because only the drain-path prefills tick it.
+            if pf_tok + sc_tok > 0 {
+                super::PREFILL_OK_TOKENS.fetch_add(
+                    (pf_tok + sc_tok) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
 

@@ -23,7 +23,9 @@
 //! cross-projection memoisation, so the assembled K/V always reflects the
 //! exact segment sequence the resolver selected this call.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use candle::{Device, Tensor};
@@ -59,12 +61,49 @@ pub(super) struct SlotState {
     /// an in-flight prefill/decode is attending. Lives on `SlotState` so it
     /// inherits the slot's lifecycle (removal + fork re-keying) for free.
     pub(super) working_set: SlotWorkingSet,
+    /// Captured glue-island K/V from the previous gap-fill wave, keyed by the
+    /// island's content-context hash (every preceding piece's identity + length,
+    /// the island's own tokens, and its forward-bridge target — see
+    /// `apply_segments_build`). An island whose key matches is Arc-injected like
+    /// a sealed section instead of being recomputed by the wave: glue K is
+    /// stored un-rotated and re-RoPE'd at read from its chunk `rope_base`, so a
+    /// cached island stays exact under any uniform position shift, and the key
+    /// guarantees its (backward-unbounded) attended context is content-identical.
+    /// Retention is generation-based, not prune-to-current: belief-driven turn
+    /// selection can alternate between two prefix shapes across consecutive
+    /// reprojections, and pruning to the current plan's islands would make the
+    /// alternating shapes evict each other forever. Entries carry the last
+    /// projection generation that used them (hit or capture) and survive
+    /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] projections. Same lifecycle/capture
+    /// pattern as `pending_user_part`.
+    pub(super) glue_islands: HashMap<u64, (u64, Arc<Vec<SealedSequence>>)>,
+    /// Monotone projection counter for the island cache's generation stamps.
+    pub(super) glue_generation: u64,
 }
+
+/// How many projections an unused cached glue island survives before it is
+/// dropped. Covers selection shapes that alternate every few reprojections
+/// while keeping the pinned-chunk footprint bounded (~shapes x islands).
+const GLUE_ISLAND_RETAIN_GENERATIONS: u64 = 4;
 
 impl SlotState {
     /// Drop the in-flight `NewUserMessage` capture after a successful seal.
     pub(super) fn trim_post_turn(&mut self) {
         self.pending_user_part = None;
+    }
+
+    /// Advance the island-cache generation for a capture pass and prune every
+    /// entry not seen (hit-refreshed or captured) within the last
+    /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] passes. Returns the generation the
+    /// pass stamps on its inserts. Separated from the capture loop so the
+    /// retention contract is unit-testable without a session.
+    pub(super) fn begin_island_capture(&mut self) -> u64 {
+        self.glue_generation += 1;
+        let horizon = self
+            .glue_generation
+            .saturating_sub(GLUE_ISLAND_RETAIN_GENERATIONS);
+        self.glue_islands.retain(|_, (g, _)| *g >= horizon);
+        self.glue_generation
     }
 }
 
@@ -415,8 +454,31 @@ pub(super) struct GapFillPlan {
     pub deferred_user: Option<Arc<Vec<u32>>>,
     /// The writer tail snapshotted before truncation, re-attached on finish.
     pub tail_per_layer: Vec<WriterTail>,
-    /// Glue token count (diagnostic).
+    /// Glue token count actually COMPUTED by the wave (cache-reused islands are
+    /// excluded — they were Arc-injected during the walk).
     pub n_glue_tokens: usize,
+    /// Every glue island of this projection, in walk order: its content-context
+    /// key, its gap-chunk block range, and whether it was reused from the
+    /// island cache. Freshly-computed islands are captured into
+    /// [`SlotState::glue_islands`] after the wave fires (`apply_segments_finish`
+    /// with `capture_islands`).
+    pub islands: Vec<PlannedIsland>,
+}
+
+/// One glue island's plan entry — see [`GapFillPlan::islands`].
+#[derive(Debug, Clone)]
+pub(super) struct PlannedIsland {
+    /// Content-context hash: prefix pieces + island tokens + bridge target.
+    pub key: u64,
+    /// Block range of the island's chunk(s) in the rebuilt slot.
+    pub start_block: usize,
+    pub end_block: usize,
+    /// True when the K/V came from the island cache (no capture needed).
+    pub reused: bool,
+    /// False when the island's forward bridge window is not fully pinned by
+    /// its key (see the cacheability gate in `apply_segments_build`) — such an
+    /// island is never captured and recomputes every wave.
+    pub cacheable: bool,
 }
 
 /// Apply `new_segments` onto the slot (single-slot path).
@@ -430,27 +492,30 @@ pub(super) fn apply_segments(
     new_segments: &[ProjectionSegment],
     defer: Option<&mut Vec<GapFillPlan>>,
 ) -> Result<(), ConversationError> {
-    let plan = apply_segments_build(&mut ctx, new_segments)?;
+    let plan = apply_segments_build(state, &mut ctx, new_segments)?;
     // When the caller is batching drain gap-fills AND this projection has no
     // deferred user message (ingest / compression — the content prefills through a
     // separate unit), queue the fire and finish now (restore-tail only). The glue
     // K/V isn't read until the caller fires the whole drain's batch as ONE forward
     // at drain end — collapsing N launch-floor gap-fills into one. A projection
     // WITH a deferred user must fire inline (the user prefill attends the glue).
+    // No island capture on this path: the gaps are still zeros at finish time.
     if let Some(sink) = defer {
         if plan.deferred_user.is_none() {
             sink.push(fire_only(&plan));
-            return apply_segments_finish(state, &mut ctx, plan);
+            return apply_segments_finish(state, &mut ctx, plan, false);
         }
     }
     let t_glue = std::time::Instant::now();
     fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan])?;
     super::drain_add_us(&super::DRAIN_GLUE_US, t_glue.elapsed().as_micros() as u64);
-    apply_segments_finish(state, &mut ctx, plan)
+    apply_segments_finish(state, &mut ctx, plan, true)
 }
 
 /// A fire-only clone of a [`GapFillPlan`] (glue scatter inputs; no deferred user /
-/// tail), for deferring the gap-fill forward into a batched drain-end fire.
+/// tail / island records), for deferring the gap-fill forward into a batched
+/// drain-end fire. Islands are dropped: the deferred path finishes BEFORE the
+/// fire, so there is nothing valid to capture.
 fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
     GapFillPlan {
         parent_id: plan.parent_id,
@@ -461,7 +526,69 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
         deferred_user: None,
         tail_per_layer: Vec::new(),
         n_glue_tokens: plan.n_glue_tokens,
+        islands: Vec::new(),
     }
+}
+
+/// Write a piece's content identity into `h` — the same fields the prefix hash
+/// records for that piece kind, minus the placed-length (unknown before
+/// injection). Used for a bridging island's forward target: the island's K/V
+/// attends the first `TURN_BRIDGE_FWD_AHEAD` tokens of this piece, so its
+/// identity is part of the island's key.
+fn hash_piece_identity(
+    h: &mut DefaultHasher,
+    piece: Option<&AssembledPiece>,
+    ctx: &ApplyContext<'_>,
+) {
+    match piece {
+        Some(AssembledPiece::Turn {
+            timeline, index, ..
+        }) => {
+            h.write_u8(3);
+            h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+            h.write_u64(index.0 as u64);
+        }
+        Some(AssembledPiece::TurnHalf {
+            timeline, index, ..
+        }) => {
+            h.write_u8(4);
+            h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+            h.write_u64(index.0 as u64);
+        }
+        Some(AssembledPiece::Section(id)) => {
+            h.write_u8(2);
+            h.write_u32(id.raw());
+            let toks = ctx.conversation.read().section_tokens_of(*id);
+            h.write_u64(Arc::as_ptr(&toks) as u64);
+            h.write_u64(toks.len() as u64);
+        }
+        Some(AssembledPiece::Glue(tokens)) => {
+            h.write_u8(1);
+            for &t in tokens.iter() {
+                h.write_u32(t);
+            }
+        }
+        Some(AssembledPiece::DeferredUser(tokens)) => {
+            h.write_u8(5);
+            for &t in tokens.iter() {
+                h.write_u32(t);
+            }
+        }
+        None => h.write_u8(0),
+    }
+}
+
+/// The slot's current block count — the walk brackets each island's chunk range
+/// with this so the capture can slice exactly the island's blocks.
+fn block_count_of(
+    ctx: &ApplyContext<'_>,
+    parent_id: SequenceId,
+) -> Result<usize, ConversationError> {
+    ctx.session
+        .sequence_block_count(parent_id.0)
+        .ok_or_else(|| {
+            ConversationError::Channel(format!("apply_segments: slot {} not in session", parent_id))
+        })
 }
 
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
@@ -470,6 +597,7 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
 /// NOT fire the forward; the caller fires (batched across slots) and then calls
 /// [`apply_segments_finish`].
 pub(super) fn apply_segments_build(
+    state: &mut SlotState,
     ctx: &mut ApplyContext<'_>,
     new_segments: &[ProjectionSegment],
 ) -> Result<GapFillPlan, ConversationError> {
@@ -512,16 +640,145 @@ pub(super) fn apply_segments_build(
         timeline.is_some_and(|tl| conversation.read().turn_no_think(tl, index))
     };
     let pieces = assemble_pieces(new_segments, ctx.boundary_markers, no_think_for);
+    // ── Island-cache keying: a rolling hash over the CONTENT identity of every
+    // piece the walk has placed so far. A glue island's K/V is a function of its
+    // own tokens, its (backward-unbounded) attended prefix, and — when its
+    // forward bridge is open — the first tokens of the piece it leads into.
+    // Glue K is stored un-rotated and re-RoPE'd at read from its chunk
+    // `rope_base`, so the hash deliberately excludes absolute positions: a
+    // uniform shift of an identical piece stream reuses exactly. Each piece
+    // contributes its kind, its identifiers, the token count it ACTUALLY placed
+    // (a skipped not-hot section hashes as a zero-length placement, distinct
+    // from an injected one), and — for sections, whose content can re-seal
+    // under the same id — the sealed unit's `Arc` identity (a reseal mints a
+    // new Arc, forcing a conservative recompute).
+    let mut prefix_h = DefaultHasher::new();
+    let mut islands: Vec<PlannedIsland> = Vec::new();
     for i in 0..pieces.len() {
+        let pos_before = walker.logical_pos;
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
                 let fwd = glue_bridge_window(pieces.get(i + 1));
-                reserve_glue_island(ctx, &mut walker, tokens, fwd)?;
+                // ── Bridge-window cacheability gate ──────────────────────────
+                // A cached island's K/V must be a pure function of its key. A
+                // backward-only island (`fwd == 0`) is prefix-keyed and always
+                // eligible. A BRIDGING island also attended `fwd` tokens
+                // forward, so it is cacheable only when that whole window is
+                // pinned by the key: the next piece is an identified turn that
+                // is sealed-available NOW (the same check its inject will make
+                // — a skipped target would silently swap the attended content)
+                // AND long enough to cover the window (a shorter turn lets the
+                // bridge spill into piece i+2, which the key does not name).
+                // Anything else — no next piece, no timeline, short or missing
+                // target — recomputes every wave.
+                let bridge_cacheable = match (fwd, pieces.get(i + 1)) {
+                    (0, _) => true,
+                    (
+                        _,
+                        Some(
+                            AssembledPiece::Turn {
+                                timeline: Some(tl),
+                                index,
+                                ..
+                            }
+                            | AssembledPiece::TurnHalf {
+                                timeline: Some(tl),
+                                index,
+                                ..
+                            },
+                        ),
+                    ) => {
+                        let conv = ctx.conversation.read();
+                        conv.turn_sealed_of(*tl, *index).is_some()
+                            && conv.turn_token_count_of(*tl, *index) >= fwd as usize
+                    }
+                    _ => false,
+                };
+                // Island key = prefix identity + island tokens + bridge window +
+                // (when bridging) the identity of the piece it leads into.
+                let mut h = prefix_h.clone();
+                h.write_u8(1);
+                for &t in tokens.iter() {
+                    h.write_u32(t);
+                }
+                h.write_u32(fwd);
+                if fwd > 0 {
+                    hash_piece_identity(&mut h, pieces.get(i + 1), ctx);
+                }
+                let key = h.finish();
+                let start_block = block_count_of(ctx, parent_id)?;
+                let gen = state.glue_generation;
+                if let Some(cached) = bridge_cacheable
+                    .then(|| {
+                        state.glue_islands.get_mut(&key).map(|e| {
+                            e.0 = gen; // refresh: this shape is live again
+                            e.1.clone()
+                        })
+                    })
+                    .flatten()
+                {
+                    // Cache hit: Arc-inject the captured K/V — the wave never
+                    // sees this island. Mirrors the sealed-inject bookkeeping.
+                    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &cached)?;
+                    walker.logical_pos += tokens.len() as u32;
+                    walker.last_was_sealed = true;
+                    walker.reused_glue_tokens += tokens.len();
+                    log_injected_tokens(ctx, tokens);
+                    let end_block = block_count_of(ctx, parent_id)?;
+                    islands.push(PlannedIsland {
+                        key,
+                        start_block,
+                        end_block,
+                        reused: true,
+                        cacheable: true,
+                    });
+                } else {
+                    // First cache miss of the walk: name the island so a
+                    // whole-prefix divergence (a varying token in generated
+                    // glue, a re-sealed early section) is attributable — the
+                    // miss index says WHERE the prefix stopped matching.
+                    if islands.iter().all(|i| i.reused) {
+                        tracing::debug!(
+                            target: "candle_conversation::scheduler::reproject",
+                            island_idx = islands.len(),
+                            piece_idx = i,
+                            n_tokens = tokens.len(),
+                            head = ?&tokens[..tokens.len().min(8)],
+                            fwd,
+                            "glue island cache: first miss of this walk"
+                        );
+                    }
+                    reserve_glue_island(ctx, &mut walker, tokens, fwd)?;
+                    let end_block = block_count_of(ctx, parent_id)?;
+                    islands.push(PlannedIsland {
+                        key,
+                        start_block,
+                        end_block,
+                        reused: false,
+                        cacheable: bridge_cacheable,
+                    });
+                }
+                // The island is itself part of every LATER island's prefix.
+                prefix_h.write_u8(1);
+                for &t in tokens.iter() {
+                    prefix_h.write_u32(t);
+                }
+                prefix_h.write_u32(fwd);
             }
             AssembledPiece::Section(id) => {
                 let t = std::time::Instant::now();
                 inject_sealed_section(ctx, &mut walker, *id)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
+                prefix_h.write_u8(2);
+                prefix_h.write_u32(id.raw());
+                // Content stamp: the section's stored token Arc — STABLE across
+                // calls (an accessor-minted Arc like `section_sealed_of`'s would
+                // differ every reproject and defeat the cache); a re-seal
+                // replaces the stored Arc, moving the hash.
+                let toks = ctx.conversation.read().section_tokens_of(*id);
+                prefix_h.write_u64(Arc::as_ptr(&toks) as u64);
+                prefix_h.write_u64(toks.len() as u64);
+                prefix_h.write_u32(walker.logical_pos - pos_before);
             }
             AssembledPiece::Turn {
                 group,
@@ -532,6 +789,11 @@ pub(super) fn apply_segments_build(
                 let t = std::time::Instant::now();
                 inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
+                prefix_h.write_u8(3);
+                prefix_h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+                prefix_h.write_u32(index.0);
+                prefix_h.write_u8(*role as u8);
+                prefix_h.write_u32(walker.logical_pos - pos_before);
             }
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens.clone());
@@ -544,6 +806,10 @@ pub(super) fn apply_segments_build(
                 let t = std::time::Instant::now();
                 inject_sealed_turn_half(ctx, &mut walker, *timeline, *group, *index)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
+                prefix_h.write_u8(4);
+                prefix_h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+                prefix_h.write_u32(index.0);
+                prefix_h.write_u32(walker.logical_pos - pos_before);
             }
         }
     }
@@ -580,6 +846,7 @@ pub(super) fn apply_segments_build(
         skipped_turns = walker.skipped_turns,
         skipped_sections = walker.skipped_sections,
         glue_tokens = walker.n_glue_tokens,
+        reused_glue_tokens = walker.reused_glue_tokens,
         deferred_user = walker.deferred_user.is_some(),
         "apply_segments: assembled slot prefix"
     );
@@ -593,6 +860,7 @@ pub(super) fn apply_segments_build(
         deferred_user: walker.deferred_user.take(),
         tail_per_layer,
         n_glue_tokens: walker.n_glue_tokens,
+        islands,
     })
 }
 
@@ -620,6 +888,8 @@ struct SegmentWalker {
     deferred_user: Option<Arc<Vec<u32>>>,
     /// Accounting: total glue tokens collected (the reproject cost scales here).
     n_glue_tokens: usize,
+    /// Accounting: glue tokens Arc-injected from the island cache (not computed).
+    reused_glue_tokens: usize,
     /// Accounting: sealed turn / section segments actually injected into the
     /// slot, the tokens they carried, and any that were resolved-but-dropped.
     /// A non-zero `skipped_*` means the model is decoding against a context
@@ -643,6 +913,7 @@ impl SegmentWalker {
             last_was_sealed: false,
             deferred_user: None,
             n_glue_tokens: 0,
+            reused_glue_tokens: 0,
             sealed_turns: 0,
             sealed_sections: 0,
             sealed_tokens: 0,
@@ -1046,6 +1317,10 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
     }
     super::drain_add_us(&super::DRAIN_PREFILL_US, t_fwd.elapsed().as_micros() as u64);
     super::drain_add_us(&super::DRAIN_PREFILL_TOKENS, tokens.len() as u64);
+    // Monotone OOM-free-throughput evidence for the admission regulator —
+    // every path above returns on error, so reaching here means the whole
+    // token run forwarded successfully at the current admission width.
+    super::PREFILL_OK_TOKENS.fetch_add(tokens.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -1213,6 +1488,7 @@ pub(super) fn apply_segments_finish(
     state: &mut SlotState,
     ctx: &mut ApplyContext<'_>,
     plan: GapFillPlan,
+    capture_islands: bool,
 ) -> Result<(), ConversationError> {
     let GapFillPlan {
         parent_id,
@@ -1223,9 +1499,33 @@ pub(super) fn apply_segments_finish(
         deferred_user,
         tail_per_layer,
         n_glue_tokens,
+        islands,
     } = plan;
     // The glue tokens were already logged into the slot_tokens debug view at
     // their interleaved positions during the walk (`reserve_glue_island`).
+
+    // ── Island capture: the wave has scattered every fresh island's K/V into
+    // its gap chunks, so slice them out of a per-layer snapshot (Arc borrows,
+    // zero-copy — the `pending_user_part` capture pattern) and file them under
+    // their content-context keys for the next reproject to Arc-inject. Prune
+    // stale keys first so the cache tracks exactly the live projection's
+    // islands. Skipped when the caller deferred the fire (`capture_islands =
+    // false`) — the gaps are still zeros there.
+    if capture_islands && !islands.is_empty() {
+        let gen = state.begin_island_capture();
+        for isl in &islands {
+            if !isl.reused && isl.cacheable && isl.end_block > isl.start_block {
+                // Ranged snapshot: records only the island's own chunks on
+                // every layer (a whole-slot record per wave costs tens of ms
+                // at deep slots; the range costs microseconds).
+                let sealed = ctx
+                    .session
+                    .snapshot_sequence_blocks(parent_id.0, isl.start_block, isl.end_block)
+                    .map_err(ConversationError::Model)?;
+                state.glue_islands.insert(isl.key, (gen, Arc::new(sealed)));
+            }
+        }
+    }
 
     // The in-flight user message prefills last, after the now-filled gaps. The
     // slot always ends in a complete region (a reserved gap chunk, or a sealed
@@ -1290,6 +1590,51 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
+
+    /// The island cache's retention contract: an entry survives exactly
+    /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] capture passes untouched, and a
+    /// hit-refresh (the build path stamping the current generation) restarts
+    /// its clock — so projection shapes that alternate within the horizon
+    /// never evict each other, while dead shapes age out.
+    #[test]
+    fn island_cache_retention_and_refresh() {
+        let mut state = SlotState::default();
+        let sealed = || Arc::new(Vec::<SealedSequence>::new());
+
+        // Captured at generation 1.
+        let gen = state.begin_island_capture();
+        assert_eq!(gen, 1);
+        state.glue_islands.insert(0xA, (gen, sealed()));
+
+        // Untouched entries survive the horizon's worth of passes...
+        for _ in 0..GLUE_ISLAND_RETAIN_GENERATIONS {
+            state.begin_island_capture();
+        }
+        assert!(
+            state.glue_islands.contains_key(&0xA),
+            "entry must survive the full retention horizon"
+        );
+        // ...and age out one pass later.
+        state.begin_island_capture();
+        assert!(
+            !state.glue_islands.contains_key(&0xA),
+            "entry past the horizon must be pruned"
+        );
+
+        // A hit-refresh restarts the clock: stamp the CURRENT generation (what
+        // the build path's cache hit does), then run a full horizon again.
+        let gen = state.begin_island_capture();
+        state.glue_islands.insert(0xB, (gen, sealed()));
+        for _ in 0..GLUE_ISLAND_RETAIN_GENERATIONS {
+            let g = state.glue_generation;
+            state.glue_islands.get_mut(&0xB).unwrap().0 = g; // hit refresh
+            state.begin_island_capture();
+        }
+        assert!(
+            state.glue_islands.contains_key(&0xB),
+            "a hit-refreshed entry must never age out while its shape recurs"
+        );
+    }
 
     fn section_seg(id: u32) -> ProjectionSegment {
         ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
