@@ -769,6 +769,10 @@ pub struct LayerSchema {
     /// Continuous-fair-wave decode priority (`decode_priority:` in YAML).
     /// Default [`DecodePriority::Low`]. The dialogue layer is `High`.
     pub decode_priority: DecodePriority,
+    /// What to do when one of this layer's turns is unrecoverable on reload
+    /// (`on_corrupt_turn:` in YAML). Default
+    /// [`CorruptTurnPolicy::DropConversation`]; the dialogue layer sets `drop_turn`.
+    pub on_corrupt_turn: CorruptTurnPolicy,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background
@@ -801,6 +805,22 @@ impl DecodePriority {
             DecodePriority::High => 64,
         }
     }
+}
+
+/// What to do with one of a layer's turns whose persisted state is unrecoverable
+/// on substrate reload (e.g. a partial write that leaves a chunk-count mismatch).
+/// Set per layer via `on_corrupt_turn:` in the projection YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CorruptTurnPolicy {
+    /// Tombstone the whole **timeline** (conversation). Correct for ingest layers
+    /// (code_read / repo_map), where one file is one timeline and the tombstone
+    /// hands the file back to the background refresh to re-ingest. The default.
+    #[default]
+    DropConversation,
+    /// Tombstone only the **corrupt turn**, leaving the rest of the conversation
+    /// live. Correct for multi-turn dialogue, where one bad turn should not drop
+    /// the whole chat.
+    DropTurn,
 }
 
 impl LayerSchema {

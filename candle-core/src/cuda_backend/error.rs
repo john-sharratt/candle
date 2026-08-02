@@ -81,9 +81,7 @@ fn note_sticky_cuda_fault(err: &CudaError) {
     if !is_sticky_driver_error(driver) {
         return;
     }
-    crate::gpu_poison::poison_gpu(|| {
-        format!("{driver:?}\n{}", super::last_cuda_kernel_launch())
-    });
+    crate::gpu_poison::poison_gpu(|| format!("{driver:?}\n{}", super::last_cuda_kernel_launch()));
 }
 
 /// Whether a `DriverError` names an unrecoverable, context-killing fault.

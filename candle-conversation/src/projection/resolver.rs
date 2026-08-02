@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
+use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::resume::TurnChunkGrid;
@@ -278,6 +278,17 @@ impl Conversation {
         self.inner.write().unwrap().mark_layer_append_only(layer);
     }
 
+    /// Register a layer's [`CorruptTurnPolicy`] (from the projection schema),
+    /// consulted at reload to decide whether an unrecoverable turn drops its whole
+    /// conversation or just the turn. See
+    /// [`crate::substrate::Substrate::set_layer_corrupt_turn_policy`].
+    pub fn set_layer_corrupt_turn_policy(&self, layer: LayerId, policy: CorruptTurnPolicy) {
+        self.inner
+            .write()
+            .unwrap()
+            .set_layer_corrupt_turn_policy(layer, policy);
+    }
+
     /// Acquire an unscored read guard.  The returned guard implements
     /// [`ContentResolver`] but every score lookup returns zero —
     /// appropriate for callers reading structural fields (turn counts,
@@ -393,6 +404,16 @@ impl Conversation {
             let Some(StreamDecl::Turn(d)) = &e.decl else {
                 continue;
             };
+            // A tombstoned turn (or timeline) must not keep voting in
+            // retrieval: its walker-replayed sig blob still exists, but the
+            // turn itself is a dead placeholder whose KV can never
+            // materialise — selecting it would point projection at content
+            // that cannot be elevated.
+            if let Some(tl) = TimelineId::from_raw(d.timeline_id) {
+                if sub.is_tombstoned(tl) || sub.is_turn_tombstoned(tl, d.turn_index) {
+                    continue;
+                }
+            }
             let in_scope = if tags.is_empty() {
                 d.tags.is_empty()
             } else {
@@ -1391,6 +1412,37 @@ impl Conversation {
             if let Some(p) = progress {
                 p(i, total);
             }
+            // A turn already dropped by a prior `drop_turn` tombstone is dead —
+            // restore it as an EMPTY PLACEHOLDER (no recover attempt, no warn)
+            // instead of skipping. The placeholder matters: `restore_turn`
+            // assigns indices densely, so a plain skip would renumber every
+            // subsequent turn of this LIVE timeline away from the persisted
+            // stream ids they are keyed by (wide-Q sigs, seams, residences),
+            // and the next appended turn would collide with an existing turn's
+            // stream records. A zero-token placeholder occupies the original
+            // index — never selected (no content), never materialisable (no
+            // cold refs) — keeping every later turn aligned.
+            if let Some(tl) = TimelineId::from_raw(decl.timeline_id) {
+                if self.read().is_turn_tombstoned(tl, decl.turn_index) {
+                    let mut view = self.write();
+                    if let (Some(layer), Some(group)) = (
+                        LayerId::from_raw(decl.layer_id),
+                        GroupId::from_raw(decl.group_id),
+                    ) {
+                        view.register_timeline(tl, layer, group);
+                    }
+                    view.restore_turn(
+                        tl,
+                        TurnLayout::new(Vec::new()),
+                        TokenBuffer::default(),
+                        0,
+                        None,
+                        decl.block_start,
+                        decl.block_end,
+                    );
+                    continue;
+                }
+            }
             // Per-turn fault isolation.  A single turn whose
             // persisted state is inconsistent (e.g. a daemon was
             // killed between chunk writes and the final TurnDecl
@@ -1430,18 +1482,87 @@ impl Conversation {
                     );
                     skipped_corrupt += 1;
                     if let Some(timeline) = TimelineId::from_raw(decl.timeline_id) {
-                        self.write().tombstone_timeline(timeline);
-                        // Durable mark WITH a reason, so the tombstone records WHY
-                        // this timeline was dropped (a corrupt-partial turn), not
-                        // just that it was. The code_read background refresh then
-                        // re-ingests the file: this conversation is now absent from
-                        // the live `content_sha256` set, so `code_read_state_from_substrate`
-                        // omits it, `changed_files` flags it, and `process_one_file`
-                        // rebuilds it. Best-effort — a failure here just means the
-                        // next reload skips the same turn again, still correct.
+                        // The corrupt-turn policy is the owning layer's (from the
+                        // projection schema); default `DropConversation` when the
+                        // layer is unknown.
+                        let policy = LayerId::from_raw(decl.layer_id)
+                            .map(|l| self.read().corrupt_turn_policy_for(l))
+                            .unwrap_or_default();
+                        // Durable mark carries the reason so the tombstone records
+                        // WHY the turn/timeline was dropped, not just that it was.
                         let reason = format!("corrupt reload (turn {}): {e}", decl.turn_index);
-                        if let Ok(mut p) = self.persistence.lock() {
-                            let _ = p.write_tombstone(timeline.raw(), Some(&reason));
+                        match policy {
+                            CorruptTurnPolicy::DropConversation => {
+                                // Ingest layers (code_read / repo_map): one file is
+                                // one timeline, so tombstoning the timeline hands the
+                                // file back to the background refresh to re-ingest
+                                // (absent from `content_sha256` → flagged changed →
+                                // `process_one_file` rebuilds it).
+                                self.write().tombstone_timeline(timeline);
+                                if let Ok(mut p) = self.persistence.lock() {
+                                    match p.write_tombstone(timeline.raw(), Some(&reason)) {
+                                        Ok(_) => tracing::debug!(
+                                            timeline_id = decl.timeline_id,
+                                            turn_index = decl.turn_index,
+                                            reason = %reason,
+                                            "tombstoned corrupt turn's TIMELINE (drop_conversation) \
+                                             — code_read will re-ingest the file",
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            timeline_id = decl.timeline_id,
+                                            turn_index = decl.turn_index,
+                                            "failed to durably tombstone corrupt turn's timeline: {e}",
+                                        ),
+                                    }
+                                }
+                            }
+                            CorruptTurnPolicy::DropTurn => {
+                                // Dialogue: drop only the corrupt turn, keeping the
+                                // rest of the conversation live.
+                                self.write().tombstone_turn(timeline, decl.turn_index);
+                                if let Ok(mut p) = self.persistence.lock() {
+                                    match p.write_turn_tombstone(
+                                        timeline.raw(),
+                                        decl.turn_index,
+                                        Some(&reason),
+                                    ) {
+                                        Ok(_) => tracing::debug!(
+                                            timeline_id = decl.timeline_id,
+                                            turn_index = decl.turn_index,
+                                            reason = %reason,
+                                            "tombstoned corrupt TURN (drop_turn) — the rest of the \
+                                             conversation is kept live",
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            timeline_id = decl.timeline_id,
+                                            turn_index = decl.turn_index,
+                                            "failed to durably tombstone corrupt turn: {e}",
+                                        ),
+                                    }
+                                }
+                                // Occupy the dropped turn's index with an empty
+                                // placeholder so the timeline's LATER turns keep
+                                // their persisted indices (`restore_turn` assigns
+                                // densely; a bare skip renumbers them away from
+                                // their stream ids and the next appended turn
+                                // collides with an existing turn's records).
+                                let mut view = self.write();
+                                if let (Some(layer), Some(group)) = (
+                                    LayerId::from_raw(decl.layer_id),
+                                    GroupId::from_raw(decl.group_id),
+                                ) {
+                                    view.register_timeline(timeline, layer, group);
+                                }
+                                view.restore_turn(
+                                    timeline,
+                                    TurnLayout::new(Vec::new()),
+                                    TokenBuffer::default(),
+                                    0,
+                                    None,
+                                    decl.block_start,
+                                    decl.block_end,
+                                );
+                            }
                         }
                     }
                     continue;

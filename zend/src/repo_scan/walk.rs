@@ -11,6 +11,7 @@ use std::path::Path;
 
 use ignore::WalkBuilder;
 
+use super::binary_sniff::is_binary_sample;
 use super::types::{FileEntry, Language, ModuleHint, RepoMap};
 
 /// Hard size ceiling for any single file the walker accepts.  Above
@@ -117,8 +118,27 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
             map.files_skipped_oversize += 1;
             continue;
         }
+        // Read the file ONCE — both the content guard and the metadata scan below
+        // work from these bytes, so there is no second open / overlapping re-read.
+        // A file that stat'd but won't read (a delete/permission race between the
+        // two) is skipped this pass and reconsidered on the next walk.
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Content guard: an allowlisted extension does NOT guarantee text. A
+        // compiled fatbin / object dump checked in as `*.txt` clears both the
+        // extension gate (`.txt` ⇒ PlainText) and the size gate (well under
+        // `MAX_FILE_BYTES`), then carves into hundreds of garbage scopes that
+        // blow the ingest co-batch's VRAM budget. `is_binary_sample` bails at the
+        // first few NULs, so a blob is rejected almost immediately and never
+        // touches the carve; real source is never mistaken for it.
+        if is_binary_sample(&bytes) {
+            map.files_skipped_binary += 1;
+            continue;
+        }
 
-        let (line_count, module_hint) = describe_file(path, language, size_bytes);
+        let (line_count, module_hint) = describe_file(path, &bytes, language);
         map.files.push(FileEntry {
             path: rel_normalised,
             line_count,
@@ -161,14 +181,9 @@ fn is_upload_dir(path: &Path, root: &Path) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("uploads"))
 }
 
-/// Count lines + extract any manifest hint.  Returns `(line_count, hint)`.
-fn describe_file(path: &Path, language: Language, size_bytes: u64) -> (u32, Option<ModuleHint>) {
-    // Single read — we already know the file is ≤ 256 KB so the
-    // allocation is bounded.
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return (0, None),
-    };
+/// Count lines + extract any manifest hint from a file's already-read `bytes`.
+/// Returns `(line_count, hint)`.
+fn describe_file(path: &Path, bytes: &[u8], language: Language) -> (u32, Option<ModuleHint>) {
     let line_count = if bytes.is_empty() {
         0
     } else {
@@ -182,8 +197,7 @@ fn describe_file(path: &Path, language: Language, size_bytes: u64) -> (u32, Opti
         }
     };
 
-    let module_hint = manifest_hint(path, &bytes, language);
-    let _ = size_bytes;
+    let module_hint = manifest_hint(path, bytes, language);
     (line_count, module_hint)
 }
 
@@ -399,6 +413,31 @@ mod tests {
         assert!(paths.contains(&"tiny.rs"));
         assert!(!paths.contains(&"huge.rs"));
         assert_eq!(map.files_skipped_oversize, 1);
+    }
+
+    #[test]
+    fn walk_skips_binary_content_despite_allowlisted_extension() {
+        let dir = fixture("binary_txt");
+        let root = dir.path().to_path_buf();
+        // A genuine text file with an allowlisted extension — kept.
+        write(&root, "notes.txt", b"plain prose, no NULs here\n");
+        // A compiled fatbin dump checked in as `*.txt`: allowlisted extension,
+        // well under the size cap, but a NUL in the first bytes ⇒ binary. This
+        // is the exact shape of `candle-flash-attn/precompiled/*.txt`.
+        write(
+            &root,
+            "precompiled/hdim64_sass.txt",
+            b"\x7fELF\x00\x00fatbin\x00code",
+        );
+
+        let map = walk_workspace(&root);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"notes.txt"), "real text kept: {paths:?}");
+        assert!(
+            !paths.contains(&"precompiled/hdim64_sass.txt"),
+            "binary-as-.txt must be skipped: {paths:?}"
+        );
+        assert_eq!(map.files_skipped_binary, 1);
     }
 
     #[test]

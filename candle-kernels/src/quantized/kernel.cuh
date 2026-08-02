@@ -2039,11 +2039,17 @@ static __device__ void quantized_matmul_grouped_entry(
     using block_c_t = block_compact_t<block_q_t>;
 
     const int tile = blockIdx.x;
+    const int b_cnt = tile_b_cnt[tile];
+    // A zero-count tile is padding: device-built tile tables (moe_bucketize.cu)
+    // are launched at the `n_tokens × k` upper bound so the host never reads a
+    // data-dependent tile count back. Exit before touching the pointer table.
+    if (b_cnt == 0) {
+        return;
+    }
     const int expert = tile_expert[tile];
     const block_c_t* weights =
         reinterpret_cast<const block_c_t*>(static_cast<uintptr_t>(weight_ptrs[expert]));
     const int b_start = tile_b_start[tile];
-    const int b_cnt = tile_b_cnt[tile];
     const int row_tile_idx = blockIdx.y;
 
     // Same decode / grid / store for every activation type; only the smem layout and

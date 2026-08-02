@@ -312,6 +312,15 @@ impl ConversationEngine {
         );
         let conversation = Conversation::from_parts(substrate, persistence);
 
+        // Register per-layer corrupt-turn policies (from the projection schema)
+        // BEFORE the reload thread is spawned, so the startup reconstruct applies
+        // the right policy per layer (drop the whole conversation for ingest
+        // layers, only the turn for dialogue). Empty ⇒ every layer defaults to
+        // `DropConversation`.
+        for (&layer, &policy) in &config.layer_corrupt_turn {
+            conversation.set_layer_corrupt_turn_policy(layer, policy);
+        }
+
         // Spawn the substrate persistence thread (§5s heartbeat + per-
         // seal trigger). Owns the redo-log write path; needs backings +
         // device for hot→warm migration and warm→cold gather. Spawn it

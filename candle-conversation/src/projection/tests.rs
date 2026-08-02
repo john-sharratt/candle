@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{Content, DecodePriority, GatherScope};
+use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
@@ -422,6 +422,38 @@ fn decode_priority_defaults_to_low_and_parses_normal_and_high() {
             b.layer(d).unwrap().decode_priority,
             want,
             "decode_priority: {word}"
+        );
+    }
+}
+
+#[test]
+fn on_corrupt_turn_defaults_to_drop_conversation_and_parses_drop_turn() {
+    // Unset → DropConversation: the ingest-layer default, where one file is
+    // one timeline and dropping it triggers a clean re-ingest.
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert_eq!(
+        b.layer(dialogue).unwrap().on_corrupt_turn,
+        CorruptTurnPolicy::DropConversation
+    );
+
+    // Both spellings parse to their variants. A silent fall-through to the
+    // default here would make the dialogue layer drop whole conversations on
+    // one corrupt turn — the exact failure the policy exists to prevent.
+    for (word, want) in [
+        ("drop_turn", CorruptTurnPolicy::DropTurn),
+        ("drop_conversation", CorruptTurnPolicy::DropConversation),
+    ] {
+        let yaml = SIMPLE_YAML.replace(
+            "  - name: dialogue\n    window: 8000",
+            &format!("  - name: dialogue\n    on_corrupt_turn: {word}\n    window: 8000"),
+        );
+        let b = Builder::from_yaml(&yaml).unwrap();
+        let d = b.id_for_layer("dialogue").unwrap();
+        assert_eq!(
+            b.layer(d).unwrap().on_corrupt_turn,
+            want,
+            "on_corrupt_turn: {word}"
         );
     }
 }

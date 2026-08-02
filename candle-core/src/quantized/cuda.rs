@@ -149,6 +149,30 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
     }
 }
 
+/// Total VRAM on CUDA device 0, queried without requiring a bound context.
+///
+/// `cuDeviceTotalMem` needs only driver init and a device handle — unlike
+/// [`get_vram_info`], which reads the *current context's* device — so this is
+/// safe to call from any thread before any `Device` exists (e.g. when picking
+/// which model quant to download at daemon startup).
+pub fn get_total_vram_device0() -> Result<usize> {
+    use cudarc::driver::sys;
+    unsafe {
+        sys::cuInit(0)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuInit failed: {:?}", e)))?;
+        let mut dev: sys::CUdevice = 0;
+        sys::cuDeviceGet(&mut dev, 0)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuDeviceGet failed: {:?}", e)))?;
+        let mut total: usize = 0;
+        sys::cuDeviceTotalMem_v2(&mut total, dev)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuDeviceTotalMem failed: {:?}", e)))?;
+        Ok(total)
+    }
+}
+
 /// Query total and free VRAM on the current CUDA device.
 ///
 /// Returns `(free_bytes, total_bytes)`.
@@ -4690,6 +4714,21 @@ pub fn dequantize_q8a128(
 /// with ytype = Q8A128. The grouped/MoE path has no mode-2 kernel, so it always
 /// runs mode-1 (Q8A128V) regardless of M. Internal building block for the `Int8`
 /// arm of [`grouped_qmatmul`].
+/// Token width of one grouped-GEMM expert tile — the int8 mode-2 (`Bm=32`,
+/// `N_SUB=2`) weight-reuse width the grouped kernel is instantiated with. Every
+/// tile-table builder MUST segment expert buckets at this width: the host
+/// builder below and the device-side `moe_bucketize` kernel both consume it,
+/// and a divergence silently mis-strides the kernel's batch slices.
+pub const GROUPED_GEMM_TILE_W: usize = 32;
+
+/// Kernel bounds of the MoE bucketize, re-exported so every gate that decides
+/// "can this routing take the device-table path?" reads the SAME constants the
+/// kernel and its wrapper validate against — a hand-copied bound here is the
+/// one place the mirrored-constant scheme couldn't reach.
+pub use candle_kernels::simple::moe_bucketize::{
+    MAX_EXPERTS as MOE_MAX_EXPERTS, MAX_TOPK as MOE_MAX_TOPK,
+};
+
 fn grouped_matmul_gemx_q8a128(
     act_ptr: u64,
     weight_ptrs: &[u64],
@@ -4726,7 +4765,7 @@ fn grouped_matmul_gemx_q8a128(
         let mut s = expert_offsets[e];
         let end = expert_offsets[e + 1];
         while s < end {
-            let cnt = (end - s).min(32);
+            let cnt = (end - s).min(GROUPED_GEMM_TILE_W as i32);
             tile_expert.push(e as i32);
             tile_b_start.push(s);
             tile_b_cnt.push(cnt);
@@ -4858,6 +4897,111 @@ pub fn grouped_qmatmul(
             )
         }
     }
+}
+
+/// Grouped (MoE) q8a128 quantized matmul with **device-resident dispatch tables**:
+/// the GPU-native twin of [`grouped_qmatmul`]'s int8 arm. Where the host path
+/// packs per-active-expert weight pointers + tile tables on the CPU (requiring
+/// the routing indices to round-trip GPU→CPU first), this variant reads
+/// everything from device memory:
+///  * `weight_ptrs_dev` — the resident expert pointer table (u64 rows, built
+///    once at load; every expert VRAM-resident); `expert_base` is the element
+///    offset of THIS layer's `[n_experts]` row block inside it, so
+///    `tile_expert` carries RAW expert ids straight from `moe_bucketize`;
+///  * `tile_expert` / `tile_b_start` / `tile_b_cnt` — `moe_bucketize`'s device
+///    tile tables, launched at the `launch_tiles` upper bound; padding tiles
+///    (`b_cnt == 0`) exit in the kernel without touching the pointer table.
+///
+/// Output is `[total_batch, nrows]` f32 with padding rows UNWRITTEN — the
+/// deterministic scatter's segment tables never reference them. Bit-identical
+/// to the host path for every valid row: same tables (proven by the bucketize
+/// tests), same ascending-expert tile order, same kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_qmatmul_dev_q8a128(
+    op: &Q8a128Operand,
+    weight_ptrs_dev: &CudaSlice<u64>,
+    expert_base: usize,
+    n_experts: usize,
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    tile_expert: &CudaSlice<i32>,
+    tile_b_start: &CudaSlice<i32>,
+    tile_b_cnt: &CudaSlice<i32>,
+    launch_tiles: usize,
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    ensure_qmatmul_pairing(&DynamicTensor::Int8(op), weight_dtype)?;
+    if nrows % 32 != 0 {
+        crate::bail!("grouped_qmatmul_dev_q8a128: nrows={nrows} must be a multiple of 32");
+    }
+    if op.cols % 128 != 0 {
+        crate::bail!(
+            "grouped_qmatmul_dev_q8a128: ncols={} must be a multiple of 128",
+            op.cols
+        );
+    }
+    if launch_tiles == 0 {
+        crate::bail!("grouped_qmatmul_dev_q8a128: launch_tiles must be > 0");
+    }
+    let qtype = dtype_to_qtype(weight_dtype)? as i32;
+    let total_batch = op.rows;
+    let ncols = op.cols;
+
+    // `tile_expert` values are bounded by the ROUTER's expert count (the
+    // bucketize input), so the whole `[n_experts]` row this layer indexes must
+    // lie inside the table — checking only the base would let a router/table
+    // width mismatch dereference past the end (or into the next layer's row).
+    if n_experts == 0
+        || expert_base
+            .checked_add(n_experts)
+            .is_none_or(|end| end > weight_ptrs_dev.len())
+    {
+        crate::bail!(
+            "grouped_qmatmul_dev_q8a128: expert row [{expert_base}, {expert_base}+{n_experts}) \
+             exceeds table len {}",
+            weight_ptrs_dev.len()
+        );
+    }
+    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+    {
+        let stream = device.cuda_stream();
+        let (wp_base, _g0) = weight_ptrs_dev.device_ptr(&stream);
+        // Offset to this layer's `[n_experts]` row inside the flat table.
+        let wp = wp_base + (expert_base * std::mem::size_of::<u64>()) as u64;
+        let (te, _g1) = tile_expert.device_ptr(&stream);
+        let (tbs, _g2) = tile_b_start.device_ptr(&stream);
+        let (tbc, _g3) = tile_b_cnt.device_ptr(&stream);
+        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
+        op.with_device_ptr(device, |act_ptr| {
+            unsafe {
+                run_grouped_quantized_matmul(
+                    wp as *const std::ffi::c_void,
+                    te as *const std::ffi::c_void,
+                    tbs as *const std::ffi::c_void,
+                    tbc as *const std::ffi::c_void,
+                    act_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    ncols as i32, // ncols_x = K
+                    nrows as i32, // nrows_x = N
+                    ncols as i32, // y_stride (unused by int8 kernel; ABI)
+                    nrows as i32, // dst_stride = N
+                    launch_tiles as i32,
+                    qtype,
+                    YType::Q8A128 as i32,
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
+    let out_shape: Shape = vec![total_batch, nrows].into();
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        out_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 /// Dense (non-MoE) quantized matmul over a [`DynamicTensor`] activation: a single weight
@@ -5388,6 +5532,169 @@ pub fn fused_deterministic_scatter(
         ),
     }
 
+    Ok(())
+}
+
+/// Reusable device workspace for [`moe_bucketize`]. All output/scratch buffers
+/// live in VRAM and are sized to a maximum `n_tokens × k`; one workspace is
+/// allocated per forward pipeline and reused across every MoE layer, so the
+/// per-layer bucketize costs a single kernel launch — no allocations, no
+/// host↔device traffic.
+pub struct MoeBucketizeWorkspace {
+    cap_assign: usize,
+    cap_starts: usize,
+    /// Expert-grouped token ids (gather rows); padding rows are `!0`.
+    pub tok_ids: CudaSlice<u32>,
+    /// Expert-grouped `widx` into the flattened routing weights; padding `!0`.
+    pub weight_ids: CudaSlice<u32>,
+    /// RAW owning expert id per grouped-GEMM tile; padding tiles are expert 0.
+    pub tile_expert: CudaSlice<i32>,
+    /// Stacked-batch start row per tile.
+    pub tile_b_start: CudaSlice<i32>,
+    /// Tokens per tile; 0 marks a padding tile the grouped kernel skips.
+    pub tile_b_cnt: CudaSlice<i32>,
+    /// Token-major valid assignment → its expert-grouped row (scatter `perm`).
+    pub perm: CudaSlice<u32>,
+    /// Token-major valid assignment → its `widx` (scatter `reordered_weight_ids`).
+    pub rw_ids: CudaSlice<u32>,
+    /// Per-token scatter segment boundaries, `[n_tokens + 1]`.
+    pub token_starts: CudaSlice<i32>,
+    /// Device header `{n_active, total_valid, num_tiles, 0}` — diagnostic only;
+    /// the pipeline launches at the `n_tokens × k` upper bound and never reads
+    /// this on the host.
+    pub header: CudaSlice<i32>,
+    inv: CudaSlice<u32>,
+    scan: CudaSlice<i32>,
+}
+
+impl MoeBucketizeWorkspace {
+    /// Allocate for up to `max_tokens × k` routing assignments.
+    pub fn new(device: &CudaDevice, max_tokens: usize, k: usize) -> Result<Self> {
+        let cap_assign = max_tokens.max(1) * k.max(1);
+        let cap_starts = max_tokens.max(1) + 1;
+        Ok(Self {
+            cap_assign,
+            cap_starts,
+            tok_ids: unsafe { device.alloc::<u32>(cap_assign)? },
+            weight_ids: unsafe { device.alloc::<u32>(cap_assign)? },
+            tile_expert: unsafe { device.alloc::<i32>(cap_assign)? },
+            tile_b_start: unsafe { device.alloc::<i32>(cap_assign)? },
+            tile_b_cnt: unsafe { device.alloc::<i32>(cap_assign)? },
+            perm: unsafe { device.alloc::<u32>(cap_assign)? },
+            rw_ids: unsafe { device.alloc::<u32>(cap_assign)? },
+            token_starts: unsafe { device.alloc::<i32>(cap_starts)? },
+            header: unsafe { device.alloc::<i32>(4)? },
+            inv: unsafe { device.alloc::<u32>(cap_assign)? },
+            scan: unsafe { device.alloc::<i32>(cap_assign)? },
+        })
+    }
+
+    /// Grow (never shrink) to cover `n_tokens × k`.
+    fn ensure(&mut self, device: &CudaDevice, n_tokens: usize, k: usize) -> Result<()> {
+        if n_tokens * k > self.cap_assign || n_tokens + 1 > self.cap_starts {
+            *self = Self::new(device, n_tokens, k)?;
+        }
+        Ok(())
+    }
+}
+
+/// GPU-native expert bucketize: turn `moe_route`'s `[n_tokens, k]` u32 index
+/// tensor into every device table the grouped expert pipeline consumes —
+/// expert-grouped gather lists, grouped-GEMM tile tables (padded to the
+/// `n_tokens × k` launch bound with `b_cnt = 0`), and the deterministic
+/// scatter's token-major segment tables — in ONE launch on the compute stream,
+/// with no GPU→CPU readback. The grouping is stable in (token, slot) order,
+/// bit-identical to the CPU counting-sort it replaces; an index
+/// `≥ n_experts` is the router's empty-slot sentinel and is skipped. See
+/// `candle-kernels/src/simple/moe_bucketize.cu` for the padding contract.
+pub fn moe_bucketize(
+    indices: &crate::Tensor,
+    n_experts: usize,
+    tile_w: usize,
+    ws: &mut MoeBucketizeWorkspace,
+) -> Result<()> {
+    use crate::cuda_backend::CudaStorageSlice;
+
+    use candle_kernels::simple::moe_bucketize::{MAX_EXPERTS, MAX_TOPK};
+
+    let (n_tokens, k) = indices.dims2()?;
+    // These bounds mirror the launcher's own guards (via the shared constants),
+    // so an invalid call errors HERE instead of the launcher silently skipping
+    // the launch and leaving the workspace holding the previous layer's tables.
+    if n_tokens == 0 || k == 0 {
+        crate::bail!("moe_bucketize: empty indices [{n_tokens}, {k}]");
+    }
+    if n_experts == 0 || n_experts > MAX_EXPERTS {
+        crate::bail!("moe_bucketize: n_experts={n_experts} must be in 1..={MAX_EXPERTS}");
+    }
+    if k > MAX_TOPK {
+        crate::bail!("moe_bucketize: k={k} exceeds {MAX_TOPK} (kernel per-token sort bound)");
+    }
+    if tile_w == 0 {
+        crate::bail!("moe_bucketize: tile_w must be > 0");
+    }
+    let device = match indices.device() {
+        crate::Device::Cuda(d) => d.clone(),
+        _ => crate::bail!("moe_bucketize: expected a CUDA tensor"),
+    };
+    if indices.dtype() != crate::DType::U32 {
+        crate::bail!(
+            "moe_bucketize: indices must be u32, got {:?}",
+            indices.dtype()
+        );
+    }
+    ws.ensure(&device, n_tokens, k)?;
+
+    let (storage, layout) = indices.storage_and_layout();
+    let (o1, o2) = layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "moe_bucketize",
+        }
+        .bt()
+    })?;
+    let cuda = match &*storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("moe_bucketize: expected CUDA storage"),
+    };
+    let ids = match &cuda.slice {
+        CudaStorageSlice::U32(s) => s.slice(o1..o2),
+        _ => crate::bail!("moe_bucketize: expected u32 storage"),
+    };
+
+    let stream = device.cuda_stream();
+    let (idp, _g0) = ids.device_ptr(&stream);
+    let (tok, _g1) = ws.tok_ids.device_ptr(&stream);
+    let (wid, _g2) = ws.weight_ids.device_ptr(&stream);
+    let (te, _g3) = ws.tile_expert.device_ptr(&stream);
+    let (tbs, _g4) = ws.tile_b_start.device_ptr(&stream);
+    let (tbc, _g5) = ws.tile_b_cnt.device_ptr(&stream);
+    let (pm, _g6) = ws.perm.device_ptr(&stream);
+    let (rw, _g7) = ws.rw_ids.device_ptr(&stream);
+    let (ts, _g8) = ws.token_starts.device_ptr(&stream);
+    let (hd, _g9) = ws.header.device_ptr(&stream);
+    let (iv, _g10) = ws.inv.device_ptr(&stream);
+    let (sc, _g11) = ws.scan.device_ptr(&stream);
+    unsafe {
+        candle_kernels::simple::moe_bucketize::run_moe_bucketize(
+            idp as *const std::ffi::c_void,
+            n_tokens as i32,
+            k as i32,
+            n_experts as i32,
+            tile_w as i32,
+            tok as *mut std::ffi::c_void,
+            wid as *mut std::ffi::c_void,
+            te as *mut std::ffi::c_void,
+            tbs as *mut std::ffi::c_void,
+            tbc as *mut std::ffi::c_void,
+            pm as *mut std::ffi::c_void,
+            rw as *mut std::ffi::c_void,
+            ts as *mut std::ffi::c_void,
+            hd as *mut std::ffi::c_void,
+            iv as *mut std::ffi::c_void,
+            sc as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
+        );
+    }
     Ok(())
 }
 

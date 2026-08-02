@@ -53,7 +53,10 @@ mod tests {
     fn first_poison_captures_root_and_reports_transition() {
         // Fresh statics per test binary; this is the only test touching them.
         assert!(!is_gpu_poisoned());
-        assert!(poison_gpu(|| "root-A".to_string()), "first poison is the transition");
+        assert!(
+            poison_gpu(|| "root-A".to_string()),
+            "first poison is the transition"
+        );
         assert!(is_gpu_poisoned());
         assert_eq!(root_fault().as_deref(), Some("root-A"));
         // A second poison is not the transition and does not overwrite the root.

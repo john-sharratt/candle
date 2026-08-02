@@ -15,6 +15,8 @@
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::BatchedModelCore;
+#[cfg(feature = "cuda")]
+use super::expert_lre::GpuDispatchTables;
 use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
@@ -22,15 +24,22 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
+use crate::models::routing_capture;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::{moe_route, DynamicActs};
+use candle::quantized::cuda::{
+    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
+    moe_bucketize, moe_route, silu_mul_q8a128, DynamicActs, Q8a128Operand, GROUPED_GEMM_TILE_W,
+    MOE_MAX_TOPK,
+};
 #[cfg(feature = "cuda")]
 use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::try_enter_relief, kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 /// Initial number of RoPE positions to precompute.
@@ -261,6 +270,59 @@ impl SparseMoeBlock {
         // value as a "no expert" sentinel into empty top-k slots, so downstream
         // must know it to filter them (see `forward_with_indices`).
         let num_experts = router_logits.dim(1)?;
+
+        // GPU-native expert dispatch (all-resident cache, int8 activations):
+        // route → bucketize → gather → grouped GEMMs → scatter run entirely
+        // on-device against the static resident pointer tables, so the routing
+        // indices never round-trip to the CPU — the per-layer readback stall
+        // this eliminates is the dominant decode cost on WDDM. Routing-trace
+        // capture needs the CPU-side expert sets, so it keeps the host path.
+        // `ZEND_MOE_HOST_DISPATCH=1` (any value but `0`/empty) forces the host
+        // path on an all-resident cache — the A/B lever for verifying the
+        // GPU-native path produces bit-identical output (the host path itself
+        // is production for the paged/threaded cache, so this is a diagnostic
+        // switch, not a shim).
+        #[cfg(feature = "cuda")]
+        fn host_dispatch_forced() -> bool {
+            static V: OnceLock<bool> = OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("ZEND_MOE_HOST_DISPATCH")
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false)
+            })
+        }
+        #[cfg(feature = "cuda")]
+        if let DynamicActs::Int8(op) = &acts {
+            // Every condition here degrades to the host path, never to an
+            // error. The cache-owned safety chain (table coverage, router
+            // width == table width, live pipeline thread) is
+            // `live_gpu_dispatch`; the model-level conditions are k inside
+            // the bucketize kernel's per-token sort bound, routing-trace
+            // capture (needs the CPU-side expert sets), and the diagnostic
+            // env override.
+            if let Some(gd) = self
+                .cache
+                .live_gpu_dispatch(self.moe_layer_idx, num_experts)
+                .filter(|_| {
+                    k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced()
+                })
+            {
+                return self.forward_gpu_native(
+                    op,
+                    &router_logits,
+                    num_tokens,
+                    b_size,
+                    seq_len,
+                    hidden_dim,
+                    k,
+                    num_experts,
+                    gd,
+                    out_dtype,
+                    t,
+                );
+            }
+        }
+
         let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
         let input = match acts {
             DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
@@ -278,6 +340,129 @@ impl SparseMoeBlock {
             num_experts,
             t,
         )
+    }
+
+    /// Fully GPU-native expert forward for the all-resident cache: the routing
+    /// indices stay on the device from `moe_route` through the scatter.
+    ///
+    ///   1. `moe_route` — fused softmax + top-k (weights + indices, both GPU);
+    ///   2. `moe_bucketize` — the expert counting-sort, on-device
+    ///      (bit-identical grouping, proven by its unit tests), into this
+    ///      layer's reusable workspace;
+    ///   3. `fused_moe_gather_q8a128` → gate/up/down `grouped_qmatmul_dev_q8a128`
+    ///      (dispatched by the static resident pointer tables, RAW expert ids)
+    ///      → fused SwiGLU;
+    ///   4. `fused_deterministic_scatter` with the bucketize's token-major
+    ///      tables — the same ascending-grouped-row accumulation order as the
+    ///      host path, so the output bits match it exactly.
+    ///
+    /// Every launch bound is data-independent (the `n_tokens × k` assignment
+    /// bound; the GEMM grid additionally tightens to `⌈a_ub/tile_w⌉ +
+    /// n_experts`, the most tiles any bucketing can produce — padding
+    /// tiles/rows are skipped in-kernel), so no data-dependent value ever
+    /// crosses back to the host.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_native(
+        &self,
+        op: &Q8a128Operand,
+        router_logits: &Tensor,
+        num_tokens: usize,
+        b_size: usize,
+        seq_len: usize,
+        hidden_dim: usize,
+        k: usize,
+        num_experts: usize,
+        gd: &GpuDispatchTables,
+        out_dtype: DType,
+        t: ProfileMark,
+    ) -> Result<Tensor> {
+        let device = router_logits.device().clone();
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("forward_gpu_native: expected a CUDA device"),
+        };
+
+        // 1. Fused GPU routing; the flattened weights feed the scatter directly.
+        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
+        let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
+        self.cache.record_profile("fwd_routing", t);
+
+        // 2. On-device bucketize into the shared reusable workspace.
+        let t = profile_now();
+        let mut ws = gd
+            .workspace
+            .lock()
+            .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
+        moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
+        let a_ub = num_tokens * k;
+        // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and
+        // each expert adds at most one partial tile, so launching `a_ub` blocks
+        // (~25× too many at large prefill) is never needed.
+        let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + num_experts);
+        let expert_base = gd
+            .expert_base(self.moe_layer_idx)
+            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
+
+        // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
+        let stacked = fused_moe_gather_q8a128(op, &ws.tok_ids, a_ub, &cuda_dev)?;
+        let gate_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.gate_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype,
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let up_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.up_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype, // up shares gate's KO dtype
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev)?;
+        let down_out = grouped_qmatmul_dev_q8a128(
+            &inter_acts,
+            &gd.down_ptrs,
+            expert_base,
+            num_experts,
+            gd.down_dtype,
+            gd.down_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        // The int8 matmul emits F32; the fused scatter requires the compute dtype.
+        let down_out = down_out.to_dtype(out_dtype)?;
+
+        // 4. Deterministic scatter — identical accumulation order to the host path.
+        let ys = Tensor::zeros((num_tokens, hidden_dim), out_dtype, &device)?;
+        fused_deterministic_scatter(
+            &ys,
+            &down_out,
+            &ws.perm,
+            &weights_flat,
+            &ws.rw_ids,
+            &ws.token_starts,
+            num_tokens,
+            &cuda_dev,
+        )?;
+        self.cache.record_profile("fwd_expert_gpu", t);
+        ys.reshape((b_size, seq_len, hidden_dim))
     }
 
     /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
@@ -1346,6 +1531,20 @@ impl ModelWeights {
         };
         #[cfg(feature = "cuda")]
         if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
+            // Guard the governor's Critical-rung pool trim against the hot→warm
+            // migrate's captured arena base pointers. The trim's `cuMemPoolTrimTo`
+            // synchronously unmaps pool memory process-wide, and the sync-hook lives
+            // in candle-core (below candle-nn) so it can't reach candle-nn's
+            // arena-topology relief guard. Registered here (candle-transformers is
+            // above candle-nn): the wrapper holds `try_enter_relief` across the trim,
+            // and skips it while a migrate is capturing pointers — otherwise the
+            // in-flight select/quantize/kv_migrate kernels read an unmapped base
+            // pointer (`CUDA_ERROR_ILLEGAL_ADDRESS`).
+            candle::vram::set_pool_trim_guard(Box::new(|trim| {
+                if let Some(_relief) = try_enter_relief() {
+                    trim();
+                }
+            }));
             match candle::vram::VramGovernor::from_device(device, gpu_id) {
                 Ok(gov) => {
                     let mut balloon =

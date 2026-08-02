@@ -90,6 +90,7 @@ use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
@@ -1503,13 +1504,30 @@ impl PipelineState {
 // Thread spawn
 // ============================================================================
 
+/// Sets its flag when dropped — including on unwind — so the thread's death is
+/// observable without joining. A dead pipeline thread has dropped its
+/// `PipelineState` (freeing every expert slot's VRAM), which invalidates any
+/// captured expert weight pointers; `ExpertCache::pipeline_dead` gates the
+/// GPU-native dispatch on this flag staying clear.
+struct DeadFlagGuard(Arc<AtomicBool>);
+
+impl Drop for DeadFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Spawn the pipeline thread.  Returns the sender for submitting work/hints.
-pub(crate) fn spawn_pipeline_thread(mut state: PipelineState) -> mpsc::SyncSender<PipelineMessage> {
+pub(crate) fn spawn_pipeline_thread(
+    mut state: PipelineState,
+    dead_flag: Arc<AtomicBool>,
+) -> mpsc::SyncSender<PipelineMessage> {
     let (tx, rx) = mpsc::sync_channel::<PipelineMessage>(4);
 
     std::thread::Builder::new()
         .name("expert-pipeline".into())
         .spawn(move || {
+            let _dead_on_exit = DeadFlagGuard(dead_flag);
             while let Ok(msg) = rx.recv() {
                 match msg {
                     PipelineMessage::Work(req) => {

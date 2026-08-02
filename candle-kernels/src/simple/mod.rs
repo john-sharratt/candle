@@ -41,6 +41,7 @@ pub mod sub_at_indices_with_values;
 pub mod scatter_op;
 
 // Fused MoE gather and weighted scatter-add kernels
+pub mod moe_bucketize;
 pub mod moe_scatter;
 
 // R16 KV gather: single-kernel replacement for per-chunk memcpy_dtov

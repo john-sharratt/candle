@@ -117,7 +117,9 @@ async fn main() -> Result<()> {
             "--queries" => {
                 queries_path = PathBuf::from(args.next().context("--queries needs a path")?)
             }
-            "--html" => html_path = Some(PathBuf::from(args.next().context("--html needs a path")?)),
+            "--html" => {
+                html_path = Some(PathBuf::from(args.next().context("--html needs a path")?))
+            }
             "--limit" => limit = Some(args.next().context("--limit needs N")?.parse()?),
             "--verbose" => verbose = true,
             "--wait-ready" => wait_ready = true,
@@ -205,7 +207,12 @@ async fn main() -> Result<()> {
                     resp.status().as_u16()
                 );
             }
-            outcomes.push(Outcome { case: case.clone(), selected: Vec::new(), hit_rank: None, hit_score: None });
+            outcomes.push(Outcome {
+                case: case.clone(),
+                selected: Vec::new(),
+                hit_rank: None,
+                hit_score: None,
+            });
             continue;
         }
         let view: ProjView = match resp.json().await {
@@ -213,7 +220,12 @@ async fn main() -> Result<()> {
             Err(e) => {
                 unavailable += 1;
                 eprintln!("  {} : could not decode ProjectView ({e})", case.id);
-                outcomes.push(Outcome { case: case.clone(), selected: Vec::new(), hit_rank: None, hit_score: None });
+                outcomes.push(Outcome {
+                    case: case.clone(),
+                    selected: Vec::new(),
+                    hit_rank: None,
+                    hit_score: None,
+                });
                 continue;
             }
         };
@@ -285,9 +297,7 @@ fn even_sample(all: &[QueryCase], k: usize) -> Vec<QueryCase> {
     if k >= all.len() || all.is_empty() {
         return all.to_vec();
     }
-    (0..k)
-        .map(|i| all[i * all.len() / k].clone())
-        .collect()
+    (0..k).map(|i| all[i * all.len() / k].clone()).collect()
 }
 
 /// File-level match. The tile `label` for a code turn resolves to its file path;
@@ -380,11 +390,24 @@ fn print_report(outcomes: &[Outcome], group_of: &HashMap<String, String>) {
     let pct = |k: usize| 100.0 * k as f64 / m.n as f64;
     println!("\n═══ code_read provenance query eval ═══\n");
     println!("Overall (n={}):", m.n);
-    println!("  hit@budget : {:>5.1}%   ({}/{})", pct(m.hit_budget), m.hit_budget, m.n);
-    println!("  hit@1      : {:>5.1}%   ({}/{})", pct(m.hit1), m.hit1, m.n);
+    println!(
+        "  hit@budget : {:>5.1}%   ({}/{})",
+        pct(m.hit_budget),
+        m.hit_budget,
+        m.n
+    );
+    println!(
+        "  hit@1      : {:>5.1}%   ({}/{})",
+        pct(m.hit1),
+        m.hit1,
+        m.n
+    );
     println!("  MRR        : {:>6.3}", m.mrr);
     println!("  mean scopes/query : {:>4.2}", m.mean_set);
-    println!("  mean expected score (on hit) : {:>6.1}  (0–1000 band)", m.mean_hit_score);
+    println!(
+        "  mean expected score (on hit) : {:>6.1}  (0–1000 band)",
+        m.mean_hit_score
+    );
     if m.empty > 0 {
         println!("  ⚠ {}/{} queries selected ZERO scopes", m.empty, m.n);
     }
@@ -415,14 +438,21 @@ fn print_report(outcomes: &[Outcome], group_of: &HashMap<String, String>) {
         println!("  (none)");
     }
     for o in &misses {
-        let picks: Vec<String> =
-            o.selected.iter().map(|s| format!("{}[{:.0}]", short(&s.path), s.score)).collect();
+        let picks: Vec<String> = o
+            .selected
+            .iter()
+            .map(|s| format!("{}[{:.0}]", short(&s.path), s.score))
+            .collect();
         println!(
             "  {:<12} {:<18} expected {:<32} | {}",
             o.case.style,
             o.case.id,
             short(&o.case.expected_path),
-            if picks.is_empty() { "∅".into() } else { picks.join(" ") }
+            if picks.is_empty() {
+                "∅".into()
+            } else {
+                picks.join(" ")
+            }
         );
     }
 }
@@ -430,7 +460,9 @@ fn print_report(outcomes: &[Outcome], group_of: &HashMap<String, String>) {
 // ── HTML report ─────────────────────────────────────────────────────────────
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn render_html(
@@ -440,7 +472,13 @@ fn render_html(
     unavailable: usize,
 ) -> String {
     let m = compute(outcomes);
-    let pct = |k: usize| if m.n == 0 { 0.0 } else { 100.0 * k as f64 / m.n as f64 };
+    let pct = |k: usize| {
+        if m.n == 0 {
+            0.0
+        } else {
+            100.0 * k as f64 / m.n as f64
+        }
+    };
     let mut h = String::new();
     h.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     h.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
@@ -462,11 +500,27 @@ fn render_html(
             "<div class=\"card\"><div class=\"val\">{val}</div><div class=\"lbl\">{label}</div><div class=\"cs\">{sub}</div></div>"
         )
     };
-    h.push_str(&card("hit@budget", format!("{:.0}%", pct(m.hit_budget)), &format!("{}/{}", m.hit_budget, m.n)));
-    h.push_str(&card("hit@1", format!("{:.0}%", pct(m.hit1)), &format!("{}/{}", m.hit1, m.n)));
+    h.push_str(&card(
+        "hit@budget",
+        format!("{:.0}%", pct(m.hit_budget)),
+        &format!("{}/{}", m.hit_budget, m.n),
+    ));
+    h.push_str(&card(
+        "hit@1",
+        format!("{:.0}%", pct(m.hit1)),
+        &format!("{}/{}", m.hit1, m.n),
+    ));
     h.push_str(&card("MRR", format!("{:.3}", m.mrr), "over selected rank"));
-    h.push_str(&card("mean scopes", format!("{:.2}", m.mean_set), "selected / query"));
-    h.push_str(&card("mean hit score", format!("{:.0}", m.mean_hit_score), "0–1000 band"));
+    h.push_str(&card(
+        "mean scopes",
+        format!("{:.2}", m.mean_set),
+        "selected / query",
+    ));
+    h.push_str(&card(
+        "mean hit score",
+        format!("{:.0}", m.mean_hit_score),
+        "0–1000 band",
+    ));
     h.push_str("</section>");
     if unavailable > 0 {
         h.push_str(&format!(

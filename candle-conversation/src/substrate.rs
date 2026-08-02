@@ -59,8 +59,8 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
-    decode_events, GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
-    TurnIndex, TurnKey,
+    decode_events, CorruptTurnPolicy, GroupId, LayerId, ProjectionTarget, SectionId,
+    TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -235,6 +235,19 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
+    /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
+    /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
+    /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
+    /// Consumers: the reload restores a flagged turn as an EMPTY PLACEHOLDER
+    /// (occupying its index so later turns keep their persisted stream ids),
+    /// the belief galleries and group-default tag resolution skip it, and
+    /// compaction sheds its bulk records while keeping its `StreamDecl` +
+    /// re-emitting the tombstone.
+    tombstoned_turns: HashSet<(TimelineId, u32)>,
+    /// Per-layer policy for an unrecoverable turn on reload
+    /// ([`CorruptTurnPolicy`]), resolved from the projection schema at engine
+    /// setup. Absent → the default [`CorruptTurnPolicy::DropConversation`].
+    layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
     /// Timelines marked for distillation, each with the [`DistillMode`] degree
     /// its turns shed to at compaction. Same replay-order-independence as
     /// tombstones.
@@ -2988,16 +3001,56 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        // Surface the reason on replay so a reload shows WHY a timeline was
-        // dropped (e.g. a corrupt-partial turn), not just that it vanished.
+        // Surface the reason on replay so a reload shows WHY a timeline (or turn)
+        // was dropped (e.g. a corrupt-partial turn), not just that it vanished.
         if let Some(reason) = &payload.reason {
             tracing::debug!(
                 timeline_id = payload.timeline_id,
+                turn_index = payload.turn_index,
                 reason = %reason,
                 "replaying tombstone with recorded reason",
             );
         }
-        self.tombstoned_timelines.insert(timeline);
+        // `turn_index = Some` is a turn-scoped tombstone (the `drop_turn` policy):
+        // kill only that turn, leaving the rest of the timeline live. `None` drops
+        // the whole timeline.
+        match payload.turn_index {
+            Some(turn) => {
+                self.tombstoned_turns.insert((timeline, turn));
+            }
+            None => {
+                self.tombstoned_timelines.insert(timeline);
+            }
+        }
+    }
+
+    /// Mark a single `(timeline, turn)` tombstoned in-RAM — the turn-scoped
+    /// companion to [`Self::tombstone_timeline`], used by the `drop_turn`
+    /// corrupt-turn policy. The rest of the timeline stays live. No VRAM release:
+    /// the corrupt turn is dropped during reload before its (partial) KV is ever
+    /// materialized, so there is nothing resident to free.
+    pub fn tombstone_turn(&mut self, timeline: TimelineId, turn_index: u32) {
+        self.tombstoned_turns.insert((timeline, turn_index));
+    }
+
+    /// Whether `(timeline, turn)` was dropped by a turn-scoped tombstone.
+    pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
+        self.tombstoned_turns.contains(&(timeline, turn_index))
+    }
+
+    /// Record a layer's [`CorruptTurnPolicy`] (from the projection schema),
+    /// consulted at reload when one of the layer's turns is unrecoverable.
+    pub fn set_layer_corrupt_turn_policy(&mut self, layer: LayerId, policy: CorruptTurnPolicy) {
+        self.layer_corrupt_turn.insert(layer, policy);
+    }
+
+    /// The layer's corrupt-turn policy, or the default
+    /// [`CorruptTurnPolicy::DropConversation`] if none was registered.
+    pub fn corrupt_turn_policy_for(&self, layer: LayerId) -> CorruptTurnPolicy {
+        self.layer_corrupt_turn
+            .get(&layer)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Mark `timeline` as tombstoned in-RAM.  Callers writing the
@@ -3082,14 +3135,18 @@ impl Substrate {
     /// disk I/O; the compaction trigger adds this to the incremental
     /// dead-byte counter.
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() {
+        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
             return 0;
         }
         self.streams
             .values()
             .filter(|s| match &s.decl {
-                Some(StreamDecl::Turn(t)) => TimelineId::from_raw(t.timeline_id)
-                    .is_some_and(|tl| self.tombstoned_timelines.contains(&tl)),
+                Some(StreamDecl::Turn(t)) => {
+                    TimelineId::from_raw(t.timeline_id).is_some_and(|tl| {
+                        self.tombstoned_timelines.contains(&tl)
+                            || self.tombstoned_turns.contains(&(tl, t.turn_index))
+                    })
+                }
                 _ => false,
             })
             .map(|s| {
@@ -3097,6 +3154,13 @@ impl Substrate {
                     + s.tokens.map_or(0, |l| l.record_size)
             })
             .sum()
+    }
+
+    /// The `(timeline, turn)` pairs dead by turn-scoped tombstones — consulted
+    /// by compaction, which sheds their bulk records while re-emitting the
+    /// tombstone itself (the reload's placeholder logic needs it).
+    pub fn tombstoned_turns(&self) -> &HashSet<(TimelineId, u32)> {
+        &self.tombstoned_turns
     }
 
     /// Re-point every residence's cold-tier references at the current
@@ -3766,8 +3830,12 @@ impl Substrate {
             let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
                 return None;
             };
-            (d.timeline_id == timeline.raw() && d.tags.iter().any(|t| t == tag))
-                .then(|| TurnIndex(d.turn_index))
+            // A tombstoned turn is a dead placeholder whose KV can never
+            // materialise — it must not resolve as a group default.
+            (d.timeline_id == timeline.raw()
+                && !self.is_turn_tombstoned(timeline, d.turn_index)
+                && d.tags.iter().any(|t| t == tag))
+            .then(|| TurnIndex(d.turn_index))
         })
     }
 
@@ -6613,6 +6681,7 @@ mod tests {
 
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: timeline.raw(),
+            turn_index: None,
             reason: None,
         });
         assert!(sub.is_tombstoned(timeline));
@@ -6634,6 +6703,7 @@ mod tests {
         sub.tombstone_timeline(registered);
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: unregistered.raw(),
+            turn_index: None,
             reason: None,
         });
 
@@ -6641,6 +6711,44 @@ mod tests {
         assert!(set.contains(&registered));
         assert!(set.contains(&unregistered));
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn turn_scoped_tombstone_kills_only_the_turn_not_the_timeline() {
+        let alloc = TimelineAllocator::new();
+        let tl = alloc.next();
+        let mut sub = Substrate::new();
+        // A turn-scoped tombstone (`turn_index = Some`) drops only that turn.
+        sub.apply_tombstone(&super::TombstonePayload {
+            timeline_id: tl.raw(),
+            turn_index: Some(2),
+            reason: Some("corrupt reload (turn 2): chunk mismatch".to_string()),
+        });
+        assert!(sub.is_turn_tombstoned(tl, 2));
+        assert!(
+            !sub.is_turn_tombstoned(tl, 1),
+            "a different turn of the same timeline is unaffected"
+        );
+        assert!(
+            !sub.is_tombstoned(tl),
+            "the timeline itself stays live — only the turn is dead"
+        );
+    }
+
+    #[test]
+    fn corrupt_turn_policy_defaults_to_drop_conversation_and_can_be_set() {
+        let mut sub = Substrate::new();
+        let layer = LayerId::for_test(9);
+        assert_eq!(
+            sub.corrupt_turn_policy_for(layer),
+            CorruptTurnPolicy::DropConversation,
+            "an unset layer defaults to drop_conversation"
+        );
+        sub.set_layer_corrupt_turn_policy(layer, CorruptTurnPolicy::DropTurn);
+        assert_eq!(
+            sub.corrupt_turn_policy_for(layer),
+            CorruptTurnPolicy::DropTurn
+        );
     }
 
     /// Regression: `snapshot_promotion_state` used to misclassify

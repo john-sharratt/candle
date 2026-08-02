@@ -95,7 +95,8 @@ pub enum ModelArch {
 /// | `Qwen2_0_5B` | 0.5 B | Q4_0 | Qwen2 | ChatML | ~0.4 GB |
 /// | `Hermes3_3B_Q6` | 3 B | Q6_K | Llama | ChatML | ~3 GB |
 /// | `Hermes3_70B_Q4` | 70 B | Q4_K_M | Llama | ChatML | ~40 GB |
-/// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~16 GB (LRU) |
+/// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~17 GB (LRU) |
+/// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
@@ -113,8 +114,11 @@ pub enum Model {
     Qwen3_14B_Q6,
 
     // ── Qwen3 MoE ──────────────────────────────────────────────────────
-    /// Qwen3-30B-A3B Q4_K_M — MoE, 128 experts, 8 active (~16 GB with LRU).
+    /// Qwen3-30B-A3B Q4_K_M — MoE, 128 experts, 8 active (~17 GB with LRU).
+    /// The sub-24 GB-VRAM fit; zend selects Q4 vs Q6 by measured VRAM.
     Qwen3_30B_A3B_Q4,
+    /// Qwen3-30B-A3B Q6_K — MoE, 128 experts, 8 active (~25 GB with LRU).
+    Qwen3_30B_A3B_Q6,
 
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
@@ -137,6 +141,7 @@ pub enum Model {
     ///     chat_format: DialectType::ChatML,
     ///     model_repo: "my-org/my-model-GGUF".into(),
     ///     model_filename: "my-model-Q4_K_M.gguf".into(),
+    ///     model_bytes: 4_500_000_000,
     ///     tokenizer_repo: "my-org/my-model".into(),
     ///     eos_token: "<|im_end|>".into(),
     ///     default_system_prompt: "You are a helpful assistant.".into(),
@@ -171,6 +176,11 @@ pub struct ModelSpec {
     pub model_repo: String,
     /// GGUF filename within the repository.
     pub model_filename: String,
+    /// Exact on-disk size of the GGUF file in bytes. Presets pin the
+    /// published file's length; custom models read it from the local file.
+    /// Downloaders use it for progress totals when the server omits
+    /// Content-Length.
+    pub model_bytes: u64,
     /// HuggingFace repository containing `tokenizer.json`.
     pub tokenizer_repo: String,
     /// Default system prompt text (before chat-format wrapping).
@@ -217,6 +227,7 @@ impl Model {
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
+            Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2
             Model::Qwen2_0_5B => qwen2::qwen2_0_5b(),
             // Hermes-3 / Llama

@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 5. The LIVE call the reproject uses.
-    let scores = conv.score_belief_collections(sp, &probe);
+    let scores = conv.score_belief_collections(sp, &probe, None);
 
     // 6. Report the top scored tools.
     let mut ranked: Vec<(String, f32)> = Vec::new();

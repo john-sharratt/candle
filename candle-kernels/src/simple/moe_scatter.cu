@@ -38,6 +38,22 @@ __device__ void moe_gather_impl(
     if (row >= total_rows) return;
 
     const uint32_t src_row = token_ids[row];
+    // 0xFFFFFFFF marks a padding row (device-built tables launched at an upper
+    // bound, see moe_bucketize.cu). Zero it rather than skip: downstream never
+    // consumes the row's VALUES (grouped-GEMM padding tiles and scatter
+    // segments both stop at the valid count), but a deterministic zero keeps
+    // THIS stacked buffer initialized. Scope: the gather output only — the
+    // grouped GEMM's own padding output rows stay unwritten (its padding tiles
+    // exit before computing), so whole-pipeline byte-stability is not implied.
+    if (src_row == 0xFFFFFFFFu) {
+        T* dst = out + (size_t)row * hidden_dim;
+        for (unsigned int col = blockIdx.y * blockDim.x + threadIdx.x;
+             col < hidden_dim;
+             col += blockDim.x * gridDim.y) {
+            dst[col] = T(0);
+        }
+        return;
+    }
     const T* src = xs + (size_t)src_row * hidden_dim;
     T* dst = out + (size_t)row * hidden_dim;
 

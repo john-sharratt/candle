@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod loading;
 pub mod log_broadcast;
 pub mod log_line;
+pub mod model_choice;
 pub mod projection_event;
 pub mod raw_read;
 pub mod refresh_ctx;

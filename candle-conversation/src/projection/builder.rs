@@ -45,9 +45,9 @@ use super::project::{
     run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
 };
 use super::schema::{
-    Budget, CompressionPrompt, Content, DecodePriority, GatherScope, GroupSchema, LayerDials,
-    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
-    SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
+    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
+    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
@@ -1173,6 +1173,7 @@ impl Builder {
                 // This synthetic fallback layer IS the dialogue layer, so it takes
                 // the interactive decode priority the production dialogue layer does.
                 decode_priority: DecodePriority::High,
+                on_corrupt_turn: CorruptTurnPolicy::DropTurn,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

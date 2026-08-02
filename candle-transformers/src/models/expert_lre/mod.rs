@@ -148,6 +148,8 @@ mod cache;
 mod compute;
 #[cfg(test)]
 mod eval;
+#[cfg(feature = "cuda")]
+mod gpu_dispatch;
 mod handle;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
@@ -158,6 +160,8 @@ mod types;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
+#[cfg(feature = "cuda")]
+pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
