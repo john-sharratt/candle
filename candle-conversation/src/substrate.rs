@@ -2557,9 +2557,20 @@ impl Substrate {
     /// Push a turn onto the pending-summary queue.  Used during
     /// cold-load reconstruction (§4) to re-enqueue orphan turns whose
     /// summary parent didn't survive a crash.
+    ///
+    /// Timelines in APPEND-ONLY ingest layers (repo_map, code_reading) never
+    /// enqueue, regardless of their per-timeline `summarize` flag: ingest
+    /// turns are background reference whose summaries the ingest pipeline
+    /// itself owns, and letting them queue here storms the summariser with
+    /// pointless decodes during a repo scan (competing with the ingest's own
+    /// forwards for the GPU). Enforced at the mechanism so no ingest path can
+    /// forget to clear the flag.
     pub fn push_pending_summary(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        // One map lookup: the entry carries its layer, so the per-timeline
+        // flag and the append-only-layer refusal read off the same borrow
+        // (`append_only_layers` is a disjoint field).
         if let Some(tl) = self.timelines.get_mut(&timeline) {
-            if !tl.summarize {
+            if !tl.summarize || self.append_only_layers.contains(&tl.layer) {
                 return;
             }
             tl.pending_summary_queue.push_back(idx);
@@ -5981,6 +5992,40 @@ mod tests {
         assert_eq!(
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
+        );
+    }
+
+    /// A timeline in an append-only ingest layer (repo_map, code_reading)
+    /// never enqueues turns for the summariser, regardless of its own
+    /// `summarize` flag — enforced in `push_pending_summary` itself so no
+    /// ingest path can forget to clear the flag. A dialogue timeline on a
+    /// normal layer still enqueues.
+    #[test]
+    fn append_only_layer_turns_never_enqueue_for_summary() {
+        use crate::projection::{GroupId, LayerId, TimelineAllocator};
+        let mut sub = Substrate::new();
+        let alloc = TimelineAllocator::new();
+
+        let ingest_layer = LayerId::for_test(1);
+        let ingest_tl = alloc.next();
+        sub.register_timeline(ingest_tl, ingest_layer, GroupId::for_test(1));
+        sub.mark_layer_append_only(ingest_layer);
+
+        let dlg_tl = alloc.next();
+        sub.register_timeline(dlg_tl, LayerId::for_test(2), GroupId::for_test(2));
+
+        sub.push_pending_summary(ingest_tl, TurnIndex(0));
+        sub.push_pending_summary(dlg_tl, TurnIndex(0));
+
+        assert_eq!(
+            sub.pending_summary_len(ingest_tl),
+            0,
+            "append-only ingest turn must not queue for the summariser"
+        );
+        assert_eq!(
+            sub.pending_summary_len(dlg_tl),
+            1,
+            "dialogue turn must still queue"
         );
     }
 

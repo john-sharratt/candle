@@ -1204,6 +1204,17 @@ impl InferenceState {
             status_tx.send(il.display.clone()).ok();
             progress.set_step_progress(0, 0);
             let content_root = workspace.join(&il.folder);
+            // Mark the layer append-only BEFORE any branch below runs — fresh
+            // ingest and resume alike. The in-memory flag (lost on restart)
+            // drives belief self-locality, the normalization warm-up's
+            // ingest-layer recognition (without it the warm-up skips the layer
+            // and every query collapses onto the promiscuous low-entropy files
+            // at an un-normalized cold score), and the summariser's
+            // append-only exclusion (an unmarked fresh ingest storms the
+            // summariser with per-listing decodes as turns seal).
+            if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
+                engine.lock().unwrap().mark_layer_append_only(layer_id);
+            }
             tracing::info!(layer = %il.name, mode = ?il.mode, folder = %il.folder, "ingest pass starting");
             match il.mode {
                 IngestMode::Folders => {
@@ -1242,16 +1253,9 @@ impl InferenceState {
                             &il.group,
                         )?
                     } else {
-                        // The blocking ingest is skipped, but its per-load layer setup
-                        // must still run: mark the layer append-only (in-memory flag,
-                        // lost on restart) so belief scoring stays self-local and the
-                        // normalization warm-up recognises it as an ingest layer and
-                        // learns each file's hit level. Without this the warm-up skips
-                        // the layer and every query collapses onto the promiscuous
-                        // low-entropy files at an un-normalized (cold) score.
-                        if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
-                            engine.lock().unwrap().mark_layer_append_only(layer_id);
-                        }
+                        // The blocking ingest is skipped; the layer's append-only
+                        // mark already ran above the mode match (it covers both the
+                        // fresh-ingest and resume branches).
                         tracing::info!(
                             layer = %il.name,
                             files = prior.file_hashes.len(),

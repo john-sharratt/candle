@@ -215,15 +215,19 @@ pub fn run_pass(
     // accumulate substrate turns as they work but have no user-facing
     // projection/summary to compress against, so any probe soft-fails. Exclude
     // them from the sweep outright; otherwise every pass re-enqueues a doomed
-    // compression and floods the log.
+    // compression and floods the log. Append-only ingest layers (repo_map,
+    // code_reading) are excluded the same way: their turns never enqueue
+    // (`push_pending_summary` refuses them), and skipping the sweep here also
+    // keeps reconcile from probing forests these timelines are never meant to
+    // grow — plus ignores any queue entries persisted before the exclusion.
     let timeline_ids: Vec<TimelineId> = {
         let guard = conversation.read();
         let all: Vec<TimelineId> = guard.all_timeline_ids().collect();
         all.into_iter()
             .filter(|t| {
-                !guard
-                    .timeline_target(*t)
-                    .is_some_and(|(layer, _)| layer.is_reserved())
+                !guard.timeline_target(*t).is_some_and(|(layer, _)| {
+                    layer.is_reserved() || guard.is_append_only_layer(layer)
+                })
             })
             .collect()
     };
