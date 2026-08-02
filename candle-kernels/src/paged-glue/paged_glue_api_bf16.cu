@@ -16,6 +16,8 @@ extern "C" void run_paged_glue_bf16(
     void* o_ptr,
     int32_t batch,
     int32_t max_glue,
+    int32_t total_q,
+    int32_t max_kv,
     int32_t n_q_head,
     int32_t n_kv_head,
     int32_t head_dim,
@@ -36,7 +38,7 @@ extern "C" void run_paged_glue_bf16(
     #define LAUNCH_GLUE(HD) \
         paged_glue::launch_paged_glue_attn<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, HD>( \
             (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)o_ptr, \
-            batch, max_glue, n_q_head, n_kv_head, softmax_scale, \
+            batch, max_glue, total_q, max_kv, n_q_head, n_kv_head, softmax_scale, \
             (const __nv_bfloat16*)k_new, (const __nv_bfloat16*)v_new, rope_cs, rope_interleaved, \
             cu_seqlens_q, q_lens, kv_lens, \
             glue_write_slice, glue_write_in_blk, fwd_ahead, stream)

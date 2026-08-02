@@ -5,7 +5,7 @@
 //! long *quantized* prefix, write their own K/V, and attend earlier glue. It is
 //! the decode kernel widened from one query token to `G` — it streams each
 //! prefix chunk once (dequant-once) and reuses it across all `G x hpg` query
-//! rows via the tensor-core M-dimension. See `docs/paged_glue_kernel.md`.
+//! rows via the tensor-core M-dimension. See `docs/glue_prefill_kernel.md`.
 
 use core::ffi::c_void;
 
@@ -31,6 +31,12 @@ extern "C" {
         o_ptr: *mut c_void,
         batch: i32,
         max_glue: i32,
+        // `Σ q_lens` — sizes the split-KV partial pool (one row per glue
+        // token per query head).
+        total_q: i32,
+        // `max kv_lens[b]` — sizes the split-KV grid; each block streams one
+        // fixed column quantum of its slot and the partials are combined.
+        max_kv: i32,
         n_q_head: i32,
         n_kv_head: i32,
         head_dim: i32,
@@ -63,6 +69,12 @@ extern "C" {
         o_ptr: *mut c_void,
         batch: i32,
         max_glue: i32,
+        // `Σ q_lens` — sizes the split-KV partial pool (one row per glue
+        // token per query head).
+        total_q: i32,
+        // `max kv_lens[b]` — sizes the split-KV grid; each block streams one
+        // fixed column quantum of its slot and the partials are combined.
+        max_kv: i32,
         n_q_head: i32,
         n_kv_head: i32,
         head_dim: i32,

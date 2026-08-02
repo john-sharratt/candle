@@ -1498,6 +1498,7 @@ fn run_offset_window_glue_case(
         &rope_cs,
         false,
         &gen_c,
+        &std::cell::RefCell::new(None),
     )?;
     let gen_b = stager.begin_generation();
     let out_b = paged_glue_attn(
@@ -1518,6 +1519,7 @@ fn run_offset_window_glue_case(
         &rope_cs,
         false,
         &gen_b,
+        &std::cell::RefCell::new(None),
     )?;
     let _ = (&backing_b, &backing_c);
 
@@ -1576,6 +1578,7 @@ fn glue_over(
         rope_cs,
         false,
         &gen,
+        &std::cell::RefCell::new(None),
     )?;
     device.synchronize()?;
     Ok(out)
@@ -1954,6 +1957,7 @@ fn run_glue_interspersed_case(
         &rope_cs,
         false,
         &gen,
+        &std::cell::RefCell::new(None),
     )?;
     device.synchronize()?;
     cache.set_current_seq_len(total)?;

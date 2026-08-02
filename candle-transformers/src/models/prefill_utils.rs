@@ -914,6 +914,7 @@ pub fn paged_glue_attn(
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
     _generation: &Generation,
+    _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     candle::bail!("paged-glue requires the cuda feature")
 }
@@ -1244,6 +1245,8 @@ type GlueFfi = unsafe extern "C" fn(
     *mut c_void,   // o
     i32,           // batch
     i32,           // max_glue
+    i32,           // total_q (Σ q_lens — sizes the split-KV partial pool)
+    i32,           // max_kv (max kv_lens[b] — sizes the split-KV grid)
     i32,           // n_q_head
     i32,           // n_kv_head
     i32,           // head_dim
@@ -1283,6 +1286,8 @@ struct PagedGlueChunks {
     headers_ptr: u64,
     batch_size: usize,
     max_glue: usize,
+    /// Max `kv_lens[b]` over the batch — sizes the kernel's split-KV grid.
+    max_kv: usize,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -1299,7 +1304,7 @@ impl PagedGlueChunks {
         q_l: &Layout,
         ffi: GlueFfi,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        let (_total_q, n_head, head_dim) = q_l.shape().dims3()?;
+        let (total_q, n_head, head_dim) = q_l.shape().dims3()?;
         if n_head != self.n_head || head_dim != self.head_dim {
             candle::bail!(
                 "paged-glue: q shape mismatch got {:?} expected (total_q, {}, {})",
@@ -1371,6 +1376,8 @@ impl PagedGlueChunks {
                 dst_ptr as *mut c_void,
                 self.batch_size as i32,
                 self.max_glue as i32,
+                total_q as i32,
+                self.max_kv as i32,
                 self.n_head as i32,
                 self.n_kv_head as i32,
                 self.head_dim as i32,
@@ -1452,6 +1459,7 @@ pub fn paged_glue_attn(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     if head_dim != 128 {
         candle::bail!("paged-glue requires head_dim==128 (got {head_dim})");
@@ -1545,11 +1553,14 @@ pub fn paged_glue_attn(
     let t_hdr = profile_now();
     // The gaps are real chunks already (no trailing write region), so the slot
     // headers cover exactly `[0, kv_len)`; pass zero glue so build_slot_headers
-    // does not extend a write region. Built fresh every call (always-miss).
+    // does not extend a write region. `shared_pm` is the forward's glue-group
+    // position-map cache: the map is layer-invariant (chunk boundaries are the
+    // same in every layer), so the first layer builds + uploads it and the
+    // other 47 reuse the device buffer, skipping the host build and the PCIe
+    // copy that otherwise dominate this span.
     let zero_q = vec![0usize; b_sz];
-    let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
     let header_upload = build_slot_headers(
-        caches, &zero_q, n_kv_head, head_dim, generation, &glue_pm, None,
+        caches, &zero_q, n_kv_head, head_dim, generation, shared_pm, None,
     )?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);
@@ -1570,6 +1581,7 @@ pub fn paged_glue_attn(
         headers_ptr: header_upload.headers_ptr,
         batch_size: b_sz,
         max_glue,
+        max_kv: kv_lens_host.iter().copied().max().unwrap_or(0),
         n_head,
         n_kv_head,
         head_dim,

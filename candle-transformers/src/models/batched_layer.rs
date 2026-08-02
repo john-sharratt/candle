@@ -715,6 +715,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             rope_cs,
             rope_interleaved,
             generation,
+            shared_pm,
         )?,
         // Ordinary prefill (fresh or over an existing prefix): the INT8
         // prefix-attention kernel (docs/archived/prefill_optimization.md) —

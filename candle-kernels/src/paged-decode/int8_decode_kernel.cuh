@@ -1522,8 +1522,10 @@ int8_decode_bmma_kernel(
 // Split-KV combine: merge the num_splits per-split partial flash-states for each
 // (slot, query-head) into the final normalized output. One block per output row
 // (slot*n_q_head + qh); HEAD_DIM threads, each owning one output dim. The merge
-// is the standard log-sum-exp (base-2, matching the decode kernel's exp2):
-//   gm = max_s m_s;  out = (Σ_s ΣwV_s · 2^(m_s-gm)) / (Σ_s l_s · 2^(m_s-gm)).
+// is the standard log-sum-exp in NATURAL base — the flash kernels accumulate
+// with `fast_exp` e^x (the `exp2` there is the float2-vectorized form, not
+// base-2), so the per-split maxima in `partial_ml` are natural-log magnitudes:
+//   gm = max_s m_s;  out = (Σ_s ΣwV_s · e^(m_s-gm)) / (Σ_s l_s · e^(m_s-gm)).
 // Null partials (m=-inf, l=0) contribute zero.
 // -----------------------------------------------------------------------------
 template <typename O, int HEAD_DIM>
@@ -1548,7 +1550,10 @@ __global__ void int8_decode_combine_kernel(
 
     float acc = 0.f, L = 0.f;
     for (int s = 0; s < num_splits; ++s) {
-        float w = exp2f(ml[s * 2] - gm);
+        // Natural base to match the flash kernels' e^x accumulation — a 2^Δ
+        // weight here would under-shrink low-max partials (2^Δ > e^Δ for Δ<0)
+        // and skew the merged softmax wherever per-split maxima differ.
+        float w = expf(ml[s * 2] - gm);
         acc += pa[(int64_t)s * HEAD_DIM + d] * w;
         L   += ml[s * 2 + 1] * w;
     }

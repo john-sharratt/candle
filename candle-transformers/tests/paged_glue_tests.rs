@@ -414,6 +414,8 @@ fn run_glue(
             dev_ptr_f16(&out)? as *mut std::ffi::c_void,
             1,
             glue as i32,
+            glue as i32,   // total_q (single slot)
+            kv_len as i32, // max_kv
             N_HEAD as i32,
             N_KV_HEAD as i32,
             HEAD_DIM as i32,
@@ -989,6 +991,8 @@ fn run_glue_batched(
             dev_ptr_f16(&out)? as *mut std::ffi::c_void,
             b as i32,
             max_glue as i32,
+            total_q as i32,
+            builds.iter().map(|sb| sb.kv_len).max().unwrap_or(0) as i32,
             N_HEAD as i32,
             N_KV_HEAD as i32,
             HEAD_DIM as i32,
@@ -1110,6 +1114,166 @@ fn paged_glue_batched_isolation_f16() -> Result<()> {
         candle::bail!(
             "cross-conversation leak detected:\n  - {}",
             failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Split-KV correctness gate: a slot deeper than the kernel's column quantum
+/// (GLUE_SPLIT_COLS = 1024) streams in multiple windows whose un-normalized
+/// flash partials are merged by the combine kernel. A/B against the
+/// position-aware f32 golden. The second case places the glue gaps straddling
+/// the window boundary (sealed 1020, glue 30 -> gaps at columns 1020..1050,
+/// boundary at 1024), so glue-attends-earlier-glue crosses windows, and mixes
+/// per-token forward bridges across that same boundary.
+#[test]
+fn paged_glue_split_kv_matches_reference_f16() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+
+    let cases: &[(usize, usize, &[u32])] = &[
+        // 2206 columns -> 3 windows; mixed causal + bridging rows.
+        (2200, 6, &[0, 3, 0, 1, 0, 0]),
+        // Gaps straddle the 1024 window edge; bridges cross it too.
+        (1020, 30, &[5u32; 30]),
+    ];
+    let mut failures = Vec::new();
+
+    for (ci, &(sealed, glue, fwd)) in cases.iter().enumerate() {
+        assert_eq!(fwd.len(), glue);
+        let (_qs, k_seal, v_seal) = make_qkv(sealed, 0x5117 ^ ci as u64, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0xC0B ^ ci as u64, &device)?;
+        let col_pos: Vec<u32> = (0..(sealed + glue) as u32).collect();
+
+        let out_ref = reference_attn_positioned(
+            &q_glue, &k_seal, &v_seal, &k_glue, &v_glue, &col_pos, fwd, sealed, glue, &device,
+        )?;
+
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        let (out, _ms) = run_glue(
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+        )?;
+
+        let diff = max_abs_diff(&out, &out_ref)?;
+        eprintln!("paged-glue split-KV case {ci} (sealed={sealed}, glue={glue}): max abs diff = {diff:.6e}");
+        if !(diff < DIFF_TOLERANCE) {
+            failures.push(format!(
+                "case {ci} (sealed={sealed}, glue={glue}): diff={diff:.6e}"
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        candle::bail!(
+            "split-KV glue diverged from the golden in {} case(s):
+  - {}",
+            failures.len(),
+            failures.join(
+                "
+  - "
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Split-KV batched isolation: the bit-identity contract extends to split mode.
+/// A slot's column partition derives only from its own kv_len (fixed quantum),
+/// and a shallow slot padded to a deep batch-mate's split grid emits null
+/// partials that add exact zeros in the combine — so each slot must produce
+/// byte-for-byte what it produces alone, INCLUDING the shallow slot whose solo
+/// run takes the single-pass direct-write path while its batched run goes
+/// through partials + combine.
+#[test]
+fn paged_glue_split_kv_batched_isolation_f16() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+
+    let conv: &[(usize, usize, Vec<u32>, u64)] = &[
+        (2200, 5, vec![0, 2, 0, 1, 0], 0xDEE9),
+        (37, 4, vec![1, 0, 3, 0], 0x5410),
+    ];
+
+    let mut alone: Vec<Tensor> = Vec::new();
+    for &(sealed, glue, ref fwd, seed) in conv {
+        let (_qs, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ seed, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ seed, &device)?;
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        let (out, _) = run_glue(
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+        )?;
+        alone.push(out);
+    }
+
+    let mut owned: Vec<(
+        ChunkedKvBacking,
+        KvCache,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Vec<u32>,
+    )> = Vec::new();
+    for &(sealed, glue, ref fwd, seed) in conv {
+        let (_qs, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ seed, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ seed, &device)?;
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        owned.push((backing, cache, q_glue, k_glue, v_glue, glue, fwd.clone()));
+    }
+    let mut refs: Vec<(
+        &ChunkedKvBacking,
+        &mut KvCache,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Vec<u32>,
+    )> = owned
+        .iter_mut()
+        .map(|(b, c, q, k, v, g, f)| (&*b, c, q.clone(), k.clone(), v.clone(), *g, f.clone()))
+        .collect();
+    let batched = run_glue_batched(&mut refs, &rope_cs, &stager, &device)?;
+
+    let mut failures = Vec::new();
+    for (i, (a, bt)) in alone.iter().zip(batched.iter()).enumerate() {
+        let diff = max_abs_diff(a, bt)?;
+        eprintln!("paged-glue split-KV isolation slot {i}: |alone - in_batch| = {diff:.6e}");
+        if diff != 0.0 {
+            failures.push(format!(
+                "slot {i}: diff={diff:.6e} (split padding perturbed the slot)"
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!(
+            "split-KV batched isolation broken:
+  - {}",
+            failures.join(
+                "
+  - "
+            )
         );
     }
     Ok(())

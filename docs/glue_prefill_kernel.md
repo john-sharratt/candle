@@ -315,3 +315,47 @@ per-column "sealed-from-cache vs earlier-glue-from-input" source — best delive
 as a **new gap-fill kernel entry that reuses the existing device-helper library**,
 not a from-scratch kernel and not a runtime branch in the hot contiguous-prefix
 path.
+
+---
+
+## 11. Split-KV (deep-slot wall-clock)
+
+The glue kernel's grid is `(slot, kv_head, glue_tile)`, and every block streams
+the slot's **entire** column range `[0, kv_len)` (dequant-once *per block*).
+With ~26 glue tiles all resident on the SMs at once, the wave's wall-clock per
+layer is one full-slot stream — ~4-7 ms/layer at 5-6k columns, ~200 ms of the
+reproject glue wave across 48 layers.
+
+Split-KV partitions the column range across blocks instead:
+
+- **Grid** becomes `(slot, kv_head, glue_tile x split)`. Each block streams one
+  column window `[split * GLUE_SPLIT_COLS, +GLUE_SPLIT_COLS)` (quantum: 1024
+  columns) and emits the un-normalized flash partial `(SwV, m, l)` for each of
+  its rows into a per-`(glue row, query head, split)` scratch pool — the same
+  grow-on-demand pool and combine kernel the paged-decode split-KV path uses
+  (`fused_attn_partial_pool`, `int8_decode_combine_kernel`). The combine merges
+  partials by natural-base log-sum-exp (the flash kernels accumulate with
+  `fast_exp` e^x) and writes the normalized output.
+- **`num_splits = ceil(max_kv / 1024)`**, from the batch's deepest slot;
+  `num_splits == 1` (slots up to 1024 columns) keeps the exact single-pass
+  direct-write path.
+- **The quantum is fixed, not derived from the batch.** A slot's column
+  partition depends only on its own `kv_len`: a shallow slot in a deep batch
+  runs its real window(s) plus **null** windows (initial flash state, m=-inf,
+  l=0) whose combine contribution is exactly zero. So every slot produces
+  byte-for-byte what it produces alone — the batched-isolation contract of §8
+  extends to split mode, verified by `paged_glue_split_kv_batched_isolation_f16`
+  (a solo direct-write shallow slot vs the same slot padded through
+  partials + combine). Only past `GLUE_MAX_SPLITS = 16` quanta (>16k-column
+  glue slots) does the quantum grow, and the guarantee then holds only among
+  batches sharing the grown quantum.
+- The glue K/V **scatter phase still runs in every block** (all glue tokens,
+  not just the block's tile/window): each block self-produces any glue column
+  it may stream, so no cross-block ordering is needed — same-value concurrent
+  writes are benign.
+
+Wall-clock effect: the per-layer stream shortens from `kv_len` columns to
+`min(kv_len, 1024)` per block, bounded by SM capacity — a 5-6k-column slot's
+attention drops ~5x. Correctness gates: `paged_glue_split_kv_matches_reference_f16`
+(multi-window vs the position-aware golden, including glue gaps straddling a
+window edge) plus the isolation test above.
