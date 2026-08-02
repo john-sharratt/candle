@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
-use candle_conversation::models::{Dialect, Model};
+use candle_conversation::models::Dialect;
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
@@ -36,6 +36,7 @@ use crate::conv_file_store::ConvFileStore;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
+use crate::model_choice::qwen30;
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
@@ -551,7 +552,7 @@ impl InferenceState {
         // expanded by `preemptive_prefill` itself.
         let before_text: String = pre_collection_prelude(&proj_builder);
 
-        let mut builder = Model::Qwen3_30B_A3B_Q6
+        let mut builder = qwen30()
             .builder()
             .system_prompt(&before_text)
             .model_path(model_path)

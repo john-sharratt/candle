@@ -12,18 +12,15 @@ use std::path::{Path, PathBuf};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-// ── Model coordinates ─────────────────────────────────────────────────────────
+use crate::model_choice::qwen30;
 
-// Original (April 2025) Qwen3-30B-A3B — the HYBRID model whose chat template
-// carries `<think>` + `enable_thinking`, so it honours the `/think` ↔ `/no_think`
-// switch the composer effort dial drives. The 2507 Instruct/Thinking refreshes
-// each dropped one half of that toggle, so neither can do both. Keep these in
-// sync with the library spec in `candle-conversation/src/models/qwen3_moe.rs`.
-const MODEL_REPO: &str = "unsloth/Qwen3-30B-A3B-GGUF";
-const MODEL_FILE: &str = "Qwen3-30B-A3B-Q6_K.gguf";
-const TOK_REPO: &str = "Qwen/Qwen3-30B-A3B";
+// ── Model coordinates ─────────────────────────────────────────────────────────
+//
+// The model repo/filename/size all come from the VRAM-adaptive choice in
+// `model_choice::qwen30()` via the library spec — the downloader never names a
+// quant itself, so it cannot drift from what the session loads.
+
 const TOK_FILE: &str = "tokenizer.json";
-const MODEL_BYTES: u64 = 25_092_532_800; // ~25 GB (Q6_K); fallback when Content-Length absent
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -36,8 +33,16 @@ pub async fn ensure_model(
     let dir = cache_dir();
     tokio::fs::create_dir_all(&dir).await?;
 
-    let model_path = resolve_file(MODEL_REPO, MODEL_FILE, Some(MODEL_BYTES), &dir, status).await?;
-    let tok_path = resolve_file(TOK_REPO, TOK_FILE, None, &dir, status).await?;
+    let spec = qwen30().spec();
+    let model_path = resolve_file(
+        &spec.model_repo,
+        &spec.model_filename,
+        Some(spec.model_bytes),
+        &dir,
+        status,
+    )
+    .await?;
+    let tok_path = resolve_file(&spec.tokenizer_repo, TOK_FILE, None, &dir, status).await?;
 
     Ok((model_path, tok_path))
 }

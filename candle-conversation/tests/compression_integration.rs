@@ -20,7 +20,7 @@ use candle_conversation::{
     models::Model, projection::TimelineId, summary_tree::TurnKind, SamplingConfig,
 };
 
-const COMP_MODEL: Model = Model::Qwen3_30B_A3B_Q6;
+const COMP_MODEL: Model = Model::Qwen3_30B_A3B_Q4;
 
 /// Six rotating mini-topics so the absorbed turns carry real, distinctive
 /// content the compressor must preserve (names, numbers, decisions).

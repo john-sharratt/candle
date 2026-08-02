@@ -56,7 +56,7 @@ fn workspace_dir(default: &str) -> PathBuf {
 
 fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     let device = cuda_device().expect("CUDA required for Tier-3 cruise");
-    let dialect = Model::Qwen3_30B_A3B_Q6.spec().dialect.clone();
+    let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
     let mut proj_builder = projection::Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_YAML,
@@ -72,7 +72,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
         .expect("primary group");
     let _ = zend::tools::install_tool_catalog(&mut proj_builder);
 
-    let mut builder = Model::Qwen3_30B_A3B_Q6
+    let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())

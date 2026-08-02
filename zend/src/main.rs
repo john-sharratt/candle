@@ -25,6 +25,7 @@ mod loading;
 mod log_broadcast;
 mod log_file;
 mod log_line;
+mod model_choice;
 mod projection_event;
 mod raw_read;
 mod refresh_ctx;

@@ -1358,7 +1358,7 @@ fn test_tool_call_weather_pos1() {
     eprintln!("\n=== Loading Qwen3-30B-A3B-Q4 ===");
     let t0 = std::time::Instant::now();
 
-    let mut builder = candle_conversation::models::Model::Qwen3_30B_A3B_Q6
+    let mut builder = candle_conversation::models::Model::Qwen3_30B_A3B_Q4
         .builder()
         .thinking(false)
         .sampling(SamplingConfig::argmax())

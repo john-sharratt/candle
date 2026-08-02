@@ -131,7 +131,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     );
     let start = std::time::Instant::now();
 
-    let dialect = Model::Qwen3_30B_A3B_Q6.spec().dialect.clone();
+    let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
     let mut proj_builder = projection::Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_YAML,
@@ -143,7 +143,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     let primary_group = proj_builder.id_for_group("primary_conversation").unwrap();
     let _ = zend::tools::install_tool_catalog(&mut proj_builder).expect("install tool catalog");
 
-    let mut builder = Model::Qwen3_30B_A3B_Q6
+    let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())

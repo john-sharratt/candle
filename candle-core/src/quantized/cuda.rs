@@ -149,6 +149,30 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
     }
 }
 
+/// Total VRAM on CUDA device 0, queried without requiring a bound context.
+///
+/// `cuDeviceTotalMem` needs only driver init and a device handle — unlike
+/// [`get_vram_info`], which reads the *current context's* device — so this is
+/// safe to call from any thread before any `Device` exists (e.g. when picking
+/// which model quant to download at daemon startup).
+pub fn get_total_vram_device0() -> Result<usize> {
+    use cudarc::driver::sys;
+    unsafe {
+        sys::cuInit(0)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuInit failed: {:?}", e)))?;
+        let mut dev: sys::CUdevice = 0;
+        sys::cuDeviceGet(&mut dev, 0)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuDeviceGet failed: {:?}", e)))?;
+        let mut total: usize = 0;
+        sys::cuDeviceTotalMem_v2(&mut total, dev)
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuDeviceTotalMem failed: {:?}", e)))?;
+        Ok(total)
+    }
+}
+
 /// Query total and free VRAM on the current CUDA device.
 ///
 /// Returns `(free_bytes, total_bytes)`.

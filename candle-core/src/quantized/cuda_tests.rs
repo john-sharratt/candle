@@ -7775,3 +7775,17 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
 
     Ok(())
 }
+
+/// The context-free total-VRAM probe must succeed and report a sane size.
+/// (In-process test order may mean a context already exists on this thread;
+/// the no-context property is exercised for real by zend's download path,
+/// which calls this before any `Device` is created.)
+#[test]
+fn cuda_total_vram_device0_probe() -> Result<()> {
+    let total = get_total_vram_device0()?;
+    assert!(
+        total > 1024 * 1024 * 1024,
+        "reported total VRAM {total} bytes is implausibly small"
+    );
+    Ok(())
+}

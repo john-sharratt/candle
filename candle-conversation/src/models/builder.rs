@@ -249,6 +249,9 @@ impl ModelBuilder {
 
         // Read metadata from the GGUF header.
         let info = Self::detect_sampling_from_gguf(&gguf_path)?;
+        let model_bytes = std::fs::metadata(&gguf_path)
+            .map_err(|e| ConversationError::Model(candle::Error::Msg(format!("{e}"))))?
+            .len();
 
         let arch = info.arch.unwrap_or(ModelArch::Llama);
         let dialect_type = info.dialect.unwrap_or(DialectType::ChatML);
@@ -259,6 +262,7 @@ impl ModelBuilder {
             dialect: dialect_type.dialect(),
             model_repo: String::new(),
             model_filename: gguf_filename,
+            model_bytes,
             tokenizer_repo: String::new(),
             default_system_prompt: "You are a helpful, accurate, and concise assistant.".into(),
             max_seq_len: info.context_length.unwrap_or(8192),

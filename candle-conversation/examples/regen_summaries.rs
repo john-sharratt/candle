@@ -25,7 +25,7 @@ use candle_conversation::projection::{Builder, TimelineId, TurnIndex};
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::{models::Model, SamplingConfig};
 
-const MODEL: Model = Model::Qwen3_30B_A3B_Q6;
+const MODEL: Model = Model::Qwen3_30B_A3B_Q4;
 const ZEND_YAML: &str = include_str!("../../zend/src/prompts/projection.yaml");
 
 /// Pick the fixture matching the layer's content kind: repository index

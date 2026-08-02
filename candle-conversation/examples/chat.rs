@@ -853,14 +853,15 @@ fn parse_model(name: &str) -> anyhow::Result<Model> {
         "qwen3-14b-q4" => Ok(Model::Qwen3_14B_Q4),
         "qwen3-14b-q5" => Ok(Model::Qwen3_14B_Q5),
         "qwen3-14b-q6" => Ok(Model::Qwen3_14B_Q6),
-        "qwen3-30b-a3b-q6" | "qwen3-moe" => Ok(Model::Qwen3_30B_A3B_Q6),
+        "qwen3-30b-a3b-q4" | "qwen3-moe" => Ok(Model::Qwen3_30B_A3B_Q4),
+        "qwen3-30b-a3b-q6" => Ok(Model::Qwen3_30B_A3B_Q6),
         "qwen2-0.5b" => Ok(Model::Qwen2_0_5B),
         "hermes3-3b-q6" => Ok(Model::Hermes3_3B_Q6),
         "hermes3-70b-q4" => Ok(Model::Hermes3_70B_Q4),
         _ => anyhow::bail!(
             "Unknown model '{name}'. Available: qwen3-8b-q4, qwen3-8b-q6, qwen3-14b-q4, \
-             qwen3-14b-q5, qwen3-14b-q6, qwen3-30b-a3b-q6, qwen2-0.5b, hermes3-3b-q6, \
-             hermes3-70b-q4"
+             qwen3-14b-q5, qwen3-14b-q6, qwen3-30b-a3b-q4, qwen3-30b-a3b-q6, qwen2-0.5b, \
+             hermes3-3b-q6, hermes3-70b-q4"
         ),
     }
 }

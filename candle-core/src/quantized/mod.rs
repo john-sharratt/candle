@@ -44,7 +44,8 @@ pub use cuda::grouped_matmul_gemx;
 pub use cuda::set_force_dmmv;
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    alloc_host_mapped, get_vram_info, register_mmap_cuda, HostMappedAlloc, MmapRegistration,
+    alloc_host_mapped, get_total_vram_device0, get_vram_info, register_mmap_cuda, HostMappedAlloc,
+    MmapRegistration,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{
