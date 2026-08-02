@@ -112,6 +112,15 @@ struct Cli {
     #[arg(long)]
     compact_substrate: bool,
 
+    /// DESTRUCTIVE: delete the working dir's `.substrate` directory (redo-log
+    /// segments, logs — the daemon's entire persistent memory) before loading,
+    /// so this run starts from a blank substrate. Exists precisely so scripts
+    /// and test harnesses never have to `rm -rf` a substrate path themselves —
+    /// the deletion only ever happens behind this explicit flag, scoped to the
+    /// resolved working dir.
+    #[arg(long)]
+    wipe_substrate: bool,
+
     /// Address to bind the HTTP server to. Defaults to loopback only
     /// (`127.0.0.1`) — reachable from this machine alone. Pass `0.0.0.0` to
     /// listen on all IPv4 interfaces (LAN / VPN reachable). WARNING: the daemon
@@ -156,6 +165,32 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let workspace = ws_arg.canonicalize().unwrap_or(ws_arg);
+
+    // ── `--wipe-substrate`: explicit-flag-only substrate deletion ─────────────
+    //
+    // Runs BEFORE logging init (the file layer writes into `.substrate/`), so
+    // the wipe is complete before anything re-creates the directory. Only the
+    // resolved working dir's own `.substrate` is touched.
+    if cli.wipe_substrate {
+        let substrate_dir = workspace.join(".substrate");
+        if substrate_dir.exists() {
+            eprintln!(
+                "--wipe-substrate: deleting {} (persistent substrate)",
+                substrate_dir.display()
+            );
+            if let Err(e) = std::fs::remove_dir_all(&substrate_dir) {
+                anyhow::bail!(
+                    "--wipe-substrate: failed to delete {}: {e}",
+                    substrate_dir.display()
+                );
+            }
+        } else {
+            eprintln!(
+                "--wipe-substrate: {} does not exist — nothing to delete",
+                substrate_dir.display()
+            );
+        }
+    }
 
     // ── Logging ───────────────────────────────────────────────────────────────
     //
