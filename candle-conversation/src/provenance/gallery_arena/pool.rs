@@ -48,12 +48,6 @@ impl PagePool {
         }
     }
 
-    /// Pages per slab (the `gid → slab` stride).
-    #[inline]
-    pub fn slab_pages(&self) -> u32 {
-        self.slab_pages
-    }
-
     /// Decode a global page id into `(slab_idx, page_in_slab)`.
     #[inline]
     pub fn locate(&self, gid: u32) -> (usize, usize) {
@@ -65,18 +59,21 @@ impl PagePool {
 
     /// Slots currently handed out (not yet freed).
     #[inline]
+    #[cfg(test)]
     pub fn live(&self) -> usize {
         self.live
     }
 
     /// Slots physically backed by registered slabs.
     #[inline]
+    #[cfg(test)]
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
     /// Number of slabs registered so far.
     #[inline]
+    #[cfg(test)]
     pub fn slab_count(&self) -> usize {
         (self.capacity / self.slab_pages) as usize
     }
@@ -120,6 +117,7 @@ impl PagePool {
 
     /// Whether the next slot needs a new slab (no free slot and hwm at capacity).
     #[inline]
+    #[cfg(test)]
     pub fn needs_slab(&self) -> bool {
         self.free.is_empty() && self.hwm >= self.capacity
     }

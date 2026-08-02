@@ -219,6 +219,63 @@ fn main() {
         "backends on the same gallery (votes verified identical): {imma_line} | {scalar_line}"
     );
 
+    // ── Collection-shape reproduction: ONE union segment over every window
+    // (case = global exchange index) with a wide probe — the live `tools`
+    // collection geometry that produced `Bmma launch failed (rc -9)`
+    // (n_tokens ~220k, n_segments = 1, n_cases ~90, probes > 256). Forcing the
+    // BMMA rung turns the ladder's silent degrade into a hard error here, so
+    // this scenario either prints the failing geometry or proves it fixed.
+    {
+        // case = FILE index folded into ~93 slots (the live tools collection:
+        // several windows share each case), windows in case order.
+        const REPRO_CASES: usize = 93;
+        let mut windows: Vec<PagedWindow> = Vec::new();
+        for (fi, (tl, turns)) in files.iter().enumerate() {
+            let case = fi * REPRO_CASES / files.len().max(1);
+            for (turn_idx, sigs) in turns {
+                windows.push(PagedWindow {
+                    sid: turn_stream_id(*tl, *turn_idx),
+                    fingerprint: fp_of(sigs),
+                    turn: sigs.as_slice(),
+                    start: 0,
+                    end: sigs.len(),
+                    case,
+                });
+            }
+        }
+        let case = REPRO_CASES;
+        let union = PagedSegment {
+            windows,
+            n_cases: case,
+        };
+        // A wide probe (past the group scans' 256 budget) mirrors the live
+        // collection probe: concatenate windows up to 320 sigs.
+        let mut wide_probe: Vec<WideQSig> = Vec::new();
+        for (_, turns) in &files {
+            for (_, sigs) in turns {
+                if wide_probe.len() >= 320 {
+                    break;
+                }
+                wide_probe.extend_from_slice(sigs);
+            }
+        }
+        wide_probe.truncate(320);
+        println!(
+            "collection-shape: 1 segment, {} windows, {} cases, probe {}",
+            union.windows.len(),
+            case,
+            wide_probe.len()
+        );
+        for probe_len in [64usize, 128, 256, 320] {
+            let p = &wide_probe[..probe_len.min(wide_probe.len())];
+            let r = arena.scan_weighted_bmma(std::slice::from_ref(&union), &[p], &[]);
+            match r {
+                Ok(_) => println!("  BMMA probe={probe_len}: OK"),
+                Err(e) => println!("  BMMA probe={probe_len}: FAILED — {e}"),
+            }
+        }
+    }
+
     // ── Compare ─────────────────────────────────────────────────────────────
     assert_eq!(gpu.len(), cpu.len(), "case count mismatch");
     let mut max_abs = 0.0f32;

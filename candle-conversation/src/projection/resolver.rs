@@ -526,7 +526,7 @@ impl Conversation {
                     Ok(mut out) => Some(out.pop().unwrap_or_default()),
                     Err(e) => {
                         tracing::debug!(
-                            target: "provenance",
+                            target: "candle_conversation::provenance",
                             "GPU collection scan unavailable, using CPU: {e}"
                         );
                         None
@@ -594,8 +594,11 @@ impl Conversation {
         }
         self.ensure_normalization_warm(schema, target);
         // Collections (the tool catalog) live in the shared system prompt.
+        let t_coll = std::time::Instant::now();
         scores = self.score_belief_collections(&schema.system_prompt, probe, arena);
+        let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
+        let t_groups = std::time::Instant::now();
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
                 layer,
@@ -606,6 +609,16 @@ impl Conversation {
                 arena,
             ));
         }
+        // Phase split for the reproject `scan_ms`: which side of the scan the
+        // time went to (the collection scan vs the per-layer group scans), so a
+        // silent GPU→CPU fallback or a growing probe shows up attributably.
+        tracing::debug!(
+            target: "candle_conversation::provenance",
+            probe_windows = probe.len(),
+            collections_us = coll_us,
+            groups_us = t_groups.elapsed().as_micros() as u64,
+            "belief scan phase split"
+        );
         (scores, candidates)
     }
 
@@ -1028,7 +1041,7 @@ impl Conversation {
                     }
                     Err(e) => {
                         tracing::debug!(
-                            target: "provenance",
+                            target: "candle_conversation::provenance",
                             "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
                         );
                         None

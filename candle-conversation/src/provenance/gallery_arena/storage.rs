@@ -49,11 +49,6 @@ impl GalleryStorage {
         }
     }
 
-    #[inline]
-    pub fn slab_count(&self) -> usize {
-        self.slabs.len()
-    }
-
     /// Total VRAM held by the slabs, in bytes.
     #[inline]
     pub fn resident_bytes(&self) -> u64 {

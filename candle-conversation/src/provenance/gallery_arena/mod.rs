@@ -350,7 +350,7 @@ impl GalleryArena {
     /// generation still holds AND every referenced turn is still resident — in
     /// which case this **pins** them (bumping their LRU) for the scan and returns
     /// the shared index. Returns `None` on any miss (caller rebuilds).
-    pub(super) fn reuse_index(&self, fingerprint: u64) -> Option<Arc<scan::PagedIndex>> {
+    fn reuse_index(&self, fingerprint: u64) -> Option<Arc<scan::PagedIndex>> {
         let (gen, idx) = {
             let cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
             let ci = cache.get(&fingerprint)?;
@@ -382,7 +382,7 @@ impl GalleryArena {
     /// Cache `idx` (built at generation `gen`) under `fingerprint` for reuse.
     /// Bounded: a full flush on overflow is fine (rare, and entries invalidate
     /// wholesale whenever the generation moves anyway).
-    pub(super) fn store_index(&self, fingerprint: u64, gen: u64, idx: Arc<scan::PagedIndex>) {
+    fn store_index(&self, fingerprint: u64, gen: u64, idx: Arc<scan::PagedIndex>) {
         let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= INDEX_CACHE_CAP && !cache.contains_key(&fingerprint) {
             cache.clear();
