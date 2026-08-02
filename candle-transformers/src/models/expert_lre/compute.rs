@@ -68,7 +68,7 @@ pub fn compute_expert_contribution_gpu_weights(
 /// Returns `(device_ptr, shape, ggml_dtype)` for the underlying quantized tensor.
 /// Returns None if the tensor is not a CUDA QTensor.
 #[cfg(feature = "cuda")]
-fn extract_weight_info(
+pub(crate) fn extract_weight_info(
     qmm: &QMatMul,
 ) -> Result<(u64, candle::Shape, candle::quantized::GgmlDType)> {
     match qmm.inner() {

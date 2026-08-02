@@ -14,6 +14,8 @@ use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
 use super::compute::compute_experts_grouped;
 #[cfg(feature = "cuda")]
+use super::gpu_dispatch::GpuDispatchTables;
+#[cfg(feature = "cuda")]
 use super::pinned::{ExpertLocation, LayerGeometry, PinnedPool};
 #[cfg(not(feature = "cuda"))]
 use super::pipeline::prewarm_expert_cache;
@@ -30,6 +32,7 @@ use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
@@ -85,6 +88,18 @@ pub struct ExpertCache {
     /// Reused every MoE layer (only one is active at a time).
     #[cfg(feature = "cuda")]
     routing_pinned: Option<PinnedRoutingBuffer>,
+    /// Static GPU-native dispatch tables (all-resident cache only): per-expert
+    /// weight pointers indexed on-device by `moe_bucketize`'s tile tables, so
+    /// the expert forward needs no routing readback. `None` ⇒ host path.
+    #[cfg(feature = "cuda")]
+    gpu_dispatch: Option<GpuDispatchTables>,
+    /// Set when the pipeline thread has exited (normally or by panic). Its
+    /// `PipelineState` drop frees every expert slot, so the dispatch tables'
+    /// captured weight pointers become dangling — the GPU-native gate checks
+    /// this so a dead pipeline degrades to the host path's loud channel error
+    /// instead of silently dereferencing freed VRAM. Never set in inline mode
+    /// (no thread).
+    pipeline_dead: Arc<AtomicBool>,
     /// Expert IDs from the most recently completed MoE layer.
     /// Used by the next layer's hint to predict via transition matrix.
     prev_layer_experts: Mutex<Vec<usize>>,
@@ -373,6 +388,23 @@ impl ExpertCache {
             }
         }
 
+        // With every expert staged into a permanent VRAM slot by the
+        // (synchronous) startup above, the weight addresses are static:
+        // capture them into device pointer tables while `inner` is still in
+        // scope, so the expert forward dispatches entirely on-GPU (no per-layer
+        // routing readback, no pipeline-thread handoff). Only meaningful when
+        // all-resident — a paged cache's pointers move with eviction.
+        #[cfg(feature = "cuda")]
+        let gpu_dispatch = if all_resident {
+            if let Device::Cuda(cuda_dev) = device {
+                GpuDispatchTables::build(&inner, cuda_dev)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let state = PipelineState {
             inner,
             device: device.clone(),
@@ -405,7 +437,8 @@ impl ExpertCache {
             int8mode,
         };
 
-        let tx = spawn_pipeline_thread(state);
+        let pipeline_dead = Arc::new(AtomicBool::new(false));
+        let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
         Ok(Self {
             mode: PipelineMode::Threaded { tx },
@@ -414,6 +447,9 @@ impl ExpertCache {
             routing_stream,
             #[cfg(feature = "cuda")]
             routing_pinned,
+            #[cfg(feature = "cuda")]
+            gpu_dispatch,
+            pipeline_dead,
             prev_layer_experts: Mutex::new(Vec::new()),
             stats,
             #[cfg(feature = "profile")]
@@ -433,19 +469,30 @@ impl ExpertCache {
         slot_to_key: Vec<Option<(usize, usize)>>,
         device: &Device,
     ) -> Self {
+        let inner = ExpertCacheInner {
+            slots,
+            free_slots: vec![],
+            key_to_slot,
+            last_used,
+            generation,
+            slot_to_key,
+            expert_scores: vec![],
+            num_moe_layers: 0,
+            experts_per_layer: 0,
+        };
+        // All experts are VRAM-resident and never move, so their weight
+        // addresses are static: capture them once into device pointer tables
+        // and the expert forward dispatches entirely on-GPU (no per-layer
+        // routing readback). Best-effort — `None` keeps the host path.
+        #[cfg(feature = "cuda")]
+        let gpu_dispatch = if let Device::Cuda(cuda_dev) = device {
+            GpuDispatchTables::build(&inner, cuda_dev)
+        } else {
+            None
+        };
         Self {
             mode: PipelineMode::Inline {
-                inner: Mutex::new(ExpertCacheInner {
-                    slots,
-                    free_slots: vec![],
-                    key_to_slot,
-                    last_used,
-                    generation,
-                    slot_to_key,
-                    expert_scores: vec![],
-                    num_moe_layers: 0,
-                    experts_per_layer: 0,
-                }),
+                inner: Mutex::new(inner),
                 device: device.clone(),
             },
             all_resident: true, // prepopulated = all in VRAM
@@ -453,6 +500,9 @@ impl ExpertCache {
             routing_stream: None,
             #[cfg(feature = "cuda")]
             routing_pinned: None,
+            #[cfg(feature = "cuda")]
+            gpu_dispatch,
+            pipeline_dead: Arc::new(AtomicBool::new(false)),
             prev_layer_experts: Mutex::new(Vec::new()),
             stats: PipelineStats::new_shared(),
             #[cfg(feature = "profile")]
@@ -757,6 +807,22 @@ impl ExpertCache {
     #[cfg(feature = "cuda")]
     pub fn routing_stream(&self) -> Option<&Arc<CudaStream>> {
         self.routing_stream.as_ref()
+    }
+
+    /// The static GPU-native dispatch tables, when this cache is all-resident
+    /// and they were successfully built at construction. `Some` ⇒ the expert
+    /// forward can run entirely on-device (no routing readback).
+    #[cfg(feature = "cuda")]
+    pub fn gpu_dispatch(&self) -> Option<&GpuDispatchTables> {
+        self.gpu_dispatch.as_ref()
+    }
+
+    /// Whether the pipeline thread has exited — after which the dispatch
+    /// tables' captured weight pointers are dangling and the GPU-native path
+    /// must not run. Always `false` in inline mode.
+    pub fn pipeline_dead(&self) -> bool {
+        self.pipeline_dead
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get mutable access to the pinned routing buffer.

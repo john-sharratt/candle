@@ -7364,3 +7364,414 @@ fn qkv_segmented_vs_concat_same_format() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// moe_bucketize: bit-exact GPU vs CPU-reference tests
+// =============================================================================
+// The GPU bucketize replaces the CPU counting-sort in the grouped expert
+// compute path, so its outputs must be BIT-IDENTICAL to the CPU grouping —
+// asserted here with exact equality (never tolerances; the computation is pure
+// integer). The reference below deliberately mirrors the production sort's
+// single-pass cursor style (`forward_with_indices`), so these tests also prove
+// the kernel's per-expert-scan formulation reproduces the production grouping.
+
+/// CPU reference of the `moe_bucketize.cu` contract, padding included.
+struct BucketizeRef {
+    tok_ids: Vec<u32>,
+    weight_ids: Vec<u32>,
+    tile_expert: Vec<i32>,
+    tile_b_start: Vec<i32>,
+    tile_b_cnt: Vec<i32>,
+    perm: Vec<u32>,
+    rw_ids: Vec<u32>,
+    token_starts: Vec<i32>,
+    header: [i32; 4],
+}
+
+fn bucketize_ref(
+    ids: &[u32],
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+    tile_w: usize,
+) -> BucketizeRef {
+    let a_ub = n_tokens * k;
+    assert_eq!(ids.len(), a_ub);
+    let valid = |e: u32| (e as usize) < n_experts;
+
+    // Counts → offsets → tile prefix (kernel phase 2).
+    let mut counts = vec![0i32; n_experts];
+    for &e in ids {
+        if valid(e) {
+            counts[e as usize] += 1;
+        }
+    }
+    let mut offsets = vec![0i32; n_experts + 1];
+    let mut tile_pref = vec![0i32; n_experts + 1];
+    let mut n_active = 0i32;
+    for e in 0..n_experts {
+        offsets[e + 1] = offsets[e] + counts[e];
+        tile_pref[e + 1] = tile_pref[e] + (counts[e] + tile_w as i32 - 1) / tile_w as i32;
+        if counts[e] > 0 {
+            n_active += 1;
+        }
+    }
+    let total_valid = offsets[n_experts];
+    let num_tiles = tile_pref[n_experts];
+
+    // Stable bucket write — single-pass cursor, the `forward_with_indices` style.
+    let mut tok_ids = vec![u32::MAX; a_ub];
+    let mut weight_ids = vec![u32::MAX; a_ub];
+    let mut inv = vec![0u32; a_ub];
+    let mut cursors: Vec<i32> = offsets[..n_experts].to_vec();
+    for (i, &e) in ids.iter().enumerate() {
+        if valid(e) {
+            let row = cursors[e as usize];
+            cursors[e as usize] += 1;
+            tok_ids[row as usize] = (i / k) as u32;
+            weight_ids[row as usize] = i as u32;
+            inv[i] = row as u32;
+        }
+    }
+
+    // Tile tables + padding.
+    let mut tile_expert = vec![0i32; a_ub];
+    let mut tile_b_start = vec![0i32; a_ub];
+    let mut tile_b_cnt = vec![0i32; a_ub];
+    let tw = tile_w as i32;
+    for e in 0..n_experts {
+        let cnt = counts[e];
+        let base = tile_pref[e];
+        let mut t = 0i32;
+        while t * tw < cnt {
+            tile_expert[(base + t) as usize] = e as i32;
+            tile_b_start[(base + t) as usize] = offsets[e] + t * tw;
+            tile_b_cnt[(base + t) as usize] = (cnt - t * tw).min(tw);
+            t += 1;
+        }
+    }
+
+    // Token-major compaction + segment boundaries. Within a token the pairs are
+    // ordered by ascending expert-grouped row — the production scatter's
+    // `sort_by_key((token_id, row))` accumulation order, so the float-summation
+    // order downstream is bit-identical to the CPU-built tables.
+    let mut perm = vec![0u32; a_ub];
+    let mut rw_ids = vec![0u32; a_ub];
+    let mut token_starts = vec![0i32; n_tokens + 1];
+    let mut j = 0usize;
+    for t in 0..n_tokens {
+        token_starts[t] = j as i32;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for s in 0..k {
+            let i = t * k + s;
+            if valid(ids[i]) {
+                pairs.push((inv[i], i as u32));
+            }
+        }
+        pairs.sort_unstable();
+        for (row, widx) in pairs {
+            perm[j] = row;
+            rw_ids[j] = widx;
+            j += 1;
+        }
+    }
+    token_starts[n_tokens] = total_valid;
+
+    BucketizeRef {
+        tok_ids,
+        weight_ids,
+        tile_expert,
+        tile_b_start,
+        tile_b_cnt,
+        perm,
+        rw_ids,
+        token_starts,
+        header: [n_active, total_valid, num_tiles, 0],
+    }
+}
+
+/// Run the GPU bucketize for `ids` and assert every output buffer is
+/// bit-identical to the CPU reference.
+#[allow(clippy::too_many_arguments)]
+fn assert_bucketize_case(
+    device: &crate::Device,
+    ids: Vec<u32>,
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+    tile_w: usize,
+    label: &str,
+) -> Result<()> {
+    let reference = bucketize_ref(&ids, n_tokens, k, n_experts, tile_w);
+    let t = crate::Tensor::from_vec(ids, (n_tokens, k), device)?;
+    let cuda_dev = match device {
+        crate::Device::Cuda(d) => d.clone(),
+        _ => unreachable!(),
+    };
+    let mut ws = MoeBucketizeWorkspace::new(&cuda_dev, n_tokens, k)?;
+    moe_bucketize(&t, n_experts, tile_w, &mut ws)?;
+
+    let a_ub = n_tokens * k;
+    let tok = cuda_dev.memcpy_dtov(&ws.tok_ids.slice(..a_ub))?;
+    let wid = cuda_dev.memcpy_dtov(&ws.weight_ids.slice(..a_ub))?;
+    let te = cuda_dev.memcpy_dtov(&ws.tile_expert.slice(..a_ub))?;
+    let tbs = cuda_dev.memcpy_dtov(&ws.tile_b_start.slice(..a_ub))?;
+    let tbc = cuda_dev.memcpy_dtov(&ws.tile_b_cnt.slice(..a_ub))?;
+    let pm = cuda_dev.memcpy_dtov(&ws.perm.slice(..a_ub))?;
+    let rw = cuda_dev.memcpy_dtov(&ws.rw_ids.slice(..a_ub))?;
+    let ts = cuda_dev.memcpy_dtov(&ws.token_starts.slice(..n_tokens + 1))?;
+    let hd = cuda_dev.memcpy_dtov(&ws.header.slice(..4))?;
+
+    assert_eq!(hd, reference.header.to_vec(), "{label}: header");
+    assert_eq!(tok, reference.tok_ids, "{label}: tok_ids");
+    assert_eq!(wid, reference.weight_ids, "{label}: weight_ids");
+    assert_eq!(te, reference.tile_expert, "{label}: tile_expert");
+    assert_eq!(tbs, reference.tile_b_start, "{label}: tile_b_start");
+    assert_eq!(tbc, reference.tile_b_cnt, "{label}: tile_b_cnt");
+    assert_eq!(pm, reference.perm, "{label}: perm");
+    assert_eq!(rw, reference.rw_ids, "{label}: rw_ids");
+    assert_eq!(ts, reference.token_starts, "{label}: token_starts");
+    Ok(())
+}
+
+/// The GPU-native dispatch gate: `grouped_qmatmul_dev_q8a128` (full resident
+/// pointer table + `moe_bucketize` device tile tables, upper-bound launch) must
+/// produce BIT-IDENTICAL output rows to the host-orchestrated `grouped_qmatmul`
+/// (active-compacted pointer array + host-built tile tables) on the same
+/// operand and weights. Same tile decomposition, same per-tile pointer, same
+/// kernel ⇒ same bits; this pins it. With the bucketize outputs proven
+/// bit-identical to the CPU sort separately, and the gather/silu/scatter
+/// kernels shared verbatim between paths, this closes the equivalence chain
+/// for the whole GPU-native expert forward.
+#[test]
+fn cuda_grouped_qmatmul_dev_matches_host_tables() -> Result<()> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let n_experts = 32usize; // smaller expert pool keeps the fixture fast
+    let nrows = 256usize;
+    let ncols = 1024usize;
+    let wdtype = GgmlDType::Q6_K; // production base quant
+    let ko_dtype = GgmlDType::Q6_KO; // its KO twin (int8 grouped path)
+
+    // Random per-expert weights, quantized then KO-repacked (the model path).
+    let mut rng = StdRng::seed_from_u64(0x9e4a_11ce);
+    let shape = crate::Shape::from((nrows, ncols));
+    let mut full_ptrs: Vec<u64> = Vec::with_capacity(n_experts);
+    let mut storages = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let mut q = QCudaStorage::zeros(&dev, ncols * nrows, wdtype)?;
+        q.quantize(&CudaStorage::wrap_cuda_slice(
+            dev.memcpy_stod(&w)?,
+            dev.clone(),
+        ))?;
+        let ko = q.repack_ko(&shape, ko_dtype)?;
+        full_ptrs.push(ko.data_ptr());
+        storages.push(ko);
+    }
+    let full_table = dev.memcpy_stod(&full_ptrs)?;
+
+    for &(n_tokens, k, label) in &[
+        (1usize, 8usize, "decode-1tok"),
+        (7, 8, "mixed-small"),
+        (64, 8, "prefill-64"),
+        (200, 8, "prefill-200-multitile"),
+    ] {
+        let a_ub = n_tokens * k;
+        // Random routing (dense; every slot valid — the sentinel path is pinned
+        // by the bucketize tests and skipped rows never reach the GEMM).
+        let ids: Vec<u32> = (0..a_ub)
+            .map(|_| rng.random_range(0..n_experts as u32))
+            .collect();
+        let reference = bucketize_ref(&ids, n_tokens, k, n_experts, 32);
+        let total_valid = reference.header[1] as usize;
+
+        // GPU tables.
+        let t = crate::Tensor::from_vec(ids.clone(), (n_tokens, k), &device)?;
+        let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
+        moe_bucketize(&t, n_experts, 32, &mut ws)?;
+
+        // One shared stacked activation covering the full launch bound.
+        let act: Vec<f32> = (0..a_ub * ncols)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let op = quantize_acts_q8a128_test(&dev, &act, a_ub, ncols)?;
+
+        // Host path: active-compacted pointers + per-active-expert offsets,
+        // exactly as `forward_with_indices` builds them.
+        let mut counts = vec![0i32; n_experts];
+        for &e in &ids {
+            counts[e as usize] += 1;
+        }
+        let mut host_ptrs: Vec<u64> = Vec::new();
+        let mut host_offsets: Vec<i32> = vec![0];
+        for e in 0..n_experts {
+            if counts[e] > 0 {
+                host_ptrs.push(full_ptrs[e]);
+                host_offsets.push(host_offsets.last().unwrap() + counts[e]);
+            }
+        }
+        let host_out = grouped_qmatmul(
+            DynamicTensor::Int8(&op),
+            &host_ptrs,
+            ko_dtype,
+            nrows,
+            &host_offsets,
+            &dev,
+        )?;
+
+        // Device path: full table, raw ids, upper-bound launch.
+        let dev_out = grouped_qmatmul_dev_q8a128(
+            &op,
+            &full_table,
+            0,
+            n_experts,
+            ko_dtype,
+            nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            a_ub,
+            &dev,
+        )?;
+
+        let host_v = read_f32_tensor(&dev, &host_out)?;
+        let dev_v = read_f32_tensor(&dev, &dev_out)?;
+        let n_cmp = total_valid * nrows;
+        assert_eq!(
+            host_v[..n_cmp]
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            dev_v[..n_cmp]
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            "{label}: dev-table GEMM must be bit-identical to host-table GEMM"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+
+    // Decode: 1 token × k=8 distinct experts (the hot interactive case).
+    assert_bucketize_case(
+        &device,
+        vec![7, 3, 100, 42, 0, 127, 55, 9],
+        1,
+        8,
+        128,
+        32,
+        "decode-1tok",
+    )?;
+
+    // Duplicate experts within a token (allowed by the contract even though
+    // top-k emits distinct ids) and multiple tokens sharing experts.
+    assert_bucketize_case(
+        &device,
+        vec![3, 3, 5, 5, 5, 0, 1, 2, 3, 5, 0, 0, 0, 1, 2, 7],
+        2,
+        8,
+        8,
+        32,
+        "dup-experts",
+    )?;
+
+    // Router empty-slot sentinels (id == n_experts) and beyond must be skipped.
+    assert_bucketize_case(
+        &device,
+        vec![1, 16, 2, 99, 3, 16, 16, 4],
+        1,
+        8,
+        16,
+        32,
+        "sentinels",
+    )?;
+
+    // Everything routes to ONE expert → a deep bucket crossing many tile
+    // boundaries (multi-tile single expert, non-divisible tail).
+    assert_bucketize_case(
+        &device,
+        vec![5u32; 100 * 8],
+        100,
+        8,
+        128,
+        32,
+        "one-expert-multitile",
+    )?;
+
+    // All slots sentinel (pathological: nothing valid anywhere).
+    assert_bucketize_case(&device, vec![128u32; 4 * 8], 4, 8, 128, 32, "all-sentinel")?;
+
+    // k = 1 and tile_w = 16 shape edges.
+    assert_bucketize_case(&device, vec![2, 0, 2, 1, 2], 5, 1, 4, 16, "k1-tile16")?;
+
+    // Seeded fuzz across prefill-like shapes, with a sprinkle of sentinels.
+    let mut rng = StdRng::seed_from_u64(0xb0cc_e71e);
+    for &(n_tokens, k, n_experts, tile_w) in &[
+        (4usize, 8usize, 128usize, 32usize),
+        (64, 8, 128, 32),
+        (333, 8, 128, 32),
+        (1024, 8, 128, 32),
+        (2048, 8, 128, 32),
+        (7, 3, 16, 32),
+        (129, 8, 128, 16),
+        (17, 8, 128, 1),
+    ] {
+        let ids: Vec<u32> = (0..n_tokens * k)
+            .map(|_| {
+                if rng.random_ratio(1, 50) {
+                    n_experts as u32 // router sentinel
+                } else {
+                    rng.random_range(0..n_experts as u32)
+                }
+            })
+            .collect();
+        assert_bucketize_case(
+            &device,
+            ids,
+            n_tokens,
+            k,
+            n_experts,
+            tile_w,
+            &format!("fuzz-{n_tokens}x{k}-e{n_experts}-w{tile_w}"),
+        )?;
+    }
+
+    // Determinism: identical input twice through the SAME workspace must give
+    // byte-identical buffers (no atomics, no ordering hazards).
+    let n_tokens = 512usize;
+    let k = 8usize;
+    let ids: Vec<u32> = (0..n_tokens * k)
+        .map(|_| rng.random_range(0..128))
+        .collect();
+    let t = crate::Tensor::from_vec(ids, (n_tokens, k), &device)?;
+    let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
+    moe_bucketize(&t, 128, 32, &mut ws)?;
+    let first = (
+        dev.memcpy_dtov(&ws.tok_ids.slice(..n_tokens * k))?,
+        dev.memcpy_dtov(&ws.perm.slice(..n_tokens * k))?,
+        dev.memcpy_dtov(&ws.tile_b_cnt.slice(..n_tokens * k))?,
+    );
+    moe_bucketize(&t, 128, 32, &mut ws)?;
+    let second = (
+        dev.memcpy_dtov(&ws.tok_ids.slice(..n_tokens * k))?,
+        dev.memcpy_dtov(&ws.perm.slice(..n_tokens * k))?,
+        dev.memcpy_dtov(&ws.tile_b_cnt.slice(..n_tokens * k))?,
+    );
+    assert_eq!(first, second, "repeat run must be byte-identical");
+
+    Ok(())
+}
