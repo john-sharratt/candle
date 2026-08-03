@@ -2095,14 +2095,15 @@ impl Sequence {
         use crate::provenance::decode_wide_sigs;
         let empty = crate::substrate::ProjectionScores::new();
         let timeline = self.target.timeline;
-        let probe = {
+        let (probe, q_span) = {
             let read = self.substrate.read();
             let count = read.turn_count(timeline);
             if count == 0 {
                 return empty;
             }
-            match read
-                .wide_q_sigs_blob(timeline, TurnIndex(count - 1))
+            let idx = TurnIndex(count - 1);
+            let probe = match read
+                .wide_q_sigs_blob(timeline, idx)
                 .and_then(decode_wide_sigs)
             {
                 // Same head+tail window the live reproject scans (see
@@ -2115,15 +2116,27 @@ impl Sequence {
                 // opening belief.
                 Some(p) => cap_probe_window(p, self.config.reproject_max_probe_tokens),
                 None => return empty,
-            }
+            };
+            // Concept F: the sealed turn's question window is its persisted
+            // user span — the sig grid is 1:1 with the real-KV layout.
+            let q_span = read.user_sig_span(timeline, idx);
+            (probe, q_span)
         };
+        let probe_q = q_span.and_then(|r| probe.get(r)).filter(|q| !q.is_empty());
         let (scores, _) = self
             .substrate
             // observe = true: the seal scan is the once-per-turn learning
             // point for the score-normalization hit levels. No arena here (the
             // scheduler owns it) → the CPU per-file scan; the hot reproject path
             // runs the paged GPU scan over the resident arena.
-            .score_beliefs(self.projection.schema(), self.target, &probe, true, None);
+            .score_beliefs(
+                self.projection.schema(),
+                self.target,
+                &probe,
+                probe_q,
+                true,
+                None,
+            );
         scores
     }
 
@@ -3070,10 +3083,13 @@ impl ProbeCtx {
     pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, usize)> {
         let probe = self.probe_wide_q(text)?;
         let query_tokens = probe.len();
+        // The typed probe IS the question, so a separate Q-window would be
+        // identical to the tail scan — `None` scans it once.
         let (scores, _) = self.substrate.score_beliefs(
             self.projection.schema(),
             self.target,
             &probe,
+            None,
             false,
             None,
         );

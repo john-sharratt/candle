@@ -1,0 +1,10 @@
+# The captured fixture data is local-only: export/ is 657 files / ~46 MiB of
+# raw sig blobs + recorded events, and the conversation JSONs are multi-MB API
+# captures. Both are regenerable from the pre-repair substrate snapshot (see
+# README.md); the tests skip with a clear message when they are absent.
+# Checked in: README.md, ideal_projections.json (hand-authored test spec),
+# baseline_golden.json (the pinned characterization digest), this file.
+export/
+*.json
+!ideal_projections.json
+!baseline_golden.json

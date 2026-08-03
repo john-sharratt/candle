@@ -194,3 +194,50 @@ fn deterministic() {
     };
     assert_eq!(run(), run());
 }
+
+/// Concept A.4: a positive per-child floor REPLACES the cold-start prior and
+/// scope floor — a tiny fragment's high floor mutes it, while a quiet
+/// full-window child's small floor lets a rare hit amplify (the design's
+/// stand-out contract). No floors means today's behavior exactly.
+#[test]
+fn per_child_floors_replace_the_prior_and_scope_floor() {
+    let scope = ScopeKey::turn_group(1, 1);
+    let frag = ChildKey::named("fragment");
+    let full = ChildKey::named("full");
+    let cache = NormalizationCache::default();
+
+    // Both unobserved, equal raw score 400. The caller's policy computed a
+    // high size floor for the fragment (muted) and a small one for the
+    // full-window child (its rare hit amplifies well past the flat prior).
+    let raw = [(frag.clone(), 400.0), (full.clone(), 400.0)];
+    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 2.0]);
+    approx(val(&out, &frag), 1000.0 * 400.0 / 6400.0, 0.1); // 62.5 — muted
+    approx(val(&out, &full), 1000.0 * 400.0 / 2.0, 0.5); // 200_000 — stands out
+
+    // A zero floor keeps the standard prior path for that child.
+    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 0.0]);
+    approx(val(&out, &full), 1000.0 * 400.0 / 400.0, 0.1); // cold prior 400
+
+    // Empty floors ⇒ identical to plain normalize.
+    let a = cache.normalize_with_floors(&scope, &raw, &[]);
+    let b = cache.normalize(&scope, &raw);
+    assert_eq!(a, b);
+}
+
+/// The floored path normalizes against the child's observed TRAFFIC PEAK when
+/// it exceeds the floor — a hit at the peak lands at the scale, and the prior
+/// seed never inflates the denominator.
+#[test]
+fn traffic_peak_dominates_the_supplied_floor() {
+    let scope = ScopeKey::turn_group(1, 1);
+    let x = ChildKey::named("x");
+    let mut cache = NormalizationCache::default();
+    // Observed traffic peaked at 5000 (regardless of the EWMA's blend).
+    cache.observe(&scope, &[(x.clone(), 5000.0)]);
+    cache.observe(&scope, &[(x.clone(), 100.0)]);
+    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 5000.0)], &[100.0]);
+    approx(val(&out, &x), 1000.0, 1.0);
+    // A weak hit relative to that peak mutes proportionally.
+    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 500.0)], &[100.0]);
+    approx(val(&out, &x), 100.0, 0.5);
+}

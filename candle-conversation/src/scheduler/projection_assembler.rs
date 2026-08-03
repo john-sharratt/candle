@@ -1023,7 +1023,12 @@ fn inject_sealed_section(
     sid: SectionId,
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
-    let sealed = match ctx.conversation.read().section_sealed_of(sid) {
+    // Drop the scrutinee read guard before the match body (see the same note in
+    // `inject_sealed_turn`): defensive — no arm here re-locks today, but the
+    // match-scrutinee-temporary rule would turn any future re-`read()` in an arm
+    // into a recursive-read self-deadlock under the writer-priority `RwLock`.
+    let sealed = ctx.conversation.read().section_sealed_of(sid);
+    let sealed = match sealed {
         Some(s) => s,
         None => {
             walker.skipped_sections += 1;
@@ -1086,7 +1091,18 @@ fn inject_sealed_turn(
         return Ok(());
     };
 
-    let sealed = match ctx.conversation.read().turn_sealed_of(timeline, index) {
+    // Bind the read to a local so the scrutinee's `RwLockReadGuard` drops BEFORE
+    // the match body runs. A guard created in a match scrutinee lives for the
+    // WHOLE match (Rust temporary-lifetime rule), so the `None` arm's re-`read()`
+    // below would be a *recursive* read on the substrate lock — which
+    // self-deadlocks against a writer queued between the two acquisitions under
+    // the writer-preferring std `RwLock`. Observed live during a heavy
+    // concurrent re-ingest: the scheduler held this scrutinee read while blocked
+    // re-reading it, and the ingest write path (adopt/couple/mint) had a writer
+    // queued, so writer-priority refused the second read forever. `turn_sealed_of`
+    // returns an owned `Arc`, so the early drop is free.
+    let sealed = ctx.conversation.read().turn_sealed_of(timeline, index);
+    let sealed = match sealed {
         Some(s) => s,
         None => {
             walker.skipped_turns += 1;

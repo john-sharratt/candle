@@ -42,7 +42,7 @@
 
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{QuantFormat, SealedSequence};
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
@@ -69,7 +69,7 @@ use crate::summary_tree::{
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::TurnLayout;
+use crate::turn_layout::{TurnLayout, TurnSegment};
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -584,6 +584,14 @@ pub struct PurgeReport {
 pub struct ProjectionScores {
     turns: AHashMap<TurnKey, f32>,
     sections: AHashMap<SectionId, f32>,
+    /// Concept B attention mass per score competition: turn groups keyed by
+    /// group id, collections keyed by collection id. Computed by the belief
+    /// scan; consumed by the flexbox / member-budget modulation in `project`.
+    group_mass: AHashMap<u32, f32>,
+    collection_mass: AHashMap<u32, f32>,
+    /// Concept C: turns whose score was RAISED by locality drag (selected only
+    /// through a neighbor) — stamped `SelectionOrigin::Locality` at selection.
+    locality_boosted: AHashSet<TurnKey>,
 }
 
 impl ProjectionScores {
@@ -625,10 +633,47 @@ impl ProjectionScores {
         self.sections.len()
     }
 
+    /// Record a turn group's Concept B attention mass.
+    pub fn set_group_mass(&mut self, group: GroupId, mass: f32) {
+        self.group_mass.insert(group.raw(), mass);
+    }
+
+    /// Record a collection's Concept B attention mass.
+    pub fn set_collection_mass(&mut self, collection: u32, mass: f32) {
+        self.collection_mass.insert(collection, mass);
+    }
+
+    /// A turn group's attention mass (0 when unscored this projection).
+    pub fn group_mass(&self, group: GroupId) -> f32 {
+        self.group_mass.get(&group.raw()).copied().unwrap_or(0.0)
+    }
+
+    /// A collection's attention mass (0 when unscored this projection).
+    pub fn collection_mass(&self, collection: u32) -> f32 {
+        self.collection_mass
+            .get(&collection)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Mark a turn as locality-boosted (Concept C).
+    pub fn mark_locality_boost(&mut self, timeline: TimelineId, index: TurnIndex) {
+        self.locality_boosted.insert(TurnKey::new(timeline, index));
+    }
+
+    /// Whether a turn's score was raised by locality drag.
+    pub fn is_locality_boosted(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.locality_boosted
+            .contains(&TurnKey::new(timeline, index))
+    }
+
     /// Discard every score, leaving the cache empty.
     pub fn clear(&mut self) {
         self.turns.clear();
         self.sections.clear();
+        self.group_mass.clear();
+        self.collection_mass.clear();
+        self.locality_boosted.clear();
     }
 
     /// Test helper: resolve `group`'s first registered timeline against
@@ -796,6 +841,23 @@ pub trait ContentResolver {
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
     fn turn_score(&self, turn: TurnKey) -> f32;
+
+    /// Concept B: a turn group's attention mass this projection (0 = no mass /
+    /// unscored — adaptivity then rests at the static budget).
+    fn group_attention_mass(&self, _group: GroupId) -> f32 {
+        0.0
+    }
+
+    /// Concept B: a collection's attention mass this projection.
+    fn collection_attention_mass(&self, _collection: u32) -> f32 {
+        0.0
+    }
+
+    /// Concept C: whether this turn's score was raised by locality drag —
+    /// selection stamps such picks `SelectionOrigin::Locality`.
+    fn turn_locality_boosted(&self, _turn: TurnKey) -> bool {
+        false
+    }
 
     /// Layer that produced a given turn.  Used to denormalise
     /// `layer_id` onto the emitted `TurnId` without a back-lookup
@@ -2673,6 +2735,13 @@ impl Substrate {
         self.streams.get(&stream_id)
     }
 
+    /// Whether ANY indexed stream carries KV chunk records. `false` means this
+    /// workspace never persists KV (e.g. `compression_policy = None`), so the
+    /// startup integrity check must not treat chunk absence as damage.
+    pub fn any_stream_has_chunks(&self) -> bool {
+        self.streams.values().any(|s| !s.chunks.is_empty())
+    }
+
     /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
     ///
     /// The belief scan reads the same static gallery on every reprojection;
@@ -2777,6 +2846,18 @@ impl Substrate {
     /// compaction dead-ratio calculation.
     pub fn live_chunk_count(&self) -> usize {
         self.streams.values().map(|s| s.chunks.len()).sum()
+    }
+
+    /// Streams that hold KV chunks but have NO `StreamDecl` — orphans. Their
+    /// turn cannot be reconstructed (reload rebuilds turns from their decl), so
+    /// the chunks are unreachable and the turn is silently lost. Surfaced at
+    /// reload so this loss is VISIBLE rather than silent, and reclaimed by
+    /// compaction (see `collect_live_records`). A healthy substrate reports 0.
+    pub fn orphan_chunk_stream_count(&self) -> usize {
+        self.streams
+            .values()
+            .filter(|s| s.decl.is_none() && !s.chunks.is_empty())
+            .count()
     }
 
     /// Clear every per-entity collection populated from redo-log
@@ -4089,6 +4170,31 @@ impl Substrate {
             .and_then(|s| s.wide_q_sigs.as_deref())
     }
 
+    /// The turn's user-half span in its real-KV grid — the Concept F question
+    /// window (`docs/provenance_adaptive_projection.md` §8). Read from the
+    /// persisted turn layout's `User` segments; `gather_wide_sigs` emits one
+    /// signature per real token 1:1 with this grid, so the range indexes the
+    /// decoded sig window directly. `None` when the turn has no user segment.
+    pub fn user_sig_span(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<std::ops::Range<usize>> {
+        let stream = self.streams.get(&turn_stream_id(timeline.raw(), index.0))?;
+        let Some(StreamDecl::Turn(decl)) = &stream.decl else {
+            return None;
+        };
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for seg in &decl.segments {
+            if let TurnSegment::User { kv, .. } = seg {
+                lo = lo.min(kv.offset as usize);
+                hi = hi.max(kv.end() as usize);
+            }
+        }
+        (hi > lo && lo != usize::MAX).then(|| lo..hi)
+    }
+
     // ── Section accessors ────────────────────────────────────────────────────
 
     /// Create a section entry atomically with all data including sealed KV.
@@ -4513,6 +4619,18 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         self.scores.turn(turn.timeline, turn.index)
     }
 
+    fn group_attention_mass(&self, group: GroupId) -> f32 {
+        self.scores.group_mass(group)
+    }
+
+    fn collection_attention_mass(&self, collection: u32) -> f32 {
+        self.scores.collection_mass(collection)
+    }
+
+    fn turn_locality_boosted(&self, turn: TurnKey) -> bool {
+        self.scores.is_locality_boosted(turn.timeline, turn.index)
+    }
+
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.substrate.timeline_target(turn.timeline)?;
         Some(layer)
@@ -4565,7 +4683,7 @@ pub struct SubstrateRead<'a> {
 impl<'a> SubstrateRead<'a> {
     /// Lookup helper: returns the attached scores, or an empty default
     /// when this is an unscored read.
-    fn scores_or_empty(&self) -> &ProjectionScores {
+    pub(crate) fn scores_or_empty(&self) -> &ProjectionScores {
         static EMPTY_SCORES: OnceLock<ProjectionScores> = OnceLock::new();
         self.scores
             .unwrap_or_else(|| EMPTY_SCORES.get_or_init(ProjectionScores::default))
@@ -4615,6 +4733,19 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
             return 0.0;
         }
         self.scores_or_empty().turn(turn.timeline, turn.index)
+    }
+
+    fn group_attention_mass(&self, group: GroupId) -> f32 {
+        self.scores_or_empty().group_mass(group)
+    }
+
+    fn collection_attention_mass(&self, collection: u32) -> f32 {
+        self.scores_or_empty().collection_mass(collection)
+    }
+
+    fn turn_locality_boosted(&self, turn: TurnKey) -> bool {
+        self.scores_or_empty()
+            .is_locality_boosted(turn.timeline, turn.index)
     }
 
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {

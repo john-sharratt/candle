@@ -483,6 +483,7 @@ impl Scheduler {
                 // pressure instead of reactively after a forward already stalled.
                 let swept = self.session.release_empty_arenas().unwrap_or(0);
                 if swept > 0 {
+                    relief_trace::note("sched", "arena_sweep", swept as u64, 0);
                     tracing::debug!(
                         target: "candle_conversation::scheduler::vram_relief",
                         arenas_swept = swept,
@@ -629,6 +630,9 @@ impl Scheduler {
         // anyway; the memory is fragmented, not merely pending-free).
         if let Some((before, after)) = self.session.trim_kv_pool(keep) {
             let freed = before.saturating_sub(after);
+            if freed > 0 {
+                relief_trace::note("sched", "pool_trim", before as u64, after as u64);
+            }
             tracing::debug!(
                 "trimmed KV pool: reserved {}MiB -> {}MiB (freed {}MiB, kept used {}MiB + slack)",
                 mib(before),

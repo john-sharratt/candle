@@ -53,8 +53,12 @@
       const body = await getJSON('/v1/conversations/' + enc(id));
       const sectionContent = {};
       (body.section_content || []).forEach((s) => { sectionContent[s.name] = s.content; });
+      // Keyed by group::timeline::index — one group holds many conversations
+      // (code_read: one per file) and turn indices repeat across them, so the
+      // timeline is a load-bearing part of the key. `text` is absent for turns
+      // whose Tokens record was lost; consumers fall back to the halves.
       const turnContent = {};
-      (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
+      (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.timeline + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
       return {
         id: String(id),
         history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [], files: m.files || [] })),

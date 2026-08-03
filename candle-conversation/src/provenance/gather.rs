@@ -14,8 +14,9 @@
 //!
 //! See `docs/tool_selection_provenance_results.md` §24.
 
+use super::fusion::FusionMode;
 use super::selection::{GroupBudget, SectionPolicy, SectionSelector};
-use super::{score_provenance_late_fusion_weighted, WideQSig};
+use super::{score_provenance_late_fusion_fused, score_provenance_late_fusion_grouped, WideQSig};
 
 /// One slot's belief after a step: its confidence and whether it is selected.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +54,27 @@ pub fn score_slots_weighted(
     n_slots: usize,
     group_weights: &[f32],
 ) -> Vec<f32> {
+    score_slots_fused(
+        query,
+        gallery_windows,
+        gallery_slot,
+        n_slots,
+        group_weights,
+        FusionMode::Additive,
+    )
+}
+
+/// Per-fold-group slot scores (Concept G): `out[g][slot]` — each group's
+/// independently needle-gated tally, weighted by `group_weights`. The caller
+/// fuses per its policy mode and derives the ungated additive sum for the
+/// Concept B mass from the same tallies.
+pub fn score_slots_grouped(
+    query: &[WideQSig],
+    gallery_windows: &[&[WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    group_weights: &[f32],
+) -> Vec<Vec<f32>> {
     let total: usize = gallery_windows.iter().map(|w| w.len()).sum();
     let mut gtoks: Vec<&WideQSig> = Vec::with_capacity(total);
     let mut gcase: Vec<u32> = Vec::with_capacity(total);
@@ -66,7 +88,34 @@ pub fn score_slots_weighted(
             gcase.push(slot as u32);
         }
     }
-    score_provenance_late_fusion_weighted(query, &gtoks, &gcase, n_slots, group_weights)
+    score_provenance_late_fusion_grouped(query, &gtoks, &gcase, n_slots, group_weights)
+}
+
+/// [`score_slots_weighted`] under a Concept G [`FusionMode`] — the policy's
+/// `fusion:` value flows here. `Additive` is bit-identical to the shipped
+/// scorer; the other modes score each fold group separately and combine.
+pub fn score_slots_fused(
+    query: &[WideQSig],
+    gallery_windows: &[&[WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    group_weights: &[f32],
+    mode: FusionMode,
+) -> Vec<f32> {
+    let total: usize = gallery_windows.iter().map(|w| w.len()).sum();
+    let mut gtoks: Vec<&WideQSig> = Vec::with_capacity(total);
+    let mut gcase: Vec<u32> = Vec::with_capacity(total);
+    for (wi, w) in gallery_windows.iter().enumerate() {
+        let slot = gallery_slot.get(wi).copied().unwrap_or(usize::MAX);
+        if slot >= n_slots {
+            continue;
+        }
+        for t in w.iter() {
+            gtoks.push(t);
+            gcase.push(slot as u32);
+        }
+    }
+    score_provenance_late_fusion_fused(query, &gtoks, &gcase, n_slots, group_weights, mode)
 }
 
 /// One online belief update: reseed from the prior projection (`prior_scores` +
@@ -114,6 +163,62 @@ pub fn belief_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+
+    /// A folded signature: `PROV_HEADS_PER_LAYER × 3` heads → 3 fold groups.
+    fn sig(fill: [u64; 3]) -> WideQSig {
+        // 3 groups × PROV_HEADS_PER_LAYER heads × 2 words/head (128-bit heads).
+        let words_per_head = 2;
+        let mut words = Vec::new();
+        for g in fill {
+            for _ in 0..(PROV_HEADS_PER_LAYER * words_per_head) {
+                words.push(g);
+            }
+        }
+        WideQSig {
+            n_heads: (PROV_HEADS_PER_LAYER * 3) as u16,
+            words,
+        }
+    }
+
+    /// The GPU content_gated path (resolver.rs) is per-group one-hot arena scans
+    /// combined by [`FusionMode::fuse`]. Each one-hot scan has proven GPU=CPU
+    /// parity (`examples/gpu_belief_parity.rs`), so the fused result is correct
+    /// BY COMPOSITION iff `score_slots_fused(ContentGated)` equals fusing the
+    /// per-group `score_slots_grouped` tallies. This locks that composition on
+    /// CPU — the GPU path can then rely on it.
+    #[test]
+    fn fused_content_gated_equals_grouped_composition() {
+        let a = 0xAAAA_AAAA_AAAA_AAAAu64;
+        let b = 0x5555_5555_5555_5555u64;
+        // Slot 0: agrees with the probe only in the id groups (1,2), zero in the
+        // content group (0) — the "spike". Slot 1: agrees in every group.
+        let probe = [sig([a, a, a])];
+        let s0 = [sig([b, a, a])];
+        let s1 = [sig([b, b, b])]; // complement-ish, weaker but present everywhere
+        let windows: Vec<&[WideQSig]> = vec![&s0, &s1];
+        let slots = [0usize, 1];
+
+        let grouped = score_slots_grouped(&probe, &windows, &slots, 2, &[]);
+        let manual = FusionMode::ContentGated { gate_group: 0 }.fuse(&grouped);
+        let fused = score_slots_fused(
+            &probe,
+            &windows,
+            &slots,
+            2,
+            &[],
+            FusionMode::ContentGated { gate_group: 0 },
+        );
+        assert_eq!(
+            fused, manual,
+            "score_slots_fused(ContentGated) must equal fuse(score_slots_grouped) — \
+             the GPU path relies on this composition"
+        );
+        // Additive stays the shipped single-pass scorer.
+        let additive = score_slots_fused(&probe, &windows, &slots, 2, &[], FusionMode::Additive);
+        let shipped = score_slots(&probe, &windows, &slots, 2);
+        assert_eq!(additive, shipped);
+    }
 
     fn policy(beta: f32, min: f32, evict: f32) -> SectionPolicy {
         SectionPolicy {

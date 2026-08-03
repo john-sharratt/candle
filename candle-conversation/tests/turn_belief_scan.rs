@@ -101,6 +101,7 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         &builder.schema().layers[0],
         target,
         &probe,
+        None,
         &mut scores,
         false,
         None,
@@ -180,6 +181,7 @@ fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
         &builder.schema().layers[0],
         target,
         &probe,
+        None,
         &mut scores,
         false,
         None,
@@ -295,7 +297,7 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
 
     // The non-target clusters group was scored, and the probed turn wins.
     let s0 = scores.turn(mem_tl, TurnIndex(0));
@@ -367,7 +369,7 @@ fn append_only_target_masks_belief_groups_self_local() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
 
     // The clusters group's turns (on mem_tl) are masked to the target timeline
     // (dlg_tl), which has none — so nothing is scored and no candidates surface.
@@ -442,7 +444,7 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false, None);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
 
     // The probed turn (index 1) wins in EVERY file — including `file_b`, the
     // second-registered one, which the old collapse never scored.
@@ -548,6 +550,7 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
             &builder.schema().layers[0],
             target,
             &probe,
+            None,
             &mut scores,
             false,
             arena,
@@ -680,8 +683,8 @@ fn score_belief_collections_gpu_matches_cpu() {
     let coll = sp.collection_named("tools").expect("tools collection");
 
     let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
-    let cpu = conv.score_belief_collections(sp, &probe, None);
-    let gpu = conv.score_belief_collections(sp, &probe, Some(&arena));
+    let cpu = conv.score_belief_collections(sp, &probe, None, false, None);
+    let gpu = conv.score_belief_collections(sp, &probe, None, false, Some(&arena));
 
     let mut cpu_scores = Vec::new();
     let mut gpu_scores = Vec::new();
@@ -708,7 +711,7 @@ fn score_belief_collections_gpu_matches_cpu() {
         assert_eq!(gamma, 0.0, "gamma has no gallery exemplars");
     }
     // A second GPU scan hits the arena's index cache and must be identical.
-    let gpu2 = conv.score_belief_collections(sp, &probe, Some(&arena));
+    let gpu2 = conv.score_belief_collections(sp, &probe, None, false, Some(&arena));
     for s in &coll.sections {
         assert_eq!(
             gpu.section(s.id).to_bits(),
@@ -739,6 +742,7 @@ fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
         &builder.schema().layers[0],
         target,
         &[],
+        None,
         &mut scores,
         false,
         None,

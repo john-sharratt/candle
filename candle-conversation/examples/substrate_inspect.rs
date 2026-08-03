@@ -27,7 +27,7 @@
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
 //! `streams`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,7 +35,7 @@ use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 
 use candle_conversation::persistence::accounting::RecordAccounting;
-use candle_conversation::persistence::content_hash::ContentHash;
+use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHash};
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, Manifest,
@@ -53,6 +53,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::substrate::{StreamRuntime, Substrate};
 use candle_conversation::summary_tree::TurnKind;
+use candle_conversation::turn_layout::TurnSegment;
 use candle_nn::kv_cache::KvFormat;
 use tokenizers::Tokenizer;
 
@@ -246,6 +247,155 @@ fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filter: Option<&str>) {
 
 /// Directory-mode `conversations`: fold every segment in ascending id order so
 /// cross-segment last-writer-wins holds, then print.
+/// Export the selection-replay fixture: raw wide-Q sig blobs + recorded
+/// projection events for every projection point of the given dialogue
+/// timelines, sig blobs + decls for every turn those events ever selected,
+/// and full sig galleries for every turn whose tags match a `--tag`
+/// substring. Walks EVERY segment (metadata-filtered — chunk/token payloads
+/// are never read), so it is safe and cheap relative to store size.
+fn export_replay(
+    segs: &[(u64, PathBuf, bool)],
+    timelines: &[String],
+    tags: &[String],
+    out: &Path,
+) -> Result<()> {
+    let wanted: Vec<u64> = timelines
+        .iter()
+        .map(|s| parse_stream_id(s).map(|id| id.0))
+        .collect::<Result<_>>()?;
+    if wanted.is_empty() && tags.is_empty() {
+        anyhow::bail!("export-replay: pass at least one --timeline or --tag");
+    }
+    let sig_dir = out.join("sigs");
+    let ev_dir = out.join("events");
+    std::fs::create_dir_all(&sig_dir)?;
+    std::fs::create_dir_all(&ev_dir)?;
+
+    // Merged metadata substrate across every segment, in ascending id order —
+    // last-writer-wins exactly as the daemon's reload resolves it.
+    let substrate = build_substrate_merged(segs)?;
+
+    // One pass over the stream index: bucket turn streams by what exports them.
+    let mut dialogue: Vec<serde_json::Value> = Vec::new();
+    let mut selected: std::collections::BTreeSet<(u64, u32)> = std::collections::BTreeSet::new();
+    let mut turn_meta: BTreeMap<(u64, u32), serde_json::Value> = BTreeMap::new();
+    let mut targets: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    let mut sig_bytes_written = 0usize;
+
+    let mut dump_sig = |tl: u64, idx: u32, blob: Option<&Vec<u8>>| -> Option<String> {
+        let blob = blob?;
+        let name = format!("{tl}_{idx}.wqs");
+        std::fs::write(sig_dir.join(&name), blob).ok()?;
+        sig_bytes_written += blob.len();
+        Some(name)
+    };
+
+    for (_, s) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(decl)) = &s.decl else {
+            continue;
+        };
+        let (tl, idx) = (decl.timeline_id, decl.turn_index);
+        // The user half's span in the turn's real-KV grid — the exact Concept F
+        // Q-window bounds (`gather_wide_sigs` is 1:1 with this grid).
+        let user_spans: Vec<serde_json::Value> = decl
+            .segments
+            .iter()
+            .filter_map(|s| match s {
+                TurnSegment::User { kv, .. } => {
+                    Some(serde_json::json!({ "offset": kv.offset, "len": kv.len }))
+                }
+                _ => None,
+            })
+            .collect();
+        let meta = serde_json::json!({
+            "timeline": tl.to_string(),
+            "index": idx,
+            "role": decl.role,
+            "tags": decl.tags,
+            "block_span": decl.block_end - decl.block_start,
+            "user_spans": user_spans,
+            "tombstoned": TimelineId::from_raw(tl)
+                .map(|t| substrate.is_turn_tombstoned(t, idx) || substrate.is_tombstoned(t))
+                .unwrap_or(false),
+            "sig": format!("{tl}_{idx}.wqs"),
+            "has_sig": s.wide_q_sigs.is_some(),
+        });
+        turn_meta.insert((tl, idx), meta.clone());
+
+        if wanted.contains(&tl) {
+            let sig = dump_sig(tl, idx, s.wide_q_sigs.as_ref());
+            let mut n_events = 0usize;
+            let ev_file = s.projection_events.as_ref().map(|bytes| {
+                let events = decode_events(bytes);
+                n_events = events.len();
+                for ev in &events {
+                    for t in &ev.selection.turns {
+                        if t.selected && t.index != u32::MAX {
+                            if let Some(sel_tl) = t.timeline {
+                                selected.insert((sel_tl, t.index));
+                            }
+                        }
+                    }
+                }
+                let name = format!("{tl}_{idx}.events.json");
+                std::fs::write(ev_dir.join(&name), bytes).ok();
+                name
+            });
+            let mut entry = meta.clone();
+            entry["sig_written"] = serde_json::json!(sig.is_some());
+            entry["events"] = serde_json::json!(ev_file);
+            entry["n_events"] = serde_json::json!(n_events);
+            dialogue.push(entry);
+        }
+
+        for tag_filter in tags {
+            if decl.tags.iter().any(|t| t.contains(tag_filter.as_str())) {
+                dump_sig(tl, idx, s.wide_q_sigs.as_ref());
+                targets.entry(tag_filter.clone()).or_default().push(meta);
+                break;
+            }
+        }
+    }
+
+    // Candidate sigs: every turn any exported dialogue event selected.
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+    for (tl, idx) in &selected {
+        let stream_id = turn_stream_id(*tl, *idx);
+        let blob = substrate
+            .stream_of(stream_id)
+            .and_then(|s| s.wide_q_sigs.as_ref());
+        dump_sig(*tl, *idx, blob);
+        match turn_meta.get(&(*tl, *idx)) {
+            Some(meta) => candidates.push(meta.clone()),
+            None => candidates.push(serde_json::json!({
+                "timeline": tl.to_string(),
+                "index": idx,
+                "missing_decl": true,
+            })),
+        }
+    }
+
+    let manifest = serde_json::json!({
+        "captured_from": "pre-integrity-repair substrate snapshot",
+        "dialogue_turns": dialogue,
+        "selected_candidates": candidates,
+        "targets": targets,
+    });
+    std::fs::write(
+        out.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    eprintln!(
+        "exported: {} dialogue turns, {} selected candidates, {} target groups, {:.1} MiB of sigs → {}",
+        dialogue.len(),
+        candidates.len(),
+        targets.len(),
+        sig_bytes_written as f64 / (1024.0 * 1024.0),
+        out.display(),
+    );
+    Ok(())
+}
+
 fn segment_conversations(segs: &[(u64, PathBuf, bool)], filter: Option<&str>) -> Result<()> {
     let mut rows: BTreeMap<u64, ConvRow> = BTreeMap::new();
     for (id, path, _) in segs {
@@ -260,6 +410,26 @@ fn segment_conversations(segs: &[(u64, PathBuf, bool)], filter: Option<&str>) ->
 enum Cmd {
     /// File + superblock overview, record histogram, live/dead ratio.
     Summary,
+    /// Export a conversation's projection points + candidate/target galleries
+    /// as an offline selection-replay fixture
+    /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
+    /// wide-Q sig blob + recorded projection events; per turn ever selected in
+    /// those events its sig blob + decl; plus every turn whose tags match a
+    /// `--tag` substring (target galleries, e.g. a file's conversation or the
+    /// tool corpus). Directory target only — walks EVERY segment.
+    ExportReplay {
+        /// Dialogue timeline id(s) to export projection points for
+        /// (decimal or `0x`-hex).
+        #[arg(long)]
+        timeline: Vec<String>,
+        /// Tag substring(s) selecting target-gallery turns (e.g.
+        /// `models/builder.rs`, `tool`).
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Output directory (created if absent).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Every record in append order: offset, type, ids, sizes.
     Headers,
     /// Validate the substrate end-to-end (read-only). Two passes: (1) re-verify
@@ -347,8 +517,10 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         max_budget: usize,
         /// Scorer: `fused` (shipped z-late-fusion), `margin` (per-token margin
-        /// vote, all groups), or `margin-id` (margin over identity groups only,
-        /// skipping the noise group L0–45).
+        /// vote, all groups), `margin-id` (margin over identity groups only,
+        /// skipping the noise group L0–45), or `gated` (Concept G content-gated
+        /// fusion: per-group scans, id-group votes count only when the content
+        /// group agrees).
         #[arg(long, default_value = "fused")]
         scorer: String,
         /// Truncate each probe to its last N tokens (0 = full turn) to match the
@@ -364,6 +536,11 @@ enum Cmd {
         /// `score_slots` lower bound.
         #[arg(long)]
         normalize: bool,
+        /// Cap the corpus to the first N tagged turns (0 = all) — bounded
+        /// sampling for large content corpora where full leave-one-out is
+        /// quadratic.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// §80.3 production-faithful replay: unlike `belief-eval` (which scores ONE
     /// window per turn), this replays each turn's recorded reprojection sequence
@@ -404,6 +581,11 @@ enum Cmd {
         /// over probe tokens, so this sets the threshold's scale.
         #[arg(long, default_value_t = 64)]
         probe_tokens: usize,
+        /// Sweep on the production 0–1000 hit-level band instead of raw scores —
+        /// the Concept A threshold-migration derivation (same causal
+        /// corpus-order normalization pass as `belief-eval --normalize`).
+        #[arg(long)]
+        normalize: bool,
     },
     /// §82 — model a conditional-decay (adaptive) probe window: walk the window
     /// backward in chunks, accumulate a weighted belief, and let each chunk's
@@ -435,6 +617,36 @@ enum Cmd {
         /// How many discriminative tokens to list.
         #[arg(long, default_value_t = 20)]
         tokens: usize,
+    },
+    /// §11.1 selection-replay: for each dialogue turn of a target conversation,
+    /// replay the PRODUCTION content-axis scoring chain
+    /// (`docs/provenance_adaptive_projection.md`) offline against the real
+    /// substrate galleries — content-gated fusion (Concept G) + hit-level
+    /// normalization warmed by self-match (Concept A) + question(head)/tail
+    /// max-fusion (Concept F) — and report the top selections per content axis
+    /// plus the code-vs-repo_map attention-mass contrast (Concept B). The
+    /// tuning loop the design's §11.1 harness describes: no model, pure CPU
+    /// over stored sigs, so it is deterministic and cheap.
+    SelectionReplay {
+        /// Target conversation: a label substring, conv-id, or raw timeline id.
+        conversation: String,
+        /// Content-axis tag for the code gallery (scopes).
+        #[arg(long, default_value = "code")]
+        code_tag: String,
+        /// Content-axis tag for the structure gallery (repo_map clusters).
+        #[arg(long, default_value = "repo_map")]
+        structure_tag: String,
+        /// Fold group the content gate keys on (0 = content L0–45).
+        #[arg(long, default_value_t = 0)]
+        gate_group: usize,
+        /// Top-N selections to print per axis per turn.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Cap each gallery to the first N member turns (0 = all). The full
+        /// snapshot code gallery is O(100k) turns; a cap keeps the O(gallery ×
+        /// probe) scan tractable for interactive iteration.
+        #[arg(long, default_value_t = 4000)]
+        limit: usize,
     },
     /// Calibration-quality audit: decode every tagged turn and flag any whose
     /// assistant response never emitted a completed `</tool_call>` — a prompt
@@ -527,6 +739,92 @@ enum Cmd {
     },
 }
 
+/// True for the commands that consume only the metadata substrate (sigs, decls,
+/// events) — these run against the MERGED multi-segment substrate on a
+/// directory target, exactly like the daemon's reload, instead of a single
+/// segment.
+fn is_belief_cmd(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::BeliefProbe { .. }
+            | Cmd::BeliefEval { .. }
+            | Cmd::BeliefReplay { .. }
+            | Cmd::BeliefDissect { .. }
+            | Cmd::BeliefSweep { .. }
+            | Cmd::BeliefDecay { .. }
+            | Cmd::SelectionReplay { .. }
+    )
+}
+
+/// Dispatch one of the belief commands against an already-built substrate
+/// (single-segment or merged — the commands are source-agnostic).
+fn run_belief(cmd: Cmd, substrate: &Substrate) -> Result<()> {
+    match cmd {
+        Cmd::BeliefProbe { stream_id, tag } => {
+            belief_probe(substrate, parse_stream_id(&stream_id)?, &tag)
+        }
+        Cmd::BeliefEval {
+            tag,
+            min_score,
+            max_budget,
+            scorer,
+            probe_tokens,
+            normalize,
+            limit,
+        } => belief_eval(
+            substrate,
+            &tag,
+            min_score,
+            max_budget,
+            &scorer,
+            probe_tokens,
+            normalize,
+            limit,
+        ),
+        Cmd::BeliefReplay {
+            tag,
+            probe_tokens,
+            cadence,
+            trace,
+        } => {
+            let trace_ids = trace
+                .iter()
+                .map(|s| parse_stream_id(s))
+                .collect::<Result<Vec<_>>>()?;
+            belief_replay(substrate, &tag, probe_tokens, cadence, &trace_ids)
+        }
+        Cmd::BeliefDissect {
+            stream_id,
+            tag,
+            tokens,
+        } => belief_dissect(substrate, parse_stream_id(&stream_id)?, &tag, tokens),
+        Cmd::BeliefSweep {
+            tag,
+            scorer,
+            probe_tokens,
+            normalize,
+        } => belief_sweep(substrate, &tag, &scorer, probe_tokens, normalize),
+        Cmd::BeliefDecay { tag, window, chunk } => belief_decay(substrate, &tag, window, chunk),
+        Cmd::SelectionReplay {
+            conversation,
+            code_tag,
+            structure_tag,
+            gate_group,
+            top,
+            limit,
+        } => selection_replay(
+            substrate,
+            &conversation,
+            &code_tag,
+            &structure_tag,
+            gate_group,
+            top,
+            limit,
+        ),
+        _ => anyhow::bail!("run_belief called with a non-belief command"),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let target = cli.log.clone().unwrap_or_else(default_log_path);
@@ -547,6 +845,15 @@ fn main() -> Result<()> {
         }
         if let Cmd::Conversations { filter } = &cli.cmd {
             return segment_conversations(&segs, filter.as_deref());
+        }
+        if let Cmd::ExportReplay { timeline, tag, out } = &cli.cmd {
+            return export_replay(&segs, timeline, tag, out);
+        }
+        // Belief commands read only metadata: run them against the merged
+        // multi-segment substrate (the whole corpus, as the daemon resolves it).
+        if is_belief_cmd(&cli.cmd) {
+            let substrate = build_substrate_merged(&segs)?;
+            return run_belief(cli.cmd, &substrate);
         }
         // Single-segment views: use the active segment (highest-id `.active`,
         // else the highest-id segment present).
@@ -576,8 +883,18 @@ fn main() -> Result<()> {
         )
     })?;
 
+    // Belief commands on a single-segment target: same code path as the
+    // directory case, built from this one log.
+    if is_belief_cmd(&cli.cmd) {
+        let substrate = build_substrate(&mut log)?;
+        return run_belief(cli.cmd, &substrate);
+    }
+
     match cli.cmd {
         Cmd::Summary => summary(&log_path, &mut log)?,
+        Cmd::ExportReplay { .. } => {
+            anyhow::bail!("export-replay requires the segmented `.substrate` DIRECTORY target")
+        }
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
         Cmd::Streams => streams(&mut log)?,
@@ -598,50 +915,15 @@ fn main() -> Result<()> {
         }
         Cmd::Meta => meta(&mut log)?,
         Cmd::Recover => recover_view(&mut log)?,
-        Cmd::BeliefProbe { stream_id, tag } => {
-            belief_probe(&mut log, parse_stream_id(&stream_id)?, &tag)?
-        }
-        Cmd::BeliefEval {
-            tag,
-            min_score,
-            max_budget,
-            scorer,
-            probe_tokens,
-            normalize,
-        } => belief_eval(
-            &mut log,
-            &tag,
-            min_score,
-            max_budget,
-            &scorer,
-            probe_tokens,
-            normalize,
-        )?,
-        Cmd::BeliefReplay {
-            tag,
-            probe_tokens,
-            cadence,
-            trace,
-        } => {
-            let trace_ids = trace
-                .iter()
-                .map(|s| parse_stream_id(s))
-                .collect::<Result<Vec<_>>>()?;
-            belief_replay(&mut log, &tag, probe_tokens, cadence, &trace_ids)?
-        }
-        Cmd::BeliefDissect {
-            stream_id,
-            tag,
-            tokens,
-        } => belief_dissect(&mut log, parse_stream_id(&stream_id)?, &tag, tokens)?,
+        Cmd::BeliefProbe { .. }
+        | Cmd::BeliefEval { .. }
+        | Cmd::BeliefReplay { .. }
+        | Cmd::BeliefDissect { .. }
+        | Cmd::BeliefSweep { .. }
+        | Cmd::BeliefDecay { .. }
+        | Cmd::SelectionReplay { .. } => unreachable!("belief commands dispatched above"),
         Cmd::CalibCheck { tag } => calib_check(&mut log, &tag)?,
         Cmd::CalibBaseline { tag, out } => calib_baseline(&mut log, &tag, out)?,
-        Cmd::BeliefSweep {
-            tag,
-            scorer,
-            probe_tokens,
-        } => belief_sweep(&mut log, &tag, &scorer, probe_tokens)?,
-        Cmd::BeliefDecay { tag, window, chunk } => belief_decay(&mut log, &tag, window, chunk)?,
         Cmd::Tree { timeline, text } => tree(&mut log, timeline, text)?,
         Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, timeline, text)?,
         Cmd::Dump { timeline, full } => dump(&mut log, timeline, full)?,
@@ -1112,10 +1394,8 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
 /// offline. Mirrors `Conversation::belief_gallery` + `score_slots`: the gallery
 /// is every turn whose tags intersect `tag`, each mapped to a slot keyed by its
 /// non-`tag` tag (the tool name); the probe is the given turn's own signature.
-fn belief_probe(log: &mut LogFile, probe_id: StreamId, tag: &str) -> Result<()> {
+fn belief_probe(substrate: &Substrate, probe_id: StreamId, tag: &str) -> Result<()> {
     use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
-
-    let substrate = build_substrate(log)?;
 
     let probe_window = substrate
         .stream_of(probe_id)
@@ -1324,6 +1604,242 @@ fn score_slots_hybrid(
     votes
 }
 
+/// §11.1 selection-replay — replay the production content-axis scoring chain
+/// offline against the real substrate galleries. See [`Cmd::SelectionReplay`].
+fn selection_replay(
+    substrate: &Substrate,
+    conversation: &str,
+    code_tag: &str,
+    structure_tag: &str,
+    gate_group: usize,
+    top: usize,
+    limit: usize,
+) -> Result<()> {
+    use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+    use candle_conversation::projection::attention_mass;
+    use candle_conversation::provenance::{
+        decode_wide_sigs, score_slots_grouped, FusionMode, WideQSig,
+    };
+
+    const PROBE: usize = 256; // reproject_max_probe_tokens
+    const HEAD: usize = 64; // question-window approximation (F11)
+
+    // Resolve the target dialogue conversation. Match on raw timeline id, then
+    // conv-id / label substring. Dialogue turns are the empty-tagged turns on it.
+    let want_tl: Option<u64> = conversation.parse().ok();
+    let mut target: Option<(u64, String)> = None;
+    for (_, s) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(d)) = &s.decl else {
+            continue;
+        };
+        if !d.tags.is_empty() {
+            continue; // gallery turn, not dialogue
+        }
+        let tl = d.timeline_id;
+        let hit = want_tl == Some(tl)
+            || TimelineId::from_raw(tl)
+                .and_then(|t| substrate.conv_id_of(t).map(|c| c.contains(conversation)))
+                .unwrap_or(false)
+            || TimelineId::from_raw(tl)
+                .and_then(|t| substrate.label_of(t).map(|l| l.contains(conversation)))
+                .unwrap_or(false);
+        if hit {
+            let label = TimelineId::from_raw(tl)
+                .and_then(|t| substrate.label_of(t).map(str::to_string))
+                .unwrap_or_default();
+            target = Some((tl, label));
+            break;
+        }
+    }
+    let (dialogue_tl, dialogue_label) =
+        target.with_context(|| format!("no dialogue conversation matching {conversation:?}"))?;
+
+    // Dialogue probes: each empty-tagged turn on the timeline, in index order.
+    let mut probes: Vec<(u32, Vec<WideQSig>)> = Vec::new();
+    for (_, s) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(d)) = &s.decl else {
+            continue;
+        };
+        if d.timeline_id != dialogue_tl || !d.tags.is_empty() {
+            continue;
+        }
+        if let Some(sig) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {
+            if !sig.is_empty() {
+                probes.push((d.turn_index, sig));
+            }
+        }
+    }
+    probes.sort_by_key(|(idx, _)| *idx);
+
+    // A content-axis gallery: turns tagged `tag`, grouped into slots keyed by the
+    // member's non-`tag` tag (the file path / cluster path). Each slot carries
+    // its turns' sig windows + a total token size (for the Concept A.4 floor).
+    struct Gallery {
+        names: Vec<String>,
+        windows: Vec<Vec<WideQSig>>, // per member turn
+        slot_of: Vec<usize>,         // window i → slot
+        tokens: Vec<usize>,          // per slot total real tokens
+    }
+    let build_gallery = |tag: &str| -> Gallery {
+        let mut names: Vec<String> = Vec::new();
+        let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+        let mut slot_of = Vec::new();
+        for (_, s) in substrate.all_streams() {
+            if limit > 0 && windows.len() >= limit {
+                break;
+            }
+            let Some(StreamDecl::Turn(d)) = &s.decl else {
+                continue;
+            };
+            if !d.tags.iter().any(|t| t == tag) {
+                continue;
+            }
+            let name = d
+                .tags
+                .iter()
+                .find(|t| t.as_str() != tag)
+                .cloned()
+                .unwrap_or_else(|| format!("tl{}#{}", d.timeline_id, d.turn_index));
+            let Some(win) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+                continue;
+            };
+            if win.is_empty() {
+                continue;
+            }
+            let slot = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                names.push(name.clone());
+                names.len() - 1
+            });
+            windows.push(win);
+            slot_of.push(slot);
+        }
+        let mut tokens = vec![0usize; names.len()];
+        for (wi, w) in windows.iter().enumerate() {
+            tokens[slot_of[wi]] += w.len();
+        }
+        Gallery {
+            names,
+            windows,
+            slot_of,
+            tokens,
+        }
+    };
+
+    // Content-gated grouped scan → fuse, over a gallery.
+    let gate = FusionMode::ContentGated { gate_group };
+    let scan = |probe: &[WideQSig], g: &Gallery| -> (Vec<f32>, Vec<f32>) {
+        let wref: Vec<&[WideQSig]> = g.windows.iter().map(|w| w.as_slice()).collect();
+        let grouped = score_slots_grouped(probe, &wref, &g.slot_of, g.names.len(), &[]);
+        if grouped.is_empty() {
+            return (vec![0.0; g.names.len()], vec![0.0; g.names.len()]);
+        }
+        (gate.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+    };
+
+    // Self-match warm the hit levels (the `warm_ingest_normalization` analog):
+    // each slot's own best turn as the probe, its raw gated score observed — so
+    // the traffic peak is learned. Under the A.4 floor path the denominator is
+    // max(peak, size_floor).
+    let warm = |g: &Gallery, cache: &mut NormalizationCache, scope: &ScopeKey| {
+        for slot in 0..g.names.len() {
+            // The slot's longest own window is the strongest self-probe.
+            let mut best: Option<&[WideQSig]> = None;
+            for (wi, w) in g.windows.iter().enumerate() {
+                if g.slot_of[wi] == slot && best.map(|b| w.len() > b.len()).unwrap_or(true) {
+                    best = Some(w.as_slice());
+                }
+            }
+            if let Some(w) = best {
+                let probe = &w[w.len().saturating_sub(PROBE)..];
+                let (fused, _) = scan(probe, g);
+                cache.observe(
+                    scope,
+                    &[(ChildKey::named(g.names[slot].clone()), fused[slot])],
+                );
+            }
+        }
+    };
+    let floors = |g: &Gallery| -> Vec<f32> {
+        g.tokens
+            .iter()
+            .map(|&t| 2.0 * (PROBE as f32 / t.max(1) as f32).clamp(1.0, 16.0))
+            .collect()
+    };
+
+    let code = build_gallery(code_tag);
+    let structure = build_gallery(structure_tag);
+    let code_scope = ScopeKey::turn_group(1, 1);
+    let structure_scope = ScopeKey::turn_group(2, 2);
+    let mut cache = NormalizationCache::new(NormConfig::default());
+    warm(&code, &mut cache, &code_scope);
+    warm(&structure, &mut cache, &structure_scope);
+    let code_floors = floors(&code);
+    let structure_floors = floors(&structure);
+
+    println!("\n══ §11.1 selection-replay — production content-axis pipeline ══\n");
+    println!(
+        "conversation: {dialogue_label:?} (tl {dialogue_tl}), {} dialogue turns",
+        probes.len()
+    );
+    println!(
+        "galleries: {} code slots / {} structure slots (fusion=content_gated gate={gate_group})\n",
+        code.names.len(),
+        structure.names.len()
+    );
+
+    for (idx, sig) in &probes {
+        let tail = &sig[sig.len().saturating_sub(PROBE)..];
+        let head = &sig[..HEAD.min(sig.len())];
+        let axis = |g: &Gallery, scope: &ScopeKey, fl: &[f32]| -> (Vec<(String, f32)>, f32) {
+            let normalize = |raw: Vec<f32>| -> Vec<f32> {
+                let pairs: Vec<(ChildKey, f32)> = g
+                    .names
+                    .iter()
+                    .zip(&raw)
+                    .map(|(n, &v)| (ChildKey::named(n.clone()), v))
+                    .collect();
+                cache
+                    .normalize_with_floors(scope, &pairs, fl)
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            let (tf, mass_base) = scan(tail, g);
+            let (qf, _) = scan(head, g);
+            let tn = normalize(tf);
+            let qn = normalize(qf);
+            let fused: Vec<f32> = tn.iter().zip(&qn).map(|(t, q)| t.max(*q)).collect();
+            let mut ranked: Vec<(String, f32)> =
+                g.names.iter().cloned().zip(fused.iter().copied()).collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            (ranked, attention_mass(&mass_base, 0.0, f32::MAX, 1, 2.0))
+        };
+        let (code_rank, code_mass) = axis(&code, &code_scope, &code_floors);
+        let (struct_rank, struct_mass) = axis(&structure, &structure_scope, &structure_floors);
+        let winner = if struct_mass > code_mass {
+            "structure"
+        } else {
+            "code"
+        };
+        println!(
+            "── turn #{idx}  ({} sig tokens)  mass: code {:.1} / structure {:.1} → {winner} ──",
+            sig.len(),
+            code_mass,
+            struct_mass
+        );
+        println!("   code:");
+        for (name, score) in code_rank.iter().take(top) {
+            println!("     {score:>8.1}  {name}");
+        }
+        println!("   structure:");
+        for (name, score) in struct_rank.iter().take(top) {
+            println!("     {score:>8.1}  {name}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
 /// §80 tool-selection accuracy over the whole tagged corpus. For every tagged
 /// turn, score its stored signature against the gallery of *all the others*
 /// (leave-one-out) and record where its true tool ranked; then apply the
@@ -1331,35 +1847,48 @@ fn score_slots_hybrid(
 /// projected set. Ranking metrics are policy-independent; selection metrics show
 /// what the shipped `committed_tool_scope` actually admits.
 fn belief_eval(
-    log: &mut LogFile,
+    substrate: &Substrate,
     tag: &str,
     min_score: f32,
     max_budget: usize,
     scorer: &str,
     probe_tokens: usize,
     normalize: bool,
+    limit: usize,
 ) -> Result<()> {
     use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
     use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
-    use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
+    use candle_conversation::provenance::{
+        decode_wide_sigs, score_slots, score_slots_weighted, WideQSig,
+    };
     use rayon::prelude::*;
 
-    let substrate = build_substrate(log)?;
+    // Corpus: every tagged turn with a wide-Q window → (stream id, tool slot,
+    // window). Candidates are sorted by stream id BEFORE `--limit` applies, so
+    // a bounded sample is deterministic across runs (the stream map iterates in
+    // hash order) and raw-vs-normalized pairs measure the same probes.
+    let mut tagged: Vec<(StreamId, &str, &Vec<u8>)> = substrate
+        .all_streams()
+        .filter_map(|(sid, e)| {
+            let Some(StreamDecl::Turn(t)) = &e.decl else {
+                return None;
+            };
+            if !t.tags.iter().any(|x| x == tag) {
+                return None;
+            }
+            let name = t.tags.iter().find(|x| x.as_str() != tag)?;
+            Some((sid, name.as_str(), e.wide_q_sigs.as_ref()?))
+        })
+        .collect();
+    tagged.sort_by_key(|(sid, _, _)| sid.0);
 
-    // Corpus: every tagged turn with a wide-Q window → (stream id, tool slot, window).
     let mut slot_names: Vec<String> = Vec::new();
     let mut corpus: Vec<(StreamId, usize, Vec<WideQSig>)> = Vec::new();
-    for (sid, e) in substrate.all_streams() {
-        let Some(StreamDecl::Turn(t)) = &e.decl else {
-            continue;
-        };
-        if !t.tags.iter().any(|x| x == tag) {
-            continue;
+    for (sid, name, blob) in tagged {
+        if limit > 0 && corpus.len() >= limit {
+            break;
         }
-        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
-            continue;
-        };
-        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(window) = decode_wide_sigs(blob) else {
             continue;
         };
         if window.is_empty() {
@@ -1369,7 +1898,7 @@ fn belief_eval(
             .iter()
             .position(|n| n == name)
             .unwrap_or_else(|| {
-                slot_names.push(name.clone());
+                slot_names.push(name.to_string());
                 slot_names.len() - 1
             });
         corpus.push((sid, slot, window));
@@ -1381,6 +1910,31 @@ fn belief_eval(
             "corpus has {} tagged turn(s) — need at least 2 for leave-one-out.",
             corpus.len()
         );
+        return Ok(());
+    }
+
+    // Leave-one-out removes the probe's own window, so a probe whose slot has
+    // no OTHER window in the corpus is unanswerable — its ground truth cannot
+    // appear in its gallery. Counting those as misses measures the sampling
+    // (single-turn files under `--limit`), not the scorer. Such turns stay in
+    // the corpus as gallery distractors; they are only excluded as PROBES.
+    let mut slot_counts = vec![0usize; n_slots];
+    for (_, slot, _) in &corpus {
+        slot_counts[*slot] += 1;
+    }
+    let probes: Vec<usize> = (0..corpus.len())
+        .filter(|i| slot_counts[corpus[*i].1] >= 2)
+        .collect();
+    if probes.len() < corpus.len() {
+        println!(
+            "skipping {}/{} probes whose slot has no other corpus window \
+             (unanswerable under leave-one-out; kept as gallery distractors)",
+            corpus.len() - probes.len(),
+            corpus.len()
+        );
+    }
+    if probes.is_empty() {
+        println!("no answerable probes remain.");
         return Ok(());
     }
 
@@ -1405,14 +1959,15 @@ fn belief_eval(
         selected: Vec<usize>,
     }
 
-    // Leave-one-out, parallel over probes. Each rebuilds its gallery from all
-    // corpus windows except its own — the probe never matches itself. Compute the
-    // raw per-slot scores for every probe FIRST, so the (order-dependent)
-    // normalization learning pass and the ranking pass share one scan instead of
-    // recomputing it.
-    let all_fresh: Vec<Vec<f32>> = (0..corpus.len())
-        .into_par_iter()
-        .map(|pi| {
+    // Leave-one-out, parallel over the answerable probes. Each rebuilds its
+    // gallery from all corpus windows except its own — the probe never matches
+    // itself. Compute the raw per-slot scores for every probe FIRST, so the
+    // (order-dependent) normalization learning pass and the ranking pass share
+    // one scan instead of recomputing it. `all_fresh[k]` belongs to corpus
+    // index `probes[k]`.
+    let all_fresh: Vec<Vec<f32>> = probes
+        .par_iter()
+        .map(|&pi| {
             let (_, _, full) = &corpus[pi];
             // Match the live reproject window when requested: the last N tokens.
             let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
@@ -1433,6 +1988,23 @@ fn belief_eval(
                     score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
                 }
                 "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
+                // Concept G content-gated fusion (design doc §9): per-group
+                // scans; identity-group votes count only when the gate (content)
+                // group agrees at all.
+                "gated" => {
+                    let g0 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[1.0, 0.0, 0.0]);
+                    let g1 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 1.0, 0.0]);
+                    let g2 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 0.0, 1.0]);
+                    (0..n_slots)
+                        .map(|s| {
+                            if g0[s] > 0.0 {
+                                g0[s] + g1[s] + g2[s]
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                }
                 _ => score_slots(probe, &gwin, &gslot, n_slots),
             }
         })
@@ -1484,10 +2056,10 @@ fn belief_eval(
         // before a scope warms).
         let scope = ScopeKey::collection(0, tag);
         let mut cache = NormalizationCache::new(NormConfig::default());
-        let mut out = Vec::with_capacity(corpus.len());
-        for pi in 0..corpus.len() {
+        let mut out = Vec::with_capacity(probes.len());
+        for (k, &pi) in probes.iter().enumerate() {
             let raw: Vec<(ChildKey, f32)> = (0..n_slots)
-                .map(|s| (ChildKey::named(slot_names[s].clone()), all_fresh[pi][s]))
+                .map(|s| (ChildKey::named(slot_names[s].clone()), all_fresh[k][s]))
                 .collect();
             // `normalize` preserves input order ⇒ index `s` is still slot `s`.
             let normed: Vec<f32> = cache
@@ -1499,14 +2071,15 @@ fn belief_eval(
             let gt = corpus[pi].1;
             cache.observe(
                 &scope,
-                &[(ChildKey::named(slot_names[gt].clone()), all_fresh[pi][gt])],
+                &[(ChildKey::named(slot_names[gt].clone()), all_fresh[k][gt])],
             );
         }
         out
     } else {
-        (0..corpus.len())
-            .into_par_iter()
-            .map(|pi| build_trial(pi, &all_fresh[pi]))
+        probes
+            .par_iter()
+            .enumerate()
+            .map(|(k, &pi)| build_trial(pi, &all_fresh[k]))
             .collect()
     };
 
@@ -1627,7 +2200,7 @@ fn belief_eval(
 /// online belief exactly as production does, leave-one-out. See
 /// [`Cmd::BeliefReplay`].
 fn belief_replay(
-    log: &mut LogFile,
+    substrate: &Substrate,
     tag: &str,
     probe_tokens: usize,
     cadence: usize,
@@ -1636,8 +2209,6 @@ fn belief_replay(
     use candle_conversation::projection::PolicyPreset;
     use candle_conversation::provenance::{belief_step, decode_wide_sigs, score_slots, WideQSig};
     use rayon::prelude::*;
-
-    let substrate = build_substrate(log)?;
 
     // Corpus: every tagged turn with a wide-Q window, its tool slot, and its full
     // per-token signature. The prefill-built calibration turns carry only a single
@@ -1975,12 +2546,10 @@ fn per_token_hybrid_votes(
 /// each chunk decay the next chunk's weight by the accumulated confidence
 /// `(top1−top2)/top1`; abort when the weight falls below the threshold. Sweeps
 /// α × abort and reports retained hit rate vs mean tokens actually consumed.
-fn belief_decay(log: &mut LogFile, tag: &str, window: usize, chunk: usize) -> Result<()> {
+fn belief_decay(substrate: &Substrate, tag: &str, window: usize, chunk: usize) -> Result<()> {
     use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
     use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
     use rayon::prelude::*;
-
-    let substrate = build_substrate(log)?;
 
     let mut slot_names: Vec<String> = Vec::new();
     let mut corpus: Vec<(usize, Vec<WideQSig>)> = Vec::new();
@@ -2290,12 +2859,17 @@ fn belief_decay(log: &mut LogFile, tag: &str, window: usize, chunk: usize) -> Re
 /// §80.2 threshold sweep: cache the leave-one-out score matrix, then sweep
 /// `min_score` × `budget.max` to chart the recall / false-positive frontier and
 /// pick the tightest gate that still holds 100% recall.
-fn belief_sweep(log: &mut LogFile, tag: &str, scorer: &str, probe_tokens: usize) -> Result<()> {
+fn belief_sweep(
+    substrate: &Substrate,
+    tag: &str,
+    scorer: &str,
+    probe_tokens: usize,
+    normalize: bool,
+) -> Result<()> {
+    use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
     use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
     use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
     use rayon::prelude::*;
-
-    let substrate = build_substrate(log)?;
 
     let mut slot_names: Vec<String> = Vec::new();
     let mut corpus: Vec<(usize, Vec<WideQSig>)> = Vec::new();
@@ -2368,6 +2942,34 @@ fn belief_sweep(log: &mut LogFile, tag: &str, scorer: &str, probe_tokens: usize)
             (*gt_slot, fresh)
         })
         .collect();
+
+    // Under --normalize the sweep runs on the production 0–1000 hit-level band
+    // (the Concept A threshold-migration derivation): the same causal
+    // corpus-order pass as `belief-eval` — each row normalized against levels
+    // learned from earlier rows only, then its own-match observed.
+    let matrix: Vec<(usize, Vec<f32>)> = if normalize {
+        let scope = ScopeKey::collection(0, tag);
+        let mut cache = NormalizationCache::new(NormConfig::default());
+        let mut out = Vec::with_capacity(matrix.len());
+        for (gt, fresh) in &matrix {
+            let raw: Vec<(ChildKey, f32)> = (0..n_slots)
+                .map(|s| (ChildKey::named(slot_names[s].clone()), fresh[s]))
+                .collect();
+            let normed: Vec<f32> = cache
+                .normalize(&scope, &raw)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            cache.observe(
+                &scope,
+                &[(ChildKey::named(slot_names[*gt].clone()), fresh[*gt])],
+            );
+            out.push((*gt, normed));
+        }
+        out
+    } else {
+        matrix
+    };
 
     let n = matrix.len();
     let pct = |k: usize| 100.0 * k as f64 / n as f64;
@@ -2516,11 +3118,14 @@ fn word_agreement(a: &[u64], b: &[u64]) -> u32 {
 /// §81 — dissect a probe's scoring against the tag-scoped gallery, per fold
 /// layer-group and per token, to locate (or rule out) a tool-identity signal
 /// that the full-signature late-fusion loses.
-fn belief_dissect(log: &mut LogFile, probe_id: StreamId, tag: &str, n_tokens: usize) -> Result<()> {
+fn belief_dissect(
+    substrate: &Substrate,
+    probe_id: StreamId,
+    tag: &str,
+    n_tokens: usize,
+) -> Result<()> {
     use candle_conversation::provenance::wide_sig::{PROV_FOLD_SIZES, PROV_HEADS_PER_LAYER};
     use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
-
-    let substrate = build_substrate(log)?;
 
     let probe: Vec<WideQSig> = substrate
         .stream_of(probe_id)
@@ -4172,6 +4777,30 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 /// tokenizer); streams, chunks, tokens, and signatures live in the
 /// substrate, populated by the same walker pass `open_in_with_substrate`
 /// uses.
+/// Merged metadata substrate across every segment of a directory store, in
+/// ascending id order so cross-segment last-writer-wins resolves exactly as the
+/// daemon's reload does. Same payload filter as [`build_substrate`] (KV chunks,
+/// token blobs, and header indexes are skipped; `WideQSig` / `ProjectionEvents`
+/// blobs are kept) — cheap relative to store size.
+fn build_substrate_merged(segs: &[(u64, PathBuf, bool)]) -> Result<Substrate> {
+    let mut substrate = Substrate::new();
+    for (id, path, _) in segs {
+        let mut log = LogFile::open_read_only(path)?;
+        let (entries, _) =
+            walker::collect_filtered(&mut log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
+                !matches!(
+                    rt,
+                    RecordType::Chunk | RecordType::Tokens | RecordType::HeaderIndex
+                )
+            })?;
+        for e in &entries {
+            substrate.apply_walker_entry(e);
+        }
+        eprintln!("walked seg {id} ({} records)", entries.len());
+    }
+    Ok(substrate)
+}
+
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
     // Fast metadata scan: skip the large reference-stored payloads (KV chunks,

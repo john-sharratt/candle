@@ -61,6 +61,11 @@ use std::collections::HashMap;
 use candle_transformers::models::dialect::{Dialect, DialectTemplate};
 use serde::Deserialize;
 
+use crate::provenance::FusionMode;
+
+use super::adaptive::{
+    AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive, ScanPolicy,
+};
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
@@ -171,6 +176,42 @@ struct YamlPolicy {
     /// Per-fold-group vote weights (`[g0, g1, g2]`); omitted ⇒ inherit / uniform.
     #[serde(default)]
     layer_weights: Option<Vec<f32>>,
+    /// Concept G fusion mode: `additive` | `content_gated` | `consensus_min` |
+    /// `consensus_geo`, with `gate_group` for `content_gated`. Omitted ⇒ inherit.
+    #[serde(default)]
+    fusion: Option<YamlFusion>,
+    /// Concept F: pin the turn's question window as a second scanned probe.
+    #[serde(default)]
+    question_pin: Option<bool>,
+    /// Concept B: mass constants.
+    #[serde(default)]
+    mass: Option<YamlMass>,
+    /// Concept A.4: size-aware level-prior constants.
+    #[serde(default)]
+    level_prior: Option<YamlLevelPrior>,
+}
+
+#[derive(Deserialize)]
+struct YamlFusion {
+    mode: String,
+    #[serde(default)]
+    gate_group: usize,
+}
+
+#[derive(Deserialize)]
+struct YamlMass {
+    #[serde(default)]
+    concentration_top_k: Option<usize>,
+    #[serde(default)]
+    concentration_rho: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct YamlLevelPrior {
+    #[serde(default)]
+    floor_base: Option<f32>,
+    #[serde(default)]
+    floor_cap: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +359,9 @@ enum YamlSystemPromptItem {
         /// Fallback section (by name) when selection is empty.
         #[serde(default)]
         default: Option<YamlSelectionDefault>,
+        /// Concept B: mass-driven member-budget extension.
+        #[serde(default)]
+        budget_adaptive: Option<YamlMemberBudgetAdaptive>,
     },
     /// An ordered, individually-toggleable tree of sealed sections.  Each node
     /// is a `section` (mandatory), an `optional` (binary toggle), or a
@@ -499,6 +543,11 @@ struct YamlLayer {
     /// corrupt turn — set on the dialogue layer so one bad turn doesn't drop the chat.
     #[serde(default)]
     on_corrupt_turn: YamlCorruptTurnPolicy,
+    /// Noun for this layer's startup-ingest progress readout ("N / M <unit>" on
+    /// the loading screen) — e.g. `files`, `folders`. Omitted → a mode-derived
+    /// default in the ingest driver; non-ingest layers ignore it.
+    #[serde(default)]
+    ingest_unit: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -572,6 +621,15 @@ struct YamlGroup {
     /// Fallback member (by tag) when selection is empty.
     #[serde(default)]
     default: Option<YamlSelectionDefault>,
+    /// Concept B: mass-driven member-budget extension.
+    #[serde(default)]
+    budget_adaptive: Option<YamlMemberBudgetAdaptive>,
+    /// Concept C: neighbor drag.
+    #[serde(default)]
+    locality: Option<YamlLocality>,
+    /// Concept D: timeline anchor member.
+    #[serde(default)]
+    anchor: Option<YamlAnchor>,
 }
 
 /// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
@@ -580,12 +638,53 @@ struct YamlSelectionDefault {
     tag: String,
 }
 
+#[derive(Deserialize)]
+struct YamlMemberBudgetAdaptive {
+    per_extra: f32,
+    absolute_max: usize,
+}
+
+#[derive(Deserialize)]
+struct YamlLocality {
+    seed_threshold: f32,
+    #[serde(default = "default_locality_decay")]
+    decay: f32,
+    #[serde(default = "default_locality_base_radius")]
+    base_radius: usize,
+    #[serde(default)]
+    extend_per: f32,
+    #[serde(default)]
+    extra_radius_max: usize,
+}
+
+fn default_locality_decay() -> f32 {
+    0.5
+}
+fn default_locality_base_radius() -> usize {
+    1
+}
+
+#[derive(Deserialize)]
+struct YamlAnchor {
+    member: String,
+}
+
 #[derive(Deserialize, Default)]
 struct YamlBudget {
     #[serde(default)]
     priority: Option<f32>,
     #[serde(default)]
     min_percent: Option<f32>,
+    #[serde(default)]
+    max_percent: Option<f32>,
+    /// Concept B: mass-modulated priority within the declared rails.
+    #[serde(default)]
+    adaptive: Option<YamlBudgetAdaptive>,
+}
+
+#[derive(Deserialize)]
+struct YamlBudgetAdaptive {
+    gain: f32,
     #[serde(default)]
     max_percent: Option<f32>,
 }
@@ -661,11 +760,135 @@ fn parse_policy(
         Some(w) => w.clone(),
         None => inherited.layer_weights.clone(),
     };
+    let mut scan = inherited.scan;
+    if let Some(f) = &yp.fusion {
+        scan.fusion = match f.mode.as_str() {
+            "additive" => FusionMode::Additive,
+            "content_gated" => FusionMode::ContentGated {
+                gate_group: f.gate_group,
+            },
+            "consensus_min" => FusionMode::ConsensusMin,
+            "consensus_geo" => FusionMode::ConsensusGeo,
+            other => {
+                return Err(ConstructionError::InvalidPolicy {
+                    name: name.to_string(),
+                    reason: format!(
+                        "unknown fusion mode {other:?} (additive | content_gated | \
+                         consensus_min | consensus_geo)"
+                    ),
+                })
+            }
+        };
+    }
+    if let Some(q) = yp.question_pin {
+        scan.question_pin = q;
+    }
+    if let Some(m) = &yp.mass {
+        if let Some(k) = m.concentration_top_k {
+            scan.mass_top_k = k;
+        }
+        if let Some(rho) = m.concentration_rho {
+            scan.mass_rho = rho;
+        }
+    }
+    if let Some(lp) = &yp.level_prior {
+        if let Some(b) = lp.floor_base {
+            scan.level_prior_base = b;
+        }
+        if let Some(c) = lp.floor_cap {
+            scan.level_prior_cap = c;
+        }
+    }
+    validate_scan(name, &scan)?;
     Ok(SelectionPolicy {
         config,
         tags,
         layer_weights,
+        scan,
     })
+}
+
+fn validate_scan(name: &str, s: &ScanPolicy) -> Result<(), ConstructionError> {
+    let bad = |reason: &str| ConstructionError::InvalidPolicy {
+        name: name.to_string(),
+        reason: reason.to_string(),
+    };
+    if s.mass_top_k == 0 {
+        return Err(bad("mass.concentration_top_k must be > 0"));
+    }
+    if s.mass_rho < 0.0 {
+        return Err(bad("mass.concentration_rho must be >= 0"));
+    }
+    if s.level_prior_base < 0.0 {
+        return Err(bad("level_prior.floor_base must be >= 0"));
+    }
+    if s.level_prior_cap < 1.0 {
+        return Err(bad("level_prior.floor_cap must be >= 1"));
+    }
+    Ok(())
+}
+
+/// Parse a group's Concept C `locality:` block, validating its rails.
+fn parse_locality(
+    name: &str,
+    yl: Option<&YamlLocality>,
+) -> Result<Option<LocalityConfig>, ConstructionError> {
+    let Some(yl) = yl else { return Ok(None) };
+    let bad = |reason: &str| ConstructionError::InvalidPolicy {
+        name: name.to_string(),
+        reason: reason.to_string(),
+    };
+    if !(0.0..=1.0).contains(&yl.decay) || yl.decay == 0.0 {
+        return Err(bad("locality.decay must be in (0, 1]"));
+    }
+    if yl.seed_threshold < 0.0 {
+        return Err(bad("locality.seed_threshold must be >= 0"));
+    }
+    if yl.extend_per < 0.0 {
+        return Err(bad("locality.extend_per must be >= 0"));
+    }
+    Ok(Some(LocalityConfig {
+        seed_threshold: yl.seed_threshold,
+        decay: yl.decay,
+        base_radius: yl.base_radius,
+        extend_per: yl.extend_per,
+        extra_radius_max: yl.extra_radius_max,
+    }))
+}
+
+/// Parse a group's Concept D `anchor:` block.
+fn parse_anchor(
+    name: &str,
+    ya: Option<&YamlAnchor>,
+) -> Result<Option<AnchorConfig>, ConstructionError> {
+    let Some(ya) = ya else { return Ok(None) };
+    match ya.member.as_str() {
+        "first" => Ok(Some(AnchorConfig {
+            member: AnchorMember::First,
+        })),
+        other => Err(ConstructionError::InvalidPolicy {
+            name: name.to_string(),
+            reason: format!("unknown anchor member {other:?} (first)"),
+        }),
+    }
+}
+
+/// Parse a group's Concept B `budget_adaptive:` block.
+fn parse_member_budget_adaptive(
+    name: &str,
+    yb: Option<&YamlMemberBudgetAdaptive>,
+) -> Result<Option<MemberBudgetAdaptive>, ConstructionError> {
+    let Some(yb) = yb else { return Ok(None) };
+    if yb.per_extra <= 0.0 {
+        return Err(ConstructionError::InvalidPolicy {
+            name: name.to_string(),
+            reason: "budget_adaptive.per_extra must be > 0".to_string(),
+        });
+    }
+    Ok(Some(MemberBudgetAdaptive {
+        per_extra: yb.per_extra,
+        absolute_max: yb.absolute_max,
+    }))
 }
 
 fn validate_policy(name: &str, c: &PolicyConfig) -> Result<(), ConstructionError> {
@@ -788,6 +1011,9 @@ fn build(
                 policy_band_declared,
                 budget: group_budget,
                 default: parse_default(yg.default.as_ref()),
+                budget_adaptive: parse_member_budget_adaptive(&yg.id, yg.budget_adaptive.as_ref())?,
+                locality: parse_locality(&yg.id, yg.locality.as_ref())?,
+                anchor: parse_anchor(&yg.id, yg.anchor.as_ref())?,
             });
         }
 
@@ -814,6 +1040,7 @@ fn build(
             gather_scope: yl.gather_scope.into(),
             decode_priority: yl.decode_priority.into(),
             on_corrupt_turn: yl.on_corrupt_turn.into(),
+            ingest_unit: yl.ingest_unit.clone(),
         });
     }
 
@@ -994,6 +1221,7 @@ fn build_system_prompt(
                 sections,
                 member_glue,
                 default: coll_default,
+                budget_adaptive: coll_budget_adaptive,
             } => {
                 let cid = *collections
                     .get(name)
@@ -1042,6 +1270,7 @@ fn build_system_prompt(
                             config,
                             tags: base_policy.tags.clone(),
                             layer_weights: base_policy.layer_weights.clone(),
+                            scan: base_policy.scan,
                         }
                     }
                     _ => parse_policy(&label, coll_policy_yaml.as_ref(), base_policy)?,
@@ -1057,6 +1286,10 @@ fn build_system_prompt(
                     member_glue: member_glue.clone().unwrap_or_default(),
                     member_glue_tokens: None,
                     default: parse_default(coll_default.as_ref()),
+                    budget_adaptive: parse_member_budget_adaptive(
+                        &label,
+                        coll_budget_adaptive.as_ref(),
+                    )?,
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {
@@ -1777,6 +2010,7 @@ fn build_section_tree<'a>(
                     summary_section: None,
                     member_glue: member_glue.map(str::to_string).unwrap_or_default(),
                     member_glue_tokens: None,
+                    budget_adaptive: None,
                     default: None,
                 };
                 // Capture the branch templates so runtime member additions
@@ -1955,10 +2189,40 @@ fn parse_budget(name: &str, yb: &YamlBudget) -> Result<Budget, ConstructionError
     if let Some(v) = yb.max_percent {
         validate_percent(name, v)?;
     }
+    let adaptive = match &yb.adaptive {
+        None => None,
+        Some(ya) => {
+            if ya.gain < 0.0 {
+                return Err(ConstructionError::InvalidPolicy {
+                    name: name.to_string(),
+                    reason: "budget.adaptive.gain must be >= 0".to_string(),
+                });
+            }
+            if let Some(v) = ya.max_percent {
+                validate_percent(name, v)?;
+                // The adaptive ceiling is the outer rail: it must not sit
+                // below the static ceiling it overrides.
+                if let Some(stat) = yb.max_percent {
+                    if v < stat {
+                        return Err(ConstructionError::InvalidPolicy {
+                            name: name.to_string(),
+                            reason: "budget.adaptive.max_percent must be >= max_percent"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            Some(BudgetAdaptive {
+                gain: ya.gain,
+                max_percent: ya.max_percent,
+            })
+        }
+    };
     Ok(Budget {
         priority,
         min_percent: yb.min_percent,
         max_percent: yb.max_percent,
+        adaptive,
     })
 }
 

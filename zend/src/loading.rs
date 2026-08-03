@@ -59,6 +59,23 @@ impl LoadStep {
             LoadStep::Ingesting => "Ingesting workspace",
         }
     }
+
+    /// The noun the step's `(progressed, total)` counter counts — rendered next to
+    /// the bar as an absolute "N / M unit" readout. Empty when the counter is a
+    /// scaled fraction (e.g. section prefill reports bytes scaled to 10 000) or
+    /// otherwise not a meaningful discrete count, in which case only the bar
+    /// shows. The `Ingesting` step's unit varies per ingest layer (folders vs
+    /// sections vs files) and is set explicitly via [`LoadProgress::set_step_unit`].
+    pub fn unit(self) -> &'static str {
+        match self {
+            LoadStep::Model => "layers",
+            LoadStep::Substrate => "turns",
+            LoadStep::Compacting => "",
+            LoadStep::Sections => "",
+            LoadStep::CalibratingSections => "",
+            LoadStep::Ingesting => "",
+        }
+    }
 }
 
 /// Snapshot of the loading state at a moment in time.
@@ -67,6 +84,15 @@ pub struct LoadingSnapshot {
     pub current: LoadStep,
     pub progress: f32,
     pub completed: Vec<LoadStep>,
+    /// Absolute progress within the current step: `progressed` of `total`
+    /// `unit`s done (e.g. 137 of 1000 files). `total == 0` means the step has
+    /// no measurable count yet. `unit` is empty when the counter is not a
+    /// meaningful discrete count (scaled fraction) — the frontend then shows
+    /// only the bar, no "N / M" readout. Owned because ingest units are
+    /// projection-YAML-defined (per layer), not compile-time constants.
+    pub progressed: u64,
+    pub total: u64,
+    pub unit: String,
 }
 
 /// Shared, mutable load-progress state. `None`-snapshot means the daemon
@@ -83,6 +109,11 @@ enum Inner {
         /// progress reported yet for this step" → bar reads 0%.
         progressed: u64,
         total: u64,
+        /// The noun `progressed`/`total` count (e.g. "files"). Defaults to the
+        /// step's [`LoadStep::unit`]; the ingest phase overrides it per layer via
+        /// [`LoadProgress::set_step_unit`] with the layer's YAML-defined unit.
+        /// Empty ⇒ no absolute readout shown.
+        unit: String,
         /// Cumulative tokens prefilled during this step (ingest stat).
         prefill_tokens: u64,
         /// Wall-clock instant the current step was entered — used for
@@ -123,6 +154,7 @@ impl LoadProgress {
                 current: LoadStep::Model,
                 progressed: 0,
                 total: 0,
+                unit: LoadStep::Model.unit().to_string(),
                 prefill_tokens: 0,
                 started: Instant::now(),
             }),
@@ -136,6 +168,7 @@ impl LoadProgress {
                 current,
                 progressed,
                 total,
+                unit,
                 ..
             } => {
                 let progress = if *total > 0 {
@@ -152,6 +185,9 @@ impl LoadProgress {
                     current: *current,
                     progress,
                     completed,
+                    progressed: *progressed,
+                    total: *total,
+                    unit: unit.clone(),
                 })
             }
             Inner::Ready => None,
@@ -195,9 +231,20 @@ impl LoadProgress {
             current: step,
             progressed: 0,
             total: 0,
+            unit: step.unit().to_string(),
             prefill_tokens: 0,
             started: Instant::now(),
         };
+    }
+
+    /// Override the unit noun for the current step's absolute readout. Used by
+    /// the ingest phase, whose single [`LoadStep::Ingesting`] step covers layers
+    /// that count different things (folders, sections, files) — each layer sets
+    /// its own YAML-defined unit as it begins. No-op once ready.
+    pub fn set_step_unit(&self, unit: &str) {
+        if let Inner::Loading { unit: u, .. } = &mut *self.inner.lock().unwrap() {
+            *u = unit.to_string();
+        }
     }
 
     /// Report real progress within the current step. `current` and
@@ -347,5 +394,32 @@ mod tests {
         p.set_step_progress(8, 10);
         p.set_step(LoadStep::Sections);
         assert_eq!(p.snapshot().unwrap().progress, 0.0);
+    }
+
+    #[test]
+    fn snapshot_exposes_absolute_counts_and_step_default_unit() {
+        let p = LoadProgress::new(); // Model step: unit "layers"
+        p.set_step_progress(3, 12);
+        let snap = p.snapshot().unwrap();
+        assert_eq!(snap.progressed, 3);
+        assert_eq!(snap.total, 12);
+        assert_eq!(snap.unit, "layers");
+    }
+
+    #[test]
+    fn set_step_unit_overrides_and_step_change_resets_to_default() {
+        let p = LoadProgress::new();
+        // The ingest step has no fixed unit (its layers count different things).
+        p.set_step(LoadStep::Ingesting);
+        assert_eq!(p.snapshot().unwrap().unit, "");
+        p.set_step_unit("files");
+        p.set_step_progress(10, 1000);
+        let snap = p.snapshot().unwrap();
+        assert_eq!(snap.unit, "files");
+        assert_eq!(snap.progressed, 10);
+        assert_eq!(snap.total, 1000);
+        // Advancing to another step resets the unit to that step's default.
+        p.set_step(LoadStep::Substrate);
+        assert_eq!(p.snapshot().unwrap().unit, "turns");
     }
 }

@@ -195,6 +195,7 @@
 //! | [`reconcile`]   | CSS-flexbox-style budget distribution                          |
 //! | [`project`]     | Full projection pipeline orchestrator                          |
 
+pub mod adaptive;
 mod builder;
 mod error;
 pub(crate) mod event;
@@ -215,6 +216,10 @@ mod tests;
 // ── Public surface ────────────────────────────────────────────────────────────
 
 pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
+pub use adaptive::{
+    attention_mass, AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig,
+    MemberBudgetAdaptive, ScanPolicy,
+};
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use event::{

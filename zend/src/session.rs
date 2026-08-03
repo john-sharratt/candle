@@ -1241,6 +1241,9 @@ impl InferenceState {
             // The layer's display label rides the step's `detail` sub-status.
             status_tx.send(il.display.clone()).ok();
             progress.set_step_progress(0, 0);
+            // The absolute readout's unit is the layer's YAML-defined `ingest_unit`
+            // (mode-defaulted in `ingest_layers`), so it stays a config item.
+            progress.set_step_unit(&il.unit);
             let content_root = workspace.join(&il.folder);
             // Mark the layer append-only BEFORE any branch below runs — fresh
             // ingest and resume alike. The in-memory flag (lost on restart)
@@ -4565,6 +4568,72 @@ mod projection_schema_tests {
             labels.iter().any(|l| l.starts_with("section tree (")),
             "the adaptive-thinking section tree is labelled: {labels:?}"
         );
+    }
+
+    /// The provenance-adaptive projection blocks
+    /// (`docs/provenance_adaptive_projection.md`) parse out of the embedded
+    /// schema onto the right nodes: content axes get content-gated fusion +
+    /// question pinning, scopes get locality + anchor, the adaptive budget
+    /// rails land on repo_map/code_reading, and the tools collection stays
+    /// additive (the measured per-axis split).
+    #[test]
+    fn embedded_schema_carries_the_adaptive_projection_config() {
+        use candle_conversation::projection::{AnchorMember, SystemPromptItem};
+        use candle_conversation::provenance::FusionMode;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let schema = builder.schema();
+
+        let layer = |name: &str| {
+            schema
+                .layers
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("layer {name} present"))
+        };
+        let repo_map = layer("repo_map");
+        let structure = &repo_map.groups[0];
+        // Content axes are ADDITIVE — content_gated was reverted after live
+        // testing showed it zeros NL→code retrieval (the domain gap).
+        assert_eq!(structure.policy.scan.fusion, FusionMode::Additive);
+        assert!(structure.policy.scan.question_pin);
+        assert!(repo_map.budget.adaptive.is_some());
+        assert_eq!(structure.budget_adaptive.unwrap().absolute_max, 5);
+
+        let code = layer("code_reading");
+        let scopes = &code.groups[0];
+        assert_eq!(scopes.policy.scan.fusion, FusionMode::Additive);
+        assert!(scopes.policy.scan.question_pin);
+        let loc = scopes.locality.expect("scopes locality");
+        assert_eq!(loc.seed_threshold, 600.0);
+        assert_eq!(loc.base_radius, 1);
+        assert_eq!(
+            scopes.anchor.map(|a| a.member),
+            Some(AnchorMember::First),
+            "the file-header anchor"
+        );
+        assert!(code.budget.adaptive.is_some());
+
+        let tools = schema
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|i| match i {
+                SystemPromptItem::Collection(c) if c.name == "tools" => Some(c),
+                _ => None,
+            })
+            .expect("tools collection");
+        assert_eq!(
+            tools.policy.scan.fusion,
+            FusionMode::Additive,
+            "tools MUST stay additive (results doc §25.8: gating collapses Top-1 97.3% → 32.9%)"
+        );
+        // Strict normalized-band gate (reverted from the too-permissive min 112).
+        assert_eq!(tools.policy.config.min_score, 800.0);
+        assert_eq!(tools.policy.config.budget_max, 3);
+
+        // Dialogue stays recency-driven — no scan concepts apply.
+        let dialogue = layer("dialogue");
+        assert!(!dialogue.groups[0].is_belief_driven());
     }
 
     /// The turn-sink load plan is DERIVED from the embedded schema's structure —

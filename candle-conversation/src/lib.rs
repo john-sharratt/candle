@@ -81,6 +81,7 @@ pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
 pub use scheduler::phase_ring;
+pub use scheduler::relief_trace;
 pub use sequence_handle::SequenceId;
 pub use stats::TurnStats;
 pub use token_buffer::TokenBuffer;

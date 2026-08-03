@@ -131,10 +131,7 @@ impl CausalMaskCache {
             let mask_total_len = mask_seq_len + mask_offset;
 
             // Try to slice the mask if dimensions are compatible
-            if mask_seq_len == mask_seq_len
-                && new_cache_len < mask_total_len
-                && new_cache_len >= mask_seq_len
-            {
+            if new_cache_len < mask_total_len && new_cache_len >= mask_seq_len {
                 // Slice the mask: keep only first new_cache_len columns
                 // Mask shape: (1, 1, mask_seq_len, mask_total_len)
                 if let Ok(truncated_mask) = mask.narrow(3, 0, new_cache_len) {

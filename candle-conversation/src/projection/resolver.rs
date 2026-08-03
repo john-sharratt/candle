@@ -14,13 +14,18 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::SubstratePersistence;
+use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
-use crate::provenance::{decode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig};
+use crate::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+use crate::provenance::{
+    decode_wide_sigs, score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, WideQSig,
+};
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
@@ -464,10 +469,23 @@ impl Conversation {
     /// up to fast-math ULP — same ranking); collection windows are the same turn
     /// streams the turn-group scan touches, so their arena residency is shared.
     /// Without one (seal-time learning, non-CUDA), the CPU path runs unchanged.
+    ///
+    /// Concepts of `docs/provenance_adaptive_projection.md` applied here:
+    /// **G** — the collection policy's `fusion` mode drives the scan
+    /// (`content_gated` = full score gated by a one-hot gate-group scan, so the
+    /// GPU arena serves both scans); **F** — with `question_pin` and a
+    /// `probe_q`, the pinned question window scans separately and the
+    /// per-section score is the max of the two normalized scans; **A** — every
+    /// collection normalizes on the 0–1000 hit-level band
+    /// (`ScopeKey::Collection`), `observe` folding levels only on the
+    /// once-per-turn seal scan; **B** — the collection's attention mass rides
+    /// on the returned scores.
     pub fn score_belief_collections(
         &self,
         sp: &SystemPromptSchema,
         probe: &[WideQSig],
+        probe_q: Option<&[WideQSig]>,
+        observe: bool,
         arena: Option<&GalleryArena>,
     ) -> ProjectionScores {
         let mut scores = ProjectionScores::new();
@@ -525,42 +543,147 @@ impl Conversation {
             // (empty ⇒ uniform — the tool default). Configured in the schema YAML.
             // GPU: the collection is ONE global-z segment over the resident arena
             // (windows keyed by their turn stream ids — shared with the group
-            // scan's residency). CPU fallback preserves today's behaviour.
-            let gpu_fresh: Option<Vec<f32>> = arena.and_then(|arena| {
-                let segment = PagedSegment {
-                    windows: windows
-                        .iter()
-                        .zip(&slots)
-                        .zip(&sids)
-                        .map(|((w, &slot), &sid)| PagedWindow {
-                            sid,
-                            fingerprint: sig_fingerprint(w),
-                            turn: w.as_slice(),
-                            start: 0,
-                            end: w.len(),
-                            case: slot,
-                        })
-                        .collect(),
-                    n_cases: n,
-                };
-                match arena.scan_weighted(&[segment], &[probe], &coll.policy.layer_weights) {
-                    Ok(mut out) => Some(out.pop().unwrap_or_default()),
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "candle_conversation::provenance",
-                            "GPU collection scan unavailable, using CPU: {e}"
-                        );
-                        None
+            // scan's residency). CPU fallback preserves today's behaviour. The
+            // fusion mode's scan law (`fused_scan`) is identical on both
+            // backends: `content_gated` runs the additive scan twice (full +
+            // one-hot gate group) and gates; consensus modes are CPU-only.
+            // Returns `(fused, mass_base)`: the policy-fused per-section scores
+            // and the UNGATED additive sum the Concept B mass keys on (the gate
+            // deliberately removes the concentrated spike mass must see —
+            // results doc §25).
+            let scan_probe = |p: &[WideQSig]| -> (Vec<f32>, Vec<f32>) {
+                let gpu_fresh: Option<(Vec<f32>, Vec<f32>)> = arena.and_then(|arena| {
+                    let make_segment = || PagedSegment {
+                        windows: windows
+                            .iter()
+                            .zip(&slots)
+                            .zip(&sids)
+                            .map(|((w, &slot), &sid)| PagedWindow {
+                                sid,
+                                fingerprint: sig_fingerprint(w),
+                                turn: w.as_slice(),
+                                start: 0,
+                                end: w.len(),
+                                case: slot,
+                            })
+                            .collect(),
+                        n_cases: n,
+                    };
+                    let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
+                        match arena.scan_weighted(&[make_segment()], &[p], w) {
+                            Ok(mut out) => Some(out.pop().unwrap_or_default()),
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "provenance",
+                                    "GPU collection scan unavailable, using CPU: {e}"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    match coll.policy.scan.fusion {
+                        FusionMode::Additive => {
+                            scan_w(&coll.policy.layer_weights).map(|v| (v.clone(), v))
+                        }
+                        mode => {
+                            // Non-additive modes: per-group one-hot scans (each
+                            // IS that group's needle-gated tally), weighted,
+                            // then fused per the mode — the same law as the CPU
+                            // `score_slots_fused`. The ungated group sum rides
+                            // along as the mass base.
+                            let n_groups = p
+                                .first()
+                                .map(|s| (s.n_heads as usize / PROV_HEADS_PER_LAYER).max(1))?;
+                            let mut grouped: Vec<Vec<f32>> = Vec::with_capacity(n_groups);
+                            for g in 0..n_groups {
+                                let mut one_hot = vec![0.0f32; n_groups];
+                                one_hot[g] =
+                                    coll.policy.layer_weights.get(g).copied().unwrap_or(1.0);
+                                grouped.push(scan_w(&one_hot)?);
+                            }
+                            Some((mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped)))
+                        }
                     }
+                });
+                gpu_fresh.unwrap_or_else(|| {
+                    let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                    match coll.policy.scan.fusion {
+                        FusionMode::Additive => {
+                            let v = score_slots_weighted(
+                                p,
+                                &wref,
+                                &slots,
+                                n,
+                                &coll.policy.layer_weights,
+                            );
+                            (v.clone(), v)
+                        }
+                        mode => {
+                            let grouped = score_slots_grouped(
+                                p,
+                                &wref,
+                                &slots,
+                                n,
+                                &coll.policy.layer_weights,
+                            );
+                            if grouped.is_empty() {
+                                (vec![0.0; n], vec![0.0; n])
+                            } else {
+                                (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+                            }
+                        }
+                    }
+                })
+            };
+
+            let (fresh, mass_base) = scan_probe(probe);
+            // Concept F: the pinned question window is a second, independent
+            // scan — max-fused with the tail AFTER normalization below.
+            let fresh_q: Option<Vec<f32>> = match probe_q {
+                Some(q) if coll.policy.scan.question_pin && !q.is_empty() => Some(scan_probe(q).0),
+                _ => None,
+            };
+
+            // Concept A: normalize on the collection's 0–1000 hit-level band.
+            // `observe` (seal only) folds the TAIL scan's raw scores — the
+            // stored whole-turn signature, matching the turn-group learn path.
+            let scope = ScopeKey::collection(coll.id.raw() as u64, coll.name.as_str());
+            let raw_pairs: Vec<(ChildKey, f32)> = coll
+                .sections
+                .iter()
+                .zip(&fresh)
+                .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
+                .collect();
+            let (normed, normed_q) = {
+                let mut cache = self.normalization.lock().unwrap();
+                let normed = cache.normalize(&scope, &raw_pairs);
+                let normed_q = fresh_q.as_ref().map(|fq| {
+                    let q_pairs: Vec<(ChildKey, f32)> = coll
+                        .sections
+                        .iter()
+                        .zip(fq)
+                        .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
+                        .collect();
+                    cache.normalize(&scope, &q_pairs)
+                });
+                if observe {
+                    cache.observe(&scope, &raw_pairs);
                 }
-            });
-            let fresh = gpu_fresh.unwrap_or_else(|| {
-                let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
-                score_slots_weighted(probe, &wref, &slots, n, &coll.policy.layer_weights)
-            });
+                (normed, normed_q)
+            };
+            let finals: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = normed.get(i).map(|(_, v)| *v).unwrap_or(0.0);
+                    let q = normed_q
+                        .as_ref()
+                        .and_then(|nq| nq.get(i).map(|(_, v)| *v))
+                        .unwrap_or(0.0);
+                    t.max(q)
+                })
+                .collect();
             if tracing::enabled!(tracing::Level::DEBUG) {
-                let nonzero = fresh.iter().filter(|&&s| s != 0.0).count();
-                let top = fresh
+                let nonzero = finals.iter().filter(|&&s| s != 0.0).count();
+                let top = finals
                     .iter()
                     .enumerate()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -570,15 +693,29 @@ impl Conversation {
                     target: "candle_conversation::belief",
                     collection = %coll.name,
                     probe_windows = probe.len(),
+                    q_windows = probe_q.map(|q| q.len()).unwrap_or(0),
                     gallery_windows = windows.len(),
                     nonzero_scores = nonzero,
                     top = %top,
-                    "belief scan"
+                    "belief scan (normalized band)"
                 );
             }
-            for (s, &score) in coll.sections.iter().zip(&fresh) {
+            for (s, &score) in coll.sections.iter().zip(&finals) {
                 scores.set_section(s.id, score);
             }
+            // Concept B: the collection's attention mass, on the UNGATED raw
+            // scan (normalization compresses — and the gate removes — the
+            // concentration signal mass keys on).
+            scores.set_collection_mass(
+                coll.id.raw(),
+                attention_mass(
+                    &mass_base,
+                    0.0,
+                    f32::MAX,
+                    coll.policy.scan.mass_top_k,
+                    coll.policy.scan.mass_rho,
+                ),
+            );
         }
         scores
     }
@@ -600,11 +737,17 @@ impl Conversation {
     /// ([`crate::conversation`]'s `last_turn_belief_scores`), `false` on every
     /// live reprojection (which only reads the levels to normalize). See
     /// `docs/provenance_score_normalization.md` §4.2.
+    /// `probe_q` is the Concept F pinned question window (the current turn's
+    /// user span); nodes whose policy sets `question_pin` scan it as a second
+    /// probe and take the per-member max of the two normalized scans. `None`
+    /// (seal-time / warm replay / hosts without a live turn) scans the tail
+    /// alone, exactly as before.
     pub fn score_beliefs(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
         probe: &[WideQSig],
+        probe_q: Option<&[WideQSig]>,
         observe: bool,
         arena: Option<&GalleryArena>,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
@@ -616,7 +759,8 @@ impl Conversation {
         self.ensure_normalization_warm(schema, target);
         // Collections (the tool catalog) live in the shared system prompt.
         let t_coll = std::time::Instant::now();
-        scores = self.score_belief_collections(&schema.system_prompt, probe, arena);
+        scores =
+            self.score_belief_collections(&schema.system_prompt, probe, probe_q, observe, arena);
         let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
         let t_groups = std::time::Instant::now();
@@ -625,6 +769,7 @@ impl Conversation {
                 layer,
                 target,
                 probe,
+                probe_q,
                 &mut scores,
                 observe,
                 arena,
@@ -728,9 +873,20 @@ impl Conversation {
         let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
         for (_, _, probe) in &probes[start..] {
             let mut throwaway = ProjectionScores::new();
+            // Collections warm alongside turn groups (Concept A extends the
+            // hit-level band to them), so a restart doesn't reset tool scoring.
+            let _ = self.score_belief_collections(&schema.system_prompt, probe, None, true, None);
             for layer in &schema.layers {
                 // Background warm-up runs off the hot path → CPU (no device).
-                let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true, None);
+                let _ = self.score_belief_groups(
+                    layer,
+                    target,
+                    probe,
+                    None,
+                    &mut throwaway,
+                    true,
+                    None,
+                );
             }
         }
     }
@@ -762,6 +918,16 @@ impl Conversation {
             }
             for group in &layer.groups {
                 if !group.is_belief_driven() {
+                    continue;
+                }
+                // A gated-fusion group normalizes traffic-relative (the A.4
+                // floored path keys on observed-traffic PEAKS, so a rare hit on
+                // a quiet file stands out). Self-match warming would stamp
+                // every file's peak at its own self-match magnitude and erase
+                // that contrast — the gate already handles the promiscuous
+                // domination this warm-up was built to fix. Config-keyed, not
+                // axis-keyed: any additive-fusion group still warms.
+                if group.policy.scan.fusion != FusionMode::Additive {
                     continue;
                 }
                 let timelines: Vec<TimelineId> = self
@@ -802,6 +968,7 @@ impl Conversation {
                             layer,
                             self_target,
                             sig.as_slice(),
+                            None,
                             &mut throwaway,
                             true,
                             None,
@@ -835,6 +1002,7 @@ impl Conversation {
         layer: &LayerSchema,
         target: ProjectionTarget,
         probe: &[WideQSig],
+        probe_q: Option<&[WideQSig]>,
         scores: &mut ProjectionScores,
         observe: bool,
         arena: Option<&GalleryArena>,
@@ -883,6 +1051,8 @@ impl Conversation {
                 arc_sids: Vec<StreamId>,
                 // (arc index into `arcs_kept`, window start, window end, exchange slot)
                 windows: Vec<(usize, usize, usize, usize)>,
+                // Real sig tokens per exchange slot — the Concept A.4 size input.
+                ex_tokens: Vec<usize>,
             }
             let mut files: Vec<FileScan> = Vec::new();
             for timeline in timelines {
@@ -993,6 +1163,10 @@ impl Conversation {
                 if windows.is_empty() {
                     continue;
                 }
+                let mut ex_tokens = vec![0usize; n_slots];
+                for &(_, s, e, slot) in &windows {
+                    ex_tokens[slot] += e - s;
+                }
                 files.push(FileScan {
                     timeline,
                     arc_turn,
@@ -1001,6 +1175,7 @@ impl Conversation {
                     arcs_kept,
                     arc_sids,
                     windows,
+                    ex_tokens,
                 });
             }
             if files.is_empty() {
@@ -1014,7 +1189,10 @@ impl Conversation {
             // group vote weights come from the group's `policy.layer_weights` (empty ⇒
             // uniform — repo_map peaks on L46 (§83), configured in the schema YAML). ──
             let weights = &group.policy.layer_weights;
-            let gpu_scores: Option<Vec<Vec<f32>>> = arena.and_then(|arena| {
+            // Returns per-file `(fused, mass_base)`: the policy-fused
+            // per-exchange scores and the UNGATED additive sum for Concept B.
+            let scan_files = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
+                let gpu_scores: Option<Vec<(Vec<f32>, Vec<f32>)>> = arena.and_then(|arena| {
                 // Per-turn residency fingerprint: the decoded-sig `Arc` identity + a
                 // content sample (first/last words). The memo serves a STABLE `Arc`
                 // that changes identity only when a turn's blob is rewritten (and keeps
@@ -1041,98 +1219,219 @@ impl Conversation {
                         n_cases: f.n_slots,
                     })
                     .collect();
-                match arena.scan_weighted(&segments, &[probe], weights) {
-                    Ok(mut out) => {
-                        // One probe in ⇒ one per-GLOBAL-case vote vector out, in segment
-                        // (file) order. Split it back per file by cumulative `n_slots`.
-                        let votes = out.pop().unwrap_or_default();
-                        let mut cum = 0usize;
+                let arena_scan = |w: &[f32]| -> Option<Vec<Vec<f32>>> {
+                    match arena.scan_weighted(&segments, &[p], w) {
+                        Ok(mut out) => {
+                            // One probe in ⇒ one per-GLOBAL-case vote vector out, in
+                            // segment (file) order. Split it back per file by
+                            // cumulative `n_slots`.
+                            let votes = out.pop().unwrap_or_default();
+                            let mut cum = 0usize;
+                            Some(
+                                files
+                                    .iter()
+                                    .map(|f| {
+                                        let end = (cum + f.n_slots).min(votes.len());
+                                        let mut v = votes.get(cum..end).unwrap_or(&[]).to_vec();
+                                        v.resize(f.n_slots, 0.0);
+                                        cum += f.n_slots;
+                                        v
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "provenance",
+                                "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
+                            );
+                            None
+                        }
+                    }
+                };
+                // Concept G on the arena: non-additive modes run one one-hot
+                // scan per fold group (each IS that group's needle-gated
+                // tally), then fuse per the mode — the same law as the CPU
+                // `score_slots_fused`. The ungated group sum rides along as
+                // the mass base.
+                match group.policy.scan.fusion {
+                    FusionMode::Additive => {
+                        arena_scan(weights).map(|per_file| {
+                            per_file.into_iter().map(|v| (v.clone(), v)).collect()
+                        })
+                    }
+                    mode => {
+                        let n_groups = p
+                            .first()
+                            .map(|s| (s.n_heads as usize / PROV_HEADS_PER_LAYER).max(1))?;
+                        // grouped_files[g][file][slot]
+                        let mut grouped_files: Vec<Vec<Vec<f32>>> =
+                            Vec::with_capacity(n_groups);
+                        for g in 0..n_groups {
+                            let mut one_hot = vec![0.0f32; n_groups];
+                            one_hot[g] = weights.get(g).copied().unwrap_or(1.0);
+                            grouped_files.push(arena_scan(&one_hot)?);
+                        }
                         Some(
-                            files
-                                .iter()
-                                .map(|f| {
-                                    let end = (cum + f.n_slots).min(votes.len());
-                                    let mut v = votes.get(cum..end).unwrap_or(&[]).to_vec();
-                                    v.resize(f.n_slots, 0.0);
-                                    cum += f.n_slots;
-                                    v
+                            (0..files.len())
+                                .map(|fi| {
+                                    let per_group: Vec<Vec<f32>> = grouped_files
+                                        .iter()
+                                        .map(|gf| gf[fi].clone())
+                                        .collect();
+                                    (
+                                        mode.fuse(&per_group),
+                                        FusionMode::Additive.fuse(&per_group),
+                                    )
                                 })
                                 .collect(),
                         )
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "candle_conversation::provenance",
-                            "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
-                        );
-                        None
-                    }
                 }
             });
-            let fresh_per_file: Vec<Vec<f32>> = gpu_scores.unwrap_or_else(|| {
-                files
-                    .iter()
-                    .map(|f| {
-                        let wref: Vec<&[WideQSig]> = f
-                            .windows
-                            .iter()
-                            .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
-                            .collect();
-                        let wslot: Vec<usize> =
-                            f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
-                        score_slots_weighted(probe, &wref, &wslot, f.n_slots, weights)
-                    })
-                    .collect()
-            });
+                gpu_scores.unwrap_or_else(|| {
+                    files
+                        .iter()
+                        .map(|f| {
+                            let wref: Vec<&[WideQSig]> = f
+                                .windows
+                                .iter()
+                                .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
+                                .collect();
+                            let wslot: Vec<usize> =
+                                f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
+                            match group.policy.scan.fusion {
+                                FusionMode::Additive => {
+                                    let v =
+                                        score_slots_weighted(p, &wref, &wslot, f.n_slots, weights);
+                                    (v.clone(), v)
+                                }
+                                mode => {
+                                    let grouped =
+                                        score_slots_grouped(p, &wref, &wslot, f.n_slots, weights);
+                                    if grouped.is_empty() {
+                                        (vec![0.0; f.n_slots], vec![0.0; f.n_slots])
+                                    } else {
+                                        (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+                                    }
+                                }
+                            }
+                        })
+                        .collect()
+                })
+            };
+            let scanned: Vec<(Vec<f32>, Vec<f32>)> = scan_files(probe);
+            let fresh_per_file: Vec<Vec<f32>> =
+                scanned.iter().map(|(fused, _)| fused.clone()).collect();
+            let mass_base_per_file: Vec<Vec<f32>> =
+                scanned.into_iter().map(|(_, base)| base).collect();
+            // Concept F: the pinned question window scans as a second probe,
+            // max-fused with the tail per exchange AFTER normalization.
+            let fresh_q_per_file: Option<Vec<Vec<f32>>> = match probe_q {
+                Some(q) if group.policy.scan.question_pin && !q.is_empty() => {
+                    Some(scan_files(q).into_iter().map(|(fused, _)| fused).collect())
+                }
+                _ => None,
+            };
 
-            // ── Phase C: per-file normalize + stamp (unchanged behaviour) ────────
+            // ── Phase C: per-file normalize → Q-fuse → locality → stamp ──────────
             // Normalize the raw scores against each EXCHANGE's learned hit level so
             // selection compares candidates on a common 0-1000 band, not a shared
             // absolute scale (docs/provenance_score_normalization.md). Scope =
             // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
             // resetting learning for the regenerated clusters; child = the exchange's
-            // head-turn index (stable across scans).
+            // head-turn index (stable across scans). The Concept A.4 level prior
+            // floors each exchange's denominator by its size; Concept F max-fuses
+            // the normalized question scan; Concept C drags neighbors afterwards.
             let mut cands: Vec<(TurnKey, f32)> = Vec::new();
-            for (f, fresh) in files.iter().zip(&fresh_per_file) {
+            // Concept B: mass rides on the RAW fused scores (pre-normalization)
+            // — measured (results doc §25): under warm hit levels the
+            // normalized band compresses genuine concentration away, while the
+            // raw top-1-share² formula keeps the code-vs-history contrast.
+            let mut group_raw: Vec<f32> = Vec::new();
+            for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
                 let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
-                let raw_pairs: Vec<(ChildKey, f32)> = f
-                    .ex_ranges
+                let child_of =
+                    |slot: usize| ChildKey::turn(f.arc_turn[f.ex_ranges[slot].start].0 as u64);
+                let raw_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
+                    .map(|slot| (child_of(slot), fresh.get(slot).copied().unwrap_or(0.0)))
+                    .collect();
+                let floors: Vec<f32> = f
+                    .ex_tokens
                     .iter()
-                    .enumerate()
-                    .map(|(slot, r)| {
-                        (
-                            ChildKey::turn(f.arc_turn[r.start].0 as u64),
-                            fresh.get(slot).copied().unwrap_or(0.0),
-                        )
-                    })
+                    .map(|&t| group.policy.scan.level_floor(t, LEVEL_PRIOR_T_REF))
                     .collect();
                 // One lock for the read-then-(maybe)-write, so no other thread mutates
                 // the levels between this turn's normalize and observe. Learning only
-                // fires on the once-per-turn seal scan, not on every reprojection.
-                let normed = {
+                // fires on the once-per-turn seal scan, not on every reprojection,
+                // and folds the TAIL scan's raw scores (the stored whole-turn probe).
+                let (normed, normed_q) = {
                     let mut cache = self.normalization.lock().unwrap();
-                    let normed = cache.normalize(&scope, &raw_pairs);
+                    let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors);
+                    let normed_q = fresh_q_per_file.as_ref().map(|per_file| {
+                        let fq = &per_file[fi];
+                        let q_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
+                            .map(|slot| (child_of(slot), fq.get(slot).copied().unwrap_or(0.0)))
+                            .collect();
+                        cache.normalize_with_floors(&scope, &q_pairs, &floors)
+                    });
                     if observe {
                         cache.observe(&scope, &raw_pairs);
                     }
-                    normed
+                    (normed, normed_q)
+                };
+                let mut fused: Vec<f32> = (0..f.n_slots)
+                    .map(|slot| {
+                        let t = normed.get(slot).map(|(_, s)| *s).unwrap_or(0.0);
+                        let q = normed_q
+                            .as_ref()
+                            .and_then(|nq| nq.get(slot).map(|(_, s)| *s))
+                            .unwrap_or(0.0);
+                        t.max(q)
+                    })
+                    .collect();
+                // Concept C: a hit drags its timeline neighbors into contention
+                // (exchange granularity, max-not-sum, radius grows with score).
+                let boosted_flags: Vec<bool> = match &group.locality {
+                    Some(loc) => {
+                        let (dragged, flags) = loc.apply(&fused);
+                        fused = dragged;
+                        flags
+                    }
+                    None => vec![false; f.n_slots],
                 };
                 // Stamp EVERY member turn of an exchange with its (shared) normalized
                 // score, so provenance selecting either half brings in the whole
                 // round-trip — never half a tool call.
                 for (slot, r) in f.ex_ranges.iter().enumerate() {
-                    let sc = normed.get(slot).map(|(_, s)| *s).unwrap_or(0.0);
+                    let sc = fused.get(slot).copied().unwrap_or(0.0);
                     for ai in r.clone() {
                         let idx = f.arc_turn[ai];
                         scores.set_turn(timeline, idx, sc);
+                        if boosted_flags[slot] {
+                            scores.mark_locality_boost(timeline, idx);
+                        }
                         cands.push((TurnKey::new(timeline, idx), sc));
                     }
                 }
+                group_raw.extend_from_slice(&mass_base_per_file[fi]);
             }
             if cands.is_empty() {
                 continue;
             }
+            // Concept B: the group's attention mass over every candidate
+            // exchange's raw fused score.
+            scores.set_group_mass(
+                group.id,
+                attention_mass(
+                    &group_raw,
+                    0.0,
+                    f32::MAX,
+                    group.policy.scan.mass_top_k,
+                    group.policy.scan.mass_rho,
+                ),
+            );
             per_group.push((group.id, cands));
         }
         per_group
@@ -1406,6 +1705,13 @@ impl Conversation {
         tracing::info!(turns = total, "substrate reconstruct: begin replay loop");
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
+        // Startup integrity repair (`persistence::integrity`): completeness is
+        // judged here — and only here — because reconstruct is the one moment
+        // with no live writer, so on-disk state is final and a half-written
+        // conversation cannot be mistaken for a damaged one.
+        let corpus_has_kv = self.read().any_stream_has_chunks();
+        let mut repaired_integrity = 0usize;
+        let mut integrity_dropped: HashSet<TimelineId> = HashSet::new();
         for (i, mut decl) in decls.into_iter().enumerate() {
             // Report turns processed so far (restored + skipped) so the daemon's
             // loading bar advances steadily even across corrupt-turn skips.
@@ -1571,6 +1877,75 @@ impl Conversation {
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
+            // A timeline already tombstoned by integrity repair this pass:
+            // its remaining turns are dead with it — skip the restore work.
+            if integrity_dropped.contains(&timeline) {
+                continue;
+            }
+            // Completeness verdict — the CRC guards bytes that were written;
+            // this guards records that were never written at all (the async
+            // writer's `Tokens`/sig records can be lost to a hard kill while
+            // the decl and KV chunks landed durably through other channels).
+            let verdict = {
+                let read = self.read();
+                classify_turn(
+                    read.distill_mode(timeline),
+                    decl.block_end > decl.block_start,
+                    !recovered.token_ids.is_empty(),
+                    corpus_has_kv,
+                    cold_refs.is_some(),
+                )
+            };
+            if verdict != TurnIntegrity::Ok {
+                let policy = LayerId::from_raw(decl.layer_id)
+                    .map(|l| self.read().corrupt_turn_policy_for(l))
+                    .unwrap_or_default();
+                match policy {
+                    CorruptTurnPolicy::DropConversation => {
+                        // Regenerable content (code_read files, repo_map
+                        // clusters): tombstone the timeline durably; the owning
+                        // layer's refresh re-ingests it complete. One tombstone
+                        // per timeline per pass — later turns skip above.
+                        repaired_integrity += 1;
+                        integrity_dropped.insert(timeline);
+                        let reason = format!(
+                            "integrity repair (turn {}): {}",
+                            decl.turn_index,
+                            verdict.describe()
+                        );
+                        self.write().tombstone_timeline(timeline);
+                        if let Ok(mut p) = self.persistence.lock() {
+                            match p.write_tombstone(timeline.raw(), Some(&reason)) {
+                                Ok(_) => tracing::info!(
+                                    timeline_id = decl.timeline_id,
+                                    turn_index = decl.turn_index,
+                                    reason = %reason,
+                                    "integrity repair: tombstoned incomplete conversation \
+                                     — the owning layer re-ingests it",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    timeline_id = decl.timeline_id,
+                                    turn_index = decl.turn_index,
+                                    "integrity repair tombstone write failed: {e}",
+                                ),
+                            }
+                        }
+                        continue;
+                    }
+                    CorruptTurnPolicy::DropTurn => {
+                        // Dialogue is user history — never auto-deleted for
+                        // incompleteness. Restore what survived: layout text
+                        // still renders, present KV still attends.
+                        tracing::warn!(
+                            timeline_id = decl.timeline_id,
+                            turn_index = decl.turn_index,
+                            "incomplete turn restored (user history is never \
+                             auto-deleted): {}",
+                            verdict.describe(),
+                        );
+                    }
+                }
+            }
             let token_count = recovered.token_count;
             let mut view = self.write();
             if let (Some(layer), Some(group)) = (
@@ -1630,6 +2005,7 @@ impl Conversation {
         let n_sections = read.section_count();
         let n_timelines = read.timeline_count();
         let n_conversations = read.conversation_count();
+        let orphan_chunk_streams = read.orphan_chunk_stream_count();
         drop(read);
         tracing::info!(
             sections = n_sections,
@@ -1637,8 +2013,22 @@ impl Conversation {
             conversations = n_conversations,
             turns = restored,
             skipped_corrupt = skipped_corrupt,
+            repaired_integrity = repaired_integrity,
+            orphan_chunk_streams = orphan_chunk_streams,
             "substrate reload complete",
         );
+        // Orphaned KV — chunks on disk whose owning turn's StreamDecl is gone —
+        // means turns were silently dropped in a prior generation (the compaction
+        // re-emit-skip bug) and their KV is now unreachable dead weight. Surface
+        // it loudly: with the re-emit guard in place this must trend to zero, and
+        // compaction now reclaims whatever remains instead of copying it forward.
+        if orphan_chunk_streams > 0 {
+            tracing::warn!(
+                orphan_chunk_streams,
+                "reload found orphaned KV (chunks with no StreamDecl): these turns \
+                 are unreconstructable and their KV will be reclaimed by compaction",
+            );
+        }
         Ok(restored)
     }
 
@@ -2232,8 +2622,12 @@ impl Conversation {
     /// record time, so this NEVER blocks the seal on the persistence lock (which a
     /// compaction holds across its whole relocation I/O). Metadata-class: exempt
     /// from the writer's KV byte cap, so a warm→cold backlog can't stall it either.
-    /// Async is crash-safe — a `Tokens` record lost on crash yields an absent turn
-    /// (reconstruct is order-independent + per-turn fault-isolated), never corruption.
+    /// Async loss window: a `Tokens` record that never lands (hard kill before the
+    /// writer drains) does NOT remove the turn — reconstruct restores it from its
+    /// decl with an empty token buffer, since the layout text, KV chunks, and sigs
+    /// persist through their own channels. The startup integrity check
+    /// (`persistence::integrity`) then repairs regenerable layers by re-ingest;
+    /// dialogue turns restore with a warning and render from layout text.
     pub fn enqueue_tokens(&self, stream_id: StreamId, token_ids: Vec<u32>) {
         self.writer.enqueue(WriteJob::Tokens {
             stream_id,
@@ -2600,6 +2994,20 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     fn turn_score(&self, turn: TurnKey) -> f32 {
         self.read.turn_score_for_timeline(turn.timeline, turn.index)
+    }
+
+    fn group_attention_mass(&self, group: GroupId) -> f32 {
+        self.read.scores_or_empty().group_mass(group)
+    }
+
+    fn collection_attention_mass(&self, collection: u32) -> f32 {
+        self.read.scores_or_empty().collection_mass(collection)
+    }
+
+    fn turn_locality_boosted(&self, turn: TurnKey) -> bool {
+        self.read
+            .scores_or_empty()
+            .is_locality_boosted(turn.timeline, turn.index)
     }
 
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {

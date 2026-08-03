@@ -95,6 +95,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::adaptive::AnchorMember;
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
 };
@@ -1202,7 +1203,13 @@ pub fn run_with_sink<R: ContentResolver>(
                 let fresh: Vec<f32> = all_turns.iter().map(|(_, s)| *s).collect();
                 // Early-decode grace: within the opening window the selection band
                 // is lowered and carried picks are floored (see `PolicyConfig::windowed`).
-                let (cfg, floor) = group.belief_config(all_turns.len()).windowed(decode_pos);
+                let (mut cfg, floor) = group.belief_config(all_turns.len()).windowed(decode_pos);
+                // Concept B: attention mass extends the member budget within the
+                // declared rail (`budget_adaptive.absolute_max`).
+                if let Some(ba) = &group.budget_adaptive {
+                    cfg.budget_max =
+                        ba.effective_max(cfg.budget_max, resolver.group_attention_mass(group.id));
+                }
                 let beliefs = crate::provenance::belief_step(
                     &fresh,
                     &prior_scores,
@@ -1219,7 +1226,15 @@ pub fn run_with_sink<R: ContentResolver>(
                     selection_scores.set_turn(*key, b.score, b.qualified);
                     if b.selected {
                         out.push((*key, b.score));
-                        selection_origins.insert(*key, SelectionOrigin::Belief);
+                        // Concept C: a pick whose score came from neighbor drag
+                        // (not its own vote) is stamped `Locality` so the record
+                        // answers "why is this here?" truthfully.
+                        let origin = if resolver.turn_locality_boosted(*key) {
+                            SelectionOrigin::Locality
+                        } else {
+                            SelectionOrigin::Belief
+                        };
+                        selection_origins.insert(*key, origin);
                     }
                 }
                 out
@@ -1286,6 +1301,39 @@ pub fn run_with_sink<R: ContentResolver>(
                         .max(group.score_threshold.unwrap_or(0.0));
                     selected.push((key, sentinel));
                     selection_origins.insert(key, SelectionOrigin::Fallback);
+                }
+            }
+
+            // Concept D — timeline anchor: whenever ANY exchange of a timeline
+            // is selected in an anchored group, the timeline's anchor member
+            // (`first` = the file-header exchange carrying imports + module
+            // doc) rides along at the timeline's best selected score — it
+            // travels WITH the hit, never above it. Fires only on non-empty
+            // per-timeline selections (an empty group is `default`'s job) and
+            // never double-injects an organically-selected head.
+            if let Some(anchor) = &group.anchor {
+                let AnchorMember::First = anchor.member;
+                let mut per_timeline: HashMap<TimelineId, f32> = HashMap::new();
+                for (key, score) in &selected {
+                    let best = per_timeline.entry(key.timeline).or_insert(f32::MIN);
+                    *best = best.max(*score);
+                }
+                for (timeline, best) in per_timeline {
+                    let head = TurnKey::new(timeline, TurnIndex(0));
+                    if selected.iter().any(|(k, _)| *k == head) {
+                        continue;
+                    }
+                    // A timeline with no turn 0 (never true for real
+                    // conversations) contributes nothing.
+                    if resolver.turn_token_count(head) == 0 {
+                        continue;
+                    }
+                    selected.push((head, best));
+                    // Pushed into `selected` above, so it qualified by
+                    // construction — the anchor is admitted regardless of where
+                    // `best` sits relative to the band.
+                    selection_scores.set_turn(head, best, true);
+                    selection_origins.insert(head, SelectionOrigin::Anchor);
                 }
             }
 
@@ -1460,12 +1508,24 @@ pub fn run_with_sink<R: ContentResolver>(
         })
         .collect();
 
-    // Layer-level flex with natural cap so freed budget redistributes.
+    // Layer-level flex with natural cap so freed budget redistributes. Concept
+    // B: a layer's attention mass (the sum over its groups') scales its
+    // priority within the declared rails — a tour-shaped probe lifts repo_map
+    // above its static share, a code probe grows the scopes layer.
     let layer_items: Vec<FlexItem> = surviving_layer_indices
         .iter()
         .enumerate()
         .map(|(slot, &li)| {
-            let mut item = FlexItem::from_budget(&visible_layers[li].budget, turn_budget);
+            let layer_mass: f32 = group_states
+                .iter()
+                .filter(|gs| gs.layer_idx == li)
+                .map(|gs| resolver.group_attention_mass(gs.schema.id))
+                .sum();
+            let mut item = FlexItem::from_budget_with_mass(
+                &visible_layers[li].budget,
+                turn_budget,
+                layer_mass,
+            );
             let nat = layer_natural[slot];
             item.max_tokens = Some(item.max_tokens.map_or(nat, |m| m.min(nat)));
             item
@@ -1488,10 +1548,15 @@ pub fn run_with_sink<R: ContentResolver>(
         }
 
         // Group-level flex within layer, also capped at natural consumption.
+        // Concept B applies one level down with the group's own mass.
         let group_items: Vec<FlexItem> = layer_groups
             .iter()
             .map(|gs| {
-                let mut item = FlexItem::from_budget(&gs.schema.budget, layer_budget);
+                let mut item = FlexItem::from_budget_with_mass(
+                    &gs.schema.budget,
+                    layer_budget,
+                    resolver.group_attention_mass(gs.schema.id),
+                );
                 let nat = natural_tokens[&gs.schema.id];
                 item.max_tokens = Some(item.max_tokens.map_or(nat, |m| m.min(nat)));
                 item
@@ -2054,7 +2119,15 @@ fn select_collection_sections<R: ContentResolver>(
             // Early-decode grace: within the opening window the selection band is
             // lowered and carried picks are floored (see `PolicyConfig::windowed`),
             // so the submit guess and a still-accruing correct tool stay in scope.
-            let (cfg, floor) = coll.policy.config.windowed(decode_pos);
+            let (mut cfg, floor) = coll.policy.config.windowed(decode_pos);
+            // Concept B: the collection's attention mass extends its member
+            // budget within the declared rail.
+            if let Some(ba) = &coll.budget_adaptive {
+                cfg.budget_max = ba.effective_max(
+                    cfg.budget_max,
+                    resolver.collection_attention_mass(coll.id.raw()),
+                );
+            }
             let beliefs = crate::provenance::belief_step(
                 &fresh,
                 &prior_scores,
