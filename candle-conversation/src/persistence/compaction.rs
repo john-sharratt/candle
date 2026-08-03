@@ -169,6 +169,16 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
         // gallery reads only the sig), TextOnly also drops sig + projections
         // (keep tokens — a plain read-only text record). Tombstoned timelines
         // drop entirely, as before.
+        // A stream with no StreamDecl is an ORPHAN: its turn/section cannot be
+        // reconstructed on reload (reload rebuilds turns from their decl), so
+        // every record it still owns — chunks, tokens, sig, projections — is
+        // unreachable dead weight. Drop the whole stream so compaction reclaims
+        // the orphaned KV instead of copying it forward on every pass forever.
+        // Without this gate a decl lost in a prior generation leaves its (huge)
+        // KV chunks immortal on disk.
+        if entry.decl.is_none() {
+            continue;
+        }
         let mut turn_dead = false;
         let distill: Option<DistillMode> =
             if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
@@ -639,10 +649,28 @@ mod tests {
 
     #[test]
     fn collect_keeps_only_the_live_winners() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
         let mut blob = Vec::new();
         // A stale ModelSpec, then the live one.
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v1-stale"));
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v2-live"));
+        // The stream's decl — without it the chunk is an orphan and is reclaimed.
+        let decl5 = StreamDecl::Turn(TurnDecl {
+            timeline_id: 5,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        blob.extend_from_slice(&record(RecordType::StreamDecl, 5, 0, &decl5.encode()));
         // A stream: a 20-token partial chunk, then the sealed winner.
         blob.extend_from_slice(&chunk_record(5, 0, b"partial-20tok-dead"));
         blob.extend_from_slice(&chunk_record(5, 0, b"sealed-final-live"));
@@ -651,8 +679,8 @@ mod tests {
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
         let live = collect_live_records(&manifest, &substrate);
-        // Exactly: 1 ModelSpec + 1 Chunk = 2 (no StreamDecl/Commit/Tokens here).
-        assert_eq!(live.len(), 2);
+        // Exactly: 1 ModelSpec + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
+        assert_eq!(live.len(), 3);
         // Each read-back item points at the live winner's on-disk location — the
         // manifest / substrate index already resolved last-writer-wins — so the
         // stale ModelSpec and the dead partial chunk are never staged. Read the
@@ -681,11 +709,62 @@ mod tests {
         );
     }
 
+    /// An orphaned stream — KV chunks (and tokens) on disk but NO `StreamDecl` —
+    /// is reclaimed by compaction, not copied forward. Regression for the
+    /// silent-loss bloat bug: a decl lost in a prior generation must not leave
+    /// its (huge) KV immortal on disk. The turn is already unreloadable without
+    /// its decl, so dropping the chunks loses nothing recoverable and reclaims
+    /// the space.
+    #[test]
+    fn orphan_stream_without_decl_is_reclaimed() {
+        let mut blob = Vec::new();
+        // Two orphan streams: one with a chunk, one with a chunk + tokens. No
+        // StreamDecl for either. Plus a legit ModelSpec singleton to prove only
+        // the orphans are dropped.
+        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model"));
+        blob.extend_from_slice(&chunk_record(9001, 0, b"orphan-kv-a"));
+        blob.extend_from_slice(&chunk_record(9002, 0, b"orphan-kv-b"));
+        blob.extend_from_slice(&record(RecordType::Tokens, 9002, 0, b"orphan-tokens"));
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+
+        let live = collect_live_records(&manifest, &substrate);
+        assert!(
+            !has_type(&live, RecordType::Chunk),
+            "orphan chunks (no StreamDecl) must be reclaimed, not kept forever",
+        );
+        assert!(
+            !has_type(&live, RecordType::Tokens),
+            "an orphan stream's tokens are reclaimed with it",
+        );
+        // The legit singleton survives — only orphan streams are dropped.
+        assert!(has_type(&live, RecordType::ModelSpec));
+    }
+
     #[test]
     fn compacted_log_recovers_to_an_identical_live_set() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"m1"));
         blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"m2"));
+        // The stream's decl — without it the chunks are orphans and are reclaimed.
+        let decl7 = StreamDecl::Turn(TurnDecl {
+            timeline_id: 7,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 2,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        blob.extend_from_slice(&record(RecordType::StreamDecl, 7, 0, &decl7.encode()));
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 0, b"c0-old"));
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 0, b"c0-new"));
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 1, b"c1"));

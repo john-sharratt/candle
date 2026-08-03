@@ -38,6 +38,7 @@
 //!
 //! Anything that survives this is guaranteed to project without errors.
 
+use super::adaptive::ScanPolicy;
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
 use super::policy::SelectionPolicy;
@@ -670,6 +671,7 @@ impl Builder {
                     config,
                     tags: Vec::new(),
                     layer_weights: Vec::new(),
+                    scan: ScanPolicy::default(),
                 }
             }
             _ => SelectionPolicy::default_policy(),
@@ -688,6 +690,7 @@ impl Builder {
                 member_glue: String::new(),
                 member_glue_tokens: None,
                 default: None,
+                budget_adaptive: None,
             }));
         self.name_maps
             .collection_names
@@ -1119,6 +1122,7 @@ impl Builder {
                     priority: 100.0,
                     min_percent: None,
                     max_percent: None,
+                    adaptive: None,
                 },
                 dials: LayerDials::default(),
                 // Template-less fallback summary so a plain-prompt conversation
@@ -1165,8 +1169,12 @@ impl Builder {
                         priority: 100.0,
                         min_percent: None,
                         max_percent: None,
+                        adaptive: None,
                     },
                     default: None,
+                    budget_adaptive: None,
+                    locality: None,
+                    anchor: None,
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),
@@ -1174,6 +1182,7 @@ impl Builder {
                 // the interactive decode priority the production dialogue layer does.
                 decode_priority: DecodePriority::High,
                 on_corrupt_turn: CorruptTurnPolicy::DropTurn,
+                ingest_unit: None,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

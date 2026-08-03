@@ -1370,6 +1370,149 @@ fn r4c(f: &Fixture, level: &[f32], floor_base: f32, floor_cap: f32) {
     );
 }
 
+// ═══ Round 5 — locking the PRODUCTION chain configuration ═══════════════════
+//
+// The battery's wins used mean-based levels; production uses the EWMA
+// hit-level cache with priors/floors and warms content levels by SELF-MATCH
+// (`warm_ingest_normalization`). R5 evaluates the exact production scoring
+// chain (`score_slots_fused` + `NormalizationCache`) across the candidate
+// configurations, on the three headline targets, to pick the shipping config:
+//   fusion:  full-gated (additive × gate)  vs  grouped-sum (per-group tallies)
+//   levels:  self-match warm (production ingest warm)  vs  dialogue-traffic
+//   floors:  A.4 size floors REPLACING prior/scope-floor  vs  stacked default
+
+use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+use candle_conversation::provenance::{score_slots_fused, FusionMode};
+
+fn r5(f: &Fixture) {
+    println!("\n═══ R5: production-chain config sweep (fusion × levels × floors) ═══");
+    let (slots, n_junk, n_builder) = r3_pool(f);
+    let tokens: Vec<usize> = slots.iter().map(|s| s.windows[0].len()).collect();
+    let n = slots.len();
+    let n_code = n_junk + n_builder;
+
+    let scan = |probe: &[WideQSig], grouped_sum: bool| -> Vec<f32> {
+        if grouped_sum {
+            gated(&group_scans(probe, &slots))
+        } else {
+            let mut windows: Vec<&[WideQSig]> = Vec::new();
+            let mut slot_of: Vec<usize> = Vec::new();
+            for (i, s) in slots.iter().enumerate() {
+                for w in &s.windows {
+                    windows.push(w);
+                    slot_of.push(i);
+                }
+            }
+            score_slots_fused(
+                probe,
+                &windows,
+                &slot_of,
+                n,
+                &[],
+                FusionMode::ContentGated { gate_group: 0 },
+            )
+        }
+    };
+
+    for grouped_sum in [false, true] {
+        // Levels via the production cache. Self-match warm: each slot's own
+        // trailing window is the probe, its raw score observed — the
+        // `warm_ingest_normalization` analog. Dialogue warm: the captured
+        // turns' seal observes.
+        for self_warm in [true, false] {
+            let scope = ScopeKey::turn_group(0, 0);
+            let mut cache = NormalizationCache::new(NormConfig::default());
+            if self_warm {
+                for (i, s) in slots.iter().enumerate() {
+                    let w = s.windows[0];
+                    let probe = &w[w.len().saturating_sub(MAX_PROBE_TOKENS)..];
+                    let raw = scan(probe, grouped_sum);
+                    cache.observe(&scope, &[(ChildKey::named(slots[i].label.clone()), raw[i])]);
+                }
+            } else {
+                let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
+                dialogue.sort_unstable();
+                for (tl, idx) in dialogue {
+                    let raw = scan(&f.probe(tl, idx), grouped_sum);
+                    let pairs: Vec<(ChildKey, f32)> = slots
+                        .iter()
+                        .zip(&raw)
+                        .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
+                        .collect();
+                    cache.observe(&scope, &pairs);
+                }
+            }
+            for replace_floors in [true, false] {
+                let floors: Vec<f32> = tokens
+                    .iter()
+                    .map(|&t| 2.0 * (256.0 / t.max(1) as f32).clamp(1.0, 16.0))
+                    .collect();
+                let normalize = |raw: Vec<f32>| -> Vec<f32> {
+                    let pairs: Vec<(ChildKey, f32)> = slots
+                        .iter()
+                        .zip(&raw)
+                        .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
+                        .collect();
+                    let out = if replace_floors {
+                        cache.normalize_with_floors(&scope, &pairs, &floors)
+                    } else {
+                        cache.normalize(&scope, &pairs)
+                    };
+                    out.into_iter().map(|(_, v)| v).collect()
+                };
+                let pipeline = |tl: u64, idx: u64| -> Vec<f32> {
+                    let all = f.sig(tl, idx);
+                    let q = normalize(scan(&all[..64.min(all.len())], grouped_sum));
+                    let t = normalize(scan(&f.probe(tl, idx), grouped_sum));
+                    q.iter().zip(&t).map(|(a, b)| a.max(*b)).collect()
+                };
+                let tour = pipeline(TOUR_TL, T_TOUR);
+                let mb = pipeline(TOUR_TL, T_MODELBUILDER);
+                let recall = pipeline(TOUR_TL, T_RECALL);
+                let rank_of_prefix = |scores: &[f32], prefix: &str| -> usize {
+                    let mut idxs: Vec<usize> = (0..n).collect();
+                    idxs.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+                    idxs.iter()
+                        .position(|&i| slots[i].label.starts_with(prefix))
+                        .map(|p| p + 1)
+                        .unwrap_or(0)
+                };
+                let mass = |s: &[f32]| -> f32 {
+                    let mut g: Vec<f32> = s[..n_code]
+                        .iter()
+                        .copied()
+                        .filter(|v| *v > 0.0)
+                        .map(|v| v.min(1000.0))
+                        .collect();
+                    g.sort_by(|a, b| b.total_cmp(a));
+                    let sum: f32 = g.iter().sum();
+                    if sum <= 0.0 {
+                        return 0.0;
+                    }
+                    sum * (g.iter().take(3).sum::<f32>() / sum)
+                };
+                let (rm, rc) = (mass(&recall), mass(&mb));
+                println!(
+                    "  fusion={} levels={} floors={}  tour cluster #{:<3} builder #{:<3} \
+                     mass recall/code {:.1}/{:.1} {}",
+                    if grouped_sum { "grouped" } else { "fullgate" },
+                    if self_warm { "self " } else { "dialog" },
+                    if replace_floors {
+                        "size-replace"
+                    } else {
+                        "stacked-dflt"
+                    },
+                    rank_of_prefix(&tour, "cluster:"),
+                    rank_of_prefix(&mb, "builder.rs"),
+                    rm,
+                    rc,
+                    if rm < 0.5 * rc { "✓" } else { "✗" },
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     let f = load_fixture();
     let total_tokens: usize = f.sigs.values().map(Vec::len).sum();
@@ -1414,5 +1557,8 @@ fn main() {
         r4a(&f, &level, 0.5, 1.0);
         r4b(&f, &level, 0.5, 1.0);
         r4c(&f, &level, 0.5, 1.0);
+    }
+    if run("5") {
+        r5(&f);
     }
 }

@@ -16,17 +16,17 @@
 /// A named, tuned policy preset (the §24.6 recommendations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyPreset {
-    /// Stable, correct, small tool scope: β0.40, min 800 / evict 600, budget
-    /// 1..3, plus an early-decode grace window (250/187.5 through the first
-    /// cadence reprojection). Thresholds are on the `z × margin` hybrid scorer
-    /// (§24.7) with a 256-token probe window (`reproject_max_probe_tokens`) and
-    /// the needle gate (§24.8). The §80.2 sweep put the 100%-recall floor near
-    /// 1000, but live decode-Q for the correct tool routinely crests just under it
-    /// (observed misses at ~920), so nominal `min` is relaxed to 800 (`evict 600`,
-    /// the same 0.75 band) to catch them while the window covers the opening tokens
-    /// where the signal is still accruing. A committed tool is held stable across
-    /// its `<tool_call>` block by the scheduler suppressing reprojection there, not
-    /// by pinning the selection. Default for the `tools` collection.
+    /// Stable, correct, small tool scope on the **normalized 0–1000 hit-level
+    /// band** (Concept A, `docs/provenance_adaptive_projection.md` §3): β0.40,
+    /// min 112 / evict 60, budget 1..4, plus an early-decode grace window
+    /// (35/26 through the first cadence reprojection). The thresholds come
+    /// from the full-corpus normalized sweep (results doc §25.8: 745 turns ×
+    /// 93 tools — true-tool normalized scores sit at p25 ≈ 949 / p50 ≈ 1394;
+    /// min 112 at budget 4 holds ~99.1 % recall at ~65 % exact-1 / 0.5 mean
+    /// FP; the budget-3 recall ceiling on the grown corpus is 99.2 %, budget 4
+    /// recovers 99.6 %). A committed tool is held stable across its
+    /// `<tool_call>` block by the scheduler suppressing reprojection there,
+    /// not by pinning the selection. Default for the `tools` collection.
     CommittedToolScope,
     /// Recall over set size: β0.40, min 40 / evict 20, budget 1..5. ~99.7% recall
     /// with the weak tail pruned to ~4 members.
@@ -41,22 +41,23 @@ impl PolicyPreset {
         match self {
             PolicyPreset::CommittedToolScope => PolicyConfig {
                 beta: 0.40,
-                // The §80.2 sweep put the 100%-recall floor at ~1000, but live
-                // decode-Q for a correct tool routinely peaks just under it (an
-                // observed datetime turn crested at 921 and was skipped). Nominal
-                // 800 (evict 600, same 0.75 hysteresis band) admits those without
-                // meaningfully widening the false-positive set, and the early-decode
-                // window below still governs the opening 64 tokens.
+                // min 800 / evict 600 on the normalized 0–1000 band. A genuine
+                // sustained tool match sits near 1000 by construction, so 800 is
+                // a STRICT gate that admits only strong matches — which is what
+                // tool selection needs. (The earlier migration to min 112 was
+                // measured too permissive live: weak content bleed — e.g. an
+                // `hmac_compute` tool scoring ~156 — cleared the gate for a code
+                // query it had no business answering. 800 restores strictness;
+                // it maps cleanly to the band because a real hit ≈ 1000 here just
+                // as the raw hits clustered near 1000 before normalization.)
                 min_score: 800.0,
                 evict_score: 600.0,
                 budget_min: 1,
                 budget_max: 3,
                 // Early-decode grace: for the first 64 generated tokens hold the
-                // bar at 250 (evict 187.5, the same 0.75 hysteresis ratio) so a
-                // correct pick whose decode-Q is still building — and the submit
-                // guess carried into the first reprojection — stays in scope until
-                // its signal crosses, instead of being evicted at token 1 while the
-                // query's prefill-Q reads ≈ 0 for it.
+                // bar at 250 (evict 187.5, same 0.75 hysteresis ratio) so a
+                // correct pick whose decode-Q is still building stays in scope
+                // until its signal crosses.
                 early_window_tokens: 64,
                 early_min_score: 250.0,
                 early_evict_score: 187.5,
@@ -97,6 +98,7 @@ impl PolicyPreset {
     }
 }
 
+use super::adaptive::ScanPolicy;
 use crate::provenance::{GroupBudget, SectionPolicy};
 
 /// The concrete belief/selection knobs, resolved from a preset ± overrides.
@@ -201,6 +203,10 @@ pub struct SelectionPolicy {
     /// concentrates — see `docs/tool_selection_provenance_results.md` §83. Set via
     /// the node's `policy.layer_weights` in the YAML.
     pub layer_weights: Vec<f32>,
+    /// Scan-side knobs (`docs/provenance_adaptive_projection.md`): fusion mode
+    /// (Concept G), question pinning (Concept F), mass constants (Concept B),
+    /// level-prior constants (Concept A.4). Defaults = today's behavior.
+    pub scan: ScanPolicy,
 }
 
 impl SelectionPolicy {
@@ -211,6 +217,7 @@ impl SelectionPolicy {
             config: PolicyPreset::CommittedToolScope.config(),
             tags: Vec::new(),
             layer_weights: Vec::new(),
+            scan: ScanPolicy::default(),
         }
     }
 
@@ -220,6 +227,7 @@ impl SelectionPolicy {
             config: preset.config(),
             tags: Vec::new(),
             layer_weights: Vec::new(),
+            scan: ScanPolicy::default(),
         }
     }
 }
@@ -242,6 +250,9 @@ mod tests {
 
     #[test]
     fn committed_tool_scope_matches_locked_values() {
+        // Strict gate on the normalized band (min 800 ≈ near the 1000 hit
+        // ceiling). The min-112 migration was reverted after live testing showed
+        // it admitted weak tools into unrelated queries.
         let c = PolicyPreset::CommittedToolScope.config();
         assert_eq!(c.beta, 0.40);
         assert_eq!(c.min_score, 800.0);

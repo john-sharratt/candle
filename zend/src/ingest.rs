@@ -59,6 +59,9 @@ pub struct IngestLayer {
     pub mode: IngestMode,
     pub folder: String,
     pub display: String,
+    /// Noun for the startup loading screen's absolute readout ("N / M <unit>").
+    /// From the layer's `ingest_unit:` in projection.yaml, else a mode default.
+    pub unit: String,
 }
 
 /// A live turn-sink's mutable state, held between refreshes and keyed by layer
@@ -161,12 +164,23 @@ pub fn ingest_layers(
             (_, None) => base_display.to_string(),
             (_, Some(d)) => format!("{base_display} ({d})"),
         };
+        // Loading-screen unit: the layer's `ingest_unit:` from projection.yaml,
+        // falling back to what the mode's progress counter actually counts.
+        let unit = layer.ingest_unit.clone().unwrap_or_else(|| {
+            match mode {
+                IngestMode::Folders => "folders",
+                IngestMode::Files => "files",
+                IngestMode::Raw => "files",
+            }
+            .to_string()
+        });
         out.push(IngestLayer {
             name: layer.name.clone(),
             group: group.name.clone(),
             mode,
             folder,
             display,
+            unit,
         });
     }
     out

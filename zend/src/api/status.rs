@@ -20,6 +20,9 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         current: s.current.label(),
         progress: s.progress,
         completed: s.completed.iter().map(|step| step.label()).collect(),
+        progressed: s.progressed,
+        total: s.total,
+        unit: s.unit.clone(),
     });
     let maintenance = session
         .substrate_maintenance()
@@ -126,4 +129,11 @@ pub struct LoadingBody {
     pub progress: f32,
     /// Labels of steps that have already completed, in execution order.
     pub completed: Vec<&'static str>,
+    /// Absolute progress within the current step: `progressed` of `total`
+    /// `unit`s (e.g. 137 of 1000 files). The frontend renders "N / M unit"
+    /// beside the bar. `total == 0` ⇒ no count yet; `unit == ""` ⇒ the counter
+    /// is a scaled fraction, not a discrete count, so only the bar shows.
+    pub progressed: u64,
+    pub total: u64,
+    pub unit: String,
 }

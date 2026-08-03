@@ -618,6 +618,36 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         tokens: usize,
     },
+    /// §11.1 selection-replay: for each dialogue turn of a target conversation,
+    /// replay the PRODUCTION content-axis scoring chain
+    /// (`docs/provenance_adaptive_projection.md`) offline against the real
+    /// substrate galleries — content-gated fusion (Concept G) + hit-level
+    /// normalization warmed by self-match (Concept A) + question(head)/tail
+    /// max-fusion (Concept F) — and report the top selections per content axis
+    /// plus the code-vs-repo_map attention-mass contrast (Concept B). The
+    /// tuning loop the design's §11.1 harness describes: no model, pure CPU
+    /// over stored sigs, so it is deterministic and cheap.
+    SelectionReplay {
+        /// Target conversation: a label substring, conv-id, or raw timeline id.
+        conversation: String,
+        /// Content-axis tag for the code gallery (scopes).
+        #[arg(long, default_value = "code")]
+        code_tag: String,
+        /// Content-axis tag for the structure gallery (repo_map clusters).
+        #[arg(long, default_value = "repo_map")]
+        structure_tag: String,
+        /// Fold group the content gate keys on (0 = content L0–45).
+        #[arg(long, default_value_t = 0)]
+        gate_group: usize,
+        /// Top-N selections to print per axis per turn.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Cap each gallery to the first N member turns (0 = all). The full
+        /// snapshot code gallery is O(100k) turns; a cap keeps the O(gallery ×
+        /// probe) scan tractable for interactive iteration.
+        #[arg(long, default_value_t = 4000)]
+        limit: usize,
+    },
     /// Calibration-quality audit: decode every tagged turn and flag any whose
     /// assistant response never emitted a completed `</tool_call>` — a prompt
     /// that made the model deliberate/refuse instead of calling its tool poisons
@@ -722,6 +752,7 @@ fn is_belief_cmd(cmd: &Cmd) -> bool {
             | Cmd::BeliefDissect { .. }
             | Cmd::BeliefSweep { .. }
             | Cmd::BeliefDecay { .. }
+            | Cmd::SelectionReplay { .. }
     )
 }
 
@@ -774,6 +805,22 @@ fn run_belief(cmd: Cmd, substrate: &Substrate) -> Result<()> {
             normalize,
         } => belief_sweep(substrate, &tag, &scorer, probe_tokens, normalize),
         Cmd::BeliefDecay { tag, window, chunk } => belief_decay(substrate, &tag, window, chunk),
+        Cmd::SelectionReplay {
+            conversation,
+            code_tag,
+            structure_tag,
+            gate_group,
+            top,
+            limit,
+        } => selection_replay(
+            substrate,
+            &conversation,
+            &code_tag,
+            &structure_tag,
+            gate_group,
+            top,
+            limit,
+        ),
         _ => anyhow::bail!("run_belief called with a non-belief command"),
     }
 }
@@ -873,7 +920,8 @@ fn main() -> Result<()> {
         | Cmd::BeliefReplay { .. }
         | Cmd::BeliefDissect { .. }
         | Cmd::BeliefSweep { .. }
-        | Cmd::BeliefDecay { .. } => unreachable!("belief commands dispatched above"),
+        | Cmd::BeliefDecay { .. }
+        | Cmd::SelectionReplay { .. } => unreachable!("belief commands dispatched above"),
         Cmd::CalibCheck { tag } => calib_check(&mut log, &tag)?,
         Cmd::CalibBaseline { tag, out } => calib_baseline(&mut log, &tag, out)?,
         Cmd::Tree { timeline, text } => tree(&mut log, timeline, text)?,
@@ -1554,6 +1602,242 @@ fn score_slots_hybrid(
         }
     }
     votes
+}
+
+/// §11.1 selection-replay — replay the production content-axis scoring chain
+/// offline against the real substrate galleries. See [`Cmd::SelectionReplay`].
+fn selection_replay(
+    substrate: &Substrate,
+    conversation: &str,
+    code_tag: &str,
+    structure_tag: &str,
+    gate_group: usize,
+    top: usize,
+    limit: usize,
+) -> Result<()> {
+    use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+    use candle_conversation::projection::attention_mass;
+    use candle_conversation::provenance::{
+        decode_wide_sigs, score_slots_grouped, FusionMode, WideQSig,
+    };
+
+    const PROBE: usize = 256; // reproject_max_probe_tokens
+    const HEAD: usize = 64; // question-window approximation (F11)
+
+    // Resolve the target dialogue conversation. Match on raw timeline id, then
+    // conv-id / label substring. Dialogue turns are the empty-tagged turns on it.
+    let want_tl: Option<u64> = conversation.parse().ok();
+    let mut target: Option<(u64, String)> = None;
+    for (_, s) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(d)) = &s.decl else {
+            continue;
+        };
+        if !d.tags.is_empty() {
+            continue; // gallery turn, not dialogue
+        }
+        let tl = d.timeline_id;
+        let hit = want_tl == Some(tl)
+            || TimelineId::from_raw(tl)
+                .and_then(|t| substrate.conv_id_of(t).map(|c| c.contains(conversation)))
+                .unwrap_or(false)
+            || TimelineId::from_raw(tl)
+                .and_then(|t| substrate.label_of(t).map(|l| l.contains(conversation)))
+                .unwrap_or(false);
+        if hit {
+            let label = TimelineId::from_raw(tl)
+                .and_then(|t| substrate.label_of(t).map(str::to_string))
+                .unwrap_or_default();
+            target = Some((tl, label));
+            break;
+        }
+    }
+    let (dialogue_tl, dialogue_label) =
+        target.with_context(|| format!("no dialogue conversation matching {conversation:?}"))?;
+
+    // Dialogue probes: each empty-tagged turn on the timeline, in index order.
+    let mut probes: Vec<(u32, Vec<WideQSig>)> = Vec::new();
+    for (_, s) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(d)) = &s.decl else {
+            continue;
+        };
+        if d.timeline_id != dialogue_tl || !d.tags.is_empty() {
+            continue;
+        }
+        if let Some(sig) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {
+            if !sig.is_empty() {
+                probes.push((d.turn_index, sig));
+            }
+        }
+    }
+    probes.sort_by_key(|(idx, _)| *idx);
+
+    // A content-axis gallery: turns tagged `tag`, grouped into slots keyed by the
+    // member's non-`tag` tag (the file path / cluster path). Each slot carries
+    // its turns' sig windows + a total token size (for the Concept A.4 floor).
+    struct Gallery {
+        names: Vec<String>,
+        windows: Vec<Vec<WideQSig>>, // per member turn
+        slot_of: Vec<usize>,         // window i → slot
+        tokens: Vec<usize>,          // per slot total real tokens
+    }
+    let build_gallery = |tag: &str| -> Gallery {
+        let mut names: Vec<String> = Vec::new();
+        let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+        let mut slot_of = Vec::new();
+        for (_, s) in substrate.all_streams() {
+            if limit > 0 && windows.len() >= limit {
+                break;
+            }
+            let Some(StreamDecl::Turn(d)) = &s.decl else {
+                continue;
+            };
+            if !d.tags.iter().any(|t| t == tag) {
+                continue;
+            }
+            let name = d
+                .tags
+                .iter()
+                .find(|t| t.as_str() != tag)
+                .cloned()
+                .unwrap_or_else(|| format!("tl{}#{}", d.timeline_id, d.turn_index));
+            let Some(win) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+                continue;
+            };
+            if win.is_empty() {
+                continue;
+            }
+            let slot = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                names.push(name.clone());
+                names.len() - 1
+            });
+            windows.push(win);
+            slot_of.push(slot);
+        }
+        let mut tokens = vec![0usize; names.len()];
+        for (wi, w) in windows.iter().enumerate() {
+            tokens[slot_of[wi]] += w.len();
+        }
+        Gallery {
+            names,
+            windows,
+            slot_of,
+            tokens,
+        }
+    };
+
+    // Content-gated grouped scan → fuse, over a gallery.
+    let gate = FusionMode::ContentGated { gate_group };
+    let scan = |probe: &[WideQSig], g: &Gallery| -> (Vec<f32>, Vec<f32>) {
+        let wref: Vec<&[WideQSig]> = g.windows.iter().map(|w| w.as_slice()).collect();
+        let grouped = score_slots_grouped(probe, &wref, &g.slot_of, g.names.len(), &[]);
+        if grouped.is_empty() {
+            return (vec![0.0; g.names.len()], vec![0.0; g.names.len()]);
+        }
+        (gate.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+    };
+
+    // Self-match warm the hit levels (the `warm_ingest_normalization` analog):
+    // each slot's own best turn as the probe, its raw gated score observed — so
+    // the traffic peak is learned. Under the A.4 floor path the denominator is
+    // max(peak, size_floor).
+    let warm = |g: &Gallery, cache: &mut NormalizationCache, scope: &ScopeKey| {
+        for slot in 0..g.names.len() {
+            // The slot's longest own window is the strongest self-probe.
+            let mut best: Option<&[WideQSig]> = None;
+            for (wi, w) in g.windows.iter().enumerate() {
+                if g.slot_of[wi] == slot && best.map(|b| w.len() > b.len()).unwrap_or(true) {
+                    best = Some(w.as_slice());
+                }
+            }
+            if let Some(w) = best {
+                let probe = &w[w.len().saturating_sub(PROBE)..];
+                let (fused, _) = scan(probe, g);
+                cache.observe(
+                    scope,
+                    &[(ChildKey::named(g.names[slot].clone()), fused[slot])],
+                );
+            }
+        }
+    };
+    let floors = |g: &Gallery| -> Vec<f32> {
+        g.tokens
+            .iter()
+            .map(|&t| 2.0 * (PROBE as f32 / t.max(1) as f32).clamp(1.0, 16.0))
+            .collect()
+    };
+
+    let code = build_gallery(code_tag);
+    let structure = build_gallery(structure_tag);
+    let code_scope = ScopeKey::turn_group(1, 1);
+    let structure_scope = ScopeKey::turn_group(2, 2);
+    let mut cache = NormalizationCache::new(NormConfig::default());
+    warm(&code, &mut cache, &code_scope);
+    warm(&structure, &mut cache, &structure_scope);
+    let code_floors = floors(&code);
+    let structure_floors = floors(&structure);
+
+    println!("\n══ §11.1 selection-replay — production content-axis pipeline ══\n");
+    println!(
+        "conversation: {dialogue_label:?} (tl {dialogue_tl}), {} dialogue turns",
+        probes.len()
+    );
+    println!(
+        "galleries: {} code slots / {} structure slots (fusion=content_gated gate={gate_group})\n",
+        code.names.len(),
+        structure.names.len()
+    );
+
+    for (idx, sig) in &probes {
+        let tail = &sig[sig.len().saturating_sub(PROBE)..];
+        let head = &sig[..HEAD.min(sig.len())];
+        let axis = |g: &Gallery, scope: &ScopeKey, fl: &[f32]| -> (Vec<(String, f32)>, f32) {
+            let normalize = |raw: Vec<f32>| -> Vec<f32> {
+                let pairs: Vec<(ChildKey, f32)> = g
+                    .names
+                    .iter()
+                    .zip(&raw)
+                    .map(|(n, &v)| (ChildKey::named(n.clone()), v))
+                    .collect();
+                cache
+                    .normalize_with_floors(scope, &pairs, fl)
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            let (tf, mass_base) = scan(tail, g);
+            let (qf, _) = scan(head, g);
+            let tn = normalize(tf);
+            let qn = normalize(qf);
+            let fused: Vec<f32> = tn.iter().zip(&qn).map(|(t, q)| t.max(*q)).collect();
+            let mut ranked: Vec<(String, f32)> =
+                g.names.iter().cloned().zip(fused.iter().copied()).collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            (ranked, attention_mass(&mass_base, 0.0, f32::MAX, 1, 2.0))
+        };
+        let (code_rank, code_mass) = axis(&code, &code_scope, &code_floors);
+        let (struct_rank, struct_mass) = axis(&structure, &structure_scope, &structure_floors);
+        let winner = if struct_mass > code_mass {
+            "structure"
+        } else {
+            "code"
+        };
+        println!(
+            "── turn #{idx}  ({} sig tokens)  mass: code {:.1} / structure {:.1} → {winner} ──",
+            sig.len(),
+            code_mass,
+            struct_mass
+        );
+        println!("   code:");
+        for (name, score) in code_rank.iter().take(top) {
+            println!("     {score:>8.1}  {name}");
+        }
+        println!("   structure:");
+        for (name, score) in struct_rank.iter().take(top) {
+            println!("     {score:>8.1}  {name}");
+        }
+        println!();
+    }
+    Ok(())
 }
 
 /// §80 tool-selection accuracy over the whole tagged corpus. For every tagged

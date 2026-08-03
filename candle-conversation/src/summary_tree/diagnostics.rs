@@ -59,6 +59,14 @@ pub enum SelectionOrigin {
     /// so the group's fallback member (by tag) was injected to keep the group —
     /// and its layer — present. Not relevance, not recency: a guaranteed floor.
     Fallback,
+    /// Concept C turn locality: the turn was dragged into contention by a
+    /// scoring neighbor on its timeline (its own organic score was below the
+    /// drag) — present because its neighborhood matters, not on its own vote.
+    Locality,
+    /// Concept D anchor: the timeline's anchor member (e.g. the file-header
+    /// first exchange), injected because a sibling exchange was selected — it
+    /// travels WITH the hit, carrying the file's imports/module doc.
+    Anchor,
 }
 
 /// Per-turn selection diagnostics, attached to `TurnResponse`.

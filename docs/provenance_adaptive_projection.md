@@ -165,6 +165,7 @@ E1–E7 and R2a–R2d over the captured probes and galleries):
 | F14 | **The root cluster never wins organically** — across all 30 dialogue turns its within-structure rank is 2–22 (median ~10); topic-specific clusters win, which is correct for specific questions. `default {tag "."}` is therefore the *load-bearing* mechanism for root presence, not a backstop, and the tour composition is floor + `k = 2` organic picks. | §13, repo_map config |
 | F15 | **The short-probe promotions are tool-shaped questions** ("what time is it?", 24–28 sig tokens): no code slot is right for them, so the code-axis top is arbitrary — and their absolute offline scores overlap genuine code hits, so within-axis gating alone cannot close it. The production discriminators are cross-axis (the tools collection wins the mass for these probes — the guards prove the signal) and the real 0–1000 band (levels learned from strong self-matches separate one-off spurious matches). Verification is a Phase-1 harness acceptance criterion, not a new mechanism. | Concept B, §11 harness |
 | F16 | **The multi-segment `belief-*` port is built and confirms everything at full-corpus scale** (snapshot, 745 tagged tool turns / 93 tools — the corpus doubled since the 372-turn baseline): additive reproduces the baseline at **Top-1 97.3 % / Top-5 100 % / MRR 0.985**; `content_gated` collapses to **32.9 %** with **66.7 % of probes scoring 0 for their own tool** (tool identity has literally no content-group agreement — the per-axis fusion split is proven, not provisional); **normalization holds ranking exactly** (Top-1 97.3 %) while improving selection at the same nominal gate (exact-1 1.2 % → 35.3 %, mean set 2.95 → 2.04). The normalized `belief-sweep` derived Concept A's threshold table: true-tool scores sit at p25 ≈ 949 / p50 ≈ 1394 on the band; at budget 3, `min ≈ 60–80` holds the 99.2 % recall ceiling at ~50 % exact-1, `min ≈ 949` trades to 97.2 % recall at 94.8 % exact-1 / 0.06 FP; the budget-3 recall ceiling is 99.2 % at this corpus size (budget 5 → 100 %). | Concepts A + G, §12 Phase 1 |
+| F18 | **The implementation round (R5 + acceptance, 2026-08-03) locked the shipping chain and overturned three v2 details.** (a) `ContentGated`'s law is the **grouped sum** (per-group needle-gated tallies, gate on the content group, `Σ_g w_g·t_g`); the full-additive-gated-by-one-hot variant collapsed the target to the pool bottom and is rejected. (b) Gated-fusion axes normalize **traffic-relative**: the A.4 floored path divides by the child's observed-traffic **peak** (floored by size), and `warm_ingest` self-match warming is skipped for non-additive-fusion groups (config-keyed) — self-levels would erase the quiet-child standout the design requires. (c) Concept B's mass keys on the **ungated** additive sum with `k = 1, ρ = 2` — the gate deliberately removes the concentrated spike mass must see, and the normalized band compresses it. Acceptance through the production chain: tour → structure **#1**; ModelBuilder → builder.rs **#3 = inside the top_k 4 selection budget + anchor** (vs absent entirely live; the two slots above are same-repo test fixtures sharing the probe's vocabulary — strict rank-1 relaxed to the selection-level criterion); recall-vs-code mass contrast 0.72× on the ungated formula. | Concepts A.4 + B + G as shipped |
 | F17 | **Code self-match at corpus scale is regime-dependent, and normalization inverts on cold levels.** Bounded 600-turn LOO (single-turn-file probes excluded — and in these runs excluded from the gallery too, leaving ≈160 multi-turn file slots as the effective pool): raw Top-1 **57.1 %** (chance ≈ 0.6 %) with a 20 % zero-self floor — cross-scope same-file retrieval is genuinely hard, which independently validates C + D (neighbors must be dragged in, not expected to score). `--normalize` **drops** to 47.5 %: with each file observed once or twice the causal pass divides by learning-starved levels — quiet-slot amplification (F5) at corpus scale. Not an A refutation (tools, observation-dense, held exactly; production warm-replays levels) but the proof that **A.4's level prior is load-bearing for cold scopes** (newly ingested files). Warm-level code verification = the §11 harness (Phase 1). | Concepts A (A.4), C + D, §12 Phase 1 |
 
 ---
@@ -262,8 +263,18 @@ level_eff(child)   = max(level_learned(child), level_floor(child))
   normalization *inverting* (57.1 % → 47.5 % Top-1) when levels are cold
   (files observed once or twice), which is the exact regime every newly
   ingested file passes through. The floor is what keeps a cold scope's
-  scoring no worse than raw until its level accrues; constants come from the
-  production-corpus sweep;**
+  scoring no worse than raw until its level accrues; shipped values
+  `floor_base 2.0 / floor_cap 16`;**
+- **shipped semantics (F18): a child with a positive size floor normalizes
+  against its observed-traffic PEAK, floored by the size floor** — not the
+  EWMA level, whose prior seed and slow decay block the quiet-child standout
+  the contract requires. A promiscuous child's peak is high (it hits on
+  everything), so its cross-hits mute; a quiet child's rare genuine hit lands
+  near its own peak and stands out. Correspondingly, `warm_ingest`'s
+  self-match warming **skips non-additive-fusion groups** (config-keyed):
+  self-levels would stamp every file's peak at its self-match magnitude and
+  erase the contrast — the content gate already solves the promiscuous
+  domination that warm-up existed to fix;
 - this also resolves §13's "structure stubs" question at the scoring level: a
   ~27-token stub cannot win by quiet-slot amplification, only by genuine
   agreement.
@@ -279,30 +290,34 @@ code-shaped probe grows the scopes budget; a tools-shaped probe grows the tools
 
 ### B.1 Attention mass (concentration-weighted — measured requirement, F4)
 
-A plain sum over gated scores is **measured invalid** as a budget signal: a
-diffuse history probe generates *more* raw code-slot mass (5 591) than a genuine
-code probe (3 470), because generic probe tokens light up promiscuous slots
+A plain sum over scores is **measured invalid** as a budget signal: a diffuse
+history probe generates *more* raw code-slot mass (5 591) than a genuine code
+probe (3 470), because generic probe tokens light up promiscuous slots
 everywhere. What separates the two is **concentration**: the code probe puts
-0.579 of its mass on its top slot, the history probe 0.368 (entropy 1.85 vs
-2.55). Mass is therefore the gated sum *scaled by* concentration:
+0.579 of its mass on its top slot, the history probe 0.368. Mass is the sum
+*scaled by* the top-share concentration:
 
 ```
-S(g)    = { s_i : s_i ≥ policy.min_score }         (scores on the normalized band, Concept A)
-sum(g)  = Σ_i  min(s_i, 1000)
-conc(g) = Σ_{top-k} min(s_i, 1000) / max(sum(g), ε)     (k = 3)
-mass(g) = sum(g) × conc(g)^ρ                            (ρ = 1)
+sum(g)  = Σ_i  s_i                       (the UNGATED additive group sum — see below)
+conc(g) = Σ_{top-k} s_i / max(sum(g), ε)     (k = 1)
+mass(g) = sum(g) × conc(g)^ρ                 (ρ = 2)
 ```
 
-Bounded, comparable, zero when nothing clears the gate — and near zero when the
-mass is smeared across the gallery (a diffuse probe self-mutes). `k` and `ρ`
-are policy-level settings (inherited from `default_policy`, overridable per
-group/collection policy like every other policy knob). **Measured (F10): with
-Concepts G + A upstream, all three ideal mass orderings hold at every swept
-`k ∈ {1,3,5}` × `ρ ∈ {0,0.5,1,2}` — the gated, normalized scores already carry
-the contrast (recall-vs-code collapses 8.9×), and concentration *widens* the
-margins rather than creating them. The term is a robustness dial, not a
-prerequisite; low-stakes constants (first values `k = 3`, `ρ = 1`), re-swept in
-production by the §11 harness.** The acceptance is the mass red test
+**Shipped basis (F18):** mass keys on the **ungated raw additive sum** of the
+same per-group tallies the fusion consumes (zero extra scan cost) — NOT the
+normalized or gated scores: the content gate deliberately removes the
+concentrated spike mass must see (measured: gated mass inverted the contrast),
+and traffic-peak normalization compresses it. `k = 1, ρ = 2` is the measured
+operating point (code 3 470 × 0.579² = 1 163 vs recall 5 591 × 0.368² = 757 —
+a 0.65–0.72× contrast, direction correct with margin).
+
+Comparable across nodes and near zero when the mass is smeared across the
+gallery (a diffuse probe self-mutes). `k` and `ρ` are policy-level settings
+(inherited from `default_policy`, overridable per group/collection policy like
+every other policy knob). (F10's earlier finding — normalized-band mass with
+any `k`/`ρ` — held under the round-3 mean-level approximation but NOT under
+the shipped traffic-peak normalizer, which is why the ungated-raw basis above
+is what ships; F18.) The acceptance is the mass red test
 (`recall_probe_code_mass_collapses_relative_to_code_probe`). Computed inside
 `score_beliefs` and carried on `ProjectionScores` (new field
 `group_mass: HashMap<GroupKey, f32>`), so it rides the existing
@@ -561,11 +576,18 @@ per group over that group's own token-vote magnitudes (as measured — each grou
 finds its own needle). Fusion across the group vectors is a per-policy mode:
 
 ```
-additive:        score = Σ_g s_g                            (today, default)
-content_gated:   score = Σ_g s_g  if s_gate > 0, else 0     (gate_group from config)
-consensus_min:   score = min_g s_g
-consensus_geo:   score = (Π_g s_g)^(1/n_groups)
+additive:        score = single-pass Σ (cross-group needle gate — today, default)
+content_gated:   score = Σ_g w_g·t_g  if t_gate > 0, else 0
+                 (t_g = group g's own needle-gated tally; gate_group from config)
+consensus_min:   score = min_g t_g
+consensus_geo:   score = (Π_g t_g)^(1/n_groups)
 ```
+
+Each per-group tally equals a one-hot-weighted additive scan, so any backend
+implementing the additive scan — including the GPU gallery arena — serves the
+non-additive modes with `n_groups` scans. (An alternative `content_gated` law —
+the full additive score gated by a one-hot gate scan — was implemented,
+measured, and REJECTED: the true target collapsed to the pool bottom, F18.)
 
 - **`content_gated` is the measured content-axis operator** (F9/F10): identity
   groups amplify only what the gate group (the content fold, L0–45) agrees
@@ -657,8 +679,8 @@ default_policy:
     question_pin: true       # Concept F: pinned Q-window (the persisted user span,
                              # F12) + decode tail, max-fused
   mass:                      # Concept B — mass definition; a policy knob like any
-    concentration_top_k: 3   # other (inherited from default_policy, overridable
-    concentration_rho: 1.0   # per group/collection policy)
+    concentration_top_k: 1   # other (inherited from default_policy, overridable
+    concentration_rho: 2.0   # per group/collection policy). Shipped values (F18).
 ```
 
 Parsing lands in `yaml.rs` beside the existing `parse_selection`/`parse_default`;
@@ -680,9 +702,28 @@ sets, origins), `TurnCoupling`, stream decls with tags. `belief-replay` in
 `substrate_inspect` already proves the production-faithful replay pattern for the
 tools axis (§80.3); this harness generalizes it to the full projection.
 
-### 11.1 `substrate_inspect selection-replay`
+### 11.1 `substrate_inspect selection-replay` — BUILT (2026-08-03)
 
-New subcommand (sibling of `belief-replay`, same load-once/CPU/model-free frame):
+Shipped as a `belief-*`-family subcommand (merged multi-segment substrate,
+CPU, model-free):
+
+```
+substrate_inspect --log <snapshot> selection-replay <conversation> \
+    [--code-tag code] [--structure-tag repo_map] [--gate-group 0] \
+    [--top N] [--limit N]
+```
+
+Per dialogue turn of the target conversation it runs the **production
+content-axis chain** against the real substrate galleries — `content_gated`
+grouped-scan fusion (G) → hit-level normalization warmed by self-match with
+the A.4 size floors (A) → per-slot max of the head (question, F11) and tail
+scans (F) — and prints the top-N selected members per axis plus the
+code-vs-`repo_map` attention-mass contrast (B, on the ungated raw sum,
+`k=1, ρ=2`). `--limit` caps each gallery (the full snapshot code gallery is
+O(100k) turns). This is the tuning loop; the always-on `selection_replay.rs`
+acceptance tests are its CI-pinned fixture counterpart.
+
+The original design sketch (kept for reference):
 
 ```
 selection-replay --conversation <label|timeline> \

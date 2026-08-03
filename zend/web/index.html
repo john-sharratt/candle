@@ -2599,6 +2599,13 @@
     const ld = (boot && boot.loading) || { current: 'Loading model', progress: 0, completed: [] };
     const pct = Math.round((ld.progress || 0) * 100);
     const completed = (ld.completed || []).map((step) => h('li', {}, step));
+    // Absolute readout beside the bar: "137 / 1,000 files · 14%". Only shown when
+    // the step reports a discrete count (a unit + a known total); otherwise just
+    // the percent, since a scaled-fraction counter has no meaningful "N / M".
+    const done = ld.progressed || 0, total = ld.total || 0, unit = ld.unit || '';
+    const countTxt = (unit && total > 0)
+      ? (done.toLocaleString() + ' / ' + total.toLocaleString() + ' ' + unit + ' · ' + pct + '%')
+      : (pct + '%');
     const card = h('div', { class: 'z-load-card' },
       h('div', { class: 'z-load-eyebrow' }, 'Starting up'),
       h('div', { class: 'z-load-row' },
@@ -2608,6 +2615,7 @@
         // reports one, falling back to the step label otherwise.
         h('span', { class: 'z-load-cur' }, (boot && boot.detail) || ld.current || 'Loading model')),
       h('div', { class: 'z-load-track' }, h('div', { class: 'z-load-bar', style: 'width:' + pct + '%;' })),
+      h('div', { style: 'margin-top:7px; font-size:0.72rem; color:#8a817a; font-family:ui-monospace,monospace; font-variant-numeric:tabular-nums;' }, countTxt),
       completed.length ? h('ul', { class: 'z-load-list' }, completed) : null,
       // Keep the step category as the sub-label once the action line shows the
       // phase, so the grouping ("Ingesting workspace") stays visible.

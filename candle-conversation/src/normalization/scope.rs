@@ -21,15 +21,39 @@ impl ScopeState {
         raw: &[(ChildKey, f32)],
         cfg: &NormConfig,
     ) -> Vec<(ChildKey, f32)> {
+        self.normalize_with_floors(raw, &[], cfg)
+    }
+
+    /// [`Self::normalize`] with a caller-supplied per-child denominator floor —
+    /// the Concept A.4 size-aware level prior
+    /// (`docs/provenance_adaptive_projection.md` §3). A positive `floors[i]`
+    /// switches child `i` to **traffic-peak normalization**: its denominator is
+    /// `max(observed_traffic_peak, floors[i])` — the prior seed and the
+    /// scope-percentile floor do not apply. A promiscuous child's peak is high
+    /// (it hits on everything), so its cross-hits mute; a quiet-but-large
+    /// child's small size floor lets a rare genuine hit stand out — while a
+    /// tiny fragment's (large) size floor mutes chance matches. The caller's
+    /// policy owns the constants; a floor of `0.0` (or a missing entry) keeps
+    /// that child on the standard hit-level path. The mechanism here stays
+    /// constant-free.
+    pub(super) fn normalize_with_floors(
+        &self,
+        raw: &[(ChildKey, f32)],
+        floors: &[f32],
+        cfg: &NormConfig,
+    ) -> Vec<(ChildKey, f32)> {
         let floor = self.floor(cfg);
         raw.iter()
-            .map(|(k, r)| {
-                let hit = self
-                    .children
-                    .get(k)
-                    .map(|h| h.level())
-                    .unwrap_or(cfg.hit_prior);
-                (k.clone(), cfg.scale * r / hit.max(floor))
+            .enumerate()
+            .map(|(i, (k, r))| {
+                let child = self.children.get(k);
+                let child_floor = floors.get(i).copied().unwrap_or(0.0);
+                let denom = if child_floor > 0.0 {
+                    child.map(|h| h.peak()).unwrap_or(0.0).max(child_floor)
+                } else {
+                    child.map(|h| h.level()).unwrap_or(cfg.hit_prior).max(floor)
+                };
+                (k.clone(), cfg.scale * r / denom)
             })
             .collect()
     }

@@ -287,6 +287,14 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         if is_tomb {
             continue;
         }
+        // Orphan (no decl): re-emit nothing — its StreamDecl is gone, so its
+        // sig/projection records are unreachable dead weight. Re-emitting them
+        // would keep the orphan's metadata immortal on the incremental path.
+        // (The `if let Some(decl)` below already skips the StreamDecl; this also
+        // skips the sig/projection re-emit.) Mirrors the other orphan gates.
+        if entry.decl.is_none() {
+            continue;
+        }
         let keep_sig = distill != Some(DistillMode::TextOnly);
         if let Some(decl) = &entry.decl {
             out.push(Resident {
@@ -483,6 +491,29 @@ impl SubstratePersistence {
     /// floor (no durable snapshot yet) or any target `>= floor` (which may hold
     /// metadata written after the last re-emission) forces a re-emit.
     fn need_resident_reemit(&self, targets: &[SegmentId]) -> bool {
+        // Exact guard for per-stream metadata (`StreamDecl` / `WideQSig` /
+        // `ProjectionEvents` / `Commit`): `metadata_locs` holds ONLY the current
+        // (last-writer-wins) copy of each, so if any target segment holds one, it
+        // is the sole durable copy of a LIVE record — dropping without re-emitting
+        // would delete a live turn's decl outright (the silent-loss bug: turns
+        // vanish on reload, their KV orphaned). The floor heuristic alone
+        // mis-skipped this whenever the current copy sat below the floor (e.g. a
+        // decl sealed in the plan→execute window, which lands under the
+        // execute-time floor without a re-emitted copy). A segment holding only
+        // SUPERSEDED metadata has no `metadata_locs` entry pointing at it, so this
+        // still skips it — no re-emit→looks-dead→compact churn.
+        if self
+            .metadata_locs
+            .values()
+            .any(|loc| targets.contains(&loc.segment))
+        {
+            return true;
+        }
+        // Timeline-keyed resident metadata (`Label` / `ConvState` / `TreeMetadata`
+        // / `DebugId` / `Tombstone` / `Distilled`) carries no tracked location, so
+        // the append-ordered floor invariant guards it: a target strictly below
+        // the last re-emission's floor holds only records already duplicated at
+        // `>= floor`.
         match self.resident_reemit_floor {
             None => true,
             Some(floor) => targets.iter().any(|t| *t >= floor),
@@ -733,6 +764,15 @@ impl SubstratePersistence {
             if is_tomb {
                 continue;
             }
+            // Orphan (no decl): its records are unreachable on reload, so DON'T
+            // relocate them — segment_liveness excludes them from live weight, so
+            // relocating (instead of dropping) would move the orphan KV forward
+            // every compact while the dead-ratio never improves: perpetual churn
+            // and the bloat is never reclaimed. Dropping the source segment
+            // reclaims it. Mirrors the collect_live_records / segment_liveness gate.
+            if entry.decl.is_none() {
+                continue;
+            }
             if distill.is_none() {
                 for (&idx, loc) in &entry.chunks {
                     if in_target(loc.segment) {
@@ -798,12 +838,23 @@ impl SubstratePersistence {
         // their metadata from the live count below (else the tombstoned segment
         // never looks reclaimable).
         let mut tombstoned_streams: HashSet<u64> = HashSet::new();
+        // Streams with a live `StreamDecl` — the reconstructible ones. A stream
+        // WITHOUT a decl is an orphan (its decl was lost in a prior generation):
+        // its turn can never be rebuilt on reload, so none of its records count
+        // as live weight — mirroring the `collect_live_records` orphan gate — and
+        // the segments holding only its records become reclaimable instead of
+        // pinned forever.
+        let mut live_streams: HashSet<u64> = HashSet::new();
         for (sid, entry) in substrate.all_streams() {
             let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
             if is_tomb {
                 tombstoned_streams.insert(sid.0);
                 continue;
             }
+            if entry.decl.is_none() {
+                continue;
+            }
+            live_streams.insert(sid.0);
             if distill.is_none() {
                 for loc in entry.chunks.values() {
                     *live.entry(loc.segment).or_default() += loc.record_size;
@@ -822,8 +873,10 @@ impl SubstratePersistence {
         // copies are absent and correctly read as dead. Without this the segment
         // holding a stream's live metadata reads as reclaimable and gets
         // re-emitted-forward every maintenance pass (the periodic-compaction churn).
+        // Tombstoned streams and orphans (no live decl) are skipped so their
+        // residual metadata never pins a segment that should be reclaimed.
         for ((_rt, stream_id), loc) in &self.metadata_locs {
-            if tombstoned_streams.contains(stream_id) {
+            if tombstoned_streams.contains(stream_id) || !live_streams.contains(stream_id) {
                 continue;
             }
             *live.entry(loc.segment).or_default() += loc.record_size;
@@ -1033,12 +1086,32 @@ mod tests {
     /// location map is rebuilt from the walk).
     #[test]
     fn current_metadata_counts_as_live_weight() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
         let dir = tmp_dir("meta_live");
-        let sid = StreamId(777);
+        // A LIVE stream: it needs a StreamDecl to be reconstructible, otherwise
+        // it is an orphan whose residual metadata is (correctly) dead weight.
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 777,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
         {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            substrate.apply_stream_decl(sid, decl.clone());
             sp.append_wide_q_sigs(sid, b"wide-q-signature-bytes")
                 .unwrap();
             sp.commit().unwrap();
@@ -1071,6 +1144,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An orphan stream (KV chunks on disk, NO `StreamDecl`) is neither relocated
+    /// nor re-emitted by the incremental maintenance path — it is left to be
+    /// reclaimed when its source segment drops. Regression for the churn bug:
+    /// `segment_liveness` excludes orphan chunks from live weight, so if
+    /// `gather_relocations` still relocated them, a mixed segment would be
+    /// compacted forever (dead-ratio never improving) and the orphan KV would
+    /// migrate segment-to-segment, never reclaimed.
+    #[test]
+    fn orphan_stream_is_not_relocated_or_re_emitted() {
+        let dir = tmp_dir("orphan_reloc");
+        let sid = StreamId(4242); // no decl declared → orphan
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap(); // seg 1 holds the orphan chunk
+        }
+        // Re-walk so the substrate sees the chunk with no owning decl.
+        let mut substrate = Substrate::new();
+        let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        assert!(
+            substrate
+                .stream_of(sid)
+                .is_some_and(|s| s.decl.is_none() && !s.chunks.is_empty()),
+            "the stream is an orphan: chunk present, no decl",
+        );
+        // gather_relocations must NOT relocate the orphan's chunk.
+        let (chunks, _tokens, _singletons) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        assert!(
+            chunks.is_empty(),
+            "orphan chunks must not be relocated (would perpetuate the bloat + churn)",
+        );
+        // gather_resident_set must not re-emit any record for the orphan stream.
+        let residents = gather_resident_set(&substrate);
+        assert!(
+            residents.iter().all(|r| r.stream_id != sid.0),
+            "orphan metadata must not be re-emitted",
+        );
+        // And it contributes zero live weight, so its segment is reclaimable.
+        let live: u64 = sp.segment_liveness(&substrate).values().sum();
+        assert_eq!(live, 0, "an orphan chunk is not live weight");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The re-emit skip guard (`need_resident_reemit`) is what breaks the
     /// compaction churn: once the resident (metadata) set is durable at `floor`,
     /// ops targeting only older segments skip the wholesale re-emission — so they
@@ -1098,6 +1218,26 @@ mod tests {
         // Any target at/after the floor in a mixed set forces a re-emit.
         assert!(sp.need_resident_reemit(&[SegmentId(5), SegmentId(11)]));
 
+        // Exact guard: a target holding the CURRENT copy of a per-stream metadata
+        // record (here a StreamDecl in seg 5, BELOW the floor) must force a
+        // re-emit — the floor heuristic alone would wrongly skip it and the drop
+        // would delete the live turn's decl (the silent-loss bug).
+        sp.metadata_locs.insert(
+            (RecordType::StreamDecl, 42),
+            RecordLoc {
+                segment: SegmentId(5),
+                offset: 0,
+                payload_len: 0,
+                record_size: 4096,
+            },
+        );
+        assert!(
+            sp.need_resident_reemit(&[SegmentId(5)]),
+            "a target holding a current StreamDecl must force a re-emit even below the floor",
+        );
+        // A below-floor target with no current metadata still skips (no churn).
+        assert!(!sp.need_resident_reemit(&[SegmentId(4)]));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1106,12 +1246,31 @@ mod tests {
     /// Both chunks read correctly afterwards and survive a reload.
     #[test]
     fn maintenance_compacts_and_relocates_a_live_record() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
         let dir = tmp_dir("compact");
-        let sid = StreamId(202);
+        // The stream needs a decl to be live — a decl-less stream is an orphan
+        // whose chunks are (correctly) reclaimed rather than relocated.
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 202,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 2,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
         {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
             sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10))
                 .unwrap(); // seg 1, live
             sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(11))

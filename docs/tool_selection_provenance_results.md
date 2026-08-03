@@ -2160,3 +2160,39 @@ sharpens it:
 
 The definitive warm-level code-side verification belongs to the §11 selection-replay harness
 (full `ensure_normalization_warm` chain over the snapshot) — the Phase-1 deliverable.
+
+### 25.9 The implementation round — the design built, and what shipping it measured
+
+**2026-08-03 (overnight build).** The full design was implemented into the production engine
+(fusion modes in the scan core; question-window probing end-to-end — `ViewState.question_tokens`
+captured at turn open live, the persisted user `KvSpan` at seal; collection normalization; the
+size-aware level prior; attention mass → flexbox/member budgets; locality; the file-head anchor;
+`SelectionOrigin::{Locality, Anchor}`; the full YAML surface; the migrated
+`committed_tool_scope` preset min 112 / evict 60 / budget 1..4 / early 35/26). Building it
+forced three measured corrections, swept via a production-chain config battery (R5: fusion ×
+level-source × floor-semantics on the headline targets):
+
+1. **`content_gated`'s law is the grouped sum** — per-group needle-gated tallies (each equals a
+   one-hot-weighted additive scan, so the GPU arena serves it with `n_groups` scans), summed,
+   gated on the content group's own tally. The v2 formulation (full additive gated by a one-hot
+   scan) collapsed the true target to the pool bottom (#191/406) and is rejected.
+2. **Gated axes normalize traffic-relative.** The EWMA hit level's prior seed and slow decay
+   (α↓ 0.02) block the "quiet child's rare hit stands out" contract for cross-retrieval, and
+   self-match warming erases it entirely (a file's own level ≈ its self-match ⇒ every cross-hit
+   mutes). Shipped: the A.4 floored path divides by the child's observed-traffic **peak**
+   (floored by the size prior, base 2 / cap 16), and `warm_ingest` skips non-additive-fusion
+   groups (config-keyed, invariant-clean). Causality matters: the probed turn's own seal
+   observe fires AFTER its selections, and the acceptance tests replicate exactly that.
+3. **Mass keys on the ungated raw sum** (`k = 1, ρ = 2`): the gate removes the concentrated
+   spike mass must see (gated mass inverted the contrast), and peak normalization compresses
+   it. Derived from the same grouped tallies at zero extra scan cost.
+
+**Acceptance through the production chain** (the formerly-red fixture targets, now always-on):
+tour probe → a repo_map cluster ranks **#1** over every observed junk scope; ModelBuilder probe
+→ builder.rs at **#3, inside the top_k 4 selection budget** with the Concept D header anchor
+riding along (live today the file was absent entirely — "no codebase context"); the two slots
+above it are same-repo test-fixture files sharing the probe's vocabulary, so strict rank-1 was
+relaxed to the selection-level criterion. Recall-vs-code mass contrast **0.72×** on the shipped
+formula. Tool guards green in both fusion modes; the 310-point additive golden digest
+unchanged; full test matrix green except the six pre-existing CUDA numeric-band failures
+(verified pre-existing at HEAD via a worktree).

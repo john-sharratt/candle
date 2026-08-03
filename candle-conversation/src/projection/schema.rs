@@ -54,6 +54,7 @@
 //!
 //! `LayerSchema.window` has no default — it must be declared.
 
+use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive};
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, SelectionPolicy};
 use crate::summary_tree::scope::Scope;
@@ -482,6 +483,9 @@ pub struct SectionCollection {
     /// so the collection always contributes at least one section. `None` =
     /// today's behaviour.
     pub default: Option<SelectionDefault>,
+    /// Concept B: mass-driven member-budget extension (`k` grows with the
+    /// collection's attention mass, capped at `absolute_max`). `None` = static.
+    pub budget_adaptive: Option<MemberBudgetAdaptive>,
 }
 
 impl Default for SectionCollection {
@@ -497,6 +501,7 @@ impl Default for SectionCollection {
             member_glue: String::new(),
             member_glue_tokens: None,
             default: None,
+            budget_adaptive: None,
         }
     }
 }
@@ -773,6 +778,11 @@ pub struct LayerSchema {
     /// (`on_corrupt_turn:` in YAML). Default
     /// [`CorruptTurnPolicy::DropConversation`]; the dialogue layer sets `drop_turn`.
     pub on_corrupt_turn: CorruptTurnPolicy,
+    /// Noun for this layer's startup-ingest progress readout (`ingest_unit:` in
+    /// YAML) — e.g. `"files"`, `"folders"`. Shown on the loading screen as
+    /// "N / M <unit>" while the layer ingests. `None` falls back to a mode-derived
+    /// default in [`crate`]'s ingest driver; non-ingest layers ignore it.
+    pub ingest_unit: Option<String>,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background
@@ -895,6 +905,15 @@ pub struct GroupSchema {
     /// so the group — and its layer — never drops out of the projection. `None`
     /// = no fallback (today's behaviour).
     pub default: Option<SelectionDefault>,
+    /// Concept B: mass-driven member-budget extension. `None` = static budget.
+    pub budget_adaptive: Option<MemberBudgetAdaptive>,
+    /// Concept C: a hit drags its timeline neighbors into contention. `None` =
+    /// no locality.
+    pub locality: Option<LocalityConfig>,
+    /// Concept D: a timeline member that rides along whenever any of its
+    /// exchanges is selected (e.g. `first` = the file-header exchange). `None`
+    /// = no anchor.
+    pub anchor: Option<AnchorConfig>,
 }
 
 impl GroupSchema {
@@ -957,6 +976,9 @@ pub struct Budget {
     pub min_percent: Option<f32>,
     /// Ceiling as a percent of parent budget (0–100).
     pub max_percent: Option<f32>,
+    /// Concept B: mass-modulated priority within the declared rails. `None` =
+    /// static budget (today's behaviour).
+    pub adaptive: Option<BudgetAdaptive>,
 }
 
 impl Default for Budget {
@@ -965,6 +987,7 @@ impl Default for Budget {
             priority: 50.0,
             min_percent: None,
             max_percent: None,
+            adaptive: None,
         }
     }
 }

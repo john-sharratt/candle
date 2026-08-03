@@ -101,6 +101,25 @@ impl FlexItem {
             max_tokens,
         }
     }
+
+    /// [`Self::from_budget`] under Concept B adaptivity
+    /// (`docs/provenance_adaptive_projection.md` §4): the node's attention
+    /// `mass` scales its flexbox priority
+    /// (`priority × (1 + gain × mass/1000)`), and the adaptive `max_percent` —
+    /// when declared — becomes the outer ceiling rail. The declared floor is
+    /// untouched: zero mass rests at the static allocation, it never sinks a
+    /// node below its `min_percent`.
+    pub fn from_budget_with_mass(budget: &Budget, parent_budget: usize, mass: f32) -> Self {
+        let mut item = Self::from_budget(budget, parent_budget);
+        if let Some(ad) = &budget.adaptive {
+            item.priority = ad.effective_priority(budget.priority, mass, 1000.0);
+            if let Some(mp) = ad.max_percent {
+                let rail = ((mp / 100.0) * parent_budget as f32).ceil() as usize;
+                item.max_tokens = Some(item.max_tokens.map_or(rail, |m| m.max(rail)));
+            }
+        }
+        item
+    }
 }
 
 /// Distribute `budget` tokens across `items` proportionally to their

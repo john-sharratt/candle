@@ -29,6 +29,7 @@
 
 use rayon::prelude::*;
 
+use super::fusion::FusionMode;
 use super::WideQSig;
 
 /// KV heads per folded layer-group — equals `n_kv_head` (heads are kept separate
@@ -171,6 +172,151 @@ pub fn score_provenance_late_fusion_weighted(
     needle_gate_tally(&per_query, n_cases)
 }
 
+/// Per-fold-group scoring for non-additive fusion (Concept G): one pass over
+/// the gallery computing each group's `z × margin` votes, then a **per-group**
+/// needle gate and tally — each group finds its own needle tokens. Returns
+/// `out[g][case]`. The additive scorer's cross-group gate lives in
+/// [`score_provenance_late_fusion_weighted`]; this variant exists for the
+/// modes that must see the groups separately before combining.
+pub fn score_provenance_late_fusion_grouped(
+    query: &[WideQSig],
+    gallery: &[&WideQSig],
+    gallery_case: &[u32],
+    n_cases: usize,
+    group_weights: &[f32],
+) -> Vec<Vec<f32>> {
+    let shape: Option<&WideQSig> = query.first().or_else(|| gallery.first().copied());
+    let Some(shape) = shape else {
+        return Vec::new();
+    };
+    let wph = shape.words_per_head();
+    let n_heads = shape.n_heads as usize;
+    if wph == 0
+        || n_heads < HEADS_PER_GROUP
+        || gallery.is_empty()
+        || gallery.len() != gallery_case.len()
+    {
+        return Vec::new();
+    }
+    let n_groups = n_heads / HEADS_PER_GROUP;
+    let gw = HEADS_PER_GROUP * wph;
+    let need = n_groups * gw;
+    let n_gal = gallery.len() as f32;
+
+    // Per query token: one `(case, z × margin)` vote PER GROUP (index = group).
+    let per_query: Vec<Vec<(usize, f32)>> = query
+        .par_iter()
+        .filter(|q| q.words.len() >= need)
+        .map(|q| {
+            let mut case_max = vec![0u32; n_cases];
+            let mut out = vec![(usize::MAX, 0.0f32); n_groups];
+            for (g, slot) in out.iter_mut().enumerate() {
+                let base = g * gw;
+                let qg = &q.words[base..base + gw];
+                for m in case_max.iter_mut() {
+                    *m = 0;
+                }
+                let (mut sum, mut sumsq) = (0u64, 0u64);
+                for (j, cand) in gallery.iter().enumerate() {
+                    if cand.words.len() < base + gw {
+                        continue;
+                    }
+                    let ag = group_agreement(qg, &cand.words[base..base + gw]);
+                    let c = gallery_case[j] as usize;
+                    if c < n_cases && ag > case_max[c] {
+                        case_max[c] = ag;
+                    }
+                    sum += ag as u64;
+                    sumsq += (ag as u64) * (ag as u64);
+                }
+                let (mut top1, mut top1c, mut top2) = (0u32, usize::MAX, 0u32);
+                for (c, &m) in case_max.iter().enumerate() {
+                    if m > top1 {
+                        top2 = top1;
+                        top1 = m;
+                        top1c = c;
+                    } else if m > top2 {
+                        top2 = m;
+                    }
+                }
+                if top1c != usize::MAX {
+                    let mean = sum as f32 / n_gal;
+                    let var = (sumsq as f32 / n_gal - mean * mean).max(1e-6);
+                    let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
+                    let margin = top1.saturating_sub(top2) as f32;
+                    let w = group_weights.get(g).copied().unwrap_or(1.0);
+                    *slot = (top1c, z * margin * w);
+                }
+            }
+            out
+        })
+        .collect();
+
+    // Per-group needle gate + tally: group g's contributions across tokens.
+    (0..n_groups)
+        .map(|g| {
+            let contribs: Vec<Vec<(usize, f32)>> = per_query
+                .iter()
+                .map(|token| {
+                    let (case, v) = token[g];
+                    if case == usize::MAX {
+                        Vec::new()
+                    } else {
+                        vec![(case, v)]
+                    }
+                })
+                .collect();
+            needle_gate_tally(&contribs, n_cases)
+        })
+        .collect()
+}
+
+/// Fused scoring entry (Concept G).
+///
+/// - [`FusionMode::Additive`] — the shipped single-pass scorer (cross-group
+///   needle gate), bit-identical to today.
+/// - Every other mode — the groups score separately
+///   ([`score_provenance_late_fusion_grouped`], per-group needle gates) and
+///   combine per [`FusionMode::fuse`]. For [`FusionMode::ContentGated`] that
+///   is the R5-measured winner: the per-group tallies sum, gated on the gate
+///   group's own tally (`g_gate > 0 ? Σ_g w_g·t_g : 0`). A full-additive
+///   variant gated by a one-hot scan was measured and REJECTED (the target
+///   collapsed to the bottom of the pool — results doc §25). Each per-group
+///   tally equals a one-hot-weighted additive scan, so any backend with the
+///   additive scan (including the GPU gallery arena) serves this mode with
+///   `n_groups` scans.
+pub fn score_provenance_late_fusion_fused(
+    query: &[WideQSig],
+    gallery: &[&WideQSig],
+    gallery_case: &[u32],
+    n_cases: usize,
+    group_weights: &[f32],
+    mode: FusionMode,
+) -> Vec<f32> {
+    match mode {
+        FusionMode::Additive => score_provenance_late_fusion_weighted(
+            query,
+            gallery,
+            gallery_case,
+            n_cases,
+            group_weights,
+        ),
+        _ => {
+            let grouped = score_provenance_late_fusion_grouped(
+                query,
+                gallery,
+                gallery_case,
+                n_cases,
+                group_weights,
+            );
+            if grouped.is_empty() {
+                return vec![0.0; n_cases];
+            }
+            mode.fuse(&grouped)
+        }
+    }
+}
+
 /// The needle gate + per-case tally shared by the pointer-gallery
 /// ([`score_provenance_late_fusion`]) and packed-gallery ([`super::score_packed`])
 /// scans. Keeping it in one place guarantees the two backends produce
@@ -239,6 +385,61 @@ mod tests {
         let votes = score_provenance_late_fusion(&[b.clone()], &gallery, &cases, 2);
         assert!((votes[1] - 1536.0).abs() < 1e-2);
         assert_eq!(votes[0], 0.0);
+    }
+
+    #[test]
+    fn grouped_scan_isolates_per_group_leaders() {
+        // Query = A everywhere. Gallery: an "id-spike" case agreeing only in
+        // groups 1–2, and a "true" case agreeing (weaker) in every group.
+        let a = 0xAAAA_AAAA_AAAA_AAAAu64;
+        let q = folded_sig(a);
+        let mut spike = folded_sig(a);
+        for w in &mut spike.words[0..8] {
+            *w = !a; // group 0: zero agreement
+        }
+        let mut true_case = folded_sig(a);
+        // One complemented word per group → agreement 448 of 512 in each.
+        true_case.words[0] = !a;
+        true_case.words[8] = !a;
+        true_case.words[16] = !a;
+
+        let gallery = [&spike, &true_case];
+        let cases = [0u32, 1];
+        let grouped = score_provenance_late_fusion_grouped(&[q.clone()], &gallery, &cases, 2, &[]);
+        assert_eq!(grouped.len(), 3);
+        // Group 0: spike 0, true 448 → leader true, margin 448, z = 1 → 448.
+        assert!((grouped[0][1] - 448.0).abs() < 1e-2, "{grouped:?}");
+        assert_eq!(grouped[0][0], 0.0);
+        // Groups 1–2: spike 512 vs true 448 → leader spike, margin 64, z = 1.
+        for g in 1..3 {
+            assert!((grouped[g][0] - 64.0).abs() < 1e-2, "{grouped:?}");
+            assert_eq!(grouped[g][1], 0.0);
+        }
+
+        // Content-gated fusion on top: the spike (gate group 0 = 0) dies, the
+        // true case keeps its gate-group score.
+        let fused = score_provenance_late_fusion_fused(
+            &[q.clone()],
+            &gallery,
+            &cases,
+            2,
+            &[],
+            FusionMode::ContentGated { gate_group: 0 },
+        );
+        assert_eq!(fused[0], 0.0, "id-spike must be killed: {fused:?}");
+        assert!((fused[1] - 448.0).abs() < 1e-2, "{fused:?}");
+
+        // Additive mode stays bit-identical to the shipped scorer.
+        let additive = score_provenance_late_fusion_fused(
+            &[q.clone()],
+            &gallery,
+            &cases,
+            2,
+            &[],
+            FusionMode::Additive,
+        );
+        let shipped = score_provenance_late_fusion(&[q], &gallery, &cases, 2);
+        assert_eq!(additive, shipped);
     }
 
     #[test]

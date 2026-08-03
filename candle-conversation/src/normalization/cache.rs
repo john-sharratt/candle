@@ -32,9 +32,21 @@ impl NormalizationCache {
     /// Read path: normalized 0–1000 scores for a scope's children. A scope never
     /// observed yet normalizes every child against the cold-start prior. Pure.
     pub fn normalize(&self, scope: &ScopeKey, raw: &[(ChildKey, f32)]) -> Vec<(ChildKey, f32)> {
+        self.normalize_with_floors(scope, raw, &[])
+    }
+
+    /// [`Self::normalize`] with a caller-supplied per-child denominator floor —
+    /// the Concept A.4 size-aware level prior, constants owned by the caller's
+    /// policy. Pure.
+    pub fn normalize_with_floors(
+        &self,
+        scope: &ScopeKey,
+        raw: &[(ChildKey, f32)],
+        floors: &[f32],
+    ) -> Vec<(ChildKey, f32)> {
         match self.scopes.get(scope) {
-            Some(s) => s.normalize(raw, &self.cfg),
-            None => ScopeState::default().normalize(raw, &self.cfg),
+            Some(s) => s.normalize_with_floors(raw, floors, &self.cfg),
+            None => ScopeState::default().normalize_with_floors(raw, floors, &self.cfg),
         }
     }
 

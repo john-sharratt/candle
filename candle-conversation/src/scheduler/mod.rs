@@ -802,6 +802,9 @@ struct ReprojectInFlight {
     scan_ms: u64,
     project_ms: u64,
     elevate_ms: u64,
+    /// The turn's Concept F question boundary, carried from the freed view's
+    /// [`ViewState`] into the re-carved one.
+    question_tokens: usize,
 }
 
 /// Per-sequence state while actively generating tokens.
@@ -942,6 +945,11 @@ struct ViewState {
     /// range — the just-decoded blocks at parent indices
     /// `[turn_start_parent_blocks, current_parent_blocks)`.
     turn_start_parent_blocks: usize,
+    /// Token length of the turn's user half (`user_content_end`), captured at
+    /// turn open and carried across swaps — the Concept F question-window
+    /// boundary (`docs/provenance_adaptive_projection.md` §8). The pinned
+    /// Q-window is the turn's first `question_tokens` real tokens.
+    question_tokens: usize,
 }
 
 /// A model-decode compression node in flight — the [`Content::Decode`]
@@ -2959,6 +2967,7 @@ impl Scheduler {
                         parent_id,
                         original_borrowed: borrowed,
                         turn_start_parent_blocks,
+                        question_tokens: user_content_end as usize,
                     },
                 );
 
@@ -6943,6 +6952,20 @@ impl Scheduler {
         if probe.is_empty() {
             return Ok(None);
         }
+        // Concept F: the pinned question window — the turn's user half, whose
+        // boundary was captured at turn open (`ViewState::question_tokens`).
+        // Gathered whole-chunk then trimmed to the exact token boundary;
+        // policies with `question_pin` scan it as a second probe and max-fuse.
+        let probe_q: Vec<crate::provenance::WideQSig> = {
+            let q_tokens = view_state
+                .question_tokens
+                .min(policy.max_probe_tokens.max(1));
+            let q_chunks = q_tokens.div_ceil(self.chunk_size);
+            let q_hi = (turn_start_chunk + q_chunks).min(cur_chunks);
+            let mut q = self.gather_wide_sigs(view_id, (turn_start_chunk, q_hi));
+            q.truncate(q_tokens);
+            q
+        };
         let probe_ms = t_probe.elapsed().as_millis() as u64;
         record_phase(t_probe, "reproject_probe_extract");
         REPROJ_SCAN_US.fetch_add(
@@ -6972,6 +6995,7 @@ impl Scheduler {
             schema,
             policy.target,
             &probe,
+            (!probe_q.is_empty()).then_some(probe_q.as_slice()),
             false,
             self.gallery_arena.as_deref(),
         );
@@ -7290,7 +7314,9 @@ impl Scheduler {
             ))
         })?;
         let sampling_state = self.sampling_states.remove(&view_id);
-        self.turn_views.remove(&view_id);
+        // Carry the turn-scoped view metadata (the Concept F question boundary)
+        // into the re-carved view below.
+        let old_view_state = self.turn_views.remove(&view_id);
         // Diagnostic log: drop the freed view's per-slot token mirror.
         // The kernel will recycle this slot index for the new view we
         // carve below; without this drop, the new view's `slot_tokens`
@@ -7365,6 +7391,7 @@ impl Scheduler {
             scan_ms,
             project_ms,
             elevate_ms,
+            question_tokens: old_view_state.map(|v| v.question_tokens).unwrap_or(0),
         }))
     }
 
@@ -7396,6 +7423,7 @@ impl Scheduler {
             scan_ms,
             project_ms,
             elevate_ms,
+            question_tokens,
         } = inflight;
 
         // Carry the belief forward: the next reprojection seeds from what this one
@@ -7496,6 +7524,7 @@ impl Scheduler {
                 // exclude the freshly-injected sections / turns and
                 // include the tail.
                 turn_start_parent_blocks: new_prefix_block_count,
+                question_tokens,
             },
         );
 

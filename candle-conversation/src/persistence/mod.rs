@@ -1958,13 +1958,33 @@ mod tests {
 
     #[test]
     fn compact_drops_dead_records_and_reopens_identical() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
         let dir = tmp_dir("compact");
-        let sid = StreamId(55);
+        // The chunk stream needs a decl, else it is an orphan whose chunks are
+        // (correctly) reclaimed — here we are testing dead-record dropping, so the
+        // stream must be legitimately live.
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 55,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
         let live_chunk = chunk_payload(7);
         {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
             // Dead weight: superseded ModelSpecs and stale chunk-0 bodies.
             for s in ["qwen3-8b", "qwen3-14b", "qwen3-30b"] {
                 sp.set_model_spec(s.as_bytes()).unwrap();
