@@ -1938,7 +1938,7 @@ impl Scheduler {
 
     /// Clear the in-flight continuous-fair-wave prefill group (residual, cursor,
     /// members) so the next wave forms a fresh one.
-    fn reset_wave_prefill(&mut self) {
+    pub(super) fn reset_wave_prefill(&mut self) {
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
         self.wave_prefill_members.clear();

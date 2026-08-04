@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
@@ -1719,12 +1720,19 @@ impl Conversation {
         // records into the substrate's per-turn KV residence slots
         // (the cold-load setup that demands knowing layer count) and
         // then runs the post-reload sweeps for the summary tree.
+        let t_reconstruct = Instant::now();
+        let t_decls = Instant::now();
         let decls = {
             let substrate = self.read();
             crate::persistence::resume::recovered_turn_decls(&substrate)
         };
         let total = decls.len();
-        tracing::info!(turns = total, "substrate reconstruct: begin replay loop");
+        let decls_build_ms = t_decls.elapsed().as_millis() as u64;
+        tracing::info!(
+            turns = total,
+            decls_build_ms,
+            "substrate reconstruct: begin replay loop",
+        );
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
         // Startup integrity repair (`persistence::integrity`): completeness is
@@ -2037,6 +2045,7 @@ impl Conversation {
             skipped_corrupt = skipped_corrupt,
             repaired_integrity = repaired_integrity,
             orphan_chunk_streams = orphan_chunk_streams,
+            reconstruct_ms = t_reconstruct.elapsed().as_millis() as u64,
             "substrate reload complete",
         );
         // Orphaned KV — chunks on disk whose owning turn's StreamDecl is gone —
@@ -2365,6 +2374,15 @@ impl Conversation {
         Ok(())
     }
 
+    /// Mark a code_read scope fork's timeline as transient scratch — its sealed KV is
+    /// spliced by reference onto the file timeline and never persisted to cold, so a
+    /// cold copy can't be stranded as an orphan when the fork is tombstoned. In-memory
+    /// only (a transient fork is never reloaded), so unlike [`Self::tombstone_timeline`]
+    /// there is no redo-log record.
+    pub fn mark_timeline_transient(&self, timeline: TimelineId) {
+        self.write().mark_timeline_transient(timeline);
+    }
+
     /// Couple `from_turn` to the tool response that follows it — in-RAM (so this
     /// session's summariser groups the exchange immediately) and on disk (a
     /// [`crate::persistence::record::RecordType::TurnCoupling`] record, so the
@@ -2485,20 +2503,6 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
     }
 
-    /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
-    /// — the seal-time half of the resume path (§16.12). All layers share
-    /// one chunk count.
-    pub fn persist_turn_kv(
-        &self,
-        stream_id: StreamId,
-        layers: &crate::persistence::resume::TurnChunkGrid,
-        token_ids: &[u32],
-    ) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        crate::persistence::resume::persist_turn_kv(&mut p, stream_id, layers, token_ids)
-            .map_err(|e| candle::Error::Msg(format!("persist turn kv: {e}")))
-    }
-
     /// Persist only a turn's per-layer chunk records — the post-quantization
     /// half of the async seal/persist chain. Called from inside the
     /// bg-quantizer callback once float→quant migrations have landed.
@@ -2542,21 +2546,6 @@ impl Conversation {
         Ok(stored)
     }
 
-    /// Persist a turn's `Tokens` record and the trailing `Commit` — always
-    /// called synchronously on seal, regardless of compression policy.
-    /// `layers` is only used to compute the highest chunk index; pass an
-    /// empty grid when no chunks were persisted (compression `None` path).
-    pub fn persist_turn_tokens(
-        &self,
-        stream_id: StreamId,
-        token_ids: &[u32],
-        layers: &crate::persistence::resume::TurnChunkGrid,
-    ) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        crate::persistence::resume::persist_turn_tokens(&mut p, stream_id, token_ids, layers)
-            .map_err(|e| candle::Error::Msg(format!("persist turn tokens: {e}")))
-    }
-
     /// Persist a turn's `Tokens` record only — no trailing `Commit`.
     /// Used by the seal path now that chunks (and the matching Commit)
     /// are written asynchronously by the persistence thread.
@@ -2565,9 +2554,18 @@ impl Conversation {
         stream_id: StreamId,
         token_ids: &[u32],
     ) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        crate::persistence::resume::persist_tokens_only(&mut p, stream_id, token_ids)
-            .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))
+        // Append (persistence lock) then register the location in the substrate
+        // index (substrate lock), taken non-nested — persistence released first.
+        // The `apply_tokens_loc` is REQUIRED: without it `entry.tokens` is `None`
+        // and the maintenance/compaction relocation drops the tokens on the next
+        // pass (see `crate::persistence::resume::persist_tokens_only`).
+        let loc = {
+            let mut p = self.persistence.lock().unwrap();
+            crate::persistence::resume::persist_tokens_only(&mut p, stream_id, token_ids)
+                .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))?
+        };
+        self.write().apply_tokens_loc(stream_id, loc);
+        Ok(())
     }
 
     /// Append a stream-level `Commit` record at the given chunk index — the
@@ -2787,6 +2785,17 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))
     }
 
+    /// Drain the off-thread [`SubstrateWriter`]: append every queued durable
+    /// write (warm→cold KV, tokens, sigs, stream-decls), `fsync`, and join the
+    /// writer thread. Idempotent; the writer is unusable afterward, so this is a
+    /// **terminal** shutdown step — call it once, after every enqueuer (the
+    /// scheduler, the persistence thread's final drain, the summariser) has
+    /// stopped. Without it, the daemon's `process::exit` would skip the writer's
+    /// `Drop` and drop everything still queued (the whole point of the drain).
+    pub fn flush_writer(&self) {
+        self.writer.shutdown();
+    }
+
     /// Like [`Self::commit_persistence`] but a no-op when nothing is
     /// staged. Returns `Ok(true)` when an `fsync` actually happened.
     /// Used by the daemon's 5-second flush task so a quiescent
@@ -2882,7 +2891,7 @@ impl Conversation {
                 let exec_ms = t_exec.elapsed().as_millis() as u64;
                 note_persistence_maint_us(t_exec.elapsed().as_micros() as u64);
                 if exec_ms > 200 {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "candle_conversation::persistence::maintenance",
                         exec_ms,
                         "segment-maintenance relocation I/O held the persistence lock \

@@ -533,7 +533,12 @@ fn run_dir_pool(
                 // model sees can never drift from the live tool's output.
                 let ctx = ToolContext::with_workspace(workspace);
                 loop {
-                    if failures.aborted() {
+                    // Stop before claiming the next directory on a first-error
+                    // abort OR a shutdown cancel. The in-flight conversation
+                    // finishes (the scheduler is still live), so the engine can
+                    // drain rather than the shutdown losing the un-drained tier
+                    // tail.
+                    if failures.aborted() || candle_conversation::ingest_cancelled() {
                         return;
                     }
                     // Claim the unit BEFORE reserving a slot: a worker that

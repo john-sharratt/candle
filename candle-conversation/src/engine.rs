@@ -1352,6 +1352,14 @@ impl ConversationEngine {
         // signals the loop to exit on its next select rather than
         // wait for a probe response that will never arrive.
         self.summariser_thread.shutdown();
+        // Terminal durability step: every enqueuer has now stopped (the
+        // scheduler's seal path, the persistence thread's final hot→warm→cold
+        // drain, and the summariser), so drain the off-thread writer's queue to
+        // the redo log, fsync, and join it. This MUST run here because the daemon
+        // force-exits (`std::process::exit`), which skips the writer's `Drop` —
+        // without this flush, every warm→cold KV / tokens / sig append still in
+        // the writer's queue at exit would be silently lost.
+        self.conversation.flush_writer();
         Ok(())
     }
 }

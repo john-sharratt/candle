@@ -235,6 +235,14 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
+    /// Timelines whose KV is transient scratch — code_read scope forks whose
+    /// sealed turns are spliced by REFERENCE onto a file timeline and then
+    /// tombstoned. Their residences are flagged [`SequenceResidence::no_cold_persist`]
+    /// so the persistence thread never writes their KV to cold: the file timeline
+    /// holds the durable copy, and a cold copy of the fork would only be stranded as
+    /// an unreconstructable orphan when the fork's decl drops at tombstone. In-memory
+    /// only — a transient timeline is never reloaded, so it carries no redo-log marker.
+    transient_timelines: HashSet<TimelineId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -389,6 +397,14 @@ pub struct SequenceResidence {
     /// first write is still queued. Distinct from `cold.is_some()`, which only
     /// becomes true once that write lands.
     pub cold_pending: bool,
+    /// When `true`, the persistence thread NEVER writes this residence to cold
+    /// ([`Self::snapshot_pending_cold`] and [`Self::pending_cold_count`] skip it).
+    /// Set for residences on a transient (scratch-fork) timeline: their KV is
+    /// spliced by reference onto a durable file timeline, so a cold copy would only
+    /// strand an unreconstructable orphan (decl dropped at tombstone, chunks left
+    /// behind). Hot/warm are still allowed — `adopt_turn` needs the fork hot — and
+    /// the warm RAM is freed at `tombstone_timeline` since no cold copy will land.
+    pub no_cold_persist: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -1242,6 +1258,7 @@ impl Substrate {
             byte_size: 0,
             evict_when_cold: false,
             cold_pending: false,
+            no_cold_persist: false,
         });
         idx
     }
@@ -1669,6 +1686,21 @@ impl Substrate {
             .sum()
     }
 
+    /// Count of hot residences awaiting a warm copy — the cheap COUNT companion to
+    /// [`Self::snapshot_pending_warm`] (which clones every pending `SealedSequence`
+    /// for the migration). Mirrors that snapshot's filter exactly (skip
+    /// already-warm, skip the pinned working set), so the shutdown drain can poll
+    /// convergence without allocating the whole work list each pass.
+    pub fn pending_warm_count(&self) -> usize {
+        self.hot_lru
+            .iter()
+            .filter(|&&idx| {
+                let slot = &self.residence[idx.0];
+                slot.warm.is_none() && slot.hot.is_some() && !self.working_set_pins.contains(&idx)
+            })
+            .count()
+    }
+
     /// Diagnostic split of the hot-without-warm set into (drainable, pinned-skip):
     /// `(drainable_count, drainable_bytes, pinned_count, pinned_bytes)`. The
     /// persistence thread logs it each pass so the tier-migration livelock is
@@ -1693,14 +1725,16 @@ impl Substrate {
         (dc, db, pc, pb)
     }
 
-    /// Snapshot indices of warm-resident slots that lack a cold (on-
-    /// disk) record — the work list for the persistence thread's
-    /// warm→cold phase. Pairs each index with the slot's [`StreamId`]
-    /// and a clone of its **hot** bytes (which are equivalent to warm
-    /// — the same payload — but live on a device the GPU gather path
-    /// can read). Skips slots where hot has been evicted; future
-    /// revisions can gather from warm directly once a CPU gather
-    /// exists.
+    /// Snapshot indices of warm-resident slots that lack a cold (on-disk) record
+    /// — the work list for the persistence thread's warm→cold phase. Pairs each
+    /// index with the slot's [`StreamId`] and a clone of its **warm** bytes (the
+    /// authoritative stored form: in the quantize-on-evict path warm holds the
+    /// compressed chunks while hot still holds the source floats, so the redo log
+    /// must capture warm — see the in-body note). Iterates `warm_lru`, so hot
+    /// residency is irrelevant here: a warm-only slot whose hot was evicted is
+    /// STILL captured (this is why the shutdown drain reaches every warm turn).
+    /// Skips slots pinned into the in-flight decode's working set and slots whose
+    /// cold copy already landed or is queued (`cold_pending`).
     pub fn snapshot_pending_cold(&self) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
         // We persist the **warm** tier, not hot. In the legacy
         // format-preserving migration path warm and hot carry the
@@ -1735,11 +1769,36 @@ impl Substrate {
                 if slot.cold.is_some() || slot.cold_pending {
                     return None;
                 }
+                // Transient (scratch-fork) residence: never cold-persist. Its KV is
+                // spliced by reference onto a durable file timeline, so a cold copy
+                // would only strand an orphan when the fork's decl drops at tombstone.
+                if slot.no_cold_persist {
+                    return None;
+                }
                 slot.warm
                     .as_ref()
                     .map(|warm| (idx, slot.stream_id, warm.clone()))
             })
             .collect()
+    }
+
+    /// Count of warm residences awaiting a cold write — the cheap COUNT companion
+    /// to [`Self::snapshot_pending_cold`] (which clones every pending warm
+    /// `SealedSequence`). Mirrors that snapshot's filter exactly (skip the pinned
+    /// working set, skip slots already cold or with a queued cold write), so the
+    /// shutdown drain can poll convergence without cloning the work list.
+    pub fn pending_cold_count(&self) -> usize {
+        self.warm_lru
+            .iter()
+            .filter(|&&idx| {
+                let slot = &self.residence[idx.0];
+                slot.warm.is_some()
+                    && slot.cold.is_none()
+                    && !slot.cold_pending
+                    && !slot.no_cold_persist
+                    && !self.working_set_pins.contains(&idx)
+            })
+            .count()
     }
 
     /// Flag a residence's warm→cold write as in flight on the off-thread writer,
@@ -3226,6 +3285,30 @@ impl Substrate {
             if self.residence[r.0].hot.take().is_some() {
                 Self::remove_from_lru(&mut self.hot_lru, *r);
             }
+            // A transient (scratch-fork) residence will never get a cold copy
+            // (`no_cold_persist`), so `evict_when_cold`'s warm-drop-on-cold-land never
+            // fires — its warm RAM is dead the moment it's tombstoned. Free it here.
+            // A normal tombstone leaves warm for any holder / cold-land reclaim.
+            if self.residence[r.0].no_cold_persist && self.residence[r.0].warm.take().is_some() {
+                Self::remove_from_lru(&mut self.warm_lru, *r);
+            }
+        }
+    }
+
+    /// Mark `timeline` as transient scratch — a code_read scope fork whose sealed
+    /// turns are spliced by REFERENCE onto a file timeline and then tombstoned. Its
+    /// residences are flagged [`SequenceResidence::no_cold_persist`] so the
+    /// persistence thread never cold-persists their KV (which would strand an
+    /// orphan). Flags residences already allocated for the timeline; `append_complete`
+    /// flags future ones via the `transient_timelines` set. In-memory only.
+    pub fn mark_timeline_transient(&mut self, timeline: TimelineId) {
+        self.transient_timelines.insert(timeline);
+        let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
+            Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
+            None => return,
+        };
+        for r in residences {
+            self.residence[r.0].no_cold_persist = true;
         }
     }
 
@@ -3612,6 +3695,12 @@ impl Substrate {
             .next_turn_index();
         let compression = self.timeline_compression.get(&timeline).copied();
         let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
+        // A turn on a transient (scratch-fork) timeline never cold-persists — its KV
+        // is spliced by reference onto a durable file timeline, so a cold copy would
+        // only strand an orphan. See `mark_timeline_transient` / `no_cold_persist`.
+        if self.transient_timelines.contains(&timeline) {
+            self.residence[residence.0].no_cold_persist = true;
+        }
         let block_start = write.block_start;
         let block_end = write.block_end;
         let token_count = write.token_count;
@@ -5172,6 +5261,87 @@ mod tests {
         // confirming we didn't double-push on re-registration.
         let listed: Vec<_> = sub.timelines_for_group(group).collect();
         assert_eq!(listed, vec![timeline]);
+    }
+
+    /// A transient (scratch-fork) timeline's turns are flagged `no_cold_persist`
+    /// and excluded from the warm→cold gather, so their KV is never written to
+    /// cold — the fix for the orphaned code_read-fork chunks. A normal timeline's
+    /// turn is gathered as usual, and tombstoning the transient fork frees its warm.
+    #[test]
+    fn transient_fork_turns_never_cold_persist() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let normal_tl = alloc.next();
+        let fork_tl = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(normal_tl, layer, group);
+        sub.register_timeline(fork_tl, layer, group);
+        sub.mark_timeline_transient(fork_tl);
+
+        let migrate = |_input: &[SealedSequence]| -> candle::Result<Vec<SealedSequence>> {
+            Ok(vec![minimal_sealed_layer(), minimal_sealed_layer()])
+        };
+        let write = || TurnPartWrite {
+            layout: TurnLayout::from_flat_grid(
+                0,
+                0,
+                0,
+                3,
+                0,
+                0,
+                String::new(),
+                Some("x".to_string()),
+                false,
+            ),
+            token_count: 3,
+            block_end: 1,
+            sealed_gpu: Some(Arc::new(vec![])),
+            ..Default::default()
+        };
+
+        let n_idx = sub.append_complete(normal_tl, write(), migrate).unwrap();
+        let f_idx = sub.append_complete(fork_tl, write(), migrate).unwrap();
+        let n_res = sub.turn_residence(normal_tl, n_idx).unwrap();
+        let f_res = sub.turn_residence(fork_tl, f_idx).unwrap();
+
+        // The fork turn's residence is flagged; the normal one is not.
+        assert!(
+            !sub.residence[n_res.0].no_cold_persist,
+            "a normal turn cold-persists"
+        );
+        assert!(
+            sub.residence[f_res.0].no_cold_persist,
+            "a transient fork turn is flagged no_cold_persist"
+        );
+
+        // Stage both in the warm tier — the warm→cold gather's input.
+        sub.install_warm(n_res, vec![minimal_sealed_layer(), minimal_sealed_layer()]);
+        sub.install_warm(f_res, vec![minimal_sealed_layer(), minimal_sealed_layer()]);
+
+        // The gather includes the normal residence, excludes the transient fork.
+        let pending = sub.snapshot_pending_cold();
+        assert!(
+            pending.iter().any(|(r, _, _)| *r == n_res),
+            "normal turn gathered for cold"
+        );
+        assert!(
+            !pending.iter().any(|(r, _, _)| *r == f_res),
+            "transient fork turn NEVER gathered for cold (no orphan)"
+        );
+        assert_eq!(
+            sub.pending_cold_count(),
+            1,
+            "only the normal turn awaits a cold write"
+        );
+
+        // Tombstoning the fork frees its warm RAM — no cold copy will ever land, so
+        // `evict_when_cold`'s warm-drop-on-cold-land never fires.
+        sub.tombstone_timeline(fork_tl);
+        assert!(
+            sub.residence[f_res.0].warm.is_none(),
+            "transient fork's warm freed at tombstone"
+        );
     }
 
     /// `append_complete` calls the migration closure and installs the

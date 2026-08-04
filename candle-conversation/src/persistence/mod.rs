@@ -595,10 +595,18 @@ impl SubstratePersistence {
         }
     }
 
-    /// Append a stream's `Tokens` record.
-    pub fn append_tokens(&mut self, stream_id: StreamId, tokens: &[u8]) -> Result<()> {
-        self.append_record(RecordType::Tokens, 0, stream_id.0, 0, 0, 0, tokens)?;
-        Ok(())
+    /// Append a stream's `Tokens` record, returning `(segment, offset,
+    /// record_size)` of the written record. The caller MUST fold this location
+    /// into the substrate index (`apply_tokens_loc`) — otherwise the in-RAM index
+    /// has no record of the tokens, and a subsequent segment compaction / relocation
+    /// can't carry them forward and reclaims them (the KV path already registers its
+    /// chunk locations; tokens must too, or a live turn silently loses its text).
+    pub fn append_tokens(
+        &mut self,
+        stream_id: StreamId,
+        tokens: &[u8],
+    ) -> Result<(SegmentId, u64, u64)> {
+        self.append_record(RecordType::Tokens, 0, stream_id.0, 0, 0, 0, tokens)
     }
 
     /// Append a turn's `ProjectionEvents` record (opaque JSON payload).

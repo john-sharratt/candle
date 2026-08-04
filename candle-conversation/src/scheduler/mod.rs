@@ -3085,6 +3085,10 @@ impl Scheduler {
                 // must too.
                 self.deferred_glue_fires
                     .retain(|p| p.parent_id != sequence_id);
+                // Purge in-flight prefill/decode/cohort state before the id is
+                // recycled — a stale prefill entry keyed by the freed id would
+                // collide with the reused slot in the next wave-group assembly.
+                self.purge_freed_slot_scheduling_state(sequence_id);
                 self.prune_ingest_timeline(freed_target);
                 true
             }
@@ -4918,6 +4922,42 @@ impl Scheduler {
         );
     }
 
+    /// Purge every in-flight scheduling entry keyed by a slot id that is being
+    /// freed. The kernel recycles a freed slot id **immediately** (the code_read
+    /// scope workers churn fork slots), so any prefill / decode entry left under
+    /// the old id would be silently re-attributed to the NEXT occupant.
+    ///
+    /// The concrete failure this prevents: `form_wave_group` emits one
+    /// [`WaveMember::Prefill`] per [`Self::active_prefills`] entry, keyed by its
+    /// sequence id. A stale entry from an abandoned fork PLUS the reused slot's
+    /// fresh prefill then yield the SAME `seq_id` twice in one wave, tripping the
+    /// batched-inference "sequence appears in more than one group" guard, which
+    /// aborts the whole wave. (Observed as an error cascade when a graceful
+    /// shutdown cancels an in-flight scope ingest mid-wave.)
+    ///
+    /// Called from every TERMINAL free path (the [`SchedulerRequest::FreeSequence`]
+    /// handler and [`Self::free_summary_slot`]). The mid-decode reproject swap
+    /// frees-and-rebinds its own view state inline and does not route here.
+    fn purge_freed_slot_scheduling_state(&mut self, id: SequenceId) {
+        self.prefill_queue.retain(|w| w.sequence_id != id);
+        self.active_prefills.retain(|p| p.work.sequence_id != id);
+        self.active_decodes.remove(&id);
+        // The held wave cohort's residual is indexed by member POSITION, so a
+        // member vanishing mid-cohort would desync every later member's slice
+        // against the residual (the exact reason the cohort is otherwise held
+        // stable). If the freed slot was a member, abandon the whole cohort — the
+        // survivors re-form a fresh group next wave, re-prefilling their partial
+        // progress. Fires only under teardown churn; a normally-completing turn
+        // frees its slot after its prefill has already drained out of the cohort,
+        // so `was_member` is false and the held cohort is untouched.
+        let was_member = self.wave_prefill_members.iter().any(|m| match m {
+            WaveMember::Prefill { seq_id } | WaveMember::Section { seq_id, .. } => *seq_id == id.0,
+        });
+        if was_member {
+            self.reset_wave_prefill();
+        }
+    }
+
     /// Free a compression scratch slot and its per-slot bookkeeping. Called on
     /// every path out of a compression pass (success or error). The decoded
     /// delta's RAII `ChunkGid`s keep the arena chunks alive after this returns.
@@ -4931,6 +4971,9 @@ impl Scheduler {
         // A queued glue plan must not outlive the slot layout it was planned
         // against (see the FreeSequence handler's purge).
         self.deferred_glue_fires.retain(|p| p.parent_id != slot);
+        // Purge any in-flight prefill/decode/cohort state for this slot before
+        // its id is recycled (see [`Self::purge_freed_slot_scheduling_state`]).
+        self.purge_freed_slot_scheduling_state(slot);
         self.prune_ingest_timeline(freed_target);
     }
 
@@ -8127,5 +8170,54 @@ mod tests {
             "a freed slot id is recycled by the allocator — the dead \
              conversation's belief must not seed the next occupant"
         );
+    }
+
+    #[test]
+    fn free_sequence_resets_wave_cohort_when_freed_slot_was_a_member() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq_id = SequenceId(scheduler.session.create_sequence().expect("create"));
+        // The freed slot is a live member of the in-flight continuous-fair-wave
+        // cohort (the code_read fork-churn case). Its held residual is indexed by
+        // member position, so the whole cohort must be abandoned on free —
+        // otherwise the recycled slot id re-enters the next wave-group assembly
+        // alongside the stale member and trips the "appears in more than one
+        // group" guard.
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: seq_id.0 }];
+        scheduler.wave_prefill_cursor = 7;
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence {
+            sequence_id: seq_id,
+        });
+
+        assert!(
+            scheduler.wave_prefill_members.is_empty(),
+            "freeing a held-cohort member must abandon the cohort so a recycled \
+             slot id cannot duplicate it in the next wave-group assembly"
+        );
+        assert_eq!(
+            scheduler.wave_prefill_cursor, 0,
+            "abandoning the cohort must also clear the creep cursor"
+        );
+    }
+
+    #[test]
+    fn free_sequence_leaves_wave_cohort_intact_for_a_non_member() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let freed = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let member = SequenceId(scheduler.session.create_sequence().expect("create"));
+        // A DIFFERENT slot is the sole cohort member. Freeing `freed` must leave
+        // the held cohort untouched — resetting it on every unrelated free would
+        // throw away the survivors' partial prefill progress each wave.
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: member.0 }];
+        scheduler.wave_prefill_cursor = 3;
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: freed });
+
+        assert_eq!(
+            scheduler.wave_prefill_members.len(),
+            1,
+            "freeing a non-member slot must leave the in-flight cohort intact"
+        );
+        assert_eq!(scheduler.wave_prefill_cursor, 3);
     }
 }

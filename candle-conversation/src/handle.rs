@@ -35,6 +35,37 @@ impl TurnHandle {
         }
     }
 
+    /// Block until the turn completes, but abandon the wait if a graceful
+    /// shutdown latches [`crate::ingest_cancelled`]. Used by the ingest
+    /// decode-waits ([`crate::Sequence::ingest_scope_roundtrip_indices`]) so a
+    /// Ctrl-C mid-ingest doesn't have to wait out the in-flight summary decode.
+    ///
+    /// On cancel this returns [`ConversationError::IngestCancelled`] WITHOUT
+    /// consuming the handle; the caller drops it, and the scheduler — seeing the
+    /// closed channel — stops decode at its next step and auto-finalizes the view
+    /// slot (see the type-level docs). The poll cadence only bounds how long
+    /// after the flag flips the wait returns; it does not busy-spin, since
+    /// `recv_timeout` still delivers `Done`/`Token`/etc. events the moment they
+    /// arrive.
+    pub fn wait_cancellable(&self) -> crate::Result<TurnResponse> {
+        let poll = std::time::Duration::from_millis(100);
+        loop {
+            match self.rx.recv_timeout(poll) {
+                Ok(TurnEvent::Done(response)) => return Ok(response),
+                Ok(TurnEvent::Error(e)) => return Err(e),
+                Ok(_) => {}
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    if crate::ingest_cancelled() {
+                        return Err(ConversationError::IngestCancelled);
+                    }
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    return Err(ConversationError::SchedulerGone)
+                }
+            }
+        }
+    }
+
     /// Iterate over events as they arrive (blocking iterator).
     ///
     /// Yields `PrefillProgress`, `Token`, `AttentionStats`, and finally

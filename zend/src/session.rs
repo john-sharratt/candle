@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use futures::{Stream, StreamExt};
@@ -393,7 +394,7 @@ impl InferenceState {
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
-    ) -> anyhow::Result<Arc<Self>> {
+    ) -> anyhow::Result<Option<Arc<Self>>> {
         // Step 1: model. Engine ctor also reloads the substrate
         // internally, so the visible boundary between Model and
         // Substrate steps below is best-effort — the substrate has
@@ -590,9 +591,20 @@ impl InferenceState {
         let model_hook = move |done: usize, total: usize| {
             model_progress.set_step_progress(done as u64, total as u64);
         };
+        // `engine_with_progress` loads the model weights (blocking, per-layer
+        // hook above) AND spawns the scheduler thread, which kicks off the
+        // substrate reload (redo-log replay) to run CONCURRENTLY in the
+        // background. So this timing is the model-weight load; the reload's cost
+        // shows up as the `LoadStep::Substrate` wait below (its overhang past the
+        // weight load) — the two together are the opaque "Loading model" span.
+        let t_engine = Instant::now();
         let engine = builder
             .engine_with_progress(&device, Some(&model_hook))
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
+        tracing::info!(
+            elapsed_ms = t_engine.elapsed().as_millis() as u64,
+            "load timing: model weights loaded (engine built; substrate reload now running in background)",
+        );
 
         // Compile the whole tool catalog into one constrained-decoding stencil,
         // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
@@ -601,6 +613,7 @@ impl InferenceState {
         // dialogue prompt. A tool-free projection installs none — it gets an empty
         // `TriggerRegistry` (never fires) rather than compiling a stencil, which
         // rejects an empty catalog.
+        let t_compile = Instant::now();
         let tool_stencil = if tool_sections.is_empty() {
             Arc::new(TriggerRegistry::new())
         } else {
@@ -617,13 +630,23 @@ impl InferenceState {
         let think_steering = engine
             .compile_think_steering()
             .map_err(|e| anyhow::anyhow!("think steering compile: {e}"))?;
+        tracing::info!(
+            elapsed_ms = t_compile.elapsed().as_millis() as u64,
+            "load timing: tool-stencil + think-steering compiled",
+        );
 
         // The substrate reload (redo-log replay) runs on the scheduler thread
         // spawned by the engine ctor. As the substrate grows this is no longer
         // instantaneous, so surface real progress and block here until it
         // finishes before advancing to section prefill (which would otherwise
         // stall against the busy scheduler under a misleading step label).
+        //
+        // This wait's elapsed time is the reload's OVERHANG past the model-weight
+        // load — i.e. how much longer the redo-log replay took than loading the
+        // weights it ran alongside. It grows with substrate size, so it's the
+        // number to watch as the corpus (and its segment count) scales.
         progress.set_step(LoadStep::Substrate);
+        let t_reload_wait = Instant::now();
         {
             let reload = engine.substrate_reload_status();
             loop {
@@ -637,6 +660,10 @@ impl InferenceState {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
+        tracing::info!(
+            elapsed_ms = t_reload_wait.elapsed().as_millis() as u64,
+            "load timing: substrate reload overhang (redo-log replay past the weight load)",
+        );
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
@@ -1250,10 +1277,34 @@ impl InferenceState {
         // (a pure conversational mind) does no filesystem reading here.
         let ingest_layers =
             crate::ingest::ingest_layers(proj_builder_refresh.schema(), &workspace, &ingest_dirs);
+        // Mark EVERY ingest layer append-only UP FRONT — deterministically, before
+        // any ingest AND before `warm_ingest_normalization` runs — using the SAME
+        // builder (`proj_builder_refresh`) whose layer ids the warm-up checks. The
+        // per-layer marks inside the ingest/skip loop below run on only the branch
+        // actually taken and, on the ingest branch, via the ingest builder's id.
+        // A boot that RE-INGESTS then marks via an id the warm-up doesn't read, so
+        // the warm sees 0 append-only layers, leaves every code scope COLD, and the
+        // most promiscuous file tops every query at an un-normalized score (the
+        // observed 0% retrieval after a re-ingest). Marking here, once, from the
+        // warm's own builder keeps the append-only set consistent on every load path.
+        for il in &ingest_layers {
+            if disabled_layers.contains(&il.name) {
+                continue;
+            }
+            if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
+                engine.lock().unwrap().mark_layer_append_only(layer_id);
+            }
+        }
         progress.set_step(LoadStep::Ingesting);
         let mut ingest_convs: HashMap<String, IngestConv> = HashMap::new();
         let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
         for il in &ingest_layers {
+            // Cooperative shutdown: stop before the next layer if a Ctrl-C landed
+            // mid-ingest. The per-file loops inside the ingest calls below check
+            // the same flag, so cancellation lands within a file, not a layer.
+            if candle_conversation::ingest_cancelled() {
+                break;
+            }
             if disabled_layers.contains(&il.name) {
                 tracing::info!(layer = %il.name, "--disable-layer: startup ingest suppressed");
                 continue;
@@ -1383,6 +1434,25 @@ impl InferenceState {
         // Clear the ingest sub-status now the phase is done.
         status_tx.send(String::new()).ok();
 
+        // Cooperative shutdown during the (long) startup ingest: if a Ctrl-C
+        // arrived while ingesting, the loop above broke early. Don't finish
+        // building the InferenceState or mark ready — drain the engine HERE, on
+        // this loader thread that owns it, exactly as `engine.shutdown()` does at
+        // ready (scheduler join → persistence hot→warm→cold full drain → off-thread
+        // writer flush). Then return `None`: the loader thread exits without
+        // publishing an engine, and `ZendSession::shutdown` (joining this thread)
+        // sees `inference` still `None` and knows the drain already happened. The
+        // turns ingested so far are durable; the rest re-ingest on the next start.
+        if candle_conversation::ingest_cancelled() {
+            tracing::warn!(
+                "shutdown during startup ingest — draining the engine on the loader thread"
+            );
+            if let Err(e) = engine.lock().unwrap().shutdown() {
+                tracing::error!("shutdown-during-ingest drain failed: {e}");
+            }
+            return Ok(None);
+        }
+
         // The titler runs on a single dedicated worker thread fed by this
         // queue. The worker owns the titler `Sequence` exclusively (no shared
         // mutex, so title generation never serialises against the request
@@ -1433,7 +1503,7 @@ impl InferenceState {
         let worker =
             std::thread::spawn(move || titler_worker_loop(worker_state, titler, titler_rx));
         *state.titler_worker.lock().unwrap() = Some(worker);
-        Ok(state)
+        Ok(Some(state))
     }
 
     /// Build a [`RefreshContext`] bound to this state's engine,
@@ -1477,6 +1547,13 @@ impl InferenceState {
         let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
         let mut any = false;
         for il in &self.ingest_layers {
+            // Cooperative shutdown: stop the background reconcile between layers so
+            // a Ctrl-C during a post-`ready` re-ingest stops promptly (the per-file
+            // worker pool also polls the same cancel). `shutdown` then drains the
+            // engine via the ready path.
+            if candle_conversation::ingest_cancelled() {
+                break;
+            }
             let content_root = self.workspace.join(&il.folder);
             match il.mode {
                 IngestMode::Folders => {
@@ -2746,6 +2823,10 @@ pub struct ZendSession {
     /// Conversation-files store (uploads). Persistent under the workspace,
     /// independent of the inference engine — available before the model loads.
     file_store: ConvFileStore,
+    /// Handle to the `zend-loader` thread. [`Self::shutdown`] joins it so an
+    /// in-progress load has broken its ingest and drained the engine (on the
+    /// loader thread, which owns it) before the process exits.
+    load_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -2855,6 +2936,7 @@ impl ZendSession {
             load_progress: Arc::new(LoadProgress::new()),
             started_at_ms,
             file_store,
+            load_thread: Mutex::new(None),
         }
     }
 
@@ -3835,6 +3917,12 @@ impl ZendSession {
         let ingest_dirs = self.config.ingest_dirs.clone();
         let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
+        // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
+        // across the process (and the test binary), so clear any cancel left by a
+        // prior load/shutdown before this one's ingest starts polling it. The
+        // startup ingest and background reconcile check `ingest_cancelled()`;
+        // `shutdown` sets it via `request_ingest_cancel()`.
+        candle_conversation::reset_ingest_cancel();
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
         // model load, so the workspace watcher's `tokio::spawn` would otherwise
@@ -3852,7 +3940,7 @@ impl ZendSession {
         // (integration tests, alternative binaries).  The bits that
         // need an async runtime (HF download) drive a local
         // current-thread runtime built inside this thread.
-        std::thread::Builder::new()
+        let loader_handle = std::thread::Builder::new()
             .name("zend-loader".into())
             .spawn(move || {
                 load_progress.set_step(LoadStep::Model);
@@ -3911,7 +3999,7 @@ impl ZendSession {
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {
-                    Ok(state) => {
+                    Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
                         tracing::info!("inference engine ready");
                         status_tx.send(String::new()).ok();
@@ -4020,6 +4108,22 @@ impl ZendSession {
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
                             conv.warm_ingest_normalization(&schema);
                         });
+                        // The engine is up — only NOW mark ready and unblock
+                        // submit-flow waiters. Skipped on the shutdown-during-ingest
+                        // path (the `Ok(None)` arm below).
+                        load_progress.mark_ready();
+                        ready_tx.send(true).ok();
+                    }
+                    Ok(None) => {
+                        // Shutdown arrived during the startup ingest: `load` already
+                        // drained the engine on this thread (scheduler join →
+                        // persistence hot→warm→cold → writer flush). Do NOT mark
+                        // ready or publish an engine — the loader thread just exits;
+                        // `ZendSession::shutdown`, which is joining it, then returns
+                        // and the process exits with everything durable.
+                        tracing::info!(
+                            "zend-loader: shutdown during startup ingest — engine drained, loader exiting"
+                        );
                     }
                     Err(e) => {
                         tracing::error!("inference engine failed to load: {e:#}; exiting");
@@ -4027,21 +4131,53 @@ impl ZendSession {
                         std::process::exit(1);
                     }
                 }
-                load_progress.mark_ready();
-                ready_tx.send(true).ok();
             })
             .expect("spawn zend-loader thread");
+        // Hand the loader thread's handle to the session so `shutdown` can join it
+        // — that join is what guarantees an in-progress load has broken its ingest
+        // and finished draining the engine before the process exits.
+        *self.load_thread.lock().unwrap() = Some(loader_handle);
     }
 
-    /// Graceful shutdown: durably commit the substrate redo log, then
-    /// stop the scheduler thread. Idempotent — safe to call when the model
-    /// never finished loading (nothing to flush). Runs on the blocking pool
-    /// since `commit_persistence` does synchronous `fsync` I/O.
+    /// Graceful shutdown: stop any in-flight ingest, durably drain + commit the
+    /// substrate (hot→warm→cold + off-thread writer flush), then stop the
+    /// scheduler. Idempotent, and — crucially — correct DURING loading too: a
+    /// Ctrl-C mid-ingest (when `inference` is still `None`) is not a no-op. Runs
+    /// the blocking work on the blocking pool since it does `fsync` I/O + joins.
     pub async fn shutdown(&self) {
+        // 1. Signal any in-flight ingest — the startup ingest inside
+        //    `InferenceState::load` AND the background reconcile — to stop
+        //    submitting. Both poll this process-scoped flag cooperatively (as do
+        //    the deep shared ingest hot paths — per-file worker pool, cluster
+        //    scan, raw docs), so no thread is torn down mid-turn; they break at a
+        //    safe boundary. `start_loading` clears it before each load.
+        candle_conversation::request_ingest_cancel();
+        // 2. Join the loader thread. If a load is IN PROGRESS, it breaks its ingest
+        //    and drains the engine on that thread (the `Ok(None)` path in
+        //    `start_loading`), and the join returns only once that drain is done.
+        //    If the load already completed (or never started), the thread has ended
+        //    and this returns immediately.
+        let loader = self.load_thread.lock().unwrap().take();
+        if let Some(h) = loader {
+            let _ = tokio::task::spawn_blocking(move || {
+                if h.join().is_err() {
+                    tracing::warn!("shutdown: loader thread panicked");
+                }
+            })
+            .await;
+        }
+        // 3. Re-read `inference` AFTER the join. If the load COMPLETED (ready path,
+        //    or it finished racing our cancel), the engine is published here and
+        //    has NOT been drained — drain it below. If the loader drained mid-ingest
+        //    (step 2), `inference` is still `None` and there is nothing left to do.
+        //    Exactly-once: the drain runs either on the loader thread OR here, never
+        //    both.
         let state: Option<Arc<InferenceState>> =
             { self.inference.read().unwrap().as_ref().map(Arc::clone) };
         let Some(state) = state else {
-            tracing::info!("shutdown: model never loaded — nothing to persist");
+            tracing::info!(
+                "shutdown: loader drained mid-ingest (or model never loaded) — nothing more to persist"
+            );
             return;
         };
         // Signal the titler worker to stop draining and wake it if it's idle.

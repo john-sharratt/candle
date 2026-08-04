@@ -60,6 +60,14 @@ pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
 /// not something that needs to react to every turn-seal.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Absolute backstop on the number of hot→warm→cold passes the shutdown drain
+/// runs. With the scheduler joined, the pending sets only shrink and the drain
+/// converges in 1–2 passes; a persistently-failing turn (e.g. a repeated GPU
+/// gather error) is caught FIRST by the loop's no-progress guard (it breaks after
+/// one pass that fails to shrink the backlog). This cap only guards a pathological
+/// shrink-then-regrow oscillation — the leftover re-ingests on the next reload.
+const SHUTDOWN_DRAIN_MAX_PASSES: usize = 32;
+
 /// Clone-able trigger for the persistence thread. Held by anything that
 /// wants to wake the loop early (e.g. the scheduler signalling "turn just
 /// sealed"). Cheap to clone — wraps two `crossbeam::channel` senders: a
@@ -366,7 +374,15 @@ fn run_loop(
         // long drain is in flight — the conservative direction.
         backlog.stamp_warm(conversation.read().pending_warm_bytes());
 
-        let run_maintenance = last_maintenance.elapsed() >= MAINTENANCE_INTERVAL;
+        // On the shutdown iteration, SKIP maintenance. The full drain below needs
+        // the persistence lock immediately; a segment-maintenance relocation holds
+        // it ~10s each, and running one here first is the ~74s shutdown stall that
+        // let an impatient second Ctrl-C / hard-kill abort the process BEFORE the
+        // drain ran — losing the entire un-drained hot tail (the observed
+        // repaired_integrity churn on the next reload). Reclaim is re-runnable
+        // background work; it resumes on the next start. Durability at exit is the
+        // drain's job, and it must not queue behind compaction.
+        let run_maintenance = !shutting_down && last_maintenance.elapsed() >= MAINTENANCE_INTERVAL;
         if run_maintenance {
             last_maintenance = Instant::now();
         }
@@ -392,8 +408,88 @@ fn run_loop(
         }
 
         if shutting_down {
-            // Final group-commit before exiting — any work staged but
-            // not yet fsynced should be made durable.
+            // FULL drain before exit. The engine joins the scheduler BEFORE it
+            // signals us (see `ConversationEngine::shutdown`), so no more turns
+            // seal — the pending sets only shrink and this loop always converges.
+            //
+            // Clear the in-flight decode's now-stale working-set pins: normally
+            // `snapshot_pending_warm`/`snapshot_pending_cold` skip pinned
+            // residences (the decode is actively attending them), but with the
+            // scheduler stopped nothing attends anything, so every hot turn must
+            // be drainable — otherwise a pinned turn stays hot-only and un-durable.
+            conversation.write().set_working_set_pins(&[], &[]);
+            // Loop hot→warm→cold (maintenance off) until nothing is left hot
+            // without warm or warm without cold. One `run_pass` moves a turn all
+            // the way to enqueued-for-cold, so this normally converges in 1–2
+            // passes; the cap is only a wedge-guard against a persistently-failing
+            // turn (e.g. a gather error), whose leftover simply re-ingests on
+            // reload. After this returns, the engine flushes the off-thread writer
+            // so the enqueued warm→cold appends actually reach disk.
+            let mut passes = 0usize;
+            let mut prev_remaining = usize::MAX;
+            loop {
+                // Cheap COUNT poll (no work-list clone — see `pending_warm_count` /
+                // `pending_cold_count`), matching `run_pass`'s own snapshot filters.
+                let (warm_left, cold_left) = {
+                    let read = conversation.read();
+                    (read.pending_warm_count(), read.pending_cold_count())
+                };
+                let remaining = warm_left + cold_left;
+                if remaining == 0 {
+                    break;
+                }
+                // No-progress guard: if a pass did not shrink the backlog, a turn is
+                // persistently failing to drain (e.g. a repeatable GPU gather error).
+                // Retrying the same failing gather only stalls exit, so stop now —
+                // the leftover re-ingests on the next reload. This breaks after ONE
+                // stuck pass instead of grinding through the whole absolute cap.
+                if remaining >= prev_remaining {
+                    tracing::warn!(
+                        warm_left,
+                        cold_left,
+                        passes,
+                        "persist: shutdown drain made no progress (a turn won't drain) \
+                         — the leftover re-ingests on next reload",
+                    );
+                    break;
+                }
+                // Absolute backstop against a pathological oscillation that shrinks
+                // then regrows without converging.
+                if passes >= SHUTDOWN_DRAIN_MAX_PASSES {
+                    tracing::warn!(
+                        warm_left,
+                        cold_left,
+                        passes,
+                        "persist: shutdown drain hit the pass cap with work remaining \
+                         — the leftover turns re-ingest on next reload",
+                    );
+                    break;
+                }
+                tracing::info!(
+                    pass = passes,
+                    warm_left,
+                    cold_left,
+                    "persist: shutdown drain hot→warm→cold",
+                );
+                prev_remaining = remaining;
+                run_pass(
+                    &conversation,
+                    &backings,
+                    &device,
+                    &copy_stream,
+                    compression_policy.as_ref(),
+                    &mut pinned_scratch,
+                    false, // no maintenance during the shutdown drain
+                    // Still stamped: the drain is what finally empties the
+                    // backlog, and leaving the gauge holding its pre-shutdown
+                    // reading would publish a deficit that never clears.
+                    &backlog,
+                );
+                passes += 1;
+            }
+            // Group-commit any records appended directly on this thread. The
+            // authoritative final fsync of the warm→cold appends happens when the
+            // engine flushes the off-thread writer after this thread joins.
             if let Err(e) = conversation.commit_persistence() {
                 tracing::warn!("persist: shutdown commit failed: {e}");
             }
@@ -1099,7 +1195,7 @@ fn run_pass(
     // `MAINTENANCE_INTERVAL` (the candidate scan is O(live records), so it's
     // decoupled from the trigger rate). The relocation I/O runs under the
     // persistence lock only (phased locking), never the substrate write lock,
-    // so it can't stall decode. The specific op is logged at DEBUG by
+    // so it can't stall decode. The specific op is logged at TRACE by
     // `finish_maintenance`.
     match if run_maintenance {
         conversation.compact_persistence_if_needed()
@@ -1108,7 +1204,7 @@ fn run_pass(
     } {
         Ok(true) => {
             relief_trace::note("tier", "segment_reclaim", 0, 0);
-            tracing::info!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 "persist: substrate maintenance op applied (segment reclaim)"
             );

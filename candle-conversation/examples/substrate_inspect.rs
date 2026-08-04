@@ -45,7 +45,7 @@ use candle_conversation::persistence::record::{
 };
 use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
-use candle_conversation::persistence::segment::FIRST_SEGMENT;
+use candle_conversation::persistence::segment::{SegmentId, FIRST_SEGMENT};
 use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::walker;
 use candle_conversation::projection::{
@@ -432,6 +432,13 @@ enum Cmd {
     },
     /// Every record in append order: offset, type, ids, sizes.
     Headers,
+    /// Report **orphan chunk streams** — streams with KV chunks but no
+    /// `StreamDecl` (the daemon's `orphan_chunk_streams`). Shows each orphan's
+    /// nature (tokens / sig / projection present ⇒ a real turn that lost its decl;
+    /// none ⇒ bare scratch, a tombstoned code_read fork) and the safety check:
+    /// whether any orphan chunk record shares a disk location with a LIVE turn
+    /// (zero ⇒ reclaiming orphans frees only dead KV). Directory target only.
+    Orphans,
     /// Validate the substrate end-to-end (read-only). Two passes: (1) re-verify
     /// EVERY record's CRC — catches disk / torn-write corruption; (2) check every
     /// turn's chunk-count consistency (`layers × chunks_per_layer`) — catches
@@ -846,6 +853,16 @@ fn main() -> Result<()> {
         if let Cmd::Conversations { filter } = &cli.cmd {
             return segment_conversations(&segs, filter.as_deref());
         }
+        // `dump` across ALL segments (holds every segment handle open) so a
+        // conversation whose records the daemon rotated between segments is read
+        // completely — the single-segment `dump` below only sees the active
+        // segment. Also validates each turn. See `dump_merged`.
+        if let Cmd::Dump { timeline, full } = &cli.cmd {
+            return dump_merged(&segs, *timeline, *full);
+        }
+        if matches!(cli.cmd, Cmd::Orphans) {
+            return orphans(&segs);
+        }
         if let Cmd::ExportReplay { timeline, tag, out } = &cli.cmd {
             return export_replay(&segs, timeline, tag, out);
         }
@@ -894,6 +911,9 @@ fn main() -> Result<()> {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::ExportReplay { .. } => {
             anyhow::bail!("export-replay requires the segmented `.substrate` DIRECTORY target")
+        }
+        Cmd::Orphans => {
+            anyhow::bail!("orphans requires the segmented `.substrate` DIRECTORY target")
         }
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
@@ -4006,6 +4026,330 @@ fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()>
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Open every segment read-only — HELD open for the returned handles' lifetime
+/// (append-only + a held handle = a stable read even as the daemon renames /
+/// reclaims segments underneath us) — and build the merged substrate index via the
+/// FAST index-anchored recovery (`recover_with_sink`: each segment's `HeaderIndex`
+/// chain backward + the tail forward, the same path the daemon reconstructs with;
+/// it validates the chain and falls back to a full walk on a torn one). Each record
+/// is walked under its OWN segment id, so `entry.tokens` / `entry.chunks` carry the
+/// real segment and later byte reads hit the right file. The returned `logs` map is
+/// how callers resolve those bytes across rotations.
+fn build_merged_substrate(
+    segs: &[(u64, PathBuf, bool)],
+) -> (std::collections::HashMap<u64, LogFile>, Substrate) {
+    let mut logs: std::collections::HashMap<u64, LogFile> = std::collections::HashMap::new();
+    for (id, path, _) in segs {
+        match LogFile::open_read_only(path) {
+            Ok(l) => {
+                logs.insert(*id, l);
+            }
+            Err(e) => eprintln!("warn: segment {id} open failed (skipping): {e}"),
+        }
+    }
+    let mut substrate = Substrate::new();
+    for (id, _, _) in segs {
+        let Some(log) = logs.get_mut(id) else {
+            continue;
+        };
+        let hint = log.superblock().last_index;
+        if let Err(e) = recovery::recover_with_sink(log, SegmentId(*id), hint, |ent| {
+            substrate.apply_walker_entry(ent);
+        }) {
+            eprintln!("warn: segment {id} recovery failed (skipping): {e}");
+        }
+    }
+    (logs, substrate)
+}
+
+/// Report the substrate's **orphan chunk streams** — streams carrying KV `Chunk`
+/// records but NO `StreamDecl` (the daemon's `orphan_chunk_streams`, unreconstructable
+/// on reload). For each: whether it still carries `Tokens` / `WideQSig` /
+/// `ProjectionEvents` (a real turn that lost only its decl) or none (bare scratch —
+/// a tombstoned code_read scope fork). And the safety check: whether any orphan chunk
+/// record shares its on-disk `(segment, offset)` with a LIVE (decl-bearing) turn —
+/// **zero overlap proves reclaiming orphans frees only dead KV, never live data.**
+fn orphans(segs: &[(u64, PathBuf, bool)]) -> Result<()> {
+    let (_logs, substrate) = build_merged_substrate(segs);
+
+    // Locations any live (decl-bearing) turn's chunks reference.
+    let mut live_locs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    for (_sid, entry) in substrate.all_streams() {
+        if entry.decl.is_some() {
+            for loc in entry.chunks.values() {
+                live_locs.insert((loc.segment.0, loc.offset));
+            }
+        }
+    }
+
+    let mut streams = 0usize;
+    let mut chunk_records = 0u64;
+    let mut shared_with_live = 0u64;
+    let mut sample: Vec<(u64, usize, u64, bool, bool, bool)> = Vec::new();
+    for (sid, entry) in substrate.all_streams() {
+        if entry.decl.is_some() || entry.chunks.is_empty() {
+            continue;
+        }
+        streams += 1;
+        chunk_records += entry.chunks.len() as u64;
+        for loc in entry.chunks.values() {
+            if live_locs.contains(&(loc.segment.0, loc.offset)) {
+                shared_with_live += 1;
+            }
+        }
+        if sample.len() < 16 {
+            let toks: u64 = entry.chunks.values().map(|l| l.token_count).sum();
+            sample.push((
+                sid.0,
+                entry.chunks.len(),
+                toks,
+                entry.tokens.is_some(),
+                entry.wide_q_sigs.is_some(),
+                entry.projection_events.is_some(),
+            ));
+        }
+    }
+
+    println!("orphan chunk streams: {streams}  chunk records: {chunk_records}");
+    println!(
+        "safety: orphan chunk records sharing a location with a LIVE turn: {shared_with_live} \
+         (0 ⇒ reclaiming orphans frees only dead KV, never live data)"
+    );
+    for (sid, nch, toks, has_tok, has_sig, has_proj) in &sample {
+        println!(
+            "  stream=0x{sid:016x} chunks={nch} tokens={toks} \
+             tokens_rec={has_tok} sig={has_sig} proj={has_proj}"
+        );
+    }
+    Ok(())
+}
+
+/// Combined linear dump of a conversation across every segment. Opens all
+/// segments read-only and HOLDS the handles for the whole call, so even as
+/// the daemon renames / reclaims them, this reads a stable, complete view of a
+/// conversation even while the daemon rotates records between segments underneath
+/// us. Crucially each record is walked with its OWN segment id (not
+/// `FIRST_SEGMENT`, which the belief-only merge uses), so `entry.tokens` /
+/// `entry.chunks` carry the real segment and the on-demand byte reads hit the
+/// right file — the fix for "the inspector can't follow mid-file rotations".
+///
+/// Also VALIDATES every turn's completeness — decl present, KV grid consistent
+/// (`n_chunks` a whole multiple of the turn's block span), Tokens present and
+/// decodable — and prints a per-turn verdict plus a summary of any problems, so a
+/// conversation can be hand-checked end to end.
+fn dump_merged(
+    segs: &[(u64, PathBuf, bool)],
+    only_timeline: Option<u64>,
+    full: bool,
+) -> Result<()> {
+    // Open every segment read-only (held for the call) and build the merged index
+    // via the fast HeaderIndex-anchored recovery — the same path the daemon uses.
+    let (mut logs, substrate) = build_merged_substrate(segs);
+
+    struct T {
+        decl: TurnDecl,
+        tokens_loc: Option<(u64, u64, u64)>,
+        n_chunks: u64,
+        kv_tok: u64,
+        distill: Option<DistillMode>,
+        kind: TurnKind,
+        children: Vec<u32>,
+        proj: Option<Vec<u8>>,
+    }
+    let mut turns: Vec<T> = Vec::new();
+    for (_id, entry) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &entry.decl else {
+            continue;
+        };
+        if only_timeline.is_some_and(|o| t.timeline_id != o) {
+            continue;
+        }
+        let tl = TimelineId::from_raw(t.timeline_id);
+        let (kind, children) =
+            match tl.and_then(|tl| substrate.tree_meta_of(tl, TurnIndex(t.turn_index))) {
+                Some(m) => (m.kind, m.children.iter().map(|c| c.0).collect()),
+                None => (TurnKind::Normal, Vec::new()),
+            };
+        let proj = tl
+            .and_then(|tl| substrate.projection_events_blob(tl, TurnIndex(t.turn_index)))
+            .map(|b| b.to_vec());
+        turns.push(T {
+            decl: t.clone(),
+            tokens_loc: entry.tokens.map(|l| (l.segment.0, l.offset, l.record_size)),
+            // Chunk COUNT and token total come straight from the index — `ChunkLoc`
+            // already carries `token_count`, so we never read the chunk records
+            // themselves (they are the KV bytes the fast HeaderIndex walk exists to
+            // skip; reading them back would re-scan the whole conversation's KV).
+            n_chunks: entry.chunks.len() as u64,
+            kv_tok: entry.chunks.values().map(|l| l.token_count).sum(),
+            // Distill mode: a distilled turn intentionally sheds tokens
+            // (ProvenanceOnly) or KV (TextOnly), so it must be EXEMPT from the
+            // missing-record checks (mirrors `integrity::classify_turn`).
+            distill: tl.and_then(|tl| substrate.distill_mode(tl)),
+            kind,
+            children,
+            proj,
+        });
+    }
+    drop(substrate);
+    turns.sort_by_key(|t| (t.decl.timeline_id, t.decl.turn_index));
+    if turns.is_empty() {
+        println!("(no turn streams matching that filter)");
+        return Ok(());
+    }
+
+    let role_name = |r: u8| match r {
+        0 => "sys",
+        1 => "user",
+        2 => "asst",
+        _ => "?",
+    };
+    let kind_str = |k: TurnKind, ch: &[u32]| match k {
+        TurnKind::Normal => "NORMAL".to_string(),
+        TurnKind::SummaryOfTurns => format!("SoT ←{ch:?}"),
+        TurnKind::SummaryOfSummaries => format!("SoS ←{ch:?}"),
+    };
+    // Expected per-turn KV layer count: every turn of a conversation seals the
+    // same L layers, so the MAX observed `n_chunks / blks` across the turns IS the
+    // model's layer count — a turn short of it dropped a whole layer's chunks
+    // (which `n_chunks % blks == 0` alone would miss).
+    let blks_of = |t: &T| t.decl.block_end.saturating_sub(t.decl.block_start);
+    let expected_layers = turns
+        .iter()
+        .filter(|t| blks_of(t) > 0)
+        .map(|t| t.n_chunks / blks_of(t))
+        .max()
+        .unwrap_or(0);
+    let mut n_ok = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    let mut cur_tl: Option<u64> = None;
+    for t in &turns {
+        let d = &t.decl;
+        if cur_tl != Some(d.timeline_id) {
+            cur_tl = Some(d.timeline_id);
+            let n = turns
+                .iter()
+                .filter(|x| x.decl.timeline_id == d.timeline_id)
+                .count();
+            println!(
+                "\n════════ conversation timeline {}  ({} turns) ════════",
+                d.timeline_id, n
+            );
+        }
+        let layout = d.layout();
+        // Tokens: read from the held segment handle. A read error is a PER-TURN
+        // problem, never a fatal abort of the whole validation (so one torn record
+        // can't hide the state of every other turn).
+        let (ids, tokens_unreadable) = match t.tokens_loc {
+            Some((seg, off, sz)) => {
+                match logs.get_mut(&seg).map(|log| read_record_at(log, off, sz)) {
+                    Some(Ok(rec)) => (
+                        Some(decode_token_ids(&rec.payload).unwrap_or_default()),
+                        false,
+                    ),
+                    Some(Err(_)) | None => (None, true),
+                }
+            }
+            None => (None, false),
+        };
+        let n_tok = ids.as_ref().map(|v| v.len()).unwrap_or(0);
+        let blks = d.block_end.saturating_sub(d.block_start);
+        let n_chunks = t.n_chunks;
+        let n_layers = if blks > 0 { n_chunks / blks } else { 0 };
+        let distilled = t.distill.is_some();
+        // Validation. A NON-distilled turn with a KV block span must carry a
+        // complete KV grid + a Tokens record; a distilled turn intentionally sheds
+        // one or the other, so it is exempt from the missing-record checks (a
+        // present-but-unreadable Tokens record is still flagged either way).
+        let mut issues: Vec<String> = Vec::new();
+        if tokens_unreadable {
+            issues.push("TOKENS UNREADABLE".into());
+        }
+        if blks > 0 && !distilled {
+            if t.tokens_loc.is_none() {
+                issues.push("MISSING TOKENS".into());
+            } else if !tokens_unreadable && n_tok == 0 {
+                issues.push("EMPTY TOKENS".into());
+            }
+            if n_chunks == 0 {
+                issues.push("MISSING KV".into());
+            } else if n_chunks % blks != 0 {
+                issues.push(format!(
+                    "KV GRID INCONSISTENT ({n_chunks} chunks / {blks} blocks)"
+                ));
+            } else if expected_layers > 0 && n_layers != expected_layers {
+                issues.push(format!(
+                    "KV INCOMPLETE ({n_layers}/{expected_layers} layers)"
+                ));
+            }
+        }
+        let verdict = if issues.is_empty() {
+            n_ok += 1;
+            if distilled {
+                "OK (distilled)".to_string()
+            } else {
+                "OK".to_string()
+            }
+        } else {
+            problems.push(format!(
+                "timeline {} turn {}: {}",
+                d.timeline_id,
+                d.turn_index,
+                issues.join(", ")
+            ));
+            format!("PROBLEM → {}", issues.join(", "))
+        };
+        let kv_tok = t.kv_tok;
+        let kv_per_layer = if n_layers > 0 {
+            kv_tok / n_layers
+        } else {
+            kv_tok
+        };
+        let events = t.proj.as_deref().map(decode_events).unwrap_or_default();
+        println!(
+            "\n── #{:<3} {:<12} {}  n_tok={} kv/layer={} chunks={}({}blk×{}L) proj={} → {}",
+            d.turn_index,
+            kind_str(t.kind, &t.children),
+            role_name(d.role),
+            n_tok,
+            kv_per_layer,
+            n_chunks,
+            blks,
+            n_layers,
+            events.len(),
+            verdict,
+        );
+        let user_text = layout.user_text();
+        let asst_text = layout.assistant_text().unwrap_or_default();
+        let (umax, amax) = if full {
+            (usize::MAX, usize::MAX)
+        } else {
+            (240, 500)
+        };
+        println!(
+            "   user({:>3}): {}",
+            user_text.chars().count(),
+            trunc(user_text, umax)
+        );
+        println!(
+            "   asst({:>3}): {}",
+            asst_text.chars().count(),
+            trunc(&asst_text, amax)
+        );
+    }
+    println!("\n════════ VALIDATION SUMMARY ════════");
+    println!(
+        "turns={}  OK={}  problems={}",
+        turns.len(),
+        n_ok,
+        problems.len()
+    );
+    for p in &problems {
+        println!("  ✗ {p}");
     }
     Ok(())
 }
