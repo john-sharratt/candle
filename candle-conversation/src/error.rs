@@ -19,6 +19,15 @@ pub enum ConversationError {
     #[error("scheduler has shut down")]
     SchedulerGone,
 
+    /// A graceful shutdown asked the in-flight ingest to stop while this turn's
+    /// summary decode was still running (see [`crate::request_ingest_cancel`]).
+    /// The wait was abandoned and the turn handle dropped so the scheduler stops
+    /// decode at its next step. This is a cooperative stop, not a failure — the
+    /// ingest caller must treat it as "cancelled", NOT count it toward any
+    /// decode-failure budget.
+    #[error("ingest cancelled during summary decode")]
+    IngestCancelled,
+
     #[error("cold store I/O error: {0}")]
     StoreIo(#[from] std::io::Error),
 

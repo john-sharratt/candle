@@ -320,9 +320,23 @@ pub fn persist_tokens_only(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     token_ids: &[u32],
-) -> Result<()> {
-    p.append_tokens(stream_id, &encode_token_ids(token_ids))?;
-    Ok(())
+) -> Result<super::manifest::RecordLoc> {
+    // Return the written record's location so the CALLER can fold it into the
+    // substrate index (`apply_tokens_loc`). Without that, `entry.tokens` stays
+    // `None`, and both the maintenance relocation (`gather_relocations`) and the
+    // full compaction (`collect_live_records`) gate on `if let Some(loc) =
+    // entry.tokens` — so they silently SKIP the Tokens record and it's reclaimed
+    // when its source segment drops (the KV path already registers its chunk
+    // locations; tokens must too). This is why turn-0 (prefilled/adopted) tokens
+    // vanished during idle maintenance while KV survived.
+    let encoded = encode_token_ids(token_ids);
+    let (segment, offset, record_size) = p.append_tokens(stream_id, &encoded)?;
+    Ok(super::manifest::RecordLoc {
+        segment,
+        offset,
+        payload_len: encoded.len() as u64,
+        record_size,
+    })
 }
 
 /// Demux a turn stream's flat chunk index set back into the `L × C` grid.
@@ -997,6 +1011,58 @@ mod tests {
             let cold = recover_turn_cold_refs(&substrate, &decl, 2).unwrap();
             assert!(cold.is_none(), "no chunks → None");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `persist_tokens_only` must return the WRITTEN record's on-disk location so
+    /// the caller can fold it into the substrate index (`apply_tokens_loc`).
+    /// Pre-fix it returned `()`, so `entry.tokens` stayed `None` and the
+    /// maintenance/compaction relocation (both gate on `if let Some(loc) =
+    /// entry.tokens`) silently reclaimed a live turn's tokens on the next idle
+    /// pass. Assert the returned loc is populated AND byte-for-byte agrees with the
+    /// location the reload walk independently records for the same record — a wrong
+    /// loc would corrupt token reads once callers register it.
+    #[test]
+    fn persist_tokens_only_returns_the_written_record_location() {
+        let dir = tmp_dir("tokens_loc_return");
+        let decl = turn_decl(21, 0, 0);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+        let live_loc = {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            let loc = persist_tokens_only(&mut sp, stream_id, &[7, 8, 9]).unwrap();
+            sp.commit().unwrap();
+            loc
+        };
+        assert!(live_loc.offset > 0, "offset past the file-start header");
+        assert!(live_loc.record_size > 0, "padded record_size populated");
+        assert_eq!(
+            live_loc.payload_len,
+            3 * 4,
+            "3 u32 tokens = 12 payload bytes"
+        );
+        // The reload walk records the same record's loc straight from disk — the
+        // live-write loc must match it exactly, proving it points at the real bytes.
+        let mut substrate = Substrate::new();
+        SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let (wseg, woff, wsize, wpay) = {
+            let e = substrate.stream_of(stream_id).expect("stream present");
+            let t = e
+                .tokens
+                .as_ref()
+                .expect("reload registered the tokens loc from disk");
+            (t.segment, t.offset, t.record_size, t.payload_len)
+        };
+        assert_eq!(wseg, live_loc.segment, "segment matches reload walk");
+        assert_eq!(woff, live_loc.offset, "offset matches reload walk");
+        assert_eq!(
+            wsize, live_loc.record_size,
+            "record_size matches reload walk"
+        );
+        assert_eq!(
+            wpay, live_loc.payload_len,
+            "payload_len matches reload walk"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -377,12 +377,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("draining complete — flushing substrate…");
     shutdown_session.shutdown().await;
     tracing::info!("zend stopped");
-    // Force-exit rather than falling out of `main`. The substrate is already
-    // flushed durably above, so the only work left is process teardown — and the
-    // detached background threads (the scheduler, the GPU/CUDA worker + context,
-    // the persistence pipeline) are not all cleanly joinable, so dropping the tokio
-    // runtime and tearing down the CUDA context otherwise hangs the process until a
-    // manual Ctrl-C. Nothing durable is lost by exiting now.
+    // Force-exit rather than falling out of `main`. `shutdown()` above ran the
+    // full drain synchronously — the persistence thread demoted every hot turn
+    // hot→warm→cold and the off-thread writer was flushed (drained + fsynced +
+    // joined via `Conversation::flush_writer`) — so the substrate is durable and
+    // the only work left is process teardown. The detached background threads
+    // (scheduler, GPU/CUDA worker + context) are not all cleanly joinable, so
+    // dropping the tokio runtime and tearing down the CUDA context otherwise hangs
+    // the process until a manual Ctrl-C. Nothing durable is lost by exiting now.
     std::process::exit(0)
 }
 

@@ -173,6 +173,10 @@ fn ingest_raw_into_sink<S: InsertTurnSink>(
     let total = files.len();
     let mut state = RawState::default();
     for (i, (rel, content)) in files.iter().enumerate() {
+        // Cooperative shutdown: stop before the next file so the engine can drain.
+        if candle_conversation::ingest_cancelled() {
+            break;
+        }
         let turns = records_to_turns(parse_chatml_records(content));
         for (user, assistant) in &turns {
             sink.insert_prefill_turn(user, assistant, vec!["raw".to_string(), rel.clone()])?;

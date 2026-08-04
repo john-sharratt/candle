@@ -844,8 +844,10 @@ fn inject_sealed_turn(
             //     hot is None → elevate promoted a different (timeline, index)
             //     so this one was never lifted into VRAM.
             let conv = ctx.conversation.read();
-            let group_timelines: Vec<u64> =
-                conv.timelines_for_group(group).map(|t| t.raw()).collect();
+            // Just the group's timeline COUNT — dumping every raw id (a group can
+            // hold dozens under bulk ingest) bloats the log without adding signal;
+            // the count plus the tier flags below is what localises the cause.
+            let group_timeline_count = conv.timelines_for_group(group).count();
             let entry_exists = conv.turn_indices(timeline).any(|i| i == index);
             // Tier flags distinguish the two root causes:
             //   all false (tier_less) → the turn has no K/V in any tier, so the
@@ -865,7 +867,7 @@ fn inject_sealed_turn(
                 index = index.0,
                 used_timeline = timeline.raw(),
                 slot_timeline = ?ctx.slot_target.map(|t| t.timeline.raw()),
-                group_timelines = ?group_timelines,
+                group_timeline_count,
                 entry_exists,
                 tier_hot = ?tier_hot,
                 tier_warm = ?tier_warm,

@@ -218,6 +218,11 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
     let mut tags = std::collections::BTreeMap::new();
     tags.insert("kind".to_string(), "repo_map".to_string());
     for (i, cluster) in clusters.iter().enumerate() {
+        // Cooperative shutdown: stop before the next cluster so the engine can
+        // drain rather than the shutdown losing the un-drained tier tail.
+        if candle_conversation::ingest_cancelled() {
+            break;
+        }
         // Restart-resume cache: skip clusters already in the substrate
         // (reloaded from the redo log with their content-hash tags).
         let rm_key = format!("rm:{}", cluster.root_dir);

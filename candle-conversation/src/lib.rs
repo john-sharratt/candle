@@ -41,6 +41,7 @@
 //! - Append-only cold store for persistence
 
 mod batched_sampler;
+mod cancel;
 mod config;
 mod conversation;
 pub mod conversation_log;
@@ -69,6 +70,7 @@ pub mod tree;
 pub mod turn;
 pub mod turn_layout;
 
+pub use cancel::{ingest_cancelled, request_ingest_cancel, reset_ingest_cancel};
 pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
     SchedulerConfig, SequenceConfig,

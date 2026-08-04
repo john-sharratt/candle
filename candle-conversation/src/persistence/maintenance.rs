@@ -703,7 +703,7 @@ impl SubstratePersistence {
             .unwrap_or_default()
             .as_secs();
         self.last_maintenance = Some((plan.op.label(), unix));
-        tracing::debug!(op = ?plan.op, "substrate maintenance op applied");
+        tracing::trace!(op = ?plan.op, "substrate maintenance op applied");
         Ok(())
     }
 

@@ -252,13 +252,25 @@ fn process_one(
             stream_id,
             token_ids,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = resume::persist_tokens_only(&mut p, stream_id, &token_ids) {
-                tracing::error!(
+            // Append under the persistence lock, then register the record's
+            // location in the substrate index under the substrate lock — taken
+            // NON-nested, persistence released first (same order as the KV-cold
+            // path). Without the `apply_tokens_loc`, maintenance/compaction can't
+            // see the tokens and reclaim them (see `persist_tokens_only`).
+            let loc = {
+                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+                resume::persist_tokens_only(&mut p, stream_id, &token_ids)
+            };
+            match loc {
+                Ok(loc) => substrate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply_tokens_loc(stream_id, loc),
+                Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
                     "tokens append failed: {e}"
-                );
+                ),
             }
         }
         WriteJob::WideQSigs { stream_id, payload } => {

@@ -624,7 +624,10 @@ fn run_file_pool(
         let mut handles = Vec::with_capacity(n_workers);
         for _ in 0..n_workers.max(1) {
             handles.push(s.spawn(|| loop {
-                if abort.load(Ordering::Relaxed) {
+                // Stop pulling new files on first-error abort OR a shutdown cancel.
+                // The current file finishes (the scheduler is still live), so no
+                // half-ingested file; the loader thread then drains the engine.
+                if abort.load(Ordering::Relaxed) || candle_conversation::ingest_cancelled() {
                     return;
                 }
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
@@ -850,6 +853,21 @@ fn process_one_file(
                 );
             }
         }
+        // If a graceful shutdown latched the cancel flag, this `Err` is the
+        // interruptible decode-wait unwinding (`wait_cancellable` →
+        // `IngestCancelled`), not a genuine decode failure — the anyhow layer has
+        // erased the variant, so the global flag is the source of truth. Don't
+        // count it toward the failure cap (that would risk tripping the abort at
+        // shutdown); the partial was just tombstoned, so the file re-ingests next
+        // run exactly like the mid-file cooperative-stop path below.
+        if candle_conversation::ingest_cancelled() {
+            tracing::debug!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "shutdown cancelled decode mid-file — dropped partial; will re-ingest next run",
+            );
+            return Ok(());
+        }
         let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             target: "zend::code_read::ingest",
@@ -864,6 +882,20 @@ fn process_one_file(
             ));
         }
         return Ok(()); // conv drops → slot freed; superseded generation still live.
+    }
+
+    // Cooperative shutdown mid-file: `ingest_scopes` broke at a chunk boundary, so
+    // this file is INCOMPLETE. Withhold `content_sha256` (the resume-cache key) and
+    // return — the partial keeps only its `path` tag, so next run's invalidation
+    // scan tombstones + re-ingests it, exactly like a crashed-partial. Not a decode
+    // failure, so it isn't counted or capped; the file just re-ingests later.
+    if candle_conversation::ingest_cancelled() {
+        tracing::debug!(
+            target: "zend::code_read::ingest",
+            file = %file.path,
+            "shutdown mid-file — leaving partial (no content_sha256); will re-ingest next run",
+        );
+        return Ok(());
     }
 
     // Tag the conversation: `content_sha256` is the resume-cache key,

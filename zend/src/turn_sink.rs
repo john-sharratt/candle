@@ -217,6 +217,15 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         on_prefilled: &crate::turn_sink::ScopeProgressFn,
     ) -> anyhow::Result<()> {
         for chunk in prepared.chunks(SCOPE_PARALLELISM) {
+            // Cooperative shutdown: abandon the rest of THIS file's scopes at the
+            // chunk boundary, so a worker returns after its in-flight chunk (~4
+            // scopes) instead of waiting for the whole file's decode to finish —
+            // that in-flight wait is the shutdown-latency (the already-submitted
+            // scopes drain slowly under VRAM pressure). The file is left partial
+            // (no `content_sha256`), so `process_one_file` re-ingests it next run.
+            if candle_conversation::ingest_cancelled() {
+                break;
+            }
             // Fork one throwaway timeline per scope in this chunk.
             let mut forks: Vec<Sequence> = Vec::with_capacity(chunk.len());
             for _ in chunk {

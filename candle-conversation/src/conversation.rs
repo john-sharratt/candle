@@ -1805,7 +1805,12 @@ impl Sequence {
         opts.selection
             .select(crate::projection::FORCE_TOOL_SELECTOR, "file_read");
         let handle = self.submit_turn_with_options(response_user, opts)?;
-        let response = handle.wait()?;
+        // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
+        // flag, and this returns `IngestCancelled` instead of waiting out the
+        // in-flight summary decode. Dropping `handle` on that early return stops
+        // the scheduler's decode at its next step. The ingest caller unwinds this
+        // as "cancelled", not a decode failure.
+        let response = handle.wait_cancellable()?;
         let resp_tokens = response.token_ids.len();
         let resp_idx = response
             .seal
@@ -1831,7 +1836,17 @@ impl Sequence {
         // race the splice ("source K/V not hot"). The fork's orphaned hot is freed
         // instead at `tombstone_timeline` (below), where the file timeline's cloned
         // chunk handles keep the shared KV alive.
-        self.fork()
+        //
+        // DO mark the fork timeline transient: its sealed KV is spliced by REFERENCE
+        // onto the file timeline (which writes its own durable cold copy) and then
+        // tombstoned, so the fork's own KV must never be cold-persisted — a cold copy
+        // would be stranded as an unreconstructable orphan when the fork's decl drops
+        // at tombstone. See `Substrate::snapshot_pending_cold` / `no_cold_persist`.
+        let fork_timeline = self
+            .substrate
+            .mint_timeline(self.target.layer, self.target.group);
+        self.substrate.mark_timeline_transient(fork_timeline);
+        self.fork_onto(fork_timeline)
     }
 
     /// Splice a per-scope fork's two coupled turns onto THIS (file) timeline in
