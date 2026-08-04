@@ -716,6 +716,29 @@ impl ArenaPool {
         None
     }
 
+    /// Claim a run from ONE SPECIFIC arena — the freshly registered one.
+    ///
+    /// The global [`Self::allocate_run`] walk cannot promise anything about a
+    /// fresh arena: between the caller's `register_arena` and its retry walk,
+    /// any other gated claimer (24-way parallel elevation of the same format is
+    /// routine) can consume the new arena's high-water tail, and the retry then
+    /// fails as if no space existed. Claiming by index removes the "which arena"
+    /// race — the only way THIS can fail is racers landing in the same arena,
+    /// which the caller answers by registering another (bounded loop).
+    fn allocate_run_in(&self, arena_idx: usize, len: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
+        // Same gate as every claim walk: `try_claim_run` is load-then-store on
+        // `hwm` and is only sound serialized.
+        let _gate = self.alloc_gate.lock().unwrap();
+        let stride = arena_gid_stride();
+        let tables = self.tables.read().unwrap();
+        let table = tables.get(&arena_idx)?;
+        let first = table.try_claim_run(len)?;
+        if table.is_full() {
+            self.capacity.clear(arena_idx);
+        }
+        Some(((arena_idx * stride + first) as i64, Arc::clone(table)))
+    }
+
     fn allocate_any(&self) -> Option<(i64, Arc<ArenaRefcounts>)> {
         // Serialize the claiming walk: only one thread scans this pool's
         // `counts` arrays at a time, so `try_claim_one` can probe occupancy
@@ -852,19 +875,28 @@ impl ArenaPool {
     ///   - Releasing would leave < 10% of `arena_chunks` of headroom
     ///     across the remaining pool (matches prior behaviour to avoid
     ///     thrashing).
-    fn try_tombstone(&self, protected_arenas: &AHashSet<usize>) -> Option<usize> {
+    fn try_tombstone(&self, protected_arenas: &AHashSet<usize>, force: bool) -> Option<usize> {
         // Free-headroom check first — derived in O(1) from the running
         // counters. After releasing one arena we'd have
         // `(total_arenas - 1) * arena_chunks - total_live` free slots;
         // bail if that's under the 10% thrash threshold without even
         // taking the tables read lock.
+        //
+        // `force` bypasses it. The guard exists to stop steady-state churn
+        // (release an arena, immediately re-create it), and it is right for
+        // that — but its condition is "the pool is nearly full", which is
+        // exactly when reclaim is being asked for. Left unconditional it makes
+        // the relief ladder a no-op at the moment it matters and the pool can
+        // never shrink back inside the card: full because it cannot shrink,
+        // unable to shrink because it is full. Under real VRAM pressure one
+        // extra create/destroy cycle is cheap and a wedged pool is not.
         let arenas = self.total_arenas.load(Ordering::Relaxed);
         if arenas == 0 {
             return None;
         }
         let total_slots_after = arenas.saturating_sub(1).saturating_mul(self.arena_chunks);
         let after_release = total_slots_after.saturating_sub(self.total_live());
-        if after_release < self.arena_chunks / 10 {
+        if !force && after_release < self.arena_chunks / 10 {
             return None;
         }
 
@@ -1185,6 +1217,27 @@ impl ChunkGidPool {
         )
     }
 
+    /// [`Self::allocate_run_for`] against one specific arena index — see
+    /// `ChunkPool::allocate_run_in` for why the caller targets the arena it
+    /// just registered instead of re-walking.
+    pub fn allocate_run_for_in(
+        &self,
+        key: ArenaKey,
+        arena_idx: usize,
+        len: usize,
+    ) -> Option<Vec<ChunkGid>> {
+        let pool = self.inner.pools.get(&key)?;
+        let (first, table) = pool.allocate_run_in(arena_idx, len)?;
+        Some(
+            (0..len as i64)
+                .map(|i| ChunkGid {
+                    id: first + i,
+                    backing: GidBacking::Pooled(Arc::clone(&table)),
+                })
+                .collect(),
+        )
+    }
+
     /// Bulk variant of [`Self::allocate_for`] — returns up to `n` gids.
     ///
     /// May return fewer than `n` if the pool ran out of capacity; the
@@ -1248,12 +1301,35 @@ impl ChunkGidPool {
     }
 
     /// Return arenas for `key` sorted by live chunk count ascending.
+    /// Arenas of `key` sorted emptiest-first, **excluding protected ones**.
+    ///
+    /// This feeds defragmentation's drain-target choice, and protected arenas
+    /// must never be targets: they are the per-format warm set, held for the
+    /// lifetime of the process so every format stays allocatable, and
+    /// `try_tombstone` will refuse to release them no matter how empty they get.
+    ///
+    /// Emptiest-first made them the FIRST pick — a warm arena is lightly used
+    /// almost by definition — so defrag spent its whole move budget draining
+    /// arenas it could never reclaim. Measured: `compact_moves=15994` with
+    /// `empty_arenas=1 protected=1 held_back=1`, i.e. the single empty arena in
+    /// 194 was the protected one, every pass, freeing nothing. Skipping them
+    /// costs nothing (they are meant to stay) and points the budget at arenas
+    /// that can actually be released.
     #[cfg(feature = "cuda")]
     pub fn arenas_sorted_by_live_for_key(&self, key: &ArenaKey) -> Vec<(usize, usize)> {
+        let protected = {
+            let state = self.inner.metadata.lock().unwrap();
+            state.protected_arenas.clone()
+        };
         self.inner
             .pools
             .get(key)
-            .map(|pool| pool.arenas_sorted_by_live())
+            .map(|pool| {
+                pool.arenas_sorted_by_live()
+                    .into_iter()
+                    .filter(|(idx, _)| !protected.contains(idx))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1269,10 +1345,10 @@ impl ChunkGidPool {
     }
 
     /// Find a fully-free arena of this format and release it.
-    pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
+    pub fn next_tombstone(&self, key: ArenaKey, force: bool) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
-        let arena_idx = pool.try_tombstone(&state.protected_arenas)?;
+        let arena_idx = pool.try_tombstone(&state.protected_arenas, force)?;
         state.arena_registry[arena_idx] = None;
         state.free_arenas.push_back(arena_idx);
         Some(arena_idx)
@@ -1494,6 +1570,132 @@ mod tests {
 
     fn test_arena_chunks() -> usize {
         arena_chunks_for_format(KvFormat::Float(DType::BF16))
+    }
+
+    /// The fix for the "fresh arena cannot fit palette run" race: a run claimed
+    /// BY INDEX from a just-registered arena must succeed even when the global
+    /// walk would have been raced, and must fail cleanly once that arena's tail
+    /// is consumed (the caller then registers another).
+    #[test]
+    fn targeted_run_claim_hits_the_registered_arena() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let cap = test_arena_chunks();
+        let idx = pool.register_arena(key.clone());
+
+        // Simulate the race: a rival's global walk consumes most of the fresh
+        // arena's tail before our targeted claim.
+        let rival = pool
+            .allocate_run_for(key.clone(), cap - 2)
+            .expect("rival run fits the fresh arena");
+        assert_eq!(rival.len(), cap - 2);
+
+        // The global walk can no longer fit 3 — but the targeted claim reports
+        // that the SPECIFIC arena is exhausted (None), not a phantom "no arena
+        // anywhere", so the caller knows to register another…
+        assert!(pool.allocate_run_for(key.clone(), 3).is_none());
+        assert!(pool.allocate_run_for_in(key.clone(), idx, 3).is_none());
+
+        // …and a run that still fits the tail lands in exactly that arena.
+        let run = pool
+            .allocate_run_for_in(key.clone(), idx, 2)
+            .expect("2 slots remain at the high-water tail");
+        assert_eq!(run.len(), 2);
+        assert!(run.iter().all(|g| g.arena_idx() == idx));
+
+        // A fresh registration + targeted claim succeeds for the full length —
+        // the loop the allocator runs.
+        let idx2 = pool.register_arena(key.clone());
+        let run2 = pool
+            .allocate_run_for_in(key.clone(), idx2, cap)
+            .expect("fresh arena serves a full-capacity run");
+        assert_eq!(run2.len(), cap);
+        assert!(run2.iter().all(|g| g.arena_idx() == idx2));
+
+        // Unknown arena index: None, never a panic.
+        assert!(pool.allocate_run_for_in(key, 9999, 1).is_none());
+    }
+
+    /// The free-headroom guard must not stand between the relief ladder and a
+    /// fully-drained arena.
+    ///
+    /// Unforced it refuses once the pool is nearly full — which is the exact
+    /// state reclaim is called for, so the pool could never shrink back inside
+    /// the card: full because it could not shrink, unable to shrink because it
+    /// was full. `force` bypasses it; steady-state churn is still guarded on
+    /// the unforced path (the per-wave proactive sweep).
+    #[test]
+    fn a_forced_sweep_reclaims_what_the_headroom_guard_refuses() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let cap = test_arena_chunks();
+
+        // Two arenas; fill BOTH completely, then free exactly one arena's worth.
+        // Live is then `cap` across 2 arenas, so releasing one would leave
+        // `1*cap - cap = 0` free slots — under `cap/10`, so the guard refuses.
+        pool.register_arena(key.clone());
+        let a: Vec<_> = (0..cap)
+            .map(|_| pool.allocate_for(key.clone()).unwrap())
+            .collect();
+        pool.register_arena(key.clone());
+        let b: Vec<_> = (0..cap)
+            .map(|_| pool.allocate_for(key.clone()).unwrap())
+            .collect();
+        assert_eq!(a.len() + b.len(), cap * 2);
+
+        // Drop one arena's worth so exactly one arena is empty.
+        let freed_idx = b[0].arena_idx();
+        assert!(
+            b.iter().all(|g| g.arena_idx() == freed_idx),
+            "b filled one arena"
+        );
+        drop(b);
+
+        assert!(
+            pool.next_tombstone(key.clone(), false).is_none(),
+            "unforced: the headroom guard holds the empty arena back"
+        );
+
+        let got = pool.next_tombstone(key.clone(), true);
+        assert_eq!(got, Some(freed_idx), "forced: the empty arena is reclaimed");
+
+        drop(a);
+    }
+
+    /// Defrag must never target a PROTECTED arena as a drain victim.
+    ///
+    /// Protected arenas are the per-format warm set, held for the process
+    /// lifetime; `try_tombstone` refuses them however empty they get. Since the
+    /// target list is sorted emptiest-first and a warm arena is lightly used by
+    /// definition, they were picked FIRST — so the whole move budget drained
+    /// arenas that could never be reclaimed (measured: 15,994 moves, 1 empty
+    /// arena in 194, and that one protected).
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn defrag_targets_exclude_protected_arenas() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+
+        // Arena 0 is the warm/protected one, left nearly empty (one chunk).
+        let warm_idx = pool.register_arena(key.clone());
+        pool.protect_arena(warm_idx);
+        let _warm_live = pool.allocate_for(key.clone()).unwrap();
+
+        // Arena 1 carries real load — the arena defrag SHOULD be draining.
+        let busy_idx = pool.register_arena(key.clone());
+        let _busy: Vec<_> = (0..8)
+            .map(|_| pool.allocate_for(key.clone()).unwrap())
+            .collect();
+
+        let targets = pool.arenas_sorted_by_live_for_key(&key);
+        assert!(
+            targets.iter().all(|(idx, _)| *idx != warm_idx),
+            "the protected warm arena must not be a drain target: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|(idx, _)| *idx == busy_idx),
+            "reclaimable arenas must still be offered: {targets:?}"
+        );
     }
 
     #[test]

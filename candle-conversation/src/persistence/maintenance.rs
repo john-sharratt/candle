@@ -284,7 +284,10 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
     let mut out: Vec<Resident> = Vec::new();
     for (stream_id, entry) in substrate.all_streams() {
         let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
-        if is_tomb {
+        // Tombstoned AND undistilled goes; tombstoned-but-distilled is the
+        // provenance corpus and is retained by its mode. See the same gate in
+        // `compaction::collect_live_records`.
+        if is_tomb && distill.is_none() {
             continue;
         }
         // Orphan (no decl): re-emit nothing — its StreamDecl is gone, so its
@@ -332,7 +335,13 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         }
     }
     for (tl, conv, label, archived, custom) in substrate.live_conv_meta() {
-        if tombstoned.contains(&tl) {
+        // A tombstoned timeline that is ALSO distilled is the provenance corpus
+        // (calibration exemplars: archived, distilled, then tombstoned out of the
+        // live gather while their signatures keep answering the belief scan).
+        // Its marker/metadata must survive, or the next reload sees a
+        // content-declaring turn with no distill exemption and condemns it.
+        // Only an undistilled tombstone is a retired conversation.
+        if tombstoned.contains(&tl) && !distilled.contains_key(&tl) {
             continue;
         }
         out.push(Resident {
@@ -376,10 +385,11 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             .encode(),
         });
     }
+    // Re-emitted for tombstoned timelines too: the marker is what exempts a
+    // distilled turn from the integrity verdict, and a distilled turn has
+    // legitimately shed its tokens/KV. Losing it condemns the provenance corpus
+    // as "corrupt" on the next reload.
     for (&tl, &mode) in &distilled {
-        if tombstoned.contains(&tl) {
-            continue;
-        }
         out.push(Resident {
             rt: RecordType::Distilled,
             stream_id: 0,
@@ -761,7 +771,11 @@ impl SubstratePersistence {
         let mut tokens: Vec<(StreamId, RecordLoc)> = Vec::new();
         for (stream_id, entry) in substrate.all_streams() {
             let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
-            if is_tomb {
+            // Same rule as the re-emit path: a tombstoned-but-DISTILLED timeline
+            // is the provenance corpus, so it is relocated by its mode (the
+            // per-mode gates below already withhold its chunks/tokens) rather
+            // than abandoned. Only an undistilled tombstone is skipped outright.
+            if is_tomb && distill.is_none() {
                 continue;
             }
             // Orphan (no decl): its records are unreachable on reload, so DON'T

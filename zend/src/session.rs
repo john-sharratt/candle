@@ -894,7 +894,13 @@ impl InferenceState {
             let mut done = 0usize;
             let mut to_run: Vec<(&str, &str, &str)> = Vec::new();
             for (name, example, marker) in cases.iter() {
-                let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, marker);
+                // Distill-inclusive: a finished exemplar's designed end state is
+                // archived + distilled(`ProvenanceOnly`) + tombstoned, and the
+                // live-only lookup cannot see it — every such case read as
+                // "never ran" and regenerated. Ordinary tombstones stay excluded,
+                // so a genuinely retired conversation is still ignored here.
+                let prior = engine
+                    .find_conversations_by_metadata_including_distilled(CALIB_MARKER_KEY, marker);
                 // Done iff a prior conversation for this case is archived.
                 if prior.iter().any(|t| engine.is_conversation_archived(*t)) {
                     // The completed corpus only needs its wide-Q sigs, so mark the
@@ -921,6 +927,18 @@ impl InferenceState {
                 }
                 to_run.push((*name, *example, marker.as_str()));
             }
+            // Say up front how much of the corpus is being regenerated and why the
+            // step will take as long as it does. A case resumes only when a prior
+            // conversation carrying its marker is ARCHIVED; anything else — a
+            // reworded tool description, an edited example, or an archive record
+            // that did not survive — regenerates. Without this split a partial
+            // recalibration is indistinguishable from a full one at a glance.
+            tracing::info!(
+                cases = total,
+                resumed = done,
+                to_run = to_run.len(),
+                "calibration resume filter"
+            );
 
             // Non-blocking sweep: archive + retire every case finished since the
             // last sweep. Archives only complete trajectories (`</tool_call>`); an
@@ -1209,6 +1227,8 @@ impl InferenceState {
             progress.set_step_progress(total as u64, total as u64);
             tracing::info!(
                 cases = total,
+                resumed = total.saturating_sub(calib_timelines.len()),
+                ran = calib_timelines.len(),
                 demoted_timelines = calib_timelines.len(),
                 "calibrating sections complete"
             );
@@ -1259,7 +1279,7 @@ impl InferenceState {
             tracing::info!(layer = %il.name, mode = ?il.mode, folder = %il.folder, "ingest pass starting");
             match il.mode {
                 IngestMode::Folders => {
-                    let (sequence, walked, state) = crate::repo_scan::ingest_repo_map(
+                    let (walked, state, report) = crate::repo_scan::ingest_repo_map(
                         &engine,
                         proj_builder_refresh.clone(),
                         &content_root,
@@ -1268,9 +1288,14 @@ impl InferenceState {
                         &il.name,
                         &il.group,
                     )?;
+                    // An incomplete map is reported, not fatal: affected
+                    // directories keep their prior generation live and retry on
+                    // the next pass, so the daemon comes up serving a partial
+                    // map rather than not coming up at all.
+                    crate::ingest_report::publish(crate::repo_scan::PASS_NAME, report);
                     // Cache this folder's walk for a co-located per-file layer.
                     walk_cache.insert(il.folder.clone(), walked);
-                    ingest_convs.insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                    ingest_convs.insert(il.name.clone(), IngestConv::Folders { state });
                 }
                 IngestMode::Files => {
                     // The blocking critical-path ingest runs on the first load AND
@@ -1427,8 +1452,8 @@ impl InferenceState {
     ///
     /// Iterates the live [`IngestConv`] registry and dispatches each layer to its
     /// loading mode's atomic refresh:
-    ///  * **folder-scan** — re-cluster the walk; on a cluster-hash change mint a
-    ///    fresh timeline, prefill the new clusters, tombstone the old timeline,
+    ///  * **folder-scan** — re-derive the directory units; each whose content
+    ///    hash moved re-ingests into a fresh conversation that supersedes the old,
     ///    and swap the new `Sequence` into the registry entry.
     ///  * **per-file** — reconcile deleted files, then re-ingest the changed
     ///    ones (each into a fresh per-file conversation that tombstones its
@@ -1455,18 +1480,14 @@ impl InferenceState {
             let content_root = self.workspace.join(&il.folder);
             match il.mode {
                 IngestMode::Folders => {
-                    // Snapshot the prior timeline + cluster state, then refresh
-                    // lock-free, then swap the replacement in — all keyed by name.
-                    let snapshot = {
+                    let prior_state = {
                         let convs = self.ingest_convs.lock().unwrap();
                         match convs.get(&il.name) {
-                            Some(IngestConv::Folders { sequence, state }) => {
-                                Some((sequence.timeline_id(), state.clone()))
-                            }
+                            Some(IngestConv::Folders { state }) => Some(state.clone()),
                             _ => None,
                         }
                     };
-                    let Some((old_timeline, prior_state)) = snapshot else {
+                    let Some(prior_state) = prior_state else {
                         continue;
                     };
                     let map = walk_cache
@@ -1475,19 +1496,18 @@ impl InferenceState {
                     let ctx = self.refresh_ctx();
                     let outcome = crate::repo_scan::refresh_repo_map(
                         &ctx,
+                        &content_root,
                         map,
                         &prior_state,
-                        old_timeline,
                         &progress,
                         &il.name,
                         &il.group,
                     )?;
-                    if let crate::repo_scan::RefreshOutcome::Replaced { sequence, state } = outcome
-                    {
+                    if let crate::repo_scan::RefreshOutcome::Replaced { state } = outcome {
                         self.ingest_convs
                             .lock()
                             .unwrap()
-                            .insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                            .insert(il.name.clone(), IngestConv::Folders { state });
                         any = true;
                         tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
                     }
@@ -3908,7 +3928,7 @@ impl ZendSession {
                         // Arm the workspace watcher. A filesystem-event burst
                         // debounces into a single refresh covering every
                         // populated ingest layer: name-relevant events (create /
-                        // remove / rename) can move a folder-scan layer's cluster
+                        // remove / rename) can move a folder-scan layer's directory
                         // hashes, content edits can move a per-file layer's
                         // content hashes. Each layer short-circuits internally
                         // when its hash record is unchanged, and a layer that was
@@ -4748,7 +4768,7 @@ mod projection_schema_tests {
 
     /// The shipped `projection.yaml` parses, and the reconstructed repo map is
     /// capped and floored: `structure` is a `top_k(3)` group with a `"."`
-    /// default so the workspace-root cluster always survives selection.
+    /// default so the workspace-root folder always survives selection.
     #[test]
     fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
         let builder = build_projection_builder(Path::new("demo-project"));
@@ -4758,13 +4778,13 @@ mod projection_schema_tests {
         let group = builder.group(structure).expect("group schema present");
 
         match &group.selection {
-            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 clusters"),
+            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 folders"),
             other => panic!("structure should be top_k(3), got {other:?}"),
         }
         assert_eq!(
             group.default.as_ref().map(|d| d.tag.as_str()),
             Some("."),
-            "repo_map default floor is the workspace-root cluster",
+            "repo_map default floor is the workspace-root folder",
         );
     }
 }

@@ -132,6 +132,9 @@ impl PinnedPool {
             );
         }
 
+        // Feed the process-wide gauge: pinned memory is non-pageable, so the
+        // host-RAM availability measurement must treat it as structural.
+        candle::vram::note_host_pinned_alloc(total_size as u64);
         tracing::info!(
             "PinnedPool: allocated {:.1} GB pinned RAM ({} slots × {:.1} KB)",
             total_size as f64 / 1e9,
@@ -214,6 +217,7 @@ impl Drop for PinnedPool {
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 tracing::warn!("PinnedPool: cuMemFreeHost failed: {:?}", result);
             }
+            candle::vram::note_host_pinned_free(self.total_size as u64);
         }
     }
 }

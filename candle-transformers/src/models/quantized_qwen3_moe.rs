@@ -1427,6 +1427,9 @@ impl ModelWeights {
                 .map_err(|e| candle::Error::Msg(format!("Failed to mmap file: {}", e)))?
         };
         let mmap = Arc::new(mmap);
+        // Feed the host-RAM budget: the budget reserves the full mmap size so
+        // warm-KV growth can never push weight pages out of RAM.
+        candle::vram::note_weights_mmap(mmap.len() as u64);
 
         // Mmap warming is handled by ExpertCache::new() (prewarm_expert_cache)
         // which fills VRAM slots first, then warms remaining pages.

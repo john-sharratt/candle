@@ -230,7 +230,7 @@ lands role-coherent, a question in user-role position and its answer in assistan
 position, and it gives retrieval a scope to match against. A single-body summary node has
 neither, and a window built from such nodes carries no user-role content at all — so the
 model, asked what was discussed, reaches for whatever user-role text it *can* see (in
-practice the `repo_map` layer's ``Repository index — `…`:`` headers) and reports that.
+practice a content layer's request headers) and reports that.
 
 The halves are produced by different means, and that split is the core rule:
 
@@ -267,17 +267,16 @@ on the content side.
 A `SummaryOfTurns` leaf has exactly one child, so it keeps that turn's question verbatim: the
 leaf is a faithful `(question, compressed answer)` pair.
 
-## Structural content (directory trees)
+## Structural content (fully-determined structure)
 
-The `repo_map` layer's summaries are directory *skeletons* — directory paths and their files.
-The model cannot be trusted with them: a faithful *merge* of children just unions their trees,
-so the skeleton grows toward the root instead of compressing; and given the thin input a
-summary node carries, a decode fabricates placeholders (`/path/to/repo`), emits shell
-snippets, and rambles (a model ceiling no prompt fixes — the *input* is degenerate).
+Some content's structure is **fully determined by its children** — a directory tree is the
+canonical case: a faithful *merge* just unions the children's trees, so the skeleton grows
+toward the root instead of compressing, and given the thin input a summary node carries, a
+decode fabricates placeholders (`/path/to/repo`), emits shell snippets, and rambles (a model
+ceiling no prompt fixes — the *input* is degenerate).
 
-For a directory tree the structure is **fully determined by the children**, so the model is
-not needed at all. `repo_map` sets `content: structural` (`Content::Structural`) on **both**
-its levels, and each is built deterministically with **no model decode**
+Where that holds, a level sets `content: structural` (`Content::Structural`) and both halves
+are built deterministically with **no model decode**
 (`scheduler::seal_structural_turn` → `summary_tree::structural`):
 
 - a **leaf** (`leaf_skeleton`) strips the `(N lines, …)` size annotations off its one scan
@@ -292,17 +291,22 @@ its levels, and each is built deterministically with **no model decode**
   `height` rides the `ProbeRequest` from the summariser.
 
 A structural level derives **both** halves from the children's skeletons, and a `scope:` key
-here is rejected rather than silently ignored. For a directory tree the skeleton is the
-authoritative statement of what the node covers, whereas the children's scopes are not: a
-`repo_map` scan turn's user half is prose (``Repository index — `candle-nn/src`:``), so a
-directory derivation over it would parse the prose as a path. The scope is therefore the
-distinct top-level directories of the skeleton.
+here is rejected rather than silently ignored: where the skeleton is the authoritative
+statement of what the node covers, the children's scopes are not, and a directory derivation
+over prose would parse the prose as a path. The scope is therefore the distinct top-level
+directories of the skeleton.
 
 Both halves are then encoded and sealed through the shared `seal_compression_turn` — the same
 think-strip, marker-framing, and role-coherent re-prefill the decode path uses. Skipping the
 decode removes the cost *and* the fabrication surface: for structure the model is not
-consulted at all. Other layers (`code_reading`, the analyses) summarise code and artifacts
-rather than paths, so their content stays `decode`.
+consulted at all.
+
+**No shipped layer selects this today.** `repo_map` did, when its turns were directory
+listings; it now ingests one conversation per folder ending in a *decoded* two-sentence
+description of what the folder is for, so its content is prose and its scope is `union` like
+every other decoded layer. `code_reading` and the analyses summarise code and artifacts rather
+than paths, so they were always `decode`. The mechanism remains available to a level whose
+structure is fully determined by its input.
 
 ## What is deleted
 

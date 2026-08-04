@@ -1,4 +1,4 @@
-//! Data types shared by the workspace walker and the cluster builder.
+//! Data types shared by the workspace walker and the per-directory unit builder.
 
 /// Languages we recognise by extension.  Each variant either maps to
 /// a tree-sitter grammar (proper scope-aware carving) or to a
@@ -59,31 +59,6 @@ impl Language {
         }
     }
 
-    /// Human-readable label rendered in the repo-map tree
-    /// (`(247 lines, Rust)` etc.).
-    pub fn label(self) -> &'static str {
-        match self {
-            Language::Rust => "Rust",
-            Language::Python => "Python",
-            Language::TypeScript => "TypeScript",
-            Language::JavaScript => "JavaScript",
-            Language::Go => "Go",
-            Language::C => "C",
-            Language::Cpp => "C++",
-            Language::Java => "Java",
-            Language::Ruby => "Ruby",
-            Language::Php => "PHP",
-            Language::Bash => "Shell",
-            Language::Html => "HTML",
-            Language::Css => "CSS",
-            Language::Markdown => "Markdown",
-            Language::Yaml => "YAML",
-            Language::Toml => "TOML",
-            Language::Json => "JSON",
-            Language::PlainText => "Text",
-        }
-    }
-
     /// Resolve a file extension (`"rs"`) to a [`Language`].  Returns
     /// `None` for extensions outside the allowlist — those files are
     /// skipped during the walk and never reach the renderer.
@@ -95,7 +70,17 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
             "c" | "h" => Some(Language::C),
-            "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "hh" => Some(Language::Cpp),
+            // CUDA carves as C++. Measured against the real kernels rather than
+            // assumed: tree-sitter-cpp names the device functions and their
+            // enclosing namespaces (`namespace fused_attn` /
+            // `int8_decode_attn_impl()`) and splits the file header cleanly. The
+            // constructs it cannot parse — `__global__` declarations, `<<<…>>>`
+            // launches in the 37 files that host-launch — degrade to Fallback
+            // scopes that still carry the function names in their path, so a
+            // question about a kernel by name still retrieves it. A dedicated
+            // `Cuda` variant would drop all 293 files to the fallback tier
+            // instead, which is strictly less structure.
+            "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "hh" | "cu" | "cuh" => Some(Language::Cpp),
             "java" => Some(Language::Java),
             "rb" | "rake" | "ru" | "gemspec" => Some(Language::Ruby),
             "php" | "phtml" => Some(Language::Php),
@@ -135,6 +120,10 @@ pub enum ModuleHint {
 }
 
 impl ModuleHint {
+    /// Short parenthetical rendered into a directory's summarise request
+    /// (`Summarize the \`candle-nn/\` folder (crate: candle-nn) …`), so the
+    /// model knows a folder is a crate/package root rather than inferring it
+    /// from a `Cargo.toml` in the listing.
     pub fn render(&self) -> String {
         match self {
             ModuleHint::CargoWorkspace { members } => format!("workspace: {members} members"),
@@ -165,7 +154,7 @@ pub struct FileEntry {
 }
 
 /// The full set of files surveyed by the workspace walker.
-/// Sorted ascending by `path` so the cluster builder's output is
+/// Sorted ascending by `path` so the unit builder's output is
 /// byte-identical across runs on the same tree.
 #[derive(Debug, Clone, Default)]
 pub struct RepoMap {
@@ -185,4 +174,21 @@ pub struct RepoMap {
     /// as `*.txt`. Carving one produces hundreds of garbage scopes that blow
     /// the ingest co-batch's VRAM budget.
     pub files_skipped_binary: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    /// The kernels are the engine. While `.cu`/`.cuh` were off the allowlist the
+    /// walk dropped all 293 of them, which took them out of BOTH layers built
+    /// from it: `code_reading` never carved a kernel, and a `repo_map` folder
+    /// whose content is CUDA hashed as though it held only its `api.rs` wrapper,
+    /// so adding a kernel never re-summarised the folder.
+    #[test]
+    fn cuda_sources_are_walked_as_cpp() {
+        assert_eq!(Language::from_extension("cu"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cuh"), Some(Language::Cpp));
+        assert_eq!(Language::Cpp.fence_tag(), "cpp");
+    }
 }

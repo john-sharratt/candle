@@ -269,6 +269,22 @@ fn summarize_examples_optional_carries_stuffed_turns() {
         content.contains("Jitter returns"),
         "stuffed content must carry the sample summaries",
     );
+    // The `repo_map` ingest reuses these examples for a FOLDER chain (list, then
+    // read the anchor, then summarise), which is a different shape from the
+    // code_reading scope read. Without a worked example of it the model imitates
+    // the file shape and describes the anchor file instead of the folder.
+    assert!(
+        content.contains("Summarize the `worker/scheduling/` folder"),
+        "stuffed content must carry a folder-shaped example for repo_map",
+    );
+    assert!(
+        content.contains("\"name\":\"file_list\""),
+        "the folder example must show the listing call the repo_map chain prefills",
+    );
+    assert!(
+        content.contains("This folder decides which tenant's jobs run next"),
+        "the folder example must end in a folder summary, not a file summary",
+    );
 }
 
 // ── extract_tool_calls ───────────────────────────────────────────────────────

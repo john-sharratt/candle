@@ -83,7 +83,19 @@ pub type Couplings = AHashSet<u32>;
 /// with a warning, because that is a *lost exchange*, not a no-op (the usual
 /// cause is a caller that coupled a non-`Normal` index, e.g. a summary turn
 /// mistaken for the call turn).
+///
+/// **No normals at all is a different, expected state and is silent.** The
+/// summariser skips append-only ingest layers entirely
+/// (`is_append_only_layer`), so those timelines never gain forest nodes while
+/// still carrying genuine couplings from their tool round-trips. Warning per
+/// coupling there says nothing about a lost exchange — there is no forest to
+/// lose it from — and drowns the log: a repo-map ingest emitted 454 of these in
+/// two minutes, two per directory conversation. The diagnostic only carries
+/// information when a forest exists and a coupling misses it.
 pub fn over_normals(raw: &AHashSet<u32>, normals: &[TurnIndex]) -> Couplings {
+    if normals.is_empty() {
+        return Couplings::default();
+    }
     // Build the turn-index → position map once (O(normals + couplings)) rather
     // than scanning `normals` per coupling (O(normals × couplings)).
     let pos_of: AHashMap<u32, u32> = normals
@@ -223,6 +235,17 @@ mod tests {
         let normals = [TurnIndex(0), TurnIndex(2), TurnIndex(4)];
         assert_eq!(over_normals(&raw(&[3]), &normals), couplings(&[]));
         assert_eq!(over_normals(&raw(&[99]), &normals), couplings(&[]));
+    }
+
+    /// A timeline with NO forest nodes is an expected state, not a lost
+    /// exchange: the summariser skips append-only ingest layers, so every
+    /// repo-map directory conversation carries real couplings with zero normals.
+    /// It must project to empty **without** warning per coupling — that flood
+    /// was 454 log lines in two minutes of ingest.
+    #[test]
+    fn no_normals_projects_empty_and_is_not_a_lost_exchange() {
+        assert_eq!(over_normals(&raw(&[0, 1]), &[]), couplings(&[]));
+        assert_eq!(over_normals(&raw(&[]), &[]), couplings(&[]));
     }
 
     #[test]

@@ -104,6 +104,22 @@
     border-color:color-mix(in srgb,var(--accent) 50%,transparent)}to{background:transparent;border-color:transparent}}
   .prow.flash{animation:promoflash 1.3s ease-out}
   @media(prefers-reduced-motion:reduce){.prow.flash{animation:none}}
+  /* memory dump — grouped key/value rows, bars for used/total pairs */
+  .memdump{font-family:var(--mono);font-size:12px;display:flex;flex-direction:column;gap:1px}
+  .memdump .mem-empty{color:var(--ink-faint);padding:6px 9px}
+  .mh{margin:9px 0 3px;padding:0 9px;font-size:10.5px;font-weight:640;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--ink-faint)}
+  .mh:first-child{margin-top:0}
+  .mrow{position:relative;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;
+    padding:2px 9px;border-radius:5px;overflow:hidden}
+  .mrow .mbar{position:absolute;left:0;top:0;bottom:0;width:0;z-index:0;
+    background:color-mix(in srgb,var(--accent) 13%,transparent)}
+  .mrow .mbar.warn{background:color-mix(in srgb,var(--warn) 18%,transparent)}
+  .mrow .mbar.crit{background:color-mix(in srgb,var(--crit) 18%,transparent)}
+  .mrow .mk,.mrow .mv{position:relative;z-index:1}
+  .mrow .mk{color:var(--ink-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mrow .mv{color:var(--ink);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+  .mrow .mv .dim{color:var(--ink-faint)}
   .foot{margin-top:26px;color:var(--ink-faint);font-size:11.5px;font-family:var(--mono);
     text-align:center;border-top:1px solid var(--line);padding-top:16px}
   .livebar{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:11.5px}
@@ -274,10 +290,16 @@
       <canvas id="c_slots" height="190"></canvas>
     </div>
 
-    <div class="card wide">
+    <div class="card">
       <h3>Working-set promotes &mdash; what's re-elevated</h3>
       <div class="cap">Cumulative count of each unit handed to the per-turn working-set elevate, by name, most-promoted first &mdash; each row <b>flashes</b> when it climbs and shows its share of all promotes. A fixed section (system prompt, a tool) near the top means it's being re-elevated every ingest turn (wasted work).</div>
       <div class="promo" id="promotelist"></div>
+    </div>
+
+    <div class="card">
+      <h3>Memory &mdash; full accounting</h3>
+      <div class="cap">The scheduler's <b>/v1/memory</b> snapshot (~2&thinsp;s cadence): every quantity the throttles reason about, side by side &mdash; driver VRAM vs pool reservation, governor budget, KV arena split, warm tier, host RAM vs the ingest floor, and the admission setpoint. <b>Structural</b> host use (pinned expert pool, WDDM commit backing) is broken out so a permanently-low "available" reads as what it is.</div>
+      <div class="memdump" id="memdump"><div class="mem-empty">waiting for first snapshot&hellip;</div></div>
     </div>
 
   </div>
@@ -792,21 +814,123 @@ function buildMeta(){
 }
 
 // ---------- live loop ----------
+// ---------- memory dump panel (/v1/memory) ----------
+function fmtB(b){
+  if(b==null) return '\u2014';
+  if(b>=1073741824) return (b/1073741824).toFixed(2)+' GiB';
+  if(b>=1048576) return Math.round(b/1048576)+' MiB';
+  if(b>=1024) return Math.round(b/1024)+' KiB';
+  return b+' B';
+}
+function renderMemory(d){
+  const box=document.getElementById('memdump'); if(!box) return;
+  const rep=d.report;
+  if(!rep){
+    box.innerHTML='<div class="mem-empty">waiting for first snapshot\u2026</div>';
+    return;
+  }
+  const rows=[];
+  const hdr=t=>rows.push('<div class="mh">'+t+'</div>');
+  // A row; frac (0..1) draws a fill bar, lvl tints it ('', 'warn', 'crit').
+  const row=(k,v,frac,lvl)=>{
+    const bar=frac!=null
+      ? '<span class="mbar '+(lvl||'')+'" style="width:'+Math.min(100,Math.round(frac*100))+'%"></span>'
+      : '';
+    rows.push('<div class="mrow">'+bar+'<span class="mk">'+k+'</span><span class="mv">'+v+'</span></div>');
+  };
+  const dim=t=>'<span class="dim">'+t+'</span>';
+  const pair=(used,total)=>fmtB(used)+' '+dim('/ '+fmtB(total));
+  const v=rep.vram, g=v&&v.governor, kv=rep.kv, w=rep.warm, h=rep.host, a=rep.admission, ex=rep.experts;
+
+  if(v){
+    hdr('vram (device)');
+    const usedFrac=v.driver_total_bytes?1-(v.driver_free_bytes/v.driver_total_bytes):0;
+    row('driver used / total', pair(v.driver_total_bytes-v.driver_free_bytes, v.driver_total_bytes),
+        usedFrac, usedFrac>0.95?'crit':usedFrac>0.85?'warn':'');
+    const poolFrac=v.driver_total_bytes?v.pool_reserved_bytes/v.driver_total_bytes:0;
+    row('kv pool used / reserved', pair(v.pool_used_bytes, v.pool_reserved_bytes), poolFrac,
+        poolFrac>0.9?'warn':'');
+    row('pool reuse gap '+dim('(not fresh-arena usable)'), fmtB(v.pool_reserved_bytes-v.pool_used_bytes));
+    if(g){
+      hdr('vram governor');
+      row('honest headroom', fmtB(g.headroom_bytes));
+      row('evictable (\u2264 moderate)', fmtB(g.evictable_moderate_bytes));
+      row('kv floor / scratch margin', fmtB(g.kv_floor_bytes)+' '+dim('/ '+fmtB(g.scratch_margin_bytes)));
+      row('reserved w\u00b7e\u00b7s\u00b7k',
+        fmtB(g.reserved_weights_bytes)+' '+dim('\u00b7')+' '+fmtB(g.reserved_expert_bytes)+' '
+        +dim('\u00b7')+' '+fmtB(g.reserved_scratch_bytes)+' '+dim('\u00b7')+' '+fmtB(g.reserved_kv_bytes));
+    }
+  }
+
+  hdr('kv arenas');
+  row('float '+dim('('+kv.float_arenas+' arenas)'),
+      fmtB(kv.float_live_bytes)+' '+dim('live / '+fmtB(kv.float_reserved_bytes)),
+      kv.float_reserved_bytes?kv.float_live_bytes/kv.float_reserved_bytes:0);
+  row('quant '+dim('('+kv.quant_arenas+' arenas)'),
+      fmtB(kv.quant_live_bytes)+' '+dim('live / '+fmtB(kv.quant_reserved_bytes)),
+      kv.quant_reserved_bytes?kv.quant_live_bytes/kv.quant_reserved_bytes:0);
+
+  hdr('warm tier (host kv)');
+  row('warm residents', w.resident_count+' '+dim('('+fmtB(w.resident_bytes)+')'));
+  row('pending hot\u2192warm', fmtB(w.pending_warm_bytes));
+  row('pinned undrainable', fmtB(w.pinned_undrainable_bytes));
+
+  hdr('host ram budget');
+  const availFrac=h.total_bytes?h.available_bytes/h.total_bytes:0;
+  row('available / total '+dim('(diagnostic)'), pair(h.available_bytes,h.total_bytes), availFrac);
+  row('reserved: buffer + weights'+(h.weights_capped?' <span class="st-warn">\u00b7 weights capped</span>':''),
+      fmtB(h.buffer_bytes)+' '+dim('+')+' '+fmtB(h.weights_reserved_bytes));
+  const wb=h.kv_warm_budget_bytes, wu=h.warm_usage_bytes, ws=h.pipeline_slack_bytes;
+  row('warm kv usage / budget'+(h.over_budget?' <span class="st-crit">\u00b7 over</span>':''),
+      fmtB(wu)+' '+dim('/ '+fmtB(wb)+' + '+fmtB(ws)+' slack'),
+      (wb+ws)?Math.min(1,wu/(wb+ws)):0, h.over_budget?'crit':'');
+  if(h.pages_in_per_sec!=null){
+    const pin=h.pages_in_per_sec;
+    // 4 KiB pages: 256/s = 1 MiB/s of hard-fault reads. Sustained thousands = thrash.
+    row('pages in from disk '+dim('(thrash signal)'),
+        Math.round(pin)+' /s '+dim('\u2248 '+fmtB(pin*4096)+'/s'),
+        Math.min(1,pin/4096), pin>2048?'crit':pin>256?'warn':'');
+  }
+  if(h.commit_total_bytes!=null){
+    const cFrac=h.commit_limit_bytes?h.commit_total_bytes/h.commit_limit_bytes:0;
+    row('commit charge / limit', pair(h.commit_total_bytes,h.commit_limit_bytes),
+        cFrac, cFrac>0.95?'crit':cFrac>0.85?'warn':'');
+  }
+  if(d.process) row('zend working set '+dim('(va size)'), fmtB(d.process.working_set_bytes)+' '+dim('('+fmtB(d.process.virtual_bytes)+')'));
+
+  hdr('experts (structural)');
+  row('host pinned pool', fmtB(ex.host_pinned_bytes));
+  row('vram resident', fmtB(ex.vram_reserved_bytes));
+
+  hdr('admission throttle');
+  const spFrac=a.ceiling_bytes?a.setpoint_bytes/a.ceiling_bytes:0;
+  row('setpoint / ceiling', pair(a.setpoint_bytes,a.ceiling_bytes), Math.min(1,spFrac));
+  row('quantum', fmtB(a.quantum_bytes));
+  row('widths p\u00b7s\u00b7d '+dim('+ queued'),
+      a.prefill_width+' '+dim('\u00b7')+' '+a.section_width+' '+dim('\u00b7')+' '+a.decode_width
+      +' '+dim('\u00b7')+' '+a.queued_prefills+' queued');
+  if(d.report_age_ms!=null) row('snapshot age', (d.report_age_ms/1000).toFixed(1)+' s');
+
+  box.innerHTML=rows.join('');
+}
+
 let paused=false, lastOk=null;
 function setLive(txt,ok){ const el=document.getElementById('live'); if(!el) return;
   el.innerHTML=`<span class="pulse ${ok?'':'stale'}"></span>${txt}`; }
 async function refresh(){
   if(paused) return;
   try{
-    const [r,rp,rpr]=await Promise.all([
+    const [r,rp,rpr,rm]=await Promise.all([
       fetch('/v1/telemetry',{cache:'no-store'}),
       fetch('/v1/phases',{cache:'no-store'}).catch(()=>null),
       fetch('/v1/promotes',{cache:'no-store'}).catch(()=>null),
+      fetch('/v1/memory',{cache:'no-store'}).catch(()=>null),
     ]);
     if(!r.ok) throw new Error(r.status);
     DATA=await r.json();
     if(rp&&rp.ok){ try{ PHDATA=await rp.json(); }catch(e){ PHDATA={points:[]}; } }
     if(rpr&&rpr.ok){ try{ renderPromotes((await rpr.json()).items||[]); }catch(e){} }
+    if(rm&&rm.ok){ try{ renderMemory(await rm.json()); }catch(e){} }
     apply(); lastOk=Date.now();
     // Phase charts are fed by /v1/phases (the in-process ring) — independent of the
     // log-parsed wave series. Create + draw them ALWAYS, so the phase view is live

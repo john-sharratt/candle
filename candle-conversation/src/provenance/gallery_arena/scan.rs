@@ -441,10 +441,28 @@ impl GalleryArena {
                         // retry the same geometry — a backend-specific launch
                         // failure degrades to the next backend, not to the CPU.
                         let _ = stream.synchronize();
+                        // Decode `-(stage * 1000 + cudaError)`; `stage` names
+                        // WHICH CUDA call rejected the work (1 alloc, 2 memset,
+                        // 3 accum launch, 4 finalize launch) and `cuda_err` is
+                        // the raw `cudaError_t`. A bare rc named neither.
+                        let (stage, cuda_err) = if rc <= -1000 {
+                            ((-rc) / 1000, (-rc) % 1000)
+                        } else {
+                            (0, -rc)
+                        };
+                        let stage_name = match stage {
+                            1 => "alloc",
+                            2 => "memset",
+                            3 => "accum_launch",
+                            4 => "finalize_launch",
+                            _ => "unstaged",
+                        };
                         tracing::warn!(
                             target: "candle_conversation::provenance",
                             backend = ?backend,
                             rc,
+                            stage = stage_name,
+                            cuda_err,
                             n_tokens = idx.pos_map.len(),
                             n_probe_tokens,
                             n_groups,

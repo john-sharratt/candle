@@ -147,67 +147,250 @@ fn evicting() -> bool {
 /// (desktop / IDE / browser) which the OS evicts the instant our resident set
 /// needs the room, so gating on it false-OOMs and swings run-to-run. Our pool
 /// usage counts only us; `init_free` is the budget that's ours to spend.
+/// Every term the arena budget gate weighs, kept together so a refusal can
+/// report the WHOLE arithmetic rather than "insufficient".
+///
+/// A refusal used to say only "needs N B but free VRAM (minus reserve) is
+/// insufficient after compaction" — which is unfalsifiable from a log: it names
+/// neither the budget that was exceeded, nor by how much, nor which of the two
+/// independent tests failed. Diagnosing one cost a full session; this struct is
+/// what that session wished existed.
 #[cfg(feature = "cuda")]
-fn vram_has_room(device: &Device, want: usize) -> bool {
+#[derive(Debug, Clone, Copy)]
+pub struct VramGateFacts {
+    /// Bytes the allocation asked for.
+    pub want: usize,
+    /// Our stream-ordered pool: bytes handed out, and bytes held from the OS.
+    pub pool_used: usize,
+    pub pool_reserved: usize,
+    /// Bytes this allocation must take FROM THE OS beyond the pool's
+    /// reserved-but-free gap (0 ⇒ pure pool reuse, always permitted).
+    pub os_needed: usize,
+    /// Driver-reported free / total on the device right now.
+    pub free: usize,
+    pub total: usize,
+    /// The budget ceiling: VRAM that was ours at device creation (`init_free`),
+    /// i.e. total minus the CUDA context, before the model loaded.
+    pub ceiling: usize,
+    /// Reserve withheld: the activation/floor term plus the eviction slice
+    /// (waived inside an `EvictionScope`).
+    pub reserve_base: usize,
+    pub reserve_evict: usize,
+    /// `pool_used + want + reserve <= ceiling` — our own footprint fits.
+    pub budget_ok: bool,
+    /// `os_needed == 0 || free - os_needed >= reserve` — growth won't drive the
+    /// driver's free toward the WDDM paging cliff.
+    pub free_ok: bool,
+    /// When `!budget_ok`: how far past the ceiling the request would put us.
+    pub budget_shortfall: usize,
+    /// When `!free_ok`: how much more driver-free the request needed.
+    pub free_shortfall: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl VramGateFacts {
+    pub fn ok(&self) -> bool {
+        self.budget_ok && self.free_ok
+    }
+    fn reserve(&self) -> usize {
+        self.reserve_base + self.reserve_evict
+    }
+    /// One-line summary in MiB — the form both the log line and the error
+    /// message carry, so a WARN and the propagated error agree exactly.
+    fn summary(&self) -> String {
+        let mb = |b: usize| b / (1024 * 1024);
+        format!(
+            "want={}MiB pool_used={}MiB pool_reserved={}MiB gap={}MiB os_needed={}MiB \
+             free={}MiB total={}MiB ceiling(init_free)={}MiB reserve={}MiB(base {}+evict {}) \
+             budget_ok={} free_ok={} budget_shortfall={}MiB free_shortfall={}MiB",
+            mb(self.want),
+            mb(self.pool_used),
+            mb(self.pool_reserved),
+            mb(self.pool_reserved.saturating_sub(self.pool_used)),
+            mb(self.os_needed),
+            mb(self.free),
+            mb(self.total),
+            mb(self.ceiling),
+            mb(self.reserve()),
+            mb(self.reserve_base),
+            mb(self.reserve_evict),
+            self.budget_ok,
+            self.free_ok,
+            mb(self.budget_shortfall),
+            mb(self.free_shortfall),
+        )
+    }
+}
+
+/// The two gate tests, as pure arithmetic — split out so the decision is
+/// testable against raw numbers without a CUDA device.
+///
+/// The two tests deliberately use DIFFERENT notions of cost, and the difference
+/// is load-bearing:
+///
+/// - `free_ok` gates only GROWTH (`os_needed`), because an allocation served
+///   from the pool's existing free blocks cannot move the driver's `free`.
+/// - `budget_ok` gates the FULL `want` against the startup ceiling, **including
+///   apparent reuse**, because `os_needed` is an optimistic lower bound.
+///
+/// That asymmetry looks like an oversight and is not. `os_needed` is derived
+/// from the AGGREGATE gap (`reserved - used`), but the pool's free space is
+/// fragmented: a contiguous 16 MiB arena can fail to fit in any single free
+/// block while ~2 GiB sits free in aggregate, and the pool then grows its OS
+/// reservation anyway. Measured by relaxing `budget_ok` for `os_needed == 0`:
+/// `pool_reserved` grew 1312 MiB while `pool_used` grew only 428 MiB, the pool
+/// ran 2480 MiB past its 13488 MiB capacity, driver-free hit 0, WDDM began
+/// spilling, and prefill forwards went from ~1.1 s to 69 s.
+///
+/// So `budget_ok` is the wall that keeps the pool inside the card. Do not relax
+/// it on an `os_needed == 0` fast path. The real remedy for a pool stuck at the
+/// wall is to make it SHRINK — see the compaction path, which currently returns
+/// `arenas_freed=0`.
+///
+/// Returns `(budget_ok, free_ok)`.
+fn gate_decide(
+    want: usize,
+    used: usize,
+    os_needed: usize,
+    free: usize,
+    ceiling: usize,
+    reserve: usize,
+) -> (bool, bool) {
+    // Our own footprint against the VRAM that was ours at device creation.
+    // Charges the full `want` — see the asymmetry note above.
+    let budget_ok = used.saturating_add(want).saturating_add(reserve) <= ceiling;
+    // Hard safety floor: only allocations that GROW our OS footprint are gated
+    // against the driver's *current* free — those are what could drive free
+    // toward zero and push the OS into a paging death-spiral (on WDDM, evicting
+    // an active desktop over PCIe locks the system).
+    let free_ok = os_needed == 0 || free.saturating_sub(os_needed) >= reserve;
+    (budget_ok, free_ok)
+}
+
+/// Weigh the budget gate and return every term (see [`VramGateFacts`]).
+/// `None` when the device isn't CUDA or the pool/total queries fail — the gate
+/// only blocks when it can PROVE the footprint wouldn't fit, so an unknown
+/// state permits.
+#[cfg(feature = "cuda")]
+fn vram_gate(device: &Device, want: usize) -> Option<VramGateFacts> {
     let Device::Cuda(d) = device else {
-        return true;
+        return None;
     };
     let gpu_id = match device.location() {
         candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
-        _ => return true,
+        _ => return None,
     };
-    let used = match d.pool_used_bytes() {
-        Ok(u) => u,
-        Err(_) => return true,
-    };
-    let (free, total) = match d.mem_get_info() {
-        Ok(ft) => ft,
-        Err(_) => return true,
-    };
+    let used = d.pool_used_bytes().ok()?;
+    let (free, total) = d.mem_get_info().ok()?;
     // Normal allocations must leave both the base reserve AND the dedicated
     // eviction slice free; a compress-to-free op (inside an `EvictionScope`) may
     // dip into the eviction slice — that's the whole point, so it can always
     // allocate its transient scratch and reclaim VRAM under extreme pressure.
-    let reserve = vram_reserve_bytes(total)
-        + if evicting() {
-            0
-        } else {
-            eviction_reserve_bytes()
-        };
+    let reserve_base = vram_reserve_bytes(total);
+    let reserve_evict = if evicting() {
+        0
+    } else {
+        eviction_reserve_bytes()
+    };
+    let reserve = reserve_base + reserve_evict;
     // Stable budget: our own pool usage (model + KV + activations), against the
     // VRAM that was ours to spend — `init_free` = total minus the CUDA context,
     // captured at device creation with the pageable desktop excluded. This is
     // the primary gate and does NOT read the volatile driver free, so it never
     // false-OOMs or swings run-to-run. Falls back to total if unrecorded.
     let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
-    let budget_ok = used.saturating_add(want).saturating_add(reserve) <= ceiling;
     // Bytes this allocation must take *from the OS*, beyond what the pool already
     // holds reserved-but-free (`reserved - used`). cudarc's stream-ordered pool
     // retains freed blocks, so reusing them (e.g. the quant arenas a KV seal
     // frees, immediately re-allocated) costs zero new OS memory — the driver's
-    // `free` doesn't move. Without this, the floor below would blindly reject
-    // pure pool reuse whenever `free` was already low.
+    // `free` doesn't move.
     let reserved = match d.pool_reserved_bytes() {
         Ok(r) => r,
         Err(_) => used,
     };
     let os_needed = want.saturating_sub(reserved.saturating_sub(used));
-    // Hard safety floor: only allocations that GROW our OS footprint are gated
-    // against the driver's *current* free — those are what could drive free
-    // toward zero and push the OS into a paging death-spiral (on WDDM, evicting
-    // an active desktop over PCIe locks the system). Pure pool reuse can't, so
-    // it's always permitted.
-    let free_ok = os_needed == 0 || free.saturating_sub(os_needed) >= reserve;
-    let ok = budget_ok && free_ok;
+    let (budget_ok, free_ok) = gate_decide(want, used, os_needed, free, ceiling, reserve);
+    let facts = VramGateFacts {
+        want,
+        pool_used: used,
+        pool_reserved: reserved,
+        os_needed,
+        free,
+        total,
+        ceiling,
+        reserve_base,
+        reserve_evict,
+        budget_ok,
+        free_ok,
+        budget_shortfall: if budget_ok {
+            0
+        } else {
+            used.saturating_add(want)
+                .saturating_add(reserve)
+                .saturating_sub(ceiling)
+        },
+        free_shortfall: if free_ok {
+            0
+        } else {
+            os_needed.saturating_add(reserve).saturating_sub(free)
+        },
+    };
     if std::env::var("KV_BUDGET_DEBUG").is_ok() {
-        let mb = |b: usize| b / (1024 * 1024);
         eprintln!(
-            "[kv-budget] gpu{gpu_id} pool_used={} pool_reserved={} free={} want={} os_needed={} reserve={} ceiling={} budget_ok={budget_ok} free_ok={free_ok} -> {}",
-            mb(used), mb(reserved), mb(free), mb(want), mb(os_needed), mb(reserve), mb(ceiling),
-            if ok { "ALLOW" } else { "REJECT" }
+            "[kv-budget] gpu{gpu_id} {} -> {}",
+            facts.summary(),
+            if facts.ok() { "ALLOW" } else { "REJECT" }
         );
     }
-    ok
+    Some(facts)
+}
+
+/// Whether `want` bytes fit — see [`vram_gate`]. Permits when the gate can't
+/// measure (non-CUDA / query failure).
+#[cfg(feature = "cuda")]
+fn vram_has_room(device: &Device, want: usize) -> bool {
+    vram_gate(device, want).map(|f| f.ok()).unwrap_or(true)
+}
+
+/// Bytes a NEW arena may still take before [`vram_has_room`] starts refusing —
+/// the allocator's own remaining budget, computed from the exact same terms as
+/// its `budget_ok` test so the two can never drift.
+///
+/// Admission MUST clamp to this. It is a different quantity from the governor's
+/// availability (driver headroom + reuse gap), and on a card whose pool has
+/// grown to its startup budget it is far smaller — the measured wedge was
+/// `pool_used=12477 + reserve=1493 > ceiling=13488`, i.e. **−482 MiB** of real
+/// arena budget while the governor still reported 3506 MiB of driver headroom.
+/// Admission believed the headroom, kept admitting 7–8 sequences wide, and every
+/// resulting arena creation was refused until the ingest hit its failure cap.
+///
+/// The two numbers are both honest and both needed: the governor's tracks
+/// physical residency (what WDDM will spill), this one tracks our own footprint
+/// against the VRAM that was ours at startup (what the allocator enforces).
+/// Admission takes the MINIMUM.
+///
+/// `None` on non-CUDA devices or when the pool/total queries fail — the caller
+/// treats that as "unknown", never as zero.
+#[cfg(feature = "cuda")]
+pub fn kv_alloc_headroom(device: &Device) -> Option<usize> {
+    let Device::Cuda(d) = device else {
+        return None;
+    };
+    let gpu_id = match device.location() {
+        candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        _ => return None,
+    };
+    let used = d.pool_used_bytes().ok()?;
+    let (_, total) = d.mem_get_info().ok()?;
+    // Same reserve the gate applies to a normal (non-eviction) allocation.
+    let reserve = vram_reserve_bytes(total) + eviction_reserve_bytes();
+    let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
+    Some(ceiling.saturating_sub(used.saturating_add(reserve)))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn kv_alloc_headroom(_device: &Device) -> Option<usize> {
+    None
 }
 
 /// Accurate "how many bytes of KV VRAM budget are free right now", for the
@@ -287,14 +470,24 @@ fn ensure_vram_budget(
     #[cfg(feature = "cuda")]
     {
         if matches!(location, ArenaLocation::Gpu) && !vram_has_room(device, arena_bytes) {
-            if retry_after_compact {
-                let _ = request_global_compact();
-            }
-            if !vram_has_room(device, arena_bytes) {
-                return Err(candle::Error::Msg(format!(
-                    "{KV_DEVICE_OOM_MARKER}: {what} arena needs {arena_bytes} B but free VRAM \
-                     (minus reserve) is insufficient after compaction"
-                )));
+            let before = vram_gate(device, arena_bytes);
+            let reclaimed = if retry_after_compact {
+                request_global_compact()
+            } else {
+                0
+            };
+            if let Some(after) = vram_gate(device, arena_bytes) {
+                if !after.ok() {
+                    // Report the WHOLE gate — both tests, both shortfalls, and
+                    // what reclaim achieved — on the WARN and in the error text.
+                    // The propagated message is what the ingest layer surfaces,
+                    // so it has to stand alone without the log.
+                    let detail = after.summary();
+                    return Err(candle::Error::Msg(format!(
+                        "{KV_DEVICE_OOM_MARKER}: {what} arena of {arena_bytes} B refused after \
+                         reclaim(arenas_freed={reclaimed}) — {detail}"
+                    )));
+                }
             }
         }
     }
@@ -660,30 +853,28 @@ impl ChunkedKvBacking {
     /// do not require block-aligned quantization on every append.
     pub(super) fn active_k_arena_key(&self) -> super::arena::ArenaKey {
         let location = self.inner.storage.default_location();
-        match self.inner.storage.k_format() {
+        let (k, _) = crate::kv_cache::active_kv_formats(
+            self.inner.storage.k_format(),
+            matches!(location, ArenaLocation::Gpu),
+        );
+        match k {
             KvFormat::Float(dtype) => {
                 super::arena::ArenaKey::uniform(KvFormat::Float(dtype), location)
             }
-            KvFormat::Quantized(_) if matches!(location, ArenaLocation::Gpu) => {
-                super::arena::ArenaKey::uniform(
-                    KvFormat::Quantized(crate::kv_cache::QuantFormat::R16),
-                    location,
-                )
-            }
-            KvFormat::Quantized(_) => {
-                super::arena::ArenaKey::uniform(KvFormat::Float(candle::DType::F16), location)
+            KvFormat::Quantized(qf) => {
+                super::arena::ArenaKey::uniform(KvFormat::Quantized(qf), location)
             }
         }
     }
 
     /// ArenaKey for active (unfilled) V chunks — always float.
     pub(super) fn active_v_arena_key(&self) -> super::arena::ArenaKey {
-        let dtype = match self.inner.storage.k_format() {
-            KvFormat::Float(dtype) => dtype,
-            KvFormat::Quantized(_) => candle::DType::F16,
-        };
         let location = self.inner.storage.default_location();
-        super::arena::ArenaKey::uniform(KvFormat::Float(dtype), location)
+        let (_, v) = crate::kv_cache::active_kv_formats(
+            self.inner.storage.k_format(),
+            matches!(location, ArenaLocation::Gpu),
+        );
+        super::arena::ArenaKey::uniform(v, location)
     }
 
     /// Allocate a full block's worth of flat chunks for the palette4 arenas.
@@ -811,15 +1002,53 @@ impl BackingInner {
         key: super::arena::ArenaKey,
         len: usize,
     ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        // A run larger than one arena can NEVER be satisfied — arenas are
+        // fixed-capacity slabs and a run must be contiguous within one. Fail
+        // with the sizes so this permanent condition is never mistaken for the
+        // transient race below (they used to share one message, and a night went
+        // into telling them apart).
+        let arena_chunks = arena_chunks_for_format(key.format);
+        if len > arena_chunks {
+            candle::bail!(
+                "palette run of {len} chunks exceeds arena capacity {arena_chunks} \
+                 for format {:?} — cannot be satisfied by any arena",
+                key.format,
+            );
+        }
         if let Some(gids) = self.pool.allocate_run_for(key.clone(), len) {
             self.ensure_arena_exists(gids[0].arena_idx(), key)?;
             return Ok(gids);
         }
-        let arena_idx = self.pool.register_arena(key.clone());
-        self.ensure_arena_exists(arena_idx, key.clone())?;
-        self.pool
-            .allocate_run_for(key, len)
-            .ok_or_else(|| candle::Error::Msg("fresh arena cannot fit palette run".into()))
+        // No existing arena has tail room: register a fresh one and claim from
+        // it BY INDEX. The old shape — register, then re-walk the whole pool —
+        // raced: between registration and the re-walk, concurrent claimers (the
+        // scheduler's prefills and the persistence thread's elevations allocate
+        // the same formats in parallel) could consume the fresh arena's tail,
+        // and the single retry then failed spuriously as "fresh arena cannot
+        // fit palette run", killing the whole forward. Targeting the registered
+        // index removes the which-arena race; losing even that (racers landing
+        // in OUR arena via their own global walks) just means another
+        // registration, bounded.
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let arena_idx = self.pool.register_arena(key.clone());
+            self.ensure_arena_exists(arena_idx, key.clone())?;
+            if let Some(gids) = self.pool.allocate_run_for_in(key.clone(), arena_idx, len) {
+                return Ok(gids);
+            }
+            // Raced into our fresh arena — the racer may equally have vacated
+            // tail room elsewhere; check the whole pool before registering again.
+            if let Some(gids) = self.pool.allocate_run_for(key.clone(), len) {
+                self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+                return Ok(gids);
+            }
+        }
+        candle::bail!(
+            "palette run of {len} chunks unsatisfied after {ATTEMPTS} fresh arenas \
+             (capacity {arena_chunks} each, format {:?}) — allocator contention or \
+             VRAM exhaustion on arena creation",
+            key.format,
+        )
     }
 
     /// Bulk allocator — mirrors [`Self::alloc_chunk_for_key`]'s
@@ -942,89 +1171,94 @@ impl ChunkedKvBacking {
         }
         self.ensure_max_blocks(required_max_blocks)?;
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-
         let chunk_size = CHUNK_SIZE;
-        for (b, &off) in offsets.iter().enumerate() {
-            // Skip unallocated slots and slots with nothing to add.
-            if state.sequences[b].is_none() || adds[b] == 0 {
-                continue;
-            }
 
-            let end_pos = off.saturating_add(adds[b]).saturating_sub(1);
-            let need_blocks = (end_pos / chunk_size) + 1;
-            for blk in 0..need_blocks {
-                if state.sequences[b].as_ref().unwrap().chunk_at(blk).is_none() {
-                    let slot = state.sequences[b].as_mut().unwrap();
-                    // Seal the current write target to full capacity.
-                    // We are allocating a new block because the write range
-                    // extends past the previous last block; the kernel will
-                    // fill every remaining position in that block.
+        // Count first, allocate WITHOUT the guard, then install. `alloc_block_chunks`
+        // can reach `request_global_compact`, which needs a write guard on every
+        // layer's block table; allocating under one made that a self-deadlock and,
+        // once the compactor was made non-blocking, a permanent no-op — so arena
+        // compaction could never run from the prefill path that needs it most.
+        // See `ensure_for_batch_entries` for the full rationale.
+        // Plan blocks AND predict tail needs in one read pass, allocate both with
+        // no guard held, then mutate under ONE write guard — extending a sequence
+        // and making its tail writable must be atomic (a reader seeing blocks
+        // pushed but the tail unreplaced would write into a full or closed-quant
+        // chunk). Predicting before the installs over-estimates safely: a freshly
+        // pushed block is writable, so installs only shrink the need.
+        let mut plan: Vec<(usize, usize)> = Vec::new();
+        let mut tail_maybe: Vec<usize> = Vec::new();
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for (b, &off) in offsets.iter().enumerate() {
+                if state.sequences[b].is_none() || adds[b] == 0 {
+                    continue;
+                }
+                let end_pos = off.saturating_add(adds[b]).saturating_sub(1);
+                let need_blocks = (end_pos / chunk_size) + 1;
+                let slot = state.sequences[b].as_ref().unwrap();
+                let missing = (0..need_blocks)
+                    .filter(|&blk| slot.chunk_at(blk).is_none())
+                    .count();
+                if missing > 0 {
+                    plan.push((b, missing));
+                }
+            }
+            for b in 0..batch {
+                if state.sequences[b].is_some() && self.tail_needs_new_block(&state, b) {
+                    tail_maybe.push(b);
+                }
+            }
+        }
+        let mut prealloc: Vec<(usize, Vec<_>)> = Vec::with_capacity(plan.len());
+        for (b, missing) in plan {
+            let mut cws = Vec::with_capacity(missing);
+            for _ in 0..missing {
+                cws.push(self.alloc_block_chunks(0, 0)?);
+            }
+            prealloc.push((b, cws));
+        }
+        let mut tail_spares: Vec<(usize, _)> = Vec::with_capacity(tail_maybe.len());
+        for b in tail_maybe {
+            tail_spares.push((b, self.alloc_block_chunks(0, 0)?));
+        }
+
+        // Fast path — see `ensure_for_batch_entries`.
+        if prealloc.is_empty() && tail_spares.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for (b, cws) in prealloc {
+                let Some(slot) = state.sequences[b].as_mut() else {
+                    continue;
+                };
+                for cw in cws {
+                    // Seal the current write target to full capacity. We are
+                    // allocating a new block because the write range extends past
+                    // the previous last block; the kernel will fill every remaining
+                    // position in that block. The seal must stay immediately before
+                    // its push.
                     if let Some(last) = slot.last_chunk_mut() {
                         let cur_offset = last.offset;
                         let capacity = chunk_size - cur_offset as usize;
                         last.usage = capacity as u32;
                     }
-                    // Push new block with 2*n_kv_head flat chunks.
-                    let cw = self.alloc_block_chunks(0, 0)?;
-                    let slot = state.sequences[b].as_mut().unwrap();
                     slot.push_chunk(cw);
                 }
             }
-        }
-
-        // Writable-tail pass: for each allocated slot, ensure the last block
-        // can accept new writes. Under the read-only projection model the
-        // tail is unshared by construction (projection pushes a fresh active
-        // chunk; closed-quant chunks force a fresh push on the first write),
-        // so we never have to COW here — we just allocate a new block when
-        // the current tail is full or in a closed-off quant arena.
-        for b in 0..batch {
-            if state.sequences[b].is_none() {
-                continue;
-            }
-            let needs_new_block: Option<bool> = state.sequences[b].as_ref().and_then(|s| {
-                let cw = s.last_chunk()?;
-                let is_full = (cw.offset as usize + cw.usage as usize) >= CHUNK_SIZE;
-                if is_full {
-                    Some(true)
-                } else {
-                    // Check if ANY arena referenced by this block is quantized
-                    // (can't append to quantized chunks).  R16 is excluded: it
-                    // uses Quantized(_) format but IS directly writable by the
-                    // decode scatter kernel (write_regs_to_r16).
-                    let unique_arenas = cw.gids.unique_arena_indices();
-                    let is_quantized = self
-                        .inner
-                        .storage
-                        .read(|s| {
-                            unique_arenas.iter().any(|&ai| {
-                                s.arena_key(ai)
-                                    .map(|k| match k.format {
-                                        crate::kv_cache::KvFormat::Quantized(
-                                            crate::kv_cache::QuantFormat::R16,
-                                        ) => false,
-                                        crate::kv_cache::KvFormat::Quantized(_) => true,
-                                        _ => false,
-                                    })
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false);
-                    if is_quantized {
-                        Some(true)
-                    } else {
-                        None // partial + float (or R16) → already writable
-                    }
+            // Writable-tail pass, same guard.
+            for (b, cw) in tail_spares {
+                if state.sequences[b].is_some() && self.tail_needs_new_block(&state, b) {
+                    let slot = state.sequences[b].as_mut().unwrap();
+                    slot.push_chunk(cw);
                 }
-            });
-            if let Some(true) = needs_new_block {
-                let cw = self.alloc_block_chunks(0, 0)?;
-                let slot = state.sequences[b].as_mut().unwrap();
-                slot.push_chunk(cw);
             }
         }
 
@@ -1190,6 +1424,71 @@ impl ChunkedKvBacking {
     /// This is the partial-batch analogue of [`ensure_for_offsets`]. It acquires
     /// the chunked state write-lock once and applies allocation/tail-writability
     /// checks only for the provided sequence slots.
+    /// Whether [`Self::ensure_for_batch_entries`] would allocate anything —
+    /// a read-only predicate over this layer's block table.
+    ///
+    /// Exists so the all-layers form can decide ONCE instead of per layer.
+    pub fn batch_entries_need_work(&self, entries: &[(usize, usize)], add: usize) -> Result<bool> {
+        if add == 0 {
+            return Ok(false);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        for &(batch_idx, _off) in entries.iter() {
+            if batch_idx >= state.sequences.len() {
+                return Ok(true); // out of range -> let the real call report it
+            }
+            let Some(slot) = state.sequences[batch_idx].as_ref() else {
+                return Ok(true); // slot needs allocating
+            };
+            let available = slot
+                .last_chunk()
+                .map(|cw| CHUNK_SIZE - (cw.offset as usize + cw.usage as usize).min(CHUNK_SIZE))
+                .unwrap_or(0);
+            if available < add || self.tail_needs_new_block(&state, batch_idx) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Ensure EVERY layer's backing has capacity for the upcoming write.
+    ///
+    /// Hoisted out of the per-layer decode loop deliberately. The block
+    /// structure is layer-invariant — every layer is extended by this same call
+    /// with identical `entries`/`add`, which is why the decode path already
+    /// builds its position map from layer 0 and applies it to all layers. So the
+    /// PLAN is computed once, from the first backing; only when work is genuinely
+    /// needed does this touch all of them.
+    ///
+    /// Doing the plan per layer cost 48 lock acquisitions and 48 tail-predicate
+    /// passes **per decoded token** — the steady state is "nothing to allocate",
+    /// so that was almost entirely wasted work on the hot path.
+    pub fn ensure_for_batch_entries_all(
+        backings: &[ChunkedKvBacking],
+        entries: &[(usize, usize)],
+        add: usize,
+    ) -> Result<()> {
+        let Some(first) = backings.first() else {
+            return Ok(());
+        };
+        if !first.batch_entries_need_work(entries, add)? {
+            debug_assert!(
+                backings
+                    .iter()
+                    .all(|b| !b.batch_entries_need_work(entries, add).unwrap_or(true)),
+                "block structure must be layer-invariant: layer 0 needs no work but another layer does"
+            );
+            return Ok(());
+        }
+        for b in backings {
+            b.ensure_for_batch_entries(entries, add)?;
+        }
+        Ok(())
+    }
+
     pub fn ensure_for_batch_entries(&self, entries: &[(usize, usize)], add: usize) -> Result<()> {
         if entries.is_empty() || add == 0 {
             return Ok(());
@@ -1219,6 +1518,7 @@ impl ChunkedKvBacking {
         // partial) slice — the same `write_slice` rule used in
         // `slot_state.rs`.
         let mut alloc_plan: Vec<(usize, usize)> = Vec::with_capacity(entries.len());
+        let mut tail_maybe: Vec<usize> = Vec::new();
         let mut required_max_blocks = 1usize;
         {
             let state = self
@@ -1257,124 +1557,97 @@ impl ChunkedKvBacking {
                 let new_total_chunks = current_chunks + additional_chunks;
                 required_max_blocks = cmp::max(required_max_blocks, new_total_chunks.max(1));
                 alloc_plan.push((batch_idx, additional_chunks));
+                // Predict the tail need in the SAME read pass — this runs once per
+                // layer per decode step, so a second guard acquisition here is
+                // pure overhead on the hot path.
+                if self.tail_needs_new_block(&state, batch_idx) {
+                    tail_maybe.push(batch_idx);
+                }
             }
         }
         self.ensure_max_blocks(required_max_blocks)?;
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        // Allocate BEFORE taking the state guard.
+        //
+        // `alloc_block_chunks` can reach `request_global_compact`, and compaction
+        // needs a write guard on EVERY layer's block table to remap relocated
+        // GIDs. Allocating while holding one of those guards made that a
+        // self-deadlock; once the compactor was made non-blocking it became a
+        // permanent no-op instead, so arena compaction could never run from the
+        // path that needs it most. The chunk counts are already known from
+        // `alloc_plan`, so the allocation needs no state access at all.
+        let mut prealloc: Vec<(usize, Vec<_>)> = Vec::with_capacity(alloc_plan.len());
         for (batch_idx, additional_chunks) in alloc_plan {
-            // Auto-allocate slot if needed (mirrors ensure_for_offset behavior).
-            if state.sequences[batch_idx].is_none() {
-                state.sequences[batch_idx] = Some(self.make_sequence_state()?);
-            }
+            let mut cws = Vec::with_capacity(additional_chunks);
             for _ in 0..additional_chunks {
-                let cw = self.alloc_block_chunks(0, 0)?;
-                let slot = state.sequences[batch_idx].as_mut().unwrap();
-                slot.push_chunk(cw);
-                slot.invalidate_gpu_chunks();
+                cws.push(self.alloc_block_chunks(0, 0)?);
             }
+            prealloc.push((batch_idx, cws));
         }
 
-        // Writable-tail pass for touched entries only.
-        for &(batch_idx, _off) in entries.iter() {
-            let needs_new_block: Option<bool> = state.sequences[batch_idx].as_ref().and_then(|s| {
-                let cw = s.last_chunk()?;
-                debug_assert!(
-                    cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
-                    "tail block must not be shared — fork should have copied it"
-                );
-                let is_full = (cw.offset as usize + cw.usage as usize) >= CHUNK_SIZE;
-                if is_full {
-                    Some(true)
-                } else {
-                    let unique_arenas = cw.gids.unique_arena_indices();
-                    let is_quantized = self
-                        .inner
-                        .storage
-                        .read(|s| {
-                            unique_arenas.iter().any(|&ai| {
-                                s.arena_key(ai)
-                                    .map(|k| match k.format {
-                                        crate::kv_cache::KvFormat::Quantized(
-                                            crate::kv_cache::QuantFormat::R16,
-                                        ) => false,
-                                        crate::kv_cache::KvFormat::Quantized(_) => true,
-                                        _ => false,
-                                    })
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false);
-                    if is_quantized {
-                        Some(true)
-                    } else {
-                        None
-                    }
-                }
-            });
+        // Predict which tails will need a fresh block, so their chunks can be
+        // allocated alongside the rest and ALL mutation can happen under ONE
+        // guard. The prediction is a safe over-estimate: installing a block makes
+        // that sequence's tail fresh and therefore writable, so the block installs
+        // below can only ever *reduce* this set, never grow it. Spares that turn
+        // out to be unnecessary simply drop, returning their GIDs to the pool.
+        let mut tail_spares: Vec<(usize, _)> = Vec::with_capacity(tail_maybe.len());
+        for batch_idx in tail_maybe {
+            tail_spares.push((batch_idx, self.alloc_block_chunks(0, 0)?));
+        }
 
-            if let Some(true) = needs_new_block {
-                let cw = self.alloc_block_chunks(0, 0)?;
+        // FAST PATH. This runs 48x per decode step (once per layer), and on a
+        // normal step the block is not full and the tail is still writable, so
+        // there is nothing to install. Returning before the write guard keeps the
+        // steady-state decode cost at one read guard, as it was before the
+        // allocation was hoisted out of the mutation guard.
+        if prealloc.is_empty() && tail_spares.is_empty() {
+            return Ok(());
+        }
+
+        // Single guard for every mutation. Extending a sequence and making its
+        // tail writable must be ATOMIC: a reader that observes blocks pushed but
+        // the tail not yet replaced would write into a full or closed-quant chunk.
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for (batch_idx, cws) in prealloc {
+                // Auto-allocate slot if needed (mirrors ensure_for_offset behavior).
+                if state.sequences[batch_idx].is_none() {
+                    state.sequences[batch_idx] = Some(self.make_sequence_state()?);
+                }
                 let slot = state.sequences[batch_idx].as_mut().unwrap();
-                slot.push_chunk(cw);
-                slot.invalidate_gpu_chunks();
+                for cw in cws {
+                    slot.push_chunk(cw);
+                    slot.invalidate_gpu_chunks();
+                }
+            }
+
+            // Writable-tail pass, still under the same guard.
+            for (batch_idx, cw) in tail_spares {
+                if self.tail_needs_new_block(&state, batch_idx) {
+                    let slot = state.sequences[batch_idx].as_mut().unwrap();
+                    slot.push_chunk(cw);
+                    slot.invalidate_gpu_chunks();
+                }
             }
         }
 
         Ok(())
     }
 
-    pub fn ensure_for_offset(&self, batch_idx: usize, offset: usize, add: usize) -> Result<()> {
-        let batch = self.batch_capacity();
-        if batch_idx >= batch {
-            candle::bail!(
-                "batch_idx {} out of range for chunked backing (capacity {})",
-                batch_idx,
-                batch
-            )
-        }
-        if add == 0 {
-            return Ok(());
-        }
-
-        let end_pos = offset.saturating_add(add).saturating_sub(1);
-        let need_blocks = (end_pos / CHUNK_SIZE) + 1;
-        self.ensure_max_blocks(need_blocks)?;
-
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-
-        // Auto-allocate slot if needed
-        if state.sequences[batch_idx].is_none() {
-            state.sequences[batch_idx] = Some(self.make_sequence_state()?);
-        }
-
-        for blk in 0..need_blocks {
-            if state.sequences[batch_idx]
-                .as_ref()
-                .unwrap()
-                .chunk_at(blk)
-                .is_none()
-            {
-                // Under cum_token addressing we never bump the
-                // previous tail's usage when allocating a new chunk.
-                // See `ensure_for_batch_entries` for rationale.
-                // Push new block with 2*n_kv_head flat chunks.
-                let cw = self.alloc_block_chunks(0, 0)?;
-                let slot = state.sequences[batch_idx].as_mut().unwrap();
-                slot.push_chunk(cw);
-            }
-        }
-
-        // Writable-tail pass: ensure the last block is a float block that can be
-        // written to.  After a full block we need a new empty block.  Fork paths
-        // copy partial tails at fork time, so shared tails should never reach this point.
-        let needs_new_block: Option<bool> = state.sequences[batch_idx].as_ref().and_then(|s| {
+    /// Whether `batch_idx`'s tail block can still be written into, or a fresh
+    /// block must be pushed. Pure read over state + arena storage; extracted so
+    /// the decision can be made under a guard while the allocation it implies
+    /// happens outside one.
+    fn tail_needs_new_block(
+        &self,
+        state: &super::types::BlockTableState,
+        batch_idx: usize,
+    ) -> bool {
+        let needs: Option<bool> = state.sequences[batch_idx].as_ref().and_then(|s| {
             let cw = s.last_chunk()?;
             debug_assert!(
                 cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
@@ -1384,10 +1657,6 @@ impl ChunkedKvBacking {
             if is_full {
                 Some(true)
             } else {
-                // Check if ANY arena referenced by this block is quantized
-                // (can't append to quantized chunks).  R16 is excluded: it
-                // uses Quantized(_) format but IS directly writable by the
-                // decode scatter kernel (write_regs_to_r16).
                 let unique_arenas = cw.gids.unique_arena_indices();
                 let is_quantized = self
                     .inner
@@ -1409,17 +1678,187 @@ impl ChunkedKvBacking {
                 if is_quantized {
                     Some(true)
                 } else {
-                    None // partial + float (or R16) → already writable
+                    None
                 }
             }
         });
+        matches!(needs, Some(true))
+    }
 
-        if let Some(true) = needs_new_block {
-            let cw = self.alloc_block_chunks(0, 0)?;
-            let slot = state.sequences[batch_idx].as_mut().unwrap();
-            slot.push_chunk(cw);
+    pub fn ensure_for_offset(&self, batch_idx: usize, offset: usize, add: usize) -> Result<()> {
+        let batch = self.batch_capacity();
+        if batch_idx >= batch {
+            candle::bail!(
+                "batch_idx {} out of range for chunked backing (capacity {})",
+                batch_idx,
+                batch
+            )
+        }
+        if add == 0 {
+            return Ok(());
+        }
+
+        let end_pos = offset.saturating_add(add).saturating_sub(1);
+        let need_blocks = (end_pos / CHUNK_SIZE) + 1;
+        self.ensure_max_blocks(need_blocks)?;
+
+        // Count first, allocate WITHOUT the guard, then install. `alloc_block_chunks`
+        // can reach `request_global_compact`, which needs a write guard on every
+        // layer's block table; allocating under one made that a self-deadlock.
+        // See `ensure_for_batch_entries` for the full rationale.
+        // Count blocks AND predict the tail need in one read pass, allocate both
+        // without a guard, then mutate under ONE write guard. Extending a sequence
+        // and making its tail writable must be atomic: a reader that saw blocks
+        // pushed but the tail not yet replaced would write into a full or
+        // closed-quant chunk. Predicting the tail before the installs is a safe
+        // over-estimate — a freshly pushed block is itself writable, so installs
+        // can only shrink the need. An unused spare drops, returning its GIDs.
+        let (missing, maybe_tail) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            let have = state.sequences[batch_idx]
+                .as_ref()
+                .map(|s| {
+                    (0..need_blocks)
+                        .filter(|&b| s.chunk_at(b).is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            (
+                need_blocks.saturating_sub(have),
+                self.tail_needs_new_block(&state, batch_idx),
+            )
+        };
+        let mut fresh = Vec::with_capacity(missing);
+        for _ in 0..missing {
+            fresh.push(self.alloc_block_chunks(0, 0)?);
+        }
+        let tail_spare = if maybe_tail {
+            Some(self.alloc_block_chunks(0, 0)?)
+        } else {
+            None
+        };
+
+        // Fast path — see `ensure_for_batch_entries`.
+        if fresh.is_empty() && tail_spare.is_none() {
+            return Ok(());
+        }
+
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            // Auto-allocate slot if needed
+            if state.sequences[batch_idx].is_none() {
+                state.sequences[batch_idx] = Some(self.make_sequence_state()?);
+            }
+            {
+                let slot = state.sequences[batch_idx].as_mut().unwrap();
+                // Under cum_token addressing we never bump the previous tail's
+                // usage when allocating a new chunk. See `ensure_for_batch_entries`.
+                for cw in fresh {
+                    if (0..need_blocks).any(|b| slot.chunk_at(b).is_none()) {
+                        slot.push_chunk(cw);
+                    }
+                }
+            }
+            // Writable-tail pass, same guard.
+            if let Some(cw) = tail_spare {
+                if self.tail_needs_new_block(&state, batch_idx) {
+                    let slot = state.sequences[batch_idx].as_mut().unwrap();
+                    slot.push_chunk(cw);
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod gate_decide_tests {
+    use super::gate_decide;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Apparent pure reuse is STILL charged against the ceiling.
+    ///
+    /// This looks over-strict — `os_needed == 0` says the pool's 1,097 MiB gap
+    /// covers the request — but the gap is AGGREGATE, not contiguous. Relaxing
+    /// exactly this case was measured: `pool_reserved` grew 1312 MiB against
+    /// only 428 MiB of `pool_used` (allocations billed as free reuse were taking
+    /// new OS memory), the pool ran 2480 MiB past its 13488 MiB capacity,
+    /// driver-free hit 0, WDDM began spilling, and prefill forwards went from
+    /// ~1.1 s to 69 s.
+    #[test]
+    fn apparent_reuse_is_still_charged_against_the_ceiling() {
+        let want = 16 * MIB;
+        let used = 13558 * MIB;
+        let reserved = 14656 * MIB;
+        let os_needed = want.saturating_sub(reserved - used); // 0 by the estimate
+        assert_eq!(os_needed, 0, "the aggregate gap appears to cover this");
+
+        let (budget_ok, free_ok) =
+            gate_decide(want, used, os_needed, 338 * MIB, 15062 * MIB, 1492 * MIB);
+
+        // used + want + reserve = 15066 > ceiling 15062. The estimate cannot be
+        // trusted to mean "no new OS memory", so the ceiling still binds.
+        assert!(
+            !budget_ok,
+            "the ceiling must bind even when reuse looks free"
+        );
+        // `free_ok` legitimately passes: it only ever gates measured growth.
+        assert!(free_ok);
+    }
+
+    /// Growth is still gated by the ceiling: the same overshoot refuses when the
+    /// allocation actually has to take memory from the OS.
+    #[test]
+    fn growth_past_the_ceiling_is_still_refused() {
+        let want = 16 * MIB;
+        let used = 13558 * MIB;
+        let reserved = used; // no gap at all → every byte is new OS memory
+        let os_needed = want.saturating_sub(reserved - used);
+        assert_eq!(os_needed, want);
+
+        let (budget_ok, _) =
+            gate_decide(want, used, os_needed, 4096 * MIB, 15062 * MIB, 1492 * MIB);
+        assert!(!budget_ok, "growth past the ceiling must still be refused");
+    }
+
+    /// A partial reuse — the gap covers only some of the request — is treated as
+    /// growth for the remainder, so the reuse path can't be used to smuggle an
+    /// unbounded allocation past the gate.
+    #[test]
+    fn partial_reuse_is_gated_on_the_growing_remainder() {
+        let want = 100 * MIB;
+        let used = 1000 * MIB;
+        let reserved = 1040 * MIB; // 40 MiB gap → 60 MiB must come from the OS
+        let os_needed = want.saturating_sub(reserved - used);
+        assert_eq!(os_needed, 60 * MIB);
+
+        // Driver-free is below reserve + the growing remainder → refused.
+        let (_, free_ok) = gate_decide(want, used, os_needed, 100 * MIB, 8000 * MIB, 512 * MIB);
+        assert!(
+            !free_ok,
+            "the growing remainder is still floored on driver-free"
+        );
+    }
+
+    /// Growth that fits keeps passing — the fix must not turn the gate off.
+    #[test]
+    fn growth_that_fits_is_permitted() {
+        let (budget_ok, free_ok) = gate_decide(
+            16 * MIB,
+            1000 * MIB,
+            16 * MIB,
+            4096 * MIB,
+            15062 * MIB,
+            1492 * MIB,
+        );
+        assert!(budget_ok && free_ok);
     }
 }

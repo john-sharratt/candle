@@ -70,12 +70,30 @@ impl ConvFileStore {
     }
 
     /// Store `bytes` as a new file on `conv`; returns its metadata.
+    ///
+    /// The blob write happens **outside** the index lock. Only the id
+    /// reservation and the record commit need exclusion; writing the payload
+    /// under the lock stalled every other store operation — `list`, metadata,
+    /// other uploads — for the full duration of the disk write, which for a
+    /// large upload is the whole transfer.
+    ///
+    /// Failure leaves the store consistent: a failed blob write consumes an id
+    /// (a harmless gap in a monotonic counter) but commits no record, so nothing
+    /// references the missing blob.
     pub fn upload(&self, conv: &str, name: &str, bytes: &[u8]) -> std::io::Result<FileMeta> {
         let kind = kind_for(name);
         let stored = encode_for_storage(bytes, kind);
-        let mut guard = self.inner.lock().unwrap();
-        guard.seq += 1;
-        let id = guard.seq;
+
+        // Reserve the id, then release the lock for the slow part.
+        let id = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.seq += 1;
+            guard.seq
+        };
+
+        fs::create_dir_all(self.root.join("blobs"))?;
+        fs::write(self.blob_path(id), stored.as_bytes())?;
+
         let rec = FileRecord {
             id,
             conv: conv.to_string(),
@@ -85,8 +103,10 @@ impl ConvFileStore {
             size_bytes: bytes.len() as u64,
             created_ms: now_ms(),
         };
-        fs::create_dir_all(self.root.join("blobs"))?;
-        fs::write(self.blob_path(id), stored.as_bytes())?;
+        // Re-take only to commit. `save_index` stays inside: it serialises the
+        // whole index, so it needs a consistent snapshot, and it writes orders of
+        // magnitude less than the blob.
+        let mut guard = self.inner.lock().unwrap();
         guard.files.push(rec.clone());
         save_index(&self.root, &guard)?;
         Ok(meta_of(&rec))
@@ -207,6 +227,43 @@ mod tests {
         let meta = s.upload("c1", "logo.png", &bytes).unwrap();
         assert_eq!(meta.kind, "img");
         assert_eq!(s.get_content("c1", meta.id).unwrap(), bytes);
+    }
+
+    /// `upload` releases the index lock across the blob write, so concurrent
+    /// uploads genuinely interleave. Each must still reserve a **distinct** id
+    /// and land a byte-exact blob under it — id reservation is the only part
+    /// that needs exclusion, and this pins that it actually does.
+    #[test]
+    fn concurrent_uploads_reserve_distinct_ids_and_keep_blobs_intact() {
+        let (s, _t) = store();
+        let s = std::sync::Arc::new(s);
+        const N: usize = 16;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    // Large enough that the writes overlap in practice.
+                    let body = vec![i as u8; 64 * 1024];
+                    let m = s.upload("c1", &format!("f{i}.bin"), &body).unwrap();
+                    (m.id, body)
+                })
+            })
+            .collect();
+        let done: Vec<(u64, Vec<u8>)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let mut ids: Vec<u64> = done.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), N, "every concurrent upload needs its own id");
+
+        assert_eq!(s.list("c1").len(), N, "every record committed");
+        for (id, body) in &done {
+            assert_eq!(
+                s.get_content("c1", *id).as_ref(),
+                Some(body),
+                "blob {id} did not survive concurrent upload"
+            );
+        }
     }
 
     #[test]

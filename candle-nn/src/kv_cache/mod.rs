@@ -42,6 +42,8 @@ pub use arena_table::{
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
 #[cfg(feature = "cuda")]
 pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
+pub use chunked::kv_alloc_headroom;
+
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
 #[cfg(feature = "cuda")]
@@ -75,6 +77,40 @@ pub use chunked::{ArenaKey, StoragePolicy};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };
+
+/// The formats **unsealed (active)** KV chunks actually occupy, given the
+/// session's configured *sealed* formats and whether the backing is on GPU.
+///
+/// A block does not reach its configured format until its turn seals and
+/// quantizes. While a sequence is live, its K sits in `R16` on GPU — raw F16
+/// **plus reserved Q-capture space, 128 bytes per 32 elements, i.e. twice plain
+/// F16** — and its V sits in plain F16. The configured pair (say `Q4_0` + `Q8_0`
+/// at 18 + 34 B) is what the same data costs *after* it settles.
+///
+/// The distinction is load-bearing for admission. Pricing a candidate at the
+/// sealed cost understates what it occupies for its entire working life by
+/// `192 / 52 ≈ 3.7x`: measured, a KV cache admission believed was ~1.5 GiB was
+/// physically 5.7 GiB (R16 3520 MiB + F16 1840 MiB = 94% of it), which is what
+/// pushed a 7.5 GiB expert cache plus KV past a 13.5 GiB ceiling and refused
+/// arena after arena. Admission must reason in ACTIVE formats; only the
+/// steady-state footprint of a finished turn is in sealed formats.
+pub fn active_kv_formats(k_format: KvFormat, on_gpu: bool) -> (KvFormat, KvFormat) {
+    match k_format {
+        // A float-configured backing never quantizes on append: active == sealed.
+        KvFormat::Float(dtype) => (KvFormat::Float(dtype), KvFormat::Float(dtype)),
+        // GPU: K accumulates in R16 (raw + Q-capture space), V in plain F16.
+        KvFormat::Quantized(_) if on_gpu => (
+            KvFormat::Quantized(QuantFormat::R16),
+            KvFormat::Float(candle::DType::F16),
+        ),
+        // CPU: active K stays plain float so partial-token appends need no
+        // block-aligned quantization.
+        KvFormat::Quantized(_) => (
+            KvFormat::Float(candle::DType::F16),
+            KvFormat::Float(candle::DType::F16),
+        ),
+    }
+}
 
 // ==================== Paged KV Arenas Trait ====================
 
@@ -344,6 +380,19 @@ impl KvFormat {
         match self {
             Self::Float(dt) => dt.size_in_bytes() as f32,
             Self::Quantized(qf) => qf.bytes_per_elem(),
+        }
+    }
+
+    /// Exact bytes one [`CHUNK_SIZE`]-element block occupies in this format.
+    ///
+    /// The integer counterpart of [`Self::bytes_per_elem`], for callers that
+    /// must account storage in whole blocks — a quantized block's size is not
+    /// generally divisible by its element count (`Q4_0` is 18 bytes for 32
+    /// elements), so per-element arithmetic cannot round-trip it.
+    pub fn bytes_per_block(&self) -> usize {
+        match self {
+            Self::Float(dt) => dt.size_in_bytes() * CHUNK_SIZE,
+            Self::Quantized(qf) => qf.bytes_per_block(),
         }
     }
 

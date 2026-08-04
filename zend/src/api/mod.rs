@@ -26,7 +26,9 @@ use crate::session::ZendSession;
 pub mod chat;
 pub mod conversations;
 pub mod files;
+mod memory;
 pub mod models;
+mod repo_map;
 pub mod status;
 pub mod substrate;
 pub mod telemetry;
@@ -68,6 +70,8 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/chat/completions", post(chat::completions))
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
+        .route("/v1/memory", get(memory::dump))
+        .route("/v1/repo_map", get(repo_map::completeness))
         .route("/v1/telemetry", get(telemetry::telemetry))
         .route("/v1/phases", get(telemetry::phases))
         .route("/v1/promotes", get(telemetry::promotes))

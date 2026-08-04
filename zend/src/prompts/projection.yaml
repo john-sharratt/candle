@@ -150,13 +150,14 @@ system_prompt:
                 technically precise. Answer the question they actually ask.
             - id: summarize
               content: |+
-                You are a code-summarization engine. Each tool response contains a code excerpt
-                that is ALREADY PROVIDED to you in full. Read that excerpt and reply with ONLY a
-                concise summary — at most two sentences, in English — of what the code does. Do
-                not think out loud, restate the request, add any preamble, headings, or notes,
-                translate to another language, apologize, or claim you cannot access, view, or
-                open the file: the code is right there in the tool response. Output the summary
-                and nothing else.
+                You are a code-summarization engine. The tool responses contain what you are
+                summarizing — a code excerpt, or a listing of a folder's files — ALREADY
+                PROVIDED to you in full. Read them and reply with ONLY a concise summary — at
+                most two sentences, in English — of what was asked about. Do not think out
+                loud, restate the request, add any preamble, headings, or notes, translate to
+                another language, apologize, or claim you cannot access, view, or open the
+                file: it is right there in the tool responses. Output the summary and nothing
+                else.
 
         # Binary toggle driven by zend (`set_optional("reasoning_stance", …)`,
         # see api/chat.rs): present ⇔ the turn thinks, the inverse of
@@ -334,81 +335,131 @@ system_prompt:
 
     # Few-shot summarizer demonstrations — PROPER CONTEXT STUFFING: real user/
     # assistant example turns emitted AFTER `system_close` (the system-end token),
-    # mirroring the exact code_read scope round-trip (user summarise request →
-    # assistant `<tool_call>` → user `<tool_response>` with the excerpt → assistant
-    # two-sentence summary). Reuses the section framework only to GATE them: OFF by
-    # default, the code_read ingest turns them on via
-    # set_optional("summarize_examples", Present) alongside persona=summarize, so the
-    # model imitates the exact request→summary shape (terse, English, no preamble,
-    # no refusal on thin content). Sealed once into the shared prefix (never into a
-    # stored scope turn). The sample files are unrelated to this repo — pure format
-    # demonstrations. The `<|im_start|>`/`<|im_end|>` are the tokenizer's real
-    # special tokens (same as the tool-calibration ChatML examples).
+    # mirroring the ingest's own round-trip exactly. Sealed once into the shared
+    # prefix (never into a stored ingest turn). The sample files/folders are
+    # unrelated to this repo — pure format demonstrations. The `<|im_start|>` /
+    # `<|im_end|>` are the tokenizer's real special tokens (same as the
+    # tool-calibration ChatML examples).
+    #
+    # ONE OPTION PER INGEST SHAPE, because an example teaches the SUBJECT as much
+    # as the format. `code_reading` reads one excerpt and summarises it; `repo_map`
+    # lists a folder, reads its module doc, and summarises THE FOLDER. Shown the
+    # file examples, the repo_map decode dutifully summarises the excerpt it was
+    # just handed ("The `mod.rs` file outlines…") instead of the directory — the
+    # right behaviour for the wrong subject. Each ingest selects the shape it
+    # actually runs (`SUMMARIZE_BRANCH` in `zend/src/repo_scan/mod.rs`).
     - kind: section_tree
       nodes:
-        - kind: optional
+        - kind: selector
           id: summarize_examples
           default: absent
-          content: |+
-            <|im_start|>user
-            Summarize `billing/webhooks.py` (lines 1-9) in no more than two sentences.<|im_end|>
-            <|im_start|>assistant
-            <tool_call>{"name":"file_read","arguments":{"path":"billing/webhooks.py","start_line":1,"end_line":9}}</tool_call><|im_end|>
-            <|im_start|>user
-            <tool_response>
-            billing/webhooks.py (lines 1-9):
+          options:
+            - id: absent
+              content: ""
+            - id: file
+              content: |+
+                <|im_start|>user
+                Summarize `billing/webhooks.py` (lines 1-9) in no more than two sentences.<|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_read","arguments":{"path":"billing/webhooks.py","start_line":1,"end_line":9}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>
+                billing/webhooks.py (lines 1-9):
 
-            ```python
-            1  @bp.route("/stripe", methods=["POST"])
-            2  def stripe_webhook():
-            3      payload = request.get_data()
-            4      sig = request.headers.get("Stripe-Signature", "")
-            5      try:
-            6          event = stripe.Webhook.construct_event(payload, sig, ENDPOINT_SECRET)
-            7      except stripe.error.SignatureVerificationError:
-            8          abort(400)
-            9      return handle_event(event), 200
-            ```
-            </tool_response><|im_end|>
-            <|im_start|>assistant
-            This Flask POST endpoint receives Stripe webhooks, verifying each request's signature against the endpoint secret and aborting with 400 on a verification failure. Valid events are dispatched to handle_event and acknowledged with a 200.<|im_end|>
-            <|im_start|>user
-            Summarize `internal/retry/backoff.go` (lines 12-18) in no more than two sentences.<|im_end|>
-            <|im_start|>assistant
-            <tool_call>{"name":"file_read","arguments":{"path":"internal/retry/backoff.go","start_line":12,"end_line":18}}</tool_call><|im_end|>
-            <|im_start|>user
-            <tool_response>
-            internal/retry/backoff.go (lines 12-18):
+                ```python
+                1  @bp.route("/stripe", methods=["POST"])
+                2  def stripe_webhook():
+                3      payload = request.get_data()
+                4      sig = request.headers.get("Stripe-Signature", "")
+                5      try:
+                6          event = stripe.Webhook.construct_event(payload, sig, ENDPOINT_SECRET)
+                7      except stripe.error.SignatureVerificationError:
+                8          abort(400)
+                9      return handle_event(event), 200
+                ```
+                </tool_response><|im_end|>
+                <|im_start|>assistant
+                This Flask POST endpoint receives Stripe webhooks, verifying each request's signature against the endpoint secret and aborting with 400 on a verification failure. Valid events are dispatched to handle_event and acknowledged with a 200.<|im_end|>
+                <|im_start|>user
+                Summarize `internal/retry/backoff.go` (lines 12-18) in no more than two sentences.<|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_read","arguments":{"path":"internal/retry/backoff.go","start_line":12,"end_line":18}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>
+                internal/retry/backoff.go (lines 12-18):
 
-            ```go
-            12  func Jitter(base time.Duration, attempt int) time.Duration {
-            13      ceiling := base * (1 << uint(attempt))
-            14      if ceiling <= 0 {
-            15          ceiling = base
-            16      }
-            17      return time.Duration(rand.Int63n(int64(ceiling)))
-            18  }
-            ```
-            </tool_response><|im_end|>
-            <|im_start|>assistant
-            Jitter returns a randomized retry backoff, uniformly sampled between zero and an exponentially growing ceiling (the base duration doubled per attempt). It falls back to the base duration as the ceiling when the shift overflows to a non-positive value.<|im_end|>
-            <|im_start|>user
-            Summarize `db/migrations/0007_add_orders_index.sql` (lines 1-4) in no more than two sentences.<|im_end|>
-            <|im_start|>assistant
-            <tool_call>{"name":"file_read","arguments":{"path":"db/migrations/0007_add_orders_index.sql","start_line":1,"end_line":4}}</tool_call><|im_end|>
-            <|im_start|>user
-            <tool_response>
-            db/migrations/0007_add_orders_index.sql (lines 1-4):
+                ```go
+                12  func Jitter(base time.Duration, attempt int) time.Duration {
+                13      ceiling := base * (1 << uint(attempt))
+                14      if ceiling <= 0 {
+                15          ceiling = base
+                16      }
+                17      return time.Duration(rand.Int63n(int64(ceiling)))
+                18  }
+                ```
+                </tool_response><|im_end|>
+                <|im_start|>assistant
+                Jitter returns a randomized retry backoff, uniformly sampled between zero and an exponentially growing ceiling (the base duration doubled per attempt). It falls back to the base duration as the ceiling when the shift overflows to a non-positive value.<|im_end|>
+                <|im_start|>user
+                Summarize `db/migrations/0007_add_orders_index.sql` (lines 1-4) in no more than two sentences.<|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_read","arguments":{"path":"db/migrations/0007_add_orders_index.sql","start_line":1,"end_line":4}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>
+                db/migrations/0007_add_orders_index.sql (lines 1-4):
 
-            ```sql
-            1  -- Speed up the customer order-history page
-            2  CREATE INDEX CONCURRENTLY idx_orders_customer_created
-            3      ON orders (customer_id, created_at DESC);
-            4
-            ```
-            </tool_response><|im_end|>
-            <|im_start|>assistant
-            This migration adds a concurrent composite index on the orders table over customer_id and created_at (descending). It targets the customer order-history query and contains no other schema changes.<|im_end|>
+                ```sql
+                1  -- Speed up the customer order-history page
+                2  CREATE INDEX CONCURRENTLY idx_orders_customer_created
+                3      ON orders (customer_id, created_at DESC);
+                4
+                ```
+                </tool_response><|im_end|>
+                <|im_start|>assistant
+                This migration adds a concurrent composite index on the orders table over customer_id and created_at (descending). It targets the customer order-history query and contains no other schema changes.<|im_end|>
+            - id: folder
+              content: |+
+                <|im_start|>user
+                Summarize the `worker/scheduling/` folder in no more than two sentences.<|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_list","arguments":{"prefix":"worker/scheduling/"}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>{"files":[{"path":"worker/scheduling/mod.rs","bytes":1180,"lines":31},{"path":"worker/scheduling/fair_queue.rs","bytes":6402,"lines":184},{"path":"worker/scheduling/leases.rs","bytes":3915,"lines":112}],"paging":{"page":0,"pages":1,"per_page":50,"total":3,"next_page":null},"total_bytes":0}</tool_response><|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_read","arguments":{"path":"worker/scheduling/mod.rs","start_line":1,"end_line":4}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>
+                worker/scheduling/mod.rs (lines 1-4 of 31):
+
+                ```rust
+                1  //! Decides which tenant's jobs run next.
+                2  //!
+                3  //! A weighted fair queue picks the tenant; a lease then pins that job to one
+                4  //! worker for a bounded time so a crashed worker's job is retried, not lost.
+                ```
+                </tool_response><|im_end|>
+                <|im_start|>assistant
+                This folder decides which tenant's jobs run next, using a weighted fair queue to pick the tenant and leases to pin a job to a single worker. The queue lives in fair_queue.rs and the bounded-time lease handling, which lets a crashed worker's job be retried rather than lost, in leases.rs.<|im_end|>
+                <|im_start|>user
+                Summarize the `platform/ratelimit/` folder in no more than two sentences.<|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_list","arguments":{"prefix":"platform/ratelimit/"}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>{"files":[{"path":"platform/ratelimit/mod.rs","bytes":940,"lines":24},{"path":"platform/ratelimit/token_bucket.rs","bytes":5120,"lines":148},{"path":"platform/ratelimit/redis_store.rs","bytes":7330,"lines":201}],"paging":{"page":0,"pages":1,"per_page":50,"total":3,"next_page":null},"total_bytes":0}</tool_response><|im_end|>
+                <|im_start|>assistant
+                <tool_call>{"name":"file_read","arguments":{"path":"platform/ratelimit/mod.rs","start_line":1,"end_line":3}}</tool_call><|im_end|>
+                <|im_start|>user
+                <tool_response>
+                platform/ratelimit/mod.rs (lines 1-3 of 24):
+
+                ```rust
+                1  //! Per-tenant request throttling.
+                2  //!
+                3  //! Token buckets are held in Redis so every node sees one shared count.
+                ```
+                </tool_response><|im_end|>
+                <|im_start|>assistant
+                This folder throttles requests per tenant, keeping the token buckets in Redis so every node shares one count. token_bucket.rs holds the bucket arithmetic and redis_store.rs the shared-state access.<|im_end|>
 
 
 layers:
@@ -416,9 +467,12 @@ layers:
   # ── Phase 1 — Repo Map ─────────────────────────────────────────────────────
   - name: repo_map
     description: |
-      Structural shape of the repository: directory tree, file types, line
-      counts.  Populated by Phase 1 of the trunk-analysis pipeline; one entry
-      per repo.
+      What each directory of the repository IS — one conversation per folder,
+      shaped as a tool round-trip (list the folder, read its README / module
+      doc) that ends in a decoded two-sentence summary of the folder's purpose.
+      Prose, not a tree: a question about "the KV cache paging code" matches a
+      description of that folder, where a bare listing only matches a filename
+      the asker already knew.
     # Loading-screen unit for this layer's startup ingest ("N / M folders").
     ingest_unit: folders
     window: 6000
@@ -441,59 +495,50 @@ layers:
     summary:
       turns:
         max_tokens: 384
-        # Structural content: the leaf is built DETERMINISTICALLY from the scan turn —
-        # strip the `(N lines, …)` size annotations, keep the full directory
-        # skeleton — with NO model decode (`summary_tree::structural::leaf_skeleton`).
-        # Both halves are derived from the skeleton, which for a directory tree is the
-        # authoritative statement of what the node covers, so no `scope:` is set (the
-        # schema rejects one here) and the `assistant:` prompt below never runs.
-        content: structural
+        # The user half of a repo_map turn names the folder (`Summarize the `a/b/`
+        # folder …`), so a roll-up's scope is the union of those folder paths,
+        # coarsening toward the root. Derived, never decoded.
+        scope: union
+        # Decoded, not structural: the layer's content is now PROSE describing what
+        # each folder is for. A deterministic merge of names would throw away the
+        # only thing these turns carry that a directory listing does not.
         assistant:
           system_prompt: |
-            You compress a repository structure map into a faithful structural
-            skeleton. Keep the layout — the exact names of every significant directory,
-            module, and file group — and drop sizes, line counts, and incidental files.
-            Never rename or invent a directory, module, or file that is not in the map.
-            Stop when the skeleton is captured; add no prose about what the code does.
+            You compress folder descriptions into one faithful digest. Open by naming
+            the directories covered — this digest stands alone, so it must say what it
+            is about. Then state what each directory is for, in one clause each,
+            keeping every directory and file name exactly as written. Never rename or
+            invent a directory, file, or purpose that is not in the descriptions. Stop
+            the moment the purposes are captured; do not pad.
           user_prompt: |
-            Reduce the repository map above to a faithful structural skeleton: the
-            significant directories, modules, and file groups by their exact name,
-            dropping sizes and counts and adding nothing.
+            Digest the folder descriptions above. Start with the directories covered,
+            then what each is for in one clause, keeping names exactly. Add nothing
+            not in the descriptions; stop when captured.
       summaries:
         max_tokens: 384
-        # Structural content: the summary-of-summaries is built DETERMINISTICALLY from
-        # the children's directory paths (truncated by tree height so it coarsens
-        # toward the root), with NO model decode — see `summary_tree::structural`.
-        # As with the leaf above, both halves are derived and the `assistant:` prompt
-        # below never runs.
-        content: structural
+        scope: union
         assistant:
           system_prompt: |
-            The sections below are already-compressed structural skeletons —
-            directory and file/module names with no sizes. Merge them into one
-            skeleton: keep the directory and file/module names exactly as written,
-            grouped by their directory, dropping only duplicates. Add nothing —
-            never invent a file, module, or directory, and never add any prose about
-            what the code does or how it is organised. Output only the merged
-            skeleton (names, grouped by directory); stop when it is captured. No
-            commentary, no word counts.
+            The folder digests below are already compressed. Merge them into one
+            digest: keep each directory by its exact path and what it is for, grouped
+            by their common parent, dropping only duplicates. Never invent a
+            directory or a purpose. Stop when the merged digest is captured. This is a
+            tree node: near the root it is the one digest of what the whole repository
+            is made of.
           user_prompt: |
-            Merge the skeletons above into one structural skeleton: the directory and
-            file/module names grouped by directory, adding nothing and describing
+            Merge the digests above into one: each directory by its exact path and
+            what it is for, grouped by common parent, dropping duplicates and adding
             nothing.
     groups:
       - id: structure
-        # Cap the reconstructed repo map at the two most-relevant clusters.
-        # With no provenance scores yet (all zero) the tie-break is ascending
-        # turn index, so the workspace-root overview (turn 0, tag ".") is always
-        # one of them; once the turn-level wide-Q scan scores clusters, the two
-        # highest-scoring survive. `default` is the floor: if a future threshold
-        # filters every cluster out, the root cluster is re-injected so repo_map
-        # never vanishes from the projection.
-        # k: 3 — the workspace-root cluster reliably wins one slot on belief
-        # (its listing names every crate, so it matches most repo questions), so
-        # 2 leaves only a single content slot that a specific dir (candle-core/src)
-        # narrowly loses to generic prose clusters (docs/). 3 = root + 2 content;
+        # Cap the reconstructed repo map at the three most-relevant folders.
+        # `default` is the floor: if the threshold filters every folder out, the
+        # workspace-root folder is re-injected so repo_map never vanishes from the
+        # projection.
+        # k: 3 — the workspace-root folder reliably wins one slot on belief (its
+        # listing names every crate, so it matches most repo questions), so 2
+        # leaves only a single content slot that a specific dir (candle-core/src)
+        # narrowly loses to generic prose folders (docs/). 3 = root + 2 content;
         # the queried dir ranks top-3 across every probed query. See §83.
         selection: { kind: top_k, k: 3 }
         default: { tag: "." }
@@ -519,7 +564,7 @@ layers:
           # tiny stub can't explode under level division while a full cluster's
           # rare hit still stands out.
           level_prior: { floor_base: 2.0, floor_cap: 16.0 }
-          # Repo_map cluster identity concentrates in the L46 fold-group (§83):
+          # Repo_map folder identity concentrates in the L46 fold-group (§83):
           # peak the belief vote on group 1 and keep groups 0 (L0-45) and 2 (L47)
           # only as a faint tie-breaker. Group 0 alone ranks the target #17 (pure
           # path noise), so it must be near-zero — at 0.3 it dragged the target to
@@ -530,15 +575,15 @@ layers:
           layer_weights: [0.1, 1.0, 0.1]
           # Carry LEAKED HARDER than the tool default (β = RelLeak leak fraction, so
           # HIGHER = faster decay = less carry). repo_map must reflect the CURRENT
-          # question, not linger on a prior topic's cluster. A numeric attractor dir
+          # question, not linger on a prior topic's folder. A numeric attractor dir
           # (perf-investigation) won a `sqrt of N` turn and, at β0.40, its belief bled
-          # into the next (candle-core) turn and crowded the correct cluster out.
-          # β0.65 makes a cluster that isn't re-matched this turn leak below evict
+          # into the next (candle-core) turn and crowded the correct folder out.
+          # β0.65 makes a folder that isn't re-matched this turn leak below evict
           # within a step or two.
           beta: 0.65
           # NORMALIZED SCALE. This group's scores now pass through the score-
           # normalization module (docs/provenance_score_normalization.md): each
-          # cluster's raw vote is rescaled against its own learned hit level, so a
+          # folder's raw vote is rescaled against its own learned hit level, so a
           # full hit ≈ 1000 per reprojection and the belief accumulates ~1/β of that
           # for a sustained hit. These are INITIAL values on that scale — steady
           # min/evict gate the accumulated belief; the early window gates the fresh

@@ -83,6 +83,8 @@ pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 // `location` field is the coarse-grained tier tag).
 pub use super::arena_table::ArenaLocation;
 
+// The allocator's own remaining arena budget — admission clamps to this.
+pub use alloc::kv_alloc_headroom;
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 #[cfg(feature = "cuda")]
 pub use alloc::vram_budget_available;

@@ -15,9 +15,11 @@
 //! `docs/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
+mod admission;
 mod decode;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
+pub mod memory_report;
 pub mod phase_ring;
 mod prefill;
 pub(crate) mod profile;
@@ -845,6 +847,21 @@ struct DecodeState {
     finished: bool,
     /// Decode start time (for stats).
     decode_start: Instant,
+    /// Microseconds this turn actually spent INSIDE decode forwards.
+    ///
+    /// Not the same as `decode_start.elapsed()`, which is turn wall-clock and
+    /// therefore includes every wave the turn merely *survived* — prefill
+    /// slices, other sequences' decode slices, relief passes, persistence
+    /// stalls. Dividing tokens by that reports a latency figure under a
+    /// throughput label: a 200-token summary alive for 60 s of wall-clock read
+    /// as "3 tok/s" no matter how fast the model actually stepped.
+    ///
+    /// Each co-batched forward adds its FULL duration to every participating
+    /// sequence (not a 1/N share): the question this answers is "while this turn
+    /// was being decoded, how fast did it go", and a forward costs nearly the
+    /// same whether it carries one sequence or eight. Summing to more than
+    /// wall-clock across sequences is expected and correct.
+    decode_busy_us: u64,
     /// Prefill duration (for stats).
     prefill_ms: f64,
     /// Number of tokens in the prefill prompt for this turn.
@@ -1069,93 +1086,9 @@ struct PendingTurnSeal {
     _sink_rx: Receiver<TurnEvent>,
 }
 
-/// AIMD multiplicative-decrease of the prefill admission window: halve `w` but
-/// never below `floor`. Pure core of [`Scheduler::shrink_admit_window`] —
-/// repeated application converges to `floor` (never 0, so the engine always
-/// keeps ≥`floor` prefills in flight).
-fn narrow_window(w: usize, floor: usize) -> usize {
-    (w / 2).max(floor)
-}
-
-/// AIMD additive-increase of the prefill admission window: `w + 1` capped at
-/// `ceil`. Pure core of [`Scheduler::grow_admit_window`].
-fn widen_window(w: usize, ceil: usize) -> usize {
-    (w + 1).min(ceil)
-}
-
-/// Admission action chosen by the drain-backlog controller.
-#[derive(Debug, PartialEq, Eq)]
-enum BacklogAction {
-    Shrink,
-    Grow,
-    Hold,
-}
-
-/// Pure decision core of [`Scheduler::regulate_ingest_admission`]: from the live
-/// hot→warm `backlog`, its `target`, the current `window`/`ceil`, and whether
-/// VRAM is under pressure, decide whether to narrow, widen, or hold ingest
-/// admission. Hysteresis — shrink above `target`, grow only below `target / 2`,
-/// hold in the deadband between — keeps the window from flapping around the
-/// target as the backlog jitters.
-fn backlog_admit_action(
-    backlog: usize,
-    target: usize,
-    window: usize,
-    ceil: usize,
-    vram_pressure: bool,
-) -> BacklogAction {
-    if backlog > target {
-        BacklogAction::Shrink
-    } else if backlog < target / 2 && window < ceil && !vram_pressure {
-        BacklogAction::Grow
-    } else {
-        BacklogAction::Hold
-    }
-}
-
-/// Evidence-based reopen under chronic nominal VRAM pressure — the escape hatch
-/// from the admission wedge on a card whose steady state reads as "pressured"
-/// forever (a reserved-but-unreclaimable pool gap, a tight budget band). The
-/// AIMD contract says grow only when pressure clears; on such a card it never
-/// does, the window pins at the floor, and prefill runs single-sequence
-/// mini-forwards at a fraction of batched throughput. The counter-evidence is
-/// throughput itself: when growth is blocked ONLY by the pressure bit (backlog
-/// low, window below the ceiling) yet forwards keep completing OOM-free tick
-/// after tick, the current width is proven sustainable — after `need`
-/// consecutive such ticks, grow one notch and re-arm. A genuinely unsustainable
-/// width surfaces as device-OOM/eviction-survival, whose shrink resets the
-/// streak (multiplicative decrease still wins instantly).
-///
-/// Returns `(grow_now, new_streak)`.
-fn evidence_admit_grow(
-    backlog: usize,
-    target: usize,
-    window: usize,
-    ceil: usize,
-    progressed: bool,
-    streak: usize,
-    need: usize,
-) -> (bool, usize) {
-    if window >= ceil || backlog >= target / 2 || !progressed {
-        return (false, 0);
-    }
-    let streak = streak + 1;
-    if streak >= need {
-        (true, 0)
-    } else {
-        (false, streak)
-    }
-}
-
-/// Consecutive evidence ticks (one per ~2 s regulator cadence) required before
-/// [`evidence_admit_grow`] reopens the window a notch: ~6 s of proven OOM-free
-/// throughput per step, so a wedged window walks back up in minutes while a
-/// transient spike still shrinks it instantly.
-const INGEST_EVIDENCE_GROW_TICKS: usize = 3;
-
 /// Minimum NEW prefill tokens per evidence tick. A tick certifies "the current
-/// width survives this pressure", which a handful of tiny interactive turns
-/// cannot — one chunk-sized batch per tick is the floor. Small forwards
+/// admission budget survives this pressure", which a handful of tiny interactive
+/// turns cannot — one chunk-sized batch per tick is the floor. Small forwards
 /// accumulate toward it rather than being discarded.
 const EVIDENCE_MIN_PREFILL_TOKENS: u64 = 256;
 
@@ -2221,19 +2154,23 @@ pub(crate) struct Scheduler {
     /// Monotonic id source for `pending_turn_seals`.
     next_turn_seal_id: u64,
 
-    /// AIMD congestion window over concurrent prefill admission — the dynamic
-    /// ceiling [`Self::promote_new_prefills`] (forward width) clamps to, on top
-    /// of its static cap ([`Self::MAX_PREFILL_WIDTH`]).
+    /// AIMD congestion budget over prefill admission, in **bytes** of VRAM the
+    /// inference working set may occupy — the single throttle every pressure
+    /// signal moves and [`Self::promote_new_prefills`] reads. See the
+    /// [`admission`] module header for why the regulated quantity is bytes and
+    /// not sequence count.
     ///
     /// A wide ragged prefill forward's transient VRAM peak (MoE expert gather +
-    /// per-sequence activations) scales with the batch width but isn't visible at
-    /// admission time, so a fixed cap that's fine on an idle card OOMs a busy one.
-    /// The window closes multiplicatively — halving toward [`Self::MIN_PREFILL_WIDTH`]
-    /// — whenever VRAM pressure survives an eviction pass or a forward actually
-    /// reports device-OOM, and reopens additively (one slot per idle-ish wave) once
-    /// pressure clears. Under sustained pressure it converges toward 1 (throughput
-    /// floor that still makes progress); with headroom it returns to the full width.
-    admit_window: usize,
+    /// per-sequence activations) isn't visible at admission time, so a fixed cap
+    /// that's fine on an idle card OOMs a busy one. The budget closes
+    /// multiplicatively — halving toward one quantum — whenever VRAM pressure
+    /// survives an eviction pass, a forward reports device-OOM, host RAM falls
+    /// below the ingest floor, or the hot→warm drain falls behind; it reopens
+    /// additively, one quantum at a time, on proven out-of-memory-free
+    /// throughput. Clamped at every read to what the card can actually deliver
+    /// ([`admission::available_bytes`]), so the setpoint can be optimistic
+    /// without the card ever being oversubscribed.
+    admit_budget: u64,
 
     /// Cached OS memory probe for host-tier ingest backpressure, as
     /// `(checked_at, available_bytes, total_bytes)`. The warm (RAM) KV tier can
@@ -2264,14 +2201,25 @@ pub(crate) struct Scheduler {
 
     /// Consecutive progress observations (new prefill tokens forwarded
     /// OOM-free) while growth was blocked ONLY by the VRAM-pressure bit — the
-    /// evidence streak that reopens a wedged window. Consumed by BOTH reopen
-    /// paths (the ingest regulator via [`evidence_admit_grow`], and the
-    /// non-ingest run-loop reopen); the phases are mutually exclusive, so one
-    /// streak serves both. Reset by any window shrink.
+    /// evidence streak that reopens a wedged budget. Consumed by BOTH reopen
+    /// paths (the ingest regulator via [`admission::evidence_admit_grow`], and
+    /// the non-ingest run-loop reopen); the phases are mutually exclusive, so
+    /// one streak serves both. Reset by any budget cut.
     admit_grow_streak: usize,
 
     /// [`PREFILL_OK_TOKENS`] as of the last evidence check.
     admit_ok_tokens_seen: u64,
+
+    /// When a standing-condition signal last cut the admission budget — see
+    /// [`Self::cut_admit_budget_leveled`]. `None` until the first level cut.
+    last_level_cut: Option<std::time::Instant>,
+
+    /// When the admission pass last traced a starved outcome (queued work the
+    /// budget would not take). Rate-limits that trace to one line per
+    /// `ADMIT_STARVED_LOG_INTERVAL` — the condition persists across every loop
+    /// iteration until the budget or the queue moves, so it would otherwise flood
+    /// the log at the loop rate. `None` until the first starved pass.
+    last_admit_starved_log: Option<std::time::Instant>,
 
     /// [`PREFILL_OK_TOKENS`] as of the last promote-side pressure episode —
     /// the "forwards are still completing" evidence that distinguishes chronic
@@ -2283,7 +2231,7 @@ pub(crate) struct Scheduler {
     /// A shrink fires only after [`PROMOTE_STALL_GRACE`] of complete silence —
     /// promote runs many times per second while forwards take seconds, so a
     /// per-pass "no progress" reading is meaningless. `None` until the first
-    /// completed forward (never shrink a pipeline that hasn't started).
+    /// completed forward (never throttle a pipeline that hasn't started).
     promote_last_progress: Option<std::time::Instant>,
 
     /// Timelines being ingested append-only (`disable_reprojection` submits, e.g.
@@ -2473,11 +2421,13 @@ impl Scheduler {
             next_compression_job_id: 0,
             pending_turn_seals: HashMap::new(),
             next_turn_seal_id: 0,
-            admit_window: Self::MAX_PREFILL_WIDTH,
+            admit_budget: Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
             host_ram_probe: None,
             defrag_futile_at: None,
             admit_grow_streak: 0,
             admit_ok_tokens_seen: 0,
+            last_level_cut: None,
+            last_admit_starved_log: None,
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
             last_footprint_relief: None,
@@ -3473,7 +3423,7 @@ impl Scheduler {
                 };
                 // The demote returned the hot chunks to the pool free-list;
                 // release now-empty arenas so `pool_used` actually drops.
-                let _ = self.session.release_empty_arenas();
+                let _ = self.session.release_empty_arenas_forced();
                 let _ = response_tx.send(Ok(demoted));
                 true
             }
@@ -4065,6 +4015,7 @@ impl Scheduler {
                 prefill_assistant_text: String::new(),
                 finished: false,
                 decode_start: Instant::now(),
+                decode_busy_us: 0,
                 prefill_ms,
                 prefill_token_count,
                 turn_start,
@@ -4866,43 +4817,105 @@ impl Scheduler {
         let _ = response_tx.send(Ok(idx));
     }
 
-    /// Static ceiling on the ragged prefill forward's width — how many in-flight
-    /// prefills coalesce into one `forward_batched`. The [`Self::admit_window`]
-    /// congestion window rides below this and shrinks it under VRAM pressure.
+    /// Static backstop on the ragged prefill forward's width — how many in-flight
+    /// prefills may coalesce into one `forward_batched`, regardless of what the
+    /// byte budget would allow.
+    ///
+    /// The [`Self::admit_budget`] setpoint is the real throttle; this is the dumb
+    /// ceiling beneath it. It exists so an error in the cost model
+    /// ([`admission::per_block_kv_bytes`] and friends) costs throughput rather
+    /// than the daemon: a cost underestimate can only ever admit this many
+    /// sequences before it is capped, whatever it believes they are worth.
     pub(super) const MAX_PREFILL_WIDTH: usize = 24;
 
-    /// Throughput floor the congestion window never closes past — one prefill
+    /// Throughput floor the admission planner never closes past — one prefill
     /// always in flight so the engine keeps making progress even under sustained
     /// pressure (a lone oversized turn is then bounded by the per-arena VRAM gate).
     const MIN_PREFILL_WIDTH: usize = 1;
 
-    /// Multiplicative-decrease the admission window: halve it toward
-    /// [`Self::MIN_PREFILL_WIDTH`]. Called when VRAM pressure survives an eviction
-    /// pass (`promote`/`pump`) or a prefill forward reports device-OOM — the
-    /// current width is unsustainable, so back off hard and let the additive
-    /// reopen ([`Self::grow_admit_window`]) probe back up once pressure clears.
-    fn shrink_admit_window(&mut self) {
-        // Any shrink invalidates the sustainable-width evidence.
+    /// Multiplicative-decrease the admission budget: halve it toward one quantum.
+    /// Called from every throttle signal — VRAM pressure surviving an eviction
+    /// pass, a prefill forward reporting device-OOM, host RAM under the ingest
+    /// floor, the hot→warm drain falling behind. `reason` names which, and is
+    /// carried into the throttle log so a collapsed budget is attributable.
+    fn cut_admit_budget(&mut self, reason: admission::ThrottleReason) {
+        // Any cut invalidates the sustainable-budget evidence.
         self.admit_grow_streak = 0;
-        let before = self.admit_window;
-        self.admit_window = narrow_window(self.admit_window, Self::MIN_PREFILL_WIDTH);
-        if self.admit_window != before {
-            tracing::info!(
-                target: "candle_conversation::scheduler::timing",
-                admit_window = self.admit_window,
-                was = before,
-                "admission window narrowed under VRAM pressure"
-            );
+        let before = self.admit_budget;
+        self.admit_budget = admission::cut_budget(self.admit_budget, admission::admit_quantum());
+        if self.admit_budget != before {
+            let ceiling = self.admit_budget_ceiling();
+            self.log_throttle(reason, before, ceiling);
         }
     }
 
-    /// Additive-increase the admission window by one, toward
-    /// [`Self::MAX_PREFILL_WIDTH`]. Called once per scheduler loop when VRAM is
-    /// not under pressure, so a transient pressure episode's backoff heals
-    /// gradually (AIMD) rather than snapping straight back to full width and
-    /// re-tripping on the next wide wave.
-    fn grow_admit_window(&mut self) {
-        self.admit_window = widen_window(self.admit_window, Self::MAX_PREFILL_WIDTH);
+    /// Cut the budget for a STANDING CONDITION — host RAM under its floor, the
+    /// hot→warm drain behind — rather than a discrete failure.
+    ///
+    /// Level signals are re-evaluated every wave and stay true until the
+    /// condition clears, so an unguarded multiplicative cut collapses the
+    /// setpoint to the floor in as many waves as it takes to halve: measured at
+    /// 6144→256 MiB in **two seconds**, against a host-RAM condition that only
+    /// moves on the scale of a drain pass. Rate-limiting to one cut per
+    /// [`admission::LEVEL_CUT_COOLDOWN`] lets each cut's effect reach the signal before the
+    /// next is decided.
+    ///
+    /// Device-OOM and relief-that-failed are EVENTS — they name a forward that
+    /// already broke — and go straight to [`Self::cut_admit_budget`].
+    fn cut_admit_budget_leveled(&mut self, reason: admission::ThrottleReason) {
+        let due = self
+            .last_level_cut
+            .is_none_or(|t| t.elapsed() >= admission::LEVEL_CUT_COOLDOWN);
+        if !due {
+            return;
+        }
+        self.last_level_cut = Some(std::time::Instant::now());
+        self.cut_admit_budget(reason);
+    }
+
+    /// The setpoint's static upper bound — [`Self::MAX_PREFILL_WIDTH`] quanta.
+    /// A pure constant, so the reopen paths can cheaply ask "is there anything to
+    /// reopen?" before paying for the live ceiling, which costs a device query
+    /// (`QueryVideoMemoryInfo`) and a walk of the registered relievers.
+    fn max_admit_budget() -> u64 {
+        Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum()
+    }
+
+    /// Additive-increase the admission budget by one quantum, toward the live
+    /// ceiling. Called when VRAM is not under pressure, or on proven
+    /// out-of-memory-free throughput under chronic nominal pressure, so a
+    /// transient episode's backoff heals gradually (AIMD) rather than snapping
+    /// straight back to full width and re-tripping on the next wide wave.
+    fn raise_admit_budget(&mut self, reason: admission::ThrottleReason) {
+        let before = self.admit_budget;
+        let ceiling = self.admit_budget_ceiling();
+        self.admit_budget =
+            admission::raise_budget(self.admit_budget, admission::admit_quantum(), ceiling);
+        if self.admit_budget != before {
+            self.log_throttle(reason, before, ceiling);
+        }
+    }
+
+    /// Emit the setpoint-change event, in BOTH directions.
+    ///
+    /// Growth used to be silent while only shrinks logged, which made the
+    /// controller's trajectory unreconstructable from a run: a budget that had
+    /// climbed and collapsed several times was indistinguishable from one wedged
+    /// at the floor the whole run. Every move is logged, with the reason that
+    /// caused it and the live availability it was clamped against. Callers pass
+    /// the `ceiling` they already measured rather than have this re-query it.
+    fn log_throttle(&self, reason: admission::ThrottleReason, was: u64, ceiling: u64) {
+        const MIB: u64 = 1 << 20;
+        tracing::debug!(
+            target: "candle_conversation::scheduler::throttle",
+            reason = reason.as_str(),
+            budget_mib = self.admit_budget / MIB,
+            was_mib = was / MIB,
+            ceiling_mib = ceiling / MIB,
+            prefills = self.active_prefills.len(),
+            queued = self.prefill_queue.len(),
+            "admission budget moved"
+        );
     }
 
     /// Free a compression scratch slot and its per-slot bookkeeping. Called on
@@ -5224,7 +5237,14 @@ impl Scheduler {
                     continue;
                 }
 
-                let decode_ms = state.decode_start.elapsed().as_secs_f64() * 1000.0;
+                // Throughput over time actually spent decoding, not turn
+                // wall-clock — see `DecodeState::decode_busy_us`. Falls back to
+                // wall-clock only if no forward was ever recorded.
+                let decode_ms = if state.decode_busy_us > 0 {
+                    state.decode_busy_us as f64 / 1000.0
+                } else {
+                    state.decode_start.elapsed().as_secs_f64() * 1000.0
+                };
                 let total_ms = state.turn_start.elapsed().as_secs_f64() * 1000.0;
                 let tokens_generated = state.generated_tokens.len();
                 let tokens_per_second = if decode_ms > 0.0 {
@@ -7810,87 +7830,6 @@ mod tests {
         // Defensive: consumed > total (should never happen) saturates to 0, not
         // underflow.
         assert_eq!(sum_pending_prefill_tokens([(10, 25)]), 0);
-    }
-
-    #[test]
-    fn admit_window_aimd_converges_and_recovers() {
-        let floor = Scheduler::MIN_PREFILL_WIDTH; // 1
-        let ceil = Scheduler::MAX_PREFILL_WIDTH; // 24
-
-        // Multiplicative decrease halves toward the floor and stops there —
-        // sustained pressure drives the window to 1, never 0 (always ≥1 in flight).
-        let mut w = ceil;
-        let descent: Vec<usize> = (0..6)
-            .map(|_| {
-                w = narrow_window(w, floor);
-                w
-            })
-            .collect();
-        assert_eq!(descent, vec![12, 6, 3, 1, 1, 1]);
-        assert_eq!(narrow_window(floor, floor), floor);
-
-        // Additive increase climbs by one and saturates at the ceiling — gradual
-        // recovery, so a cleared episode doesn't snap straight back to full width.
-        let mut w = floor;
-        for _ in 0..(ceil * 2) {
-            w = widen_window(w, ceil);
-        }
-        assert_eq!(w, ceil);
-        assert_eq!(widen_window(ceil, ceil), ceil);
-        assert_eq!(widen_window(5, ceil), 6);
-
-        // A shrink is undone by exactly `n` grows for an n-halving descent — the
-        // window is a plain saturating counter with no hidden state.
-        assert_eq!(widen_window(narrow_window(2, floor), ceil), 2);
-    }
-
-    #[test]
-    fn evidence_grow_requires_streak_and_progress() {
-        use super::evidence_admit_grow as g;
-        let (ceil, need) = (24, 3);
-        // Streak builds one tick at a time, grows on the third, then re-arms.
-        assert_eq!(g(10, 100, 1, ceil, true, 0, need), (false, 1));
-        assert_eq!(g(10, 100, 1, ceil, true, 1, need), (false, 2));
-        assert_eq!(g(10, 100, 1, ceil, true, 2, need), (true, 0));
-        // No forward progress → evidence resets (a stalled pump proves nothing).
-        assert_eq!(g(10, 100, 1, ceil, false, 2, need), (false, 0));
-        // Backlog out of the grow band → not a pressure-only block; reset.
-        assert_eq!(g(60, 100, 1, ceil, true, 2, need), (false, 0));
-        // Window already at the ceiling → nothing to reopen.
-        assert_eq!(g(10, 100, ceil, ceil, true, 2, need), (false, 0));
-    }
-
-    #[test]
-    fn backlog_admit_action_hysteresis() {
-        use BacklogAction::{Grow, Hold, Shrink};
-        let ceil = Scheduler::MAX_PREFILL_WIDTH;
-        let target = 8000;
-
-        // Above target → shrink, regardless of window position.
-        assert_eq!(
-            backlog_admit_action(8001, target, ceil, ceil, false),
-            Shrink
-        );
-        assert_eq!(backlog_admit_action(20000, target, 1, ceil, false), Shrink);
-
-        // Deadband [target/2, target] → hold — no flapping as the backlog jitters.
-        assert_eq!(backlog_admit_action(target, target, 4, ceil, false), Hold);
-        assert_eq!(
-            backlog_admit_action(target / 2, target, 4, ceil, false),
-            Hold
-        );
-        assert_eq!(backlog_admit_action(5000, target, 4, ceil, false), Hold);
-
-        // Below target/2 with headroom and no VRAM pressure → grow.
-        assert_eq!(backlog_admit_action(3999, target, 4, ceil, false), Grow);
-        assert_eq!(backlog_admit_action(0, target, 1, ceil, false), Grow);
-
-        // Grow is suppressed at the ceiling (nothing to reopen)…
-        assert_eq!(backlog_admit_action(0, target, ceil, ceil, false), Hold);
-        // …and while VRAM is under pressure (the hard floor wins over reopening).
-        assert_eq!(backlog_admit_action(0, target, 4, ceil, true), Hold);
-        // But a high backlog still shrinks even under VRAM pressure.
-        assert_eq!(backlog_admit_action(9000, target, 4, ceil, true), Shrink);
     }
 
     use candle_transformers::models::batched_inference::{

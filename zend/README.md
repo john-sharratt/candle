@@ -13,7 +13,7 @@ On startup `zend` resolves a **workspace** directory (see `--working-dir` below)
 
 Every layer the projection schema declares is filled by convention rather than annotation — `src/ingest.rs` derives the load plan from the schema's shape, not from extra YAML metadata:
 
-- `repo_map` — a structural folder scan (`src/repo_scan/`): walks the workspace, clusters directories under a token budget, and prefills one user/assistant turn pair per cluster.
+- `repo_map` — a per-directory folder scan (`src/repo_scan/`): walks the workspace and mints one conversation per directory, explored as two `code_read`-shaped tool round-trips (`file_list` the folder, then `file_read` its `README`/module-doc anchor), the last of which **decodes** a two-sentence summary of what the folder is for. Both tool responses are produced by running the real tools, so a prefilled response cannot drift from the live one.
 - `code_reading` — a per-file ingest (`src/code_read/`): each file becomes one conversation, parsed into scope-aware parts via tree-sitter (Rust, Python, TypeScript, JavaScript, Go, C, C++, Java, Ruby, PHP, Bash, HTML, CSS, plus a structured-config and a generic fallback parser); each part contributes a prefilled `read_file` tool-call round-trip.
 - Any other declared turn-sink layer reads raw ChatML records from a same-named folder — but only for a **mind** workspace (one carrying its own `<workspace>/projection.yaml`), never for an arbitrary coding-agent project directory.
 
@@ -28,7 +28,7 @@ Every layer the projection schema declares is filled by convention rather than a
 | `src/session.rs` | `ZendSession` / `InferenceState` — the daemon's central state: model load sequence, per-conversation state, tool/think-steering compilation, `submit`/`submit_with_sampling` streaming entry points |
 | `src/api/` | The axum HTTP router: `chat.rs` (`/v1/chat/completions`), `models.rs`, `status.rs`, `substrate.rs` (read-only viewer), `telemetry.rs`, `conversations.rs`, `files.rs`, `ws_logs.rs` |
 | `src/ingest.rs` | Structure-derived load-plan resolution — decides *how* each schema layer/collection gets populated |
-| `src/repo_scan/` | `repo_map` folder-scan ingest: walk, cluster, binary sniffing |
+| `src/repo_scan/` | `repo_map` folder-scan ingest: walk, per-directory units, anchor selection, turn rendering, binary sniffing |
 | `src/code_read/` | `code_reading` per-file ingest: tree-sitter parsers, scope carving, header/summary generation |
 | `src/tools.rs`, `tool_def.rs`, `tool_summary.rs` | Tool catalog installation into the projection schema, tool-call extraction/execution loop, deterministic catalog summaries |
 | `src/stencil` (in `candle-conversation`) | Constrained decoding backing the tool-call/think steering `zend` compiles at load |

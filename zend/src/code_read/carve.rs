@@ -391,7 +391,7 @@ fn comment_syntax(
 /// the file's own overview rather than its first function — including when the
 /// tree-sitter walk already attached the header comments to that function via
 /// `start_with_leading_comments`, which [`split_file_header`] then peels back off.
-fn file_header_end(source: &[u8], language: Language) -> u32 {
+pub(crate) fn file_header_end(source: &[u8], language: Language) -> u32 {
     let (line_prefixes, block) = comment_syntax(language);
     if line_prefixes.is_empty() && block.is_none() {
         return 0;

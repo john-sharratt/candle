@@ -52,6 +52,35 @@ pub fn is_device_oom(err: &candle::Error) -> bool {
 static BACKING_REGISTRY: Mutex<Vec<Weak<BackingInner>>> = Mutex::new(Vec::new());
 
 /// Register a backing for cooperative compaction.
+/// Take write guards on **every** element of `states`, BLOCKING on contention.
+///
+/// Blocking is safe here — and load-bearing — under one invariant:
+///
+/// > **No caller may reach `defragment_arenas` while holding any layer's
+/// > `BlockTableState` lock.** The allocation path is barred from full
+/// > compaction for exactly this reason: `request_global_compact` is
+/// > release-empty-only, so the only routes here are the scheduler's
+/// > wave-boundary relief and explicit maintenance, which hold no layer locks.
+///
+/// The previous non-blocking all-or-nothing (`try_write`) form protected
+/// against the allocation-path self-deadlock, but it converted the persistence
+/// thread's *transient* block-table reads into a permanent skip: during ingest
+/// some layer is almost always briefly locked, so every defrag pass built its
+/// move plan and then abandoned it (`moves=4096, freed=0` every relief pass),
+/// fragmentation never consolidated, and 16 MiB arena creations failed on a
+/// card with 1.5 GB of reclaimable gap. Waiting the few milliseconds is the
+/// correct behaviour — it is what this code always did before tonight.
+///
+/// Returns `None` only if a lock is poisoned (a panicked writer elsewhere);
+/// the pass is abandoned before any GPU copy, leaving state consistent.
+fn lock_all<T>(states: &[Arc<RwLock<T>>]) -> Option<Vec<RwLockWriteGuard<'_, T>>> {
+    let mut out = Vec::with_capacity(states.len());
+    for s in states {
+        out.push(s.write().ok()?);
+    }
+    Some(out)
+}
+
 pub(super) fn register_backing(inner: &Arc<BackingInner>) {
     if let Ok(mut registry) = BACKING_REGISTRY.lock() {
         // Clean up dead entries while we're here
@@ -98,7 +127,27 @@ pub(super) fn request_global_compact() -> usize {
                     }
                     quiesced = true;
                 }
-                if let Ok(n) = backing.compact_arenas_forced() {
+                // RELEASE-ONLY on this path — never `compact_arenas_forced`.
+                //
+                // This runs from the ALLOCATION path, i.e. potentially in the
+                // middle of a live forward: an allocation between two layer
+                // launches of the same wave. Releasing empty arenas is safe
+                // there (no live GID references them, the quiesce above retired
+                // anything queued, and the frees are stream-ordered). Chunk
+                // RELOCATION is not: it moves live KV and rewrites GID tables
+                // between layer launches of a wave whose earlier layers were
+                // assembled against the old layout — observed as
+                // CUDA_ERROR_ILLEGAL_ADDRESS in `run_paged_prefill_int8` /
+                // `run_paged_decode_q8` the first time this path could actually
+                // execute (it previously always deadlocked or skipped on the
+                // layer-state locks, so release-only restores the envelope that
+                // ran safely). Full defragmentation belongs to the scheduler's
+                // wave-boundary relief (`defragment_bounded`), where no forward
+                // is mid-assembly.
+                // Forced: this path runs only when an allocation has already
+                // been refused, so the anti-churn headroom guard must not stand
+                // between us and the memory.
+                if let Ok(n) = backing.release_empty_arenas_forced() {
                     freed += n;
                 }
             }
@@ -273,13 +322,24 @@ impl BackingInner {
     }
 
     fn release_empty_arenas(&self) -> Result<usize> {
+        self.release_empty_arenas_inner(false)
+    }
+
+    /// [`Self::release_empty_arenas`] with the free-headroom guard bypassed —
+    /// for the VRAM-pressure path, where a wedged pool costs far more than an
+    /// extra arena create/destroy cycle. See `try_tombstone`.
+    fn release_empty_arenas_forced(&self) -> Result<usize> {
+        self.release_empty_arenas_inner(true)
+    }
+
+    fn release_empty_arenas_inner(&self, force: bool) -> Result<usize> {
         let mut freed = 0;
 
         // Phase 1: Pool-driven tombstoning of fully-free arenas.
         // For each format key, repeatedly call next_tombstone until exhausted.
         let keys = self.pool.format_keys();
         for key in keys {
-            while let Some(arena_idx) = self.pool.next_tombstone(key.clone()) {
+            while let Some(arena_idx) = self.pool.next_tombstone(key.clone(), force) {
                 self.storage.release_arena(arena_idx)?;
                 // Paired with the recycle log in `ChunkGidPool::register_arena`:
                 // a fault correlated between a free here and a re-registration
@@ -319,6 +379,8 @@ impl BackingInner {
         }
 
         self.pool.resync_counters();
+        // A sweep that frees nothing is the wedge signature — say which gate
+        // held it back rather than leaving `arenas_compacted=0` unexplained.
         Ok(freed)
     }
 
@@ -509,28 +571,21 @@ impl BackingInner {
             // Phase 2 — one lock, one GPU copy, one sync, one remap.
             let t_copy = std::time::Instant::now();
             let state_arcs = self.registered_states();
-            let mut locked_states: Vec<RwLockWriteGuard<'_, BlockTableState>> =
-                Vec::with_capacity(state_arcs.len());
-            let mut lock_ok = true;
-            for sa in &state_arcs {
-                match sa.write() {
-                    Ok(g) => locked_states.push(g),
-                    Err(_) => {
-                        lock_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !lock_ok {
-                // remap + all_dst_gids auto-freed on drop.
+            let Some(mut locked_states) = lock_all(&state_arcs) else {
+                // Poisoned lock only. Bail BEFORE the GPU copy: nothing has
+                // moved, so dropping the remap + all_dst_gids returns every
+                // destination GID to the pool and leaves state consistent.
                 return Ok(0);
-            }
+            };
 
             // On copy failure the source data is still intact (remap not yet
             // applied), so all sequence references remain valid.
             // remap + all_dst_gids are freed by drop.
             // No device sync needed: the CUDA stream serialises the copy before
             // any subsequent kernel that touches the same slots.
+            // LOAD-BEARING HOLD: the generation is the pinned-staging lifetime
+            // mechanism for the async copy below. It must outlive
+            // `arena_compact_copy_async`. Do not narrow or drop early.
             let _generation = self.pinned_stager.begin_generation();
             let primary_stream = cuda_dev.cuda_stream();
             if arena_compact_copy_async(&all_moves, 128, &primary_stream, &self.pinned_stager)
@@ -958,6 +1013,14 @@ impl ChunkedKvBacking {
     /// defrag stays on the reactive allocation-time OOM retry.
     pub fn release_empty_arenas(&self) -> Result<usize> {
         self.inner.release_empty_arenas()
+    }
+
+    /// [`Self::release_empty_arenas`] with the anti-churn free-headroom guard
+    /// bypassed — for the VRAM relief ladder and the allocation-refusal path,
+    /// where the guard's "the pool is nearly full" condition is precisely the
+    /// state reclaim is being asked to fix. See `try_tombstone`.
+    pub fn release_empty_arenas_forced(&self) -> Result<usize> {
+        self.inner.release_empty_arenas_forced()
     }
 
     /// Get the current batch capacity (number of sequence slots).
@@ -2991,5 +3054,61 @@ impl crate::kv_cache::PagedKvArenas for ChunkedKvBacking {
 
     fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)> {
         ChunkedKvBacking::quantized_arenas(self)
+    }
+}
+
+#[cfg(test)]
+mod lock_all_tests {
+    use super::lock_all;
+    use std::sync::mpsc;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+
+    /// Uncontended: every guard is returned, held simultaneously (the remap
+    /// needs them all at once).
+    #[test]
+    fn takes_every_guard_when_uncontended() {
+        let locks: Vec<Arc<RwLock<u32>>> = (0..4).map(|i| Arc::new(RwLock::new(i))).collect();
+        let guards = lock_all(&locks).expect("uncontended must acquire");
+        assert_eq!(guards.len(), 4);
+        assert!(locks[0].try_write().is_err(), "held while guards live");
+        drop(guards);
+        assert!(locks[0].try_write().is_ok());
+    }
+
+    /// TRANSIENT contention is waited out, not skipped — the regression this
+    /// suite pins. The non-blocking form turned the persistence thread's brief
+    /// block-table reads into a permanent defrag skip (moves built, nothing
+    /// freed, every pass); blocking must acquire once the holder releases.
+    #[test]
+    fn waits_out_transient_contention_instead_of_skipping() {
+        let locks: Vec<Arc<RwLock<u32>>> = (0..3).map(|i| Arc::new(RwLock::new(i))).collect();
+        let held = locks[1].clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let g = held.write().unwrap();
+            ready_tx.send(()).unwrap();
+            // A transient hold, like a persistence-thread table read.
+            std::thread::sleep(Duration::from_millis(120));
+            drop(g);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Must block through the transient hold and then succeed.
+        let t = std::time::Instant::now();
+        let guards = lock_all(&locks).expect("must acquire after the holder releases");
+        assert_eq!(guards.len(), 3);
+        assert!(
+            t.elapsed() >= Duration::from_millis(60),
+            "should have actually waited for the transient holder"
+        );
+        drop(guards);
+        holder.join().unwrap();
+    }
+
+    /// An empty set is trivially acquirable.
+    #[test]
+    fn empty_set_acquires() {
+        let none: Vec<Arc<RwLock<u32>>> = Vec::new();
+        assert!(lock_all(&none).is_some());
     }
 }

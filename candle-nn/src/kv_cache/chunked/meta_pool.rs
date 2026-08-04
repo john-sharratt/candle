@@ -522,12 +522,19 @@ impl MetaPool {
                     .or_default()
                     .push((gid.record_idx(), bytes.as_slice()));
             }
-            let mut s = self.slabs.lock().expect("meta pool lock poisoned");
+            // Build every run's staging buffer BEFORE taking the lock. Coalescing
+            // records into runs, allocating the staging vec and gathering the
+            // bytes into it is pure host-side CPU work that needs no exclusion —
+            // only reaching `s.device[slab_idx]` does. The lock previously
+            // covered all of it, so every concurrent meta-record write serialised
+            // behind another writer's memcpy *and* its buffer construction.
+            struct Run {
+                slab_idx: usize,
+                off: usize,
+                staging: Vec<u8>,
+            }
+            let mut runs: Vec<Run> = Vec::new();
             for (slab_idx, mut recs) in by_slab {
-                let dev = match s.device.get_mut(slab_idx) {
-                    Some(d) => d,
-                    None => continue,
-                };
                 recs.sort_unstable_by_key(|(i, _)| *i);
                 let mut i = 0;
                 while i < recs.len() {
@@ -541,12 +548,31 @@ impl MetaPool {
                     for (k, (_, bytes)) in recs[i..=j].iter().enumerate() {
                         staging[k * rb..(k + 1) * rb].copy_from_slice(bytes);
                     }
-                    let off = run_start * rb;
-                    stream
-                        .memcpy_htod(&staging, &mut dev.gpu.slice_mut(off..off + run_len * rb))
-                        .w()?;
+                    runs.push(Run {
+                        slab_idx,
+                        off: run_start * rb,
+                        staging,
+                    });
                     i = j + 1;
                 }
+            }
+
+            // The copies themselves stay under the lock: issuing one needs
+            // `&mut` on the destination slab. Their ORDER and stream are
+            // unchanged — this moves host work out of the critical section, it
+            // does not reorder or defer any GPU operation. Each `staging` now
+            // outlives its copy by construction (it lives in `runs` until the
+            // function returns), which is strictly safer than the previous
+            // per-iteration temporary.
+            let mut s = self.slabs.lock().expect("meta pool lock poisoned");
+            for run in &runs {
+                let Some(dev) = s.device.get_mut(run.slab_idx) else {
+                    continue;
+                };
+                let len = run.staging.len();
+                stream
+                    .memcpy_htod(&run.staging, &mut dev.gpu.slice_mut(run.off..run.off + len))
+                    .w()?;
             }
         }
         Ok(())

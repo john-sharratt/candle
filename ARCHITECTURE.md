@@ -441,9 +441,9 @@ order decides how it reads). Design:
 
 ### 8.2 Timelines, turns, sections, collections
 
-A **turn** is one user/assistant exchange (or a repo_map cluster, or a
-code_read file scope — every ingest pipeline produces turns onto some
-layer's group). A **timeline** (`TimelineId`) is a distinct KV-bearing
+A **turn** is one user/assistant exchange (or one step of a repo_map folder
+chain, or a code_read file scope — every ingest pipeline produces turns onto
+some layer's group). A **timeline** (`TimelineId`) is a distinct KV-bearing
 projection lineage — a re-scan or fork mints a new timeline rather than
 mutating an old one, keeping provenance normalization scopes (§5.4) and KV
 sharing well-defined. A **section** is a system-prompt fragment; a
@@ -488,10 +488,17 @@ per-layer code: `ingest.rs` derives a load plan purely from the schema's
 declared structure (the `Sequence`-selection group is the live dialogue
 layer and is excluded; `repo_map` and `code_reading` are recognised by
 convention; everything else reads ChatML records from a same-named folder).
-Two pipelines matter architecturally: **`repo_scan/`** walks the workspace,
-clusters directories under a token budget, and prefills one turn pair per
-cluster onto the `repo_map` layer, refreshing only clusters whose file-name
-hash (`ClusterState`) actually changed. **`code_read/`** mints one
+Two pipelines matter architecturally: **`repo_scan/`** walks the workspace and
+mints one conversation per directory onto the `repo_map` layer, each explored as
+two `code_read`-shaped tool round-trips — list the folder, then read its
+`README`/module-doc anchor (`anchor.rs`) — the last of which **decodes** a
+two-sentence summary of what the folder is for. Keeping every decode's request
+one turn back is what holds it on task; folded into one longer chain the model
+keeps driving the tool loop instead of answering. Both tool responses are produced by running the real tools, so a
+prefilled response cannot drift from what the model sees at runtime. The unit's
+content hash (`DirState`) covers the evidence the turns actually *show* — the
+listed page plus the anchor excerpt — so a refresh re-ingests exactly the
+directories whose shown evidence moved. **`code_read/`** mints one
 conversation per file, parsed (`carve.rs`, `parsers/`) into scope-aware
 parts each contributing a prefilled `read_file` tool round-trip; files
 ingest **in parallel** (`CODE_READ_PARALLELISM` workers) while scopes within

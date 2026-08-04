@@ -1823,11 +1823,14 @@ impl ChunkedKvBacking {
                         .unwrap_or(0)
                 };
                 self.ensure_max_blocks(current_block_count + 1)?;
+                // Allocate BEFORE the guard: `alloc_block_chunks` can reach
+                // `request_global_compact`, which needs a write guard on every
+                // layer's block table. See `ensure_for_batch_entries`.
+                let cw = self.alloc_block_chunks(0, 0)?;
                 let mut state = self
                     .state
                     .write()
                     .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-                let cw = self.alloc_block_chunks(0, 0)?;
                 if let Some(Some(slot)) = state.sequences.get_mut(batch_idx) {
                     slot.push_chunk(cw);
                 }

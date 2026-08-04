@@ -399,6 +399,15 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
 // hardware but no image). `cudaFuncGetAttributes` fails exactly when no image
 // loads for the current device. The Rust side falls down its backend ladder
 // when this reports 0.
+// Failure stages encoded into the launcher's negative return code as
+// `-(stage * 1000 + cudaError)`. A bare `-(int)err` named the error but not
+// WHERE it came from, so an `InvalidConfiguration` could equally be a bad grid,
+// a shared-memory overflow, or a stale error from unrelated work.
+#define BDP_BMMA_STAGE_ALLOC 1
+#define BDP_BMMA_STAGE_MEMSET 2
+#define BDP_BMMA_STAGE_ACCUM 3
+#define BDP_BMMA_STAGE_FINALIZE 4
+
 extern "C" int bdp_bmma_supported() {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) {
@@ -455,11 +464,20 @@ extern "C" int run_bmma_bdp_scan(
         return 1;
     }
     cudaStream_t s = (cudaStream_t)stream;
+    // Discard any error left pending on this thread by unrelated earlier work.
+    // Without this the `cudaGetLastError()` calls below can pick up someone
+    // else's failure and report it as ours — a launch that never actually
+    // failed then looks like a BMMA rejection.
+    (void)cudaGetLastError();
     const size_t nc = (size_t)n_probe_tokens * n_groups * n_cases;
 
     unsigned int *d_max = nullptr;
     unsigned long long *d_sum = nullptr;
     unsigned long long *d_sq = nullptr;
+    // Which step failed, for the stage-encoded return code (see the header
+    // comment on BDP_BMMA_STAGE_*). "insufficient" told us nothing about which
+    // of six CUDA calls actually rejected the work.
+    int stage = BDP_BMMA_STAGE_ALLOC;
     cudaError_t err = cudaMallocAsync((void **)&d_max, nc * sizeof(unsigned int), s);
     if (err == cudaSuccess) {
         err = cudaMallocAsync((void **)&d_sum, nc * sizeof(unsigned long long), s);
@@ -468,6 +486,7 @@ extern "C" int run_bmma_bdp_scan(
         err = cudaMallocAsync((void **)&d_sq, nc * sizeof(unsigned long long), s);
     }
     if (err == cudaSuccess) {
+        stage = BDP_BMMA_STAGE_MEMSET;
         err = cudaMemsetAsync(d_max, 0, nc * sizeof(unsigned int), s);
     }
     if (err == cudaSuccess) {
@@ -477,6 +496,7 @@ extern "C" int run_bmma_bdp_scan(
         err = cudaMemsetAsync(d_sq, 0, nc * sizeof(unsigned long long), s);
     }
     if (err == cudaSuccess) {
+        stage = BDP_BMMA_STAGE_ACCUM;
         const dim3 grid((n_tokens + BMMA_TC - 1) / BMMA_TC, n_groups);
         bdp_bmma_accum_kernel<<<grid, 256, 0, s>>>(
             gallery_case, probe_words, page_ptr, pos_map, n_tokens,
@@ -484,6 +504,7 @@ extern "C" int run_bmma_bdp_scan(
         err = cudaGetLastError();
     }
     if (err == cudaSuccess) {
+        stage = BDP_BMMA_STAGE_FINALIZE;
         const int total = n_probe_tokens * n_groups * n_segments;
         const int blocks = (total + 255) / 256;
         bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
@@ -502,5 +523,5 @@ extern "C" int run_bmma_bdp_scan(
     if (d_sq != nullptr) {
         cudaFreeAsync(d_sq, s);
     }
-    return (err == cudaSuccess) ? 0 : -(int)err;
+    return (err == cudaSuccess) ? 0 : -(stage * 1000 + (int)err);
 }

@@ -391,7 +391,17 @@ impl Scheduler {
                 return;
             }
         };
-        let fwd_ms = t_fwd.elapsed().as_millis() as u64;
+        let fwd_elapsed = t_fwd.elapsed();
+        let fwd_ms = fwd_elapsed.as_millis() as u64;
+        // Charge the forward's FULL duration to every sequence in it — this is
+        // decode-busy time per turn, the denominator of the reported tok/s.
+        // Microseconds, so short forwards do not truncate to zero.
+        let fwd_us = fwd_elapsed.as_micros() as u64;
+        for &id in seq_ids.iter() {
+            if let Some(st) = self.active_decodes.get_mut(&id) {
+                st.decode_busy_us = st.decode_busy_us.saturating_add(fwd_us);
+            }
+        }
         super::record_phase(t_fwd, "decode_forward");
         // Decode batch = N sequences × 1 token each.
         self.wave_stats

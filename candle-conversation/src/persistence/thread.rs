@@ -70,10 +70,52 @@ pub struct PersistenceTrigger {
     /// Carries a one-shot ack sender into the loop: the next pass runs the
     /// hot→warm migration and replies on the ack once pending_warm is drained.
     flush_tx: Sender<Sender<()>>,
-    /// Live hot→warm drain backlog in bytes, stamped by the persistence loop
-    /// each pass (pre- and post-drain). The scheduler polls this to throttle
-    /// ingest admission off a leading signal. See [`Substrate::pending_warm_bytes`].
-    pending_warm_bytes: Arc<AtomicU64>,
+    /// Live drain gauges, stamped by the persistence loop each pass. The
+    /// scheduler polls them to throttle admission off a leading signal.
+    backlog: BacklogGauge,
+}
+
+/// The persistence loop's drain gauges, shared with every
+/// [`PersistenceTrigger`] handed out. Stamped each pass (pre- and post-drain);
+/// read by the scheduler's admission throttle every wave.
+///
+/// The two halves answer different questions and must not be conflated. `warm`
+/// is work the drain will get to — a deficit that admission should slow down
+/// for. `pinned` is hot KV the drain is *skipping* because it belongs to an
+/// in-flight decode's working set: it counts as evictable in the VRAM forecast
+/// but cannot be reclaimed at any price, so admission subtracts it outright
+/// rather than throttling against it.
+#[derive(Clone, Default)]
+pub struct BacklogGauge {
+    warm: Arc<AtomicU64>,
+    pinned: Arc<AtomicU64>,
+    /// Residences holding a warm copy — the purge population, stamped at the
+    /// purge gate each pass so readers never take the substrate lock.
+    warm_residents: Arc<AtomicU64>,
+    /// Byte size of the purge population, stamped alongside `warm_residents`.
+    warm_resident_bytes: Arc<AtomicU64>,
+}
+
+impl BacklogGauge {
+    /// Record this pass's readings: the drainable hot→warm deficit and the
+    /// pin-deferred bytes the drain skipped.
+    fn stamp(&self, warm: u64, pinned: u64) {
+        self.warm.store(warm, Ordering::Relaxed);
+        self.pinned.store(pinned, Ordering::Relaxed);
+    }
+
+    /// Record only the drainable deficit, leaving the pinned reading from the
+    /// last full split in place. Used at the points in a pass where the cheap
+    /// `pending_warm_bytes` sum is refreshed but the split has not been recomputed.
+    fn stamp_warm(&self, warm: u64) {
+        self.warm.store(warm, Ordering::Relaxed);
+    }
+
+    /// Record the warm-resident population (see `warm_residents`).
+    fn stamp_residents(&self, n: u64, bytes: u64) {
+        self.warm_residents.store(n, Ordering::Relaxed);
+        self.warm_resident_bytes.store(bytes, Ordering::Relaxed);
+    }
 }
 
 impl PersistenceTrigger {
@@ -107,7 +149,28 @@ impl PersistenceTrigger {
     /// drain and falls as the drain catches up, before the lagging VRAM-pressure
     /// trip ever fires.
     pub fn pending_warm_bytes(&self) -> u64 {
-        self.pending_warm_bytes.load(Ordering::Relaxed)
+        self.backlog.warm.load(Ordering::Relaxed)
+    }
+
+    /// Hot KV the drain most recently SKIPPED because it is an in-flight
+    /// decode's pinned working set. The VRAM forecast counts these bytes as
+    /// reversibly evictable, but nothing can reclaim them while the pin holds —
+    /// and they peak exactly when the drain has stalled, so admission subtracts
+    /// them from its ceiling rather than planning against them. See
+    /// [`Substrate::warm_backlog_split`].
+    pub fn pinned_undrainable_bytes(&self) -> u64 {
+        self.backlog.pinned.load(Ordering::Relaxed)
+    }
+
+    /// Residences currently holding a warm (host RAM) copy, as of the last
+    /// persistence pass — the population the warm purge draws from.
+    pub fn warm_resident_count(&self) -> u64 {
+        self.backlog.warm_residents.load(Ordering::Relaxed)
+    }
+
+    /// Bytes held by warm copies, as of the last persistence pass.
+    pub fn warm_resident_bytes(&self) -> u64 {
+        self.backlog.warm_resident_bytes.load(Ordering::Relaxed)
     }
 
     /// Test-only no-op trigger. Holds senders whose receivers are dropped
@@ -121,7 +184,7 @@ impl PersistenceTrigger {
         Self {
             tx,
             flush_tx,
-            pending_warm_bytes: Arc::new(AtomicU64::new(0)),
+            backlog: BacklogGauge::default(),
         }
     }
 }
@@ -139,9 +202,9 @@ pub struct PersistenceThread {
     trigger_tx: Sender<()>,
     flush_tx: Sender<Sender<()>>,
     shutdown_tx: Sender<()>,
-    /// Shared with the loop (which stamps it) and every [`PersistenceTrigger`]
-    /// handed out (which read it) — the live hot→warm drain backlog in bytes.
-    pending_warm_bytes: Arc<AtomicU64>,
+    /// Shared with the loop (which stamps them) and every [`PersistenceTrigger`]
+    /// handed out (which reads them) — the live drain gauges.
+    backlog: BacklogGauge,
 }
 
 impl PersistenceThread {
@@ -165,8 +228,8 @@ impl PersistenceThread {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
         let (flush_tx, flush_rx) = channel::bounded::<Sender<()>>(1);
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
-        let pending_warm_bytes = Arc::new(AtomicU64::new(0));
-        let loop_backlog = pending_warm_bytes.clone();
+        let backlog = BacklogGauge::default();
+        let loop_backlog = backlog.clone();
 
         // All persist-thread CUDA work runs on the device's primary
         // stream — selection, convert, gather, DtoH. Sharing the primary
@@ -206,7 +269,7 @@ impl PersistenceThread {
             trigger_tx,
             flush_tx,
             shutdown_tx,
-            pending_warm_bytes,
+            backlog,
         }
     }
 
@@ -223,7 +286,7 @@ impl PersistenceThread {
         PersistenceTrigger {
             tx: self.trigger_tx.clone(),
             flush_tx: self.flush_tx.clone(),
-            pending_warm_bytes: self.pending_warm_bytes.clone(),
+            backlog: self.backlog.clone(),
         }
     }
 
@@ -255,7 +318,7 @@ fn run_loop(
     trigger_rx: Receiver<()>,
     flush_rx: Receiver<Sender<()>>,
     shutdown_rx: Receiver<()>,
-    pending_warm_bytes: Arc<AtomicU64>,
+    backlog: BacklogGauge,
 ) {
     // Bind this thread to the device's CUDA context BEFORE any pinned
     // alloc — the CUDA context is per-thread on Windows and the
@@ -301,7 +364,7 @@ fn run_loop(
         // Stamp the backlog this pass is about to face (pre-drain). Held high
         // for the whole pass so the scheduler keeps ingest throttled while a
         // long drain is in flight — the conservative direction.
-        pending_warm_bytes.store(conversation.read().pending_warm_bytes(), Ordering::Relaxed);
+        backlog.stamp_warm(conversation.read().pending_warm_bytes());
 
         let run_maintenance = last_maintenance.elapsed() >= MAINTENANCE_INTERVAL;
         if run_maintenance {
@@ -315,11 +378,12 @@ fn run_loop(
             compression_policy.as_ref(),
             &mut pinned_scratch,
             run_maintenance,
+            &backlog,
         );
 
         // Re-stamp the residual backlog (post-drain) so the signal decays as
         // soon as the pass installs warm, letting admission reopen promptly.
-        pending_warm_bytes.store(conversation.read().pending_warm_bytes(), Ordering::Relaxed);
+        backlog.stamp_warm(conversation.read().pending_warm_bytes());
 
         // run_pass migrates all pending hot→warm before returning, so by here
         // the just-sealed turns hold a warm copy — signal the waiting flush.
@@ -598,6 +662,7 @@ fn run_pass(
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
     run_maintenance: bool,
+    backlog: &BacklogGauge,
 ) {
     // Cross-thread write→read barrier. This persist pass runs on the background
     // persistence thread and reads each freshly-sealed turn's K/V for the
@@ -677,6 +742,9 @@ fn run_pass(
     // read a base pointer that a concurrent `cuMemPoolTrimTo` has unmapped.
     // Dropped right after the sync (below), before install — by then the kernel
     // has retired, so the install's own arena frees are safe.
+    // LOAD-BEARING HOLD: this guard must span the whole build->launch->readback
+    // ->sync window. Shortening it to "reduce lock time" re-opens the arena
+    // base-pointer corruption it exists to prevent. Do not narrow.
     let migrate_guard = candle_nn::kv_cache::enter_migrate();
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);
@@ -818,6 +886,10 @@ fn run_pass(
     // was pin-deferred, so a healthy idle pass stays quiet.
     {
         let (dc, db, pc, pb) = conversation.read().warm_backlog_split();
+        // Stamp unconditionally so the scheduler's admission ceiling sees the
+        // pin discount fall back to zero as soon as the working set releases —
+        // a gauge that only ever rises would throttle admission forever.
+        backlog.stamp(db, pb);
         if pc > 0 {
             tracing::debug!(
                 target: "candle_conversation::persistence::tier",
@@ -962,7 +1034,7 @@ fn run_pass(
     // The warm (RAM) copies produced by Phase 1 are durable the moment
     // their cold copy lands (Phase 2 / 2.5 above), but nothing else drops
     // them: `install_cold` frees hot, never warm, and the only other
-    // `purge_warm_to_target` call site is the cold→hot recall path in
+    // `purge_warm_to_budget` call site is the cold→hot recall path in
     // `elevate_to_hot`. During a bulk ingest (calibration, repo scan)
     // there are almost no recalls — just hot→warm→cold migration — so the
     // warm tier would otherwise grow unbounded and exhaust host RAM (the
@@ -974,20 +1046,41 @@ fn run_pass(
     // are dropped. `incoming = 0`: we bound the existing footprint, not
     // reserve for an upcoming allocation.
     //
-    // Gated on this pass having actually moved KV into warm — warm only
-    // grows via the hot→warm migration above, and a pass that produced
-    // none can't have pushed RAM up, so an idle tick skips the sysinfo
-    // query entirely.
-    if hot_to_warm_count > 0 || warm_to_cold_count > 0 {
+    // Gated on there BEING warm to purge, not on this pass having produced it.
+    // The migration above is not warm's only producer: `elevate_to_hot` lands a
+    // cold recall as `hot + warm`, and the resume path installs warm directly. A
+    // gate on "did this pass migrate?" therefore goes silent in exactly the state
+    // that most needs the purge — a workspace whose hot→warm and warm→cold sets
+    // have both drained to empty while recalls keep pushing warm bytes back into
+    // RAM. That state pins free RAM under the floor indefinitely, which the
+    // scheduler reads as permanent host-RAM pressure and answers by throttling
+    // admission to its floor, forever, against a cause VRAM admission cannot
+    // move. Gating on the warm population instead costs one OS query per pass
+    // whenever anything is warm, and `purge_warm_to_budget` is a no-op while warm
+    // is comfortable.
+    // Bound to a local so the read guard is unambiguously dropped before the
+    // block below takes the WRITE side. An `if` condition is a temporary scope so
+    // the inline form is also correct — but `match`/`if let` scrutinees are NOT,
+    // and that one-word difference is exactly what produced the recursive-read
+    // self-deadlock in `inject_sealed_turn`. Too sharp an edge to leave implicit
+    // directly above a `conversation.write()`.
+    let (warm_resident, warm_bytes) = {
+        let read = conversation.read();
+        (read.warm_resident_count(), read.warm_resident_bytes())
+    };
+    backlog.stamp_residents(warm_resident as u64, warm_bytes);
+    if warm_resident > 0 {
         let mut sys = System::new();
         sys.refresh_memory();
-        let total_ram = sys.total_memory();
-        let available_ram = sys.available_memory();
-        // `purge_warm_to_target` logs its own batch summary (see substrate.rs);
-        // no extra log here.
+        // Budget-based purge: warm may hold up to what RAM affords after the OS
+        // buffer, pinned pools, and fully-reserved weights. A zero budget means
+        // this machine cannot afford a standing warm tier — everything
+        // cold-backed drains straight out. `purge_warm_to_budget` logs its own
+        // batch summary (see substrate.rs).
+        let budget = candle::vram::host_ram_budget(sys.total_memory());
         let _ = conversation
             .write()
-            .purge_warm_to_target(0, available_ram, total_ram);
+            .purge_warm_to_budget(budget.kv_warm_budget_bytes, 0);
     }
 
     // ── Phase 3: fsync ─────────────────────────────────────────────────

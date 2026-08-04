@@ -20,6 +20,7 @@
 pub mod balloon;
 mod budget;
 mod diag;
+mod host_probe;
 mod managed;
 pub mod reading;
 mod relief;
@@ -31,6 +32,9 @@ mod probe_dxgi;
 
 pub use budget::{GovernorConfig, LadderTier};
 pub use diag::{BudgetRow, BudgetTable};
+pub use host_probe::{
+    host_perf, host_ram_budget, host_ram_budget_from, pages_in_per_sec, HostPerf, HostRamBudget,
+};
 pub use managed::is_oom;
 pub use reading::{BudgetWatchHandle, ProbeKind, VramProbe, VramReading};
 pub use relief::{KvReliefDriver, ReliefHandle, ReliefOutcome, ReliefRequest, ReliefResult};
@@ -440,6 +444,76 @@ fn guarded_pool_trim(mut trim: impl FnMut()) {
 /// Remove the governor for `gpu_id` (test cleanup).
 pub fn remove(gpu_id: usize) {
     registry().lock().unwrap().remove(&gpu_id);
+}
+
+// ── Host-pinned gauge ────────────────────────────────────────────────────────
+// Process-wide tally of host RAM held in NON-PAGEABLE pinned allocations
+// (`cuMemAllocHost` pools — the MoE expert host tier is the dominant one, 11 GB
+// on the current dev box). Pinned memory is invisible to per-allocation
+// accounting downstream but is exactly the bytes a host-RAM availability
+// measurement must treat as structural: it can never be paged or reclaimed, so
+// "available < floor" while this is large is a permanent condition, not
+// pressure. Lives here (not in the allocating crate) because the gauge must be
+// readable from CPU-only builds — the memory report is built unconditionally,
+// while the allocators are `cfg(cuda)`.
+
+static HOST_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record `bytes` of newly allocated host-pinned memory.
+pub fn note_host_pinned_alloc(bytes: u64) {
+    HOST_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` of host-pinned memory returned to the OS.
+pub fn note_host_pinned_free(bytes: u64) {
+    let mut cur = HOST_PINNED_BYTES.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(bytes);
+        match HOST_PINNED_BYTES.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Total host-pinned bytes currently allocated process-wide.
+pub fn host_pinned_bytes() -> u64 {
+    HOST_PINNED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Size of the mmap-backed model weights, recorded once at load.
+///
+/// The host-RAM budget treats the weights as FULLY RESERVED even though they
+/// are file-backed: letting the OS evict weight pages to make room for warm KV
+/// trades cheap-tier capacity for hard faults on the inference path, which is
+/// the one exchange the budget exists to forbid. (Only when the weights exceed
+/// `total − buffer` do they get capped — a machine that cannot hold its model
+/// resident must swap by definition, and the budget accepts it explicitly
+/// rather than pretending otherwise.)
+static WEIGHTS_MMAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record the mmap-backed weight size (called at model load; last write wins).
+///
+/// `bytes` must be the WHOLE model's mapped size, not one file's. Last-write-wins
+/// is what makes a model swap replace the old figure instead of accumulating
+/// across loads, and it is correct today because the GGUF loader maps a single
+/// file. A multi-part loader must therefore sum its shards and call this once —
+/// calling per shard would leave the gauge holding only the last one, and the
+/// host-RAM budget under-reserves the weights in exact proportion, handing the
+/// shortfall to warm KV as budget it does not have. That failure is silent: no
+/// error, just weight pages evicted and hard faults on the inference path.
+pub fn note_weights_mmap(bytes: u64) {
+    WEIGHTS_MMAP_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The recorded mmap-backed weight size, 0 before any model load.
+pub fn weights_mmap_bytes() -> u64 {
+    WEIGHTS_MMAP_BYTES.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

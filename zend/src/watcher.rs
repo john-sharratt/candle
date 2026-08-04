@@ -8,7 +8,7 @@
 //! short window, then asks the session to re-walk and decide whether
 //! a refresh is actually warranted — content edits short-circuit on
 //! file-content hash equality, and repo-map refresh short-circuits
-//! on per-cluster file-name hash equality.
+//! on per-directory content-hash equality.
 //!
 //! Events that can't move either hash record (file access, pure
 //! permission / xattr changes) are filtered out before they reach

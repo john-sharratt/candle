@@ -16,6 +16,7 @@ pub mod config;
 pub mod conv_file_store;
 pub mod conv_files;
 pub mod ingest;
+pub mod ingest_report;
 pub mod loading;
 pub mod log_broadcast;
 pub mod log_line;

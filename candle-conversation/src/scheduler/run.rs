@@ -1,3 +1,4 @@
+use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::prefill::VramPhase;
 use super::*;
 use std::time::{Duration, Instant};
@@ -127,7 +128,7 @@ impl Scheduler {
     /// time-sliced decode quantum adapts to newly-queued conversations and keeps KV
     /// bounded across a long slice without waiting for the quantum to end. Mirrors
     /// the top-of-loop admission (`drain` → `promote` → `pump`) under the identical
-    /// `admit_window`/VRAM cap, plus the per-wave ingest throttle + gentle demote.
+    /// `admit_budget`/VRAM cap, plus the per-wave ingest throttle + gentle demote.
     ///
     /// Returns `false` if the drain observed shutdown/disconnect: the request is
     /// already consumed here (so the top-of-loop drain can't re-read it), so the
@@ -354,34 +355,35 @@ impl Scheduler {
             self.regulate_ingest_admission();
             self.demote_cold_ingest_if_pressured();
 
-            // AIMD reopen (non-ingest): if a prior pressure episode narrowed the
-            // admission window, probe it back open by one slot per loop once VRAM
-            // is no longer under pressure — gradual recovery so we don't snap to
-            // full width and re-trip on the next wide wave. Gated on the window
-            // being closed so the steady state never pays the VRAM query. Ingest
-            // is excluded here: its window is driven from the drain backlog at the
-            // wave cadence below (`regulate_ingest_admission`), and a per-loop
-            // reopen would fight that throttle.
+            // AIMD reopen (non-ingest): if a prior pressure episode cut the
+            // admission budget, probe it back open by one quantum per loop once
+            // VRAM is no longer under pressure — gradual recovery so we don't
+            // snap to full width and re-trip on the next wide wave. Gated on the
+            // budget being below the live ceiling so the steady state never pays
+            // the VRAM query twice. Ingest is excluded here: its budget is driven
+            // from the drain backlog at the wave cadence below
+            // (`regulate_ingest_admission`), and a per-loop reopen would fight
+            // that throttle.
             //
             // Under CHRONIC nominal pressure (a card whose steady-state
             // availability sits just under the band — e.g. the expert-resident
             // budget leaves KV a couple hundred MiB short of it), the
-            // pressure-clear path never fires and the window wedges at the
+            // pressure-clear path never fires and the budget wedges at the
             // floor, serializing e.g. section calibration into single-sequence
             // mini-forwards. The evidence path reopens it anyway: every check
             // that finds NEW prefill tokens forwarded OOM-free counts one
             // streak tick (idle loop iterations neither count nor reset — the
             // loop spins far faster than forwards complete), and a full streak
-            // grows the window one notch. Any shrink (real OOM, eviction
+            // grows the budget one quantum. Any cut (real OOM, eviction
             // survival) resets the streak — multiplicative decrease still wins.
-            if self.admit_window < Self::MAX_PREFILL_WIDTH && self.ingest_timelines.is_empty() {
+            if self.ingest_timelines.is_empty() && self.admit_budget < Self::max_admit_budget() {
                 if !self.vram_under_pressure() {
                     self.admit_grow_streak = 0;
-                    self.grow_admit_window();
+                    self.raise_admit_budget(ThrottleReason::Throughput);
                 } else {
                     // A tick requires a real VOLUME of new tokens, not just
                     // any completion: three 25-token interactive turns are not
-                    // evidence that a wider window survives this pressure.
+                    // evidence that a wider budget survives this pressure.
                     // Small forwards accumulate toward the floor rather than
                     // being discarded (`admit_ok_tokens_seen` advances only
                     // when a tick fires).
@@ -389,16 +391,11 @@ impl Scheduler {
                     if ok >= self.admit_ok_tokens_seen + EVIDENCE_MIN_PREFILL_TOKENS {
                         self.admit_ok_tokens_seen = ok;
                         self.admit_grow_streak += 1;
-                        if self.admit_grow_streak >= INGEST_EVIDENCE_GROW_TICKS {
+                        let need =
+                            evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum()));
+                        if self.admit_grow_streak >= need {
                             self.admit_grow_streak = 0;
-                            let before = self.admit_window;
-                            self.grow_admit_window();
-                            tracing::info!(
-                                target: "candle_conversation::scheduler::timing",
-                                admit_window = self.admit_window,
-                                was = before,
-                                "admission window reopened on throughput evidence under nominal pressure"
-                            );
+                            self.raise_admit_budget(ThrottleReason::Throughput);
                         }
                     }
                 }
@@ -467,6 +464,9 @@ impl Scheduler {
                     (reserved_mib, total_mib, free_mib, weights_mib),
                     slots,
                 );
+                // Same cadence: publish the full memory report (global slot for
+                // `GET /v1/memory` + one JSON debug line). See `memory_report`.
+                self.publish_memory_report();
                 // Return freed KV VRAM to the OS every wave. FIRST release
                 // now-empty arenas: compression (hot→warm) and eviction leave
                 // arenas fully free but still *reserved*, and the async pool never
@@ -516,7 +516,7 @@ impl Scheduler {
             // Livelock guard. If this wave had NO runnable forward work of any class,
             // yet the idle `recv` above did not block (some queue is non-empty), then
             // work exists that this thread cannot clear by spinning. During ingest a
-            // hot→warm backlog clamps `admit_window` to zero (`regulate_ingest_admission`),
+            // hot→warm backlog cuts `admit_budget` to the floor (`regulate_ingest_admission`),
             // so queued prefills/sections can't be admitted and every width reads 0.
             // Busy-spinning here burns a core AND continuously re-takes the conversation
             // read lock, starving the persistence thread's install-warm WRITE lock — so

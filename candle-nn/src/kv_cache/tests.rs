@@ -1182,6 +1182,42 @@ fn test_kv_format_float_variants() {
     assert_eq!(bf16_fmt.bytes_per_elem(), 2.0);
 }
 
+/// `bytes_per_block` is the exact integer counterpart of `bytes_per_elem`, and
+/// must agree with the block layouts byte for byte — VRAM accounting rounds to
+/// whole blocks, and a quantized block's size does not divide its element count.
+#[test]
+fn test_kv_format_bytes_per_block() {
+    use crate::kv_cache::{KvFormat, QuantFormat};
+    use candle::DType;
+
+    // Float formats: dtype width across all 32 elements.
+    assert_eq!(KvFormat::Float(DType::F32).bytes_per_block(), 128);
+    assert_eq!(KvFormat::Float(DType::F16).bytes_per_block(), 64);
+    assert_eq!(KvFormat::Float(DType::BF16).bytes_per_block(), 64);
+
+    // Quantized formats delegate to the block layout: d:f16 + 32 nibbles = 18,
+    // d:f16 + 32 i8 = 34, and R16's per-element d:f16 + q:u16 = 128.
+    assert_eq!(KvFormat::Quantized(QuantFormat::Q4_0).bytes_per_block(), 18);
+    assert_eq!(KvFormat::Quantized(QuantFormat::Q8_0).bytes_per_block(), 34);
+    assert_eq!(KvFormat::Quantized(QuantFormat::R16).bytes_per_block(), 128);
+
+    // Every format agrees with its own float ratio — the two accessors are the
+    // same quantity, so they must not be able to drift apart.
+    use strum::IntoEnumIterator;
+    let all = [DType::F32, DType::F16, DType::BF16, DType::F8E4M3]
+        .into_iter()
+        .map(KvFormat::Float)
+        .chain(QuantFormat::iter().map(KvFormat::Quantized));
+    for fmt in all {
+        let ratio = fmt.bytes_per_block() as f32 / CHUNK_SIZE as f32;
+        assert!(
+            (ratio - fmt.bytes_per_elem()).abs() < 1e-6,
+            "{fmt:?}: {ratio} != {}",
+            fmt.bytes_per_elem()
+        );
+    }
+}
+
 #[test]
 fn test_kv_format_quantized_variants() {
     use crate::kv_cache::{KvFormat, QuantFormat};

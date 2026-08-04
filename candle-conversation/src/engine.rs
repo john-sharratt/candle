@@ -626,6 +626,19 @@ impl ConversationEngine {
         self.conversation.find_timelines_by_metadata(key, value)
     }
 
+    /// [`Self::find_conversations_by_metadata`] plus tombstoned conversations
+    /// that carry a distillation mode — the provenance corpus, whose designed
+    /// end state is archived + distilled + tombstoned. Ordinary tombstones stay
+    /// excluded. Used by the calibration resume filter.
+    pub fn find_conversations_by_metadata_including_distilled(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Vec<TimelineId> {
+        self.conversation
+            .find_timelines_by_metadata_including_distilled(key, value)
+    }
+
     /// One-pass snapshot of the distinct `custom[key]` values across live
     /// conversations — for O(1) resume-cache membership probing.
     pub fn conversation_metadata_values(&self, key: &str) -> std::collections::HashSet<String> {

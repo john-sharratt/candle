@@ -1,15 +1,17 @@
 //! Indirection between the workspace-ingestion paths and the
 //! underlying [`candle_conversation::Sequence`].
 //!
-//! One operation is abstracted: **`insert_prefill_turn(user, assistant)`**
-//! — prefill a complete user/assistant exchange with no decode.  The
-//! repo_map layer's cluster listings and the per-part prefilled halves of
-//! the code_reading layer's per-file tool-call conversation (the user-side
-//! "Read X lines A-B." prompt + the assistant-side `<tool_call>` echo, and
-//! the user-side `<tool_response>` carrying the file content) all flow
-//! through this method. Per-file summaries are NOT decoded here — they are
-//! the async summary tree's rollup, built by the summariser over the
-//! recorded scope turns.
+//! Two operations are abstracted:
+//!
+//! * **`insert_prefill_turn(user, assistant)`** — prefill a complete
+//!   user/assistant exchange with no decode. The prefilled halves of a tool
+//!   round-trip (the user-side request or `<tool_response>`, the assistant-side
+//!   `<tool_call>` echo) flow through this.
+//! * **`ingest_chain` / `ingest_scope_roundtrip`** — a tool round-trip whose
+//!   LAST assistant turn is DECODED: the `code_reading` layer's per-scope
+//!   summary (two turns) and the `repo_map` layer's per-folder summary (three).
+//!   Per-file summaries are NOT decoded here — they are the async summary
+//!   tree's rollup, built by the summariser over the recorded scope turns.
 //!
 //! Integration tests wire a [`RecordingTurnSink`] that captures every call
 //! into memory, so the conversation shape can be verified without loading a
@@ -46,22 +48,30 @@ pub trait InsertTurnSink {
         tags: Vec<String>,
     ) -> anyhow::Result<usize>;
 
-    /// Like [`Self::insert_prefill_turn`], but `assistant` carries `seam_marker`s
-    /// at structural boundaries (e.g. subdirectory headers). Each becomes a
-    /// self-referencing projection event so the listing's regions are
-    /// independently retrievable (see
-    /// `Conversation::insert_turn_staged_windowed`). Default: strip the markers and
-    /// fall back to a plain prefill — a sink without projection-event storage keeps
-    /// the turn, just not the sub-window seams.
-    fn insert_prefill_turn_windowed(
+    /// Ingest an N-turn tool round-trip chain whose LAST assistant turn is
+    /// DECODED — the `repo_map` folder shape. `prefilled` holds the verbatim
+    /// `(user, assistant)` pairs (a request or `<tool_response>` paired with the
+    /// `<tool_call>` it provokes); `decode_user` is the final tool response, whose
+    /// assistant half the model writes. `force_tools` names every tool the
+    /// prefilled calls refer to, so the projection carries their definitions.
+    /// Returns the tokens ingested.
+    ///
+    /// Default (model-less sinks, e.g. tests): record every turn with an empty
+    /// final assistant half — no engine to decode it.
+    fn ingest_chain(
         &mut self,
-        user: &str,
-        assistant_with_seams: &str,
-        seam_marker: &str,
+        prefilled: &[(String, String)],
+        decode_user: &str,
         tags: Vec<String>,
-    ) -> anyhow::Result<()> {
-        self.insert_prefill_turn(user, &assistant_with_seams.replace(seam_marker, ""), tags)?;
-        Ok(())
+        _max_summary_tokens: usize,
+        _force_tools: &[String],
+    ) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        for (user, assistant) in prefilled {
+            total += self.insert_prefill_turn(user, assistant, tags.clone())?;
+        }
+        total += self.insert_prefill_turn(decode_user, "", tags)?;
+        Ok(total)
     }
 
     /// Ingest one code scope as a TOOL ROUND-TRIP of two coupled turns — the
@@ -117,19 +127,6 @@ pub trait InsertTurnSink {
         }
         Ok(())
     }
-
-    /// Restart-resume cache probe: whether some conversation in the
-    /// substrate already carries `key == value` in its `custom` metadata
-    /// (i.e. this unit was ingested in a prior run and reloaded from the
-    /// redo log). Default `false` — non-substrate sinks never cache-hit.
-    fn unit_cached(&self, _key: &str, _value: &str) -> bool {
-        false
-    }
-
-    /// Tag the underlying conversation with `tags` (content hash + rich
-    /// descriptive fields) so a later run's [`Self::unit_cached`] finds it.
-    /// Default no-op for sinks without a backing conversation.
-    fn tag_unit(&self, _tags: &std::collections::BTreeMap<String, String>) {}
 }
 
 /// Sink that drives a live [`Sequence`] — the daemon's production
@@ -146,16 +143,23 @@ impl<'a> SequenceTurnSink<'a> {
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
-    fn insert_prefill_turn_windowed(
+    fn ingest_chain(
         &mut self,
-        user: &str,
-        assistant_with_seams: &str,
-        seam_marker: &str,
+        prefilled: &[(String, String)],
+        decode_user: &str,
         tags: Vec<String>,
-    ) -> anyhow::Result<()> {
+        max_summary_tokens: usize,
+        force_tools: &[String],
+    ) -> anyhow::Result<usize> {
         self.inner
-            .insert_turn_staged_windowed(user, assistant_with_seams, seam_marker, tags)
-            .map_err(|e| anyhow::anyhow!("insert_turn_staged_windowed: {e}"))
+            .ingest_roundtrip_chain(
+                prefilled,
+                decode_user,
+                tags,
+                max_summary_tokens,
+                force_tools,
+            )
+            .map_err(|e| anyhow::anyhow!("ingest_roundtrip_chain: {e}"))
     }
 
     fn insert_prefill_turn(
@@ -301,22 +305,6 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             drop(forks);
         }
         Ok(())
-    }
-
-    fn unit_cached(&self, key: &str, value: &str) -> bool {
-        !self
-            .inner
-            .find_conversations_by_metadata(key, value)
-            .is_empty()
-    }
-
-    fn tag_unit(&self, tags: &std::collections::BTreeMap<String, String>) {
-        if let Err(e) = self.inner.set_metadata_many(tags) {
-            tracing::warn!(
-                target: "zend::turn_sink",
-                "failed to tag conversation metadata (resume cache): {e:#}",
-            );
-        }
     }
 }
 

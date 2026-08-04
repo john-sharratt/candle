@@ -823,7 +823,15 @@ impl BatchedInferenceSession {
         let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
         // Ensure backings are sized for the upcoming decode write so the
         // slot's chunks reflect the post-write layout when we read them.
-        self.backings[0].ensure_for_batch_entries(&seq_offsets, 1)?;
+        //
+        // ALL layers at once, and once per decode step — not once per layer. The
+        // plan is layer-invariant (this position map is itself built from layer 0
+        // and applied to every layer), so `ensure_for_batch_entries_all` decides
+        // from the first backing and only walks the rest when work is actually
+        // needed. Per-layer, this cost 48 lock acquisitions and 48 tail-predicate
+        // passes per decoded token, in a steady state where the answer is almost
+        // always "nothing to allocate".
+        ChunkedKvBacking::ensure_for_batch_entries_all(&self.backings, &seq_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
             let entry_start = pm_flat.len();
             pm_seq_byte_offsets.push(entry_start * 4);
@@ -888,12 +896,8 @@ impl BatchedInferenceSession {
         let mut saw_slot_reuse = false;
 
         for layer_idx in 0..self.num_layers {
-            // Ensure the write chunk for each sequence is allocated before reading
-            // metadata. At chunk boundaries the write chunk does not exist yet
-            // (it is allocated lazily inside paged_decode_attention), so we must
-            // pre-allocate it here so the GPU buffer reflects the correct
-            // new write chunk rather than the previous sealed tail.
-            self.backings[layer_idx].ensure_for_batch_entries(&seq_offsets, 1)?;
+            // Capacity for the upcoming write is ensured for EVERY layer above,
+            // before this loop — see `ensure_for_batch_entries_all`.
 
             let arena_info = self.backings[layer_idx].resolve_arena_info()?;
 
@@ -1414,6 +1418,21 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// [`Self::release_empty_arenas`] with the anti-churn free-headroom guard
+    /// bypassed, for callers that only run under VRAM pressure (the relief
+    /// ladder, the footprint reclaim). Same topology guard and quiesce.
+    pub fn release_empty_arenas_forced(&self) -> Result<usize> {
+        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
+            return Ok(0);
+        };
+        self.device.synchronize()?;
+        let mut total_freed = 0;
+        for backing in &self.backings {
+            total_freed += backing.release_empty_arenas_forced()?;
+        }
+        Ok(total_freed)
+    }
+
     /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
     /// query failure. Drives the scheduler's VRAM-pressure admission gate.
     pub fn vram_free_total(&self) -> Option<(usize, usize)> {
@@ -1464,6 +1483,24 @@ impl BatchedInferenceSession {
     /// bytes the pool has reserved from the OS. `reserved - used` is held but
     /// reusable; `reserved` is why the driver's `free` reads near zero. The
     /// real diagnostic for "what's using VRAM". `None` on non-CUDA / failure.
+    /// The formats live (unsealed) KV chunks occupy — see
+    /// [`candle_nn::kv_cache::active_kv_formats`]. Admission prices candidates
+    /// in THESE, not the configured sealed formats.
+    pub fn active_kv_formats(
+        &self,
+    ) -> (candle_nn::kv_cache::KvFormat, candle_nn::kv_cache::KvFormat) {
+        candle_nn::kv_cache::active_kv_formats(
+            self.config.k_format,
+            matches!(self.device, Device::Cuda(_)),
+        )
+    }
+
+    /// Bytes a new KV arena may still take before the allocator refuses — see
+    /// [`candle_nn::kv_cache::kv_alloc_headroom`]. Admission clamps to this.
+    pub fn kv_alloc_headroom(&self) -> Option<usize> {
+        candle_nn::kv_cache::kv_alloc_headroom(&self.device)
+    }
+
     pub fn vram_pool_stats(&self) -> Option<(usize, usize)> {
         #[cfg(feature = "cuda")]
         {
@@ -3346,6 +3383,28 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             .collect();
 
         let mut caches_data = session.caches_for_sequences_mut(&all_seqs);
+        // `caches_for_sequences_mut` SILENTLY skips slots that are `None`, so a
+        // sequence released between wave-group formation and this forward yields a
+        // short `contexts`. That used to surface ~100 lines later as
+        // `group bounds exceed batch` — a `checked_sub` underflow of
+        // `contexts.len() - (n_decode + n_prefill)` — which names neither the real
+        // fault nor the sequence responsible. Fail here instead, where the missing
+        // slots are still known. (A duplicate index in `all_seqs` collapses the
+        // same way, since the lookup is set-based; this catches that too.)
+        if caches_data.len() != all_seqs.len() {
+            let live: std::collections::HashSet<usize> =
+                caches_data.iter().map(|(i, _, _)| *i).collect();
+            let missing: Vec<usize> = all_seqs
+                .iter()
+                .copied()
+                .filter(|s| !live.contains(s))
+                .collect();
+            candle::bail!(
+                "forward_wave: {} sequences requested but only {} have live slots                  (missing/duplicated: {missing:?}) — the wave group named a sequence                  the scheduler has since released",
+                all_seqs.len(),
+                caches_data.len(),
+            );
+        }
         let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(all_seqs.len());
         for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
             contexts.push(SequenceContext {

@@ -1,7 +1,7 @@
 //! Raw ChatML ingestion — the "raw" loading mode.
 //!
 //! Reads every file under a content folder, parses its ChatML records, and
-//! prefills them into a projection layer as turns — with **no** clustering,
+//! prefills them into a projection layer as turns — with **no** grouping,
 //! carving, or summarisation. Where the deterministic modes (`repo_scan`,
 //! `code_read`) derive structure from source code, raw mode holds conversation
 //! records verbatim: a file of `<|im_start|>role … <|im_end|>` blocks becomes a

@@ -21,6 +21,7 @@ mod conv_file_store;
 mod conv_files;
 mod download;
 mod ingest;
+mod ingest_report;
 mod loading;
 mod log_broadcast;
 mod log_file;

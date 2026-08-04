@@ -1,7 +1,13 @@
+use super::admission::{
+    admit_quantum, available_bytes, backlog_admit_action, budget_notches, decode_reserve_bytes,
+    evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes, plan_admission,
+    prefill_cost_bytes, BacklogAction, BandParams, ThrottleReason,
+};
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
+use candle::vram::Criticality;
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 
@@ -168,6 +174,13 @@ const FOOTPRINT_HYSTERESIS: usize = 256 * 1024 * 1024;
 /// its own site instantly.
 const PROMOTE_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Minimum wall-clock between "admitted nothing" throttle traces. The admission
+/// pass runs many times a second, and a queue the budget won't take reproduces
+/// the same line every iteration until the budget or the queue moves — without a
+/// cooldown a single throttled ingest floods the log at the loop rate. Passes
+/// that DID admit are never suppressed: their rate is bounded by real work.
+const ADMIT_STARVED_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn env_pct(var: &str, default: usize, max: usize) -> usize {
     std::env::var(var)
         .ok()
@@ -228,19 +241,23 @@ fn ingest_sync_ceiling_pct() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_pct("CANDLE_INGEST_SYNC_CEILING_PCT", 25, 80))
 }
-/// Free host RAM (as a % of total) below which ingest admission throttles to
-/// protect the hot→warm migration. The warm (RAM) KV tier grows as sealed turns
-/// migrate off the GPU; if it outpaces warm→cold demotion it exhausts host RAM
-/// and the migration's contiguous staging buffer can't be allocated (the OOM
-/// that aborted a full overnight load). Kept deliberately **below** the warm
-/// purge's own free target (`max(2 GiB, 5% × total)`) so it fires only when the
-/// purge has fallen behind, not in steady state. Floored at 2 GiB — several
-/// 512 MiB migration batches of headroom. Env `CANDLE_INGEST_HOST_RAM_FLOOR_PCT`,
-/// default 2, clamped to 20.
-fn host_ram_floor_bytes(total_ram: u64) -> u64 {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let pct = *V.get_or_init(|| env_pct("CANDLE_INGEST_HOST_RAM_FLOOR_PCT", 2, 20)) as u64;
-    std::cmp::max(2 * 1024 * 1024 * 1024, total_ram / 100 * pct)
+/// Slack the warm PIPELINE may hold above the standing budget: hot→warm output
+/// that exists only while the drain moves it to cold. On a zero-budget machine
+/// this is the only warm residency there ever is, and cutting admission for it
+/// would recreate the ratchet-to-the-floor failure — the drain clears it in a
+/// pass. The throttle fires only when `resident + pending` exceeds
+/// `budget + slack`, i.e. when the drain is genuinely not keeping up. Default
+/// 1 GiB; override with `CANDLE_WARM_PIPELINE_SLACK_MB`.
+pub(super) fn warm_pipeline_slack_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb = std::env::var("CANDLE_WARM_PIPELINE_SLACK_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(1024);
+        mb * 1024 * 1024
+    })
 }
 /// Minimum spacing between OS memory probes for host-RAM backpressure —
 /// `sysinfo` is a syscall, so the scheduler caches the reading between waves.
@@ -385,11 +402,11 @@ impl Scheduler {
                 (freed, deepest, flushed, evicted, compressed, released)
             } else {
                 // Non-CUDA / no governor: direct cheapest-first ladder.
-                let mut released = self.session.release_empty_arenas().unwrap_or(0);
+                let mut released = self.session.release_empty_arenas_forced().unwrap_or(0);
                 self.trim_kv_pool();
                 if self.vram_under_pressure_for(phase) && self.session.can_reclaim_arena() {
                     let _ = self.session.defragment_bounded(compact_base_moves());
-                    released += self.session.release_empty_arenas().unwrap_or(0);
+                    released += self.session.release_empty_arenas_forced().unwrap_or(0);
                     self.trim_kv_pool();
                 }
                 let mut flushed = false;
@@ -400,7 +417,7 @@ impl Scheduler {
                             .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT)
                     });
                     evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
-                    released += self.session.release_empty_arenas().unwrap_or(0);
+                    released += self.session.release_empty_arenas_forced().unwrap_or(0);
                     self.trim_kv_pool();
                 }
                 // No governor ⇒ non-CUDA / no compress-to-free (quantize is CUDA-only).
@@ -490,60 +507,264 @@ impl Scheduler {
         );
     }
 
+    /// Bytes one 32-token KV block costs across the whole model, in the formats
+    /// a **live** sequence actually occupies — the unit every admission cost is
+    /// quoted in. See [`per_block_kv_bytes`].
+    ///
+    /// ACTIVE formats, not the configured sealed ones: a block only reaches
+    /// `k_format`/`v_format` once its turn seals and quantizes, and admission is
+    /// deciding whether a sequence fits while it is running. Pricing the sealed
+    /// pair understated the working set by ~3.7x (192 B/block active vs 52 B
+    /// sealed), so admission cleared batches whose real KV was several GiB and
+    /// the allocator then refused them one arena at a time. See
+    /// [`candle_nn::kv_cache::active_kv_formats`].
+    fn per_block_kv_bytes(&self) -> u64 {
+        let (k, v) = self.session.active_kv_formats();
+        per_block_kv_bytes(
+            self.session.num_layers(),
+            self.session.n_kv_head(),
+            self.session.head_dim(),
+            k,
+            v,
+        )
+    }
+
+    /// What the card can actually deliver to admission right now — the live
+    /// ceiling [`Scheduler::admit_budget`] is clamped to on every read.
+    ///
+    /// Honest allocatable bytes plus reversibly-evictable KV, minus the hot KV
+    /// the drain is skipping because it is pinned, minus the load-phase reserve
+    /// band. The pinned discount is what keeps the forecast from reading its most
+    /// optimistic exactly when the hot→warm drain has stalled: those bytes are
+    /// counted as evictable but cannot be reclaimed at any price.
+    ///
+    /// Without a governor (non-CUDA) there is no evictable estimate to add, so
+    /// this degrades to the pool-budget availability less the band.
+    pub(super) fn admit_budget_ceiling(&self) -> u64 {
+        // No forward reserve is subtracted here: it is width-dependent, and
+        // `plan_admission` holds it back at the width it is choosing. See
+        // `admit_band_params`.
+        let pinned = self.persist_trigger.pinned_undrainable_bytes();
+
+        // Room a NEW arena can come from: the device total minus what the pool has
+        // ALREADY reserved. This clamp is the difference between admission and the
+        // relief ladder.
+        //
+        // `VramGovernor::available()` is `headroom + pool reuse gap`, which is the
+        // right number for relief (eviction grows the reuse pool without moving
+        // DXGI headroom) and the WRONG one for admission. A prefill needs *fresh*
+        // arenas — `try_claim_run` only takes contiguous never-used slots at the
+        // high-water mark — and the reuse gap cannot back one. Worse, once the pool
+        // nears the card, that gap is exactly the part WDDM has spilled to host
+        // memory, so counting it admits work whose KV then pages over PCIe.
+        //
+        // Measured: admission read `available=3045 MiB` from the reuse gap while
+        // `vram_free=0` and `reserved=15168` of `16375`; it admitted six prefills,
+        // decode fell to ~3 tok/s on paged KV, arena creation failed, and the run
+        // aborted. `vram_under_pressure_for` already documents this trap — the
+        // budget accounting "still reads GiBs free" while the card is spilling.
+        let unreserved = match (
+            self.session.vram_free_total(),
+            self.session.vram_pool_stats(),
+        ) {
+            (Some((_, total)), Some((_, reserved))) => total.saturating_sub(reserved) as u64,
+            _ => u64::MAX,
+        };
+
+        // AND the allocator's own remaining budget. `unreserved` above bounds
+        // what the OS can still give the pool; this bounds what the arena gate
+        // will actually permit us to take (`init_free − pool_used − reserve`).
+        // They are different numbers, and admitting against the larger one is
+        // what wedged the ingest: the governor reported GiBs of driver headroom
+        // while the allocator's budget had gone NEGATIVE, so every admitted
+        // sequence's first arena creation failed. See `kv_alloc_headroom`.
+        let alloc_headroom = self
+            .session
+            .kv_alloc_headroom()
+            .map(|b| b as u64)
+            .unwrap_or(u64::MAX);
+        let unreserved = unreserved.min(alloc_headroom);
+
+        match self.session.vram_governor() {
+            Some(gov) => available_bytes(
+                gov.measure().map(|r| r.headroom).unwrap_or(0),
+                gov.evictable_estimate(Criticality::Moderate),
+                pinned,
+                unreserved,
+            ),
+            None => available_bytes(
+                self.session.vram_budget_available().unwrap_or(0) as u64,
+                0,
+                pinned,
+                unreserved,
+            ),
+        }
+    }
+
+    /// Bytes the work already in flight will still allocate this pass: every
+    /// active prefill's *remaining* tokens, plus the amortised per-step growth of
+    /// the live decodes. This is charged against the budget before anything new
+    /// is admitted — committed work is never displaced by a fresh candidate.
+    fn in_flight_cost_bytes(&self, per_block: u64) -> u64 {
+        // KV only. The transient share of in-flight sequences is priced by the
+        // reserve, which `plan_admission` evaluates at `live_width + n`.
+        let prefill: u64 = self
+            .active_prefills
+            .iter()
+            .filter(|p| p.error.is_none())
+            .map(|p| prefill_cost_bytes(p.work.tokens.len().saturating_sub(p.offset), per_block))
+            .sum();
+        let sections: u64 = self
+            .active_section_ingests
+            .iter()
+            .filter(|s| s.error.is_none())
+            .map(|s| prefill_cost_bytes(s.tokens.len().saturating_sub(s.offset), per_block))
+            .sum();
+        prefill
+            .saturating_add(sections)
+            .saturating_add(decode_reserve_bytes(self.decode_width(), per_block))
+    }
+
+    /// Admit queued prefills against the VRAM byte budget.
+    ///
+    /// A burst of small parallel scopes (code_read's worker count), a bulk
+    /// collection ingest's per-section prefills, or a batch of calibration cases
+    /// all arrive here. What coalesces into one ragged forward is whatever fits
+    /// the budget: the largest queued candidate that fits, then the rest of the
+    /// queue in submission order (see [`plan_admission`]).
+    ///
+    /// [`Scheduler::MAX_PREFILL_WIDTH`] is a backstop above this, not the
+    /// control; [`Scheduler::MIN_PREFILL_WIDTH`] keeps ≥1 in flight regardless,
+    /// so an oversized lone turn still runs and is bounded by the per-arena VRAM
+    /// gate (which compacts or fails fast rather than spilling to host memory).
     pub(super) fn promote_new_prefills(&mut self) {
-        // Ragged prefill forward width — how many in-flight prefills coalesce into
-        // one forward: a burst of small parallel scopes (code_read's worker count),
-        // a bulk collection ingest's per-section prefills (`insert_section_collection`
-        // fires one prefill per section), or a batch of calibration cases. Capped by
-        // the AIMD `admit_window`, which narrows the batch under VRAM pressure so the
-        // forward's transient peak (which scales with width) can't OOM a busy card;
-        // `MIN_PREFILL_WIDTH` keeps ≥1 in flight regardless. (Decode-side waves are
-        // bounded separately, e.g. calibration's `CALIBRATION_BATCH`.)
-        let cap = Self::MAX_PREFILL_WIDTH.min(self.admit_window.max(Self::MIN_PREFILL_WIDTH));
-        while self.active_prefills.len() < cap {
-            // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
-            // pins its conversation's KV in VRAM, so under pressure we shed hot KV
-            // to the substrate rather than piling on more concurrent prefills; if
-            // that doesn't clear it, narrow the window and leave the rest queued
-            // this pass. We always keep ≥1 prefill in flight so the engine makes
-            // progress — a single oversized turn is then bounded by the per-arena
-            // VRAM budget gate (which compacts/fails fast rather than spilling).
-            if !self.active_prefills.is_empty() && self.vram_under_pressure() {
-                if self.relieve_vram_pressure("promote", VramPhase::Load) {
-                    // Pressure survived eviction — stop piling on this pass
-                    // (the `!is_empty` guard keeps ≥1 in flight). The window
-                    // halves only on a genuine THROUGHPUT STALL, never on the
-                    // mere presence of nominal pressure: multiplicative
-                    // decrease is failure evidence, and a card whose steady
-                    // state sits just under the pressure band would otherwise
-                    // pin every bulk-prefill phase at the floor width.
-                    //
-                    // Stall detection is time-aware because this branch runs
-                    // many times a second while `PREFILL_OK_TOKENS` advances
-                    // only when a forward completes (seconds apart for wide
-                    // forwards): a stall is real only when NO forward has
-                    // completed for a full [`PROMOTE_STALL_GRACE`]. Each
-                    // elapsed grace period backs off one halving and re-arms;
-                    // a device-OOM still shrinks instantly at its own site.
-                    let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-                    if ok > self.promote_ok_tokens_seen {
-                        self.promote_ok_tokens_seen = ok;
-                        self.promote_last_progress = Some(std::time::Instant::now());
-                    }
-                    let stalled = self
-                        .promote_last_progress
-                        .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
-                    if stalled {
-                        self.shrink_admit_window();
-                        self.promote_last_progress = Some(std::time::Instant::now());
-                    }
-                    break;
+        if self.prefill_queue.is_empty() {
+            return;
+        }
+        let in_flight = self.active_prefills.len();
+        if in_flight >= Self::MAX_PREFILL_WIDTH {
+            return;
+        }
+
+        // VRAM-pressure backpressure. Each admitted prefill pins its
+        // conversation's KV in VRAM, so under pressure we shed hot KV to the
+        // substrate rather than piling on more concurrent prefills; if that
+        // doesn't clear it, leave the rest queued this pass.
+        if in_flight > 0 && self.vram_under_pressure() {
+            if self.relieve_vram_pressure("promote", VramPhase::Load) {
+                // Pressure survived eviction — stop piling on this pass (the
+                // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
+                // only on a genuine THROUGHPUT STALL, never on the mere presence
+                // of nominal pressure: multiplicative decrease is failure
+                // evidence, and a card whose steady state sits just under the
+                // pressure band would otherwise pin every bulk-prefill phase at
+                // the floor.
+                //
+                // Stall detection is time-aware because this branch runs many
+                // times a second while `PREFILL_OK_TOKENS` advances only when a
+                // forward completes (seconds apart for wide forwards): a stall is
+                // real only when NO forward has completed for a full
+                // [`PROMOTE_STALL_GRACE`]. Each elapsed grace period backs off one
+                // halving and re-arms; a device-OOM still cuts instantly at its
+                // own site.
+                let ok = super::PREFILL_OK_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+                if ok > self.promote_ok_tokens_seen {
+                    self.promote_ok_tokens_seen = ok;
+                    self.promote_last_progress = Some(std::time::Instant::now());
                 }
+                let stalled = self
+                    .promote_last_progress
+                    .is_some_and(|t| t.elapsed() >= PROMOTE_STALL_GRACE);
+                if stalled {
+                    self.cut_admit_budget(ThrottleReason::ReliefSurvived);
+                    self.promote_last_progress = Some(std::time::Instant::now());
+                }
+                return;
             }
-            let work = match self.prefill_queue.pop_front() {
-                Some(w) => w,
-                None => break,
-            };
+        }
+
+        let per_block = self.per_block_kv_bytes();
+        // Two independent limits — see `plan_admission`. `available` is what the
+        // card has and the forward reserve comes out of it; `setpoint` caps how
+        // much KV admission may add. Do not pre-combine them.
+        let available = self.admit_budget_ceiling();
+        let setpoint = self.admit_budget;
+        let live = self.in_flight_cost_bytes(per_block);
+        let live_width = self.prefill_width() + self.section_ingest_width();
+        let band = self.admit_band_params();
+        let costs: Vec<u64> = self
+            .prefill_queue
+            .iter()
+            .map(|w| prefill_cost_bytes(w.tokens.len(), per_block))
+            .collect();
+        let room = Self::MAX_PREFILL_WIDTH - in_flight;
+
+        let mut plan = plan_admission(available, setpoint, live, live_width, &costs, room, &band);
+        // Keep at least one prefill in flight even when nothing fits: an engine
+        // that admits nothing makes no progress, and the alternative to a lone
+        // oversized turn running is it never running at all. A turn forced
+        // through here is still bounded by the per-arena VRAM gate, which
+        // compacts or fails fast rather than spilling to host memory.
+        //
+        // The forced pick is the QUEUE HEAD, not the cheapest candidate.
+        // Cheapest-first looks attractive — it fits the most work into a floored
+        // budget — but under a budget that stays at the floor it becomes a
+        // starvation loop: the expensive directories are never the cheapest, so
+        // they are passed over on every pass while cheap ones keep arriving.
+        // Measured on this workload with the budget pinned at 256 MiB and a
+        // 384 MiB head: every forced admission took a 12-54 MiB candidate and no
+        // large directory ever ran. FIFO bounds each item's wait by the queue
+        // ahead of it.
+        if plan.admitted.is_empty() && in_flight < Self::MIN_PREFILL_WIDTH && !costs.is_empty() {
+            plan.spent = costs[0];
+            plan.admitted.push(0);
+            plan.skipped -= 1;
+        }
+
+        // Trace the pass whenever it admitted something — a real event, bounded in
+        // rate by how fast work actually drains. A pass that admitted NOTHING is
+        // the more interesting signal (queued work the budget won't take) but it
+        // repeats every loop iteration until the budget or the queue moves, so it
+        // is rate-limited to one line per [`ADMIT_STARVED_LOG_INTERVAL`].
+        let starved = plan.admitted.is_empty();
+        let due = self
+            .last_admit_starved_log
+            .is_none_or(|t| t.elapsed() >= ADMIT_STARVED_LOG_INTERVAL);
+        if !starved || due {
+            if starved {
+                self.last_admit_starved_log = Some(std::time::Instant::now());
+            }
+            const MIB: u64 = 1 << 20;
+            tracing::debug!(
+                target: "candle_conversation::scheduler::throttle",
+                available_mib = available / MIB,
+                setpoint_mib = setpoint / MIB,
+                live_mib = live / MIB,
+                spent_mib = plan.spent / MIB,
+                admitted = plan.admitted.len(),
+                skipped = plan.skipped,
+                in_flight,
+                head_cost_mib = costs.iter().copied().max().unwrap_or(0) / MIB,
+                reserve_mib = super::admission::reserve_for_width(
+                    live_width + plan.admitted.len(),
+                    &band,
+                ) / MIB,
+                "admission pass"
+            );
+        }
+
+        // Remove by descending index so earlier positions stay valid as we take
+        // them out of the queue.
+        let mut take = plan.admitted;
+        take.sort_unstable_by(|a, b| b.cmp(a));
+        let mut admitted: Vec<PrefillWork> = take
+            .into_iter()
+            .filter_map(|i| self.prefill_queue.remove(i))
+            .collect();
+        // …then restore submission order among the admitted set.
+        admitted.reverse();
+
+        for work in admitted {
             let total = work.tokens.len();
             let _ = work
                 .event_tx
@@ -640,16 +861,43 @@ impl Scheduler {
     /// admits a narrow batch, so the width term stays under the card fraction and
     /// the reserve is unchanged there. Clamped to a third of the card so a width
     /// spike can never strand the whole device.
+    /// The load-phase band's terms, for admission to evaluate at the width it is
+    /// choosing rather than the width already in flight. Same `base`, `per_seq`
+    /// and capacity clamp the pressure/relief gates use via
+    /// [`Self::vram_band_for`] — one reserve law, two evaluation points.
+    fn admit_band_params(&self) -> BandParams {
+        BandParams {
+            per_seq: per_seq_load_bytes() as u64,
+            capacity: self
+                .session
+                .vram_governor()
+                .map(|g| g.capacity())
+                .unwrap_or(0),
+        }
+    }
+
+    /// The band's **card-fraction term only** — the reserve held regardless of
+    /// how wide the batch is. [`Self::vram_band_for`] combines it with the
+    /// width-scaled term for the pressure/relief gates.
+    fn vram_base_band_for(&self, phase: VramPhase) -> usize {
+        let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
+            // No governor (legacy / non-WDDM path): fixed band, no capacity term
+            // to reason against.
+            return vram_budget_band();
+        };
+        match phase {
+            VramPhase::Load => (c / 10).max(vram_budget_band()),
+            VramPhase::Decode => (c / 20).max(vram_decode_band()),
+        }
+    }
+
     fn vram_band_for(&self, phase: VramPhase) -> usize {
         let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
             // No governor (legacy / non-WDDM path): fixed band, no capacity or
             // width term to reason against.
             return vram_budget_band();
         };
-        let base = match phase {
-            VramPhase::Load => (c / 10).max(vram_budget_band()),
-            VramPhase::Decode => (c / 20).max(vram_decode_band()),
-        };
+        let base = self.vram_base_band_for(phase);
         let (width, per_seq) = match phase {
             VramPhase::Load => (
                 self.prefill_width() + self.section_ingest_width(),
@@ -820,7 +1068,7 @@ impl Scheduler {
 
         // ── Defrag controller ───────────────────────────────────────────────
         if reserved > compact_ceiling {
-            let _ = self.session.release_empty_arenas();
+            let _ = self.session.release_empty_arenas_forced();
             self.trim_kv_pool();
             let (u2, r2) = self.session.vram_pool_stats().unwrap_or((used, reserved));
             // Compact only when the release+trim above didn't clear it AND the gap
@@ -851,7 +1099,7 @@ impl Scheduler {
                 let t = std::time::Instant::now();
                 compact_moves = self.session.defragment_bounded(budget).unwrap_or(0);
                 relief_trace::note("sched", "defrag", budget as u64, compact_moves as u64);
-                let _ = self.session.release_empty_arenas();
+                let _ = self.session.release_empty_arenas_forced();
                 super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
                 compact_ms = t.elapsed().as_millis() as u64;
@@ -892,7 +1140,7 @@ impl Scheduler {
                         .unwrap_or(0);
                     relief_trace::note("sched", "defrag_post_evict", 0, moves as u64);
                 }
-                let _ = self.session.release_empty_arenas();
+                let _ = self.session.release_empty_arenas_forced();
                 super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
             }
@@ -974,7 +1222,7 @@ impl Scheduler {
                         .session
                         .defragment_bounded(compact_base_moves().saturating_mul(3));
                 }
-                let _ = self.session.release_empty_arenas();
+                let _ = self.session.release_empty_arenas_forced();
                 super::timed_synchronize(&self.device);
                 self.trim_kv_pool();
             }
@@ -1110,7 +1358,7 @@ impl Scheduler {
         };
         if report.count > 0 {
             // Freed hot arenas → release + trim so `reserved` can actually fall.
-            let _ = self.session.release_empty_arenas();
+            let _ = self.session.release_empty_arenas_forced();
             self.trim_kv_pool();
             tracing::debug!(
                 target: "candle_conversation::scheduler::vram_relief",
@@ -1137,11 +1385,10 @@ impl Scheduler {
     /// true VRAM spike). No-op when nothing is ingesting — chat keeps the
     /// per-iteration AIMD recovery in the run loop. Runs at the ~2 s wave
     /// cadence, matching how often the backlog signal refreshes.
-    /// Whether free host RAM has dropped below the ingest floor
-    /// ([`host_ram_floor_bytes`]). Refreshes the cached `sysinfo` reading at most
-    /// once per [`HOST_RAM_PROBE_INTERVAL`] — never a per-wave syscall. Returns
-    /// `false` until the first probe, so a fresh scheduler never throttles blind.
-    fn host_ram_pressured(&mut self) -> bool {
+    /// Refresh the cached `sysinfo` reading at most once per
+    /// [`HOST_RAM_PROBE_INTERVAL`] — never a per-wave syscall — and return the
+    /// cached `(available, total)`. `(0, 0)` until the first probe.
+    pub(super) fn host_ram_reading(&mut self) -> (u64, u64) {
         let stale = self
             .host_ram_probe
             .map(|(t, _, _)| t.elapsed() >= HOST_RAM_PROBE_INTERVAL)
@@ -1155,30 +1402,57 @@ impl Scheduler {
                 sys.total_memory(),
             ));
         }
-        match self.host_ram_probe {
-            Some((_, available, total)) => available < host_ram_floor_bytes(total),
-            None => false,
+        self.host_ram_probe
+            .map(|(_, a, t)| (a, t))
+            .unwrap_or((0, 0))
+    }
+
+    /// Whether the warm KV tier has outgrown its host-RAM budget PLUS the drain
+    /// pipeline's slack — the condition under which slowing admission actually
+    /// helps (less sealing → less hot→warm output). This replaced the absolute
+    /// available-RAM floor, which our own resident weights held permanently
+    /// true on any machine whose model fills RAM: an untestable condition that
+    /// ratcheted the setpoint to the floor against structure, not pressure.
+    pub(super) fn warm_over_budget(&mut self) -> bool {
+        let (_, total) = self.host_ram_reading();
+        if total == 0 {
+            return false;
         }
+        let budget = candle::vram::host_ram_budget(total);
+        let usage = self
+            .persist_trigger
+            .warm_resident_bytes()
+            .saturating_add(self.persist_trigger.pending_warm_bytes());
+        usage
+            > budget
+                .kv_warm_budget_bytes
+                .saturating_add(warm_pipeline_slack_bytes())
     }
 
     pub(super) fn regulate_ingest_admission(&mut self) {
         if self.ingest_timelines.is_empty() {
             return;
         }
-        // Host-tier backpressure: if the warm (RAM) tier has driven free host RAM
-        // below the floor, throttle regardless of the VRAM backlog. The hot→warm
-        // migration needs host memory for its staging buffer; starving it stalls
-        // the whole drain. This is the leading signal the VRAM-only backlog check
-        // below cannot see (VRAM can look fine while host RAM is nearly gone).
-        if self.host_ram_pressured() {
-            self.shrink_admit_window();
+        // Host-tier backpressure: throttle only when the warm KV tier has
+        // outgrown its host-RAM budget plus the drain pipeline's slack — the one
+        // host condition slowing admission can actually relieve. (The old
+        // absolute available-RAM floor sat permanently tripped on any box whose
+        // weights fill RAM, ratcheting the setpoint against structure.)
+        if self.warm_over_budget() {
+            self.cut_admit_budget_leveled(ThrottleReason::WarmOverBudget);
             return;
         }
         let Some(capacity) = self.resident_capacity() else {
             return;
         };
-        let target = capacity / 100 * ingest_warm_backlog_pct();
-        let backlog = self.persist_trigger.pending_warm_bytes() as usize;
+        let target = (capacity / 100 * ingest_warm_backlog_pct()) as u64;
+        let backlog = self.persist_trigger.pending_warm_bytes();
+        // "Is there room to reopen?" is asked against the STATIC bound, not the
+        // live ceiling: this runs every wave, and the live ceiling costs a device
+        // query plus a walk of the registered relievers. The live clamp still
+        // happens where it matters — inside `raise_admit_budget`, and again at
+        // admission time in `promote_new_prefills`.
+        let ceiling = Self::max_admit_budget();
         // Volume-floored progress: a tick certifies the current width, which a
         // trickle of tiny forwards cannot (see `EVIDENCE_MIN_PREFILL_TOKENS`).
         // Sub-floor volume accumulates — `admit_ok_tokens_seen` advances only
@@ -1189,44 +1463,40 @@ impl Scheduler {
         if progressed {
             self.admit_ok_tokens_seen = ok_tokens;
         }
-        match super::backlog_admit_action(
+        match backlog_admit_action(
             backlog,
             target,
-            self.admit_window,
-            Self::MAX_PREFILL_WIDTH,
+            self.admit_budget,
+            ceiling,
             self.vram_under_pressure(),
         ) {
             // Drain falling behind the seal rate — throttle admission.
-            super::BacklogAction::Shrink => self.shrink_admit_window(),
-            // Drain caught up and VRAM is clear — reopen a notch.
-            super::BacklogAction::Grow => {
+            BacklogAction::Shrink => self.cut_admit_budget_leveled(ThrottleReason::WarmBacklog),
+            // Drain caught up and VRAM is clear — reopen a quantum.
+            BacklogAction::Grow => {
                 self.admit_grow_streak = 0;
-                self.grow_admit_window();
+                self.raise_admit_budget(ThrottleReason::DrainCaughtUp);
             }
             // Deadband — or growth blocked only by the pressure bit. The
-            // evidence path reopens a wedged window on proven OOM-free
-            // throughput (see `evidence_admit_grow`); a real spike still
-            // shrinks instantly and resets the streak.
-            super::BacklogAction::Hold => {
-                let (grow, streak) = super::evidence_admit_grow(
+            // evidence path reopens a wedged budget on proven OOM-free
+            // throughput (see `evidence_admit_grow`); a real spike still cuts
+            // instantly and resets the streak.
+            BacklogAction::Hold => {
+                let (grow, streak) = evidence_admit_grow(
                     backlog,
                     target,
-                    self.admit_window,
-                    Self::MAX_PREFILL_WIDTH,
+                    self.admit_budget,
+                    ceiling,
                     progressed,
                     self.admit_grow_streak,
-                    super::INGEST_EVIDENCE_GROW_TICKS,
+                    // Cost scales with the budget already held, so the climb
+                    // slows as it nears the budget that last collapsed instead
+                    // of charging it at constant speed.
+                    evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum())),
                 );
                 self.admit_grow_streak = streak;
                 if grow {
-                    let before = self.admit_window;
-                    self.grow_admit_window();
-                    tracing::info!(
-                        target: "candle_conversation::scheduler::timing",
-                        admit_window = self.admit_window,
-                        was = before,
-                        "admission window reopened on throughput evidence under nominal pressure"
-                    );
+                    self.raise_admit_budget(ThrottleReason::Throughput);
                 }
             }
         }
@@ -2452,16 +2722,18 @@ impl Scheduler {
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
-    /// wide for the card. Narrow the admission window (so subsequent waves run
-    /// smaller forwards) and surface the error on each in-batch prefill's caller
-    /// channel.
+    /// wide for the card. Cut the admission budget (so subsequent waves admit
+    /// less) and surface the error on each in-batch prefill's caller channel.
+    ///
+    /// The hardest evidence the controller gets — a forward that actually failed
+    /// — so it acts immediately here rather than waiting for the setpoint loop.
     ///
     /// `group_idxs` are the `active_prefills` positions that were in this forward;
     /// they're still valid because nothing mutates `active_prefills` between the
     /// forward returning and this call.
     fn handle_prefill_oom(&mut self, group_idxs: &[usize], err: &candle::Error) {
-        self.shrink_admit_window();
         let in_batch: HashSet<usize> = group_idxs.iter().copied().collect();
+        self.cut_admit_budget(ThrottleReason::DeviceOom);
         let msg = format!("batched prefill forward failed: {err}");
         for (i, p) in self.active_prefills.iter_mut().enumerate() {
             if in_batch.contains(&i) {
@@ -2724,6 +2996,7 @@ impl Scheduler {
                         prefill_assistant_text: work.prefill_assistant_text,
                         finished: true,
                         decode_start: Instant::now(),
+                        decode_busy_us: 0,
                         prefill_ms,
                         prefill_token_count: context_depth,
                         turn_start,
@@ -2821,6 +3094,7 @@ impl Scheduler {
                 prefill_assistant_text: work.prefill_assistant_text,
                 finished: false,
                 decode_start: Instant::now(),
+                decode_busy_us: 0,
                 prefill_ms,
                 prefill_token_count: context_depth,
                 turn_start,
@@ -2978,7 +3252,11 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
             // to the OS. No data movement, no hit-rate cost.
             Criticality::Trivial => {
                 let t = std::time::Instant::now();
-                let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
+                let arenas = self
+                    .sched
+                    .session
+                    .release_empty_arenas_forced()
+                    .unwrap_or(0);
                 self.released += arenas;
                 self.sched.trim_kv_pool();
                 let freed = arenas as u64 * ARENA_BYTES;
@@ -3006,7 +3284,11 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                         .session
                         .defragment_bounded(compact_base_moves())
                         .unwrap_or(0);
-                    let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
+                    let arenas = self
+                        .sched
+                        .session
+                        .release_empty_arenas_forced()
+                        .unwrap_or(0);
                     self.released += arenas;
                     self.sched.trim_kv_pool();
                     let freed = arenas as u64 * ARENA_BYTES;
@@ -3053,7 +3335,11 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                 let turns = self.sched.compress_pending_turns(budget);
                 let compress_ms = compress_t.elapsed().as_millis() as u64;
                 self.compressed += turns;
-                let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
+                let arenas = self
+                    .sched
+                    .session
+                    .release_empty_arenas_forced()
+                    .unwrap_or(0);
                 self.released += arenas;
                 super::timed_synchronize(&self.sched.device);
                 self.sched.trim_kv_pool();
@@ -3120,7 +3406,11 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                         .session
                         .defragment_bounded(compact_base_moves().saturating_mul(3));
                 }
-                let arenas = self.sched.session.release_empty_arenas().unwrap_or(0);
+                let arenas = self
+                    .sched
+                    .session
+                    .release_empty_arenas_forced()
+                    .unwrap_or(0);
                 self.released += arenas;
                 super::timed_synchronize(&self.sched.device);
                 self.sched.trim_kv_pool();
@@ -3151,27 +3441,15 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
 }
 
 #[cfg(test)]
-mod host_ram_floor_tests {
-    use super::host_ram_floor_bytes;
+mod warm_budget_tests {
+    use super::warm_pipeline_slack_bytes;
 
-    /// The warm purge maintains `max(2 GiB, 5% x total)` free; the ingest
-    /// throttle floor must sit at or below that so it fires only when the purge
-    /// falls behind, never in steady state (which would throttle ingest forever).
+    /// The slack exists so a zero-budget machine's transient drain traffic never
+    /// reads as over-budget — tonight's healthy pipeline peaked ~0.7 GiB.
     #[test]
-    fn floor_stays_at_or_below_purge_target() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        for &total in &[16 * GIB, 64 * GIB, 189 * GIB, 512 * GIB] {
-            let purge_target = std::cmp::max(2 * GIB, total / 20);
-            let floor = host_ram_floor_bytes(total);
-            assert!(
-                floor <= purge_target,
-                "floor {floor} must be <= purge target {purge_target} at total {total}"
-            );
-            assert!(
-                floor >= 2 * GIB,
-                "floor must keep at least 2 GiB of migration headroom"
-            );
-        }
+    fn default_slack_clears_a_healthy_drain_pipeline() {
+        let slack = warm_pipeline_slack_bytes();
+        assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
     }
 }
 

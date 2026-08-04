@@ -47,6 +47,8 @@ struct MockResolver {
     /// (group_raw, tag) → turn_raw, backing `turn_with_tag` so tests can assert
     /// the default-fallback path resolves a declared default to a real turn.
     tag_turns: HashMap<(u32, String), u32>,
+    /// Stands in for "the projection target is an append-only ingest layer".
+    ingest_self: bool,
 }
 
 impl MockResolver {
@@ -64,6 +66,13 @@ impl MockResolver {
         let idx = TurnIndex(*count);
         *count += 1;
         idx
+    }
+
+    /// Mark the projection target as an append-only ingest layer — the
+    /// conversation is generating its own content, not retrieving.
+    fn as_ingest_self(mut self) -> Self {
+        self.ingest_self = true;
+        self
     }
 
     fn with_score(mut self, group: GroupId, idx: TurnIndex, score: f32) -> Self {
@@ -141,6 +150,10 @@ impl MockResolver {
 }
 
 impl ContentResolver for MockResolver {
+    fn target_is_ingest_self(&self) -> bool {
+        self.ingest_self
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         let tl = Self::timeline_of(group);
         (0..self.turn_counts.get(&group.raw()).copied().unwrap_or(0))
@@ -739,6 +752,100 @@ layers:
 }
 
 // —— Score threshold ———————————————————————————————————————————————————————————
+
+/// An ingest conversation must see its OWN turns while it generates, even
+/// though they carry no wide-Q belief yet and so score zero.
+///
+/// This is the defect that made every `repo_map` folder summary useless: the
+/// request turn was inserted, scored 0, was filtered out by the group's band,
+/// and the decode answered "the user hasn't asked a specific question yet" with
+/// the request sitting one turn back in its own conversation.
+#[test]
+fn ingest_self_projection_sees_its_own_unscored_turns() {
+    let yaml = INGEST_GATED_YAML;
+    let b = Builder::from_yaml(yaml).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let i0 = resolver.append(grp);
+    let i1 = resolver.append(grp);
+    // Freshly inserted ingest turns: no belief yet, so zero — exactly what the
+    // group's threshold would otherwise reject.
+    let resolver = resolver
+        .with_score(grp, i0, 0.0)
+        .with_score(grp, i1, 0.0)
+        .as_ingest_self();
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert!(
+        indices.contains(&0) && indices.contains(&1),
+        "an ingest conversation must project its own turns regardless of score: {indices:?}",
+    );
+}
+
+/// The same schema and the same zero-scored turns, but the target is NOT an
+/// ingest layer — retrieval, where a turn must earn its slot. The band applies
+/// exactly as before, so dialogue pulling this content back is untouched.
+#[test]
+fn retrieval_still_gates_unscored_turns() {
+    let b = Builder::from_yaml(INGEST_GATED_YAML).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let i0 = resolver.append(grp);
+    let i1 = resolver.append(grp);
+    let resolver = resolver.with_score(grp, i0, 0.0).with_score(grp, i1, 0.0);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert!(
+        indices.is_empty(),
+        "retrieval must still gate zero-scored turns: {indices:?}",
+    );
+}
+
+/// Schema shared by the two tests above: a gated group, as both ingest layers
+/// declare (`repo_map` min_score 250, `code_reading` score_threshold 100).
+const INGEST_GATED_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+layers:
+  - name: layer
+    window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: grp
+        score_threshold: 0.6
+        selection: { kind: top_k, k: 4 }
+"#;
 
 #[test]
 fn turns_below_score_threshold_filtered() {
@@ -3208,8 +3315,11 @@ fn zend_projection_yaml_parses() {
 
     assert!(b.id_for_group("primary_conversation").is_some());
 
-    // repo_map (directory trees) declares deterministic structural content;
-    // every other layer's content is a model decode.
+    // Every layer's summary content is a model decode. `repo_map` was the one
+    // structural holdout while its turns were directory listings; it now ingests
+    // one conversation per folder ending in a decoded description of what the
+    // folder is for, so a deterministic merge of names would throw away the only
+    // thing those turns carry that a listing does not.
     let mode_of = |layer: &str| {
         let id = b.id_for_layer(layer).unwrap();
         b.schema()
@@ -3223,10 +3333,8 @@ fn zend_projection_yaml_parses() {
             .expect("layer has a summaries level")
             .content
     };
-    // Only repo_map (directory trees) uses the deterministic structural roll-up;
-    // the other layers' summaries are code definitions/artifacts, not paths.
-    assert_eq!(mode_of("repo_map"), Content::Structural);
     for single in [
+        "repo_map",
         "code_reading",
         "static_analysis",
         "dependency_analysis",

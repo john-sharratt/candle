@@ -862,6 +862,10 @@ pub const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 /// Unset ⇒ ordinary belief selection. Kept here so the string can't drift.
 pub const FORCE_TOOL_SELECTOR: &str = "force_tool";
 
+/// Separator between member names in a [`FORCE_TOOL_SELECTOR`] value. A pin may
+/// name several tools when one ingest turn prefills calls to more than one.
+pub const FORCE_TOOL_SEPARATOR: char = ',';
+
 /// The two states of an `optional` section-tree node: whether its content is
 /// projected (`Present`) or omitted (`Absent`).
 ///
@@ -1192,6 +1196,38 @@ pub fn run_with_sink<R: ContentResolver>(
             // when score-density wasn't applicable.
             let mut selected: Vec<(TurnKey, f32)> = if score_density_used {
                 selected
+            } else if resolver.target_is_ingest_self() && group.id == target.group {
+                // An append-only ingest conversation reading its OWN turns while
+                // it generates. Every candidate is selected, unconditionally.
+                //
+                // Belief selection is for RETRIEVAL — ranking a corpus against a
+                // probe. It is the wrong instrument for a conversation reading
+                // its own history: an ingest turn is inserted and decoded against
+                // immediately, so it carries no wide-Q belief yet, scores zero,
+                // and is filtered out by its own group's band (repo_map
+                // `min_score` 250, code_reading `score_threshold` 100). The
+                // decode is then left holding only its own user turn — which is
+                // how a folder-summary decode came to answer "the user hasn't
+                // asked a specific question yet" with the request one turn back.
+                //
+                // `group_turns` has already masked the candidates to the target
+                // timeline for an append-only target, so "every candidate" is
+                // exactly "this conversation's own turns" — 2-4 for a repo_map
+                // folder, one prior turn for a forked code_read scope. Phase-1
+                // selection is unbounded by design (see the module header): the
+                // flexbox pass below still trims to `layer.window`.
+                //
+                // Dialogue retrieving this same content is untouched — the target
+                // is then the dialogue layer, not an append-only one, so this arm
+                // never fires and belief gates as before.
+                all_turns
+                    .iter()
+                    .map(|(key, score)| {
+                        selection_scores.set_turn(*key, *score, true);
+                        selection_origins.insert(*key, SelectionOrigin::IngestSelf);
+                        (*key, *score)
+                    })
+                    .collect()
             } else if group.is_belief_driven() {
                 // Belief-driven turn selection: RelLeak (hysteresis + budget) over
                 // the fresh per-turn wide-Q scores, seeded from the carried prior
@@ -2092,16 +2128,26 @@ fn select_collection_sections<R: ContentResolver>(
             out
         }
         SelectionRule::TopK { .. } => {
-            // Forced-member pin: when the runtime sets `FORCE_TOOL_SELECTOR` to a
-            // member's name, emit exactly that member and skip belief selection
-            // (the code_read summary path pins `file_read` so its prefilled
-            // tool_call/response is backed by a present tool definition). Same
-            // by-name pick as `Named`, score-independent. Unset ⇒ belief path.
+            // Forced-member pin: when the runtime sets `FORCE_TOOL_SELECTOR`, emit
+            // exactly the named members and skip belief selection, so a prefilled
+            // tool_call is always backed by a present tool definition. Same by-name
+            // pick as `Named`, score-independent. Unset ⇒ belief path.
+            //
+            // The value is a comma-separated list because an ingest turn can
+            // prefill calls to more than one tool: the repo_map folder round-trip
+            // uses `file_list` then `file_read`, and pinning only one would leave
+            // the other call naming a tool absent from the `<tools>` block — the
+            // incoherence this pin exists to prevent. Emitted in the order named
+            // (`FORCE_TOOL_SEPARATOR`); unknown names are skipped.
             if let Some(target) = selection_state.get(FORCE_TOOL_SELECTOR) {
-                if let Some(s) = coll.sections.iter().find(|s| s.name == target) {
-                    let mut out = Vec::new();
-                    push_section_segment(&mut out, s);
-                    scores.set_section(s.id, coll.score_threshold.max(1.0), true);
+                let mut out = Vec::new();
+                for name in target.split(FORCE_TOOL_SEPARATOR).map(str::trim) {
+                    if let Some(s) = coll.sections.iter().find(|s| s.name == name) {
+                        push_section_segment(&mut out, s);
+                        scores.set_section(s.id, coll.score_threshold.max(1.0), true);
+                    }
+                }
+                if !out.is_empty() {
                     return out;
                 }
             }

@@ -1012,17 +1012,35 @@ impl Conversation {
         if probe.is_empty() {
             return per_group;
         }
-        let sub = self.inner.read().unwrap();
+        // The substrate read guard is scoped to Phase A, never held across Phase
+        // B's GPU scan.
+        //
+        // A `RwLockReadGuard` drops at end of scope, so binding it here would
+        // hold it across `scan_weighted` — blocking EVERY substrate writer for
+        // the scan's whole duration, most importantly the persistence thread's
+        // install-warm (the same starvation the wave loop's livelock guard
+        // documents). Nothing in Phase B needs it: `decoded_wide_sig` and
+        // `decoded_seams` hand back `Arc`s and `couplings_of` returns by value,
+        // so the scan borrows owned data, not the substrate. The borrow checker
+        // is what keeps this honest — if Phase B ever grows a substrate access,
+        // the `drop(sub)` below stops compiling rather than silently re-extending
+        // the hold.
+        //
         // Self-local when the target is an append-only ingest layer: mask EVERY
         // belief group to the target timeline, so an ingest scope-summary scores
         // only its own scope (mirror of the `TargetedRead::group_turns` selection
         // mask). Dialogue targets are never append-only, so cross-file scoring
         // there is untouched.
-        let self_local = sub.is_append_only_layer(target.layer);
+        let self_local = self
+            .inner
+            .read()
+            .unwrap()
+            .is_append_only_layer(target.layer);
         for group in &layer.groups {
             if !group.is_belief_driven() {
                 continue;
             }
+            let sub = self.inner.read().unwrap();
             // Score EVERY conversation in the group, not just the first. A belief
             // group like `code_reading` declares one timeline per file; scoring
             // only the first-registered timeline left every other file at score 0
@@ -1178,6 +1196,10 @@ impl Conversation {
                     ex_tokens,
                 });
             }
+            // End of Phase A — release the substrate before the scan. Every
+            // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
+            // below borrows the guard.
+            drop(sub);
             if files.is_empty() {
                 continue;
             }
@@ -2239,6 +2261,19 @@ impl Conversation {
         self.read().timelines_with_metadata(key, value)
     }
 
+    /// [`Self::find_timelines_by_metadata`] plus tombstoned timelines that are
+    /// DISTILLED — see
+    /// [`crate::substrate::Substrate::timelines_with_metadata_including_distilled`].
+    /// For the calibration resume filter; ordinary tombstones stay excluded.
+    pub fn find_timelines_by_metadata_including_distilled(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Vec<TimelineId> {
+        self.read()
+            .timelines_with_metadata_including_distilled(key, value)
+    }
+
     /// Distinct `custom[key]` values across live timelines — a one-pass
     /// snapshot for O(1) membership probing (e.g. the resume cache).
     pub fn metadata_values_for_key(&self, key: &str) -> std::collections::HashSet<String> {
@@ -3013,6 +3048,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.read.timeline_target(turn.timeline)?;
         Some(layer)
+    }
+
+    fn target_is_ingest_self(&self) -> bool {
+        self.read.is_append_only_layer(self.target.layer)
     }
 
     fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {

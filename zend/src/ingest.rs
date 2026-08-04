@@ -25,7 +25,7 @@ use candle_conversation::Sequence;
 
 use crate::code_read::CodeReadState;
 use crate::raw_read::RawState;
-use crate::repo_scan::ClusterState;
+use crate::repo_scan::DirState;
 
 /// The built-in section collection filled from a non-folder source (the tool
 /// registry), so it is never treated as a folder-backed section sink.
@@ -41,7 +41,8 @@ const IDENTITY_ANCHOR_COLLECTION: &str = "identity_anchor";
 /// identity, never annotated in the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngestMode {
-    /// Walk + cluster the content root's directories (the built-in `repo_map`).
+    /// Walk the content root and summarise each of its directories (the built-in
+    /// `repo_map`).
     Folders,
     /// Per-file scope-aware carve of the content root (the built-in `code_reading`).
     Files,
@@ -68,12 +69,10 @@ pub struct IngestLayer {
 /// name in the session's registry. The variant mirrors the layer's [`IngestMode`].
 #[allow(clippy::large_enum_variant)]
 pub enum IngestConv {
-    /// A folder-scan layer: the owning conversation (held so its sealed K/V stays
-    /// reachable by dialogue retrieval) plus the per-cluster hash record.
-    Folders {
-        sequence: Sequence,
-        state: ClusterState,
-    },
+    /// A folder-scan layer: only the per-directory content-hash record — each
+    /// directory's conversation is freed once its turns seal into the substrate,
+    /// exactly as the per-file layer's are.
+    Folders { state: DirState },
     /// A per-file layer: only the merged per-file content-hash record — the
     /// per-file conversations are freed after their turns seal into the substrate.
     Files { state: CodeReadState },
