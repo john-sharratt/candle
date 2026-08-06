@@ -13,7 +13,7 @@ use std::ffi::c_void;
 /// never drift from the launcher's silent-return guards (a drifted wrapper
 /// would skip the launch and leave the workspace holding the PREVIOUS layer's
 /// tables).
-pub const MAX_EXPERTS: usize = 128;
+pub const MAX_EXPERTS: usize = 256;
 /// Kernel bound on top-k width (`k`), mirrored from `MAX_TOPK` in the `.cu`.
 pub const MAX_TOPK: usize = 32;
 

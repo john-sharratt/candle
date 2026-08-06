@@ -62,6 +62,12 @@ pub enum QType {
     Q5_KO = 46,
     Q6_KO = 47,
     Q8_KO = 48,
+    // Lane-major exponent-collapse MXFP4 for the q8a128 int8 path: the routed DeepSeek-V4
+    // MXFP4 experts, byte-permuted into the KO lane layout with the four per-32 subs of each
+    // 128-K tile collapsed onto their common e_max in-register (so they fold into a single
+    // int32). Stays 4-bit. Value 50 mirrors QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul
+    // kernel, so it is intentionally absent from this kernel-only enum.
+    MXFP4_KO = 50,
 }
 
 /// Y vector type enum (matches dispatcher ytype parameter).
@@ -361,5 +367,6 @@ mod matmul_qtype_lock_tests {
         assert_eq!(QType::Q5_KO as i32, 46);
         assert_eq!(QType::Q6_KO as i32, 47);
         assert_eq!(QType::Q8_KO as i32, 48);
+        assert_eq!(QType::MXFP4_KO as i32, 50);
     }
 }

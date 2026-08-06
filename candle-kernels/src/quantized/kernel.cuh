@@ -1797,9 +1797,12 @@ __device__ void grouped_matmul_impl(
 // above; only the activation load, weight unpack, and MMA+fold differ. The
 // contraction runs on the INT8 m16n8k32 tensor core: q8a128 activations (raw int8
 // qs) × quantized weights (raw integers), int32 accumulate, deferred-scale fold to
-// F32 with the per-sub {scale, min}. Per-16-scale K-quants split the k32 MMA in two
-// (Q6_K/Q3_K symmetric; Q2_K affine + an all-ones MMA for per-16 activation sums).
-// See docs/q8_matmul_pipeline.md.
+// F32 with ONE (scale, min) per 128-K per output row (PER-128, not per-sub). The four
+// k32 sub-MMAs of a 128-K tile collapse into a single int32 BEFORE the scale is applied
+// — that single-accumulator collapse is why the fold is per-128 (a per-sub scale would
+// need a separate accumulator per sub and kill throughput; see the note in
+// loader/gemx_dequant.cuh). Finer-scale sources (Q4_K per-32, Q6_K per-16) are
+// re-quantized to this per-128 KO grid by `to_ko`. See docs/q8_matmul_pipeline.md.
 // =============================================================================
 
 // Activation tile load: global → shared via cp.async (.ca, L1-resident — the tile is re-read

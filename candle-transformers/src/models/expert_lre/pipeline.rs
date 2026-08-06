@@ -89,6 +89,8 @@ use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -168,15 +170,37 @@ pub(crate) fn startup_two_tier(
     let mut vram_count: usize = 0;
     let mut pinned_count: usize = 0;
     let mut errors: usize = 0;
+    // Coarse phase attribution across the whole stage: `repack` = mmap read + host reorder
+    // (the parallel part), `place` = VRAM H2D + qtensor wrap OR pinned-pool memcpy (serial).
+    let mut repack_ns: u128 = 0;
+    let mut place_ns: u128 = 0;
 
     for moe_idx in 0..num_moe_layers {
         let geom = &layer_geometries[moe_idx];
-        for expert_idx in 0..num_experts {
-            let r = &host_refs[moe_idx][expert_idx];
 
-            // Read GGML bytes + GPU repack each projection to K/128.
-            let result = repack_expert_projections(mmap, r, geom, cuda_dev);
+        // ── Repack this layer's experts (mmap read + reorder) ──
+        // MXFP4_KO repacks purely host-side (`mxfp4_native_to_ko_gpu_chunk` — no CUDA calls), so
+        // we fan the whole layer across the CPU pool: concurrent page faults saturate NVMe and the
+        // reorder parallelizes. The other KO twins re-quant on the GPU (single context), so they
+        // must stay serial. Placement (below) is always serial — it mutates the slot pools.
+        let t_rp = std::time::Instant::now();
+        let repacked: Vec<Result<(Vec<u8>, Vec<u8>, Vec<u8>)>> = if geom.gate_dtype
+            == candle::quantized::GgmlDType::MXFP4_KO
+        {
+            (0..num_experts)
+                .into_par_iter()
+                .map(|e| repack_expert_projections(mmap, &host_refs[moe_idx][e], geom, cuda_dev))
+                .collect()
+        } else {
+            (0..num_experts)
+                .map(|e| repack_expert_projections(mmap, &host_refs[moe_idx][e], geom, cuda_dev))
+                .collect()
+        };
+        repack_ns += t_rp.elapsed().as_nanos();
 
+        // ── Place each repacked expert (serial: mutates VRAM/pinned pools) ──
+        let t_pl = std::time::Instant::now();
+        for (expert_idx, result) in repacked.into_iter().enumerate() {
             match result {
                 Ok((gate_repacked, up_repacked, down_repacked)) => {
                     if !inner.free_slots.is_empty() {
@@ -234,6 +258,7 @@ pub(crate) fn startup_two_tier(
                 cb(moe_idx * num_experts + expert_idx + 1, total_experts);
             }
         }
+        place_ns += t_pl.elapsed().as_nanos();
         // Progress every 8 layers.
         if (moe_idx + 1) % 8 == 0 || moe_idx + 1 == num_moe_layers {
             tracing::info!(
@@ -248,12 +273,15 @@ pub(crate) fn startup_two_tier(
     }
 
     let elapsed = t0.elapsed();
-    tracing::info!(
-        "startup: done in {:.1}s — {} VRAM + {} pinned ({} errors)",
+    eprintln!(
+        "[stage] done in {:.1}s — {} VRAM + {} pinned ({} errors) | repack(read+reorder)={:.1}s \
+         place(h2d/pinned)={:.1}s",
         elapsed.as_secs_f64(),
         vram_count,
         pinned_count,
         errors,
+        repack_ns as f64 / 1e9,
+        place_ns as f64 / 1e9,
     );
 }
 

@@ -22,6 +22,7 @@ pub const QK_Q4_KS: usize = 32;
 pub const QK_Q8_KS: usize = 32;
 pub const QK2_0: usize = 32;
 pub const QK3_0: usize = 32;
+pub const QK_MXFP4: usize = 32;
 pub const QK_R16: usize = 32;
 pub const QK_Q0: usize = 32;
 pub const QK1_S: usize = 32;
@@ -165,6 +166,58 @@ pub struct BlockQ3_0 {
     pub(crate) qs: [u8; QK3_0 / 4],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ3_0>() == 14);
+
+/// MXFP4: 4-bit micro-scaling FP4 (OCP MXFP4), the native trained format for the
+/// DeepSeek-V4 routed experts. 32 elements per block: one E8M0 (`ue8m0`) power-of-two
+/// scale byte + 16 packed nibbles indexing the E2M1 value table. Wire-identical to
+/// llama.cpp `block_mxfp4` (ggml file code 39) — see `ggml-common.h` / `ggml-impl.h`.
+///
+/// Decode: `value = MXFP4_KVALUES[nibble] * e8m0_to_f32_half(e)`, where the ×0.5 that
+/// turns the integer table `{0,1,2,3,4,6,8,12,…}` back into the real E2M1 magnitudes
+/// `{0,.5,1,1.5,2,3,4,6,…}` is folded into the "half" scale.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockMXFP4 {
+    pub(crate) e: u8,
+    pub(crate) qs: [u8; QK_MXFP4 / 2],
+}
+const _: () = assert!(std::mem::size_of::<BlockMXFP4>() == 17);
+
+/// E2M1 value table in ggml's integer convention (2× the real FP4 magnitude; the ×0.5
+/// lives in [`e8m0_to_f32_half`]). Mirrors `kvalues_mxfp4` in `ggml-common.h`.
+pub(crate) const MXFP4_KVALUES: [i8; 16] =
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// ggml `ggml_e8m0_to_fp32_half`: decode a `ue8m0` scale byte to `2^(e-128)` (i.e.
+/// `0.5·2^(e-127)`), reproducing ggml's subnormal bit patterns for `e < 2` exactly so
+/// MXFP4 blocks decode bit-identically to llama.cpp.
+#[inline]
+pub(crate) fn e8m0_to_f32_half(e: u8) -> f32 {
+    let bits = if e < 2 {
+        // 0x00200000 = 2^-128, 0x00400000 = 2^-127
+        0x0020_0000u32 << e
+    } else {
+        // 0.5·2^(e-127) = 2^(e-128) = normalized fp32 with biased exponent (e-1)
+        (e as u32 - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+/// Nearest E2M1 index for `x` under scale `d`, by absolute error. Mirrors ggml's
+/// `best_index_mxfp4` (first-wins ties, ascending index scan).
+#[inline]
+fn best_index_mxfp4(x: f32, d: f32) -> u8 {
+    let mut best = 0usize;
+    let mut best_err = (MXFP4_KVALUES[0] as f32 * d - x).abs();
+    for i in 1..16 {
+        let err = (MXFP4_KVALUES[i] as f32 * d - x).abs();
+        if err < best_err {
+            best = i;
+            best_err = err;
+        }
+    }
+    best as u8
+}
 
 /// Q0: Single INT8 centroid shared by all 32 lanes.
 ///
@@ -916,6 +969,85 @@ impl GgmlType for BlockQ4_0 {
                 sum_i += v0 * ys.qs[j] as i32 + v1 * ys.qs[j + QK8_0 / 2] as i32
             }
             sumf += sum_i as f32 * f16::to_f32(xs.d) * f16::to_f32(ys.d)
+        }
+        sumf
+    }
+}
+
+impl GgmlType for BlockMXFP4 {
+    const DTYPE: GgmlDType = GgmlDType::MXFP4;
+    const BLCK_SIZE: usize = QK_MXFP4;
+    type VecDotType = BlockQ8_0;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let qk = Self::BLCK_SIZE;
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(qk),
+            "dequantize_row_mxfp4: {k} is not divisible by {qk}"
+        );
+        let nb = k / qk;
+        for i in 0..nb {
+            let d = e8m0_to_f32_half(xs[i].e);
+            for j in 0..(qk / 2) {
+                let x0 = MXFP4_KVALUES[(xs[i].qs[j] & 0x0F) as usize] as f32;
+                let x1 = MXFP4_KVALUES[(xs[i].qs[j] >> 4) as usize] as f32;
+                ys[i * qk + j] = x0 * d;
+                ys[i * qk + j + qk / 2] = x1 * d;
+            }
+        }
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let qk = Self::BLCK_SIZE;
+        let k = xs.len();
+        debug_assert!(k.is_multiple_of(qk), "{k} is not divisible by {qk}");
+        debug_assert_eq!(ys.len(), k / qk, "size mismatch {} {} {}", k, ys.len(), qk);
+        for (i, y) in ys.iter_mut().enumerate() {
+            let xb = &xs[i * qk..(i + 1) * qk];
+            let mut amax = 0f32;
+            for &v in xb.iter() {
+                let a = v.abs();
+                if a > amax {
+                    amax = a;
+                }
+            }
+            // e = floor(log2(amax)) - 2 + 127, clamped like ggml's uint8 cast.
+            let e: u8 = if amax > 0.0 {
+                (amax.log2().floor() - 2.0 + 127.0) as u8
+            } else {
+                0
+            };
+            let d = e8m0_to_f32_half(e);
+            y.e = e;
+            for j in 0..(qk / 2) {
+                let lo = best_index_mxfp4(xb[j], d);
+                let hi = best_index_mxfp4(xb[qk / 2 + j], d);
+                y.qs[j] = lo | (hi << 4);
+            }
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_MXFP4),
+            "vec_dot_mxfp4_q8_0: {n} is not divisible by {QK_MXFP4}"
+        );
+        // The E2M1 table is integer-valued, so the dot reduces to an exact int32
+        // accumulation scaled by the two per-block scales (mirrors vec_dot_q4_0_q8_0).
+        let mut sumf = 0f32;
+        for (xs, ys) in xs.iter().zip(ys.iter()) {
+            let mut sum_i = 0i32;
+            for j in 0..QK_MXFP4 / 2 {
+                let v0 = MXFP4_KVALUES[(xs.qs[j] & 0x0F) as usize] as i32;
+                let v1 = MXFP4_KVALUES[(xs.qs[j] >> 4) as usize] as i32;
+                sum_i += v0 * ys.qs[j] as i32 + v1 * ys.qs[j + QK_MXFP4 / 2] as i32
+            }
+            sumf += sum_i as f32 * e8m0_to_f32_half(xs.e) * f16::to_f32(ys.d)
         }
         sumf
     }
@@ -6528,3 +6660,143 @@ verify_block_sizes!(
     f16,
     bf16
 );
+
+#[cfg(test)]
+mod mxfp4_tests {
+    use super::{e8m0_to_f32_half, BlockMXFP4, BlockQ8_0, GgmlType, MXFP4_KVALUES, QK_MXFP4};
+    use crate::quantized::GgmlDType;
+
+    /// The 17-byte block layout `{ e: u8, qs: [u8; 16] }` is what we assert against —
+    /// `#[repr(C)]` makes the field bytes the on-disk bytes.
+    #[test]
+    fn block_is_17_bytes() {
+        assert_eq!(std::mem::size_of::<BlockMXFP4>(), 17);
+        assert_eq!(GgmlDType::MXFP4.type_size(), 17);
+        assert_eq!(GgmlDType::MXFP4.block_size(), 32);
+    }
+
+    /// `ggml_e8m0_to_fp32_half`: exact power-of-two decode incl. the subnormal `e<2` path.
+    #[test]
+    fn e8m0_half_exact() {
+        assert_eq!(e8m0_to_f32_half(129), 2.0); // 2^(129-128)
+        assert_eq!(e8m0_to_f32_half(128), 1.0);
+        assert_eq!(e8m0_to_f32_half(127), 0.5);
+        assert_eq!(e8m0_to_f32_half(125), 0.125); // 2^-3
+        assert_eq!(e8m0_to_f32_half(1), f32::from_bits(0x0040_0000)); // 2^-127
+        assert_eq!(e8m0_to_f32_half(0), f32::from_bits(0x0020_0000)); // 2^-128
+    }
+
+    /// GGUF on-disk file code for MXFP4 is 39 (matches llama.cpp `GGML_TYPE_MXFP4`), and
+    /// it round-trips through our translation boundary.
+    #[test]
+    fn gguf_file_code_is_39() {
+        assert_eq!(GgmlDType::MXFP4.to_gguf_file_code(), 39);
+        assert_eq!(
+            GgmlDType::from_gguf_file_code(39).unwrap(),
+            GgmlDType::MXFP4
+        );
+        assert_eq!(GgmlDType::from_u32(49).unwrap(), GgmlDType::MXFP4);
+    }
+
+    /// Encode a block whose values are all exactly representable at `amax = 6.0`
+    /// (⇒ `e = 127`, `d = 0.5`, real table `{0,.5,1,1.5,2,3,4,6}`), and assert the exact
+    /// bytes produced, then that dequant recovers the inputs bit-for-bit.
+    #[test]
+    fn exact_bytes_and_roundtrip() {
+        let mut xs = vec![0f32; QK_MXFP4];
+        // Low nibbles come from positions 0..16, high nibbles from 16..32.
+        xs[0] = 6.0; // idx 7  (kvalues 12 * 0.5)
+        xs[1] = 3.0; // idx 5  (6 * 0.5)
+        xs[2] = 1.5; // idx 3  (3 * 0.5)
+        xs[3] = 0.5; // idx 1  (1 * 0.5)
+        xs[16] = -6.0; // idx 15
+        xs[17] = -3.0; // idx 13
+        xs[18] = 4.0; // idx 6  (8 * 0.5)
+        xs[19] = -0.5; // idx 9
+
+        let mut blk = [BlockMXFP4::zeros()];
+        BlockMXFP4::from_float(&xs, &mut blk);
+
+        assert_eq!(blk[0].e, 127);
+        assert_eq!(blk[0].qs[0], 7 | (15 << 4));
+        assert_eq!(blk[0].qs[1], 5 | (13 << 4));
+        assert_eq!(blk[0].qs[2], 3 | (6 << 4));
+        assert_eq!(blk[0].qs[3], 1 | (9 << 4));
+        for j in 4..16 {
+            assert_eq!(blk[0].qs[j], 0, "qs[{j}] should be zero");
+        }
+
+        let mut ys = vec![0f32; QK_MXFP4];
+        BlockMXFP4::to_float(&blk, &mut ys);
+        assert_eq!(ys[0], 6.0);
+        assert_eq!(ys[1], 3.0);
+        assert_eq!(ys[2], 1.5);
+        assert_eq!(ys[3], 0.5);
+        assert_eq!(ys[16], -6.0);
+        assert_eq!(ys[17], -3.0);
+        assert_eq!(ys[18], 4.0);
+        assert_eq!(ys[19], -0.5);
+        for &y in ys.iter().take(16).skip(4) {
+            assert_eq!(y, 0.0);
+        }
+    }
+
+    /// Ties in `best_index_mxfp4` resolve to the lower index (ggml scans ascending and
+    /// keeps strictly-smaller errors). At `d = 0.5`, `2.5` is equidistant from `2.0`
+    /// (idx 4) and `3.0` (idx 5) ⇒ idx 4.
+    #[test]
+    fn quant_tie_breaks_low() {
+        let mut xs = vec![0f32; QK_MXFP4];
+        xs[0] = 6.0; // pin amax so e = 127, d = 0.5
+        xs[1] = 2.5; // tie between idx 4 (2.0) and idx 5 (3.0)
+        let mut blk = [BlockMXFP4::zeros()];
+        BlockMXFP4::from_float(&xs, &mut blk);
+        assert_eq!(blk[0].e, 127);
+        assert_eq!(blk[0].qs[1] & 0x0F, 4);
+    }
+
+    /// Decode a hand-built raw block (bytes chosen directly) and check every lane,
+    /// exercising the low/high nibble split and a non-0.5 scale (`e = 125 ⇒ d = 0.125`).
+    #[test]
+    fn decode_known_raw_block() {
+        let mut blk = BlockMXFP4::zeros();
+        blk.e = 125; // d = 0.125
+        blk.qs[0] = 6 | (7 << 4); // low idx 6 -> 8, high idx 7 -> 12
+        blk.qs[5] = 14 | (2 << 4); // low idx 14 -> -8, high idx 2 -> 2
+        let mut ys = vec![0f32; QK_MXFP4];
+        BlockMXFP4::to_float(std::slice::from_ref(&blk), &mut ys);
+        assert_eq!(ys[0], 8.0 * 0.125); // 1.0
+        assert_eq!(ys[16], 12.0 * 0.125); // 1.5
+        assert_eq!(ys[5], -8.0 * 0.125); // -1.0
+        assert_eq!(ys[21], 2.0 * 0.125); // 0.25
+    }
+
+    /// `vec_dot` against Q8_0 activations equals the exact integer-table dot scaled by the
+    /// two per-block scales — verified against a from-scratch f32 reference on the
+    /// dequantized operands.
+    #[test]
+    fn vec_dot_matches_dequant_reference() {
+        let mut wq = vec![0f32; QK_MXFP4];
+        let mut aq = vec![0f32; QK_MXFP4];
+        for i in 0..QK_MXFP4 {
+            // Values chosen to be exactly representable so the reference is unambiguous.
+            wq[i] = MXFP4_KVALUES[i % 8] as f32 * 0.5;
+            aq[i] = ((i as f32) - 16.0) * 0.03;
+        }
+        wq[0] = 6.0; // pin weight amax -> e = 127
+        let mut wblk = [BlockMXFP4::zeros()];
+        BlockMXFP4::from_float(&wq, &mut wblk);
+        let mut ablk = [BlockQ8_0::zeros()];
+        BlockQ8_0::from_float(&aq, &mut ablk);
+
+        let got = BlockMXFP4::vec_dot(QK_MXFP4, &wblk, &ablk);
+
+        // Reference: dequantize both operands and dot in f32.
+        let mut wdq = vec![0f32; QK_MXFP4];
+        let mut adq = vec![0f32; QK_MXFP4];
+        BlockMXFP4::to_float(&wblk, &mut wdq);
+        BlockQ8_0::to_float(&ablk, &mut adq);
+        let want: f32 = wdq.iter().zip(adq.iter()).map(|(a, b)| a * b).sum();
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+}

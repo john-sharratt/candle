@@ -125,6 +125,9 @@ extern "C" __global__ void dequantize_block_q8_0_bf16(const void*, __nv_bfloat16
 extern "C" __global__ void dequantize_block_q8_1_f32(const void*, float*, const int);
 extern "C" __global__ void dequantize_block_q8_1_f16(const void*, __half*, const int);
 extern "C" __global__ void dequantize_block_q8_1_bf16(const void*, __nv_bfloat16*, const int);
+extern "C" __global__ void dequantize_block_mxfp4_f32(const void*, float*, const int);
+extern "C" __global__ void dequantize_block_mxfp4_f16(const void*, __half*, const int);
+extern "C" __global__ void dequantize_block_mxfp4_bf16(const void*, __nv_bfloat16*, const int);
 extern "C" __global__ void dequantize_block_q4_ks_f32(const void*, float*, const int);
 extern "C" __global__ void dequantize_block_q4_ks_f16(const void*, __half*, const int);
 extern "C" __global__ void dequantize_block_q4_ks_bf16(const void*, __nv_bfloat16*, const int);
@@ -466,6 +469,27 @@ extern "C" void run_quantize_block(
 // =============================================================================
 // qtype: GgmlDType-aligned integer (see QTYPE_* in quantized/block_compact.cuh).
 // out_dtype: 0=F32, 1=F16, 2=BF16
+
+// Standalone MXFP4 dequant (out_dtype: 0=F32, 1=F16, 2=BF16). Kept separate from the
+// QTYPE-indexed run_dequantize_block dispatch so MXFP4 does not perturb the locked
+// QTYPE_COUNT size tables. Same 256-elems-per-block / 32-thread launch as q4_0.
+extern "C" void run_dequantize_mxfp4(
+    const void* src,
+    void* dst,
+    int32_t elem_count,
+    int32_t out_dtype
+) {
+    int num_blocks = (elem_count + 255) / 256;
+    if (num_blocks < 1) num_blocks = 1;
+    dim3 grid(num_blocks, 1, 1), block(32, 1, 1);
+    int nb32 = elem_count / 32;
+    if (out_dtype == 0)
+        dequantize_block_mxfp4_f32<<<grid, block>>>(src, (float*)dst, nb32);
+    else if (out_dtype == 1)
+        dequantize_block_mxfp4_f16<<<grid, block>>>(src, (__half*)dst, nb32);
+    else
+        dequantize_block_mxfp4_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+}
 
 extern "C" void run_dequantize_block(
     const void* src,

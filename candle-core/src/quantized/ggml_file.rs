@@ -184,6 +184,28 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q6_K => {
             from_raw_data::<k_quants::BlockQ6_K>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::MXFP4 => {
+            from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
+        }
+        // KO twins are GPU-only lane-major chunks with no CPU block struct — their on-disk bytes
+        // are already in the exact layout the int8 KO matmul reads (identical to
+        // `QCudaStorage::repack_ko` output). Copy them straight to VRAM with no reinterpret and no
+        // MATRIX_ROW_PADDING; `size_in_bytes` (from `type_size`) equals the emitted `ko_chunk_bytes`.
+        GgmlDType::Q8_KO
+        | GgmlDType::Q4_KO
+        | GgmlDType::Q5_KO
+        | GgmlDType::Q6_KO
+        | GgmlDType::MXFP4_KO => match device {
+            Device::Cuda(cuda) => super::QTensor::new(
+                super::cuda::load_repacked(cuda, &raw_data[..size_in_bytes], ggml_dtype)?,
+                dims,
+            ),
+            _ => {
+                crate::bail!(
+                    "KO quantized type {ggml_dtype:?} is CUDA-only (lane-major GPU chunks)"
+                )
+            }
+        },
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
 }
@@ -299,6 +321,28 @@ pub fn qtensor_from_ggml_on_stream(
             dims,
             cuda_device,
             stream,
+        ),
+        GgmlDType::MXFP4 => from_raw_data_on_stream::<k_quants::BlockMXFP4>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        // KO twins: pre-repacked lane-major bytes → VRAM on the copy stream, no padding/reinterpret
+        // (see the non-stream `qtensor_from_ggml` arm).
+        GgmlDType::Q8_KO
+        | GgmlDType::Q4_KO
+        | GgmlDType::Q5_KO
+        | GgmlDType::Q6_KO
+        | GgmlDType::MXFP4_KO => super::QTensor::new(
+            super::cuda::load_repacked_on_stream(
+                cuda_device,
+                stream,
+                &raw_data[..size_in_bytes],
+                ggml_dtype,
+            )?,
+            dims,
         ),
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }

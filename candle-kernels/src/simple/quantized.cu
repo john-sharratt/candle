@@ -328,6 +328,26 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_fp16_t) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// OCP MXFP4 (ggml file code 39): 32 elems, one E8M0 scale byte + 16 E2M1 nibbles.
+// Wire-identical to llama.cpp `block_mxfp4` and candle-core `BlockMXFP4`.
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;                  // E8M0 (ue8m0) power-of-two scale
+    uint8_t qs[QK_MXFP4 / 2];   // 16 packed 4-bit E2M1 indices
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 17, "wrong mxfp4 block size/padding");
+
+// E2M1 integer value table (2x the real FP4 magnitude; the x0.5 is folded into the
+// "half" scale below). Matches ggml `kvalues_mxfp4`.
+__device__ static const int mxfp4_kvalues[16] =
+    {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// ggml `ggml_e8m0_to_fp32_half`: 2^(e-128) with the subnormal bit patterns for e<2.
+__device__ __forceinline__ float mxfp4_e8m0_half(uint8_t e) {
+    uint32_t bits = (e < 2) ? (0x00200000u << e) : ((uint32_t)(e - 1) << 23);
+    return __uint_as_float(bits);
+}
+
 #define QK4_1 32
 #define QR4_1 2
 #define QI4_1 (QK4_1 / (4 * QR4_1))
@@ -911,6 +931,27 @@ static __device__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t
     }
 }
 
+// MXFP4 dequant — same 256-elems-per-threadblock / 32-thread layout as q4_0.
+template<typename dst_t>
+static __device__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+    const int64_t i = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+    const block_mxfp4 * x = (const block_mxfp4 *)vx + ib;
+    const float d = mxfp4_e8m0_half(x->e);
+    const uint8_t * q = x->qs + 4*il;
+    for (int l = 0; l < 4; ++l) {
+        y[l+ 0] = mxfp4_kvalues[q[l] & 0xF] * d;
+        y[l+16] = mxfp4_kvalues[q[l] >>  4] * d;
+    }
+}
+
 template<typename dst_t>
 static __device__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -1463,6 +1504,7 @@ DEQUANTIZE(q5_0)
 DEQUANTIZE(q5_1)
 DEQUANTIZE(q8_0)
 DEQUANTIZE(q8_1)
+DEQUANTIZE(mxfp4)
 DEQUANTIZE(q4_ks)
 DEQUANTIZE(q8_ks)
 DEQUANTIZE(q2_0)

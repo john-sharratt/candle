@@ -39,6 +39,7 @@ pub mod dac;
 pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
+pub mod deepseek4;
 pub mod depth_anything_v2;
 pub mod dialect;
 pub mod dinov2;

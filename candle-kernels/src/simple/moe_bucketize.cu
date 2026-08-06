@@ -40,8 +40,11 @@
 
 #include <stdint.h>
 
-#define BUCKETIZE_THREADS 128
-#define MAX_EXPERTS 128
+// 256 threads so thread e can own expert e for up to 256 experts (DeepSeek-V4 has 256
+// routed experts; Qwen3-MoE has 128). Phase-1/3/4 are one-thread-per-expert; phase-4b/5
+// are BUCKETIZE_THREADS grid-stride, so both scale together.
+#define BUCKETIZE_THREADS 256
+#define MAX_EXPERTS 256
 #define MAX_TOPK 32
 #define INVALID_ROW 0xFFFFFFFFu
 

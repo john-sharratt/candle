@@ -853,6 +853,8 @@ extern "C" __global__ void q4_ko_int8_f32_dense(const void*, const void*, void*,
 extern "C" __global__ void q5_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q6_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q8_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
+// MXFP4_KO exponent-collapse twin (row 18).
+extern "C" __global__ void mxfp4_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
 // q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is decided in Rust
 // (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
 // since the optimal point depends on weight bytes vs L2, not token count alone.
@@ -862,15 +864,17 @@ extern "C" __global__ void q4_ko_int8_f32_dense_m2(const void*, const void*, voi
 extern "C" __global__ void q5_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q6_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q8_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
-// Indexed by (kernel_row - 14): Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17.
-static void* dense_kernels_int8_m2[4] = {
+extern "C" __global__ void mxfp4_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
+// Indexed by (kernel_row - 14): Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17, MXFP4_KO=18.
+static void* dense_kernels_int8_m2[5] = {
     (void*)q4_ko_int8_f32_dense_m2,
     (void*)q5_ko_int8_f32_dense_m2,
     (void*)q6_ko_int8_f32_dense_m2,
     (void*)q8_ko_int8_f32_dense_m2,
+    (void*)mxfp4_ko_int8_f32_dense_m2,
 };
 
-static void* dense_kernels_int8[18] = {
+static void* dense_kernels_int8[19] = {
     (void*)q4_0_int8_f32_dense,      // 0   q4_0
     (void*)q4_1_int8_f32_dense,      // 1   q4_1
     (void*)q5_0_int8_f32_dense,      // 2   q5_0
@@ -889,6 +893,7 @@ static void* dense_kernels_int8[18] = {
     (void*)q5_ko_int8_f32_dense,     // 15  q5_KO
     (void*)q6_ko_int8_f32_dense,     // 16  q6_KO
     (void*)q8_ko_int8_f32_dense,     // 17  q8_KO
+    (void*)mxfp4_ko_int8_f32_dense,  // 18  mxfp4_KO
 };
 
 extern "C" void run_quantized_matmul(
@@ -995,7 +1000,7 @@ extern "C" void run_quantized_matmul(
         const int dst_stride = nrows_x;                   // N
         const bool mode2 = (force_mode2 != 0);  // weight-reuse crossover decided in Rust
         int batch_div = 16;                               // BATCH_TILE_I8 = 16 (mode-1)
-        if (mode2 && kernel_row >= 14 && kernel_row <= 17) {
+        if (mode2 && kernel_row >= 14 && kernel_row <= 18) {
             kfn = dense_kernels_int8_m2[kernel_row - 14];  // Bm=32 weight-reuse variant
             batch_div = 32;                               // Bm = 32 (mode-2, N_SUB=2)
         }
@@ -1270,9 +1275,13 @@ extern "C" __global__ void q6_ko_int8_f32_grouped(
 extern "C" __global__ void q8_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
     void*, int, int, int, int);
+// MXFP4_KO exponent-collapse twin (row 18).
+extern "C" __global__ void mxfp4_ko_int8_f32_grouped(
+    const void*, const void*, const void*, const void*, const void*,
+    void*, int, int, int, int);
 
 // [qtype_kernel_row] — same row ordering as grouped_kernels above.
-static void* grouped_kernels_int8[18] = {
+static void* grouped_kernels_int8[19] = {
     (void*)q4_0_int8_f32_grouped,      // 0   q4_0
     (void*)q4_1_int8_f32_grouped,      // 1   q4_1
     (void*)q5_0_int8_f32_grouped,      // 2   q5_0
@@ -1291,6 +1300,7 @@ static void* grouped_kernels_int8[18] = {
     (void*)q5_ko_int8_f32_grouped,     // 15  q5_KO
     (void*)q6_ko_int8_f32_grouped,     // 16  q6_KO
     (void*)q8_ko_int8_f32_grouped,     // 17  q8_KO
+    (void*)mxfp4_ko_int8_f32_grouped,  // 18  mxfp4_KO
 };
 
 /// Single-launch grouped matmul over all expert tiles.

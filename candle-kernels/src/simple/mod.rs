@@ -56,3 +56,7 @@ pub mod kv_migrate;
 // Fletcher-32 KV-chunk golden checksum: GPU-side integrity hash, one launch for
 // a whole plan of quantized chunks, leaving the KV data on the device
 pub mod fletcher32;
+
+// Fused Sinkhorn (doubly-stochastic) normalization of the mHC combine matrix:
+// one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
+pub mod sinkhorn;

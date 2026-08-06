@@ -46,7 +46,7 @@ impl VersionedMagic {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub ggml_dtype: GgmlDType,
     pub shape: crate::Shape,
@@ -356,7 +356,7 @@ impl Value {
         Ok(v)
     }
 
-    fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+    pub(crate) fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
         match self {
             &Self::U8(v) => w.write_u8(v)?,
             &Self::I8(v) => w.write_i8(v)?,
@@ -416,7 +416,7 @@ impl ValueType {
         Ok(v)
     }
 
-    fn to_u32(self) -> u32 {
+    pub(crate) fn to_u32(self) -> u32 {
         match self {
             Self::U8 => 0,
             Self::I8 => 1,
@@ -524,10 +524,132 @@ impl Content {
     }
 }
 
-fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
+pub(crate) fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
     let bytes = str.as_bytes();
     w.write_u64::<LittleEndian>(bytes.len() as u64)?;
     w.write_all(bytes)?;
+    Ok(())
+}
+
+/// Merge a multi-file split GGUF (`NAME-00001-of-000NN.gguf`, …) into a single GGUF at
+/// `output`, streaming each tensor's raw bytes straight from its source split (no full
+/// materialization — constant memory regardless of model size). Global metadata is taken
+/// from the first split with the `split.*` keys dropped so the result is a standalone file.
+///
+/// `inputs` must be the ordered split paths. Alignment is the GGUF default (32).
+pub fn merge_split_ggufs<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+    inputs: &[P],
+    output: Q,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if inputs.is_empty() {
+        crate::bail!("merge_split_ggufs: no input files");
+    }
+    const ALIGN: usize = 32;
+    let pad_for = |size: usize| (ALIGN - 1) - (ALIGN - 1 + size) % ALIGN;
+
+    // Read each split's directory and keep its file handle + data offset.
+    let mut files: Vec<std::fs::File> = Vec::new();
+    let mut contents: Vec<Content> = Vec::new();
+    for p in inputs.iter() {
+        let mut f = std::fs::File::open(p.as_ref())?;
+        let c = Content::read(&mut f)?;
+        files.push(f);
+        contents.push(c);
+    }
+
+    // Ordered (source_idx, name, dtype, size_bytes) across all splits.
+    struct Entry {
+        src: usize,
+        name: String,
+        src_offset: u64,
+        size: usize,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for (src, c) in contents.iter().enumerate() {
+        for (name, info) in c.tensor_infos.iter() {
+            let block_size = info.ggml_dtype.block_size();
+            let type_size = info.ggml_dtype.type_size();
+            let elem_count = info.shape.elem_count();
+            let size = elem_count / block_size * type_size;
+            entries.push(Entry {
+                src,
+                name: name.clone(),
+                src_offset: info.offset,
+                size,
+            });
+        }
+    }
+
+    let out = std::fs::File::create(output.as_ref())?;
+    let mut w = std::io::BufWriter::with_capacity(16 * 1024 * 1024, out);
+
+    // Header: magic, version 3, tensor_count, metadata_count (file0 minus split.*).
+    let meta: Vec<(&String, &Value)> = contents[0]
+        .metadata
+        .iter()
+        .filter(|(k, _)| !k.starts_with("split."))
+        .collect();
+    w.write_u32::<LittleEndian>(0x46554747)?;
+    w.write_u32::<LittleEndian>(3)?;
+    w.write_u64::<LittleEndian>(entries.len() as u64)?;
+    w.write_u64::<LittleEndian>(meta.len() as u64)?;
+    for (name, value) in meta.iter() {
+        write_string(&mut w, name)?;
+        w.write_u32::<LittleEndian>(value.value_type().to_u32())?;
+        value.write(&mut w)?;
+    }
+
+    // Tensor directory with recomputed, sequential, 32-aligned offsets.
+    let mut offset = 0usize;
+    let mut merged_offsets = Vec::with_capacity(entries.len());
+    for e in entries.iter() {
+        write_string(&mut w, &e.name)?;
+        let info = &contents[e.src].tensor_infos[&e.name];
+        let dims = info.shape.dims();
+        w.write_u32::<LittleEndian>(dims.len() as u32)?;
+        for &dim in dims.iter().rev() {
+            w.write_u64::<LittleEndian>(dim as u64)?;
+        }
+        w.write_u32::<LittleEndian>(info.ggml_dtype.to_gguf_file_code())?;
+        w.write_u64::<LittleEndian>(offset as u64)?;
+        merged_offsets.push(offset);
+        offset += e.size + pad_for(e.size);
+    }
+
+    // Pad to the tensor-data alignment.
+    let pos = w.stream_position()? as usize;
+    w.write_all(&vec![0u8; pad_for(pos)])?;
+    let data_start = w.stream_position()? as usize;
+
+    // Stream each tensor's bytes from its source split.
+    let n = entries.len();
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    for (i, (e, moff)) in entries.iter().zip(merged_offsets.iter()).enumerate() {
+        let cur = w.stream_position()? as usize;
+        if cur != data_start + moff {
+            crate::bail!("merge: position {cur} != expected {}", data_start + moff);
+        }
+        let src_data_off = contents[e.src].tensor_data_offset + e.src_offset;
+        files[e.src].seek(SeekFrom::Start(src_data_off))?;
+        let mut remaining = e.size;
+        while remaining > 0 {
+            let take = remaining.min(buf.len());
+            files[e.src].read_exact(&mut buf[..take])?;
+            w.write_all(&buf[..take])?;
+            remaining -= take;
+        }
+        let pad = pad_for(e.size);
+        if pad > 0 {
+            w.write_all(&vec![0u8; pad])?;
+        }
+        if let Some(cb) = progress {
+            cb(i + 1, n);
+        }
+    }
+    w.flush()?;
     Ok(())
 }
 

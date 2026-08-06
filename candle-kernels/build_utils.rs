@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 // Simple CUDA kernels: basic operations, indexed operations, and simple transformations
 // NOTE: Only include properly formed dispatcher files that use <<<...>>> kernel launch syntax.
-const SIMPLE_KERNELS: [&str; 42] = [
+const SIMPLE_KERNELS: [&str; 43] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     // Kernel implementations
     "src/simple/add_at_indices.cu",
@@ -30,6 +30,7 @@ const SIMPLE_KERNELS: [&str; 42] = [
     "src/simple/kv_migrate.cu",
     "src/simple/fletcher32.cu",
     "src/simple/moe_bucketize.cu",
+    "src/simple/sinkhorn.cu",
     "src/simple/moe_scatter.cu",
     "src/simple/affine.cu",
     "src/simple/binary.cu",
@@ -73,7 +74,7 @@ const SIMPLE_KERNELS: [&str; 42] = [
 ];
 
 // Quantized kernel instantiations (14 loaders × 3 Y_types: F16, BF16, F32)
-const QUANTIZED_KERNELS: [&str; 43] = [
+const QUANTIZED_KERNELS: [&str; 44] = [
     "src/quantized/impl/qkv_segmented_f32.cu",
     "src/quantized/impl/q2_K_f16.cu",
     "src/quantized/impl/q2_K_bf16.cu",
@@ -111,6 +112,7 @@ const QUANTIZED_KERNELS: [&str; 43] = [
     "src/quantized/impl/q8_k_f16.cu",
     "src/quantized/impl/q8_k_bf16.cu",
     "src/quantized/impl/q8_k_f32.cu",
+    "src/quantized/impl/mxfp4_f32.cu",
     "src/quantized/impl/q_awq_f16.cu",
     "src/quantized/impl/q_awq_bf16.cu",
     "src/quantized/impl/q_awq_f32.cu",

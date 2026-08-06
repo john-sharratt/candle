@@ -142,54 +142,29 @@ struct block_type_traits<block_c_q5_K> {
     static constexpr bool has_min = true;
 };
 
-// INT8 path: distinct weight scales per 32-K MMA sub. Most formats quantize per-32
-// (==1, single post-MMA fold). K-quants whose scales are per-16 set this to 2,
-// triggering the split 2-MMA fold (C_lo·scale_lo + C_hi·scale_hi) that applies each
-// 16-group's scale exactly. Those formats feed CENTERED signed int8 weights (no min
-// term) so no per-16 activation sum is needed.
-template <typename BlockType>
-struct int8_scales_per_sub_trait {
-    static constexpr int value = 1;
-};
-template <>
-struct int8_scales_per_sub_trait<block_c_q6_K> {
-    static constexpr int value = 2;
-};
-// block_c_q6_KO: requantized to per-32 affine (scale,min) → default value=1 → per-32 affine
-// fold (else branch), like Q4_KO/Q8_KO. No per-16 split.
-template <>
-struct int8_scales_per_sub_trait<block_c_q3_K> {
-    static constexpr int value = 2;
-};
-
-// INT8 path: affine per-16 K-quants (Q2_K). value = d·q + m with per-16 {d,m}. The
-// split 2-MMA applies each 16-group's d to its half (C_lo, C_hi); the per-16 min
-// term m·Σx needs per-16 activation sums, obtained in-kernel via an all-ones MMA
-// over the same half-fragments (no q8a128 format change). Weights stay UNSIGNED
-// (q in 0..3). Formats here implement sub_dm (lo {d,m}) and sub_dm_hi (hi {d,m}).
-template <typename BlockType>
-struct int8_affine_per16_trait {
-    static constexpr bool value = false;
-};
-template <>
-struct int8_affine_per16_trait<block_c_q2_K> {
-    static constexpr bool value = true;
-};
-
-// INT8 path: per-32 affine formats that benefit from issuing the k32 MMA as TWO k16
-// MMAs (clo+chi == the k32 result exactly). The extra in-flight tensor-core work hides
-// the cp.async weight-load latency that the single k32 MMA leaves exposed. Q5_K's int8
-// path is otherwise latency-bound (ncu: long_scoreboard ~16, idle pipes) despite the
-// same traffic/occupancy as the per-16-split Q6_K. Fold is the standard per-32 affine.
-// The 2-k16-MMA split was a latency-hiding device for Q5 — but k16 int8 MMAs run at
-// FP16 tensor rate (the int8 2× only comes from k32 packing 2× the K per issue), and
-// the split doubles the int32 accumulators. Q5 is per-32 (one scale/sub) and
-// clo+chi == the k32 result exactly, so it routes into the per-32 k32 branch instead:
-// full int8 tensor throughput + fewer accumulator registers. No format uses the split.
-template <typename BlockType>
-struct int8_split_per32_trait {
-    static constexpr bool value = false;
-};
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THE INT8 WEIGHT FOLD IS PER-128, NOT PER-SUB (per-32 / per-16)
+// ─────────────────────────────────────────────────────────────────────────────
+// The live int8 KO fold applies ONE (scale, min) per 128-K per output row. It does
+// this deliberately, for tensor-core throughput: the four k32 sub-MMAs of a 128-K tile
+// accumulate into a SINGLE int32 before any scale is applied (see
+// `grouped_matmul_impl_int8` in kernel.cuh). A per-sub (per-32 / per-16) weight scale
+// would force a SEPARATE int32 accumulator per sub plus a per-sub float scale applied
+// mid-fold — more accumulator registers, no cross-sub accumulation, and the int8 MMA's
+// throughput advantage evaporates. So source formats with finer native scales (Q4_K
+// per-32, Q6_K per-16) are RE-QUANTIZED to the coarser per-128 KO affine by `to_ko`; the
+// step-up in bit width (`Int8Mode::Precision`) absorbs the granularity loss near-losslessly
+// (measured: MXFP4→Q8_KO costs ~0.002 rel_l2 over an exact per-32 int8 — see
+// candle-core `mxfp4_int8_matmul_matches_float_baseline`). Per-128 is the design, not a bug.
+//
+// HISTORICAL NOTE / TRAP REMOVED: three traits used to live here —
+// `int8_scales_per_sub_trait` (per-16 "split 2-MMA fold"), `int8_affine_per16_trait`
+// (Q2_K per-16 + an "all-ones MMA" for per-16 activation sums), and
+// `int8_split_per32_trait`. Their comments described a per-sub fold as if it were live.
+// **None of them ever had a consumer** — the split fold was never wired into any kernel.
+// They were deleted (2026-08) because their descriptive comments repeatedly misled readers
+// into thinking a per-32/per-16 fold existed. If you need a per-sub scale, you are ADDING
+// a new fold, not enabling an existing one — and weigh it against the throughput cost above.
 
 // De-interleaved scale storage: when true, the per-32 {scale,-min} dm values do NOT
 // live in the weight block — they sit in a separate scale region at the tail of the
@@ -216,12 +191,17 @@ template <>
 struct is_scale_separate<block_c_q8_KO> {
     static constexpr bool value = true;
 };
+template <>
+struct is_scale_separate<block_c_mxfp4> {
+    static constexpr bool value = true;
+};
 // k1024 chunk blocks carry their scales inline (blk.dm) — the int8 fold reads them from
 // the chunk, the only "scale-separate" (non-staged) path now used.
 template <> struct is_scale_separate<block_c_q4_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_q5_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_q6_KO_k1024> { static constexpr bool value = true; };
 template <> struct is_scale_separate<block_c_q8_KO_k1024> { static constexpr bool value = true; };
+template <> struct is_scale_separate<block_c_mxfp4_k1024> { static constexpr bool value = true; };
 
 // =============================================================================
 // K/64 SCALE HELPERS (embedded scales)

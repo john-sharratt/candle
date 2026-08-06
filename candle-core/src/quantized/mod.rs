@@ -12,6 +12,7 @@ pub mod gguf_file;
 pub mod int8_matmul_mode;
 pub mod k_quants;
 pub mod ko_quant;
+pub mod prepare;
 // Note: the previous `q0_v_test` module has been removed — it tested the OLD
 // (sign + shape + curve_pos) Q0_V format that no longer exists. The new
 // (curve + scale + centroid) format will get a fresh test suite.
@@ -644,6 +645,22 @@ pub enum GgmlDType {
     Q5_KO = 46,
     Q6_KO = 47,
     Q8_KO = 48,
+
+    /// OCP MXFP4 (4-bit micro-scaling FP4): 32 elems/block, one E8M0 scale byte + 16
+    /// nibbles indexing the E2M1 table. GGUF file code 39. The native trained format
+    /// for the DeepSeek-V4 routed experts. See [`k_quants::BlockMXFP4`].
+    MXFP4 = 49,
+
+    /// Lane-major exponent-collapse MXFP4 for the q8a128 int8 tensor-core matmul — the KO
+    /// twin the MXFP4 routed experts repack to. The E2M1 nibbles are kept **4-bit** (no
+    /// requant to a wider grid): because the E8M0 scale is a pure power of two, the four
+    /// per-32 subs of each 128-K tile are collapsed onto their common `e_max` in-register
+    /// (each sub's int8 mantissa shifted right by the exponent difference) so they fold into
+    /// a single int32, matching the per-128 int8 kernel. Stays 4-bit → fits in RAM where
+    /// Q6_KO/Q8_KO don't, at Q6-equivalent quality. GPU-only; value 50 mirrors
+    /// `QTYPE_MXFP4_KO` / `QType::MXFP4_KO`. See `ko_quant::quantize_mxfp4_ko` +
+    /// `loader/mxfp4.cuh`.
+    MXFP4_KO = 50,
 }
 
 impl GgmlDType {
@@ -651,7 +668,10 @@ impl GgmlDType {
     /// These are the only weight layouts the q8a128 int8 tensor-core matmul can read, so the
     /// `DynamicTensor::Int8` matmul path guards on this.
     pub fn is_ko(self) -> bool {
-        matches!(self, Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO)
+        matches!(
+            self,
+            Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO | Self::MXFP4_KO
+        )
     }
 
     /// The KO weight twin used for int8 optimization, selected by [`Int8Mode`].
@@ -668,6 +688,11 @@ impl GgmlDType {
     ///
     /// Errors for [`Int8Mode::Off`] (no KO twin) and for dtypes with no KO form.
     pub fn to_ko(self, mode: Int8Mode) -> Result<Self> {
+        // Already a KO format (e.g. a pre-repacked / prepared weight): the twin is itself, so
+        // the optimize/geometry step is a no-op regardless of mode — nothing to repack.
+        if self.is_ko() {
+            return Ok(self);
+        }
         match mode {
             Int8Mode::Off => crate::bail!("to_ko: Int8Mode::Off has no KO weight twin"),
             Int8Mode::Performance => Ok(match self {
@@ -676,6 +701,10 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q5_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                // MXFP4 keeps its native 4-bit E2M1 nibbles: the per-32 E8M0 subs collapse
+                // onto their common e_max in-register (no requant to a wider grid), so it
+                // fits in RAM where Q6_KO/Q8_KO don't, at Q6-equivalent quality.
+                Self::MXFP4 => Self::MXFP4_KO,
                 other => crate::bail!("no KO weight form for {other:?}"),
             }),
             Int8Mode::Precision => Ok(match self {
@@ -684,6 +713,9 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q6_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                // Same 4-bit exponent-collapse twin as Performance — the collapse is already
+                // near-lossless (Q6-equivalent), so there is no wider grid to step up to.
+                Self::MXFP4 => Self::MXFP4_KO,
                 other => crate::bail!("no KO weight form for {other:?}"),
             }),
         }
@@ -754,6 +786,8 @@ impl GgmlDType {
             46 => Self::Q5_KO,
             47 => Self::Q6_KO,
             48 => Self::Q8_KO,
+            49 => Self::MXFP4,
+            50 => Self::MXFP4_KO,
             _ => crate::bail!("unknown dtype discriminant {u}"),
         };
         Ok(dtype)
@@ -795,8 +829,18 @@ impl GgmlDType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             15 => Self::Q8_K,
+            // Standard ggml integer / f64 tensor codes (llama.cpp writes these for
+            // non-quant tensors such as the hash-routing `tid2eid` table). candle's own
+            // writer uses the 231+ codes, but external files use these — read both.
+            24 => Self::I8,
+            25 => Self::I16,
+            26 => Self::I32,
+            27 => Self::I64,
+            28 => Self::F64,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            // MXFP4 (OCP micro-scaling FP4) — DeepSeek-V4 routed experts.
+            39 => Self::MXFP4,
             // AWQ types use IDs 100+ to avoid conflicts with GGML types
             100 => Self::QAWQ,
             101 => Self::QAWQ_G64,
@@ -826,6 +870,7 @@ impl GgmlDType {
             220 => Self::Q5_KO,
             221 => Self::Q6_KO,
             222 => Self::Q8_KO,
+            223 => Self::MXFP4_KO,
             230 => Self::F64,
             231 => Self::U8,
             232 => Self::I8,
@@ -883,6 +928,7 @@ impl GgmlDType {
             Self::Q0_M4 => 216,
             Self::F8E4M3 => 217,
             Self::F8E5M2 => 218,
+            Self::MXFP4 => 39,
             Self::F64 => 230,
             Self::U8 => 231,
             Self::I8 => 232,
@@ -898,6 +944,7 @@ impl GgmlDType {
             Self::Q5_KO => 220,
             Self::Q6_KO => 221,
             Self::Q8_KO => 222,
+            Self::MXFP4_KO => 223,
         }
     }
 
@@ -974,6 +1021,15 @@ impl GgmlDType {
                 BlockQ8_KO::zeros();
                 elem_count / BlockQ8_KO::BLCK_SIZE
             ]),
+            Self::MXFP4 => Box::new(vec![
+                BlockMXFP4::zeros();
+                elem_count / BlockMXFP4::BLCK_SIZE
+            ]),
+            // MXFP4_KO is a GPU-only lane-major chunk (built by repacking MXFP4 on-device,
+            // never as CPU blocks) — there is no host block struct to zero-fill.
+            Self::MXFP4_KO => {
+                panic!("MXFP4_KO has no CPU block form; build it via repack from MXFP4 on CUDA")
+            }
         }
     }
     /// The type size for blocks in bytes.
@@ -1026,10 +1082,20 @@ impl GgmlDType {
             Self::Q0_M2 => std::mem::size_of::<BlockQ0M2>(),
             Self::Q0_M4 => std::mem::size_of::<BlockQ0M4>(),
             // KO compact blocks: same byte size as their K counterpart, just reordered.
-            Self::Q4_KO => std::mem::size_of::<BlockQ4_KO>(),
-            Self::Q5_KO => std::mem::size_of::<BlockQ5_KO>(),
-            Self::Q6_KO => std::mem::size_of::<BlockQ6_KO>(),
-            Self::Q8_KO => std::mem::size_of::<BlockQ8_KO>(),
+            // KO twins are GPU-only lane-major chunks sized by `ko_quant::ko_chunk_bytes`
+            // (128 elems/block, ko_chunk_bytes/8 bytes/block) — NOT the CPU `BlockQ*_KO`
+            // struct layout. `type_size` is what the GGUF header uses to lay out and slice
+            // tensor data (offset accounting on write, length on read), so it MUST equal the
+            // bytes `quantize_ko` actually emits or offsets drift (past-EOF reads). Mirrors
+            // MXFP4_KO returning `72` (= 576/8) directly rather than a Block struct size.
+            Self::Q4_KO => 68,  // ko_chunk_bytes 544 / 8
+            Self::Q5_KO => 84,  // ko_chunk_bytes 672 / 8
+            Self::Q6_KO => 100, // ko_chunk_bytes 800 / 8
+            Self::Q8_KO => 132, // ko_chunk_bytes 1056 / 8
+            Self::MXFP4 => std::mem::size_of::<BlockMXFP4>(),
+            // 576-byte GPU chunk per 1024 elements (512 nibbles + 32 E8M0 + 32 dm) → 72 B
+            // per 128, keeping bytes == n_blocks × type_size for the [N,K] storage.
+            Self::MXFP4_KO => 72,
         }
     }
 
@@ -1081,6 +1147,9 @@ impl GgmlDType {
             Self::Q5_KO => BlockQ5_KO::BLCK_SIZE,
             Self::Q6_KO => BlockQ6_KO::BLCK_SIZE,
             Self::Q8_KO => BlockQ8_KO::BLCK_SIZE,
+            Self::MXFP4 => k_quants::QK_MXFP4,
+            // K/128 granularity (the collapse is per 128-K tile), like the other KO twins.
+            Self::MXFP4_KO => 128,
         }
     }
 }
@@ -2368,6 +2437,18 @@ impl crate::CustomOp1 for QTensor {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
+            // MXFP4 has no native matmul kernel (and no native FP4 tensor-core MMA on
+            // sm_120), so dequantize the weight (fast GPU kernel / CPU codec) and run a
+            // standard matmul. Used by the DeepSeek-V4 routed experts.
+            Self::QTensor(t) if t.dtype() == GgmlDType::MXFP4 => {
+                let w = t.dequantize(xs.device())?.to_dtype(xs.dtype())?; // [out, in]
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.matmul(&w)
+            }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
                 let w = match *xs.dims() {

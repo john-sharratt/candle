@@ -717,6 +717,24 @@ typedef struct __align__(16) {
 } block_c_q4_KO_k128;
 static_assert(sizeof(block_c_q4_KO_k128) == 64, "block_c_q4_KO_k128 must be 64 bytes (quant only; scales separate)");
 
+// MXFP4_KO per-128 quant stand-in — the block_compact<> key type for the native-MXFP4
+// exponent-collapse int8 format. Structurally identical to block_c_q4_KO_k128 (64 B of
+// nibbles) but a DISTINCT type so `block_compact<block_c_mxfp4>` maps to the MXFP4 k1024
+// chunk (not the Q4_KO one). The nibbles are MXFP4 E2M1 codebook indices [0,15], not affine
+// [0,15]; the per-sub E8M0 scales + collapsed per-128 scale ride the k1024 chunk (see
+// block_c_mxfp4_k1024). This type is only used as a template key — never streamed itself.
+typedef struct __align__(16) {
+    int qs[16];   // 0-63: [I0,I2,I1,I3] per sub (same lane interleave as Q4_KO)
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) d[i] = s[i];
+    }
+} block_c_mxfp4_k128;
+static_assert(sizeof(block_c_mxfp4_k128) == 64, "block_c_mxfp4_k128 must be 64 bytes (quant-only key type)");
+
 // Q5_K K/128: 16 threads × 8 elements, 4 scale pairs (32-elem groups)
 // Same layout as Q5_1 - 4 threads share a scale pair
 typedef struct __align__(16) {
@@ -903,12 +921,15 @@ static_assert(sizeof(block_c_q8_KO_k128) == 128, "block_c_q8_KO_k128 must be 128
 // KO K/1024 CHUNK BLOCKS — the strongly-typed unit the int8 (q8a128) path streams.
 // =============================================================================
 // One block = one 8-row weight chunk (8 rows × 128 K = 1024 elements) carrying its OWN
-// scales inline: the 8 per-row quant sub-blocks followed by the 32 per-(row,sub)
-// (scale, min) half2 pairs. This replaces the old "quant-only k128 block + separate
-// scale region at the tensor tail" layout: now the chunk's scales ride the same cp.async
-// as its quants and are read straight from the prefetched smem chunk in the fold — no
-// dm-hoist, no second DRAM stream, one unified read path. `q[row]` is the existing k128
-// quant block (bit-layout unchanged); `dm[row][sub]` is its (scale, min).
+// scales inline: the 8 per-row quant sub-blocks followed by 8 `half2` scale pairs — ONE
+// (scale, min) PER ROW (i.e. per 128-K), 32 bytes total. (This is per-128, NOT per-sub —
+// there is exactly one scale per row, applied after the four k32 sub-MMAs collapse into a
+// single int32; see loader/gemx_dequant.cuh for why the fold is per-128.) This replaces
+// the old "quant-only k128 block + separate scale region at the tensor tail" layout: now
+// the chunk's scales ride the same cp.async as its quants and are read straight from the
+// prefetched smem chunk in the fold — no dm-hoist, no second DRAM stream, one unified read
+// path. `q[row]` is the existing k128 quant block (bit-layout unchanged); `dm[row]` is its
+// per-128 (scale, min).
 template <typename QuantRow>
 struct block_c_KO_k1024 {
     QuantRow q[8];        // 8 rows of quants (8 * sizeof(QuantRow) bytes); 16-aligned
@@ -919,6 +940,23 @@ typedef block_c_KO_k1024<block_c_q5_KO_k128> block_c_q5_KO_k1024;
 typedef block_c_KO_k1024<block_c_q6_KO_k128> block_c_q6_KO_k1024;
 typedef block_c_KO_k1024<block_c_q8_KO_k128> block_c_q8_KO_k1024;
 
+// MXFP4_KO K/1024 chunk — the native-MXFP4 exponent-collapse int8 format. The 512 B quant
+// region is the SAME lane-major layout as block_c_q4_KO_k1024 (byte for (lane, sub, i) at
+// lane*16 + sub*4 + i, the uint32 packing K[p] | K[p+16]<<4) — but the nibbles are MXFP4
+// E2M1 codebook INDICES [0,15], not affine quants. Each 32-K sub carries its OWN E8M0
+// power-of-two scale byte in `e` (e[row*4 + sub]). The dequant collapses the four per-32
+// subs of a row onto their common largest exponent e_max by shifting each sub's int8
+// mantissa right by (e_max - e_sub), so all four share ONE per-128 scale and fold into a
+// single int32 (see loader/mxfp4.cuh). `dm[row]` is that shared scale precomputed at repack:
+// (2^(e_max-128), 0) — symmetric (E2M1 is centered, no min). Stays 4-bit in storage; the
+// collapse is in-register. `dm` sits at the same struct tail the int8 fold reads (blk->dm[rl]).
+struct __align__(16) block_c_mxfp4_k1024 {
+    uint8_t ql[512];   // lane-major MXFP4 nibbles (codebook indices): K[p] | K[p+16]<<4
+    uint8_t e[32];     // per-sub E8M0 scale bytes: e[row*4 + sub]
+    half2   dm[8];     // per-row collapsed scale (2^(e_max-128), 0), precomputed at repack
+};
+static_assert(sizeof(block_c_mxfp4_k1024) == 576, "block_c_mxfp4_k1024 must be 576 bytes (512 ql + 32 e + 32 dm)");
+
 // Bytes per warp weight chunk (8 rows) in the int8 path. KO k1024 blocks ARE the 8-row
 // chunk (quants + inline scales) → sizeof. Legacy non-KO int8 blocks are per-row → ×8.
 template <typename T> struct int8_chunk_bytes { static constexpr int value = 8 * (int)sizeof(T); };
@@ -926,6 +964,7 @@ template <> struct int8_chunk_bytes<block_c_q4_KO_k1024> { static constexpr int 
 template <> struct int8_chunk_bytes<block_c_q5_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q5_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q6_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q6_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q8_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q8_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_mxfp4_k1024> { static constexpr int value = (int)sizeof(block_c_mxfp4_k1024); };
 
 // =============================================================================
 // AWQ (ACTIVATION-AWARE WEIGHT QUANTIZATION) - K/128 FORMAT
@@ -1022,6 +1061,18 @@ template<>
 struct gemx_tile_traits<block_c_q4_KO_k128> {
     static constexpr bool is_ktile_major = true;
     static constexpr int stride = 80;             // 64 quant + 16 scale
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 4;
+    static constexpr int scales_per_ktile = 4;    // 1 scale per 32 elements
+};
+
+// MXFP4_KO: 64B of nibbles (E2M1 codebook indices) + per-sub E8M0 scales. Same 4-bit
+// nibble footprint as Q4_KO; the extra per-sub scale bytes ride the k1024 chunk, so the
+// per-128 stand-in mirrors the Q4_KO quant footprint for the output-layout stride helper.
+template<>
+struct gemx_tile_traits<block_c_mxfp4_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 80;             // 64 quant + scale (mirrors Q4_KO)
     static constexpr int elements_per_tile = 128;
     static constexpr int bits_per_element = 4;
     static constexpr int scales_per_ktile = 4;    // 1 scale per 32 elements
@@ -1230,7 +1281,15 @@ enum QType {
     QTYPE_Q6_KO  = 47,
     QTYPE_Q8_KO  = 48,
 
-    QTYPE_COUNT   = 49
+    // Native OCP MXFP4 storage (mirrors GgmlDType::MXFP4); has no matmul kernel of its own
+    // — the routed experts are repacked to the lane-major collapse twin MXFP4_KO below.
+    QTYPE_MXFP4    = 49,
+    // Lane-major exponent-collapse MXFP4 for the q8a128 int8 path: the four per-32 subs of
+    // each 128-K tile are collapsed onto their common e_max in-register so they fold into a
+    // single int32 (see loader/mxfp4.cuh). Stays 4-bit in storage. First slot past Q8_KO.
+    QTYPE_MXFP4_KO = 50,
+
+    QTYPE_COUNT   = 51
 };
 
 // =============================================================================
@@ -1282,7 +1341,9 @@ static_assert(QTYPE_Q4_KO   == 45, "QTYPE_Q4_KO must be 45");
 static_assert(QTYPE_Q5_KO   == 46, "QTYPE_Q5_KO must be 46");
 static_assert(QTYPE_Q6_KO   == 47, "QTYPE_Q6_KO must be 47");
 static_assert(QTYPE_Q8_KO   == 48, "QTYPE_Q8_KO must be 48");
-static_assert(QTYPE_COUNT   == 49, "QTYPE_COUNT must be 49");
+static_assert(QTYPE_MXFP4    == 49, "QTYPE_MXFP4 must be 49 to match GgmlDType::MXFP4");
+static_assert(QTYPE_MXFP4_KO == 50, "QTYPE_MXFP4_KO must be 50");
+static_assert(QTYPE_COUNT   == 51, "QTYPE_COUNT must be 51");
 
 // =============================================================================
 // QType -> matmul kernel index
@@ -1319,6 +1380,7 @@ __host__ __device__ inline int qtype_to_matmul_kernel_index(int qtype) {
         case QTYPE_Q5_KO:    return 15;
         case QTYPE_Q6_KO:    return 16;
         case QTYPE_Q8_KO:    return 17;
+        case QTYPE_MXFP4_KO: return 18;
         default:             return -1;
     }
 }
@@ -1399,6 +1461,7 @@ __host__ __device__ inline int qtype_output_block_size(int qtype) {
         case QTYPE_Q5_KO:    return gemx_tile_traits<block_c_q5_KO_k128>::stride;
         case QTYPE_Q6_KO:    return gemx_tile_traits<block_c_q6_KO_k128>::stride;
         case QTYPE_Q8_KO:    return gemx_tile_traits<block_c_q8_KO_k128>::stride;
+        case QTYPE_MXFP4_KO: return gemx_tile_traits<block_c_mxfp4_k128>::stride;
         default:             return -1;   // Unsupported by GEMX output layout
     }
 }
@@ -1437,6 +1500,7 @@ typedef block_c_q5_KO_k128 block_c_q5_KO;
 typedef block_c_q6_K_k128 block_c_q6_K;
 typedef block_c_q6_KO_k128 block_c_q6_KO;
 typedef block_c_q8_KO_k128 block_c_q8_KO;
+typedef block_c_mxfp4_k128 block_c_mxfp4;
 typedef block_c_q8_K_k128 block_c_q8_K;
 
 // Per-row smem stride for the INT8 weight slot = the block byte size (rows packed

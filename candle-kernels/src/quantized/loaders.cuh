@@ -115,6 +115,7 @@ template <> struct block_compact<block_c_q5_KO> { using type = block_c_q5_KO_k10
 template <> struct block_compact<block_c_q6_K> { using type = block_c_q6_K; };
 template <> struct block_compact<block_c_q6_KO> { using type = block_c_q6_KO_k1024; };
 template <> struct block_compact<block_c_q8_KO> { using type = block_c_q8_KO_k1024; };
+template <> struct block_compact<block_c_mxfp4> { using type = block_c_mxfp4_k1024; };
 
 // AWQ mappings
 template <> struct block_compact<block_q_awq> { using type = block_c_q_awq; };

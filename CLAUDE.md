@@ -34,7 +34,7 @@ Every 32-token block is independently evaluated. The `CompressionPolicy` selects
 **Attention sink protection**: The first 4 tokens (positions 0–3) use a dedicated fine scale (Q4_KS/Q8_KS) to prevent global scale inflation from attention sink magnitudes.
 
 ### Attentional Provenance Retrieval
-Q vectors are captured live during decode (not pre-computed from embeddings). A flat CPU scan over all KV chunks uses Binary Directional Provenance (sign(Q_PCA^T @ K), XOR+popcount with VNNI) completing in 3–10 ms across the full unbounded corpus. Results prefetch from warm/cold tiers while GPU decodes the next token.
+Q vectors are captured live during decode (not pre-computed from embeddings). A paged GPU BDP scan over the resident gallery arena (Binary Directional Provenance: sign(Q_PCA^T @ K) agreement via IMMA/BMMA kernels; `candle-conversation/src/provenance/gallery_arena/scan.rs`) completes in milliseconds across the full unbounded corpus. Results prefetch from warm/cold tiers while GPU decodes the next token.
 
 ### Markov Expert Prediction (MoE models)
 Routing patterns from the prior layer predict the current layer's expert needs. Measured 69% hit rate on Qwen3-30B-A3B. Wave-batched grouped GEMM steps 64 concurrent sessions coherently through layers, amortising expert weight loads across sessions.
@@ -46,6 +46,7 @@ Routing patterns from the prior layer predict the current layer's expert needs. 
 | Model | Use | Notes |
 |-------|-----|-------|
 | **Qwen3-30B-A3B** | Current development/benchmarking | 30B total, 3B active, MoE |
+| **DeepSeek-V4-Flash-0731** | Native-sparse 1M-context port (in progress) | 284B total, 13B active, MXFP4 experts, K≡V latent attention; see `docs/deepseek_batched_paged_attention_plan.md` |
 | **Qwen3-235B-A22B** | Production Zen Code target | Requires RTX 5090 workstation |
 | **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum uncensored fine-tune |
 | Qwen3-8B/14B | Ablation baselines | — |
@@ -56,8 +57,8 @@ Qwen3 thresholds are model-specific and must be re-derived for each variant. Whe
 
 ## Hardware
 
-**Current dev machine** — RTX 4090 Mobile 16 GB GDDR6.
-- Benchmarks: 509 t/s single-session, 2,446 t/s aggregate (64 sessions), Qwen3-30B-A3B.
+**Current dev machine** — RTX PRO 5000 Blackwell 72 GB (sm_120).
+- Reference benchmarks (measured on the previous RTX 4090 Mobile 16 GB): 509 t/s single-session, 2,446 t/s aggregate (64 sessions), Qwen3-30B-A3B.
 
 **Ordered production workstation** (~mid-2026):
 - 2× RTX 5090 32 GB GDDR7 (Blackwell, water-cooled)

@@ -3399,6 +3399,74 @@ fn dense_int8_matches_grouped() -> Result<()> {
     Ok(())
 }
 
+/// The novel MXFP4 exponent-collapse int8 kernel (`loader/mxfp4.cuh`) must reproduce the CPU
+/// oracle `ko_quant::mxfp4_collapse_int8_matmul`. The activation path is shared infrastructure,
+/// so we feed the oracle the DEQUANTIZED q8a128 activations the kernel consumes (re-quantizing
+/// them recovers the exact int8×scale, since each 128-block's max maps to ±127) — isolating the
+/// one thing under test: the in-register weight collapse (four per-32 E8M0 subs → common e_max →
+/// each sub's int8 mantissa shifted right by the exponent difference → single int32 fold, scaled
+/// by the baked per-128 `2^(e_max-128)`). Adversarial per-32 exponent spread forces non-zero
+/// shifts on every tile. Agreement is to FP accumulation order (the int32 sums are exact).
+#[test]
+fn mxfp4_collapse_cuda_matches_cpu_oracle() -> Result<()> {
+    use crate::quantized::ko_quant;
+    let dev = CudaDevice::new(0)?;
+    let nrows = 256usize; // N (multiple of 8)
+    let ncols = 512usize; // K (multiple of 128 → 4 collapse subs per tile)
+    let m = 48usize; // M — spans 3 dense 16-token tiles
+    let mut rng = rand::rng();
+
+    // Weight with adversarial per-32-block exponent spread: each 32-block gets a random
+    // 2^(-3..3) magnitude, so the four subs of every 128-tile land on different E8M0
+    // exponents and the collapse must shift them onto a common e_max.
+    let mut wf32 = vec![0f32; nrows * ncols];
+    for blk in 0..(nrows * ncols) / 32 {
+        let s = 2f32.powi(rng.random_range(-3i32..=3));
+        for j in 0..32 {
+            wf32[blk * 32 + j] = rng.random_range(-1.0f32..1.0) * s;
+        }
+    }
+
+    // Activations → q8a128 (the exact int8 grid the kernel multiplies), then dequantized so the
+    // CPU oracle re-quantizes to the identical a_i8 / a_scale (no activation-quant divergence).
+    let act: Vec<f32> = (0..m * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let q8a128 = quantize_acts_q8a128_test(&dev, &act, m, ncols)?;
+    let act_deq_dev = dequantize_q8a128(q8a128.data_slice()?, m, ncols, &dev)?;
+    let act_deq = dev.memcpy_dtov(&act_deq_dev.slice(..))?;
+
+    // CPU oracle over the 544-byte chunk + the shared activations.
+    let chunk544 = ko_quant::quantize_mxfp4_ko(&wf32, nrows, ncols);
+    let out_cpu = ko_quant::mxfp4_collapse_int8_matmul(&chunk544, &act_deq, nrows, ncols, m);
+
+    // GPU: the 576-byte chunk (per-row dm baked) through the dense int8 MXFP4_KO kernel.
+    let chunk576 = ko_quant::mxfp4_ko_to_gpu_chunk(&chunk544, nrows, ncols);
+    let ko_slice = dev.memcpy_stod(&chunk576)?;
+    let stream = dev.cuda_stream();
+    let (ko_ptr, _g) = ko_slice.device_ptr(&stream);
+    let out = dense_qmatmul(
+        DynamicTensor::Int8(&q8a128),
+        ko_ptr,
+        GgmlDType::MXFP4_KO,
+        nrows,
+        0,
+        &dev,
+    )?;
+    let out_gpu = read_f32_tensor(&dev, &out)?;
+
+    assert_eq!(out_gpu.len(), out_cpu.len());
+    let rel = rel_l2(&out_gpu, &out_cpu);
+    println!(
+        "MXFP4 collapse: CUDA kernel vs CPU oracle rel_l2 = {rel:.3e} (N={nrows} K={ncols} M={m})"
+    );
+    assert!(
+        rel < 1e-4,
+        "CUDA MXFP4 collapse diverged from CPU oracle: rel_l2 = {rel:.6}"
+    );
+    Ok(())
+}
+
 /// End-to-end `int8mode` flag machinery: the SAME flag drives `QMatMul::repack_for_optimization`
 /// (weight → KO when on, FP GEMX when off) and `to_dynamic` (activations → q8a128 when on, float
 /// when off), and the repacked weight + converted activations feed `dense_qmatmul`. Both flag
@@ -3463,6 +3531,167 @@ fn qmatmul_int8mode_flag_end_to_end() -> Result<()> {
             rel < tol,
             "int8mode={mode:?} precision rel_l2={rel:.4} >= {tol}"
         );
+    }
+    Ok(())
+}
+
+/// Repro guard for the offline-KO GGUF load path: a Q8_KO weight built from CPU
+/// `quantize_ko` bytes uploaded via `load_repacked` (what `qtensor_from_ggml` now does for a
+/// pre-KO GGUF) must forward-via-int8 identically to the same weight repacked on-GPU by
+/// `repack_for_optimization` (the Cat2 at-load path). Both feed the SAME Q8_0-dequantized f32,
+/// so any divergence (or crash) isolates the offline-load path from the engine.
+#[test]
+fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
+    use crate::quantized::ko_quant::quantize_ko;
+    use crate::quantized::{QMatMul, QTensor};
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (nrows, ncols, m) = (256usize, 512usize, 32usize); // out, in, batch
+    let mut rng = rand::rng();
+    let wf32: Vec<f32> = (0..nrows * ncols)
+        .map(|_| rng.random_range(-0.1f32..0.1))
+        .collect();
+    let act: Vec<f32> = (0..m * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let w_t = crate::Tensor::from_vec(wf32, (nrows, ncols), &device)?;
+    let act_t = crate::Tensor::from_vec(act, (m, ncols), &device)?;
+
+    // Path A (known-good, Cat2): Q8_0 → GPU repack_for_optimization → forward_via_int8.
+    let q8 = QMatMul::from_qtensor(QTensor::quantize(&w_t, GgmlDType::Q8_0)?)?;
+    let opt_a = q8.repack_for_optimization(Int8Mode::Performance)?;
+    let y_a: Vec<f32> = opt_a
+        .forward_via_int8(&act_t, Int8Mode::Performance)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    // Path B (offline emulation): dequant the SAME Q8_0 → CPU quantize_ko → load_repacked → wrap.
+    let w_q8_deq = QTensor::quantize(&w_t, GgmlDType::Q8_0)?.dequantize(&device)?;
+    let w_q8_vec = w_q8_deq.flatten_all()?.to_vec1::<f32>()?;
+    let ko_bytes = quantize_ko(&w_q8_vec, nrows, ncols, GgmlDType::Q8_KO);
+    let storage_b = crate::quantized::cuda::load_repacked(&dev, &ko_bytes, GgmlDType::Q8_KO)?;
+    let qt_b = QTensor::new(storage_b, vec![nrows, ncols])?;
+    let mm_b = QMatMul::from_qtensor(qt_b)?;
+    let y_b: Vec<f32> = mm_b
+        .forward_via_int8(&act_t, Int8Mode::Performance)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    let rel = rel_l2(&y_a, &y_b);
+    println!("offline-KO-load vs GPU-repack rel_l2 = {rel:.3e}");
+    assert!(
+        rel < 1e-3,
+        "offline-KO-load path diverged from GPU repack: rel_l2={rel}"
+    );
+    Ok(())
+}
+
+/// The fused Sinkhorn kernel (`run_sinkhorn_f32`) must reproduce the scalar reference that mirrors
+/// `hyper.rs::sinkhorn` (softmax over cols + eps → col-norm → (iters-1)×[row-norm, col-norm]) for a
+/// batch of small `[hc, hc]` matrices — the one-launch replacement for the ~120 tiny host ops.
+#[test]
+fn sinkhorn_kernel_matches_scalar_reference() -> Result<()> {
+    use candle_kernels::simple::sinkhorn::run_sinkhorn_f32;
+    use std::ffi::c_void;
+
+    // Scalar reference — identical op order to the kernel and to `hyper.rs::sinkhorn`.
+    fn reference(a: &[f32], hc: usize, iters: usize, eps: f32) -> Vec<f32> {
+        let mut c = vec![0f32; hc * hc];
+        for i in 0..hc {
+            let mut m = f32::MIN;
+            for j in 0..hc {
+                m = m.max(a[i * hc + j]);
+            }
+            let mut s = 0f32;
+            for j in 0..hc {
+                let e = (a[i * hc + j] - m).exp();
+                c[i * hc + j] = e;
+                s += e;
+            }
+            for j in 0..hc {
+                c[i * hc + j] = c[i * hc + j] / s + eps;
+            }
+        }
+        for j in 0..hc {
+            let mut s = eps;
+            for i in 0..hc {
+                s += c[i * hc + j];
+            }
+            for i in 0..hc {
+                c[i * hc + j] /= s;
+            }
+        }
+        for _ in 0..iters - 1 {
+            for i in 0..hc {
+                let mut s = eps;
+                for j in 0..hc {
+                    s += c[i * hc + j];
+                }
+                for j in 0..hc {
+                    c[i * hc + j] /= s;
+                }
+            }
+            for j in 0..hc {
+                let mut s = eps;
+                for i in 0..hc {
+                    s += c[i * hc + j];
+                }
+                for i in 0..hc {
+                    c[i * hc + j] /= s;
+                }
+            }
+        }
+        c
+    }
+
+    let dev = CudaDevice::new(0)?;
+    let (n, hc, iters, eps) = (5usize, 4usize, 20usize, 1e-6f32);
+    let mut s = 0x1234_5678u32;
+    let inp: Vec<f32> = (0..n * hc * hc)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 4.0 - 2.0
+        })
+        .collect();
+
+    let inp_dev = dev.memcpy_stod(&inp)?;
+    let mut out_dev = unsafe { dev.alloc::<f32>(n * hc * hc)? };
+    let stream = dev.cuda_stream();
+    {
+        let (ip, _g0) = inp_dev.device_ptr(&stream);
+        let (op, _g1) = out_dev.device_ptr_mut(&stream);
+        unsafe {
+            run_sinkhorn_f32(
+                ip as *const f32,
+                op as *mut f32,
+                n as i32,
+                hc as i32,
+                iters as i32,
+                eps,
+                stream.cu_stream() as *mut c_void,
+            );
+        }
+    }
+    dev.synchronize()?;
+    let got: Vec<f32> = dev.memcpy_dtov(&out_dev.slice(..))?;
+
+    for m in 0..n {
+        let want = reference(&inp[m * hc * hc..(m + 1) * hc * hc], hc, iters, eps);
+        for k in 0..hc * hc {
+            let g = got[m * hc * hc + k];
+            let w = want[k];
+            assert!(
+                (g - w).abs() < 1e-5,
+                "matrix {m} elem {k}: kernel {g} vs reference {w}"
+            );
+        }
+        // Doubly-stochastic sanity: rows and columns each sum to ~1.
+        for i in 0..hc {
+            let rs: f32 = (0..hc).map(|j| got[m * hc * hc + i * hc + j]).sum();
+            assert!((rs - 1.0).abs() < 1e-3, "matrix {m} row {i} sum {rs}");
+        }
     }
     Ok(())
 }
@@ -7786,6 +8015,175 @@ fn cuda_total_vram_device0_probe() -> Result<()> {
     assert!(
         total > 1024 * 1024 * 1024,
         "reported total VRAM {total} bytes is implausibly small"
+    );
+    Ok(())
+}
+
+/// MXFP4 GPU dequant must bit-match the CPU codec: both decode the same 17-byte blocks
+/// with identical E2M1-table × E8M0-half-scale arithmetic. Covers F32, F16, and BF16
+/// outputs. This is the FP4 expert-weight decode path for DeepSeek-V4.
+#[test]
+fn cuda_mxfp4_dequant_matches_cpu() -> Result<()> {
+    let cpu = crate::Device::Cpu;
+    let cuda = crate::Device::new_cuda(0)?;
+    let n = 1024usize;
+    // Values spanning negatives, zero, and a wide magnitude range so multiple E8M0
+    // scales and every E2M1 index are exercised across blocks.
+    let xs: Vec<f32> = (0..n).map(|i| ((i as f32) - 512.0) * 0.017).collect();
+    let x = crate::Tensor::from_vec(xs, (n,), &cpu)?;
+    let qc = crate::quantized::QTensor::quantize(&x, GgmlDType::MXFP4)?;
+    let deq_cpu = qc.dequantize(&cpu)?.to_vec1::<f32>()?;
+
+    // Upload the exact quantized bytes to the GPU and dequantize there.
+    let bytes = qc.data()?;
+    let (qg, _guard) =
+        crate::quantized::QTensor::from_host_mapped_ggml(GgmlDType::MXFP4, &bytes, vec![n], &cuda)?;
+
+    let deq_gpu_f32 = qg
+        .dequantize(&cuda)?
+        .to_dtype(crate::DType::F32)?
+        .to_vec1::<f32>()?;
+    for (i, (a, b)) in deq_cpu.iter().zip(deq_gpu_f32.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-6, "f32 mismatch at {i}: cpu {a} gpu {b}");
+    }
+
+    // BF16 output: within one bf16 ulp of the CPU value.
+    let deq_gpu_bf16 = qg
+        .dequantize_bf16(&cuda)?
+        .to_dtype(crate::DType::F32)?
+        .to_vec1::<f32>()?;
+    for (i, (a, b)) in deq_cpu.iter().zip(deq_gpu_bf16.iter()).enumerate() {
+        let tol = 0.01 * (1.0 + a.abs());
+        assert!((a - b).abs() < tol, "bf16 mismatch at {i}: cpu {a} gpu {b}");
+    }
+    Ok(())
+}
+
+/// MXFP4 `QMatMul::forward` runs via the dequantize→matmul path (no native FP4 MMA on
+/// sm_120) and matches an explicit dequantize-then-matmul. This is the DeepSeek-V4 routed
+/// expert compute path.
+#[test]
+fn cuda_mxfp4_qmatmul_dequant_path() -> Result<()> {
+    use crate::Module;
+    let cpu = crate::Device::Cpu;
+    let dev = crate::Device::new_cuda(0)?;
+    let (out, inn) = (64usize, 128usize);
+    let wf: Vec<f32> = (0..out * inn)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+        .collect();
+    let w_cpu = crate::Tensor::from_vec(wf, (out, inn), &cpu)?;
+    let qw = crate::quantized::QTensor::quantize(&w_cpu, GgmlDType::MXFP4)?;
+    let bytes = qw.data()?;
+    let (qg, _guard) = crate::quantized::QTensor::from_host_mapped_ggml(
+        GgmlDType::MXFP4,
+        &bytes,
+        vec![out, inn],
+        &dev,
+    )?;
+    // Reference dequant weight before qg is moved into the QMatMul.
+    let wdq = qg.dequantize(&dev)?.to_dtype(crate::DType::BF16)?; // [out, inn]
+    let qmm = crate::quantized::QMatMul::from_qtensor(qg)?;
+
+    let x = crate::Tensor::randn(0f32, 1.0, (4, inn), &dev)?.to_dtype(crate::DType::BF16)?;
+    let y = qmm.forward(&x)?; // [4, out]
+    assert_eq!(y.dims(), &[4, out]);
+    let yref = x.matmul(&wdq.t()?)?;
+    let d = (y.to_dtype(crate::DType::F32)? - yref.to_dtype(crate::DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert!(d < 1e-2, "MXFP4 QMatMul vs dequant-matmul diff {d}");
+    Ok(())
+}
+
+/// MXFP4 weights feed the int8 KO matmul kernel: repacking an MXFP4 weight to its KO twin
+/// (Q6_KO for Performance, Q8_KO for Precision) and running the q8a128 int8 MMA matches the
+/// float baseline (MXFP4 dequant × float activations). This is the "MXFP4 works with our
+/// int8 kernels" end-to-end check — CPU/float baseline vs the CUDA int8 kernel.
+#[test]
+fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
+    use crate::quantized::{QMatMul, QStorage, QTensor};
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let cpu = crate::Device::Cpu;
+    let (nrows, ncols, m) = (256usize, 512usize, 32usize);
+    let mut rng = rand::rng();
+    let act: Vec<f32> = (0..m * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let act_t = crate::Tensor::from_vec(act, (m, ncols), &device)?;
+
+    // Weight → MXFP4 (CPU quantize) → GPU (host-mapped).
+    let wf32: Vec<f32> = (0..nrows * ncols)
+        .map(|_| rng.random_range(-0.1f32..0.1))
+        .collect();
+
+    // Exact per-32 int8 CPU reference on the SAME weight + activations: this is the
+    // "best-case int8" (per-32 weight scales applied exactly, only the 8-bit activation
+    // quant is lossy). Comparing it and the per-128 KO kernel to the float baseline shows
+    // exactly what the per-128 optimization costs.
+    let cpu_chunk = crate::quantized::ko_quant::quantize_mxfp4_ko(&wf32, nrows, ncols);
+    let act_cpu = act_t
+        .to_dtype(crate::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let cpu_per32 =
+        crate::quantized::ko_quant::mxfp4_ko_int8_matmul(&cpu_chunk, &act_cpu, nrows, ncols, m);
+
+    let w_cpu = crate::Tensor::from_vec(wf32, (nrows, ncols), &cpu)?;
+    let qw = QTensor::quantize(&w_cpu, GgmlDType::MXFP4)?;
+    let bytes = qw.data()?;
+    let (qg, _guard) =
+        QTensor::from_host_mapped_ggml(GgmlDType::MXFP4, &bytes, vec![nrows, ncols], &device)?;
+    let qmm = QMatMul::from_qtensor(qg)?;
+
+    // Float baseline: MXFP4 dequant × float acts (the QMatMul MXFP4 dequant→matmul path).
+    let base_t = crate::Module::forward(&qmm, &act_t)?; // [m, nrows]
+    let base = base_t
+        .to_dtype(crate::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    let run = |mode: Int8Mode| -> Result<Vec<f32>> {
+        let opt = qmm.repack_for_optimization(mode)?;
+        let q = opt.qtensor().unwrap();
+        let (wptr, wlen) = match &q.storage {
+            QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
+            _ => unreachable!(),
+        };
+        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let out = dense_qmatmul(acts.as_dynamic(), wptr, q.dtype(), nrows, wlen, &dev)?;
+        read_f32_tensor(&dev, &out)
+    };
+
+    // Exact per-32 int8 (CPU) vs float baseline — the best int8 could do if it kept the
+    // per-32 weight scales (the residual is only the 8-bit activation quant).
+    assert_eq!(cpu_per32.len(), base.len());
+    let rel_per32 = rel_l2(&cpu_per32, &base);
+    println!("exact per-32 int8 (CPU) vs float baseline: rel_l2 = {rel_per32:.5}");
+
+    for (mode, tol) in [
+        (Int8Mode::Performance, 0.08f64),
+        (Int8Mode::Precision, 0.03),
+    ] {
+        let int8 = run(mode)?;
+        assert_eq!(int8.len(), base.len());
+        let rel = rel_l2(&int8, &base);
+        println!(
+            "MXFP4->{:?} (per-128, {mode:?}) int8 vs float baseline: rel_l2 = {rel:.5} (tol {tol}); \
+             per-128 cost over exact per-32 = {:.5}",
+            GgmlDType::MXFP4.to_ko(mode)?,
+            (rel - rel_per32).max(0.0)
+        );
+        assert!(
+            rel < tol,
+            "MXFP4 {mode:?} int8 diverged from float baseline: rel_l2 {rel:.5} >= {tol}"
+        );
+    }
+    // The exact per-32 reference must be at least as good as the per-128 kernel.
+    assert!(
+        rel_per32 < 0.03,
+        "exact per-32 int8 rel_l2 {rel_per32:.5} unexpectedly high"
     );
     Ok(())
 }

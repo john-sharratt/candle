@@ -296,6 +296,7 @@ fn dtype_to_qtype(dtype: GgmlDType) -> Result<QType> {
         GgmlDType::Q5_KO => QType::Q5_KO,
         GgmlDType::Q6_KO => QType::Q6_KO,
         GgmlDType::Q8_KO => QType::Q8_KO,
+        GgmlDType::MXFP4_KO => QType::MXFP4_KO,
         GgmlDType::Q0_M4 => QType::Q0_M4,
         _ => crate::bail!("unsupported dtype for quantized op: {dtype:?}"),
     })
@@ -2391,6 +2392,24 @@ fn dequantize_f32(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if dtype == GgmlDType::MXFP4 {
+        // MXFP4 has no QType slot (kept off the locked QTYPE tables) — standalone kernel.
+        let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+        {
+            let stream = dev.cuda_stream();
+            let (data_ptr, _dg) = data.inner.device_ptr(&stream);
+            let (dst_ptr, _og) = dst.device_ptr(&stream);
+            unsafe {
+                candle_kernels::simple::quantized::run_dequantize_mxfp4(
+                    data_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    elem_count as i32,
+                    0,
+                );
+            }
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<f32>(elem_count)? };
     {
@@ -2416,6 +2435,23 @@ fn dequantize_f16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if dtype == GgmlDType::MXFP4 {
+        let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+        {
+            let stream = dev.cuda_stream();
+            let (data_ptr, _dg) = data.inner.device_ptr(&stream);
+            let (dst_ptr, _og) = dst.device_ptr(&stream);
+            unsafe {
+                candle_kernels::simple::quantized::run_dequantize_mxfp4(
+                    data_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    elem_count as i32,
+                    1,
+                );
+            }
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<f16>(elem_count)? };
     {
@@ -2442,6 +2478,23 @@ fn dequantize_bf16(
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     use half::bf16;
+    if dtype == GgmlDType::MXFP4 {
+        let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
+        {
+            let stream = dev.cuda_stream();
+            let (data_ptr, _dg) = data.inner.device_ptr(&stream);
+            let (dst_ptr, _og) = dst.device_ptr(&stream);
+            unsafe {
+                candle_kernels::simple::quantized::run_dequantize_mxfp4(
+                    data_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    elem_count as i32,
+                    2,
+                );
+            }
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
     {
@@ -2882,6 +2935,7 @@ impl QCudaStorage {
                 | GgmlDType::Q2_A
                 | GgmlDType::Q2_1
                 | GgmlDType::Q3_1
+                | GgmlDType::MXFP4
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -2908,6 +2962,9 @@ impl QCudaStorage {
             GgmlDType::BF16 => deq::<half::bf16>(&buffer, block_len, &mut out),
             GgmlDType::F8E4M3 => panic!("not implemented"),
             GgmlDType::F8E5M2 => panic!("not implemented"),
+            GgmlDType::MXFP4 => {
+                deq::<crate::quantized::k_quants::BlockMXFP4>(&buffer, block_len, &mut out)
+            }
             GgmlDType::Q4_0 => deq::<crate::quantized::BlockQ4_0>(&buffer, block_len, &mut out),
             GgmlDType::Q4_1 => deq::<crate::quantized::BlockQ4_1>(&buffer, block_len, &mut out),
             GgmlDType::Q5_0 => deq::<crate::quantized::BlockQ5_0>(&buffer, block_len, &mut out),
@@ -2945,6 +3002,11 @@ impl QCudaStorage {
             GgmlDType::Q5_KO => deq::<crate::quantized::BlockQ5_KO>(&buffer, block_len, &mut out),
             GgmlDType::Q6_KO => deq::<crate::quantized::BlockQ6_KO>(&buffer, block_len, &mut out),
             GgmlDType::Q8_KO => deq::<crate::quantized::BlockQ8_KO>(&buffer, block_len, &mut out),
+            // MXFP4_KO is a GPU-only lane-major chunk with no per-128 host block codec; it is
+            // never CPU-dequantized (the collapse fold lives in the int8 kernel).
+            GgmlDType::MXFP4_KO => {
+                crate::bail!("MXFP4_KO has no CPU dequant path; it is a GPU-only int8 weight")
+            }
         }
 
         self.device
@@ -3650,12 +3712,13 @@ impl QCudaStorage {
     /// [`Self::repack_gemx`] used by `QMatMul::repack_for_optimization`.
     pub fn repack_ko(&self, shape: &Shape, ko_dtype: GgmlDType) -> Result<Self> {
         let (nrows, ncols) = shape.dims2()?;
-        // The KO chunk layout packs 8 rows × 128 K per chunk; unaligned dims would under-size the
-        // output buffer below while the kernel writes the full N×K → OOB device write. Match the
-        // CPU twin's invariants (ko_quant::quantize_ko).
-        if nrows % 8 != 0 || ncols % 128 != 0 {
+        // The KO chunk layout packs 8 rows × 128 K per chunk, but the q8a128 matmul kernel that
+        // reads the result tiles N in blocks of 32 — so require `nrows % 32` (not just 8), matching
+        // the matmul. Callers (`repack_for_optimization` → `qlinear_int8`) treat the bail as "not
+        // KO-tileable" and fall back to a dense weight (e.g. the tiny mHC `fn_w`, `mix_hc=24`).
+        if nrows % 32 != 0 || ncols % 128 != 0 {
             crate::bail!(
-                "repack_ko: shape [{nrows}, {ncols}] must have nrows % 8 == 0 and ncols % 128 == 0"
+                "repack_ko: shape [{nrows}, {ncols}] must have nrows % 32 == 0 and ncols % 128 == 0"
             );
         }
         let qtype = dtype_to_qtype(ko_dtype)? as i32;
@@ -3832,6 +3895,24 @@ pub fn repack_to_host(
     // (`target_dtype`) ONCE. The host bytes are cached in the expert pinned pool exactly like the
     // gemx repack, so a miss DMA-reloads them with no per-miss re-quant. The int8 KO matmul reads
     // these; the staging pipeline is format-agnostic (gemx K/128 or KO — both just tensors).
+    // Already the target format (a prepared / pre-repacked weight, e.g. MXFP4_KO on disk):
+    // nothing to do — hand the bytes straight through so the staging path stays uniform and
+    // pays no reorder. This is what lets the engine load a pre-KO GGUF with no runtime repack.
+    if dtype == target_dtype {
+        return Ok(ggml_bytes.to_vec());
+    }
+    // MXFP4_KO: the native MXFP4 experts repack by an EXACT byte-reorder (no dequant/requant),
+    // keeping the weights 4-bit. Done on the host straight from the GGUF bytes — the collapse
+    // itself lives in the int8 kernel, so this only permutes nibbles + E8M0 and bakes the per-row
+    // e_max scale. (Bypasses the affine `repack_ko` path below, which is a lossy F32 re-quant.)
+    if target_dtype == GgmlDType::MXFP4_KO {
+        if dtype != GgmlDType::MXFP4 {
+            crate::bail!("repack_to_host(MXFP4_KO): source must be MXFP4, got {dtype:?}");
+        }
+        return Ok(crate::quantized::ko_quant::mxfp4_native_to_ko_gpu_chunk(
+            ggml_bytes, nrows, ncols,
+        ));
+    }
     if target_dtype.is_ko() {
         let src = load_repacked(device, ggml_bytes, dtype)?;
         let src_cuda = match &src {

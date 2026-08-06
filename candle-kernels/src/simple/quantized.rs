@@ -1767,6 +1767,15 @@ extern "C" {
         out_dtype: c_int,
     );
 
+    /// Standalone MXFP4 (OCP FP4) dequantize. `out_dtype`: 0=F32, 1=F16, 2=BF16. Kept
+    /// separate from `run_dequantize_block` so MXFP4 stays off the locked QTYPE tables.
+    pub fn run_dequantize_mxfp4(
+        src: *const c_void,
+        dst: *mut c_void,
+        elem_count: c_int,
+        out_dtype: c_int,
+    );
+
     /// Q0_V dequantize test entrypoint — wraps `BlockConverter<block_q0_v, float>::load`
     /// so unit tests can exercise the exact production GPU decode path used by
     /// attention/prefill kernels. Writes `num_blocks * 32` f32 elements to `dst`.
@@ -2021,6 +2030,10 @@ pub enum QType {
     Q5_KO = 46,
     Q6_KO = 47,
     Q8_KO = 48,
+    // Lane-major exponent-collapse MXFP4 for the q8a128 int8 path — the KO twin the MXFP4
+    // routed experts repack to (stays 4-bit; the four per-32 subs collapse onto e_max
+    // in-register). Value 50 mirrors QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul kernel.
+    MXFP4_KO = 50,
 }
 
 #[cfg(test)]
@@ -2075,6 +2088,7 @@ mod kv_qtype_lock_tests {
         assert_eq!(QType::Q5_KO as i32, 46);
         assert_eq!(QType::Q6_KO as i32, 47);
         assert_eq!(QType::Q8_KO as i32, 48);
+        assert_eq!(QType::MXFP4_KO as i32, 50);
     }
 }
 
