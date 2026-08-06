@@ -20,28 +20,49 @@
 //! path is layered on top separately.
 
 mod attention;
-mod batched;
 mod compressor;
 mod config;
 #[cfg(feature = "cuda")]
 mod engine;
+#[cfg(feature = "cuda")]
+pub use engine::Dsv4Engine;
+mod footprint;
+mod gallery;
 mod hyper;
 mod indexer;
+#[cfg(feature = "cuda")]
+mod kernel_attention;
 mod linear;
 mod loader;
 mod moe;
+mod paged;
+pub mod readback;
 mod rope;
 mod streaming;
 mod transformer;
+#[cfg(feature = "cuda")]
+mod wave;
 
 pub use attention::{Attention, AttentionParams};
 pub use compressor::Compressor;
 pub use config::{Config, LayerKind};
+pub use footprint::{
+    deepseek_kv_footprint, fp16_linear_baseline_bytes, ratio_vs_fp16_linear, KvFootprint,
+    CORPUS_DTYPE, WINDOW_KV_DTYPE,
+};
+pub use gallery::FloatGallery;
+#[cfg(feature = "cuda")]
+pub use gallery::{bdp_recall, sign_pack};
 pub use hyper::{HyperConnection, HyperParams};
 pub use indexer::Indexer;
 pub use linear::QLinear;
 pub use loader::{config_from_gguf, GgufModel};
 pub use moe::{Expert, Gate, MoE, ScoreFunc};
+#[cfg(feature = "cuda")]
+pub use paged::{paged_deepseek_decode, paged_deepseek_decode_raw, SyntheticSlots};
+pub use rope::yarn_freqs;
 pub use rope::RotaryCache;
 pub use streaming::StreamingModel;
 pub use transformer::{Block, Transformer};
+#[cfg(feature = "cuda")]
+pub use wave::DeepSeekBatched;

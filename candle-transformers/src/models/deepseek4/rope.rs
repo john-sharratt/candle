@@ -8,21 +8,59 @@
 
 use candle::{DType, Device, Result, Tensor, D};
 
-/// Precomputed `cos`/`sin` tables for one `(rope_dim, theta, original_seq_len)` setting.
-/// Shape `[max_seq, rope_dim / 2]`.
+/// Host-side RoPE for one `(rope_dim, theta, original_seq_len)` setting.
+///
+/// Holds ONLY the YaRN-adjusted frequencies — `cos`/`sin` are computed per
+/// call for exactly the requested positions. Nothing position-sized is ever
+/// allocated, so the addressable context is unbounded (the §L fixed-budget
+/// principle): a query at position 10⁶ costs the same as one at position 10.
+/// The paged kernels compute their own RoPE in-kernel from the same
+/// [`yarn_freqs`] values; this host path serves the indexer/compressor
+/// projections and the reference forwards.
 #[derive(Debug, Clone)]
 pub struct RotaryCache {
-    cos: Tensor,
-    sin: Tensor,
+    freqs: Vec<f64>,
     rope_dim: usize,
+    device: Device,
+}
+
+/// The YaRN-adjusted inverse frequencies (`rope_dim / 2` values). When
+/// `original_seq_len == 0` YaRN is disabled and these are the plain RoPE
+/// frequencies `1 / theta^(2i/dim)`. This is the single source of truth — the
+/// [`RotaryCache`] tables and the paged kernels' in-kernel RoPE both derive
+/// from it.
+pub fn yarn_freqs(
+    rope_dim: usize,
+    theta: f64,
+    original_seq_len: usize,
+    factor: f64,
+    beta_fast: f64,
+    beta_slow: f64,
+) -> Vec<f64> {
+    let half = rope_dim / 2;
+    let mut freqs: Vec<f64> = (0..half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f64 / rope_dim as f64))
+        .collect();
+
+    if original_seq_len > 0 {
+        let (low, high) =
+            RotaryCache::correction_range(beta_fast, beta_slow, rope_dim, theta, original_seq_len);
+        for (i, f) in freqs.iter_mut().enumerate() {
+            // smooth = 1 - ramp; interpolate between scaled (/factor) and raw freqs.
+            let ramp = RotaryCache::ramp(low, high, i);
+            let smooth = 1.0 - ramp;
+            *f = *f / factor * (1.0 - smooth) + *f * smooth;
+        }
+    }
+    freqs
 }
 
 impl RotaryCache {
-    /// Build the tables. `factor`/`beta_fast`/`beta_slow` are the YaRN parameters; when
-    /// `original_seq_len == 0` YaRN is disabled and plain RoPE frequencies are used.
+    /// `factor`/`beta_fast`/`beta_slow` are the YaRN parameters; when
+    /// `original_seq_len == 0` YaRN is disabled and plain RoPE frequencies are
+    /// used.
     pub fn new(
         rope_dim: usize,
-        max_seq: usize,
         theta: f64,
         original_seq_len: usize,
         factor: f64,
@@ -30,35 +68,39 @@ impl RotaryCache {
         beta_slow: f64,
         device: &Device,
     ) -> Result<Self> {
-        let half = rope_dim / 2;
-        // Base inverse frequencies: 1 / base^(2i/dim).
-        let mut freqs: Vec<f64> = (0..half)
-            .map(|i| 1.0 / theta.powf((2 * i) as f64 / rope_dim as f64))
-            .collect();
+        let freqs = yarn_freqs(
+            rope_dim,
+            theta,
+            original_seq_len,
+            factor,
+            beta_fast,
+            beta_slow,
+        );
+        Ok(Self {
+            freqs,
+            rope_dim,
+            device: device.clone(),
+        })
+    }
 
-        if original_seq_len > 0 {
-            let (low, high) =
-                Self::correction_range(beta_fast, beta_slow, rope_dim, theta, original_seq_len);
-            for (i, f) in freqs.iter_mut().enumerate() {
-                // smooth = 1 - ramp; interpolate between scaled (/factor) and raw freqs.
-                let ramp = Self::ramp(low, high, i);
-                let smooth = 1.0 - ramp;
-                *f = *f / factor * (1.0 - smooth) + *f * smooth;
-            }
-        }
-
-        let mut cos = vec![0f32; max_seq * half];
-        let mut sin = vec![0f32; max_seq * half];
-        for t in 0..max_seq {
-            for (i, &f) in freqs.iter().enumerate() {
-                let angle = t as f64 * f;
+    /// `cos`/`sin` rows for exactly these positions, shape `[n, rope_dim/2]`.
+    /// Same math the precomputed table used (`f64` angle, direct sincos), so
+    /// every consumer's numerics are unchanged.
+    fn cos_sin_for(&self, positions: &[u32]) -> Result<(Tensor, Tensor)> {
+        let half = self.rope_dim / 2;
+        let n = positions.len();
+        let mut cos = vec![0f32; n * half];
+        let mut sin = vec![0f32; n * half];
+        for (t, &pos) in positions.iter().enumerate() {
+            for (i, &f) in self.freqs.iter().enumerate() {
+                let angle = pos as f64 * f;
                 cos[t * half + i] = angle.cos() as f32;
                 sin[t * half + i] = angle.sin() as f32;
             }
         }
-        let cos = Tensor::from_vec(cos, (max_seq, half), device)?;
-        let sin = Tensor::from_vec(sin, (max_seq, half), device)?;
-        Ok(Self { cos, sin, rope_dim })
+        let cos = Tensor::from_vec(cos, (n, half), &self.device)?;
+        let sin = Tensor::from_vec(sin, (n, half), &self.device)?;
+        Ok((cos, sin))
     }
 
     fn correction_dim(num_rotations: f64, dim: usize, base: f64, max_seq: usize) -> f64 {
@@ -90,17 +132,16 @@ impl RotaryCache {
     /// applied (used to de-rotate attention output).
     pub fn apply(&self, x: &Tensor, start: usize, inverse: bool) -> Result<Tensor> {
         let seq = x.dim(D::Minus2)?;
-        let cos = self.cos.narrow(0, start, seq)?;
-        let sin = self.sin.narrow(0, start, seq)?;
+        let positions: Vec<u32> = (start as u32..(start + seq) as u32).collect();
+        let (cos, sin) = self.cos_sin_for(&positions)?;
         self.apply_with(x, &cos, &sin, inverse)
     }
 
-    /// As [`Self::apply`] but at arbitrary (e.g. strided) positions given by a `[seq]`
-    /// `u32` index tensor — used for compressed KV entries, whose RoPE positions are the
-    /// group-start token positions `0, ratio, 2·ratio, …`.
-    pub fn apply_positions(&self, x: &Tensor, positions: &Tensor, inverse: bool) -> Result<Tensor> {
-        let cos = self.cos.index_select(positions, 0)?;
-        let sin = self.sin.index_select(positions, 0)?;
+    /// As [`Self::apply`] but at arbitrary (e.g. strided) positions — used for
+    /// compressed KV entries, whose RoPE positions are the group-start token
+    /// positions `0, ratio, 2·ratio, …`.
+    pub fn apply_positions(&self, x: &Tensor, positions: &[u32], inverse: bool) -> Result<Tensor> {
+        let (cos, sin) = self.cos_sin_for(positions)?;
         self.apply_with(x, &cos, &sin, inverse)
     }
 
@@ -160,7 +201,7 @@ mod tests {
     #[test]
     fn forward_then_inverse_is_identity() -> Result<()> {
         let dev = Device::Cpu;
-        let cache = RotaryCache::new(8, 64, 10000.0, 0, 1.0, 32.0, 1.0, &dev)?;
+        let cache = RotaryCache::new(8, 10000.0, 0, 1.0, 32.0, 1.0, &dev)?;
         // [b=2, heads=3, seq=5, rope_dim=8] with seq on Minus2.
         let x = Tensor::randn(0f32, 1.0, (2, 3, 5, 8), &dev)?;
         let rotated = cache.apply(&x, 7, false)?;
@@ -180,7 +221,7 @@ mod tests {
     fn query_rope_is_token_position_broadcast_over_heads() -> Result<()> {
         let dev = Device::Cpu;
         let (rope_dim, theta) = (8usize, 10000.0f64);
-        let cache = RotaryCache::new(rope_dim, 32, theta, 0, 1.0, 32.0, 1.0, &dev)?;
+        let cache = RotaryCache::new(rope_dim, theta, 0, 1.0, 32.0, 1.0, &dev)?;
         let (h, s) = (3usize, 5usize);
         // Query in the attention's roped layout: [b=1, heads, seq, rope_dim].
         let q = Tensor::randn(0f32, 1.0, (1, h, s, rope_dim), &dev)?;
@@ -218,7 +259,7 @@ mod tests {
     fn rotation_matches_scalar_formula() -> Result<()> {
         let dev = Device::Cpu;
         let (rope_dim, theta) = (8usize, 10000.0f64);
-        let cache = RotaryCache::new(rope_dim, 32, theta, 0, 1.0, 32.0, 1.0, &dev)?;
+        let cache = RotaryCache::new(rope_dim, theta, 0, 1.0, 32.0, 1.0, &dev)?;
         let pos = 3usize;
         // single vector [1,1,1,rope_dim]
         let vals: Vec<f32> = (0..rope_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();

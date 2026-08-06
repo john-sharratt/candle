@@ -134,6 +134,11 @@ pub(crate) struct BoundaryMarkers {
     pub(crate) assistant_end_str: String,
     pub(crate) user_end_str: String,
     pub(crate) assistant_start_str: String,
+    /// When set, inter-turn glue attends **backward-unbounded, strictly causal**
+    /// — no forward bridge into the turn it introduces (`fwd_ahead ≡ 0`, §E).
+    /// The `paged-deepseek` glue kernel is causal-only; the forward-window path
+    /// is a Qwen-only feature. Keyed on the dialect at construction.
+    pub(crate) causal_only_glue: bool,
 }
 
 impl BoundaryMarkers {
@@ -163,6 +168,10 @@ impl BoundaryMarkers {
             assistant_end_str: dialect.assistant_end.to_string(),
             user_end_str: dialect.user_end.to_string(),
             assistant_start_str: dialect.assistant_start.to_string(),
+            causal_only_glue: matches!(
+                dialect.dialect_type(),
+                candle_transformers::models::dialect::DialectType::DeepSeek
+            ),
         })
     }
 }
@@ -515,7 +524,14 @@ pub(super) fn apply_segments_build(
     for i in 0..pieces.len() {
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
-                let fwd = glue_bridge_window(pieces.get(i + 1));
+                // Causal-only dialects (DeepSeek) drop the forward bridge — glue
+                // attends backward-unbounded only (§E), matching the paged-glue
+                // kernel's `fwd_ahead ≡ 0` contract.
+                let fwd = if ctx.boundary_markers.causal_only_glue {
+                    0
+                } else {
+                    glue_bridge_window(pieces.get(i + 1))
+                };
                 reserve_glue_island(ctx, &mut walker, tokens, fwd)?;
             }
             AssembledPiece::Section(id) => {
@@ -1191,10 +1207,12 @@ pub(super) fn fire_gap_fill_batch(
     // the source, so the failure is named instead of a cryptic index panic.
     for &id in &ids {
         let session_off = session.sequence_offset(id).unwrap_or(0);
-        let backing_len = session
-            .sequence_caches(id)
-            .map(|c| c.current_seq_len())
-            .unwrap_or(session_off);
+        // Authoritative backing length = Σ chunk usage (the same source
+        // `reconcile_wave_offsets` reads). The legacy per-sequence Cache
+        // counter is only maintained by Cache-level write paths, which
+        // in-kernel writers never touch — it would read 0 and fail the
+        // invariant spuriously.
+        let backing_len = session.sequence_backing_tokens(id).unwrap_or(session_off);
         if backing_len != session_off {
             return Err(ConversationError::Channel(format!(
                 "gap-fill desynced slot {id}: session offset {session_off} != backing length \
@@ -1382,6 +1400,7 @@ mod tests {
             assistant_end_str: "<|im_end|>\n".into(),
             user_end_str: "<|im_end|>\n".into(),
             assistant_start_str: "<|im_start|>assistant\n".into(),
+            causal_only_glue: false,
         }
     }
 

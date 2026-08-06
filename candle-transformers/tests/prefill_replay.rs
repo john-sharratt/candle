@@ -228,7 +228,6 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
             &rope_offsets,
             &rope_cs,
             cap.rope_interleaved,
-            0,
             &generation,
             &RefCell::new(None),
         )

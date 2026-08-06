@@ -216,6 +216,17 @@ float top-k? Sweep M vs recovered-fraction, **per layer**, on real traces (the
 cost. Pure-BDP replacement (drop the Indexer) is possible but bets the model tolerates OOD selection;
 the two-stage version does not require that bet.
 
+_Measured (first real-trace sweep, `indexer_recall_sweep_real_traces`, 416-token generation, G=96
+entries/CSA layer, probe k=8): recall@M is **moderate, not strong** at this depth — per-layer
+recall@M=32 spans 0.00–1.00 (median ≈ 0.5), recall@M=64 spans 0.38–1.00. The relu + per-head gate
+weights discard information plain sign-agreement can't see — exactly the precision loss anticipated
+above. Consequences: (1) the two-stage structure stands (any M-superset is valid; the Indexer
+re-ranks), but the shortlist must be sized generously and re-measured at depth — the step-6
+long-context runs re-sweep at G in the tens of thousands, the regime that actually matters; (2) if
+depth confirms weak recall, the recall kernel has headroom: gate-weight-aware agreement (weight each
+head's popcount by its `w_h`) is a small kernel change. Machinery validated exactly: recall@G ≡ 1
+per layer, two-stage ≡ full Indexer when the shortlist covers the corpus._
+
 **Storage:** the compressed corpus is unbounded + per-layer (tens of GB at 1M), so it lives in a
 tiered store. The provenance corpus's *tiering skeleton* (`StreamId` residency, fingerprint upload,
 free-list pool, LRU + rebuild-from-warm) transfers, but its leaf is sign-bits; the compressed entries
@@ -641,10 +652,14 @@ double-buffer of the 8-key latent = +8 KB → 3 blocks/SM; skip it — occupancy
 `acc += c · scaleQ[h][p] · scaleK[key][p]`. **PV:** FP `fmaf` over the reused staged latent (or int8
 read-through when all palettes are read-through formats — one arena, so the gate is per-slot cheap).
 **Sink:** fold per head at the end — `m'=max(m,sink[h]); l = l·e^{m−m'} + e^{sink−m'}`.
-**RoPE:** computed **in-kernel** from the `rope_head_dim/2` YaRN-adjusted frequencies (constant
-memory, `sincosf`) — the fork does **not** inherit the position-indexed `rope_cs` table
-(`int8_decode_kernel.cuh:56`), which at 1M positions is hundreds of MB of device memory growing
-with N (§L).
+**RoPE:** computed **in-kernel** from the `rope_head_dim/2` YaRN-adjusted frequencies — the fork
+does **not** inherit the position-indexed `rope_cs` table (`int8_decode_kernel.cuh:56`), which at
+1M positions is hundreds of MB of device memory growing with N (§L). The angle `pos·freq` is
+reduced to a quadrant + residual **in f64** (an f32 product is unusable at depth: ulp(10⁶ rad)
+≈ 0.06 rad, and `__sincosf` degrades outside the principal range), then sin/cos come from the
+fork's own plain-arithmetic minimax polynomials (`rope_angle`/`ds_sincos`, built from `_rn`
+intrinsics so the compiler cannot contract them) — accurate at any position AND reproduced
+bit-for-bit by the CPU mirror oracle.
 
 **Hybrid loop (one online-softmax, two key sources):**
 - **Window pass** — the stock gap-aware sequential slice-scan over the slot's window chunks, bounded
@@ -656,18 +671,43 @@ with N (§L).
   that shortlist asynchronously (§D cadence) — never on the decode hot path.
 Both are key streams feeding one accumulator; the split-KV `num_splits` spans their union.
 
-## G.5 Prefill kernel — the arena must be re-derived
-The stock 25.6 KB union arena is sized for HD=128 (`PRO_BYTES = 64·(HD+16)`); at HD=512 that Q-stage
-alone is **33.8 KB** — the `static_assert(ARENA_BYTES+128 <= 25600)` fails, and even HD=256 needs
-~41 KB. Two forks:
-- **(A) Palette-tiled arena (preferred):** stage + MMA **one 128-d palette at a time** through a ~1/4
-  arena (loop the 4 palettes, accumulate QK), keeping the 25.6 KB / 4-blocks-per-SM budget and 67%
-  occupancy at the cost of 4× staging barriers. Needs the 7-bit rank repack (§G.2#2).
-- **(B) Whole-head arena at reduced occupancy:** ~41–50 KB arena → **2 blocks/SM** (opt-in >48 KB
-  dynamic smem). Simpler, ~½ occupancy.
-Recommend **(A)**. Prefill also carries the hybrid (window + all/selected compressed for HCA/CSA),
-causal `horizon`, and the sliding-window bound; K≡V single-latent applies. Built **after** decode is
-bit-exact, one shot.
+## G.5 Prefill kernel — per-query decode geometry over a settled slot
+_Revised at implementation (the palette-tiled-arena plan below it replaced assumed the stock
+adaptive-format staging; the fixed-FP8 direct-load fork obviates it)._ The implemented prefill is
+the **decode step itself, run once per prompt token inside the wave**. The wave's real batching
+win is the MoE (one grouped call + one routing readback per layer per wave, amortized over every
+row); attention absorbs the prompt through `kernel_attn_decode_step` — the SAME launch the decode
+rows use: in-kernel FP8 writer scatter, push→select→attend corpus order, auto split factor.
+Mechanism: `build_decode_metadata_at(seqs, generation, offset_overrides)` pre-builds one header
+snapshot per prompt token at wave entry (token `t` serialized at offset `base+t`, all layers;
+non-prefill slots are frozen for the wave, so snapshot 0 serves the decode and glue rows). This is
+**bit-identical to per-token stepping by construction** — same kernel, same launch geometry, same
+accumulation order. The multi-query `deepseek_prefill_kernel` remains the glue-row path (arbitrary per-query positions
+over a settled slot) but it is **NOT the prompt-absorption path** — and the reason is a genuine
+semantic fork, not a reassociation. The decode kernel **bf16-stages the current token's PV** (the
+query's own key contributes to the value sum at bf16 precision), while a settled-slot prefill reads
+every key — its own diagonal included — from the FP8 arena. On real bf16 activations the FP8
+diagonal differs from decode's bf16 diagonal; early SWA layers weight self-attention heavily
+(≈0.9), so FP8's ~12% mantissa error on the diagonal value shifts the layer output ~11%, which
+flips a downstream CSA top-k selection — a discrete cliff, not smooth drift — and 43 layers compound
+it into an argmax flip (measured: garbage output, `" The\n * GNU General Public License…"` instead
+of `Paris`). **No single-launch batched prefill can bit-match per-token decode**, because decode
+transitions each key from bf16 (diagonal at step _t_) to FP8 (window key at step _t+1_), while a
+batched pass has one representation per key. The correct fast batched prefill is therefore a
+**kernel change, not a host reshuffle**: give the prefill kernel a `[s, HEAD_DIM]` bf16 `diag_src`
+and, when a window key's `key_pos == q_pos[qi]` (the diagonal), read it from `diag_src[qi]`
+bf16-staged (int8-from-roped-f32 for QK, matching decode) instead of the arena FP8 — window keys
+`[t-w, t-1]` still come from the arena. That reproduces the decode walk exactly and is gated by
+`prefill_rows_equal_decode_steps` extended to compare against a per-token decode reference on
+**real** (not fp8-exact synthetic) activations. Until that kernel lands, prompt absorption uses the
+per-token path above (correct, ~5 tok/s), which is sufficient for the step-6 recall gate at
+multi-thousand-token depth. **Residual batched-float variance** (independent of the above): the
+wave's row-parallel non-attention ops (mHC projections, MoE gate/experts) reduce in shape-dependent
+order, so a multi-row wave's hidden states carry a few-ulp drift vs strict per-token stepping — the
+same variance multi-session co-batched decode waves already carry by design. With attention
+absorption order-exact (per-token), the residual is ≤1 fp8-ulp window drift and a ~2.7 max logit gap
+with IDENTICAL argmax. The audit gate (`wave_prefill_state_matches_decode_steps`) therefore asserts
+**next-step argmax equality** — the property the product depends on — not bitwise state equality.
 
 ## G.6 Glue-recombine kernel — attention seam + compression fold in one launch
 Fork `paged_glue_kernel.cuh` (decode-derivative, **causal-only** — `fwd_ahead≡0`, drop the
@@ -675,10 +715,14 @@ forward-window path), single-latent K≡V. Register-resident flash-state (glue i
 HD=512 the `q_reg`+`o_reg` per glue token is large, so **`GLUE_G_TILE=1–2`**, O distributed across
 threads (32 F32/thread), glue runs fanned across `gridDim.z`.
 
-**+ compression fold (§C/§E):** the glue forward already recomputes the boundary tokens' hidden
-states `x`. Add a pass that runs the compressor projections (`wkv`/`wgate` → per-channel `kv`,
-`s = score + ape[within-group offset]`) on those tokens and **LSE-folds them per channel** with the
-incoming persisted partial `(m,l,acc)`:
+**+ compression fold (§C/§E) — the LSE monoid operator is IMPLEMENTED host-side**
+(`compressor.rs::GroupPartial`: `identity` / `fold(scores,kvs)` / `merge` / `finalize`, proven by
+`group_partial_seam_fold_matches_whole` — a group's pooling rows cut at every interior seam and
+re-merged equal the single-shot softmax pool, and the identity law holds). The glue kernel transcribes
+this same per-channel recurrence in-register. The glue forward already recomputes the boundary
+tokens' hidden states `x`. Add a pass that runs the compressor projections (`wkv`/`wgate` →
+per-channel `kv`, `s = score + ape[within-group offset]`) on those tokens and **LSE-folds them per
+channel** with the incoming persisted partial `(m,l,acc)`:
 ```
 per channel c:  m' = max(m, s_c);  l = l*e^(m-m') + e^(s_c-m');  acc = acc*e^(m-m') + e^(s_c-m')*kv_c
 finalize on group completion:  entry_c = acc_c / l_c  -> RMSNorm   (pre-RoPE; RoPE at read)
@@ -765,6 +809,14 @@ bounded window + a pooled corpus.
    at tolerance. (The window is the FP8-stored path and the corpus stays float; naive bit-exactness
    against float `sink_attend` is impossible by construction once QK requants to int8 — a sloppy
    oracle here costs days.)
+   _Achieved (decode): 9/9 green, bit-exact **including live RoPE**. Three hard-won mirror-contract
+   facts, load-bearing for the prefill/glue forks too: the SM80+ `fast_exp` runs its PTX-asm
+   variant with different FMA-tuned coefficients (mirror THAT); all fork trig is own-polynomial
+   `_rn`-intrinsic code (`rope_angle`/`ds_sincos` — `__sincosf` is neither mirrorable nor accurate
+   at depth); and the kernel quantizes int8 from roped f32 registers while PV reads the bf16-staged
+   latent — the mirror keeps both (zero-rope tests cannot catch this: fp8 ⊂ bf16). Device-vs-mirror
+   bit probes for `ds_exp`/`ds_sincos` + a nullable kernel stage-dump are permanent regression
+   infrastructure (`deepseek4/paged.rs`)._
 3. **Engine vs CPU reference** — `engine_generate_paris_fast` (engine.rs:532) still answers Paris
    after each kernel is swapped into `Dsv4Engine`. The engine is kept solely as this rung's harness
    (Decisions-locked: numeric golden, not a product path).
@@ -799,6 +851,7 @@ Each step keeps the prior rung green as its gate; that green rung is the **next 
 | 3 | `FloatGalleryArena` + two-stage select (BO §3) | (a) **BDP recall ⊇ Indexer top-k**, swept per layer (§D validation); (b) corpus round-trip raw bytes; (c) two-stage == full Indexer top-k on synthetic gallery | rung 2 corpus path matches `sink_attend` (oracle b) over the same selection |
 | 4 | `paged-deepseek` **prefill** kernel (BO §4) | rung 2: prefill vs `streaming.rs::forward` on synthetic prompt → then **rung 3** | **`engine_generate_paris_fast` green on the real kernel path** (host attention gone) |
 | 5 | `BatchedModelCore` + temp-substrate migration (BO §6), incl. the §2 sync eliminations (`moe_bucketize` routing −N, on-device Indexer top-k −C) | **rung 4**: persist→reboot→resume == pre-reboot KV (monoid boundary-merge, §C); same Paris; instrumented **readbacks/token == 1** (the sampler) | rung 4 Paris + resume-exact + one-readback assert |
+|   | _Implemented as `ManagedBatchedModel` directly (`deepseek4/wave.rs` — the scheduler binds `Box<dyn ManagedBatchedModel>`, so the mHC loop stays private; zero scheduler changes). Readback accounting, measured and asserted (`wave_paris`): the Indexer top-k and prefill selections are fully on-device (−C ✓); MoE routing is ONE amortized readback per layer per **wave** — intrinsic to the **streaming** `ExpertCache` (host must see expert ids to schedule pinned→VRAM uploads; §2's zero-readback dispatch engages exactly when the expert set is fully resident, as on Qwen). Budget = 1 sampler readback/token + that documented routing set, nothing else._ | | |
 | 6 | Dynamic corpus/RoPE budgets to 1M (§L) | NIAH needle recall via `ruler_gen` (generic over `ManagedBatchedModel` — needs the step-5 core) + footprint **flat** as N grows | Paris green; footprint-flat + needle recall hold |
 | 7 | `paged-deepseek` **glue** kernel + compression-seam merge (BO §5, §E) | rung 2: glue-recombine vs host LSE fold (raw `(m,l,acc)`) → two-turn seam-straddling group reconstructs == single-shot forward of the concatenation | rung 4 Paris across a 2-turn seam |
 | 8 | **Intra-turn glue embedding (LAST)** (§E optimization) | equivalence: embedded-intra-glue reconstruction == fully-regenerated-glue reconstruction | no Paris/coherence regression |
@@ -818,15 +871,28 @@ Today `window_size = 128` (config.rs:82) and `max_seq = 512` (engine.rs:309, a p
 constant). Scaling to 1M does **not** grow the per-query attended set — that stays bounded at
 `window + top-k ≈ 640` (the O(1) budget, and the entire premise). What must become dynamic:
 
-- **RoPE to 1M — compute in-kernel, never grow a table.** The inherited kernels index a
-  position-sized `rope_cs` table (`int8_decode_kernel.cuh:56`); at 1M positions that table is
-  hundreds of MB of device memory growing with N — a quiet violation of the fixed-budget principle.
-  The `paged-deepseek` fork computes RoPE in-kernel from the `rope_head_dim/2` YaRN-adjusted
-  frequencies (constant memory, `sincosf`; §G.4), so nothing position-sized exists on the kernel
-  path. The host `RotaryCache` (`max_seq = 512`, engine.rs:309) survives only in the
-  prototype/reference path, sized there to the session's live token count.
-- **Corpus tier budget** — the `FloatGalleryArena` grows with N and spills warm→cold through the
-  reused tiering skeleton (§D); the hot resident set stays bounded.
+- **RoPE to 1M — compute per-position, never grow a table (IMPLEMENTED).** The inherited kernels
+  index a position-sized `rope_cs` table (`int8_decode_kernel.cuh:56`); at 1M positions that table
+  is hundreds of MB of device memory growing with N — a quiet violation of the fixed-budget
+  principle. The `paged-deepseek` fork computes RoPE in-kernel from the `rope_head_dim/2`
+  YaRN-adjusted frequencies (constant memory, `sincosf`; §G.4), so nothing position-sized exists on
+  the kernel path. The host `RotaryCache` (`deepseek4/rope.rs`) is now **table-free too**: it holds
+  only the `rope_head_dim/2` `yarn_freqs` and computes `cos`/`sin` per call for exactly the
+  positions requested (`apply(start, seq)` / `apply_positions(&[u32])`), same `f64`-angle math as
+  the old table so every consumer's numerics are unchanged (the `max_seq` constructor argument is
+  gone — 15 call sites updated). A query at position 10⁶ costs the same host memory as one at
+  position 10; the indexer/compressor projections and reference forwards are all position-unbounded.
+- **Corpus tier budget (IMPLEMENTED).** The `FloatGallery` splits its storage by access pattern:
+  the sign/pos **index** (`signs` [G, sign_words] u32 + `pos` [G] u32, `sign_words·4 + 4` B/entry)
+  stays GPU-resident at any depth — the BDP recall scan reads all of it, and it is tiny (≈105 MB at
+  1M tokens across the compression layers). The **float pair** (`attn` [G, head_dim] + `keys` [G,
+  index_head_dim], the bulk) spills to CPU RAM past `HOT_ENTRY_CAP` entries; per query, only the
+  bounded shortlist (`gather_keys`, ≤`top_m`≤1024 rows) and the selection (`gather_selected`,
+  `top_k` rows) are gathered back to the GPU, and the kernel walks that compacted pair densely. The
+  resident GPU footprint is therefore the index alone — bounded — while the corpus grows in RAM;
+  `spilled_corpus_selects_exactly` proves selection stays bit-exact vs the full-residency oracle
+  across the spill boundary. Below the threshold a gallery is fully hot, so short conversations pay
+  nothing.
 - **Window itself stays 128.** "Extend the window beyond current budgets" resolves to *extend the
   addressable context and corpus*, while the attended window and top-k remain fixed — that bound is
   what keeps error O(1) at 1M.

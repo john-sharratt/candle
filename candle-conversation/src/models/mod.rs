@@ -74,6 +74,9 @@ pub enum ModelArch {
     Qwen2,
     /// `quantized_llama::ModelWeights`
     Llama,
+    /// `deepseek4::DeepSeekBatched` over the resident `Dsv4Engine` (offline
+    /// KO-repacked GGUF; paged-deepseek kernel attention).
+    DeepSeekV4,
 }
 
 /// Pre-configured model presets.
@@ -306,6 +309,7 @@ impl std::fmt::Display for ModelArch {
             ModelArch::Qwen3Moe => write!(f, "Qwen3Moe"),
             ModelArch::Qwen2 => write!(f, "Qwen2"),
             ModelArch::Llama => write!(f, "Llama"),
+            ModelArch::DeepSeekV4 => write!(f, "DeepSeekV4"),
         }
     }
 }

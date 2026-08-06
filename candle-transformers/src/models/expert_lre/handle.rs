@@ -857,6 +857,9 @@ impl ExpertCache {
     /// Returns `(buffer_ptr_as_mut_slice, capacity)` if available.
     /// The caller must ensure no concurrent DMA is in flight.
     #[cfg(feature = "cuda")]
+    // Deliberate interior mutability over a raw pinned host buffer (the cache
+    // is behind `Arc`); exclusivity is a documented caller obligation.
+    #[allow(clippy::mut_from_ref)]
     pub fn routing_pinned_mut(&self, len: usize) -> Option<&mut [u32]> {
         // SAFETY: We're the only thread accessing the routing buffer
         // (it lives on the forward thread), and the caller ensures

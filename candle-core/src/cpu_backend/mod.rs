@@ -2794,6 +2794,9 @@ impl BackendStorage for CpuStorage {
             (Self::F64(src), Self::F64(dst)) => {
                 copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
             }
+            (Self::F8E4M3(src), Self::F8E4M3(dst)) => {
+                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
+            }
             (_, dst) => {
                 return Err(Error::DTypeMismatchBinaryOp {
                     lhs: self.dtype(),

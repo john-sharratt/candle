@@ -327,6 +327,16 @@ impl ChunkedKvBacking {
                                 }
                             }
 
+                            if self
+                                .inner
+                                .single_latent
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                // K≡V: the V band aliases the K band just
+                                // written — nothing separate to store.
+                                continue;
+                            }
+
                             let v_ai = v_gid.arena_idx();
                             let v_ci = v_gid.chunk_idx();
                             let v_arena = arenas.get(&v_ai).ok_or_else(|| {

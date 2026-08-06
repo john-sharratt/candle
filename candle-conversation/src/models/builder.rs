@@ -542,17 +542,32 @@ impl ModelBuilder {
     /// Build an [`EngineConfig`] from the builder's settings and a tokenizer.
     pub fn engine_config(&self, tokenizer: &tokenizers::Tokenizer) -> EngineConfig {
         let mut eos_tokens = Vec::new();
-        for token in [
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<|end_of_text|>",
-            "<|eom_id|>",
-            "<|eot_id|>",
-            "<|reserved_special_token_31|>",
-        ] {
+        // The spec's dialect is the source of truth for the model family's
+        // end-of-turn/document markers (e.g. DeepSeek's `<｜end▁of▁sentence｜>`);
+        // the fixed list covers the families whose dialects predate it.
+        let dialect_ends = [
+            self.spec.dialect.document_end,
+            self.spec.dialect.turn_end,
+            self.spec.dialect.assistant_end,
+        ];
+        for token in dialect_ends
+            .iter()
+            .copied()
+            .filter(|s| !s.is_empty())
+            .chain([
+                "<|im_end|>",
+                "<|endoftext|>",
+                "<|end_of_text|>",
+                "<|eom_id|>",
+                "<|eot_id|>",
+                "<|reserved_special_token_31|>",
+            ])
+        {
             if let Some(id) = tokenizer.token_to_id(token) {
-                tracing::trace!("✅ EOS token registered: '{}' = ID {}", token, id);
-                eos_tokens.push(id);
+                if !eos_tokens.contains(&id) {
+                    tracing::trace!("✅ EOS token registered: '{}' = ID {}", token, id);
+                    eos_tokens.push(id);
+                }
             } else {
                 tracing::debug!("⚠️  EOS token NOT FOUND in tokenizer: '{}'", token);
             }
@@ -695,6 +710,18 @@ impl ModelBuilder {
                 Ok(Box::new(BatchedInference::new_with_inv_freq(
                     raw, inv, max_seq, device,
                 )?))
+            }
+            ModelArch::DeepSeekV4 => {
+                use candle::quantized::Int8Mode;
+                use candle_transformers::models::deepseek4::{DeepSeekBatched, Dsv4Engine};
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
+                let _ = max_seq; // window/corpus budgets are model-derived
+                let engine = Dsv4Engine::load(model_path, device, Int8Mode::Performance)
+                    .map_err(ConversationError::Model)?;
+                Ok(Box::new(
+                    DeepSeekBatched::new(engine).map_err(ConversationError::Model)?,
+                ))
             }
         }
     }

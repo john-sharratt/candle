@@ -13,6 +13,7 @@ pub enum DialectType {
     ChatML,
     Llama2,
     Llama3,
+    DeepSeek,
 }
 
 impl std::fmt::Display for DialectType {
@@ -21,6 +22,7 @@ impl std::fmt::Display for DialectType {
             DialectType::ChatML => write!(f, "ChatML"),
             DialectType::Llama2 => write!(f, "Llama2"),
             DialectType::Llama3 => write!(f, "Llama3"),
+            DialectType::DeepSeek => write!(f, "DeepSeek"),
         }
     }
 }
@@ -31,6 +33,7 @@ impl DialectType {
             DialectType::ChatML => Dialect::chat_ml(),
             DialectType::Llama2 => Dialect::llama2(),
             DialectType::Llama3 => Dialect::llama3(),
+            DialectType::DeepSeek => Dialect::deepseek(),
         }
     }
 }
@@ -222,6 +225,40 @@ impl Dialect {
             no_think_block: "",
             no_think: "",
             think_block: "",
+            tool_block_open: "<tools>\n",
+            tool_block_close: "</tools>\n",
+            tool_response_open: "<tool_response>\n",
+            tool_response_close: "</tool_response>\n",
+        }
+    }
+
+    /// DeepSeek-V4 chat template: `bos + system-text + <｜User｜>… +
+    /// <｜Assistant｜>… + eos`, no role-header wrappers. The model ALWAYS
+    /// thinks, so every no-think field is empty — the `/no_think` glue island
+    /// tokenises to an empty run and nothing is emitted; `<think>` is kept
+    /// only as a BDP structural-noise seed (the model emits it itself as its
+    /// first decoded token).
+    pub fn deepseek() -> Self {
+        Self {
+            dialect_type: DialectType::DeepSeek,
+            document_start: "<｜begin▁of▁sentence｜>",
+            document_end: "<｜end▁of▁sentence｜>",
+            marker_start: "<｜User｜>",
+            marker_end: "<｜end▁of▁sentence｜>",
+            turn_start: "<｜User｜>",
+            turn_begin: "",
+            turn_end: "<｜end▁of▁sentence｜>",
+            system_start: "",
+            system_end: "",
+            user_start: "<｜User｜>",
+            user_end: "",
+            assistant_start: "<｜Assistant｜>",
+            assistant_end: "<｜end▁of▁sentence｜>",
+            recent_start: "<｜User｜>",
+            recent_end: "<｜end▁of▁sentence｜>",
+            no_think_block: "",
+            no_think: "",
+            think_block: "<think>",
             tool_block_open: "<tools>\n",
             tool_block_close: "</tools>\n",
             tool_response_open: "<tool_response>\n",

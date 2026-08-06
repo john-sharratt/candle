@@ -2211,6 +2211,13 @@ impl QMatMul {
     /// float matmul (`repack_gemx`). The weight-side half of the single `int8mode` knob (paired
     /// with `cuda::to_dynamic` on the activation side); the matmul's KO⇔int8 pairing guard keeps
     /// the two consistent. Requires the quantized (`QTensor`) variant on CUDA.
+    /// Non-CUDA build: the KO/GEMX repacked layouts are CUDA-kernel formats, so there is
+    /// nothing to repack to — this always errors (the `dummy_cuda` convention).
+    #[cfg(not(feature = "cuda"))]
+    pub fn repack_for_optimization(&self, _mode: Int8Mode) -> Result<QMatMul> {
+        crate::bail!("repack_for_optimization requires the cuda feature")
+    }
+
     #[cfg(feature = "cuda")]
     pub fn repack_for_optimization(&self, mode: Int8Mode) -> Result<QMatMul> {
         let qt = self
@@ -2357,6 +2364,13 @@ impl QMatMul {
     /// activation form (q8a128 for any non-`Off` mode). Quantizes the activation here (the
     /// **unfused** path, one standalone launch) then runs [`QMatMul::forward_dynamic`]; the fused
     /// producers bypass this by emitting q8a128 themselves and calling `forward_dynamic` directly.
+    /// Non-CUDA build: the q8a128 × KO int8 matmul is a CUDA tensor-core path — always
+    /// errors (the `dummy_cuda` convention).
+    #[cfg(not(feature = "cuda"))]
+    pub fn forward_via_int8(&self, _xs: &Tensor, _mode: Int8Mode) -> Result<Tensor> {
+        crate::bail!("forward_via_int8 requires the cuda feature")
+    }
+
     #[cfg(feature = "cuda")]
     pub fn forward_via_int8(&self, xs: &Tensor, mode: Int8Mode) -> Result<Tensor> {
         let device = match self {

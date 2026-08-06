@@ -42,10 +42,8 @@ impl StreamingModel {
             base: loader::dequant_f32(&mut gguf, "output_hc_base.weight", device)?,
             scale: loader::dequant_f32(&mut gguf, "output_hc_scale.weight", device)?,
         };
-        let max_seq = 512;
         let rope_compress = RotaryCache::new(
             cfg.rope_head_dim,
-            max_seq,
             cfg.compress_rope_theta,
             cfg.original_seq_len,
             cfg.rope_factor,
@@ -55,7 +53,6 @@ impl StreamingModel {
         )?;
         let rope_swa = RotaryCache::new(
             cfg.rope_head_dim,
-            max_seq,
             cfg.rope_theta,
             0,
             cfg.rope_factor,

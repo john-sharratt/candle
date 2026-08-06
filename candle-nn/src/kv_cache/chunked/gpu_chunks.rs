@@ -31,6 +31,25 @@ pub(crate) struct GpuChunks {
     /// Byte size of one serialised chunk entry (e.g. one `TokenSliceHost`).
     /// Zero until the first call to [`GpuChunksGuard::update`].
     chunk_byte_size: usize,
+    /// Cached copy of the records section in a stager generation. The records
+    /// (per-chunk `KvHead` band pointers) are immutable once a chunk exists, so
+    /// `snapshot_into_generation` copies them once per (epoch, chunk-count) and
+    /// reuses the copy across the many per-token header snapshots that share the
+    /// same chunks. Invalidated by epoch change (arena reset) or chunk append.
+    gen_records: Option<GenRecordsCache>,
+}
+
+/// A records-section copy living in a stager generation's arena.
+struct GenRecordsCache {
+    /// Stager epoch the copy was made under; a mismatch means the arena reset.
+    epoch: u64,
+    /// Chunk count the copy covers; a mismatch means a chunk was appended.
+    n_chunks: usize,
+    /// Device pointer to the start of the copied records section.
+    dev_ptr: u64,
+    /// FNV-1a fingerprint of the records bytes at copy time. Checked (debug only)
+    /// on every cache hit to catch a record mutating within one (epoch, n_chunks).
+    records_checksum: u64,
 }
 
 impl std::fmt::Debug for GpuChunks {
@@ -50,6 +69,7 @@ impl GpuChunks {
             gpu: None,
             stream,
             chunk_byte_size: 0,
+            gen_records: None,
         }
     }
 
@@ -80,6 +100,204 @@ impl GpuChunks {
             0
         }
     }
+
+    /// Copy the current serialised slot-state into immutable buffers owned by
+    /// the pinned-stager `generation`, returning the copy's device pointer (a
+    /// contiguous `TokenSlice` header array the kernel's `get_slice` indexes).
+    ///
+    /// The live `gpu` buffer is reallocated whenever a chunk is appended
+    /// (`rebuild_decode` → `resize` → fresh `stream.alloc`, old freed). A caller
+    /// that captures `raw_device_ptr()` and defers its kernel launch — the wave
+    /// prefill builds every per-token metadata snapshot up front, then runs the
+    /// layer loop — would read a freed buffer once a later snapshot crosses a
+    /// chunk boundary. Copying into the generation (whose arena lives for the
+    /// whole forward) makes the pointer stable and pins that token's exact slice
+    /// content (per-token write-chunk length included).
+    ///
+    /// The two sections are handled differently to keep the cost O(prefill_len)
+    /// rather than O(prefill_len²): the `KvHead` **records** are immutable once a
+    /// chunk exists, so they are copied once per (epoch, chunk-count) and cached
+    /// ([`GenRecordsCache`]) for reuse across the many per-token snapshots that
+    /// share the same chunks; only the small 16-B **headers** — which carry the
+    /// per-token write-chunk length — are copied every call. Float chunks inline
+    /// their record, so each header's `kvheads_ptr` points into the source
+    /// buffer and is rebased onto the cached records copy; resident (meta-pool)
+    /// records point at the arena and are left untouched.
+    ///
+    /// `write_idx`/`write_len` override the write chunk's serialised length in
+    /// the copied header. The live buffer only re-serialises the write length at
+    /// a chunk boundary (the per-token advance normally rides the on-device
+    /// `commit_decode_write_len_kernel`, which increments the *shared* buffer).
+    /// Because each snapshot is a private copy, that on-device increment can no
+    /// longer carry from one token to the next, so the caller supplies the
+    /// sequence-offset-derived length for this snapshot's token directly.
+    pub(crate) fn snapshot_into_generation(
+        &mut self,
+        generation: &candle::quantized::pinned_staging::Generation,
+        write_idx: usize,
+        write_len: u16,
+    ) -> candle::Result<u64> {
+        let host = self.buf.as_slice();
+        let len = host.len();
+        if len == 0 {
+            return Ok(0);
+        }
+        let n = self.n_chunks();
+        // `write_idx` is `decode_write_chunk_idx()` (always `< host chunk count`);
+        // after `sync_decode_gpu_chunks` the serialised buffer holds exactly that
+        // many chunks, so `write_idx < n` is an invariant. Fail loudly rather
+        // than silently skip the write-length patch (which would ship a stale
+        // length and silently corrupt `q_pos`/the window walk).
+        if write_idx >= n {
+            candle::bail!(
+                "snapshot_into_generation: write_idx {write_idx} >= n_chunks {n} (buffer/host chunk-count desync)"
+            );
+        }
+        let headers_len = n * SLICE_HEADER_BYTES;
+        let records_len = len - headers_len;
+        let d_old = self.raw_device_ptr();
+        let records_base_old = d_old + headers_len as u64;
+        let records_end_old = d_old + len as u64;
+
+        // Records section: reuse the cached generation copy when it still matches
+        // this generation's epoch and chunk count; otherwise copy it in. The
+        // reuse is sound because a chunk's `KvHead` record (band pointers,
+        // palette, outer scale) is fixed once the chunk exists and the host
+        // buffer only re-serialises records at a chunk-boundary rebuild (which
+        // changes `n_chunks` → cache miss). The debug checksum asserts that
+        // invariant so a backing that mutates records within a chunk-count (e.g.
+        // an adaptive-quant arena re-scaling the write chunk as it fills) trips
+        // in tests instead of silently serving stale scales.
+        let epoch = generation.epoch();
+        let records_ptr = if records_len == 0 {
+            0
+        } else {
+            let records_src = &host[headers_len..headers_len + records_len];
+            let hit = self
+                .gen_records
+                .as_ref()
+                .filter(|c| c.epoch == epoch && c.n_chunks == n);
+            match hit {
+                Some(c) => {
+                    debug_assert_eq!(
+                        records_checksum(records_src),
+                        c.records_checksum,
+                        "stale records cache reused: chunk records changed within one (epoch, n_chunks)"
+                    );
+                    c.dev_ptr
+                }
+                None => {
+                    let ptr = copy_into_generation(generation, records_src)?;
+                    self.gen_records = Some(GenRecordsCache {
+                        epoch,
+                        n_chunks: n,
+                        dev_ptr: ptr,
+                        records_checksum: records_checksum(records_src),
+                    });
+                    ptr
+                }
+            }
+        };
+
+        // Header section: copied every call (carries the per-token write length),
+        // with each inline `kvheads_ptr` rebased onto the cached records copy.
+        let mut pinned = generation.alloc(headers_len)?;
+        if !pinned.is_bump() {
+            candle::bail!(
+                "snapshot_into_generation: expected a bump-allocated staging buffer for {headers_len} bytes"
+            );
+        }
+        let host_ptr = pinned.as_mut_slice().as_mut_ptr();
+        pinned.as_mut_slice().copy_from_slice(&host[..headers_len]);
+        let gpu = generation.submit(pinned)?;
+        let headers_ptr = gpu.dev_ptr();
+
+        // Rebase inline `kvheads_ptr` and patch the write-chunk length. The
+        // original pointers are read from `host` (the source), NOT from `dst`:
+        // both arenas are write-combined, and reading back bytes just stored to
+        // WC memory can return stale data before the WC buffer drains, whereas
+        // `host` was written a rebuild ago and is settled.
+        // SAFETY: `host_ptr` is the device-mapped bump slice we just filled; it
+        // stays valid for the generation's lifetime and no kernel has read it
+        // yet (build runs before the layer loop launches).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(host_ptr, headers_len);
+            rebase_and_patch_headers(
+                dst,
+                &host[..headers_len],
+                n,
+                records_base_old,
+                records_end_old,
+                records_ptr,
+                write_idx,
+                write_len,
+            );
+        }
+        Ok(headers_ptr)
+    }
+}
+
+/// Rebase inline `kvheads_ptr`s and patch the write-chunk length in a copied
+/// `TokenSlice` header array. Pure byte arithmetic (no device, no unsafe) so it
+/// is unit-testable against raw expected bytes.
+///
+/// `dst` is the freshly-copied header array to fix up; `src` is the authoritative
+/// source header bytes to read the *original* pointers from (reading from `src`
+/// rather than `dst` avoids a write-combined read-after-write hazard). For each
+/// chunk, if its `kvheads_ptr` (u64 at header offset 8) falls in the source
+/// records section `[records_base_old, records_end_old)` it is inline and is
+/// rebased onto `records_ptr`; otherwise it is a resident/arena pointer and left
+/// as copied. Finally the write chunk's `len` (u16 at header offset 2) is set to
+/// `write_len`. Caller guarantees `write_idx < n` and `dst.len() == src.len() == n * 16`.
+fn rebase_and_patch_headers(
+    dst: &mut [u8],
+    src: &[u8],
+    n: usize,
+    records_base_old: u64,
+    records_end_old: u64,
+    records_ptr: u64,
+    write_idx: usize,
+    write_len: u16,
+) {
+    for i in 0..n {
+        let off = i * SLICE_HEADER_BYTES + 8;
+        let p = u64::from_le_bytes(src[off..off + 8].try_into().unwrap());
+        if p >= records_base_old && p < records_end_old {
+            let np = records_ptr + (p - records_base_old);
+            dst[off..off + 8].copy_from_slice(&np.to_le_bytes());
+        }
+    }
+    let loff = write_idx * SLICE_HEADER_BYTES + 2;
+    dst[loff..loff + 2].copy_from_slice(&write_len.to_le_bytes());
+}
+
+/// FNV-1a checksum of a byte slice — a cheap fingerprint for the records-cache
+/// staleness debug assertion (release builds never call it).
+fn records_checksum(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Copy `bytes` into a fresh device-mapped bump buffer in `generation` and
+/// return its device pointer. The copied bytes are read verbatim by the GPU.
+fn copy_into_generation(
+    generation: &candle::quantized::pinned_staging::Generation,
+    bytes: &[u8],
+) -> candle::Result<u64> {
+    let mut pinned = generation.alloc(bytes.len())?;
+    if !pinned.is_bump() {
+        candle::bail!(
+            "copy_into_generation: expected a bump-allocated staging buffer for {} bytes",
+            bytes.len()
+        );
+    }
+    pinned.as_mut_slice().copy_from_slice(bytes);
+    let gpu = generation.submit(pinned)?;
+    Ok(gpu.dev_ptr())
 }
 
 /// Mutable accessor for [`GpuChunks`].
@@ -286,6 +504,9 @@ impl GpuChunksGuard<'_> {
         self.inner.buf = PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail");
         self.inner.gpu = None;
         self.inner.chunk_byte_size = 0;
+        // The cached generation records described the old chunk set; drop it so
+        // the next snapshot re-copies from the rebuilt buffer.
+        self.inner.gen_records = None;
     }
 }
 
@@ -307,6 +528,7 @@ impl Drop for GpuChunksGuard<'_> {
             gpu,
             stream,
             chunk_byte_size,
+            gen_records: _,
         } = &mut *self.inner;
         let chunk_byte_size = *chunk_byte_size;
         if chunk_byte_size == 0 {
@@ -392,6 +614,7 @@ impl Clone for GpuChunks {
             gpu: None,
             stream: self.stream.clone(),
             chunk_byte_size: 0,
+            gen_records: None,
         }
     }
 }
@@ -490,4 +713,108 @@ pub(crate) fn write_identity_pal_map(head_dim: usize, dst: &mut [u8]) {
     }
 }
 
-// Unit tests live in tests/gpu_chunks_tests.rs (compiled under #[cfg(feature = "cuda")]).
+// Integration-style unit tests live in tests/gpu_chunks_tests.rs. The pure
+// header-rebase arithmetic is tested here (no device needed).
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{rebase_and_patch_headers, records_checksum, SLICE_HEADER_BYTES};
+
+    /// Serialise one 16-byte `TokenSlice` header: offset u16 | len u16 | rope u32
+    /// | kvheads_ptr u64.
+    fn header(offset: u16, len: u16, rope: u32, kvheads_ptr: u64) -> [u8; 16] {
+        let mut h = [0u8; 16];
+        h[0..2].copy_from_slice(&offset.to_le_bytes());
+        h[2..4].copy_from_slice(&len.to_le_bytes());
+        h[4..8].copy_from_slice(&rope.to_le_bytes());
+        h[8..16].copy_from_slice(&kvheads_ptr.to_le_bytes());
+        h
+    }
+
+    fn read_ptr(bytes: &[u8], chunk: usize) -> u64 {
+        let off = chunk * SLICE_HEADER_BYTES + 8;
+        u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+    }
+    fn read_len(bytes: &[u8], chunk: usize) -> u16 {
+        let off = chunk * SLICE_HEADER_BYTES + 2;
+        u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap())
+    }
+
+    #[test]
+    fn rebase_inline_leaves_resident_and_patches_write_len() {
+        // 3 chunks, 8-byte records; source buffer based at 0x10000, headers
+        // occupy [0, 48), records [48, 72). Chunk 0/1 inline (kvheads_ptr into
+        // the records section), chunk 2 resident (arena pointer, out of range).
+        const REC_BYTES: u64 = 8;
+        let d_old: u64 = 0x1_0000;
+        let n = 3usize;
+        let headers_len = n * SLICE_HEADER_BYTES; // 48
+        let records_base_old = d_old + headers_len as u64; // 0x10030
+        let records_end_old = d_old + headers_len as u64 + n as u64 * REC_BYTES; // 0x10048
+        let records_ptr: u64 = 0x2_0000; // relocated records copy base
+
+        let mut src = Vec::new();
+        src.extend_from_slice(&header(0, 32, 0, records_base_old)); // chunk 0 inline
+        src.extend_from_slice(&header(0, 5, 32, records_base_old + REC_BYTES)); // chunk 1 inline
+        src.extend_from_slice(&header(7, 0, 64, 0x9999_9999_9999)); // chunk 2 resident
+        let mut dst = src.clone();
+
+        rebase_and_patch_headers(
+            &mut dst,
+            &src,
+            n,
+            records_base_old,
+            records_end_old,
+            records_ptr,
+            1,  // write chunk
+            18, // new write length
+        );
+
+        // Inline pointers rebased onto the relocated records copy.
+        assert_eq!(read_ptr(&dst, 0), records_ptr);
+        assert_eq!(read_ptr(&dst, 1), records_ptr + REC_BYTES);
+        // Resident pointer untouched.
+        assert_eq!(read_ptr(&dst, 2), 0x9999_9999_9999);
+        // Only the write chunk's length changed.
+        assert_eq!(read_len(&dst, 0), 32);
+        assert_eq!(read_len(&dst, 1), 18);
+        assert_eq!(read_len(&dst, 2), 0);
+        // Non-pointer, non-write-len bytes of the write header are preserved
+        // (offset stays 0, rope stays 32).
+        assert_eq!(&dst[16..18], &0u16.to_le_bytes()); // chunk 1 offset
+        assert_eq!(&dst[20..24], &32u32.to_le_bytes()); // chunk 1 rope
+    }
+
+    #[test]
+    fn edge_case_last_chunk_inline_ptr_is_in_range() {
+        // The last inline record starts at records_end_old - REC_BYTES, which
+        // must still satisfy the `< records_end_old` bound (no off-by-one).
+        const REC_BYTES: u64 = 8;
+        let d_old: u64 = 0;
+        let n = 1usize;
+        let records_base_old = d_old + SLICE_HEADER_BYTES as u64; // 16
+        let records_end_old = records_base_old + REC_BYTES; // 24
+        let records_ptr: u64 = 0x5000;
+        let src = header(0, 1, 0, records_base_old).to_vec();
+        let mut dst = src.clone();
+        rebase_and_patch_headers(
+            &mut dst,
+            &src,
+            n,
+            records_base_old,
+            records_end_old,
+            records_ptr,
+            0,
+            1,
+        );
+        assert_eq!(read_ptr(&dst, 0), records_ptr);
+    }
+
+    #[test]
+    fn checksum_detects_record_mutation() {
+        let a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut b = a;
+        b[3] = 0xff;
+        assert_eq!(records_checksum(&a), records_checksum(&a));
+        assert_ne!(records_checksum(&a), records_checksum(&b));
+    }
+}

@@ -2959,6 +2959,14 @@ impl Scheduler {
                 // `create_view_sequence`. So `borrowed.0` is the
                 // anchor for mid-turn captures and final seals.
                 let turn_start_parent_blocks = borrowed.0;
+                tracing::trace!(
+                    target: "candle_conversation::scheduler::view_create",
+                    "view carve: parent {} borrowed {} blocks, parent layout {:?}",
+                    parent_id,
+                    borrowed.0,
+                    self.session
+                        .provenance_chunk_layout(parent_id.0, parent_offset_for_log),
+                );
 
                 // Step 5: register the view so cleanup_finished can auto-finalize.
                 self.turn_views.insert(
@@ -4490,6 +4498,16 @@ impl Scheduler {
 
         let pending_id = self.next_turn_seal_id;
         self.next_turn_seal_id += 1;
+        tracing::trace!(
+            target: "candle_conversation::scheduler::turn_seal",
+            "clean reprefill enqueued: slot {}, {} clean tokens, post-truncate offset {:?}, \
+             blocks {:?}, writer_start {:?}",
+            parent_id,
+            clean_tokens.len(),
+            self.session.sequence_offset(parent_id.0),
+            self.session.sequence_block_count(parent_id.0),
+            self.session.writer_start_idx(parent_id.0),
+        );
 
         // Private sink for the re-prefill unit's `PrefillWork`; the real caller
         // channel (`state.event_tx`) fires `Done` from `complete_turn_reprefill`.
@@ -4561,6 +4579,14 @@ impl Scheduler {
             _sink_rx,
         } = pending;
 
+        tracing::trace!(
+            target: "candle_conversation::scheduler::turn_seal",
+            "reprefill complete: slot {}, offset {:?}, blocks {:?}, writer_start {:?}",
+            parent_id,
+            self.session.sequence_offset(parent_id.0),
+            self.session.sequence_block_count(parent_id.0),
+            self.session.writer_start_idx(parent_id.0),
+        );
         let turn_content = TurnContent {
             role: Role::Assistant,
             tags,
@@ -5355,6 +5381,13 @@ impl Scheduler {
                     && self
                         .session
                         .truncate_sequence_to_blocks(seal_slot.0, seal_block_from)
+                        .and_then(|_| {
+                            // The kept blocks are the immutable prefix; the
+                            // clean re-prefill must append AT `seal_block_from`
+                            // (the seal anchor), never extend a kept
+                            // partial/empty tail block below it.
+                            self.session.seal_writer_boundary(seal_slot.0)
+                        })
                         .is_ok()
                 {
                     let stats = TurnStats {
@@ -5524,6 +5557,23 @@ impl Scheduler {
         _chunks_per_layer: usize,
         tokens: TokenBuffer,
     ) -> Result<(), ConversationError> {
+        // The cold→hot section install goes through the adaptive-format
+        // restore machinery (`alloc_sealed_block` + per-band arena writes),
+        // which does not alias K≡V. A single-latent backing (DeepSeek's
+        // fixed-FP8 plan) restored through it presents broken chunk tables
+        // to the kernels — the caller must re-ingest instead (deterministic:
+        // the re-prefill reproduces the exact same K/V the seal captured).
+        if self
+            .session
+            .backings()
+            .first()
+            .is_some_and(|b| b.single_latent())
+        {
+            return Err(ConversationError::Channel(
+                "section restore-from-log unsupported on a single-latent backing — re-ingest"
+                    .into(),
+            ));
+        }
         let n_layers = self.session.num_layers();
 
         // 1. Resolve cold refs from the manifest — these point at
@@ -6043,6 +6093,22 @@ impl Scheduler {
         // `BatchedInferenceSession::sequence_block_count`.
         let block_count = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
         if block_count <= seal_block_from {
+            // Legitimate for empty section pins; for a dialogue turn it means
+            // the turn's K/V range is gone and the seal would silently drop
+            // the turn — always worth a loud trace.
+            if matches!(seal_action, SealAction::Turn) {
+                let off = self.session.sequence_offset(seal_slot.0);
+                tracing::warn!(
+                    "turn seal SKIPPED: block_count {} <= seal_block_from {} for slot {} \
+                     (offset {:?}, layout {:?}) — the turn will NOT persist",
+                    block_count,
+                    seal_block_from,
+                    seal_slot,
+                    off,
+                    self.session
+                        .provenance_chunk_layout(seal_slot.0, off.unwrap_or(0)),
+                );
+            }
             return Ok(None);
         }
 
@@ -6186,11 +6252,22 @@ impl Scheduler {
                     if let Some(turn_policy) = self.session.compression_policy() {
                         let boundary_policy = Self::section_compression_policy_boundary();
                         let member_policy = Self::section_compression_policy_member(&turn_policy);
-                        self.quantize_pending_sections(
+                        // Non-fatal: the turn's decl/tokens/chunks were already
+                        // recorded above and do not depend on section
+                        // requantization — a quantize failure (e.g. a model
+                        // whose head_dim the palette4 path doesn't support)
+                        // must not abort the turn seal. Same handling as the
+                        // post-priming drain site.
+                        if let Err(e) = self.quantize_pending_sections(
                             &conversation,
                             &boundary_policy,
                             &member_policy,
-                        )?;
+                        ) {
+                            tracing::warn!(
+                                "turn-seal section quantize drain failed (seal continues): {e}"
+                            );
+                            self.pending_section_quantize.clear();
+                        }
                     } else {
                         self.pending_section_quantize.clear();
                     }

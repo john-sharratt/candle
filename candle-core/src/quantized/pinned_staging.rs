@@ -55,6 +55,9 @@ use std::sync::{Arc, Mutex};
 /// Create via [`PinnedStager::begin_generation`].
 pub struct Generation {
     inner: Arc<Mutex<PinnedStagerInner>>,
+    /// The stager epoch captured when this generation began. Device pointers it
+    /// hands out are valid only while the stager's epoch still equals this.
+    epoch: u64,
 }
 
 impl Drop for Generation {
@@ -114,6 +117,15 @@ impl Generation {
             inner: Arc::clone(&self.inner),
         };
         stager.submit(buf)
+    }
+
+    /// The stager epoch this generation was opened at. A device pointer this
+    /// generation returned stays valid only while the generation is alive; once
+    /// it (and every sibling) drops, the arena resets and the next generation
+    /// carries a higher epoch. Cache consumers compare against this to know
+    /// whether a previously-handed-out pointer still refers to live memory.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -445,6 +457,12 @@ struct PinnedStagerInner {
     /// Number of live [`Generation`] guards. While > 0, the arenas must not
     /// be reset — submitted bump pointers are still potentially in use.
     live_generations: usize,
+    /// Monotonic counter bumped every time a fresh [`Generation`] begins. A
+    /// generation's arena is reset (all bump pointers invalidated) once the last
+    /// guard drops, so the epoch captured at `begin` uniquely identifies the
+    /// arena's current fill. Consumers that cache a device pointer handed out by
+    /// one generation compare epochs to detect a reset before reusing it.
+    epoch: u64,
 }
 
 impl PinnedStager {
@@ -487,6 +505,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                epoch: 0,
             })),
         }
     }
@@ -510,6 +529,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                epoch: 0,
             })),
         }
     }
@@ -531,6 +551,7 @@ impl PinnedStager {
                 arena_dirty: false,
                 bump_outstanding: 0,
                 live_generations: 0,
+                epoch: 0,
             })),
         }
     }
@@ -548,8 +569,11 @@ impl PinnedStager {
     pub fn begin_generation(&self) -> Generation {
         let mut inner = self.inner.lock().unwrap();
         inner.live_generations += 1;
+        inner.epoch += 1;
+        let epoch = inner.epoch;
         Generation {
             inner: Arc::clone(&self.inner),
+            epoch,
         }
     }
 

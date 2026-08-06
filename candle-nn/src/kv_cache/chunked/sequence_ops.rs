@@ -1942,12 +1942,35 @@ impl ChunkedKvBacking {
         // `block_count` is whatever the caller had (typically nothing
         // for `truncate(0)` or Arc-shared for partial truncates).
         // Clamp the existing writer_start to be ≤ the new chunk count
-        // so any writes go into existing chunks past it.
+        // so any writes go into existing chunks past it. Callers that
+        // need the kept blocks fully immutable (the turn-seal re-prefill)
+        // follow up with [`Self::seal_writer_boundary`].
         if slot.writer_start_idx() > slot.block_count() {
             slot.set_writer_start_idx(slot.block_count());
         }
         let new_tokens: usize = slot.chunks_slice().iter().map(|c| c.usage as usize).sum();
         Ok(new_tokens)
+    }
+
+    /// Mark every block the slot currently holds as immutable prefix: later
+    /// writes append AFTER them in a fresh writer chunk, never extend a kept
+    /// partial/empty tail block. The turn-seal re-prefill needs this after
+    /// its truncate — the seal range anchors at exactly the kept block count,
+    /// so a write landing below it would fall outside the sealed span and
+    /// silently drop from persistence.
+    pub fn seal_writer_boundary(&self, batch_idx: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let slot = state.sequences[batch_idx].as_mut().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "seal_writer_boundary: slot {} not allocated",
+                batch_idx
+            ))
+        })?;
+        slot.set_writer_start_idx(slot.block_count());
+        Ok(())
     }
 
     /// Truncate the sequence to exactly `target_tokens` cum-tokens, freeing any

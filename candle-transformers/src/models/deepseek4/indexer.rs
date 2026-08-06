@@ -52,6 +52,48 @@ impl Indexer {
         }
     }
 
+    /// The Indexer's query-side spaces for the token at `pos`: the roped
+    /// per-head query `[n_heads, head_dim]` and the per-head gate weights
+    /// `[n_heads]` (the `hd^-0.5 · h^-0.5` scale folded in) — the score is
+    /// `Σ_h relu(q_h·k)·w_h` against any entry-key set (Vec entries on the
+    /// reference path, the `FloatGallery` on the kernel path).
+    pub fn query_space(
+        &self,
+        x: &Tensor,
+        qr: &Tensor,
+        rope: &RotaryCache,
+        pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (h, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        // q = wq_b(qr) → per-head → RoPE the trailing rd dims by TOKEN POSITION
+        // `pos`, broadcast over heads (matches `Indexer::scores` / `model.py`).
+        // Transpose to [1,h,1,hd] so `rope.apply`'s Minus2 axis is seq (len 1).
+        let qr = qr.reshape((1, 1, ()))?.to_dtype(DType::F32)?;
+        let q = self
+            .wq_b
+            .forward(&qr)?
+            .reshape((1, 1, h, hd))?
+            .transpose(1, 2)?
+            .contiguous()?; // [1,h,1,hd]
+        let q_nope = q.narrow(D::Minus1, 0, hd - rd)?;
+        let q_rope = rope.apply(&q.narrow(D::Minus1, hd - rd, rd)?, pos, false)?;
+        let q = Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?.reshape((h, hd))?;
+
+        let scale = self.softmax_scale * (h as f64).powf(-0.5);
+        let weights = (self
+            .weights_proj
+            .forward(&x.reshape((1, ()))?.to_dtype(DType::F32)?)?
+            * scale)?
+            .reshape(h)?; // [h]
+        Ok((q, weights))
+    }
+
+    /// A streaming compressor over the Indexer's own key space — the kernel
+    /// path drives this directly (`push_raw`) to feed the `FloatGallery`.
+    pub fn incremental_compressor(&self) -> super::compressor::IncrementalCompressor {
+        self.compressor.incremental()
+    }
+
     pub fn top_k(&self) -> usize {
         self.top_k
     }
@@ -141,6 +183,28 @@ impl IncrementalIndexer<'_> {
     /// Select the group indices (sorted ascending) the query attends to: the top-k accumulated
     /// entries by index score for the query `(x, qr)` at token position `pos`. Empty when no
     /// entry yet.
+    /// The Indexer's learned spaces for the query at `pos`: the roped per-head
+    /// query `[n_heads, head_dim]`, the per-head gate weights `[n_heads]`
+    /// (scale folded in), and the accumulated entry keys `[n, head_dim]` —
+    /// exactly what the two-stage BDP-recall→precision selection consumes and
+    /// what the per-layer recall validation sweeps. `None` until an entry
+    /// exists.
+    pub fn capture_space(
+        &self,
+        x: &Tensor,
+        qr: &Tensor,
+        rope: &RotaryCache,
+        pos: usize,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        let n = self.entries.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let (q, weights) = self.idx.query_space(x, qr, rope, pos)?;
+        let kv = Tensor::stack(&self.entries.iter().collect::<Vec<_>>(), 0)?; // [n, hd]
+        Ok(Some((q, weights, kv)))
+    }
+
     pub fn select(
         &self,
         x: &Tensor,
@@ -148,38 +212,15 @@ impl IncrementalIndexer<'_> {
         rope: &RotaryCache,
         pos: usize,
     ) -> Result<Vec<usize>> {
-        let n = self.entries.len();
-        if n == 0 {
+        let Some((q, weights, kv)) = self.capture_space(x, qr, rope, pos)? else {
             return Ok(Vec::new());
-        }
-        let (h, hd, rd) = (self.idx.n_heads, self.idx.head_dim, self.idx.rope_head_dim);
-
-        // q = wq_b(qr) → per-head → RoPE the trailing rd dims by TOKEN POSITION `pos`, broadcast
-        // over heads (matches the fixed `Indexer::scores` / `model.py`). Transpose to [1,h,1,hd]
-        // so `rope.apply`'s Minus2 axis is seq (length 1), not heads.
-        let qr = qr.reshape((1, 1, ()))?.to_dtype(DType::F32)?;
-        let q = self
-            .idx
-            .wq_b
-            .forward(&qr)?
-            .reshape((1, 1, h, hd))?
-            .transpose(1, 2)?
-            .contiguous()?; // [1,h,1,hd]
-        let q_nope = q.narrow(D::Minus1, 0, hd - rd)?;
-        let q_rope = rope.apply(&q.narrow(D::Minus1, hd - rd, rd)?, pos, false)?; // Minus2 = s(=1)
-        let q = Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?.reshape((h, hd))?;
-
-        // per-head gate weights (hd^-0.5 · h^-0.5 scale), then Σ_h relu(q_h·kv_g)·w_h.
-        let scale = self.idx.softmax_scale * (h as f64).powf(-0.5);
-        let weights = (self
-            .idx
-            .weights_proj
-            .forward(&x.reshape((1, ()))?.to_dtype(DType::F32)?)?
-            * scale)?
-            .reshape((h, 1))?; // [h,1]
-        let kv = Tensor::stack(&self.entries.iter().collect::<Vec<_>>(), 0)?; // [n, hd]
+        };
+        let n = self.entries.len();
         let score = q.matmul(&kv.t()?.contiguous()?)?; // [h, n]
-        let index_score = score.relu()?.broadcast_mul(&weights)?.sum(0)?; // [n]
+        let index_score = score
+            .relu()?
+            .broadcast_mul(&weights.reshape(((), 1))?)?
+            .sum(0)?; // [n]
         let scores = index_score.to_vec1::<f32>()?;
 
         // Top-k by score, then sorted ascending (prefill gathers compressed keys in group order).
@@ -204,7 +245,7 @@ mod tests {
     fn scores_match_scalar_reference() -> Result<()> {
         let dev = Device::Cpu;
         let (dim, qlr, h, hd, rd, ratio) = (8usize, 6usize, 3usize, 8usize, 4usize, 4usize);
-        let rope = RotaryCache::new(rd, 64, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
         let s = 12;
         let x = Tensor::randn(0f32, 1.0, (1, s, dim), &dev)?;
         let qr = Tensor::randn(0f32, 1.0, (1, s, qlr), &dev)?;

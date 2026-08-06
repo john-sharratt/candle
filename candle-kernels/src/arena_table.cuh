@@ -12,8 +12,8 @@
 //
 // Metadata encoding: (k_format_tag << 16) | (v_format_tag << 8) | location
 //
-// Format tags:
-//   0=F32, 1=F16, 2=BF16, 3=F8E4M3, 10=Q4_0, 11=Q8_0, 255=Invalid
+// Format tags: see the `ArenaFormat` namespace constants below (F32=0, F16=1,
+//   BF16=2, F8E4M3=34, quantized formats at their listed offsets, 255=Invalid)
 // Location:
 //   0=GPU, 1=CPU
 // ============================================================================

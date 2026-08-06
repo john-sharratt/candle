@@ -149,6 +149,15 @@ fn read_chunk_into_pinned_bytes(arena: &Arena, chunk_idx: usize, dst: &mut [u8])
                     };
                     dst.copy_from_slice(bytes);
                 }
+                DType::F8E4M3 => {
+                    let v: Vec<float8::F8E4M3> = flat.to_vec1::<float8::F8E4M3>()?;
+                    // SAFETY: F8E4M3 is a 1-byte POD; v.len() == n_elems
+                    // (validated via expected_bytes above).
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
+                    };
+                    dst.copy_from_slice(bytes);
+                }
                 other => {
                     return Err(candle::Error::Msg(format!(
                         "read_chunk_into_pinned_bytes: unsupported Float dtype {other:?}"
@@ -1080,6 +1089,22 @@ impl ChunkedKvBacking {
                                 .float_data_mut()?
                                 .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
                         }
+                        KvFormat::Float(DType::F8E4M3) => {
+                            let values: Vec<float8::F8E4M3> = k_slice
+                                .iter()
+                                .map(|&b| float8::F8E4M3::from_bits(b))
+                                .collect();
+                            let k_tensor = Tensor::from_vec(
+                                values,
+                                (1, chunk_size, sub_head_dim),
+                                &device,
+                            )?;
+                            s.arenas_mut()
+                                .get_mut(&k_ai)
+                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
+                                .float_data_mut()?
+                                .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
+                        }
                         KvFormat::Float(other) => {
                             candle::bail!(
                                 "write_raw_sealed_chunk: unsupported float K dtype {other:?}"
@@ -1175,6 +1200,22 @@ impl ChunkedKvBacking {
                                 .map(|chunk| {
                                     f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                                 })
+                                .collect();
+                            let v_tensor = Tensor::from_vec(
+                                values,
+                                (1, chunk_size, sub_head_dim),
+                                &device,
+                            )?;
+                            s.arenas_mut()
+                                .get_mut(&v_ai)
+                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
+                                .float_data_mut()?
+                                .slice_set(&v_tensor, 0, v_gid.chunk_idx())?;
+                        }
+                        KvFormat::Float(DType::F8E4M3) => {
+                            let values: Vec<float8::F8E4M3> = v_slice
+                                .iter()
+                                .map(|&b| float8::F8E4M3::from_bits(b))
                                 .collect();
                             let v_tensor = Tensor::from_vec(
                                 values,
@@ -2476,6 +2517,16 @@ impl ChunkedKvBacking {
                     DType::F32 => {
                         let slice = unsafe {
                             std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elems)
+                        };
+                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
+                    }
+                    DType::F8E4M3 => {
+                        // SAFETY: F8E4M3 is 1-byte POD; length validated above.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const float8::F8E4M3,
+                                n_elems,
+                            )
                         };
                         Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
                     }

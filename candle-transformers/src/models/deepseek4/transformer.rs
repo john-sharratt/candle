@@ -259,7 +259,7 @@ mod tests {
     use super::super::indexer::Indexer;
     use super::super::moe::{Expert, Gate, ScoreFunc};
     use super::*;
-    use candle::{Device, IndexOp};
+    use candle::Device;
 
     fn dense(rows: usize, cols: usize, dev: &Device) -> Result<QLinear> {
         Ok(QLinear::from_weight(Tensor::randn(
@@ -415,7 +415,6 @@ mod tests {
         };
         let rope_c = RotaryCache::new(
             cfg.rope_head_dim,
-            256,
             cfg.compress_rope_theta,
             cfg.original_seq_len,
             cfg.rope_factor,
@@ -425,7 +424,6 @@ mod tests {
         )?;
         let rope_s = RotaryCache::new(
             cfg.rope_head_dim,
-            256,
             cfg.rope_theta,
             0,
             cfg.rope_factor,

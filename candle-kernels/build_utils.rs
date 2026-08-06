@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 // Simple CUDA kernels: basic operations, indexed operations, and simple transformations
 // NOTE: Only include properly formed dispatcher files that use <<<...>>> kernel launch syntax.
-const SIMPLE_KERNELS: [&str; 43] = [
+const SIMPLE_KERNELS: [&str; 44] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     // Kernel implementations
     "src/simple/add_at_indices.cu",
@@ -31,6 +31,7 @@ const SIMPLE_KERNELS: [&str; 43] = [
     "src/simple/fletcher32.cu",
     "src/simple/moe_bucketize.cu",
     "src/simple/sinkhorn.cu",
+    "src/simple/deepseek_bdp.cu",
     "src/simple/moe_scatter.cu",
     "src/simple/affine.cu",
     "src/simple/binary.cu",
@@ -122,7 +123,7 @@ const QUANTIZED_KERNELS: [&str; 44] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 12] = [
+const FLASH_KERNELS: [&str; 13] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -139,6 +140,8 @@ const FLASH_KERNELS: [&str; 12] = [
     // Paged glue: reprojection glue forward (decode-derivative; fp16, bf16)
     "src/paged-glue/paged_glue_api_fp16.cu",
     "src/paged-glue/paged_glue_api_bf16.cu",
+    // DeepSeek hybrid decode: single-latent K≡V window + compressed top-k
+    "src/paged-deepseek/paged_deepseek_api_bf16.cu",
 ];
 
 /// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
@@ -359,7 +362,31 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         groups.push(ArchiveGroup {
             name: "paged_glue".to_string(),
             kernels: glue_kernels,
-            compile_args: decode_args,
+            compile_args: decode_args.clone(),
+            include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // 7. DeepSeek hybrid decode (decode-derivative fork: single-latent K≡V,
+    //    HEAD_DIM=512). Same flags as the stock decode PLUS `-fmad=false`:
+    //    implicit mul+add contraction is disabled so the CPU mirror oracle can
+    //    reproduce the kernel bit-for-bit — fused multiply-adds exist only
+    //    where the kernel writes an explicit `__fmaf_rn`.
+    {
+        let deepseek_kernels: Vec<String> = FLASH_KERNELS
+            .iter()
+            .filter(|k| k.contains("paged-deepseek") || k.contains("paged_deepseek"))
+            .map(|s| s.to_string())
+            .collect();
+        let deepseek_args: Vec<String> = decode_args
+            .iter()
+            .cloned()
+            .chain(std::iter::once("-fmad=false".to_string()))
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "paged_deepseek".to_string(),
+            kernels: deepseek_kernels,
+            compile_args: deepseek_args,
             include_dirs: flash_includes,
         });
     }

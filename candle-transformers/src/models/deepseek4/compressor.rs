@@ -150,7 +150,6 @@ impl Compressor {
         let d = self.head_dim;
         // group-start positions: 0, ratio, 2*ratio, ...
         let positions: Vec<u32> = (0..groups).map(|g| (g * self.ratio) as u32).collect();
-        let positions = Tensor::from_vec(positions, groups, entry.device())?;
 
         let nope = entry.narrow(D::Minus1, 0, d - rd)?;
         let rope_part = entry.narrow(D::Minus1, d - rd, rd)?;
@@ -207,6 +206,81 @@ impl Compressor {
     }
 }
 
+/// The compressor pool as an **online-softmax (LSE) monoid** — the per-channel
+/// accumulator `(m, l, acc)` over a group's pooling rows (§C). It is the *same*
+/// primitive as the attention split-KV combine: a group's compressed entry is
+/// `acc / l` (pre-RMSNorm), and the fold is associative, so a group's rows may
+/// be cut anywhere — across a turn seam — and re-merged exactly. The persisted
+/// unit for a straddling group is one of these partials; at the seam the
+/// boundary tokens' fresh rows fold in and the group finalizes, with no
+/// re-prefill of the interior.
+///
+/// Per channel `c ∈ [0, head_dim)`:
+/// `m_c = max_t s_t[c]`, `l_c = Σ_t e^{s_t[c]−m_c}`, `acc_c = Σ_t e^{s_t[c]−m_c}·kv_t[c]`.
+#[derive(Clone)]
+pub struct GroupPartial {
+    m: Tensor,   // [d] running per-channel max score
+    l: Tensor,   // [d] running per-channel Σ exp
+    acc: Tensor, // [d] running per-channel Σ exp·kv
+}
+
+impl GroupPartial {
+    /// The monoid identity `(−∞, 0, 0)` — the empty fold.
+    pub fn identity(d: usize, device: &Device) -> Result<Self> {
+        Ok(Self {
+            m: Tensor::full(f32::NEG_INFINITY, d, device)?,
+            l: Tensor::zeros(d, DType::F32, device)?,
+            acc: Tensor::zeros(d, DType::F32, device)?,
+        })
+    }
+
+    /// Fold `n` pooling rows into this partial. `scores`/`kvs` are `[n, d]`
+    /// (already `score + ape`, and — for the overlapping compressor — already
+    /// split to the `d`-wide pooling half). Order-independent.
+    pub fn fold(&self, scores: &Tensor, kvs: &Tensor) -> Result<Self> {
+        let (_n, d) = scores.dims2()?;
+        // Local partial for the incoming rows, then LSE-merge with self.
+        let m_local = scores.max(0)?; // [d]
+        let shifted = scores.broadcast_sub(&m_local)?.exp()?; // [n, d]
+        let l_local = shifted.sum(0)?; // [d]
+        let acc_local = shifted.broadcast_mul(kvs)?.sum(0)?; // [d]
+        let local = Self {
+            m: m_local,
+            l: l_local,
+            acc: acc_local,
+        };
+        let _ = d;
+        self.merge(&local)
+    }
+
+    /// LSE-merge two partials of the SAME group (associative + commutative).
+    pub fn merge(&self, other: &Self) -> Result<Self> {
+        let m = self.m.maximum(&other.m)?; // [d]
+        let a = self.m.broadcast_sub(&m)?.exp()?; // e^{m_self − m}
+        let b = other.m.broadcast_sub(&m)?.exp()?; // e^{m_other − m}
+                                                   // NaN guard: −inf − −inf → NaN in the identity case; e^{−inf} is 0, but
+                                                   // the subtraction NaN survives, so zero it where both maxes are −inf.
+        let a = replace_nan(&a, 0.0)?;
+        let b = replace_nan(&b, 0.0)?;
+        let l = ((&self.l * &a)? + (&other.l * &b)?)?;
+        let acc = ((self.acc.broadcast_mul(&a))? + (other.acc.broadcast_mul(&b))?)?;
+        Ok(Self { m, l, acc })
+    }
+
+    /// Finalize the completed group: `acc / l` → the pre-RoPE, pre-RMSNorm
+    /// pooled entry `[d]`.
+    pub fn finalize(&self) -> Result<Tensor> {
+        &self.acc / &self.l
+    }
+}
+
+/// Replace NaNs with `fill` (element-wise): `where(x == x, x, fill)`.
+fn replace_nan(x: &Tensor, fill: f64) -> Result<Tensor> {
+    let is_nan = x.ne(x)?; // NaN != NaN → 1
+    let fill_t = Tensor::full(fill as f32, x.shape(), x.device())?;
+    is_nan.where_cond(&fill_t, x)
+}
+
 /// Streaming (decode-time) counterpart to [`Compressor`]. The prefill `Compressor::forward`
 /// recomputes every compressed entry from the full prefix on each step; during incremental
 /// decode we instead accumulate the current group's `ratio` token projections and emit one
@@ -245,7 +319,23 @@ impl IncrementalCompressor {
         Some(self.emit_group(rope)).transpose()
     }
 
-    fn emit_group(&mut self, rope: &RotaryCache) -> Result<Tensor> {
+    /// As [`Self::push`] but emitting the **pre-RoPE** entry plus its
+    /// group-start position — the paged-kernel path's form (the kernel applies
+    /// RoPE at read time from the stored position; storage stays
+    /// position-free).
+    pub fn push_raw(&mut self, x: &Tensor) -> Result<Option<(Tensor, u32)>> {
+        let (kv, score) = self.c.project_row(x)?;
+        self.kv_rows.push(kv);
+        self.score_rows.push(score);
+        if self.kv_rows.len() < self.c.ratio {
+            return Ok(None);
+        }
+        Some(self.emit_group_raw()).transpose()
+    }
+
+    /// Pool → RMSNorm (NO RoPE): the position-free entry `[1, 1, d]` and its
+    /// group-start position.
+    fn emit_group_raw(&mut self) -> Result<(Tensor, u32)> {
         let d = self.c.head_dim;
         let r = self.c.ratio;
         let dev = self.c.device().clone();
@@ -284,16 +374,23 @@ impl IncrementalCompressor {
         self.kv_rows.clear();
         self.score_rows.clear();
 
-        // RMSNorm → RoPE at the group-start position (g·ratio), matching `forward`.
+        // RMSNorm, position carried alongside (RoPE is the caller's concern:
+        // `emit_group` applies it here on the reference path; the kernel path
+        // stores pre-RoPE and rotates at read).
         let g = self.group_idx;
         self.group_idx += 1;
         let entry = entry.reshape((1, 1, d))?;
         let entry = self.rms_norm_entry(&entry)?;
+        Ok((entry, (g * r) as u32))
+    }
+
+    fn emit_group(&mut self, rope: &RotaryCache) -> Result<Tensor> {
+        let (entry, pos) = self.emit_group_raw()?;
+        let d = self.c.head_dim;
         let rd = self.c.rope_head_dim;
         let nope = entry.narrow(D::Minus1, 0, d - rd)?;
         let rope_part = entry.narrow(D::Minus1, d - rd, rd)?;
-        let positions = Tensor::from_vec(vec![(g * r) as u32], 1, &dev)?;
-        let rope_part = rope.apply_positions(&rope_part, &positions, false)?;
+        let rope_part = rope.apply_positions(&rope_part, &[pos], false)?;
         Tensor::cat(&[&nope, &rope_part], D::Minus1)
     }
 
@@ -367,6 +464,69 @@ mod tests {
         Ok(())
     }
 
+    /// §C/§E compression-seam monoid: a group's pooling rows folded WHOLE and
+    /// folded in two fragments then LSE-merged both equal the single-shot
+    /// softmax pool — the "two-turn seam-straddling group reconstructs ==
+    /// single-shot forward of the concatenation" property. Also checks the
+    /// monoid identity law. Pure `(m,l,acc)` arithmetic, model-independent.
+    #[test]
+    fn group_partial_seam_fold_matches_whole() -> Result<()> {
+        let dev = Device::Cpu;
+        let (r, d) = (6usize, 8usize);
+        let scores = Tensor::randn(0f32, 1.0, (r, d), &dev)?;
+        let kvs = Tensor::randn(0f32, 1.0, (r, d), &dev)?;
+
+        // Single-shot reference: softmax over the r rows (per channel) · kv.
+        let w = softmax(&scores, 0)?; // [r, d]
+        let reference = w.broadcast_mul(&kvs)?.sum(0)?; // [d]
+        let ref_v = reference.to_vec1::<f32>()?;
+
+        let close = |a: &Tensor, msg: &str| -> Result<()> {
+            let av = a.to_vec1::<f32>()?;
+            for c in 0..d {
+                assert!(
+                    (av[c] - ref_v[c]).abs() < 1e-5,
+                    "{msg} channel {c}: {} vs {}",
+                    av[c],
+                    ref_v[c]
+                );
+            }
+            Ok(())
+        };
+
+        // Whole fold == reference.
+        let whole = GroupPartial::identity(d, &dev)?
+            .fold(&scores, &kvs)?
+            .finalize()?;
+        close(&whole, "whole fold")?;
+
+        // Cut the group at every interior seam point; each split + merge ==
+        // reference (order-independent, so both merge orders too).
+        for cut in 1..r {
+            let s1 = scores.narrow(0, 0, cut)?;
+            let k1 = kvs.narrow(0, 0, cut)?;
+            let s2 = scores.narrow(0, cut, r - cut)?;
+            let k2 = kvs.narrow(0, cut, r - cut)?;
+            let p1 = GroupPartial::identity(d, &dev)?.fold(&s1, &k1)?;
+            let p2 = GroupPartial::identity(d, &dev)?.fold(&s2, &k2)?;
+            close(
+                &p1.merge(&p2)?.finalize()?,
+                &format!("seam cut {cut} (p1⊕p2)"),
+            )?;
+            close(
+                &p2.merge(&p1)?.finalize()?,
+                &format!("seam cut {cut} (p2⊕p1)"),
+            )?;
+        }
+
+        // Identity law: id ⊕ p == p ⊕ id == p.
+        let p = GroupPartial::identity(d, &dev)?.fold(&scores, &kvs)?;
+        let id = GroupPartial::identity(d, &dev)?;
+        close(&id.merge(&p)?.finalize()?, "id ⊕ p")?;
+        close(&p.merge(&id)?.finalize()?, "p ⊕ id")?;
+        Ok(())
+    }
+
     /// Overlapping pooling (`ratio == 4`): group 0 has no previous group, so its `-inf`
     /// prev-half is fully masked and the entry equals a pool over just the current 4 rows.
     #[test]
@@ -425,7 +585,7 @@ mod tests {
         let dev = Device::Cpu;
         let dim = 8usize;
         let coff = if ratio == 4 { 2 } else { 1 };
-        let rope = RotaryCache::new(rd, 256, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
         let c = Compressor::new(
             Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
             Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
@@ -485,7 +645,7 @@ mod tests {
     fn forward_shape_and_finite() -> Result<()> {
         let dev = Device::Cpu;
         let (dim, d, ratio, rd) = (8usize, 6usize, 4usize, 4usize);
-        let rope = RotaryCache::new(rd, 64, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
         let x = Tensor::randn(0f32, 1.0, (2, 20, dim), &dev)?;
         let c = Compressor::new(
             Tensor::randn(0f32, 1.0, (2 * d, dim), &dev)?,

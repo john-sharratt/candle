@@ -145,6 +145,15 @@ pub(crate) struct BackingInner {
     /// seal runs single-threaded so it's uncontended. Mirrors `KvSamplerGpu`.
     #[cfg(feature = "cuda")]
     pub(crate) prov_sign_scratch: Mutex<Option<ProvSignScratch>>,
+
+    /// Single-latent (K≡V) mode: one latent vector serves as both key and
+    /// value (DeepSeek MLA-style attention). Chunk allocation aliases each V
+    /// band GID to its K band GID (the refcounted `ChunkGid` handles make the
+    /// double reference safe), and contiguous writes skip the V plane — so V
+    /// storage costs nothing and every table/kernel consumer sees
+    /// `v_ptr == k_ptr` without further special-casing. Set once, before any
+    /// chunk is allocated.
+    pub(crate) single_latent: std::sync::atomic::AtomicBool,
 }
 
 /// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
@@ -718,6 +727,23 @@ impl ChunkedKvBacking {
         )
     }
 
+    /// Enable single-latent (K≡V) mode — one latent serves as both key and
+    /// value (DeepSeek MLA-style). V band GIDs alias their K band GIDs and
+    /// contiguous writes skip the V plane. Must be set before any chunk is
+    /// allocated; applies to every layer sharing this backing group.
+    pub fn set_single_latent(&self, on: bool) {
+        self.inner
+            .single_latent
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether single-latent (K≡V) mode is active.
+    pub fn single_latent(&self) -> bool {
+        self.inner
+            .single_latent
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Create a new chunked backing with adaptive per-block format selection.
     ///
     /// The `k_format`/`v_format` serve as the ceiling (highest fidelity) format.
@@ -805,6 +831,7 @@ impl ChunkedKvBacking {
             ),
             #[cfg(feature = "cuda")]
             prov_sign_scratch: Mutex::new(None),
+            single_latent: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Register for cooperative compaction
@@ -1283,6 +1310,59 @@ impl ChunkedKvBacking {
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
                 seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?
+            } else {
+                ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
+            };
+            let elapsed = t_sync.elapsed();
+            match sync_kind {
+                super::types::DecodeGpuChunksSyncKind::Rebuild => {
+                    stats.rebuilds += 1;
+                    stats.rebuild_time += elapsed;
+                }
+                super::types::DecodeGpuChunksSyncKind::Reuse => {
+                    stats.reuses += 1;
+                    stats.reuse_time += elapsed;
+                }
+                super::types::DecodeGpuChunksSyncKind::Empty => {
+                    stats.empty += 1;
+                }
+            }
+            results.push(result);
+        }
+        Ok((results, stats))
+    }
+
+    /// Like [`Self::sync_decode_gpu_chunks`], but each returned `slices_ptr` is
+    /// an immutable copy of that sequence's slot-state placed in the pinned
+    /// stager `generation` (device pointer stable for the whole forward),
+    /// instead of the live `gpu_chunks` buffer (which reallocates on the next
+    /// chunk append). Used by the metadata builder so per-token snapshots built
+    /// up front survive later chunk-boundary rebuilds. See
+    /// [`super::gpu_chunks::GpuChunks::snapshot_into_generation`].
+    pub fn sync_decode_gpu_chunks_snapshot(
+        &self,
+        batch_entries: &[(usize, usize)],
+        arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
+        generation: &candle::quantized::pinned_staging::Generation,
+    ) -> candle::Result<(Vec<(u64, u32, u32)>, DecodeGpuChunkSyncStats)> {
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+
+        let mut results = Vec::with_capacity(batch_entries.len());
+        let mut stats = DecodeGpuChunkSyncStats::default();
+        for &(seq_idx, seq_offset) in batch_entries {
+            let t_sync = std::time::Instant::now();
+            let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
+                seq.validate_decode_state(seq_idx, seq_offset)?;
+                let ((_live_ptr, n_slices, write_slice), kind) =
+                    seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
+                let snap_ptr = seq.snapshot_gpu_chunks_into(generation, seq_offset)?;
+                ((snap_ptr, n_slices, write_slice), kind)
             } else {
                 ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
             };

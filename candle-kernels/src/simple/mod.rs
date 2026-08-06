@@ -59,4 +59,5 @@ pub mod fletcher32;
 
 // Fused Sinkhorn (doubly-stochastic) normalization of the mHC combine matrix:
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
+pub mod deepseek_bdp;
 pub mod sinkhorn;

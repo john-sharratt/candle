@@ -743,7 +743,6 @@ mod tests {
         let (theta, orig) = cfg.rope_params(layer);
         let rope = super::super::rope::RotaryCache::new(
             cfg.rope_head_dim,
-            256,
             theta,
             orig,
             cfg.rope_factor,
@@ -818,7 +817,6 @@ mod tests {
         let (theta, orig) = cfg.rope_params(layer);
         let rope = super::super::rope::RotaryCache::new(
             cfg.rope_head_dim,
-            256,
             theta,
             orig,
             cfg.rope_factor,

@@ -50,8 +50,12 @@ use crate::persistence::record::DistillMode;
 pub enum TurnIntegrity {
     /// All expected pieces present (or absent by design).
     Ok,
-    /// The decl declares a KV block span but no chunk stream exists — the turn
-    /// can never materialise into a projection.
+    /// The decl declares a KV block span but no chunk stream exists AND no
+    /// `Tokens` record survived — nothing remains to rebuild the turn from,
+    /// so it can never materialise into a projection. (KV-less turns WITH
+    /// tokens are recoverable: the shutdown drain deliberately leaves a
+    /// just-sealed turn's KV behind and the reload re-prefills it from the
+    /// persisted token ids — that is the redo log's designed cold path.)
     MissingKv,
     /// No `Tokens` record survived — the turn cannot be decoded to verbatim
     /// text (layout text may still render it).
@@ -92,7 +96,7 @@ pub fn classify_turn(
     if distill.is_some() || !declares_content {
         return TurnIntegrity::Ok;
     }
-    if expects_kv && !has_kv {
+    if expects_kv && !has_kv && !has_tokens {
         return TurnIntegrity::MissingKv;
     }
     if !has_tokens {
@@ -142,6 +146,18 @@ mod tests {
         assert_eq!(
             classify_turn(None, true, false, true, false),
             TurnIntegrity::MissingKv
+        );
+    }
+
+    #[test]
+    fn kv_less_turn_with_tokens_is_recoverable() {
+        // The clean-shutdown shape: the drain deferred the just-sealed turn's
+        // pinned hot KV (decl + tokens flushed, chunks never reached cold).
+        // The tokens are the rebuild source — reload re-prefills the K/V —
+        // so this is NOT damage and must never tombstone the conversation.
+        assert_eq!(
+            classify_turn(None, true, true, true, false),
+            TurnIntegrity::Ok
         );
     }
 

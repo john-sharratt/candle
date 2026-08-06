@@ -792,6 +792,31 @@ impl BatchedInferenceSession {
         seq_indices: &[usize],
         generation: &Generation,
     ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
+        self.build_decode_metadata_at(seq_indices, generation, &[], &[], false)
+    }
+
+    /// [`Self::build_decode_metadata`] with explicit per-sequence offset
+    /// overrides: each `(seq, offset)` pair serializes that slot AS IF the
+    /// sequence stood at `offset`, without touching session state. The wave
+    /// prefill uses this to pre-build one header snapshot per absorbed token
+    /// (token `t` attends `[0, base+t)` + itself — exactly the per-token
+    /// decode regime), while other sequences serialize their live offsets.
+    ///
+    /// `non_writer` names sequences whose rows do NOT scatter through the
+    /// decode write slot (glue rows write into explicitly reserved gap chunks
+    /// instead). They are EXCLUDED from the `+1` write-chunk ensure: applying
+    /// it would allocate a spurious empty chunk past a full/gap tail, which
+    /// permanently inflates the slot's block count — the turn-seal range
+    /// `[turn_start_parent_blocks, block_count)` then misses the turn's real
+    /// blocks and the turn silently never persists.
+    pub fn build_decode_metadata_at(
+        &self,
+        seq_indices: &[usize],
+        generation: &Generation,
+        offset_overrides: &[(usize, usize)],
+        non_writer: &[usize],
+        snapshot_slices: bool,
+    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
         let n_active = seq_indices.len();
         if n_active == 0 {
             return Ok((None, None, 0));
@@ -805,11 +830,16 @@ impl BatchedInferenceSession {
         let seq_offsets: Vec<(usize, usize)> = seq_indices
             .iter()
             .map(|&seq_idx| {
-                let offset = self
-                    .sequences
-                    .get(seq_idx)
-                    .and_then(|s| s.as_ref())
-                    .map_or(0, |s| s.offset);
+                let offset = offset_overrides
+                    .iter()
+                    .find(|(s, _)| *s == seq_idx)
+                    .map(|&(_, o)| o)
+                    .unwrap_or_else(|| {
+                        self.sequences
+                            .get(seq_idx)
+                            .and_then(|s| s.as_ref())
+                            .map_or(0, |s| s.offset)
+                    });
                 (seq_idx, offset)
             })
             .collect();
@@ -823,7 +853,13 @@ impl BatchedInferenceSession {
         let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
         // Ensure backings are sized for the upcoming decode write so the
         // slot's chunks reflect the post-write layout when we read them.
-        self.backings[0].ensure_for_batch_entries(&seq_offsets, 1)?;
+        // Only for sequences that actually decode-write — see `non_writer`.
+        let writer_offsets: Vec<(usize, usize)> = seq_offsets
+            .iter()
+            .copied()
+            .filter(|(s, _)| !non_writer.contains(s))
+            .collect();
+        self.backings[0].ensure_for_batch_entries(&writer_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
             let entry_start = pm_flat.len();
             pm_seq_byte_offsets.push(entry_start * 4);
@@ -893,7 +929,7 @@ impl BatchedInferenceSession {
             // (it is allocated lazily inside paged_decode_attention), so we must
             // pre-allocate it here so the GPU buffer reflects the correct
             // new write chunk rather than the previous sealed tail.
-            self.backings[layer_idx].ensure_for_batch_entries(&seq_offsets, 1)?;
+            self.backings[layer_idx].ensure_for_batch_entries(&writer_offsets, 1)?;
 
             let arena_info = self.backings[layer_idx].resolve_arena_info()?;
 
@@ -901,8 +937,20 @@ impl BatchedInferenceSession {
             // Common case: the cached GPU buffer is already valid and we only
             // reuse its pointer. Chunk-boundary case: the layer rebuilds once
             // from authoritative CPU chunk state.
-            let (seq_ptrs, sync_stats) =
-                self.backings[layer_idx].sync_decode_gpu_chunks(&seq_offsets, &arena_info)?;
+            // The wave prefill builds every per-token snapshot up front, then
+            // runs the layer loop, so its `slices_ptr` must be an immutable copy
+            // that survives later chunk-boundary reallocations of the live
+            // buffer. Live decode (one metadata build per step, used immediately)
+            // keeps the zero-copy live pointer + on-device write-len commit.
+            let (seq_ptrs, sync_stats) = if snapshot_slices {
+                self.backings[layer_idx].sync_decode_gpu_chunks_snapshot(
+                    &seq_offsets,
+                    &arena_info,
+                    generation,
+                )?
+            } else {
+                self.backings[layer_idx].sync_decode_gpu_chunks(&seq_offsets, &arena_info)?
+            };
             slot_reuse_time += sync_stats.reuse_time;
             slot_rebuild_time += sync_stats.rebuild_time;
             saw_slot_reuse |= sync_stats.reuses > 0;
@@ -1587,6 +1635,23 @@ impl BatchedInferenceSession {
     /// Get the current offset (position) of a sequence.
     pub fn sequence_offset(&self, idx: usize) -> Option<usize> {
         self.sequences.get(idx)?.as_ref().map(|s| s.offset)
+    }
+
+    /// The layer-0 writer boundary for a sequence — the first chunk index the
+    /// slot may write into (chunks below it are Arc-shared / sealed).
+    pub fn writer_start_idx(&self, idx: usize) -> Option<usize> {
+        self.backings.first()?.writer_start_idx_for_seq(idx)
+    }
+
+    /// Mark every block `idx` currently holds (all layers) as immutable
+    /// prefix — later writes append after them in a fresh writer chunk. The
+    /// turn-seal re-prefill calls this after its truncate so the clean grid
+    /// lands exactly at the seal anchor block.
+    pub fn seal_writer_boundary(&self, idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            backing.seal_writer_boundary(idx)?;
+        }
+        Ok(())
     }
 
     /// Get the chunk count of a sequence slot — the authoritative

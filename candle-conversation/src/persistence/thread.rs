@@ -770,8 +770,20 @@ fn run_pass(
     // Dropped right after the sync (below), before install — by then the kernel
     // has retired, so the install's own arena frees are safe.
     let migrate_guard = candle_nn::kv_cache::enter_migrate();
+    // A single-latent backing (DeepSeek's fixed-FP8 K≡V window) has no adaptive
+    // per-block palette — its arena IS the storage format, so hot→warm is a
+    // plain move, never a palette-4 requantize. The engine-wide policy is
+    // non-None (the builder sets a compression level for the Qwen path), but
+    // the session overrode the backing to single-latent FP8; running the
+    // palette-4 selection kernel against that arena launches malformed and
+    // faults the whole device context. Force the pass-through move.
+    let single_latent = backings.first().is_some_and(|b| b.single_latent());
     for (cc, group) in groups {
-        let effective = effective_turn_policy(compression_policy, cc);
+        let effective = if single_latent {
+            None
+        } else {
+            effective_turn_policy(compression_policy, cc)
+        };
         migrate_group_hot_to_warm(
             backings,
             device,

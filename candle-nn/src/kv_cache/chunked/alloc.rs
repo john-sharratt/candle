@@ -705,16 +705,32 @@ impl ChunkedKvBacking {
         // but contiguous bands give the select/QREL walk better spatial
         // locality, so we mint them as runs where a run is available.
         // HeadGids layout stays `head * GIDS_PER_HEAD + palette * 2 + is_value`.
+        let single_latent = self
+            .inner
+            .single_latent
+            .load(std::sync::atomic::Ordering::Relaxed);
         for _h in 0..self.inner.n_kv_head {
             let k_run = self
                 .inner
                 .alloc_chunk_run_for_key(k_key.clone(), N_PALETTE)?;
-            let v_run = self
-                .inner
-                .alloc_chunk_run_for_key(v_key.clone(), N_PALETTE)?;
-            for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
-                gids.push(k_gid);
-                gids.push(v_gid);
+            if single_latent {
+                // K≡V: the V band aliases the K band. `ChunkGid` is a
+                // refcounted handle, so the double reference keeps the chunk
+                // alive until both drop — V storage costs nothing and every
+                // table consumer sees v_ptr == k_ptr.
+                for k_gid in k_run {
+                    let v_gid = k_gid.clone();
+                    gids.push(k_gid);
+                    gids.push(v_gid);
+                }
+            } else {
+                let v_run = self
+                    .inner
+                    .alloc_chunk_run_for_key(v_key.clone(), N_PALETTE)?;
+                for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
+                    gids.push(k_gid);
+                    gids.push(v_gid);
+                }
             }
         }
 

@@ -956,6 +956,28 @@ impl SequenceState {
             DecodeGpuChunksSyncKind::Reuse,
         ))
     }
+
+    /// Snapshot the current slot-state into the stager `generation`, returning
+    /// the immutable copy's device pointer. Call after `sync_decode_gpu_chunks`
+    /// has brought `gpu_chunks` to the desired offset. See
+    /// [`super::gpu_chunks::GpuChunks::snapshot_into_generation`].
+    pub(crate) fn snapshot_gpu_chunks_into(
+        &mut self,
+        generation: &candle::quantized::pinned_staging::Generation,
+        seq_offset: usize,
+    ) -> candle::Result<u64> {
+        // The write chunk's per-token length is not carried in the live buffer
+        // between snapshots (see `snapshot_into_generation`); derive it from the
+        // sequence offset (tokens already in the write chunk before this token).
+        let wi = self.decode_write_chunk_idx();
+        let rope_base: usize = self.chunks[..wi.min(self.chunks.len())]
+            .iter()
+            .map(|c| c.usage as usize)
+            .sum();
+        let write_len = seq_offset.saturating_sub(rope_base) as u16;
+        self.gpu_chunks
+            .snapshot_into_generation(generation, wi, write_len)
+    }
 }
 
 /// Global allocation state for all chunks.

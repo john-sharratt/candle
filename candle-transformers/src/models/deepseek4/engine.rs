@@ -31,11 +31,11 @@ use super::rope::RotaryCache;
 
 /// One transformer layer's resident (non-routed-expert) weights. The routed experts for this
 /// layer live in the shared [`ExpertCache`], indexed by `moe_layer_idx`.
-struct EngineLayer {
-    attn: super::attention::Attention,
-    hc_attn: HyperParams,
-    hc_ffn: HyperParams,
-    attn_norm: Tensor,
+pub(super) struct EngineLayer {
+    pub(super) attn: super::attention::Attention,
+    pub(super) hc_attn: HyperParams,
+    pub(super) hc_ffn: HyperParams,
+    pub(super) attn_norm: Tensor,
     ffn_norm: Tensor,
     /// MoE router (`sqrtsoftplus`/`noaux_tc`/hash — reused from the validated base). Produces
     /// `(weights, indices)`; the routed experts execute via the `ExpertCache`.
@@ -306,10 +306,8 @@ impl Dsv4Engine {
             gb(free_after_experts.saturating_sub(free_after_resident)),
         );
 
-        let max_seq = 512;
         let rope_compress = RotaryCache::new(
             cfg.rope_head_dim,
-            max_seq,
             cfg.compress_rope_theta,
             cfg.original_seq_len,
             cfg.rope_factor,
@@ -319,7 +317,6 @@ impl Dsv4Engine {
         )?;
         let rope_swa = RotaryCache::new(
             cfg.rope_head_dim,
-            max_seq,
             cfg.rope_theta,
             0,
             cfg.rope_factor,
@@ -351,7 +348,7 @@ impl Dsv4Engine {
     }
 
     /// RoPE table for `layer`: long-context (compressed layers) vs base (sliding-window).
-    fn rope_for(&self, layer: usize) -> &RotaryCache {
+    pub(super) fn rope_for(&self, layer: usize) -> &RotaryCache {
         if self.cfg.layer_kind(layer).compresses() {
             &self.rope_compress
         } else {
@@ -364,12 +361,26 @@ impl Dsv4Engine {
     /// on the int8-KO path (`MoeInput::Q8`), add the always-on shared expert. Returns
     /// `[1, 1, dim]`. `token_id` drives the hash-layer `tid2eid` routing.
     fn moe_forward(&self, layer: &EngineLayer, x: &Tensor, token_id: u32) -> Result<Tensor> {
+        self.moe_forward_batch(layer, x, &[token_id])
+    }
+
+    /// Batched MoE over `nt` rows: ONE routing readback per call (the
+    /// counting-sort's expert ids must be host-visible to schedule the
+    /// streaming cache's pinned→VRAM uploads — intrinsic to a non-resident
+    /// expert set, and amortized across every row of the wave).
+    pub(super) fn moe_forward_batch(
+        &self,
+        layer: &EngineLayer,
+        x: &Tensor,
+        token_ids: &[u32],
+    ) -> Result<Tensor> {
         let dim = self.cfg.dim;
-        let x2 = x.reshape((1, dim))?; // [nt=1, dim]
-                                       // Float-normalized input for routing + the shared expert.
+        let nt = token_ids.len();
+        let x2 = x.reshape((nt, dim))?;
+        // Float-normalized input for routing + the shared expert.
         let normed = rms_norm(&x2, &layer.ffn_norm, self.cfg.norm_eps)?;
-        let ids = Tensor::from_vec(vec![token_id], 1, &self.device)?;
-        let (weights, indices) = layer.gate.route(&normed, &ids)?; // [1,k], [1,k] u32
+        let ids = Tensor::from_vec(token_ids.to_vec(), nt, &self.device)?;
+        let (weights, indices) = layer.gate.route(&normed, &ids)?; // [nt,k], [nt,k] u32
 
         // q8a128 activation for the int8-KO grouped expert GEMM (fused RMSNorm→quant, same
         // normalization as `normed` — quantization noise only, within the QAT tolerance).
@@ -386,6 +397,10 @@ impl Dsv4Engine {
 
         // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),
         // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
+        // The ONE intrinsic wave-path readback: the streaming expert cache
+        // schedules pinned→VRAM uploads by expert id, so the routing indices
+        // must be host-visible (amortized across every row of the wave).
+        super::readback::note_readback();
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
         let weights_flat = weights.flatten_all()?; // [nt*k]
         let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
@@ -428,7 +443,7 @@ impl Dsv4Engine {
             assignments,
         )?; // [nt, dim] F32
         let shared = layer.shared.forward(&normed)?; // [nt, dim] F32
-        (routed + shared)?.reshape((1, 1, dim))
+        (routed + shared)?.reshape((1, nt, dim))
     }
 
     /// Open a decode session (per-layer streaming attention KV) over this resident model.
@@ -457,6 +472,188 @@ impl Dsv4Engine {
             logits = sess.step(next)?;
         }
         Ok(out)
+    }
+
+    // ── Accessors for the batched wave model (`deepseek4/wave.rs`) — the
+    // resident engine IS the loaded model; the wave impl drives its weights,
+    // experts, and hyper-connections over many sequences. ──
+    pub(super) fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+    pub(super) fn hc(&self) -> &HyperConnection {
+        &self.hc
+    }
+    pub(super) fn hc_head(&self) -> &HyperParams {
+        &self.hc_head
+    }
+    pub(super) fn embed(&self) -> &Tensor {
+        &self.embed
+    }
+    pub(super) fn output_norm(&self) -> &Tensor {
+        &self.output_norm
+    }
+    pub(super) fn lm_head(&self) -> &QLinear {
+        &self.lm_head
+    }
+    pub(super) fn engine_device(&self) -> &Device {
+        &self.device
+    }
+    pub(super) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+    pub(super) fn engine_layer(&self, l: usize) -> &EngineLayer {
+        &self.layers[l]
+    }
+    pub(super) fn moe_forward_row(
+        &self,
+        layer: &EngineLayer,
+        x: &Tensor,
+        token_id: u32,
+    ) -> Result<Tensor> {
+        self.moe_forward(layer, x, token_id)
+    }
+
+    /// The paged-kernel decode session: attention runs in the
+    /// `paged-deepseek` kernel over a production chunked-arena slot
+    /// (single-latent FP8 window) + `FloatGallery` corpus; the host keeps the
+    /// int8 projections and MoE. One sequence, one slot per layer group.
+    pub fn kernel_session(&self) -> Result<KernelSession<'_>> {
+        use crate::models::batched_inference::{BatchedConfig, BatchedInferenceSession};
+        use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat};
+
+        let cfg = BatchedConfig {
+            k_format: KvFormat::Float(DType::F8E4M3),
+            v_format: KvFormat::Float(DType::F8E4M3),
+            initial_seq_len: 4096,
+            ..Default::default()
+        };
+        let first = ChunkedKvBacking::new_with_format_adaptive(
+            1,
+            1,
+            self.cfg.head_dim,
+            cfg.k_format,
+            cfg.v_format,
+            &self.device,
+            cfg.initial_seq_len,
+            None,
+        )?;
+        first.set_single_latent(true);
+        let mut backings = Vec::with_capacity(self.cfg.n_layers);
+        backings.push(first.clone());
+        for layer_idx in 1..self.cfg.n_layers {
+            backings.push(first.new_layer(layer_idx, 1, cfg.initial_seq_len));
+        }
+        let mut kv =
+            BatchedInferenceSession::new_with_backings(backings.clone(), cfg, &self.device);
+        let seq = kv.create_sequence()?;
+
+        let mut layers = Vec::with_capacity(self.cfg.n_layers);
+        for (l, layer) in self.layers.iter().enumerate() {
+            let (theta, orig) = self.cfg.rope_params(l);
+            layers.push(super::kernel_attention::KernelAttnLayer::new(
+                &layer.attn,
+                theta,
+                orig,
+                self.cfg.rope_factor,
+                self.cfg.beta_fast,
+                self.cfg.beta_slow,
+                self.cfg.index_head_dim,
+                &self.device,
+            )?);
+        }
+        Ok(KernelSession {
+            engine: self,
+            kv,
+            backings,
+            seq,
+            layers,
+            pos: 0,
+        })
+    }
+
+    /// Greedy decode on the kernel path — the rung-3 vehicle
+    /// (`generate`'s host-attention twin with the attention in the kernel).
+    pub fn generate_kernel(&self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+        let mut sess = self.kernel_session()?;
+        let mut logits: Option<Tensor> = None;
+        for &t in prompt {
+            logits = Some(sess.step(t)?);
+        }
+        let mut logits = logits.ok_or_else(|| candle::Error::msg("empty prompt"))?;
+        let mut out = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let next = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            out.push(next);
+            logits = sess.step(next)?;
+        }
+        Ok(out)
+    }
+}
+
+/// The paged-kernel decode session: per-layer [`KernelAttnLayer`] state over
+/// a shared `BatchedInferenceSession` slot group.
+pub struct KernelSession<'a> {
+    engine: &'a Dsv4Engine,
+    kv: crate::models::batched_inference::BatchedInferenceSession,
+    /// Per-layer backings (Arc-shared with `kv`) — the per-step CPU usage
+    /// commit (`set_len`) runs on each before the slot headers serialize.
+    backings: Vec<candle_nn::kv_cache::ChunkedKvBacking>,
+    seq: usize,
+    layers: Vec<super::kernel_attention::KernelAttnLayer>,
+    pos: usize,
+}
+
+impl KernelSession<'_> {
+    /// One decode step on the kernel path: `token_id` → logits `[vocab]`.
+    pub fn step(&mut self, token_id: u32) -> Result<Tensor> {
+        let e = self.engine;
+        let dim = e.cfg.dim;
+        let idt = Tensor::from_vec(vec![token_id], 1, &Device::Cpu)?;
+        let row = e
+            .embed
+            .index_select(&idt, 0)?
+            .reshape((1, 1, dim))?
+            .to_dtype(DType::F32)?
+            .to_device(&e.device)?;
+        let mut h = e.hc.expand(&row)?;
+
+        // Per-step slot metadata for ALL layers (24-byte SlotHeader each,
+        // one pinned upload). Kept alive through the layer loop. The CPU-side
+        // chunk usage must mirror the tokens the GPU commits have written —
+        // `set_len` distributes `pos` across each layer's writer chunks
+        // before the headers serialize.
+        self.kv.set_sequence_offset(self.seq, self.pos)?;
+        for b in &self.backings {
+            b.set_len(self.seq, self.pos);
+        }
+        let generation = self.kv.begin_stager_generation();
+        let (_pm, headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
+        let headers = headers.ok_or_else(|| candle::Error::msg("no decode metadata"))?;
+        let base = headers.dev_ptr();
+
+        for (l, layer) in e.layers.iter().enumerate() {
+            let (x, post, comb) = e.hc.pre(&h, &layer.hc_attn)?;
+            let x = rms_norm(&x, &layer.attn_norm, e.cfg.norm_eps)?;
+            let x = self.layers[l].step(
+                &layer.attn,
+                &x,
+                e.rope_for(l),
+                self.pos,
+                base + (l as u64) * stride,
+            )?;
+            let h1 = e.hc.post(&x, &h, &post, &comb)?;
+
+            let (x, post, comb) = e.hc.pre(&h1, &layer.hc_ffn)?;
+            let moe = e.moe_forward(layer, &x, token_id)?;
+            h = e.hc.post(&moe, &h1, &post, &comb)?;
+        }
+        drop(generation);
+        self.pos += 1;
+
+        let h = e.hc.head_reduce(&h, &e.hc_head)?;
+        let h = rms_norm(&h, &e.output_norm, e.cfg.norm_eps)?;
+        let logits = e.lm_head.forward(&h)?;
+        logits.reshape((e.cfg.vocab_size,))
     }
 }
 
@@ -523,6 +720,228 @@ mod tests {
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf")
     }
 
+    /// RUNG 3 — the step-4 milestone: the engine answers "Paris" with the
+    /// attention running entirely in the `paged-deepseek` kernel (FP8 arena
+    /// window + FloatGallery corpus + two-stage selection); host attention is
+    /// gone from this path. Ignored (needs the merged file + CUDA).
+    #[test]
+    #[ignore]
+    fn engine_generate_paris_kernel() -> Result<()> {
+        let path = merged();
+        if !path.exists() {
+            eprintln!("[skip] merged file absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let t0 = std::time::Instant::now();
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        eprintln!("[kernel] load {:.1}s", t0.elapsed().as_secs_f32());
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>What is the capital of France? \
+             Reply with only the city name.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+
+        let t1 = std::time::Instant::now();
+        let gen = engine.generate_kernel(&ids, 12)?;
+        let dt = t1.elapsed().as_secs_f32();
+        let text = tokenizer
+            .decode(&gen, false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        eprintln!("[kernel] generated ids={gen:?}");
+        eprintln!("[kernel] continuation={text:?}");
+        eprintln!(
+            "[kernel] {} prompt + 12 gen in {:.1}s = {:.2} tok/s decode",
+            ids.len(),
+            dt,
+            12.0 / dt
+        );
+        assert!(
+            text.contains("Paris"),
+            "kernel-path engine did not answer Paris: {text:?}"
+        );
+        Ok(())
+    }
+
+    /// Template-distribution discriminator for the rung-4 conversation gate:
+    /// the conversation-engine prompt (BOS + system text + chat markers) run
+    /// through BOTH the reference per-token attention (`generate`) and the
+    /// paged-kernel path (`generate_kernel`) on the same loaded weights.
+    /// Agreement (both crisp or both rambling) attributes the rung-4 output
+    /// to the model's template distribution; divergence attributes it to the
+    /// kernel path. Ignored (needs the merged file + CUDA).
+    #[test]
+    #[ignore]
+    fn engine_conversation_prompt_ab() -> Result<()> {
+        let path = merged();
+        if !path.exists() {
+            eprintln!("[skip] merged file absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let prompt = "<｜begin▁of▁sentence｜>You are a concise, factual assistant.\
+             <｜User｜>What is the capital of France? \
+             Reply with only the city name.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+
+        let gen_ref = engine.generate(&ids, 16)?;
+        let text_ref = tokenizer
+            .decode(&gen_ref, false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        eprintln!("[ab] reference ids={gen_ref:?}");
+        eprintln!("[ab] reference continuation={text_ref:?}");
+
+        let gen_k = engine.generate_kernel(&ids, 16)?;
+        let text_k = tokenizer
+            .decode(&gen_k, false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        eprintln!("[ab] kernel    ids={gen_k:?}");
+        eprintln!("[ab] kernel    continuation={text_k:?}");
+        eprintln!("[ab] identical={}", gen_ref == gen_k);
+        Ok(())
+    }
+
+    /// Step-3 gate (a): per-CSA-layer recall sweep on REAL Indexer spaces —
+    /// does the training-free sign top-M contain the learned float top-k?
+    /// Runs a real multi-hundred-token generation so every CSA layer
+    /// accumulates a meaningful compressed-entry count, captures each layer's
+    /// (query, weights, entry keys) at the final step, and sweeps recall@M.
+    /// The probe k is a strict subset of the entry count at this depth (the
+    /// production `index_topk = 512` exceeds it — the full-depth re-sweep
+    /// rides the step-6 long-context runs). Ignored (needs the merged file +
+    /// CUDA; several minutes).
+    #[test]
+    #[ignore]
+    fn indexer_recall_sweep_real_traces() -> Result<()> {
+        use super::super::gallery::{bdp_recall, sign_pack, topm_select};
+
+        let path = merged();
+        if !path.exists() {
+            eprintln!("[skip] merged file absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>Write a detailed, factual essay about \
+             the history of navigation at sea: dead reckoning, the astrolabe, the marine \
+             chronometer and the longitude problem, radio beacons, and satellite \
+             positioning. Cover each era with specific dates, names, and instruments, and \
+             explain how each advance changed trade routes and naval strategy.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+
+        let mut sess = engine.session()?;
+        let mut logits = None;
+        for &t in &ids {
+            logits = Some(sess.step(t)?);
+        }
+        let mut logits = logits.unwrap();
+        // Generate enough real text that CSA layers hold ~100 entries each.
+        let gen_len = 320usize;
+        let mut last = 0u32;
+        for i in 0..gen_len {
+            let next = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            last = next;
+            if i + 2 == gen_len {
+                for a in sess.attn.iter_mut() {
+                    a.set_capture_indexer_space(true);
+                }
+            }
+            logits = sess.step(next)?;
+        }
+        let _ = last;
+
+        let probe_k = 8usize;
+        let mut worst_recall_at_4k = 1.0f32;
+        for (l, a) in sess.attn.iter().enumerate() {
+            let Some((q, w, kv)) = a.captured_space.as_ref() else {
+                continue;
+            };
+            let n = kv.dim(0)?;
+            if n < 4 * probe_k {
+                continue;
+            }
+            // Float reference top-k (host).
+            let scores = q
+                .matmul(&kv.t()?.contiguous()?)?
+                .relu()?
+                .broadcast_mul(&w.reshape(((), 1))?)?
+                .sum(0)?
+                .to_vec1::<f32>()?;
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&x, &y| scores[y].partial_cmp(&scores[x]).unwrap());
+            let full: std::collections::HashSet<usize> = order[..probe_k].iter().copied().collect();
+
+            // Sign recall on-device.
+            let q_signs = sign_pack(q)?;
+            let kv_signs = sign_pack(kv)?;
+            let ih = kv.dim(1)?;
+            let counts = bdp_recall(&q_signs, &kv_signs, ih)?;
+            let bins = q.dim(0)? * ih + 1;
+            let mut line = format!("[sweep] layer {l:2} G={n:4}:");
+            for mult in [1usize, 2, 4, 8] {
+                let m = (probe_k * mult).min(n);
+                let ids = topm_select(&counts, m, bins)?.to_vec1::<u32>()?;
+                let short: std::collections::HashSet<usize> =
+                    ids.into_iter().map(|v| v as usize).collect();
+                let hit = full.iter().filter(|g| short.contains(g)).count();
+                let recall = hit as f32 / probe_k as f32;
+                if mult == 4 {
+                    worst_recall_at_4k = worst_recall_at_4k.min(recall);
+                }
+                line.push_str(&format!("  R@{mult}k={recall:.2}"));
+            }
+            // Machinery sanity: shortlist == everything ⇒ recall 1.
+            let ids = topm_select(&counts, n, bins)?.to_vec1::<u32>()?;
+            let all: std::collections::HashSet<usize> =
+                ids.into_iter().map(|v| v as usize).collect();
+            assert_eq!(
+                full.iter().filter(|g| all.contains(g)).count(),
+                probe_k,
+                "layer {l}: recall@G must be 1"
+            );
+            eprintln!("{line}");
+        }
+        eprintln!("[sweep] worst recall@4k across CSA layers = {worst_recall_at_4k:.2}");
+        Ok(())
+    }
+
     /// The resident-expert engine greedy-generates the SAME "Paris" answer as the block-streaming
     /// reference, but with experts resident (int8-KO `ExpertCache`) instead of re-read from disk
     /// every forward — the speedup. Prints load time + decode tok/s. Ignored (needs the merged
@@ -572,6 +991,14 @@ mod tests {
             ids.len(),
             dt,
             12.0 / dt
+        );
+        let n_ctx = ids.len() + 12;
+        use super::super::footprint;
+        eprintln!(
+            "[engine] kv ratio vs FP16-linear @ {n_ctx} tokens: {:.1}x ({} B vs {} B)",
+            footprint::ratio_vs_fp16_linear(n_ctx, engine.config()),
+            footprint::deepseek_kv_footprint(n_ctx, engine.config()).total(),
+            footprint::fp16_linear_baseline_bytes(n_ctx, engine.config()),
         );
         assert!(
             text.contains("Paris"),

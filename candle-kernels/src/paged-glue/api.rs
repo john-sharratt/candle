@@ -20,8 +20,9 @@ extern "C" {
     ///   `cu_seqlens_q[b..b+1]` bound its glue rows, `q_lens[b]` is its glue
     ///   count, `kv_lens[b]` its total context (prefix + glue). The sealed prefix
     ///   and the glue writer chunks live in `headers_ptr[b]` (`SlotHeader`).
-    ///   `col_actual_pos[cu_kvlens[b] + k]` is column `k`'s TRUE sequence
-    ///   position, driving the actual-position causal mask + glue RoPE.
+    ///   Each column's TRUE sequence position — driving the causal mask + glue
+    ///   RoPE — derives from its chunk's `rope_base` (`slice_rope`) + in-block
+    ///   offset; there is no per-column position array.
     ///   `glue_write_slice[t]` / `glue_write_in_blk[t]` are glue row `t`'s
     ///   writer-chunk slice index + in-block offset.
     #[allow(clippy::too_many_arguments)]

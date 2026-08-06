@@ -244,7 +244,7 @@ impl Attention {
     }
 
     /// Grouped low-rank output projection: `o [b,h,s,hd]` → `[b,s,dim]`.
-    fn output_proj(&self, o: &Tensor, b: usize, s: usize) -> Result<Tensor> {
+    pub(crate) fn output_proj(&self, o: &Tensor, b: usize, s: usize) -> Result<Tensor> {
         let (h, hd, ng, olr) = (self.n_heads, self.head_dim, self.n_groups, self.o_lora_rank);
         let per_group = (h / ng) * hd;
         // [b,h,s,hd] -> [b,s,h,hd] -> [b,s,ng,per_group]
@@ -270,6 +270,53 @@ impl Attention {
 }
 
 impl Attention {
+    // ── Weight/config accessors for the paged-kernel attention path (the
+    // projections stay host-side; the attention math moves to the kernel). ──
+    pub(crate) fn wq_a(&self) -> &QLinear {
+        &self.wq_a
+    }
+    pub(crate) fn q_norm(&self) -> &Tensor {
+        &self.q_norm
+    }
+    pub(crate) fn wq_b(&self) -> &QLinear {
+        &self.wq_b
+    }
+    pub(crate) fn wkv(&self) -> &QLinear {
+        &self.wkv
+    }
+    pub(crate) fn kv_norm(&self) -> &Tensor {
+        &self.kv_norm
+    }
+    pub(crate) fn attn_sink(&self) -> &Tensor {
+        &self.attn_sink
+    }
+    pub(crate) fn compressor(&self) -> Option<&Compressor> {
+        self.compressor.as_ref()
+    }
+    pub(crate) fn indexer(&self) -> Option<&Indexer> {
+        self.indexer.as_ref()
+    }
+    pub(crate) fn kind(&self) -> LayerKind {
+        self.kind
+    }
+    pub(crate) fn window_size(&self) -> usize {
+        self.window_size
+    }
+    pub(crate) fn n_heads(&self) -> usize {
+        self.n_heads
+    }
+    pub(crate) fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    pub(crate) fn softmax_scale(&self) -> f64 {
+        self.softmax_scale
+    }
+    pub(crate) fn eps(&self) -> f64 {
+        self.eps
+    }
+}
+
+impl Attention {
     /// Build the incremental (decode) form of this attention layer: a stateful streamer that
     /// accepts one token per `step` and returns that query's attention output `[1, 1, dim]`,
     /// bit-for-bit identical to the corresponding row of `forward` over the full prefix.
@@ -284,6 +331,8 @@ impl Attention {
             comp_entries: Vec::new(),
             idx: self.indexer.as_ref().map(|ix| ix.incremental()),
             pos: 0,
+            capture_indexer_space: false,
+            captured_space: None,
         })
     }
 }
@@ -308,9 +357,23 @@ pub struct IncrementalAttention<'a> {
     idx: Option<super::indexer::IncrementalIndexer<'a>>,
     /// Next query position (0-based).
     pos: usize,
+    /// When set, `step` stores the Indexer's (query, weights, entry keys)
+    /// spaces for its query — the per-layer recall-validation capture.
+    capture_indexer_space: bool,
+    /// The captured spaces from the most recent `step` (see
+    /// [`IncrementalIndexer::capture_space`]).
+    pub captured_space: Option<(Tensor, Tensor, Tensor)>,
 }
 
 impl IncrementalAttention<'_> {
+    /// Arm/disarm the per-step Indexer space capture (recall validation).
+    pub fn set_capture_indexer_space(&mut self, on: bool) {
+        self.capture_indexer_space = on;
+        if !on {
+            self.captured_space = None;
+        }
+    }
+
     /// Feed the next token's hidden state `x` (`[dim]` / `[1, dim]` / `[1, 1, dim]`) and return
     /// its attention output `[1, 1, dim]` — equal to row `pos` of the prefill `forward`.
     pub fn step(&mut self, x: &Tensor, rope: &RotaryCache) -> Result<Tensor> {
@@ -352,6 +415,12 @@ impl IncrementalAttention<'_> {
 
         // --- which compressed entries this query attends (sorted ascending group order) ---
         //   SWA: none; HCA: all causal; CSA: indexer top-k.
+        if self.capture_indexer_space {
+            self.captured_space = match self.idx.as_ref() {
+                Some(idx) => idx.capture_space(&x, &qr, rope, pos)?,
+                None => None,
+            };
+        }
         let selected: Vec<usize> = match (a.kind, self.idx.as_ref()) {
             (LayerKind::Csa, Some(idx)) => idx.select(&x, &qr, rope, pos)?,
             (LayerKind::Hca, _) => (0..self.comp_entries.len()).collect(),
@@ -382,7 +451,7 @@ impl IncrementalAttention<'_> {
 }
 
 /// RMSNorm with a learned weight: `x * rsqrt(mean(x²)+eps) * w`.
-fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
     let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = x.broadcast_div(&(ms + eps)?.sqrt()?)?;
@@ -390,7 +459,7 @@ fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// Unweighted RMS scaling over the last dim: `x * rsqrt(mean(x²)+eps)`.
-fn rms_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
     let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
     x.broadcast_div(&(ms + eps)?.sqrt()?)
 }
@@ -529,7 +598,6 @@ mod tests {
         let (theta, orig) = cfg.rope_params(layer);
         RotaryCache::new(
             cfg.rope_head_dim,
-            256,
             theta,
             orig,
             cfg.rope_factor,
@@ -553,7 +621,7 @@ mod tests {
     }
 
     fn mk_attention(cfg: &Config, layer: usize, dev: &Device) -> Result<Attention> {
-        let (h, hd, rd, ng, olr) = (
+        let (h, hd, _rd, ng, olr) = (
             cfg.n_heads,
             cfg.head_dim,
             cfg.rope_head_dim,
