@@ -168,6 +168,13 @@ pub struct DirRecord {
 }
 
 impl DirState {
+    /// The state that would result if EVERY unit ingested successfully.
+    ///
+    /// Tests use this to express an expected outcome. The production path must
+    /// not: it builds the state from the walk, so a directory whose ingest
+    /// failed still gets its hash recorded as ingested and is never retried.
+    /// See `repo_scan::dir_state_from_substrate`, which reads what actually
+    /// landed.
     pub fn from_units(units: &[DirUnit]) -> Self {
         Self {
             units: units
@@ -182,13 +189,21 @@ impl DirState {
 
     /// `true` when a fresh walk produced exactly the same directories and hashes
     /// — the refresh has nothing to do.
+    ///
+    /// Compared as a set, not pairwise: the state is rebuilt from substrate
+    /// metadata, whose enumeration order has nothing to do with the walk's.
     pub fn equivalent_to(&self, units: &[DirUnit]) -> bool {
-        self.units.len() == units.len()
-            && self
-                .units
-                .iter()
-                .zip(units.iter())
-                .all(|(a, b)| a.dir == b.dir && a.content_hash == b.content_hash)
+        if self.units.len() != units.len() {
+            return false;
+        }
+        let prior: HashMap<&str, &str> = self
+            .units
+            .iter()
+            .map(|r| (r.dir.as_str(), r.content_hash.as_str()))
+            .collect();
+        units
+            .iter()
+            .all(|u| prior.get(u.dir.as_str()) == Some(&u.content_hash.as_str()))
     }
 
     /// Directories whose hash differs, plus those that vanished. Informational —
@@ -278,6 +293,32 @@ mod tests {
         let st = DirState::from_units(&units);
         assert!(st.equivalent_to(&units));
         assert!(st.changed_dirs(&units).is_empty());
+    }
+
+    /// The production state is rebuilt from substrate metadata, whose
+    /// enumeration order is unrelated to the walk's. A pairwise comparison
+    /// would call that "changed" and re-ingest the whole workspace on every
+    /// filesystem event.
+    #[test]
+    fn state_is_compared_as_a_set_not_pairwise() {
+        let d = empty_workspace();
+        let units = build_units(&map(&["a/x.rs", "b/y.rs", "c/z.rs"]), d.path());
+        let mut st = DirState::from_units(&units);
+        st.units.reverse();
+        assert!(st.equivalent_to(&units), "{:?}", st.units);
+        assert!(st.changed_dirs(&units).is_empty());
+    }
+
+    /// A directory missing from the state (its ingest failed, so no hash was
+    /// written) must read as changed — that is what gets it retried.
+    #[test]
+    fn a_directory_absent_from_the_state_is_changed() {
+        let d = empty_workspace();
+        let units = build_units(&map(&["a/x.rs", "b/y.rs"]), d.path());
+        let mut st = DirState::from_units(&units);
+        let dropped = st.units.pop().expect("two units").dir;
+        assert!(!st.equivalent_to(&units));
+        assert!(st.changed_dirs(&units).contains(&dropped), "{dropped}");
     }
 
     #[test]

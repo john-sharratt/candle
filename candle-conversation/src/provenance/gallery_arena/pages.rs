@@ -86,10 +86,10 @@ mod tests {
         let sigs: Vec<WideQSig> = (0..33).map(|t| sig(0xA000 + t as u64)).collect();
         let pages = transpose_to_pages(&sigs, 24, 3);
         assert_eq!(pages.len(), 2);
-        // Token 32 → page 1, in_pg 0.
+        // Token 32 → page 1, in_pg 0, so its words sit at each group's base.
         for g in 0..3 {
             for w in 0..8 {
-                assert_eq!(pages[1][g * 256 + 0 * 8 + w], sigs[32].words[g * 8 + w]);
+                assert_eq!(pages[1][g * 256 + w], sigs[32].words[g * 8 + w]);
             }
         }
         // in_pg 1..32 of page 1 are zero (unused tail).

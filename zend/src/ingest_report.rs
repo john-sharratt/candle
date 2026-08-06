@@ -95,10 +95,6 @@ impl Failures {
         n
     }
 
-    pub fn count(&self) -> usize {
-        self.n.load(Ordering::Relaxed)
-    }
-
     /// Stop the pass: the failure cap tripped, so remaining units are
     /// abandoned rather than burning GPU on a systemic fault.
     pub fn set_abort(&self) {

@@ -62,6 +62,8 @@ pub mod granite;
 pub mod granitemoehybrid;
 pub mod helium;
 pub mod hiera;
+#[cfg(feature = "cuda")]
+pub mod host_embedding;
 pub mod jina_bert;
 pub mod kv_cache_utils;
 pub mod kv_collect_utils;

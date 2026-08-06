@@ -113,12 +113,12 @@ mod tests {
         let max_blocks = 4;
         // batch 0: 3 blocks allocated, batch 1: 1 block, batch 2: 4 blocks
         let mut positions = vec![0i32; batch_size * max_blocks];
-        // batch 0: blocks 0,1,2
+        // batch 0: blocks 0,1,2 — batch 0's row starts at offset 0
         for i in 0..3 {
-            positions[0 * max_blocks + i] = (i as i32) * chunk_size;
+            positions[i] = (i as i32) * chunk_size;
         }
         // batch 1: block 0 only
-        positions[1 * max_blocks + 0] = 0;
+        positions[max_blocks] = 0;
         // batch 2: all 4 blocks
         for i in 0..4 {
             positions[2 * max_blocks + i] = (i as i32) * chunk_size;
@@ -172,6 +172,22 @@ mod cuda_tests {
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
+    use std::sync::Mutex;
+
+    /// Every test here builds real paged-KV arenas on the shared device, drawing
+    /// from the process-global chunk pool and pinned stager — so they cannot run
+    /// concurrently, and the harness runs tests in parallel by default. Two
+    /// overlapping decodes corrupt each other's arenas and attention comes back
+    /// simply wrong: `[MHA hd64] BF16 decode no-history mean error too large:
+    /// 0.529` is a wrong result, not a loose tolerance. Each test passed alone
+    /// and under `--test-threads=1`, which is exactly what made an ordinary
+    /// shared-state race read as GPU flakiness. Poison-tolerant so one failure
+    /// does not cascade into the rest.
+    static GPU_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
+        GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // ------------------------------------------------------------------
     // RoPE table helpers (same theta=10000 convention as prefill_utils)
@@ -483,6 +499,7 @@ mod cuda_tests {
     // and warp=head (hpg>8) paths must match it once gap-fixed.
     #[test]
     fn correctness_decode_seal_gap() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         // Small sealed chunk (p) + large writer (w): a gap-blind chunk_div drops
@@ -608,6 +625,7 @@ mod cuda_tests {
 
     #[test]
     fn paged_decode_bf16_smoke() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
@@ -646,6 +664,7 @@ mod cuda_tests {
 
     #[test]
     fn test_fp8_hd128_paged_decode() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 128);
         let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
@@ -683,6 +702,7 @@ mod cuda_tests {
 
     #[test]
     fn test_fp8_hd64_paged_decode() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 64);
         let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
@@ -726,6 +746,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_no_history_bf16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         for &(n_head, n_kv_head, head_dim, label) in &[
@@ -782,6 +803,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_no_history_f16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
         for &(n_head, n_kv_head, head_dim, label) in &[
@@ -840,6 +862,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_with_history_bf16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         for &(n_head, n_kv_head, head_dim, history_len, label) in &[
@@ -888,6 +911,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_with_history_f16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
         for &(n_head, n_kv_head, head_dim, history_len, label) in &[
@@ -934,6 +958,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_gqa_head_mapping_regression() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let history_len = 10usize;
@@ -981,6 +1006,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_diagnostic_per_head() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim, history_len) = (40, 8, 64, 10);
@@ -1041,6 +1067,7 @@ mod cuda_tests {
 
     #[test]
     fn rope_offset_decode_none_succeeds() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
@@ -1083,6 +1110,7 @@ mod cuda_tests {
     /// history keys.
     #[test]
     fn rope_offset_decode_real_vs_zero_differs() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim, history_len) = (8, 8, 64, 16);
@@ -1152,6 +1180,7 @@ mod cuda_tests {
     /// see the same effective Q and K — a tight tolerance is expected.
     #[test]
     fn rope_offset_decode_functional() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (4, 4, 64);

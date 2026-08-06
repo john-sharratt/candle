@@ -2754,20 +2754,29 @@ fn q8a128_dequant_exact() -> Result<()> {
     Ok(())
 }
 
-/// Edge cases: an all-zero sub-block (amax=0 → scale 0, qs 0, dequant 0), a
-/// single-spike sub-block (one large value among small), and a saturating block.
+/// Edge cases, at the granularity the format actually has: an all-zero TILE
+/// (amax=0 → scale 0, sum 0, qs 0) and a mixed tile carrying a spike, a constant
+/// run and a mixed-sign ramp that all share the spike's scale.
+///
+/// q8a128 is per-**128**: one `{scale, sum}` per 128-element tile, at `ds[0]`
+/// (see `quantize/quantize_q8a128.cuh`). An earlier revision quantized per
+/// 32-element sub-block, and this test still read four scales out of the tile's
+/// meta slot — so it asserted the tile scale (100/127, from the spike) against
+/// the zeroed sub-block's expected 0, and read `ds[1]` for a "sub 1 scale" that
+/// is 16-byte-alignment pad no producer writes.
 #[test]
 fn q8a128_edge_cases() -> Result<()> {
     use half::f16;
     let dev = CudaDevice::new(0)?;
     let rows = 1usize;
-    let cols = 128usize; // one block, 4 subs
+    let cols = 256usize; // two 128-element tiles
     let mut act = vec![0.0f32; cols];
-    // sub 0: all zeros. sub 1: single spike. sub 2: all equal. sub 3: ramp.
-    act[32] = 100.0; // sub 1 spike
+    // Tile 0 stays all-zero. Tile 1: spike, then a constant run, then a ramp —
+    // one scale covers all three, which is the property under test.
+    act[128] = 100.0; // spike
     for i in 0..32 {
-        act[64 + i] = 2.0; // sub 2 constant
-        act[96 + i] = i as f32 - 16.0; // sub 3 ramp (mixed sign)
+        act[160 + i] = 2.0; // constant run
+        act[224 + i] = i as f32 - 16.0; // mixed-sign ramp
     }
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
@@ -2776,28 +2785,51 @@ fn q8a128_edge_cases() -> Result<()> {
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
-    // q8a1024: a single tile (flat=0) → qs at byte 0, ds (4× half2) at byte 1024.
-    // sub 0 — all-zero: scale=0, sum=0, qs all 0.
-    let s0 = f16::from_le_bytes([raw[1024], raw[1025]]);
-    let sum0 = f16::from_le_bytes([raw[1026], raw[1027]]);
-    assert_eq!(s0.to_f32(), 0.0, "zero sub scale");
-    assert_eq!(sum0.to_f32(), 0.0, "zero sub sum");
-    for i in 0..32 {
-        assert_eq!(raw[i], 0, "zero sub qs[{i}]");
+    // Both tiles sit in super-block 0: qs at 0 and 128, meta at 1024 and 1040.
+    let scale_at = |off: usize| f16::from_le_bytes([raw[off], raw[off + 1]]);
+    let sum_at = |off: usize| f16::from_le_bytes([raw[off + 2], raw[off + 3]]);
+
+    // Tile 0 — all zero: amax 0 takes the `id = 0` branch, so every quant is 0
+    // and the scale is exactly 0 rather than an inf/NaN from dividing by amax.
+    assert_eq!(scale_at(1024).to_bits(), 0, "zero tile scale");
+    assert_eq!(sum_at(1024).to_bits(), 0, "zero tile sum");
+    for i in 0..128 {
+        assert_eq!(raw[i], 0, "zero tile qs[{i}]");
     }
-    // sub 1 — spike: amax=100 → scale=100/127; the spike quantizes to 127, the
-    // rest (0) to 0.
-    let s1 = f16::from_le_bytes([raw[1028], raw[1029]]);
+
+    // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16).
     assert_eq!(
-        s1.to_bits(),
+        scale_at(1040).to_bits(),
         f16::from_f32(100.0 / 127.0).to_bits(),
-        "spike scale"
+        "mixed tile scale is the spike's",
     );
-    assert_eq!(raw[32] as i8, 127, "spike qs[0]"); // first elem of sub 1 is the spike
+    assert_eq!(
+        sum_at(1040).to_bits(),
+        f16::from_f32(148.0).to_bits(),
+        "mixed tile sum",
+    );
+
+    // The spike saturates to 127; everything else is scaled by the SAME id, so
+    // the constant run lands on 3 and the ramp spans −20..19.
+    let qs = &raw[128..256];
+    assert_eq!(qs[0] as i8, 127, "spike quantizes to full scale");
     for i in 1..32 {
-        assert_eq!(raw[32 + i] as i8, 0, "spike sub qs[{i}]");
+        assert_eq!(qs[i] as i8, 0, "post-spike zeros qs[{i}]");
     }
-    println!("q8a128 edge cases (zero / spike / constant / ramp) verified");
+    for i in 32..64 {
+        assert_eq!(qs[i] as i8, 3, "constant run qs[{i}]");
+    }
+    for i in 64..96 {
+        assert_eq!(qs[i] as i8, 0, "interior zeros qs[{i}]");
+    }
+    const RAMP: [i8; 32] = [
+        -20, -19, -18, -17, -15, -14, -13, -11, -10, -9, -8, -6, -5, -4, -3, -1, 0, 1, 3, 4, 5, 6,
+        8, 9, 10, 11, 13, 14, 15, 17, 18, 19,
+    ];
+    for i in 0..32 {
+        assert_eq!(qs[96 + i] as i8, RAMP[i], "ramp qs[{i}]");
+    }
+    println!("q8a128 edge cases (zero tile / spike / constant / ramp) verified");
     Ok(())
 }
 
@@ -2836,8 +2868,22 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
     dev.synchronize()?;
     let a: Vec<u8> = dev.memcpy_dtov(&typed.slice(..))?;
     let b: Vec<u8> = dev.memcpy_dtov(&unified.slice(..))?;
+    // Tile meta is `ds[0]` plus 12 bytes of alignment pad that neither producer
+    // writes; comparing whole buffers compares two allocations' leftovers and
+    // fails at random. See `q8a128_f16_bf16_paths_match_f32`.
+    let meaningful = |raw: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(nblocks * 132);
+        for tile in 0..nblocks {
+            let qs = (tile >> 3) * 1152 + (tile & 7) * 128;
+            let ds = (tile >> 3) * 1152 + 1024 + (tile & 7) * 16;
+            out.extend_from_slice(&raw[qs..qs + 128]);
+            out.extend_from_slice(&raw[ds..ds + 4]);
+        }
+        out
+    };
     assert_eq!(
-        a, b,
+        meaningful(&a),
+        meaningful(&b),
         "run_quantize_block(qtype=36) must equal typed q8a128 quantize byte-for-byte"
     );
 
@@ -3105,6 +3151,21 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
     let rows = 4usize;
     let cols = 512usize;
     let n = rows * cols;
+    // A q8a1024 buffer is not byte-comparable as a whole: each tile's 16-byte
+    // meta slot carries data only in `ds[0]`, and `ds[1..3]` is alignment pad
+    // that no producer writes and no consumer reads, so it holds whatever the
+    // fresh allocation held. Comparing raw buffers made this test a coin toss on
+    // uninitialised device memory. Compare exactly the bytes the format defines.
+    let meaningful = |raw: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity((n / 128) * 132);
+        for tile in 0..n / 128 {
+            let qs = (tile >> 3) * 1152 + (tile & 7) * 128;
+            let ds = (tile >> 3) * 1152 + 1024 + (tile & 7) * 16;
+            out.extend_from_slice(&raw[qs..qs + 128]);
+            out.extend_from_slice(&raw[ds..ds + 4]);
+        }
+        out
+    };
     let base: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.37).collect();
     let stream = dev.cuda_stream();
 
@@ -3123,7 +3184,8 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
         assert_eq!(
-            bt, bf,
+            meaningful(&bt),
+            meaningful(&bf),
             "F16 quantize must byte-match the f32 path on identical values"
         );
 
@@ -3168,7 +3230,8 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
         assert_eq!(
-            bt, bf,
+            meaningful(&bt),
+            meaningful(&bf),
             "BF16 quantize must byte-match the f32 path on identical values"
         );
 
@@ -5903,26 +5966,59 @@ fn grouped_int8_outlier_stress() -> Result<()> {
         }
     }
 
-    let (weight_ptrs, _storages, act_storage, act_layout, expert_offsets) = build_int8_ab_fixture(
-        &dev,
-        nrows,
-        ncols,
-        expert_batches,
-        &act_data,
-        GgmlDType::Q4_K,
-    )?;
+    // Two weight sets from the SAME floats: Q4_K feeds the FP16 oracle, Q4_KO the
+    // int8 path. They cannot share one pool — `ensure_qmatmul_pairing` pairs int8
+    // q8a128 activations exclusively with KO weights and float activations
+    // exclusively with non-KO, so the single-pool form this test used to run
+    // returns a pairing error rather than a number. (Its sibling
+    // `grouped_int8_matches_legacy` was retired for the same reason; this one was
+    // missed, and outlier robustness is not covered anywhere else.)
+    use crate::Shape;
+    let shape = Shape::from((nrows, ncols));
+    let stream = dev.cuda_stream();
+    let mut k_ptrs: Vec<u64> = Vec::with_capacity(expert_batches.len());
+    let mut ko_ptrs: Vec<u64> = Vec::with_capacity(expert_batches.len());
+    let mut k_pool = Vec::with_capacity(expert_batches.len());
+    let mut ko_pool = Vec::with_capacity(expert_batches.len());
+    for _ in 0..expert_batches.len() {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, GgmlDType::Q4_K)?;
+        xs.quantize(&CudaStorage::wrap_cuda_slice(
+            dev.memcpy_stod(&w)?,
+            dev.clone(),
+        ))?;
+        let xs = xs.repack_gemx(&shape)?;
+        k_ptrs.push(xs.data_ptr());
+        // Q4_KO per-128 re-quant of the same weights: maxq 15, no crumb/hi bytes.
+        let ko_slice = dev.memcpy_stod(&requant_ko_per128(&w, nrows, ncols, 15, 0, 0))?;
+        {
+            let (p, _g) = ko_slice.device_ptr(&stream);
+            ko_ptrs.push(p); // valid while `ko_slice` lives in the pool below
+        }
+        k_pool.push(xs);
+        ko_pool.push(ko_slice);
+    }
+    let act_bf16: Vec<bf16> = act_data.iter().map(|&v| bf16::from_f32(v)).collect();
+    let act_storage = CudaStorage::wrap_cuda_slice(dev.memcpy_stod(&act_bf16)?, dev.clone());
+    let act_layout = crate::Layout::contiguous(Shape::from(vec![total_batch, ncols]));
+    let mut expert_offsets: Vec<i32> = vec![0];
+    for &b in expert_batches {
+        expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
+    }
 
     let q8a128 = quantize_acts_q8a128_test(&dev, &act_data, total_batch, ncols)?;
     let int8 = grouped_qmatmul(
         DynamicTensor::Int8(&q8a128),
-        &weight_ptrs,
-        GgmlDType::Q4_K,
+        &ko_ptrs,
+        GgmlDType::Q4_KO,
         nrows,
         &expert_offsets,
         &dev,
     )?;
     let legacy = grouped_matmul_gemx(
-        &weight_ptrs,
+        &k_ptrs,
         GgmlDType::Q4_K,
         nrows,
         ncols,

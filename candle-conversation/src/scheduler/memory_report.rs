@@ -41,6 +41,40 @@ pub struct MemoryReport {
     pub host: HostSection,
     pub admission: AdmissionSection,
     pub experts: ExpertSection,
+    pub weights: WeightSection,
+    pub gallery: GallerySection,
+}
+
+/// Model weights resident in VRAM, split into the two parts that behave
+/// differently: the dense tensors, which are permanent, and the expert slots,
+/// which page against host RAM.
+///
+/// Without this the dense half is invisible to every consumer of the report —
+/// it sits outside the KV pool (so it is absent from `pool_used_bytes`) and its
+/// [`AllocClass::Weights`] tally is never credited, so a whole-card accounting
+/// could only reach it by subtraction.
+#[derive(Debug, Clone, Serialize)]
+pub struct WeightSection {
+    /// Dense tensors: embeddings, attention projections, norms, output head.
+    /// `None` when the model cannot report it (non-MoE or no expert cache).
+    pub base_bytes: Option<u64>,
+    /// Expert slots currently resident in VRAM — moves as experts page.
+    pub resident_expert_bytes: Option<u64>,
+}
+
+/// The provenance gallery arena's VRAM slabs.
+///
+/// The arena allocates 16 MiB device slabs directly and holds them for its
+/// lifetime, outside both the KV pool and the governor's class tallies, so it
+/// appears in no other field of this report. It is registered for relief (its
+/// pages are evictable and rebuild from the substrate on demand), but relief
+/// registration reports what *could* be freed, not what is currently held.
+#[derive(Debug, Clone, Serialize)]
+pub struct GallerySection {
+    /// VRAM held by the arena's slabs right now.
+    pub resident_bytes: u64,
+    /// Turns currently paged into the arena.
+    pub resident_turns: usize,
 }
 
 /// Device + pool + governor view of the card.
@@ -203,10 +237,16 @@ impl Scheduler {
     /// Called at the wave-telemetry cadence (~2 s). The ceiling read performs
     /// one device query — the same cost an admission pass already pays — so
     /// this adds no new class of work to the loop.
+    ///
+    /// Logged at TRACE: it fires every wave and the line is a full JSON dump of
+    /// every arena, so at DEBUG it drowns out everything else in the log. The
+    /// report is always published to [`publish`] regardless of level, so
+    /// `/v1/memory` and the perf view keep their data whether or not anyone is
+    /// capturing the line.
     pub(super) fn publish_memory_report(&mut self) {
         let report = self.build_memory_report();
         match serde_json::to_string(&report) {
-            Ok(json) => tracing::debug!(
+            Ok(json) => tracing::trace!(
                 target: "candle_conversation::scheduler::memory",
                 %json,
                 "memory report"
@@ -335,6 +375,34 @@ impl Scheduler {
                 .unwrap_or(0),
         };
 
+        // ── Model weights ───────────────────────────────────────────────────
+        // `resident_weight_bytes` is dense + resident experts; the expert half
+        // is already reported above, so split it back out rather than double
+        // count it in a whole-card sum.
+        let resident_expert_bytes = self
+            .model
+            .expert_stats()
+            .map(|s| s.resident_vram_bytes as u64);
+        let weights = WeightSection {
+            base_bytes: self
+                .model
+                .resident_weight_bytes()
+                .map(|total| (total as u64).saturating_sub(resident_expert_bytes.unwrap_or(0))),
+            resident_expert_bytes,
+        };
+
+        // ── Gallery arena ───────────────────────────────────────────────────
+        let gallery = GallerySection {
+            resident_bytes: self
+                .gallery_arena
+                .as_ref()
+                .map_or(0, |a| a.resident_bytes()),
+            resident_turns: self
+                .gallery_arena
+                .as_ref()
+                .map_or(0, |a| a.resident_turns()),
+        };
+
         MemoryReport {
             captured_unix_ms,
             vram,
@@ -343,6 +411,8 @@ impl Scheduler {
             host,
             admission,
             experts,
+            weights,
+            gallery,
         }
     }
 }
@@ -419,6 +489,14 @@ mod tests {
                 host_pinned_bytes: 11_000_000_000,
                 vram_reserved_bytes: 8_000_000_000,
             },
+            weights: WeightSection {
+                base_bytes: Some(1_100_000_000),
+                resident_expert_bytes: Some(8_000_000_000),
+            },
+            gallery: GallerySection {
+                resident_bytes: 268_435_456,
+                resident_turns: 42,
+            },
         }
     }
 
@@ -448,6 +526,12 @@ mod tests {
             "pages_in_per_sec",
             "commit_limit_bytes",
             "resident_bytes",
+            // The two consumers a whole-card sum could otherwise only reach by
+            // subtraction: dense weights sit outside the KV pool, and the
+            // gallery arena allocates outside the pool AND the class tallies.
+            "base_bytes",
+            "resident_expert_bytes",
+            "resident_turns",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }

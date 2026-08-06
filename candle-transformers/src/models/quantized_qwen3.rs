@@ -658,8 +658,8 @@ impl BatchedModelCore for ModelWeights {
         &self.device
     }
 
-    fn embeddings(&self) -> &Embedding {
-        &self.embeddings
+    fn embeddings(&self) -> Option<&Embedding> {
+        Some(&self.embeddings)
     }
 
     fn layer(&self, idx: usize) -> &Self::Layer {

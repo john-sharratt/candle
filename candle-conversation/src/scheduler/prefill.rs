@@ -841,30 +841,24 @@ impl Scheduler {
         })
     }
 
-    /// The pressure/relief reserve band for `phase`. `Load` keeps the wide
-    /// transient-peak reserve; `Decode` keeps only a thin safety margin so the
-    /// freed-float free-list counts as available and KV stays maximally resident.
-    /// See [`VramPhase`]. Without a governor, falls back to the fixed load band
-    /// (the capacity + width terms need the governor).
-    ///
-    /// The band is the larger of two adaptive terms:
-    /// - a **card fraction** (`capacity/10` load, `/20` decode) — scales with the
-    ///   device, and
-    /// - a **width term** (`co-batched sequences × per-seq activation`) — scales
-    ///   with the batch actually in flight.
-    ///
-    /// The width term is the fix for wide-batch OOM: a big card admits a wide
-    /// ingest co-batch whose transient activation peak exceeds the flat card
-    /// fraction (with larger model weights leaving less spare, that peak spills →
-    /// `CUDA_ERROR_OUT_OF_MEMORY`). Reserving in proportion to the width in flight
-    /// makes real headroom before the forward competes for it. A small card only
-    /// admits a narrow batch, so the width term stays under the card fraction and
-    /// the reserve is unchanged there. Clamped to a third of the card so a width
-    /// spike can never strand the whole device.
     /// The load-phase band's terms, for admission to evaluate at the width it is
     /// choosing rather than the width already in flight. Same `base`, `per_seq`
     /// and capacity clamp the pressure/relief gates use via
     /// [`Self::vram_band_for`] — one reserve law, two evaluation points.
+    ///
+    /// Splitting `per_seq` into a shared term (the MoE expert gather, which the
+    /// whole batch pays once) plus a smaller marginal one is a measured dead end,
+    /// however physical the argument sounds. At 512 MiB shared + 128 MiB
+    /// marginal on the 16 GiB card it changed whole-phase calibration by 0.5%
+    /// (981s → 976s, 472 → 475 tok/s) — inside run-to-run noise, because a wider
+    /// batch holds more KV and `available` is measured after that KV lands, so
+    /// width re-equilibrates at the same place. The same pass then lost 9 of 314
+    /// directories to arena refusals where the unsplit law lost none.
+    ///
+    /// The trap that makes it look like a win: throughput decays as the substrate
+    /// fills (the baseline's own halves run 595 then 329 tok/s), so a sample
+    /// taken from the first minutes of calibration reads ~2x a sample taken from
+    /// the middle. Compare whole phases, never windows.
     fn admit_band_params(&self) -> BandParams {
         BandParams {
             per_seq: per_seq_load_bytes() as u64,
@@ -891,6 +885,26 @@ impl Scheduler {
         }
     }
 
+    /// The pressure/relief reserve band for `phase`. `Load` keeps the wide
+    /// transient-peak reserve; `Decode` keeps only a thin safety margin so the
+    /// freed-float free-list counts as available and KV stays maximally resident.
+    /// See [`VramPhase`]. Without a governor, falls back to the fixed load band
+    /// (the capacity + width terms need the governor).
+    ///
+    /// The band is the larger of two adaptive terms:
+    /// - a **card fraction** (`capacity/10` load, `/20` decode) — scales with the
+    ///   device, and
+    /// - a **width term** (`co-batched sequences × per-seq activation`) — scales
+    ///   with the batch actually in flight.
+    ///
+    /// The width term is the fix for wide-batch OOM: a big card admits a wide
+    /// ingest co-batch whose transient activation peak exceeds the flat card
+    /// fraction (with larger model weights leaving less spare, that peak spills →
+    /// `CUDA_ERROR_OUT_OF_MEMORY`). Reserving in proportion to the width in flight
+    /// makes real headroom before the forward competes for it. A small card only
+    /// admits a narrow batch, so the width term stays under the card fraction and
+    /// the reserve is unchanged there. Clamped to a third of the card so a width
+    /// spike can never strand the whole device.
     fn vram_band_for(&self, phase: VramPhase) -> usize {
         let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
             // No governor (legacy / non-WDDM path): fixed band, no capacity or

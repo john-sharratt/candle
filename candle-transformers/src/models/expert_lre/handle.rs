@@ -853,21 +853,21 @@ impl ExpertCache {
         Some(gd)
     }
 
-    /// Get mutable access to the pinned routing buffer.
+    /// Base pointer of the pinned routing buffer, if it exists and holds `len`.
     ///
-    /// Returns `(buffer_ptr_as_mut_slice, capacity)` if available.
-    /// The caller must ensure no concurrent DMA is in flight.
+    /// A pointer rather than a `&mut [u32]`: the cache lives behind an `Arc`, so
+    /// a `&mut` handed out from `&self` is one the borrow checker cannot police —
+    /// nothing stops a second call from minting an overlapping one. The single
+    /// writer here is the forward thread, and the ordering against the routing
+    /// stream's DtoH is the caller's (it holds the events), so the caller is
+    /// where the slice and its `unsafe` belong.
     #[cfg(feature = "cuda")]
-    pub fn routing_pinned_mut(&self, len: usize) -> Option<&mut [u32]> {
-        // SAFETY: We're the only thread accessing the routing buffer
-        // (it lives on the forward thread), and the caller ensures
-        // DMA has completed before reading.  We use interior mutability
-        // via raw pointer since ExpertCache is behind Arc.
+    pub fn routing_pinned_ptr(&self, len: usize) -> Option<*mut u32> {
         let pinned = self.routing_pinned.as_ref()?;
         if len > pinned.capacity {
             return None;
         }
-        Some(unsafe { std::slice::from_raw_parts_mut(pinned.ptr, len) })
+        Some(pinned.ptr)
     }
 
     /// Store the expert IDs from the most recently completed MoE layer.

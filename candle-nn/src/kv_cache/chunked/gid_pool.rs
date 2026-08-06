@@ -620,6 +620,18 @@ impl CapacityBitmap {
     }
 }
 
+/// One defragmentation pass's drain plan for a single format pool, produced by
+/// [`ArenaPool::drain_plan`].
+#[cfg(feature = "cuda")]
+#[derive(Debug, Default)]
+pub struct DrainPlan {
+    /// Arenas to empty this pass, emptiest-first.
+    pub sources: Vec<usize>,
+    /// Arenas that must not receive a relocated chunk: every source, plus every
+    /// arena that is already empty and so is about to be released for free.
+    pub blocked: AHashSet<usize>,
+}
+
 /// (rare); allocation walks the tables read-locked and operates lock-
 /// free against the chosen arena's counts.
 #[derive(Debug)]
@@ -846,25 +858,78 @@ impl ArenaPool {
         Some(((arena_idx * stride + chunk_idx) as i64, table))
     }
 
-    /// Allocate a gid from any arena **except** `exclude_arena`. Used
-    /// during greedy arena drain so destination slots never land in
-    /// the arena being evicted. CUDA-only — the defrag path that
-    /// uses it is gated behind the cuda feature.
+    /// Allocate a gid from any arena outside `blocked`. Used during arena
+    /// drain so a relocated chunk never lands somewhere that cancels the
+    /// move — see [`DrainPlan`]. CUDA-only, like the defrag path that uses it.
     #[cfg(feature = "cuda")]
-    fn allocate_excluding(&self, exclude_arena: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
+    fn allocate_avoiding(&self, blocked: &AHashSet<usize>) -> Option<(i64, Arc<ArenaRefcounts>)> {
         // Serialize with the other claim walks (see `allocate_any`).
         let _gate = self.alloc_gate.lock().unwrap();
         let stride = arena_gid_stride();
         let tables = self.tables.read().unwrap();
         for (&arena_idx, table) in tables.iter() {
-            if arena_idx == exclude_arena {
+            if blocked.contains(&arena_idx) {
                 continue;
             }
             if let Some(chunk_idx) = table.try_claim_one() {
+                if table.is_full() {
+                    self.capacity.clear(arena_idx);
+                }
                 return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
             }
         }
         None
+    }
+
+    /// Plan one defragmentation pass over this pool: which arenas to drain,
+    /// and which arenas the drained chunks may NOT be relocated into.
+    ///
+    /// The plan is bounded by the pool's slot balance. Perfect packing needs
+    /// `ceil(total_live / arena_chunks)` arenas, so at most
+    /// `total_arenas - needed` can ever come back; picking more sources than
+    /// that is arithmetically self-defeating, because the surplus arenas'
+    /// chunks have nowhere to go except into another arena in the same pass.
+    /// Unbounded emptiest-first draining does exactly that and the pass moves
+    /// chunks in a circle: measured live as `moves=5588 arenas_compacted=0
+    /// arenas_released=0` with the pool wedged at 0 t/s — every arena request
+    /// refused because compaction kept promising memory it could not deliver.
+    ///
+    /// Already-empty arenas spend the same budget (the empty sweep releases
+    /// them without a single move) and are blocked as destinations: refilling
+    /// one cancels the arena it was about to give back.
+    ///
+    /// Protected arenas are never sources — they are the per-format warm set,
+    /// held for the process lifetime, and `try_tombstone` refuses them however
+    /// empty they get — but they remain perfectly good destinations.
+    #[cfg(feature = "cuda")]
+    fn drain_plan(&self, protected: &AHashSet<usize>) -> DrainPlan {
+        let by_live = self.arenas_sorted_by_live();
+        let live: usize = by_live.iter().map(|&(_, l)| l).sum();
+        let needed = if live == 0 {
+            0
+        } else {
+            live.div_ceil(self.arena_chunks)
+        };
+        let mut budget = by_live.len().saturating_sub(needed);
+
+        let mut plan = DrainPlan::default();
+        for (idx, live_count) in by_live {
+            if budget == 0 {
+                break;
+            }
+            if live_count == 0 {
+                budget -= 1;
+                plan.blocked.insert(idx);
+                continue;
+            }
+            if protected.contains(&idx) {
+                continue;
+            }
+            budget -= 1;
+            plan.blocked.insert(idx);
+            plan.sources.push(idx);
+        }
+        plan
     }
 
     /// Find a fully-free arena and tombstone it. Returns the arena's
@@ -876,6 +941,21 @@ impl ArenaPool {
     ///     across the remaining pool (matches prior behaviour to avoid
     ///     thrashing).
     fn try_tombstone(&self, protected_arenas: &AHashSet<usize>, force: bool) -> Option<usize> {
+        // Held across BOTH the emptiness test and the removal. Claims are gated
+        // (`allocate_any` and friends take this before `tables.read()`), so with
+        // it held no slot in the candidate can be occupied between observing
+        // `live_count() == 0` and dropping the table. Without it, a claimer
+        // slipping into that window leaves a live `ChunkGid` pointing into an
+        // arena the caller then unmaps, and the freed index is recycled to
+        // another format — cross-context KV contamination, not a clean fault.
+        // Drops stay ungated: they can only take an arena from live to empty,
+        // which never invalidates a decision made here.
+        //
+        // Lock order is `alloc_gate` → `tables`, matching every claim walk.
+        // `next_tombstone` holds `metadata` outside this, and no claim path
+        // takes `metadata`, so the two nest without a cycle.
+        let _gate = self.alloc_gate.lock().unwrap();
+
         // Free-headroom check first — derived in O(1) from the running
         // counters. After releasing one arena we'd have
         // `(total_arenas - 1) * arena_chunks - total_live` free slots;
@@ -1270,11 +1350,15 @@ impl ChunkGidPool {
     }
 
     /// Allocate a gid for `key` from any arena **except**
-    /// `exclude_arena`. Used during greedy arena eviction.
+    /// any arena in `blocked`. Used during arena drain — see [`DrainPlan`].
     #[cfg(feature = "cuda")]
-    pub fn allocate_for_excluding(&self, key: ArenaKey, exclude_arena: usize) -> Option<ChunkGid> {
+    pub fn allocate_for_avoiding(
+        &self,
+        key: ArenaKey,
+        blocked: &AHashSet<usize>,
+    ) -> Option<ChunkGid> {
         let pool = self.inner.pools.get(&key)?;
-        let (id, table) = pool.allocate_excluding(exclude_arena)?;
+        let (id, table) = pool.allocate_avoiding(blocked)?;
         Some(ChunkGid {
             id,
             backing: GidBacking::Pooled(table),
@@ -1300,23 +1384,22 @@ impl ChunkGidPool {
             .unwrap_or_default()
     }
 
-    /// Return arenas for `key` sorted by live chunk count ascending.
-    /// Arenas of `key` sorted emptiest-first, **excluding protected ones**.
+    /// Plan one defragmentation pass over `key`'s pool — see [`DrainPlan`].
     ///
-    /// This feeds defragmentation's drain-target choice, and protected arenas
-    /// must never be targets: they are the per-format warm set, held for the
-    /// lifetime of the process so every format stays allocatable, and
-    /// `try_tombstone` will refuse to release them no matter how empty they get.
+    /// Two things the plan gets right that emptiest-first-drain-everything did
+    /// not, both measured as passes that moved thousands of chunks and freed
+    /// nothing:
     ///
-    /// Emptiest-first made them the FIRST pick — a warm arena is lightly used
-    /// almost by definition — so defrag spent its whole move budget draining
-    /// arenas it could never reclaim. Measured: `compact_moves=15994` with
-    /// `empty_arenas=1 protected=1 held_back=1`, i.e. the single empty arena in
-    /// 194 was the protected one, every pass, freeing nothing. Skipping them
-    /// costs nothing (they are meant to stay) and points the budget at arenas
-    /// that can actually be released.
+    /// - **Protected arenas are never sources.** They are the per-format warm
+    ///   set, held for the process lifetime, and `try_tombstone` refuses them
+    ///   however empty they get — yet a warm arena is lightly used almost by
+    ///   definition, so emptiest-first picked them FIRST
+    ///   (`compact_moves=15994`, `empty_arenas=1 protected=1`).
+    /// - **The source count is bounded by the slot balance.** Draining more
+    ///   arenas than the pool can actually give back sends chunks into arenas
+    ///   that are themselves being drained (`moves=5588 arenas_released=0`).
     #[cfg(feature = "cuda")]
-    pub fn arenas_sorted_by_live_for_key(&self, key: &ArenaKey) -> Vec<(usize, usize)> {
+    pub fn drain_plan_for_key(&self, key: &ArenaKey) -> DrainPlan {
         let protected = {
             let state = self.inner.metadata.lock().unwrap();
             state.protected_arenas.clone()
@@ -1324,12 +1407,7 @@ impl ChunkGidPool {
         self.inner
             .pools
             .get(key)
-            .map(|pool| {
-                pool.arenas_sorted_by_live()
-                    .into_iter()
-                    .filter(|(idx, _)| !protected.contains(idx))
-                    .collect()
-            })
+            .map(|pool| pool.drain_plan(&protected))
             .unwrap_or_default()
     }
 
@@ -1677,25 +1755,120 @@ mod tests {
         let key = float_key();
 
         // Arena 0 is the warm/protected one, left nearly empty (one chunk).
+        // Placement is explicit: `allocate_for` packs lowest-first, so it would
+        // put every chunk in arena 0 and leave arena 1 empty.
         let warm_idx = pool.register_arena(key.clone());
         pool.protect_arena(warm_idx);
-        let _warm_live = pool.allocate_for(key.clone()).unwrap();
+        let _warm_live = pool.allocate_from_arena(key.clone(), warm_idx).unwrap();
 
         // Arena 1 carries real load — the arena defrag SHOULD be draining.
         let busy_idx = pool.register_arena(key.clone());
         let _busy: Vec<_> = (0..8)
-            .map(|_| pool.allocate_for(key.clone()).unwrap())
+            .map(|_| pool.allocate_from_arena(key.clone(), busy_idx).unwrap())
             .collect();
 
-        let targets = pool.arenas_sorted_by_live_for_key(&key);
+        let plan = pool.drain_plan_for_key(&key);
         assert!(
-            targets.iter().all(|(idx, _)| *idx != warm_idx),
-            "the protected warm arena must not be a drain target: {targets:?}"
+            !plan.sources.contains(&warm_idx),
+            "the protected warm arena must not be a drain source: {plan:?}"
         );
         assert!(
-            targets.iter().any(|(idx, _)| *idx == busy_idx),
-            "reclaimable arenas must still be offered: {targets:?}"
+            plan.sources.contains(&busy_idx),
+            "reclaimable arenas must still be offered: {plan:?}"
         );
+        assert!(
+            !plan.blocked.contains(&warm_idx),
+            "a protected arena is still a valid destination: {plan:?}"
+        );
+    }
+
+    /// The drain set must be bounded by the pool's slot balance.
+    ///
+    /// With every arena more than half full, no arena can be released: the
+    /// chunks of any source have to land in another arena that is itself a
+    /// source, so the pass moves data in a circle. Live, that was
+    /// `moves=5588 arenas_compacted=0 arenas_released=0` with the pool wedged
+    /// at 0 t/s — compaction kept promising memory it could never deliver, so
+    /// every fresh-arena request stayed refused.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn drain_plan_refuses_a_pass_that_cannot_free_an_arena() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+
+        // Fill three arenas, then hollow the first one out. The pool is now
+        // badly fragmented — arena 0 holds a single chunk — but 2*cap+1 live
+        // chunks still need all three arenas, so nothing can be released.
+        let arenas: Vec<usize> = (0..3).map(|_| pool.register_arena(key.clone())).collect();
+        let mut held: Vec<ChunkGid> = Vec::new();
+        while let Some(gid) = pool.allocate_for(key.clone()) {
+            held.push(gid);
+        }
+        held.retain(|g| g.arena_idx() != arenas[0] || g.chunk_idx() == 0);
+        assert_eq!(
+            held.iter().filter(|g| g.arena_idx() == arenas[0]).count(),
+            1,
+            "arena 0 hollowed out to one live chunk"
+        );
+
+        let plan = pool.drain_plan_for_key(&key);
+        assert!(
+            plan.sources.is_empty(),
+            "fragmented, but no arena can be freed — nothing may be drained: {plan:?}"
+        );
+
+        // Hollow arena 1 out by half and the balance tips: the survivors fit in
+        // two arenas, so the emptiest becomes drainable.
+        held.retain(|g| g.arena_idx() != arenas[1] || g.chunk_idx() % 2 != 0);
+        let plan = pool.drain_plan_for_key(&key);
+        assert_eq!(
+            plan.sources,
+            vec![arenas[0]],
+            "the emptiest arena is the one source: {plan:?}"
+        );
+        assert_eq!(
+            plan.blocked.len(),
+            1,
+            "only the source is barred; the rest must stay available: {plan:?}"
+        );
+    }
+
+    /// An arena that is already empty is released by the empty sweep for free,
+    /// so it must not be a relocation destination — refilling it cancels the
+    /// arena it was about to give back — and it spends drain budget just the
+    /// same as one that has to be moved out of.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn drain_plan_blocks_already_empty_arenas_as_destinations() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+
+        // Arenas 0 and 1 hold one chunk each; arena 2 is fully empty.
+        let arenas: Vec<usize> = (0..3).map(|_| pool.register_arena(key.clone())).collect();
+        let mut held: Vec<ChunkGid> = Vec::new();
+        while let Some(gid) = pool.allocate_for(key.clone()) {
+            held.push(gid);
+        }
+        held.retain(|g| g.arena_idx() != arenas[2] && g.chunk_idx() == 0);
+
+        let plan = pool.drain_plan_for_key(&key);
+        assert!(
+            plan.blocked.contains(&arenas[2]),
+            "the empty arena must not receive chunks: {plan:?}"
+        );
+        assert!(
+            !plan.sources.contains(&arenas[2]),
+            "an empty arena has nothing to drain: {plan:?}"
+        );
+        // Two live arenas could each fit in the other, but only two arenas can
+        // come back in total and the empty one already accounts for one of them.
+        assert_eq!(
+            plan.sources,
+            vec![arenas[0]],
+            "the empty arena spends drain budget like any other: {plan:?}"
+        );
+
+        held.clear();
     }
 
     #[test]

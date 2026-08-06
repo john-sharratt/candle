@@ -379,8 +379,17 @@ impl BackingInner {
         }
 
         self.pool.resync_counters();
-        // A sweep that frees nothing is the wedge signature — say which gate
-        // held it back rather than leaving `arenas_compacted=0` unexplained.
+        // A sweep that frees nothing while the pool still reports recoverable
+        // arenas is the wedge signature: relief keeps being asked for memory
+        // the pool believes it has and cannot hand over. Say so rather than
+        // leaving `arenas_released=0` unexplained.
+        if freed == 0 && self.pool.can_reclaim_arena() {
+            tracing::debug!(
+                target: "candle_nn::kv_cache::gid_pool",
+                force,
+                "empty sweep freed nothing though the pool reports a recoverable arena"
+            );
+        }
         Ok(freed)
     }
 
@@ -467,30 +476,28 @@ impl BackingInner {
                         continue;
                     }
 
-                    // Arenas sorted emptiest-first: process in that order so we
-                    // drain the cheapest targets and stop when no space remains.
-                    let arenas = self.pool.arenas_sorted_by_live_for_key(&key);
-                    if arenas.len() < 2 {
+                    // Emptiest-first sources, bounded by how many arenas this
+                    // pool can actually give back, with every source (and every
+                    // already-empty arena) barred as a destination. Relocating
+                    // into an arena that is itself being drained is what makes
+                    // a pass move chunks in a circle and free nothing.
+                    let plan = self.pool.drain_plan_for_key(&key);
+                    if plan.sources.is_empty() {
                         continue;
                     }
 
-                    for &(target_arena, live_count) in &arenas {
-                        if live_count == 0 {
-                            // Already empty; release_empty_arenas handles it.
-                            continue;
-                        }
-
+                    for &target_arena in &plan.sources {
                         // Live GIDs come from pool state — no sequence scan needed.
                         let live_gids = self.pool.live_gids_for_arena(target_arena);
                         if live_gids.is_empty() {
                             continue;
                         }
 
-                        // Allocate replacement GIDs, strictly excluding target_arena.
+                        // Replacement GIDs, never inside a blocked arena.
                         let slice_start = all_dst_gids.len();
                         let mut alloc_ok = true;
                         for _ in 0..live_gids.len() {
-                            match self.pool.allocate_for_excluding(key.clone(), target_arena) {
+                            match self.pool.allocate_for_avoiding(key.clone(), &plan.blocked) {
                                 Some(gid) => all_dst_gids.push(gid),
                                 None => {
                                     alloc_ok = false;

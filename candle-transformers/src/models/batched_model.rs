@@ -22,7 +22,7 @@
 //!     fn n_kv_head(&self) -> usize { self.layers[0].n_kv_head }
 //!     fn head_dim(&self) -> usize { self.layers[0].head_dim }
 //!     fn device(&self) -> &Device { &self.device }
-//!     fn embeddings(&self) -> &Embedding { &self.embeddings }
+//!     fn embeddings(&self) -> Option<&Embedding> { Some(&self.embeddings) }
 //!     fn layer(&self, idx: usize) -> &Self::Layer { &self.layers[idx] }
 //!     fn final_norm(&self) -> &RmsNorm { &self.norm }
 //!     fn output_proj(&self) -> &QMatMul { &self.output }
@@ -111,8 +111,22 @@ pub trait BatchedModelCore {
     /// Device the model is on.
     fn device(&self) -> &Device;
 
-    /// Access the embedding layer.
-    fn embeddings(&self) -> &Embedding;
+    /// Access the resident embedding layer.
+    ///
+    /// `None` when the table is served from host memory instead — see
+    /// [`Self::host_embedding`]. Exactly one of the two is populated.
+    fn embeddings(&self) -> Option<&Embedding>;
+
+    /// The token embedding served from the GGUF mmap rather than VRAM.
+    ///
+    /// `Some` only when the table is large enough relative to the card that
+    /// keeping it resident is not worth the VRAM (see
+    /// [`crate::models::host_embedding`]); the rows are then gathered per
+    /// forward instead. `None` keeps the resident path.
+    #[cfg(feature = "cuda")]
+    fn host_embedding(&self) -> Option<&crate::models::host_embedding::HostEmbedding> {
+        None
+    }
 
     /// Access a layer by index.
     fn layer(&self, idx: usize) -> &Self::Layer;
@@ -385,11 +399,34 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 let inputs: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
                 let packed = TensorCat::from_tensors(1, inputs.into_iter())?;
                 let xt = packed.to_tensor();
-                let embedded = self
-                    .model
-                    .embeddings()
-                    .forward_as_dtype(&xt, embed_dtype)?
-                    .contiguous()?;
+                // Prefer the host-served table when the model has one: the rows
+                // are gathered from the mmap over PCIe, so the embedding never
+                // occupies VRAM. Falls back to the resident lookup otherwise.
+                #[cfg(feature = "cuda")]
+                let host = self.model.host_embedding();
+                #[cfg(not(feature = "cuda"))]
+                let host: Option<&()> = None;
+                let embedded = match host {
+                    #[cfg(feature = "cuda")]
+                    Some(he) => {
+                        let flat = xt.flatten_all()?;
+                        let n = flat.elem_count();
+                        let rows = he.embed(&flat, self.model.device())?;
+                        rows.reshape((1, n, he.layout().ncols))?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    Some(_) => unreachable!("host embedding requires the cuda feature"),
+                    None => self
+                        .model
+                        .embeddings()
+                        .ok_or_else(|| {
+                            candle::Error::Msg(
+                                "model has neither a resident nor a host embedding".into(),
+                            )
+                        })?
+                        .forward_as_dtype(&xt, embed_dtype)?
+                        .contiguous()?,
+                };
                 TensorCat::from_cat_tensor(embedded.to_dtype(embed_dtype)?, 0)?
             }
             Some(resume) => resume,

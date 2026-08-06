@@ -21,12 +21,13 @@ pub mod render;
 pub mod types;
 pub mod walk;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{self, GroupId, LayerId};
+use candle_conversation::memory_report::MemoryReport;
+use candle_conversation::projection::{self, GroupId, LayerId, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
 
@@ -36,7 +37,7 @@ use crate::refresh_ctx::RefreshContext;
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use binary_sniff::is_binary_sample;
-pub use dir_unit::{build_units, DirState, DirUnit};
+pub use dir_unit::{build_units, DirRecord, DirState, DirUnit};
 pub use types::{FileEntry, Language, RepoMap};
 pub use walk::{walk_workspace, MAX_FILE_BYTES};
 
@@ -44,13 +45,19 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// short chain (two prefills + one bounded decode), so this is the whole
 /// concurrent conversation count for the layer.
 ///
-/// Sized to keep the DECODE row-group fed, not to widen prefill. A directory's
-/// worker is a three-phase state machine — prefill, prefill, decode — and
-/// `promote_new_prefills` admits exactly one prefill while
-/// `vram_under_pressure()` holds, so workers queued behind it contribute no
-/// decode work while they wait. At 8, 45% of waves ran a prefill with the decode
-/// row idle; the extra width exists to fill those. It cannot make prefill
-/// itself faster — that floor is one submission at a time.
+/// Sized to feed BOTH row-groups. A directory's worker is a three-phase state
+/// machine — prefill, prefill, decode — so width buys sequences in each. At 8,
+/// 45% of waves ran a prefill with the decode row idle, and the extra width
+/// exists to fill those.
+///
+/// Width also widens prefill itself, which is where most of a directory's wall
+/// clock goes. A prefill wave carries as many sequences as are ready, and its
+/// throughput scales close to linearly with that count — measured across 981
+/// waves on Qwen3-30B-A3B: 188 t/s at one sequence, 357 at two, 457 at three,
+/// 699 at four, 1427 at five. A forward carried 10.9x the tokens for 7.2x the
+/// time as the batch grew, because the expert weight load amortizes across the
+/// batch. Sustaining four or more ready sequences takes roughly twice that many
+/// open conversations, since each spends part of its chain decoding.
 ///
 /// 24 matches the scheduler's own `MAX_PREFILL_WIDTH` ceiling, so the pool never
 /// asks for more concurrency than a wave can carry, and sits below `code_read`'s
@@ -59,28 +66,6 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// prefill — so on a tight card the useful width is bounded by eviction churn
 /// rather than by this constant.
 pub const REPO_MAP_PARALLELISM: usize = 24;
-
-/// Fraction of the governor's KV capacity above which a worker must not OPEN a
-/// new directory conversation.
-///
-/// [`REPO_MAP_PARALLELISM`] bounds worker threads, not VRAM — and the thing that
-/// costs VRAM is an *open conversation*, because it pins its K/V until its chain
-/// completes. While a conversation is live its K sits in `R16` (4 bytes/element)
-/// and its V in F16, so a directory costs several times what the same turns cost
-/// once sealed and quantized.
-///
-/// 24 of those at once is right for a large card and far too many for a 16 GiB
-/// one whose expert cache already holds 7.5 GiB: measured, the pool reached
-/// 5.6 GiB of KV — 94% of it unsealed — and drove `pool_used` into the arena
-/// allocator's ceiling, refusing directory after directory. Admission cannot
-/// help: it throttles prefill *submission*, and by then the conversation exists
-/// and its K/V is already pinned.
-///
-/// So the pool is bounded by the card instead of by a constant. A worker about
-/// to claim a unit waits while the pool is above this fraction, which lets the
-/// in-flight conversations seal, quantize, and drain first. Self-regulating: it
-/// adapts to whatever the expert cache and model leave behind, on any card.
-const SCAN_POOL_HIGH_WATER: f64 = 0.70;
 
 /// Longest a worker will wait for VRAM before claiming its unit anyway.
 ///
@@ -115,28 +100,126 @@ fn max_live_conversations() -> Option<usize> {
     if age_ms > 10_000 {
         return None;
     }
+    let kv = kv_reserved(&report);
     let vram = report.vram?;
-    let capacity = vram.governor?.capacity_bytes;
-    if capacity == 0 {
+    let governor = vram.governor?;
+    if governor.capacity_bytes == 0 {
         return None;
     }
-    let kv = report
+    Some(scan_width(
+        governor.capacity_bytes,
+        governor.scratch_margin_bytes,
+        vram.pool_used_bytes,
+        kv,
+        SCAN_KV_BASELINE.load(Ordering::Relaxed),
+        SCAN_LIVE_CONVS.load(Ordering::Relaxed),
+    ))
+}
+
+/// Total reserved KV arena bytes in a memory report — the quantity the arena
+/// allocator's ceiling actually counts, across both backings.
+fn kv_reserved(report: &MemoryReport) -> u64 {
+    report
         .kv
         .float_reserved_bytes
-        .saturating_add(report.kv.quant_reserved_bytes);
-    // What the pool holds that no scan decision can release.
-    let fixed = vram.pool_used_bytes.saturating_sub(kv);
-    let limit = ((capacity as f64) * SCAN_POOL_HIGH_WATER) as u64;
-    let for_kv = limit.saturating_sub(fixed);
-    // Per-conversation KV, measured rather than assumed. Clamped so a cold start
-    // cannot admit unboundedly and one atypical directory cannot stall the scan.
-    let live = SCAN_LIVE_CONVS.load(Ordering::Relaxed);
-    let per_conv = if live > 0 && kv > 0 {
-        (kv / live as u64).clamp(SCAN_CONV_KV_MIN, SCAN_CONV_KV_MAX)
+        .saturating_add(report.kv.quant_reserved_bytes)
+}
+
+/// The count bound, as arithmetic over the report's figures alone.
+///
+/// `(capacity - scratch_margin - fixed - baseline) / per_conversation`, where
+/// `fixed` is what the pool holds that no scan decision can release — the expert
+/// cache plus dense weights — `baseline` is the inherited pre-scan KV corpus
+/// (see [`SCAN_KV_BASELINE`]), and `per_conversation` is measured from the
+/// pool's own growth.
+///
+/// Numerator and denominator must price the same bytes. `fixed` is
+/// `pool_used - kv`, so subtracting it alone hands *every* KV byte back as room
+/// for new conversations — including the inherited corpus, which is resident,
+/// is not the scan's to spend, and is precisely what `per_conversation_kv`
+/// excludes on the other side of the divide. On the measured report below that
+/// counted ~2 GiB of standing arenas as free space and opened ten directories
+/// against room for six.
+///
+/// The thing that costs VRAM is an *open conversation*: it pins its K/V until
+/// its chain completes, and while it is live its K sits in `R16` (4 bytes per
+/// element) and its V in F16, so a directory costs several times what the same
+/// turns cost once sealed and quantized. Admission cannot substitute for this
+/// bound — it throttles prefill *submission*, and by then the conversation
+/// exists and its K/V is already pinned.
+///
+/// The margin held back is the governor's OWN `scratch_margin`, not a fraction
+/// of capacity. A fraction double-charges the expert cache: `fixed` subtracts it
+/// explicitly, then the fraction holds back a share of capacity that is mostly
+/// the same bytes again. Measured on the 16 GiB card, a 0.70 fraction left the
+/// gate 1.87 GiB for scan KV while the governor had ~5 GiB floored for exactly
+/// that — under half the room, and width is what the whole pool is for: up to
+/// the point the card sustains, a wave's throughput scales with the sequences it
+/// carries, because the expert load amortizes across them (prefill 188 t/s at
+/// one sequence against 699 at four; decode 3.4 against 15.9 at nine). Holding
+/// back the scratch margin instead spends the room the governor already reserved
+/// for KV — while [`SCAN_CONV_KV_MIN`] keeps the resulting width on the safe
+/// side of that point.
+fn scan_width(
+    capacity: u64,
+    scratch_margin: u64,
+    pool_used: u64,
+    kv: u64,
+    baseline: u64,
+    live: usize,
+) -> usize {
+    let fixed = pool_used.saturating_sub(kv);
+    let for_kv = capacity
+        .saturating_sub(scratch_margin)
+        .saturating_sub(fixed)
+        .saturating_sub(baseline);
+    let per_conv = per_conversation_kv(kv, baseline, live);
+    ((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM)
+}
+
+/// What one more open directory conversation is expected to cost the pool.
+///
+/// Measured rather than assumed, and measured against the pool's OWN growth:
+/// the estimate prices `kv - baseline`, never the whole process's arenas (see
+/// [`SCAN_KV_BASELINE`]). Clamped so a cold start cannot admit unboundedly and
+/// one atypical directory cannot stall the scan.
+fn per_conversation_kv(kv: u64, baseline: u64, live: usize) -> u64 {
+    let grown = kv.saturating_sub(baseline);
+    if live > 0 && grown > 0 {
+        (grown / live as u64).clamp(SCAN_CONV_KV_MIN, SCAN_CONV_KV_MAX)
     } else {
         SCAN_CONV_KV_MIN
-    };
-    Some(((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM))
+    }
+}
+
+/// Reserved KV present when the pool opened — the corpus the scan did not
+/// create, and cannot free by finishing a directory.
+///
+/// The tool sections, the base builder's prefill and the calibration exemplars
+/// all live in the same arenas the report totals, and together they run to
+/// gigabytes before a single directory is opened. Charging that to the handful
+/// of conversations in flight pins [`per_conversation_kv`] to
+/// [`SCAN_CONV_KV_MAX`] and throttles the pool to a width of two on a card with
+/// room for more — and the error compounds in the wrong direction, since fewer
+/// live conversations divide the same fixed corpus into a larger per-conversation
+/// estimate. Pricing the delta instead leaves exactly the part a scan decision
+/// influences: a completed directory demotes to the warm tier and gives its
+/// arenas back, so the delta tracks what is genuinely in flight.
+static SCAN_KV_BASELINE: AtomicU64 = AtomicU64::new(0);
+
+/// Re-anchor [`SCAN_KV_BASELINE`] on the arenas already in place, so the pool
+/// about to open prices only the KV it goes on to create. Called once per pass,
+/// before any worker claims a directory.
+fn anchor_scan_kv_baseline() {
+    let baseline = candle_conversation::memory_report::latest()
+        .map(|(report, _age_ms)| kv_reserved(&report))
+        .unwrap_or(0);
+    SCAN_KV_BASELINE.store(baseline, Ordering::Relaxed);
+    tracing::debug!(
+        target: "zend::repo_scan",
+        baseline_bytes = baseline,
+        "scan pool: per-conversation KV estimate anchored on the pre-scan corpus",
+    );
 }
 
 /// Pool width from the VRAM governor, for the moment BEFORE any memory report
@@ -176,6 +259,23 @@ static SCAN_LIVE_CONVS: AtomicUsize = AtomicUsize::new(0);
 /// sample), because each format keeps its own partially-filled 16 MiB slabs.
 /// So a conversation costs the pool about 480 MiB of *reserved* arena, which is
 /// the quantity the allocator's ceiling actually counts.
+///
+/// The doubling is NOT slack, and halving it to price only the live half is a
+/// measured dead end. The argument for halving is that slab waste belongs to a
+/// *format* rather than to a conversation, so the marginal directory should not
+/// pay it twice; the card says otherwise. At 256 MiB the gate opened 19
+/// directories on the 16 GiB card and the pass hit the wall inside two minutes:
+/// `pool_reserved=14976MiB` against `pool_used=13560MiB` — a 1415 MiB gap of
+/// reserved-but-unfilled arena — 18 MiB free, a 16 MiB quantized arena refused
+/// with `arenas_freed=0`, a device OOM that halved the admission budget, and 15
+/// directories lost in a single millisecond. The gap is exactly the slab
+/// overhead, and it scales with concurrently-live conversations, because each
+/// one's chunks land in different format arenas at different fill levels.
+///
+/// It was also slower, which is the part worth remembering: 10 s per directory
+/// against 6.82 at width 10, with decode throughput at nine co-batched sequences
+/// falling from 15.9 tok/s to 7.9 and degrading further past ten. Past the wall
+/// the extra width buys eviction churn, not throughput.
 const SCAN_CONV_KV_MIN: u64 = 480 * 1024 * 1024;
 const SCAN_CONV_KV_MAX: u64 = 768 * 1024 * 1024;
 
@@ -243,11 +343,33 @@ fn take_scan_slot(live: &AtomicUsize) {
     SCAN_LIVE_CONVS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Give the slot back. Must run on every exit path from a reserved section, or
-/// the gauges drift up and the pool throttles itself toward a width of one.
-fn release_scan_slot(live: &AtomicUsize) {
-    live.fetch_sub(1, Ordering::Relaxed);
-    SCAN_LIVE_CONVS.fetch_sub(1, Ordering::Relaxed);
+/// Holds one admitted conversation's slot on both gauges, and gives it back on
+/// drop.
+///
+/// A guard rather than a paired release call: `SCAN_LIVE_CONVS` is
+/// process-global and never reset, so a slot lost to an unwind is lost for the
+/// life of the daemon. One panic inside an ingest — where the failure paths
+/// already tolerate a directory going wrong — would leave the gate permanently
+/// believing a conversation is open, and enough of them throttle every later
+/// pass toward a width of one.
+struct ScanSlot<'a> {
+    live: &'a AtomicUsize,
+}
+
+impl<'a> ScanSlot<'a> {
+    /// Wait for room, then take a slot. Returns holding it, so no other worker
+    /// can decide against this state.
+    fn reserve(live: &'a AtomicUsize) -> Self {
+        reserve_scan_slot(live);
+        Self { live }
+    }
+}
+
+impl Drop for ScanSlot<'_> {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        SCAN_LIVE_CONVS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Hard `max_tokens` on a folder summary decode. The request asks for two
@@ -326,7 +448,6 @@ pub fn ingest_repo_map(
 ) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
     let map = walk_workspace(workspace);
     let units = build_units(&map, workspace);
-    let state = DirState::from_units(&units);
 
     tracing::info!(
         n_files = map.files.len(),
@@ -344,7 +465,7 @@ pub fn ingest_repo_map(
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
     reconcile_deleted(engine, &present);
     let report = run_dir_pool(engine, &plan, workspace, &units, progress);
-    Ok((map, state, report))
+    Ok((map, dir_state_from_substrate(engine), report))
 }
 
 /// Outcome of a [`refresh_repo_map`] call. `Replaced` carries only the new
@@ -401,7 +522,7 @@ pub fn refresh_repo_map(
     let report = run_dir_pool(ctx.engine, &plan, workspace, &units, progress);
     crate::ingest_report::publish(PASS_NAME, report);
     Ok(RefreshOutcome::Replaced {
-        state: DirState::from_units(&units),
+        state: dir_state_from_substrate(ctx.engine),
     })
 }
 
@@ -474,6 +595,38 @@ const DIR_KEY: &str = "dir";
 /// only after the unit's ingest succeeds.
 const HASH_KEY: &str = "content_sha256";
 
+/// Rebuild the [`DirState`] from what the substrate has ACTUALLY ingested,
+/// joining each conversation's [`DIR_KEY`] and [`HASH_KEY`] metadata by timeline
+/// — the same durable record `code_read` derives its state from.
+///
+/// The state must come from the substrate, never from the walk. A walk-derived
+/// state records every directory the pass *attempted*, so a directory whose
+/// ingest failed still gets its content hash stored as ingested; the next walk
+/// then sees an unchanged hash, `equivalent_to` returns true, the refresh is a
+/// `NoOp`, and the directory is never retried — silently absent from the repo
+/// map for the life of the workspace, while `process_one_dir` logs that it will
+/// be picked up next run. [`HASH_KEY`] is written only after a unit's ingest
+/// succeeds, so joining on it records exactly what is really there.
+fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState {
+    let e = engine.lock().unwrap();
+    let hashes: HashMap<TimelineId, String> = e
+        .conversations_with_metadata_key(HASH_KEY)
+        .into_iter()
+        .collect();
+    let mut units: Vec<DirRecord> = e
+        .conversations_with_metadata_key(DIR_KEY)
+        .into_iter()
+        .filter_map(|(tl, dir)| {
+            hashes.get(&tl).map(|content_hash| DirRecord {
+                dir,
+                content_hash: content_hash.clone(),
+            })
+        })
+        .collect();
+    units.sort_by(|a, b| a.dir.cmp(&b.dir));
+    DirState { units }
+}
+
 /// Drive a bounded worker pool over `units`: each worker pulls the next
 /// directory from a shared cursor and runs [`process_one_dir`]. Workers share
 /// the progress counter, a tolerated-failure counter, and an abort flag (the
@@ -487,6 +640,9 @@ fn run_dir_pool(
 ) -> IngestReport {
     let total = units.len();
     progress.set_step_progress(0, total as u64);
+    // Price the pool against the arenas it is about to add, not the ones it
+    // inherits. Must precede the width sizing below, which reads the estimate.
+    anchor_scan_kv_baseline();
     // One snapshot of the live hashes drives every worker's O(1) resume probe.
     let present_hashes = engine
         .lock()
@@ -549,19 +705,28 @@ fn run_dir_pool(
                     if idx >= units.len() {
                         return;
                     }
-                    // Bound open conversations by the card, not by the thread
-                    // count — see `SCAN_POOL_HIGH_WATER`. Returns holding the
-                    // slot, so no other worker can decide against this state.
-                    reserve_scan_slot(&live_convs);
-                    let result = process_one_dir(
-                        engine,
-                        plan,
-                        &ctx,
-                        &units[idx],
-                        &present_hashes,
-                        &failures,
-                    );
-                    release_scan_slot(&live_convs);
+                    // Probe the resume cache BEFORE queueing for VRAM. A hit
+                    // opens no conversation and costs one hash lookup, so
+                    // waiting on the KV gate for it buys nothing — and on a
+                    // fully-cached restart every unit is a hit, which put ~700
+                    // free lookups through a gate that admits a handful at a
+                    // time.
+                    let result = if present_hashes.contains(&units[idx].content_hash) {
+                        tracing::debug!(
+                            target: "zend::repo_scan",
+                            dir = %units[idx].dir,
+                            "skip: directory already in substrate (resume cache hit)",
+                        );
+                        Ok(())
+                    } else {
+                        // Bound open conversations by the card, not by the
+                        // thread count — see `scan_width`. The guard holds the
+                        // slot for the whole ingest, so no other worker can
+                        // decide against this state, and an unwind cannot leak
+                        // it from the process-global gauge.
+                        let _slot = ScanSlot::reserve(&live_convs);
+                        process_one_dir(engine, plan, &ctx, &units[idx], &failures)
+                    };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
                     // An error escaping `process_one_dir` is an unexpected one
@@ -613,10 +778,12 @@ fn run_dir_pool(
     report
 }
 
-/// Ingest one directory into a fresh conversation: skip via the resume-cache
-/// snapshot if its content hash is already live; otherwise render the folder's
+/// Ingest one directory into a fresh conversation: render the folder's
 /// round-trip chain, run it (two prefills + the summary decode), tag the
 /// conversation, and free it.
+///
+/// The caller has already established this unit is not a resume-cache hit, and
+/// holds its [`ScanSlot`] for the duration.
 ///
 /// A per-directory ingest failure is TOLERATED up to [`MAX_DECODE_FAILURES`]:
 /// the attempt's partial is tombstoned, the prior generation is left live, and
@@ -626,18 +793,8 @@ fn process_one_dir(
     plan: &IngestPlan,
     ctx: &ToolContext,
     unit: &DirUnit,
-    present_hashes: &HashSet<String>,
     failures: &Failures,
 ) -> anyhow::Result<()> {
-    if present_hashes.contains(&unit.content_hash) {
-        tracing::debug!(
-            target: "zend::repo_scan",
-            dir = %unit.dir,
-            "skip: directory already in substrate (resume cache hit)",
-        );
-        return Ok(());
-    }
-
     // Render BEFORE minting anything: the tool responses come from actually
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
@@ -758,6 +915,22 @@ fn process_one_dir(
                     );
                 }
             }
+            // If a graceful shutdown latched the cancel flag, this `Err` is the
+            // interruptible decode-wait unwinding (`wait_cancellable` →
+            // `IngestCancelled`), not a genuine ingest failure — the anyhow
+            // layer has erased the variant, so the global flag is the source of
+            // truth. Don't record it against the failure cap: a Ctrl-C with 24
+            // workers in flight would otherwise book 24 failures at once, trip
+            // the abort, and report the pass as incomplete. The partial was just
+            // tombstoned, so the directory re-ingests next run.
+            if candle_conversation::ingest_cancelled() {
+                tracing::debug!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    "shutdown cancelled decode mid-directory — dropped partial; will re-ingest next run",
+                );
+                return Ok(());
+            }
             let n = failures.record(&unit.dir, format!("{e:#}"));
             tracing::warn!(
                 target: "zend::repo_scan",
@@ -788,26 +961,49 @@ fn process_one_dir(
     if let Some(a) = &unit.anchor {
         tags.insert("anchor".to_string(), a.path.clone());
     }
-    let committed = match conv.set_metadata_many(&tags) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(
-                target: "zend::repo_scan",
-                dir = %unit.dir,
-                "failed to tag conversation metadata (resume cache): {e:#}",
-            );
-            false
+    // The tag write is what commits the new generation. If it fails, this
+    // attempt has to go: keeping the prior generation live is right, but keeping
+    // BOTH is not — the untagged replacement is invisible to the resume cache
+    // and to the invalidation sweep, yet its turns are perfectly visible to
+    // provenance, so the folder would vote twice in every scan from then on,
+    // permanently. Drop it and let the unit retry, exactly like a decode
+    // failure.
+    if let Err(e) = conv.set_metadata_many(&tags) {
+        {
+            let en = engine.lock().unwrap();
+            if let Err(err) = en.tombstone_timeline(conv.timeline_id()) {
+                tracing::warn!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    "tombstone of untagged replacement failed — TWO generations of this \
+                     directory are now live: {err:#}",
+                );
+            }
         }
-    };
+        let n = failures.record(&unit.dir, format!("metadata tag write failed: {e:#}"));
+        tracing::warn!(
+            target: "zend::repo_scan",
+            dir = %unit.dir,
+            superseded_kept = superseded.len(),
+            "failed to tag conversation metadata (resume cache); dropped the replacement \
+             and kept the prior generation: {e:#}",
+        );
+        if n > MAX_DECODE_FAILURES {
+            tracing::error!(
+                target: "zend::repo_scan",
+                n, cap = MAX_DECODE_FAILURES,
+                "repo map ingest stopping early: failure cap reached (last: {e:#})",
+            );
+            failures.set_abort();
+        }
+        return Ok(());
+    }
 
-    // Deferred tombstone ACTIVATES — but only once the new generation is truly
-    // committed (its hash landed above). If that write failed the replacement
-    // isn't resume-cached, so treat it as not-yet-committed and keep the prior
-    // generation live rather than swapping to an untagged replacement. On success
-    // the swap completes here: until this instant a projection saw the prior
-    // generation (stale but present); from here it sees this one, and only this
-    // one.
-    if committed && !superseded.is_empty() {
+    // Deferred tombstone ACTIVATES, now that the new generation is truly
+    // committed (its hash landed above). Until this instant a projection saw the
+    // prior generation (stale but present); from here it sees this one, and only
+    // this one.
+    if !superseded.is_empty() {
         let e = engine.lock().unwrap();
         for tl in &superseded {
             if let Err(err) = e.tombstone_timeline(*tl) {
@@ -1124,5 +1320,144 @@ mod tests {
     fn the_invalidation_key_is_distinct_from_code_reads() {
         assert_eq!(DIR_KEY, "dir");
         assert_ne!(DIR_KEY, "path");
+    }
+
+    /// Measured report from a `repo_map` pass on the 16 GiB card, 21 directories
+    /// in: capacity 13.17 GiB, scratch margin 1 GiB, `pool_used` 9.67 GiB, KV
+    /// arenas 2.31 GiB.
+    const CAPACITY: u64 = 14_143_193_088;
+    const SCRATCH: u64 = 1_073_741_824;
+    const POOL_USED: u64 = 10_380_898_464;
+    const KV: u64 = 2_483_027_968;
+    /// Arenas standing before the first directory opened — tool sections, the
+    /// base builder's prefill, and the calibration exemplars.
+    const PRE_SCAN: u64 = 2_000_000_000;
+
+    /// The estimate must price the KV a scan ADDS. Charged the whole process's
+    /// arenas instead, the per-conversation estimate pinned to its ceiling — and
+    /// the error compounds, since a narrower pool divides the same fixed corpus
+    /// into a still-larger estimate.
+    #[test]
+    fn the_estimate_prices_the_scans_own_kv_not_the_inherited_corpus() {
+        assert!(per_conversation_kv(KV, PRE_SCAN, 2) < per_conversation_kv(KV, 0, 2));
+        assert_eq!(per_conversation_kv(KV, 0, 2), SCAN_CONV_KV_MAX);
+    }
+
+    /// ...and the numerator must price it the same way. `fixed` is
+    /// `pool_used - kv`, so subtracting only `fixed` returns every KV byte as
+    /// free room — including the inherited corpus the denominator deliberately
+    /// excludes. Growing that corpus leaves the same room for new work, so the
+    /// pool must get narrower; unfixed, it stayed exactly as wide.
+    #[test]
+    fn the_inherited_corpus_is_not_free_room() {
+        const EXTRA: u64 = 2 * 1024 * 1024 * 1024;
+        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2);
+        let with_corpus = scan_width(
+            CAPACITY,
+            SCRATCH,
+            POOL_USED + EXTRA,
+            KV + EXTRA,
+            PRE_SCAN + EXTRA,
+            2,
+        );
+        assert!(with_corpus < base, "{with_corpus} vs {base}");
+    }
+
+    /// Holding back a FRACTION of capacity double-charges the expert cache:
+    /// `fixed` subtracts it explicitly, then the fraction holds back a share of
+    /// capacity that is mostly the same bytes again. On the measured report a
+    /// 0.70 fraction left 1.87 GiB for scan KV against the governor's own
+    /// ~5 GiB KV floor — under half the room, and the pool ran that much
+    /// narrower for it.
+    #[test]
+    fn the_margin_held_back_is_the_governors_not_a_fraction_of_capacity() {
+        let per_conv = per_conversation_kv(KV, PRE_SCAN, 2);
+        let held_by_fraction = CAPACITY - ((CAPACITY as f64) * 0.70) as u64;
+        assert!(held_by_fraction > SCRATCH * 3, "{held_by_fraction}");
+        let by_fraction =
+            (((CAPACITY as f64) * 0.70) as u64).saturating_sub(POOL_USED - KV + PRE_SCAN) / per_conv;
+        let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
+        assert_eq!(by_fraction, 0);
+        assert_eq!(by_governor, 6);
+    }
+
+    /// The floor charges a conversation for RESERVED arena, not for the live
+    /// half — and that is the width the card actually sustains.
+    ///
+    /// Pricing only the live ~240 MiB (on the theory that slab waste belongs to
+    /// a format rather than to a conversation) opens 19 directories on this
+    /// report and walks straight into the wall: measured, 15 directories lost in
+    /// one millisecond, a device OOM, 18 MiB free, and a 1415 MiB gap between
+    /// reserved and used arena that is precisely the overhead the halving
+    /// assumed away. Ten is the width that ran clean, and faster.
+    #[test]
+    fn the_floor_charges_reserved_arena_not_just_the_live_half() {
+        assert_eq!(SCAN_CONV_KV_MIN, 480 * 1024 * 1024);
+        let for_kv = CAPACITY - SCRATCH - (POOL_USED - KV) - PRE_SCAN;
+        assert_eq!(for_kv / SCAN_CONV_KV_MIN, 6);
+        // Halving the floor nearly doubles the width — the same argument that
+        // opened 19 directories on this card and walked into the wall.
+        assert_eq!(for_kv / (256 * 1024 * 1024), 11);
+    }
+
+    /// Growing the inherited corpus must not inflate the per-conversation
+    /// estimate: the anchor moves with it, so the same in-flight KV is priced
+    /// the same however large the corpus underneath it grows.
+    #[test]
+    fn a_larger_inherited_corpus_does_not_inflate_the_estimate() {
+        const EXTRA: u64 = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            per_conversation_kv(KV, PRE_SCAN, 2),
+            per_conversation_kv(KV + EXTRA, PRE_SCAN + EXTRA, 2),
+        );
+    }
+
+    /// A pool holding nothing open has added nothing, so the estimate is the
+    /// measured floor rather than a division over a corpus it never created.
+    #[test]
+    fn an_idle_pool_estimates_at_the_floor() {
+        assert_eq!(per_conversation_kv(9_000_000_000, 0, 0), SCAN_CONV_KV_MIN);
+        assert_eq!(
+            per_conversation_kv(9_000_000_000, 9_000_000_000, 4),
+            SCAN_CONV_KV_MIN,
+        );
+        // Demotion can hand back more than the scan added; the delta floors.
+        assert_eq!(
+            per_conversation_kv(1_000, 9_000_000_000, 4),
+            SCAN_CONV_KV_MIN
+        );
+    }
+
+    /// The estimate stays inside its measured clamps at both ends: a cold start
+    /// cannot admit unboundedly, and one atypical directory cannot stall the
+    /// scan by pricing every later one off the card.
+    #[test]
+    fn the_per_conversation_estimate_stays_within_its_measured_clamps() {
+        assert_eq!(
+            per_conversation_kv(4 * SCAN_CONV_KV_MAX, 0, 1),
+            SCAN_CONV_KV_MAX,
+        );
+        assert_eq!(
+            per_conversation_kv(SCAN_CONV_KV_MIN / 4, 0, 1),
+            SCAN_CONV_KV_MIN,
+        );
+        assert_eq!(
+            per_conversation_kv(2 * SCAN_CONV_KV_MIN, 0, 2),
+            SCAN_CONV_KV_MIN,
+        );
+    }
+
+    /// The bound is a width, so it never reaches zero — a pool that may not open
+    /// a conversation can never free the VRAM it is waiting on — and never
+    /// exceeds the thread count the pool actually spawns.
+    #[test]
+    fn the_width_stays_between_one_and_the_pool_ceiling() {
+        assert_eq!(scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0), 1);
+        // A margin wider than the card leaves nothing, and still not zero.
+        assert_eq!(scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0), 1);
+        assert_eq!(
+            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
+            REPO_MAP_PARALLELISM,
+        );
     }
 }

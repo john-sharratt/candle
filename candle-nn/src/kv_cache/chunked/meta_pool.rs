@@ -778,8 +778,8 @@ mod tests {
         let stride = crate::kv_cache::chunked::types::arena_gid_stride() as i64;
         let mut raw = vec![0i64; GIDS_PER_HEAD * n_kv_head];
         // k_gid_pal(0,0) is slot 0; k_gid_pal(0,1) is slot 2 (palette*2+0).
-        raw[0] = stride * 0 + 1; // arena 0, chunk 1
-        raw[2] = stride * 1 + 2; // arena 1, chunk 2
+        raw[0] = 1; // arena 0 (base 0), chunk 1
+        raw[2] = stride + 2; // arena 1, chunk 2
         let gids = HeadGids::from_vec(raw.iter().map(|&r| ChunkGid::detached(r)).collect());
         let arena_info = vec![
             ResolvedArenaInfo {

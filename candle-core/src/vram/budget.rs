@@ -129,6 +129,21 @@ impl VramGovernor {
         self.class_reserved[class.idx()].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set a class's reserved tally outright, for footprints that are
+    /// **established once and replaced wholesale** rather than accumulated:
+    /// the dense weights and the expert cache's slot capacity, both fixed by a
+    /// model load.
+    ///
+    /// `credit_class` is wrong for those. It adds, so loading a second model
+    /// into the same process tallies both — and for `Weights` that is not just
+    /// a cosmetic over-count: `kv_floor` is `abs + pct × (C − weights)`, so a
+    /// doubled tally drives `C − weights` to zero and collapses the floor to
+    /// `kv_floor_abs`, silently removing the KV reserve on the card where it
+    /// matters most.
+    pub fn set_class(&self, class: AllocClass, bytes: u64) {
+        self.class_reserved[class.idx()].store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Decrement a class's loose reserved tally when a tracked allocation is
     /// freed (e.g. a KV arena released, an expert slot evicted). Reporting only —
     /// the availability gate is always the live measurement.

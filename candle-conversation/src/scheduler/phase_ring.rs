@@ -419,6 +419,20 @@ pub fn migrate_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The phase / wave / migrate rings are process-global, and the harness runs
+    /// tests in parallel — so a test that pushes and then reads the ring cannot
+    /// run alongside another that pushes. `empty_window_is_dropped` asserts on
+    /// the ring's TAIL, so a concurrent push lands there instead of its sentinel
+    /// and the assertion reads someone else's entry. It only lost the race under
+    /// load (a full `--workspace` run), which made a shared-state race look like
+    /// flakiness. Poison-tolerant so one failure doesn't cascade.
+    static RING_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ring_guard() -> std::sync::MutexGuard<'static, ()> {
+        RING_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn m(kind: PhaseKind, tokens: u64) -> PhaseMeasure {
         PhaseMeasure {
@@ -433,6 +447,7 @@ mod tests {
 
     #[test]
     fn empty_window_is_dropped() {
+        let _ring = ring_guard();
         push_window(2000, vec![]);
         // Nothing pushed for an empty phase list — snapshot stays whatever the
         // prior tests left; assert only that this call added nothing by pushing a
@@ -445,6 +460,7 @@ mod tests {
 
     #[test]
     fn snapshot_flattens_phases_with_age() {
+        let _ring = ring_guard();
         push_window(
             2000,
             vec![m(PhaseKind::Prefill, 100), m(PhaseKind::Sealing, 0)],
@@ -463,6 +479,7 @@ mod tests {
 
     #[test]
     fn wave_and_migrate_rings_round_trip() {
+        let _ring = ring_guard();
         push_wave(wave_sample(
             2000,
             74,

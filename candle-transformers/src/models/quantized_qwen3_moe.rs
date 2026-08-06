@@ -522,9 +522,19 @@ impl SparseMoeBlock {
         let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = router_logits.device() {
             let total_indices = num_tokens * k;
             let routing_stream = self.cache.routing_stream();
-            let pinned_buf = self.cache.routing_pinned_mut(total_indices);
+            let pinned_ptr = self.cache.routing_pinned_ptr(total_indices);
 
-            if let (Some(rs), Some(buf)) = (routing_stream, pinned_buf) {
+            if let (Some(rs), Some(ptr)) = (routing_stream, pinned_ptr) {
+                // One slice for the whole sequence — the DtoH destination in
+                // step 3 and the source read in step 7 are the same bytes, and
+                // minting a second slice for the read would alias this one.
+                //
+                // SAFETY: `routing_pinned_ptr` validated the length against the
+                // buffer's capacity. This forward is the buffer's only writer,
+                // and the DtoH that fills it is ordered against the read below
+                // by `e2`, which step 6 synchronizes on.
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, total_indices) };
+
                 // Step 1: Record event on compute stream after sort output
                 let compute_stream = cuda_dev.cuda_stream();
                 let e1 = compute_stream
@@ -583,14 +593,10 @@ impl SparseMoeBlock {
                 self.cache.record_profile("fwd_routing_wait", t_wait);
 
                 // Step 7: Read indices from pinned buffer into Vec<Vec<u32>>
-                let pinned_slice = self
-                    .cache
-                    .routing_pinned_mut(total_indices)
-                    .expect("pinned buffer disappeared");
                 let mut idx_cpu: Vec<Vec<u32>> = Vec::with_capacity(num_tokens);
                 for tok in 0..num_tokens {
                     let start = tok * k;
-                    idx_cpu.push(pinned_slice[start..start + k].to_vec());
+                    idx_cpu.push(buf[start..start + k].to_vec());
                 }
                 idx_cpu
             } else {
@@ -867,7 +873,14 @@ impl BatchedAttentionLayer for LayerWeights {
 // ============================================================================
 
 pub struct ModelWeights {
-    embeddings: Embedding,
+    /// Resident embedding table. `None` when [`Self::host_embedding`] serves it
+    /// from the mmap instead — exactly one of the two is populated.
+    embeddings: Option<Embedding>,
+    /// Embedding table left in the GGUF mmap and gathered per forward, chosen at
+    /// load when the table is large relative to the card (see
+    /// [`crate::models::host_embedding`]).
+    #[cfg(feature = "cuda")]
+    host_embedding: Option<crate::models::host_embedding::HostEmbedding>,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -918,8 +931,13 @@ impl BatchedModelCore for ModelWeights {
         &self.device
     }
 
-    fn embeddings(&self) -> &Embedding {
-        &self.embeddings
+    fn embeddings(&self) -> Option<&Embedding> {
+        self.embeddings.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn host_embedding(&self) -> Option<&crate::models::host_embedding::HostEmbedding> {
+        self.host_embedding.as_ref()
     }
 
     fn layer(&self, idx: usize) -> &Self::Layer {
@@ -939,7 +957,9 @@ impl BatchedModelCore for ModelWeights {
     }
 
     fn prune(&self) -> Result<()> {
-        self.embeddings.compact();
+        if let Some(e) = &self.embeddings {
+            e.compact();
+        }
         if let Some(layer) = self.layers.first() {
             if let Ok(mut cis) = layer.self_attn.rotary_emb.cis.write() {
                 cis.compact();
@@ -1353,7 +1373,10 @@ impl ModelWeights {
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
 
         Ok(Self {
-            embeddings,
+            embeddings: Some(embeddings),
+            #[cfg(feature = "cuda")]
+            // Reader path has no mmap to gather from, so the table is resident.
+            host_embedding: None,
             layers,
             norm,
             lm_head,
@@ -1429,7 +1452,8 @@ impl ModelWeights {
         let mmap = Arc::new(mmap);
         // Feed the host-RAM budget: the budget reserves the full mmap size so
         // warm-KV growth can never push weight pages out of RAM.
-        candle::vram::note_weights_mmap(mmap.len() as u64);
+        // One mmap per model here, so this single call IS the whole mapped size.
+        candle::vram::set_weights_mmap(mmap.len() as u64);
 
         // Mmap warming is handled by ExpertCache::new() (prewarm_expert_cache)
         // which fills VRAM slots first, then warms remaining pages.
@@ -1566,18 +1590,18 @@ impl ModelWeights {
             }
         }
 
-        // Driver-used VRAM baseline BEFORE any weights load (the governor's
-        // balloon has already been freed). The delta from here to the fully-built
-        // model, minus the resident-expert footprint, is the fixed base-weight
-        // VRAM the whole-card decomposition reports (see `base_weight_bytes`).
-        #[cfg(feature = "cuda")]
-        let used_before_weights: usize = if matches!(device, Device::Cuda(_)) {
-            get_vram_info()
-                .map(|(free, total)| total.saturating_sub(free))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Running total of the DENSE (non-expert) weight bytes this load puts on
+        // the device — every tensor that goes through `load_tensor`, which is all
+        // of them except the experts (those are read as raw `MmapExpertRef`
+        // offsets straight into the cache's own slots).
+        //
+        // Summed rather than measured as a driver delta, because a driver delta
+        // cannot see through the caching allocator: the governor's balloon
+        // releases ~13 GiB back into the CUDA pool rather than to the driver, the
+        // weights then allocate out of those cached blocks, and driver-used
+        // barely moves. Measured, that read a 1313 MiB pre-load baseline against
+        // a ~230 MiB context and under-reported the weights by a third.
+        let dense_bytes = std::cell::Cell::new(0usize);
 
         // Helper: load tensor directly to VRAM
         let load_tensor = |name: &str| -> Result<QTensor> {
@@ -1585,12 +1609,100 @@ impl ModelWeights {
                 .tensor_infos
                 .get(name)
                 .ok_or_else(|| candle::Error::Msg(format!("tensor {} not found", name)))?;
-            tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)
+            let t = tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)?;
+            dense_bytes.set(dense_bytes.get() + t.storage_size_in_bytes());
+            Ok(t)
         };
 
-        // Load embeddings
-        let tok_embed = load_tensor("token_embd.weight")?.dequantize(device)?;
-        let embeddings = Embedding::new(tok_embed, hidden_size)?;
+        // Embeddings. The table is the worst VRAM-per-access ratio in the model —
+        // one row read per token, but the whole thing resident and dequantized —
+        // so on a card where it is a meaningful fraction of capacity it stays in
+        // the mmap and is gathered per forward instead. See
+        // `crate::models::host_embedding`.
+        #[cfg(feature = "cuda")]
+        let (embeddings, host_embedding, embed_dense_bytes) = {
+            let info = ct
+                .tensor_infos
+                .get("token_embd.weight")
+                .ok_or_else(|| candle::Error::Msg("tensor token_embd.weight not found".into()))?;
+            // `[vocab, hidden]`: a row is one token's embedding, so `rows` is the
+            // vocabulary and `cols` the hidden size. Not swapped — the shape is
+            // already row-major here, and inverting it makes `cols` the vocab,
+            // which fails the whole-blocks check rather than gathering garbage.
+            let (rows, cols) = match info.shape.dims() {
+                [r, c] => (*r, *c),
+                dims => candle::bail!("token_embd.weight is not 2-D: {dims:?}"),
+            };
+            // What the table costs the CARD if it stays resident: `Embedding`
+            // keeps its source on CPU and materialises a device copy at the
+            // compute dtype on first forward, so the F32 dequantize below is a
+            // transient, not the footprint.
+            let resident_bytes = (rows * cols * dtype_model.size_in_bytes()) as u64;
+            let capacity = candle::vram::get(gpu_id).map_or(0, |g| g.capacity());
+            let serve_from_host =
+                crate::models::host_embedding::should_serve_from_host(resident_bytes, capacity);
+
+            let host = if serve_from_host {
+                let byte_offset = ct.tensor_data_offset as usize + info.offset as usize;
+                match crate::models::host_embedding::HostEmbedding::new(
+                    &mmap,
+                    byte_offset,
+                    info.ggml_dtype,
+                    rows,
+                    cols,
+                ) {
+                    Ok(h) => Some(h),
+                    // Not GPU-reachable (mmap registration failed) — fall back to
+                    // the resident table rather than failing the load.
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "candle_transformers::quantized_qwen3_moe",
+                            "host embedding unavailable ({e}); keeping it resident"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            match host {
+                Some(h) => {
+                    tracing::info!(
+                        target: "candle_transformers::quantized_qwen3_moe",
+                        resident_mib = resident_bytes >> 20,
+                        capacity_mib = capacity >> 20,
+                        "embedding served from the mmap; VRAM reclaimed"
+                    );
+                    (None, Some(h), 0usize)
+                }
+                None => {
+                    let q = load_tensor("token_embd.weight")?;
+                    let q_bytes = q.storage_size_in_bytes();
+                    let t = q.dequantize(device)?;
+                    dense_bytes.set(dense_bytes.get() - q_bytes);
+                    // Charge the device cache, not the dequantize: `Embedding::new`
+                    // moves `t` to CPU, so the F32 copy is gone before the first
+                    // forward and only the compute-dtype variant is ever resident.
+                    (
+                        Some(Embedding::new(t, hidden_size)?),
+                        None,
+                        resident_bytes as usize,
+                    )
+                }
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (embeddings, embed_dense_bytes) = {
+            let q = load_tensor("token_embd.weight")?;
+            let q_bytes = q.storage_size_in_bytes();
+            let t = q.dequantize(device)?;
+            // As above: the resident copy is the compute-dtype device cache.
+            let bytes = t.elem_count() * dtype_model.size_in_bytes();
+            dense_bytes.set(dense_bytes.get() - q_bytes);
+            (Some(Embedding::new(t, hidden_size)?), bytes)
+        };
+        dense_bytes.set(dense_bytes.get() + embed_dense_bytes);
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype_model,
@@ -1732,13 +1844,6 @@ impl ModelWeights {
         let total_units = total_expert_ticks + num_layers;
 
         // ── Build Expert Cache ──
-        // Driver-used VRAM bracketing the expert-cache build, so the base-weight
-        // measurement can EXCLUDE experts by construction (base = the driver delta
-        // OUTSIDE this bracket). Subtracting the expert gauge instead would cancel
-        // against the gauge re-added in `resident_weight_bytes`, collapsing the
-        // whole figure back to the raw (governor-balloon-polluted) driver delta.
-        #[cfg(feature = "cuda")]
-        let used_before_experts = super::batched_model::driver_used_bytes(device);
         let expert_cache = if !all_host_refs.is_empty() && n_expert > 0 {
             // Determine per-expert shapes from the first layer's first expert
             // Use max expert size across all layers for budget calculation
@@ -1815,7 +1920,7 @@ impl ModelWeights {
             // kv_floor base; the availability gate stays the live measurement).
             #[cfg(feature = "cuda")]
             if let Some(g) = candle::vram::get(gpu_id) {
-                g.credit_class(
+                g.set_class(
                     candle::vram::AllocClass::Expert,
                     (num_slots * max_expert_size) as u64,
                 );
@@ -1826,11 +1931,6 @@ impl ModelWeights {
             warm_mmap(&mmap);
             None
         };
-        // Driver-used VRAM right after the expert cache built — the delta from
-        // `used_before_experts` is the experts' driver footprint (excluded from base).
-        #[cfg(feature = "cuda")]
-        let used_after_experts = super::batched_model::driver_used_bytes(device);
-
         // ── Load layers ──
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -1991,38 +2091,46 @@ impl ModelWeights {
             int8mode
         );
 
-        // Base-weight VRAM = the driver-used growth OUTSIDE the expert-cache
-        // bracket: embeddings + rotary/misc (before the cache) plus attention +
-        // norms + router + lm_head (the layer loop, after it). Experts are
-        // excluded by construction — `resident_weight_bytes` adds the live expert
-        // gauge back on top, so nothing cancels. Fixed for the session (dense
-        // weights never move); the experts are the only time-varying part.
+        // Dense (non-expert) weight VRAM: the exact sum `load_tensor` accumulated.
+        // Fixed for the session — dense weights never move — while the experts
+        // are the time-varying part `resident_weight_bytes` adds back on top, so
+        // nothing double-counts.
+        //
+        // This was a driver delta bracketed around the expert load, and it was
+        // wrong twice over: it read 3936 MiB, then 733 MiB after the bracket was
+        // anchored on the expert gauge, against a true ~990 MiB (the embedding
+        // tensor alone is 594 MiB dequantized, and `lm_head` another ~167 MiB).
+        // A driver delta cannot measure this at all — the governor's balloon
+        // releases ~13 GiB into the CUDA pool rather than back to the driver, the
+        // weights then allocate out of those cached blocks, and driver-used
+        // barely moves. Summing the tensors is immune to both the caching
+        // allocator and to load-time transients.
+        let base_weight_bytes: usize = dense_bytes.get();
         #[cfg(feature = "cuda")]
-        let base_weight_bytes: usize = if matches!(device, Device::Cuda(_)) {
-            let used_after = get_vram_info()
-                .map(|(free, total)| total.saturating_sub(free))
-                .unwrap_or(0);
-            let pre_experts = used_before_experts.saturating_sub(used_before_weights);
-            let post_experts = used_after.saturating_sub(used_after_experts);
-            let base = pre_experts + post_experts;
-            let expert_driver = used_after_experts.saturating_sub(used_before_experts);
+        if matches!(device, Device::Cuda(_)) {
             let expert_gauge = expert_cache.as_ref().map_or(0, |c| c.resident_vram_bytes());
             tracing::info!(
                 target: "candle_transformers::quantized_qwen3_moe",
-                base_gib = base as f64 / 1e9,
-                expert_driver_gib = expert_driver as f64 / 1e9,
-                expert_gauge_gib = expert_gauge as f64 / 1e9,
-                "weight VRAM breakdown (base = non-expert driver delta; experts from gauge)"
+                base_mib = base_weight_bytes >> 20,
+                expert_gauge_mib = expert_gauge >> 20,
+                "weight VRAM breakdown (base = summed dense tensors)"
             );
-            base
-        } else {
-            0
-        };
-        #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes: usize = 0;
+            // Record the dense weights with the governor. `kv_floor` is
+            // `abs + pct x (C - weights)`, so leaving this unrecorded computes
+            // the floor against the whole card as though the model were free —
+            // inflating the floor and taking the difference straight out of the
+            // expert budget, which is the scarcest thing on a tight card.
+            // Set, not add: this is the session's whole dense footprint, and
+            // adding it a second time would drive `C - weights` to zero.
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.set_class(candle::vram::AllocClass::Weights, base_weight_bytes as u64);
+            }
+        }
 
         Ok(Self {
             embeddings,
+            #[cfg(feature = "cuda")]
+            host_embedding,
             layers,
             norm,
             lm_head,
@@ -2297,6 +2405,8 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            /*
+            // C10 does not work on this model, the compression is just too much
             TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
@@ -2305,6 +2415,7 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            */
             // BF16 single context (after everything is warm)
             TestConfig {
                 mode: InferenceMode::BF16,

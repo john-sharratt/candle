@@ -47,6 +47,10 @@ pub mod moe_scatter;
 // R16 KV gather: single-kernel replacement for per-chunk memcpy_dtov
 pub mod gather_r16_kv;
 
+// Format-agnostic indexed row gather, including from CUDA-registered host
+// memory — lets a tensor stay in the GGUF mmap instead of occupying VRAM
+pub mod gather_rows;
+
 // Provenance sign(Q) bit-pack: GPU read+sign+pack, one launch for all layers
 pub mod prov_sign_pack;
 

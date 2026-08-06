@@ -80,7 +80,6 @@ impl Drop for MmapRegistration {
 /// (allocated with `CU_MEMHOSTALLOC_DEVICEMAP`).
 pub struct HostMappedAlloc {
     host_ptr: *mut std::ffi::c_void,
-    #[allow(dead_code)]
     size: usize,
 }
 
@@ -94,6 +93,7 @@ impl Drop for HostMappedAlloc {
         unsafe {
             let _ = cudarc::driver::sys::cuMemFreeHost(self.host_ptr).result();
         }
+        crate::vram::note_host_pinned_free(self.size as u64);
     }
 }
 
@@ -118,18 +118,39 @@ pub fn register_mmap_cuda(mmap: &memmap2::Mmap) -> Option<MmapRegistration> {
     };
     match register_result.result() {
         Ok(_) => Some(MmapRegistration { ptr }),
-        Err(_) => None,
+        Err(e) => {
+            // Do not swallow this. Callers degrade to a slower path when
+            // registration fails, so a silent `None` turns a driver-level
+            // refusal into an unexplained performance difference that looks
+            // like a tuning problem.
+            tracing::warn!(
+                target: "candle_core::quantized::cuda",
+                len,
+                "cuMemHostRegister(DEVICEMAP|READ_ONLY) failed ({e:?}); \
+                 falling back to staged host-to-device copies"
+            );
+            None
+        }
     }
 }
 
 /// Allocate host memory that is GPU-accessible via PCIe (`cudaHostAllocMapped`).
 ///
 /// Returns `(host_ptr, device_ptr, guard)`. The `guard` frees the memory on drop.
-/// GPU kernels use `device_ptr` transparently â€” hardware handles PCIe transfers.
+/// GPU kernels use `device_ptr` transparently — hardware handles PCIe transfers.
 ///
 /// This is the building block for VRAM-overflow weight storage: tensors that
 /// don't fit in VRAM can live in pinned host memory and still be used by CUDA
 /// kernels (at PCIe bandwidth instead of VRAM bandwidth).
+///
+/// Allocating here is not interchangeable with registering memory you already
+/// have. On WDDM, [`register_mmap_cuda`] succeeds on a multi-gigabyte model
+/// mmap and `cuMemHostGetDevicePointer` then *refuses* that range, so a
+/// registered mmap is not kernel-addressable however large it is. Forcing the
+/// host pointer through anyway — on the theory that unified addressing makes it
+/// equivalent — faults with `CUDA_ERROR_ILLEGAL_ADDRESS` on the first forward
+/// and poisons the context. Anything a kernel must dereference from host memory
+/// has to be copied into an allocation from this function.
 pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)> {
     use cudarc::driver::sys;
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -144,6 +165,10 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
             let _ = sys::cuMemFreeHost(host_ptr).result();
             crate::bail!("cuMemHostGetDevicePointer failed: {:?}", e);
         }
+        // Non-pageable by construction, so the host-RAM budget must count it as
+        // structural — tracked here rather than at each call site, so no caller
+        // can allocate gigabytes of pinned RAM the budget reads as pageable.
+        crate::vram::note_host_pinned_alloc(size as u64);
         let guard = HostMappedAlloc { host_ptr, size };
         Ok((host_ptr as *mut u8, dev_ptr, guard))
     }

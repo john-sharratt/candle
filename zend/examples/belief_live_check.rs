@@ -74,8 +74,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 5. The LIVE call the reproject uses.
-    let scores = conv.score_belief_collections(sp, &probe, None);
+    // 5. The LIVE call the reproject uses. `observe: false` — this is a
+    // read-only diagnostic, and folding hit levels into the normalization band
+    // is the once-per-turn seal scan's job; no arena, so the CPU scan runs (same
+    // ranking as the GPU gallery path).
+    let scores = conv.score_belief_collections(sp, &probe, None, false, None);
 
     // 6. Report the top scored tools.
     let mut ranked: Vec<(String, f32)> = Vec::new();

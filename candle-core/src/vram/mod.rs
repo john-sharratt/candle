@@ -497,17 +497,20 @@ pub fn host_pinned_bytes() -> u64 {
 /// rather than pretending otherwise.)
 static WEIGHTS_MMAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Record the mmap-backed weight size (called at model load; last write wins).
+/// Set the mmap-backed weight size — the WHOLE model's mapped size, not one
+/// file's.
 ///
-/// `bytes` must be the WHOLE model's mapped size, not one file's. Last-write-wins
-/// is what makes a model swap replace the old figure instead of accumulating
-/// across loads, and it is correct today because the GGUF loader maps a single
-/// file. A multi-part loader must therefore sum its shards and call this once —
-/// calling per shard would leave the gauge holding only the last one, and the
-/// host-RAM budget under-reserves the weights in exact proportion, handing the
-/// shortfall to warm KV as budget it does not have. That failure is silent: no
-/// error, just weight pages evicted and hard faults on the inference path.
-pub fn note_weights_mmap(bytes: u64) {
+/// Deliberately a store, not an add: a model swap must replace the old figure
+/// rather than accumulate across loads. The corollary is that a multi-part
+/// loader has to sum its shards and call this **once**. Calling it per shard
+/// would leave the gauge holding only the last one, and
+/// [`host_ram_budget`](super::vram::host_ram_budget) then under-reserves the
+/// weights in exact proportion and hands the shortfall to warm KV as budget it
+/// does not have — silently, surfacing only as evicted weight pages and hard
+/// faults on the inference path. Named `set_` rather than `note_` (the pinned
+/// gauges above accumulate) so a per-shard call reads as wrong where it is
+/// written.
+pub fn set_weights_mmap(bytes: u64) {
     WEIGHTS_MMAP_BYTES.store(bytes, Ordering::Relaxed);
 }
 

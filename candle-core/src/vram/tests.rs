@@ -42,8 +42,26 @@ fn test_config() -> GovernorConfig {
 fn governed(vram: &FakeVram, c: u64, weights: u64) -> VramGovernor {
     let gov = VramGovernor::new(0, Box::new(vram.probe()), test_config());
     gov.set_capacity(c);
-    gov.credit_class(AllocClass::Weights, weights);
+    gov.set_class(AllocClass::Weights, weights);
     gov
+}
+
+/// A model load records the session's WHOLE dense footprint, so recording it
+/// again must replace it, not stack on top.
+///
+/// Added, a second load drives `C - weights` to zero and `kv_floor` collapses
+/// to `kv_floor_abs` — the KV reserve silently disappears on exactly the card
+/// that needs it.
+#[test]
+fn reloading_the_model_does_not_collapse_the_kv_floor() {
+    let vram = FakeVram::new(64 * GIB, 64 * GIB);
+    let gov = governed(&vram, 16 * GIB, 8 * GIB);
+    let floor = gov.kv_floor();
+    assert!(floor > gov.config().kv_floor_abs, "{floor}");
+
+    gov.set_class(AllocClass::Weights, 8 * GIB);
+    assert_eq!(gov.kv_floor(), floor, "a second load must not move the floor");
+    assert_eq!(gov.class_reserved(AllocClass::Weights), 8 * GIB);
 }
 
 /// Register a relief closure that counts its calls and releases `release` bytes
@@ -1030,6 +1048,7 @@ mod real_cuda {
     use super::*;
     use crate::vram::balloon::DeviceBalloonAllocator;
     use crate::{Device, Tensor};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -1478,17 +1497,33 @@ mod real_cuda {
     }
 
     /// The pool trim routes through the registered arena-topology guard: the
-    /// wrapper decides whether the trim runs. Here it records the call and SKIPS
-    /// the trim (as it would while a migrate holds the topology). OnceLock —
-    /// first registration wins, so this is the only test that sets the guard.
+    /// wrapper decides whether the trim runs — skipping it while a migrate holds
+    /// the topology, running it otherwise.
+    ///
+    /// The wrapper is gated on a flag this test clears again before returning,
+    /// and the test holds [`gpu_guard`], because `POOL_TRIM_GUARD` is a
+    /// `OnceLock`: process-global, first-registration-wins, and impossible to
+    /// remove. A wrapper that skipped unconditionally therefore disabled the
+    /// Critical rung's trim for the whole rest of the binary — after which
+    /// `real_cuda_relief_ladder_and_critical` measured no headroom recovery
+    /// (11936MiB -> 11936MiB, relief "Relieved(2.5GiB)" in 0.1ms instead of
+    /// 47.7ms) and failed. It failed only when the harness happened to schedule
+    /// this test first, which is what made it look like GPU flakiness.
     #[test]
     fn guarded_pool_trim_routes_through_the_registered_guard() {
         static GUARD_CALLS: AtomicU64 = AtomicU64::new(0);
         static TRIM_RUNS: AtomicU64 = AtomicU64::new(0);
-        set_pool_trim_guard(Box::new(|_trim| {
+        static SKIP_TRIM: AtomicBool = AtomicBool::new(false);
+        let _gpu = gpu_guard();
+        set_pool_trim_guard(Box::new(|trim| {
             GUARD_CALLS.fetch_add(1, Ordering::SeqCst);
-            // Deliberately do NOT call `_trim` — the trim is skipped this pass.
+            if !SKIP_TRIM.load(Ordering::SeqCst) {
+                trim();
+            }
         }));
+
+        // Migrate in flight: the wrapper swallows the trim.
+        SKIP_TRIM.store(true, Ordering::SeqCst);
         guarded_pool_trim(|| {
             TRIM_RUNS.fetch_add(1, Ordering::SeqCst);
         });
@@ -1501,6 +1536,23 @@ mod real_cuda {
             TRIM_RUNS.load(Ordering::SeqCst),
             0,
             "the guard skipped the underlying trim"
+        );
+
+        // Topology free again: the same wrapper must let the trim through — and
+        // leaving it in THIS state is what keeps the rest of the binary honest.
+        SKIP_TRIM.store(false, Ordering::SeqCst);
+        guarded_pool_trim(|| {
+            TRIM_RUNS.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            GUARD_CALLS.load(Ordering::SeqCst),
+            2,
+            "the wrapper is consulted on every trim"
+        );
+        assert_eq!(
+            TRIM_RUNS.load(Ordering::SeqCst),
+            1,
+            "the guard runs the trim once the topology is free"
         );
     }
 }
