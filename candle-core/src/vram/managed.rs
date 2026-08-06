@@ -88,10 +88,65 @@ impl VramGovernor {
     /// live measurement (mandatory weights already loaded), leaving the KV floor
     /// and the scratch cushion free. The expert loader divides this by
     /// `max_expert_size` to pick how many slots to keep resident (§11).
+    ///
+    /// Bounded by the balloon-measured capacity `C`, not by live headroom alone.
+    /// `headroom` is what the driver reports free, and on a WDDM card that is
+    /// materially more than what can actually be held resident — the balloon
+    /// exists precisely to find that difference. Sizing against headroom spends
+    /// it: measured on a 16 GiB card, `C` was 13488 MiB while headroom at expert
+    /// load was ~15000 MiB, so the cache took 8888 MiB (3065 slots) where the
+    /// capacity allowed 6493 (2187), and every later allocation ran into a pool
+    /// whose `used` sat above `C` with the driver still reporting free memory.
+    /// Startup never finished: section prefill and calibration together need
+    /// ~4.4 GiB of KV, and the overshoot left them under 1 GiB. The expert cache is
+    /// permanent — nothing reclaims it, no relief rung can shed a slot — so an
+    /// overshoot here is not transient pressure, it is a card that never fits its
+    /// own workload again.
+    ///
+    /// What we have already spent of `C` is the **drop in headroom since `C` was
+    /// measured**, not `total - headroom`. DXGI reports
+    /// `headroom = Budget - CurrentUsage`, so `total - headroom` is
+    /// `(total - Budget) + CurrentUsage` — and the first term is the OS reserve,
+    /// which the balloon already discovered and excluded from `C`. Subtracting it
+    /// again double-books it and hands the expert cache ~1 GiB less than the card
+    /// allows. Differencing two headroom readings cancels the reserve: it is
+    /// present in both.
+    ///
+    /// The `Weights` tally can't serve as the spend either — the dense weights
+    /// finish loading *after* the expert cache is sized, so it reads zero here.
+    ///
+    /// Falls back to headroom alone when `C` was never measured, or when the
+    /// baseline is missing/stale (headroom above the baseline means memory came
+    /// back, so nothing of `C` is spent).
     pub fn expert_budget(&self) -> Result<u64> {
-        let headroom = self.probe.read()?.headroom;
-        Ok(headroom
+        let reading = self.probe.read()?;
+        let capacity = self.capacity();
+        let baseline = self.headroom_at_capacity();
+        let usable = if capacity == 0 || baseline == 0 {
+            reading.headroom
+        } else {
+            let spent_by_us = baseline.saturating_sub(reading.headroom);
+            reading.headroom.min(capacity.saturating_sub(spent_by_us))
+        };
+        let budget = usable
             .saturating_sub(self.kv_floor())
-            .saturating_sub(self.scratch_margin()))
+            .saturating_sub(self.scratch_margin());
+        // A zero budget is not a small budget: the loader keeps no expert
+        // resident and every forward streams all of them over PCIe. That is a
+        // configuration failure (floor + cushion exceed what is left of `C`),
+        // and it is otherwise indistinguishable from a card that is merely
+        // tight, so say it rather than let the model come up silently crippled.
+        if budget == 0 {
+            tracing::warn!(
+                target: "candle_core::vram",
+                usable_mib = usable / (1024 * 1024),
+                kv_floor_mib = self.kv_floor() / (1024 * 1024),
+                scratch_margin_mib = self.scratch_margin() / (1024 * 1024),
+                capacity_mib = capacity / (1024 * 1024),
+                "expert budget is zero — no experts will stay resident and every \
+                 forward will stream them over PCIe"
+            );
+        }
+        Ok(budget)
     }
 }

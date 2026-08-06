@@ -212,6 +212,53 @@ fn balloon_target_combines_fraction_and_absolute() -> Result<()> {
     Ok(())
 }
 
+/// The balloon's absolute reserve must not re-book the scratch cushion.
+///
+/// `scratch_margin` is already subtracted in `expert_budget` and sits below
+/// every relief rung, so reserving the transient peak again in the balloon cap
+/// books the same bytes twice — and unlike `scratch_margin`, those bytes are
+/// never handed to *any* allocator, because `C` is the ceiling every budget is
+/// derived from. Measured on the 16 GiB card: a 2.5 GiB cap held `C` at 13488
+/// MiB while the ceiling the balloon finds when allowed to look is 14592.
+///
+/// The cap's job is only to stop the *measurement* destabilising the desktop.
+/// It must therefore stay at or below the scratch cushion — anything larger is
+/// reserving engine headroom a second time.
+///
+/// Reads the shipped constants directly rather than `GovernorConfig::default()`,
+/// which resolves `CANDLE_VRAM_*` overrides: this project uses those knobs
+/// routinely, and a developer with one exported would otherwise see this fail
+/// for reasons that have nothing to do with the defaults it exists to pin.
+#[test]
+fn the_balloon_reserve_does_not_double_book_the_scratch_cushion() {
+    let cfg = GovernorConfig::defaults_ignoring_env();
+    assert!(
+        cfg.balloon_headroom_abs <= cfg.scratch_margin,
+        "balloon reserve {} would re-book the {} scratch cushion",
+        cfg.balloon_headroom_abs,
+        cfg.scratch_margin
+    );
+}
+
+/// A cap set above the card's real ceiling costs nothing: the balloon stops
+/// where the driver refuses, which is the honest capacity. This is what lets
+/// the default be generous — on a card that genuinely cannot hold that much,
+/// the allocation failure binds first.
+#[test]
+fn balloon_stops_at_the_real_ceiling_when_the_cap_is_generous() -> Result<()> {
+    let mut cfg = test_config();
+    cfg.balloon_target_frac = 0.99;
+    cfg.balloon_headroom_abs = 128 * MIB; // effectively no cap
+
+    // The card reports 16 GiB but only 12 GiB can actually be claimed.
+    let total = 16 * GIB;
+    let vram = FakeVram::new(total, total);
+    let mut alloc = FakeBalloonAllocator::new(vram.clone(), 12 * GIB);
+    let c = super::balloon::balloon_measure(&vram.probe(), &mut alloc, &cfg)?;
+    assert_eq!(c, 12 * GIB, "the driver's refusal is the ceiling, not the cap");
+    Ok(())
+}
+
 #[test]
 fn balloon_undersized_falls_back() -> Result<()> {
     let total = 64 * GIB;
@@ -452,6 +499,108 @@ fn some_experts_resident_when_tight() -> Result<()> {
     let all_resident = num_slots >= total_experts;
     assert!(!all_resident, "not all experts fit on a tight card");
     assert!(num_slots > 0, "but some are resident");
+    Ok(())
+}
+
+/// The expert cache must be sized inside the balloon-measured capacity, not
+/// against raw driver headroom.
+///
+/// On a WDDM card the driver reports materially more free memory than can
+/// actually be held resident — finding that gap is what the balloon is for.
+/// Measured on the 16 GiB dev card: `C` = 13488 MiB, headroom at expert load
+/// ~15000 MiB. Sizing against headroom took 8888 MiB for experts where the
+/// capacity allowed ~6000, and since nothing can ever shed an expert slot, the
+/// pool then sat permanently above `C` with the driver still reporting free
+/// memory — every later KV allocation refused on the pool's own ceiling.
+#[test]
+fn expert_budget_is_bounded_by_capacity_not_driver_headroom() -> Result<()> {
+    const MIB_U: u64 = 1 << 20;
+    // Card reports 15000 MiB free of 16375; the balloon proved only 13488 is
+    // holdable. `set_capacity` records 15000 as the baseline, so nothing of `C`
+    // is spent yet and the whole of it is available beyond floor + cushion.
+    let vram = FakeVram::new(15000 * MIB_U, 16375 * MIB_U);
+    let gov = VramGovernor::new(0, Box::new(vram.probe()), test_config());
+    gov.set_capacity(13488 * MIB_U);
+
+    let budget = gov.expert_budget()?;
+    assert_eq!(
+        budget,
+        13488 * MIB_U - gov.kv_floor() - gov.scratch_margin(),
+        "capacity, not headroom, is the ceiling"
+    );
+    assert!(
+        budget < 15000 * MIB_U - gov.kv_floor() - gov.scratch_margin(),
+        "sizing against headroom would have allowed more than the card can hold"
+    );
+    Ok(())
+}
+
+/// The spend against `C` is the drop in headroom since `C` was measured — NOT
+/// `total - headroom`.
+///
+/// DXGI reports `headroom = Budget - CurrentUsage`, so `total - headroom` also
+/// carries `total - Budget`: the OS reserve, which the balloon already excluded
+/// from `C`. Charging it again costs roughly a gigabyte of expert residency on
+/// the 16 GiB card. Here the reserve is 1375 MiB and we have since spent 500;
+/// only the 500 may be deducted.
+#[test]
+fn expert_budget_charges_our_own_spend_not_the_os_reserve() -> Result<()> {
+    const MIB_U: u64 = 1 << 20;
+    let total = 16375 * MIB_U;
+    let vram = FakeVram::new(15000 * MIB_U, total);
+    let gov = VramGovernor::new(0, Box::new(vram.probe()), test_config());
+    gov.set_capacity(13488 * MIB_U); // baseline headroom = 15000 MiB
+
+    vram.set(14500 * MIB_U); // we allocated 500 MiB
+    let budget = gov.expert_budget()?;
+    assert_eq!(
+        budget,
+        13488 * MIB_U - 500 * MIB_U - gov.kv_floor() - gov.scratch_margin(),
+        "only our own 500 MiB is spent; the 1375 MiB OS reserve is already in C"
+    );
+    // The discredited form would have charged `total - headroom` = 1875 MiB.
+    let double_booked =
+        13488 * MIB_U - 1875 * MIB_U - gov.kv_floor() - gov.scratch_margin();
+    assert!(
+        budget > double_booked,
+        "double-booking the reserve costs {} MiB",
+        (budget - double_booked) / MIB_U
+    );
+    Ok(())
+}
+
+/// Headroom recovering above the baseline (another process released memory)
+/// must not underflow into a bogus spend.
+#[test]
+fn expert_budget_handles_headroom_returning_above_the_baseline() -> Result<()> {
+    const MIB_U: u64 = 1 << 20;
+    let vram = FakeVram::new(12000 * MIB_U, 16375 * MIB_U);
+    let gov = VramGovernor::new(0, Box::new(vram.probe()), test_config());
+    gov.set_capacity(13488 * MIB_U); // baseline headroom = 12000 MiB
+
+    vram.set(15000 * MIB_U); // a neighbour freed 3 GiB
+    let budget = gov.expert_budget()?;
+    assert_eq!(
+        budget,
+        13488 * MIB_U - gov.kv_floor() - gov.scratch_margin(),
+        "nothing of C is spent, and the surplus does not inflate past C"
+    );
+    Ok(())
+}
+
+/// Before the balloon has run there is no capacity to bound against, so the
+/// live reading is the only measurement available.
+#[test]
+fn expert_budget_falls_back_to_headroom_before_the_balloon_runs() -> Result<()> {
+    let vram = FakeVram::new(20 * GIB, 24 * GIB);
+    let gov = VramGovernor::new(0, Box::new(vram.probe()), test_config());
+    // No `set_capacity` — C is still 0.
+    let budget = gov.expert_budget()?;
+    assert_eq!(
+        budget,
+        20 * GIB - gov.kv_floor() - gov.scratch_margin(),
+        "with no capacity measurement the budget is headroom-derived"
+    );
     Ok(())
 }
 

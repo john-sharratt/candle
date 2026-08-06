@@ -143,6 +143,18 @@ pub struct VramGovernor {
     sync_calls: AtomicU64,
     config: GovernorConfig,
     capacity_c: AtomicU64,
+    /// Probe headroom at the instant `C` was measured — the baseline our own
+    /// consumption is counted from.
+    ///
+    /// `total - headroom` is NOT our usage: DXGI reports
+    /// `headroom = Budget - CurrentUsage`, so that difference is
+    /// `(total - Budget) + CurrentUsage` and the first term is the OS reserve —
+    /// exactly what the balloon already discovered and excluded from `C`.
+    /// Subtracting it again double-books it. Measuring the *drop* in headroom
+    /// since `C` was taken cancels the reserve out: both readings carry it.
+    ///
+    /// `0` ⇒ `C` was never measured, so there is no baseline to count from.
+    headroom_at_capacity: AtomicU64,
     class_reserved: [AtomicU64; AllocClass::COUNT],
     relief: RwLock<ReliefRegistry>,
     last_relief: Mutex<Option<(Criticality, u64)>>,
@@ -176,6 +188,7 @@ impl VramGovernor {
             sync_calls: AtomicU64::new(0),
             config,
             capacity_c: AtomicU64::new(0),
+            headroom_at_capacity: AtomicU64::new(0),
             class_reserved: Default::default(),
             relief: RwLock::new(ReliefRegistry::default()),
             last_relief: Mutex::new(None),
@@ -249,7 +262,23 @@ impl VramGovernor {
     /// Directly set the measured capacity `C` (test hook / after an external
     /// balloon). Normal path is [`Self::run_balloon`].
     pub fn set_capacity(&self, c: u64) {
+        self.record_capacity(c);
+    }
+
+    /// Store `C` together with the headroom reading it was measured against, so
+    /// [`Self::expert_budget`] can count our own consumption from that baseline
+    /// (see [`Self::headroom_at_capacity`]). Every path that establishes `C`
+    /// goes through here — a `C` without its baseline would silently fall back
+    /// to the headroom-only budget.
+    fn record_capacity(&self, c: u64) {
         self.capacity_c.store(c, Ordering::Relaxed);
+        let headroom = self.probe.read().map(|r| r.headroom).unwrap_or(0);
+        self.headroom_at_capacity.store(headroom, Ordering::Relaxed);
+    }
+
+    /// Headroom at the moment `C` was measured; `0` when `C` was never set.
+    pub(crate) fn headroom_at_capacity(&self) -> u64 {
+        self.headroom_at_capacity.load(Ordering::Relaxed)
     }
 
     /// Run the balloon through `alloc`, record the resident high-water as `C`,
@@ -266,7 +295,7 @@ impl VramGovernor {
         let target = (self.config.balloon_target_frac * reading.total as f64) as u64;
         if reading.headroom >= target {
             let c = reading.headroom.min(reading.total);
-            self.capacity_c.store(c, Ordering::Relaxed);
+            self.record_capacity(c);
             tracing::info!(
                 target: "candle_core::vram",
                 "balloon skipped: card already free (headroom {}MiB ≥ target {}MiB) — C={}MiB",
@@ -296,7 +325,7 @@ impl VramGovernor {
             );
             total.saturating_sub(BALLOON_FALLBACK_MARGIN)
         };
-        self.capacity_c.store(c, Ordering::Relaxed);
+        self.record_capacity(c);
         Ok(c)
     }
 
