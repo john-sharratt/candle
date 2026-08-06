@@ -34,6 +34,29 @@ green before the next phase starts.
   stripped). The cheap per-kernel checks are the `paged.rs` mirror-oracle tests and the
   wave-vs-decode state audit. Load model once; the run is ~11 min for all three configs.
 
+## Baselines, references & grounding (read before starting)
+
+- **Read the canonical design doc first:** `docs/deepseek_batched_paged_attention_plan.md`. It is
+  authoritative for the attention design (compressor monoid, two-stage BDP→Indexer corpus select,
+  single-latent K≡V, glue, the C/E/G/K sections referenced throughout this plan). Ground every
+  kernel change in it; if the doc is itself wrong, fix the doc in the same change.
+- **Two distinct oracles — use the right one for the job:**
+  - **GPU per-token decode reference** (`kernel_attn_decode_step` looped one token at a time, as in
+    `wave_prefill_state_matches_decode_steps`). Fast enough to run full prompts and every batch size.
+    This is the **full-prompt / whole-test oracle**: the batched path (wave prefill + batched decode)
+    must match it bit-for-bit, or within the O(1) envelope.
+  - **CPU DeepSeek reference model** (the pure reference forward). Bit-exact ground truth, but far too
+    slow to run the full StoryRewrite suite (especially n=8). Use it for **component-level**
+    validation and iteration: one layer, one attention step, a short prompt, a codec/quant round-trip
+    — comparing a single GPU kernel's output against the CPU computation of the same input. Do **not**
+    attempt the full n=8 test on it.
+  - Rule of thumb: **CPU model → is this kernel/component correct?** **GPU decode reference → does the
+    batched path reproduce the reference over the whole prompt/batch?**
+- **HuggingFace reference implementation** of DeepSeek-V4-Flash is available online and may be
+  consulted to confirm reference math (RoPE/YaRN, MLA latent projection, MoE routing, the indexer)
+  when the CPU port or a kernel's intent is ambiguous. It is a reference for *correctness intent*,
+  not a performance target.
+
 ---
 
 ## Phase 1 — De-naming: make model-specific modules generic
@@ -227,6 +250,18 @@ was instructed is a **classic attention failure**: the batched path, at some bat
 attend to the rewrite instruction / the new name. n=1 and n=4 are 100%, so it is batch-count- or
 batch-position-dependent.
 
+**Step 0 — quick quant probe (fast diagnostic, run first).** Before the full bisect, cheaply test
+whether K/V dynamic range is implicated: with Phase-4's multi-format support in hand, re-run the n=8
+StoryRewrite with K/V as **Q8_0** and then **Q8_1** (both carry a per-block scale — Q8_1 also a min —
+and cover the latent's dynamic range better than FP8-E4M3). This is a *diagnostic*, not the fix:
+- If a higher-dynamic-range format makes the failing session(s) pass (or shifts which position
+  fails), we have a strong lead that the weakness is **quantization/precision** in the K/V path →
+  pursue it here and carry the finding into Phase 7's fuller evaluation.
+- If it does **not** move the failure, quantization is likely not the cause → set it aside, proceed to
+  the bisect below, and defer the full quant A/B to Phase 7.
+Keep FP8 as the control; record the n=8 pass rate per format. (This is the one place quant work jumps
+the queue — deliberately, because it's a 10-minute discriminator, not a rebuild of Phase 7.)
+
 **Hypotheses to discriminate (in order).**
 1. **Batched attention divergence** — glue/compressed-selection/window at high batch differs from the
    reference for a specific slot. Most likely, given it's batch-position-specific and the story body
@@ -242,10 +277,14 @@ batch-position-dependent.
 **Steps.**
 1. Reproduce deterministically: fixed seed/prompt, dump per-session generated token ids at n=8,
    confirm which position(s) fail and whether it's deterministic across runs (rules 4 in/out).
-2. **Bisect against the CPU/reference baseline**, not against another GPU path. Extend the state
-   audit to n=8 with the StoryRewrite prompt: for the failing session, diff every layer's arena
-   window + compressed selection + logits at the token where the name is emitted, vs the single-
-   session reference for that exact prompt. First divergent artifact = the bug.
+2. **Bisect with the right oracle** (see "Baselines & references"). Extend the state audit to n=8
+   with the StoryRewrite prompt and diff the failing session against the **GPU per-token decode
+   reference** for that exact prompt — every layer's arena window + compressed selection + logits at
+   the token where the name is emitted; the first divergent artifact localizes the bug to a
+   component. Then confirm that component against the **CPU reference model** at the component level
+   (single layer / single step / short input — the CPU model can't run the whole n=8 prompt) to
+   decide whether the GPU kernel or the reference math is wrong. Consult the HuggingFace reference if
+   the intended math is ambiguous.
 3. Fix the identified component (kernel or metadata), re-validate bit-exact vs baseline, then re-run
    the full n=8 StoryRewrite. **The fix lives in the engine; the test is untouched.**
 4. If (and only if) the audit proves the batched path is bit-identical to the reference and the
@@ -260,12 +299,14 @@ it model quality.
 
 ---
 
-## Phase 7 — K/V quant experiments (Q8_0 / Q8_1 vs FP8)
+## Phase 7 — K/V quant & compression (7a formats · 7b levels)
+
+### 7a — Format evaluation (Q8_0 / Q8_1 vs FP8)
 
 **Goal.** Once the kernels support multiple formats (Phase 4) and attention is correct (Phase 6),
-evaluate whether a higher-dynamic-range 8-bit format improves decode quality. FP8-E4M3 (current) has
-coarse mantissa; **Q8_0/Q8_1** carry a per-block scale (Q8_1 also a min) and better represent the
-latent's dynamic range.
+evaluate whether a higher-dynamic-range 8-bit format improves decode quality — the fuller version of
+the Phase-6 Step-0 probe. FP8-E4M3 (current) has coarse mantissa; **Q8_0/Q8_1** carry a per-block
+scale (Q8_1 also a min) and better represent the latent's dynamic range.
 
 **Steps.**
 1. Add Q8_0 and Q8_1 as selectable K/V (single-latent) formats via the Phase-4 machinery.
@@ -273,12 +314,34 @@ latent's dynamic range.
    record accuracy and t/s (Q8 is heavier per read).
 3. Keep the winner as the default only if it does not regress the bit-exact envelope elsewhere.
 
-**Gate.** Measured accuracy/throughput table across the three formats; a defensible default.
-**Expectation (user):** likely *not* the fix for the n=8 failure (Phase 6 owns that) — this is a
-quality/robustness lever, run it anyway. **Result:** _(fill)_
+**Gate (7a).** Measured accuracy/throughput table across the three formats; a defensible default.
+**Expectation (user):** likely *not* the fix for the n=8 failure (Phase 6 owns that; the Phase-6
+Step-0 probe already screened it) — this is a quality/robustness lever, run it anyway. **Result:** _(fill)_
+
+### 7b — Adaptive compression levels (C0–C9)
+
+**Goal.** The adaptive per-block KV compression (C0 near-lossless → C9 max, the `CompressionPolicy`
+in `candle-nn/.../chunked/compression_policy.rs`) is the engine's headline capability. With the
+latent kernels now format-aware (Phase 4), enable it on the single-latent path and characterize how
+far it can be pushed before quality breaks.
+
+**Steps.**
+1. Enable compression-mode selection for single-latent chunks (per-32-token block format selection
+   via the cosine-distance thresholds) — reusing the existing policy, not a new one. The K/V
+   asymmetry (`PRODUCTION_K_*` / `PRODUCTION_V_*`) must be re-derived by measurement for
+   DeepSeek-V4-Flash (they are model-specific — see the CLAUDE.md note).
+2. Sweep compression levels against the StoryRewrite suite + a longer-context quality probe: for each
+   level C0..C9, record whether the tests hold and the memory/throughput won. Find the highest level
+   that keeps n=1/4/8 passing.
+3. Verify the attention-sink protection (first 4 tokens' dedicated fine scale) holds under
+   compression on the latent path.
+
+**Gate (7b).** A compression-level vs quality/footprint table; the highest level that keeps the
+StoryRewrite suite green identified and set as the aggressive default; sink protection verified.
+**Result:** _(fill)_
 
 **Risk.** Q8 read cost may hurt the Phase-8 throughput target; treat as a quality/speed trade to
-measure, not assume.
+measure, not assume. Thresholds are model-specific — do not reuse Qwen3's `PRODUCTION_*` constants.
 
 ---
 
@@ -308,5 +371,13 @@ gate before accepting a speedup.
 1 (naming) is prerequisite hygiene so all later kernel work lands in correctly-named files. 2 (load)
 is independent but makes every subsequent iteration cycle ~2 min faster (huge multiplier over dozens
 of runs). 3 (prefill kernel) must precede 5/8 (can't optimize a kernel that's still the wrong shape).
-4 (formats) unblocks 7. 6 (n=8 correctness) precedes 7/8 because we optimize/quantize only a *correct*
-engine. 8 is last — throughput tuning on a correct, fast-loading, generic engine.
+4 (formats) unblocks both the Phase-6 Step-0 quant probe and Phase 7. 6 (n=8 correctness) precedes
+7/8 because we optimize/quantize only a *correct* engine — but its **Step 0 borrows Phase-4's formats
+for a fast Q8 discriminator** before the bisect, since it's a 10-minute test that could hand us the
+cause. 7 splits into 7a (formats, the full version of that probe) and 7b (adaptive C0–C9 compression
+levels). 8 is last — throughput tuning on a correct, fast-loading, generic engine.
+
+**One caveat on strict ordering:** the Phase-6 Step-0 quant probe is the single intentional
+exception — a cheap diagnostic that reaches forward to Phase-4 format support. It does not reorder
+the work (Phase 4 is already done by the time Phase 6 runs); it just front-loads a 10-minute test
+whose result steers Phase 6. Everything else runs strictly 1→8.
