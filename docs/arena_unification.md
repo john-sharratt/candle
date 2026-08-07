@@ -533,6 +533,30 @@ Cross-cutting machinery used by both sides of the reservation.
   must consume. Views/reshapes share the `Arc<Storage>` and the lease travels
   with them, so the inference loop keeps its Tensor-based code.
 
+  **Interception is mandatory, not an optimization.** A region pointer is an
+  offset into the VMM reservation, never a pool allocation, so letting
+  `CudaSlice::drop` reach `cuMemFreeAsync` on it is an *error*, not a leak.
+  The mechanism is measured, built, and reverted in experiment E4 (§8.2): a
+  tombstone variant on `CudaStorageSlice` plus
+
+  ```rust
+  impl Drop for CudaStorage {
+      fn drop(&mut self) {
+          if self.backing == Backing::Lease {
+              let slice = std::mem::replace(&mut self.slice, CudaStorageSlice::Empty);
+              slice.leak();   // per-variant CudaSlice::leak()
+          }
+      }
+  }
+  ```
+
+  `CudaSlice::leak` takes `self` **by value** and `mem::forget`s it, so it is
+  unreachable from `&mut self` without the `mem::replace`. Calling it — rather
+  than merely suppressing the drop — is load-bearing: `leak` waits on the
+  slice's read/write events, destroys them, and decrements the
+  `Arc<CudaStream>`. Bare suppression strands two `CudaEvent`s and a stream
+  refcount **per lease**, thousands per second.
+
   **No lifetime parameterization.** An earlier draft added
   `TensorG<'a>(Arc<Tensor_>, PhantomData<&'a ()>)` with
   `type Tensor = TensorG<'static>` to make use-after-reset uncompilable. It
@@ -707,8 +731,14 @@ defrag/compaction still exist (they fire far less).
 
 - Introduce the **`Backing::Lease` storage variant** (§3.7) — needed here
   only so the legacy `read_contiguous`/`write_contiguous` façade can take
-  on-demand tensor views over region bytes. No lifetime parameterization; no
-  other candle-core change.
+  on-demand tensor views over region bytes. No lifetime parameterization.
+  The candle-core surface is **measured, not estimated** (E4, §8.2): 4 new
+  declarations (`Backing`, `CudaStorageSlice::Empty`, `CudaStorageSlice::leak`,
+  `Drop for CudaStorage`), **18** exhaustive match arms, **43** struct
+  literals (35 candle-core + 8 candle-nn), 2 imports — 115 insertions total,
+  workspace **and tests** compiling clean. Every one is compiler-enumerated
+  (E0004 / E0063), so there is no silent-failure surface; budget it as an
+  afternoon of mechanical edits, not a refactor.
 - Add per-band format tags to `ChunkWindow` and `SealedChunk` (parallel to
   `gids`; `Arc`-shared per block like pal/scale). Invert every
   format-from-arena derivation — the verified site list:
@@ -840,6 +870,17 @@ per-32-token alloc/free/sync cycles disappear — check `KV_ARENA_STATS` and
 pool counters, and watch for a decode-latency improvement); no perf
 regression. Run the migration byte-identity round-trip tests alongside the
 model test (audit A2's second gate), plus the new `byte_size` assertion.
+
+Two numbers to record specifically, because both are predictions this step
+makes and neither is visible in tokens/s:
+
+- **Fused selection-table bytes** (E5): expect a fall at typical drain
+  widths — 17.7 MiB → ~1.7 MiB at 336 arenas / a 1000-token turn — and the
+  scaling to switch from arena count to chunk count.
+- **Where the `GID_STRIDE` win lands** (A15): if LLVM was *not* folding
+  `arena_gid_stride()`, the gain shows up as a broad host-side drop across
+  every refcount operation, not a serialize-path one. Which of the two it is
+  tells us whether the fold was happening.
 
 ### Step 2 — Port transient buffers to the bump side
 
@@ -1066,9 +1107,10 @@ scheduler's signal wiring — instead of a workspace-wide type refactor.
 
 ## 8. Audits and experiments (2026-08-07)
 
-Fifteen audits and three throwaway experiments run before implementation.
+Fifteen audits and five throwaway experiments run before implementation.
 Four findings changed the design (A1 + its amendment, A10/A13, A14); one added
-a deletion (A4); one re-priced a change (A15); the rest confirmed it.
+a deletion (A4); two re-priced a change (A15, E5); one overturned an earlier
+experiment's conclusion (E4 vs E3); the rest confirmed it.
 
 ### 8.1 Audits
 
@@ -1275,13 +1317,66 @@ Promoted to three permanent tests in step 1.
 lib *and* tests compiling clean. Confirms the "test-only consumers, delete
 don't port" claim empirically rather than by grep. Reverted.
 
-**E3 — `Backing::Lease` mechanics.** cudarc 0.17.3 provides
+**E3 — `Backing::Lease` primitives.** cudarc 0.17.3 provides
 `CudaStream::upgrade_device_ptr<T>(ptr, len) -> CudaSlice<T>` (unsafe) and
 `CudaSlice::leak() -> CUdeviceptr`. The lease is therefore
-**upgrade-on-construct + leak-on-drop** — no vendored-cudarc change and no
-`ManuallyDrop` hack. cudarc's stated contract ("memory may not be valid for
-`T`; memset it") is already satisfied by zero-on-recycle (invariant 4).
-Closes open question 5.
+**upgrade-on-construct + leak-on-drop**, with no vendored-cudarc change.
+cudarc's stated contract ("memory may not be valid for `T`; memset it") is
+already satisfied by zero-on-recycle (invariant 4). Closes open question 5.
+
+*Corrected by E4*: E3 also claimed "no `ManuallyDrop` hack", which was wrong
+in both directions. `CudaSlice::leak` takes `self` **by value** and ends in
+`mem::forget(self)`, so it cannot be called from `Drop::drop(&mut self)` at
+all — *something* must move the slice out. But `ManuallyDrop` is not that
+something: a tombstone variant plus `mem::replace` is smaller and leaves
+owned storage's drop semantics untouched. E3 named the primitives correctly
+and then guessed at the assembly; E4 built it.
+
+**E4 — `Backing::Lease`, built end-to-end and reverted.** Three phases, each
+compiled separately so the cost of each is attributable:
+
+| Phase | Question | Result |
+|---|---|---|
+| 1 — add `CudaStorageSlice::Empty` | how many exhaustive matches break? | **18**, one round, no nested reveals; `cuda_backend/{mod,utils}.rs` only |
+| 2 — add `backing: Backing` | how many struct literals break? | **35** candle-core + **8** candle-nn; **only** E0063, nothing else |
+| 3 — add `Drop for CudaStorage` | does anything move fields out? | **zero errors** — nothing destructures a `CudaStorage` |
+
+`cargo check --workspace --features cuda --tests`: clean. Total **115
+insertions / 30 deletions across 6 files**. Reverted.
+
+Phase 3 was the real risk — implementing `Drop` forbids moving fields out of
+a type, and `CudaStorage`'s two fields are `pub`. Nothing does. Had anything
+destructured it, the tombstone route would have died and the
+`ManuallyDrop`-per-variant route (**142** `ManuallyDrop::new` sites, measured
+separately) would have been forced. It is worth knowing that the fallback
+exists and what it costs, because nothing else in the design has a
+three-times-larger plan B hiding behind a one-line assumption.
+
+**E5 — selection-table sizing. FINDING: the fused table is 48 identical
+copies today.** `ChunkedKvBacking::new_layer` does `inner:
+Arc::clone(&self.inner)` (`backing.rs:908`), so every layer of a group shares
+**one** `BackingInner` and therefore one arena set. But
+`from_head_gids_multi` calls `backing.per_head_table_host()` once per layer
+and concatenates the results, relabelling each by `arena_offset`
+(`gpu.rs:965-980`). All 48 calls return byte-identical data. At `PerHeadEntry`
+= 288 B/row and the §9 geometry (48 layers × 4 KV heads):
+
+```
+TODAY  rows = n_layers × num_arenas × n_kv_head      ← the 48 copies
+   336 arenas  →  64,512 rows = 17.72 MiB per fused selection
+
+AFTER  rows = total_chunks × n_kv_head
+   1,536 chunks (a ~1000-token turn) →  6,144 rows =  1.69 MiB
+   crossover at 336 arenas: 16,128 chunks = 10,752 tokens/layer
+```
+
+The ratio is workload-dependent; the **exponent** is not, and that is the
+point. Today the table scales with *arena count* — it grows with exactly the
+fragmentation this initiative exists to delete, so the drain gets more
+expensive as the pool gets sicker. After the re-index it scales with *chunks
+actually being selected*, i.e. with work. **Record the fused-table bytes in
+the step-1 gate**; expect a fall at typical drain widths and confirm the
+crossover only bites above ~10 K tokens/layer.
 
 ## 9. Verification status
 
@@ -1315,6 +1410,9 @@ scratchpad (`vmm_probe.py`, `vmm_release_probe.py`, `vmm_overcommit_probe.py`).
 | The selection-gid validator bounds `chunk_idx` per format (A14) | `backing.rs:1523-1534` (`arena_chunks_for_format(arena.format())`) |
 | `arena_gid_stride()` is called from all five `ChunkGid` refcount ops (A15) | `gid_pool.rs:462`, `:495`, `:500`, `:517`, `:539`; definition iterates `QuantFormat::iter()` at `types.rs:50-68` |
 | `alloc_side` already prefers a contiguous `N_PALETTE` run per uniform group | `compress.rs:729-730` — classes are coarser than formats, so run eligibility *rises* |
+| **All layers of a group share one `BackingInner`** (⇒ one arena set) | `backing.rs:908` `inner: Arc::clone(&self.inner)` in `new_layer`; load-bearing for E5 and for `per_head_table_host`'s dense-over-storage sizing |
+| Nothing destructures a `CudaStorage`, so `Drop` may be added | E4 phase 3: zero errors workspace-wide with `impl Drop for CudaStorage` present |
+| `CudaSlice::leak` is by-value and `mem::forget`s | cudarc 0.17.3 `core.rs:1915`; waits on read/write events, destroys them, decrements the stream `Arc` |
 
 **Proven by probe**
 
