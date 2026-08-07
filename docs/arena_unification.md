@@ -1,6 +1,6 @@
 # Unified Arena Memory — One Reservation, Two Directions, No Defragmentation
 
-> **Status**: **FINAL** — design approved, audited against the code (A1–A12),
+> **Status**: **FINAL** — design approved, audited against the code (A1–A15),
 > probed on the target hardware, scoped, and with **no open questions
 > remaining** (§10). Implementation staged in seven gated steps; step 1 is
 > unblocked. What is left is measurement, and every measurement has a named
@@ -672,6 +672,10 @@ exact counters.
    tests assert raw bytes, per repo policy. **This is not free under size
    classes**: the persist path is stride-driven end to end, so it requires
    the payload/stride split of invariant 8 (audit A1, §8).
+6. **u16 recycle links**: chunks-per-region ≤ 65,535 for every class
+   (min class 320 B ⇒ 52,428).
+7. **Lifetime segregation** (principle 2): no transient allocation in a
+   class region, no class chunk in the bump side, at any time.
 8. **Payload bytes ≠ address stride.** `ResolvedArenaInfo` carries *two*
    lengths: `chunk_byte_stride` (the class stride — address arithmetic only,
    `base + idx × stride`) and `chunk_payload_bytes` (the format's real bytes
@@ -679,11 +683,10 @@ exact counters.
    uses the **stride** (invariant 4: the next tenant may be any format);
    copying and persisting use the **payload**. Conflating them makes every
    hot→warm migration move pad over PCIe and silently changes on-disk image
-   sizes and their Fletcher goldens.
-6. **u16 recycle links**: chunks-per-region ≤ 65,535 for every class
-   (min class 320 B ⇒ 52,428).
-7. **Lifetime segregation** (principle 2): no transient allocation in a
-   class region, no class chunk in the bump side, at any time.
+   sizes and their Fletcher goldens. **Seven** sites consume the length as a
+   copy/extent rather than an address step, and they span three crates —
+   enumerated in §5 step 1; A1 found the class, and the sweep that followed
+   found the rest.
 
 ---
 
@@ -696,9 +699,11 @@ Capture the **baseline** run before step 1.
 ### Step 1 — Unify allocation across quants and arena types (size classes)
 
 *Scope*: `candle-nn/src/kv_cache/`, one `candle-core` storage variant
-(`Backing::Lease`), and one CUDA function (`resolve_band_source`). The CUDA
-allocator is still called per region; defrag/compaction still exist (they
-fire far less).
+(`Backing::Lease`), one CUDA function (`resolve_band_source`), and **one
+`candle-conversation` persist site** — `seal_to_chunk_images_cpu`
+(`transfer.rs:269`) is a payload/stride consumer and cannot be left behind
+(see the split below). The CUDA allocator is still called per region;
+defrag/compaction still exist (they fire far less).
 
 - Introduce the **`Backing::Lease` storage variant** (§3.7) — needed here
   only so the legacy `read_contiguous`/`write_contiguous` façade can take
@@ -740,6 +745,23 @@ fire far less).
   `(SizeClass, ArenaLocation)`; `arena_chunks_for_format` →
   `chunks_for_class`; `arena_gid_stride()` → the fixed 65,536; scarcity-only
   class promotion in the allocator.
+
+  The fixed stride is a bigger win than "cheaper gid decode in the serialize
+  paths" implies. `arena_gid_stride()` re-derives the maximum over **all 22
+  `QuantFormat`s plus 3 float dtypes** through a `strum` iterator on every
+  call, and it is called inside `ChunkGid::clone`, `drop`, `arena_idx`,
+  `chunk_idx`, and `strong_count` (`gid_pool.rs:462/495/500/517/539`) — i.e.
+  on **every refcount operation in the system**. It is not a `const fn` and
+  nothing guarantees the fold. A compiled `1 << 16` makes it shift/mask by
+  construction.
+- **Port `validate_selection_gids`, do not delete it**
+  (`backing.rs:1499-1541`, audit A14). It bounds-checks every selection gid's
+  `chunk_idx` against `arena_chunks_for_format(arena.format())` before the
+  table upload, and its second arm exists for a sanitizer-confirmed OOB read
+  at exactly slab end. Classes make its failure mode *rarer*, not impossible:
+  a region freed and re-stamped to a different class has a different stride,
+  which is the same re-tenancy hazard under a new name. Rewrite the bound as
+  `chunks_for_class(class)` and keep both arms.
 - Collapse `Arena::Float`/`Arena::Quantized` into **one byte-slab variant**
   with a class stride (§3.7): `zero_chunk_at` → memset, the pinned
   read/write paths → memcpy, pointer resolution → `base + idx × stride`.
@@ -749,13 +771,30 @@ fire far less).
   `k_arenas()`/`v_arenas()` methods and their ~19 test references are
   rewritten to byte-slab equivalents or deleted with the tests they serve.
 - **Split payload from stride** (invariant 8): add `chunk_payload_bytes` to
-  `ResolvedArenaInfo` and switch the copy-length sites to it — the DtoH
-  gather (`chunk_ops.rs:1987`), the cross-layer gather (`:2206`), the HtoD
-  scatter (`:2755`), and `HeadGids::arena_byte_size`
-  (`head_gids.rs:156-186`, which feeds `seal_to_chunk_images`' blob slicing
-  and per-chunk Fletcher goldens). Leave every `base + idx × stride`
-  addressing site on `chunk_byte_stride`, and leave `zero_chunk_at` on the
-  stride.
+  `ResolvedArenaInfo` and switch **all seven** copy-length sites to it. Leave
+  every `base + idx × stride` addressing site on `chunk_byte_stride`, and
+  leave `zero_chunk_at` on the stride. The verified inventory:
+
+  | # | Site | Role of the length |
+  |---|---|---|
+  | 1 | `chunk_ops.rs:1987` | DtoH gather copy length |
+  | 2 | `chunk_ops.rs:2206` | cross-layer gather copy length |
+  | 3 | `chunk_ops.rs:2755` | HtoD scatter copy length |
+  | 4 | `head_gids.rs:156-186` | `arena_byte_size` → `SealedChunk.byte_size` |
+  | 5 | `migrate.rs:199` | `resolve_sealed_chunk_ptrs` → `(ptr, len)` pairs |
+  | 6 | `migrate.rs:234` | `resolve_sealed_chunk_ptrs_per_gid`, same |
+  | 7 | `transfer.rs:269` | `seal_to_chunk_images_cpu` blob slot reservation |
+
+  Sites 5–7 are the ones the first pass missed, and **7 is the dangerous
+  one**. `seal_to_chunk_images_cpu` appends a **stride**-sized slot to the
+  blob per unique gid, then splits that blob by `sc.byte_size`. Today the two
+  agree by construction. The moment `byte_size` becomes payload-summed while
+  the gather still reserves stride, the blob and the split disagree — the
+  visible outcome is `seal_to_chunk_images_cpu: blob underrun`, the invisible
+  one is every chunk after the first landing on shifted boundaries in
+  persisted data. Site 5 feeds `seal_to_chunk_images_gpu`'s `split_sizes` the
+  same way. **All seven must move in one commit**; a partial conversion is
+  worse than none, because sites that still agree mask the ones that don't.
 - Land four **permanent** invariant tests. Three are the E1 harness,
   promoted: every `QuantFormat` and float dtype maps to a class; every class
   yields ≤ 65,535 chunks/region; `GID_STRIDE` exceeds the max chunks/region.
@@ -1021,13 +1060,15 @@ buy. None erodes a §1.1 benefit.
 | **S7** | Pinned host (warm-tier) reservation | a second reservation subsystem | Different memory (host RAM), different benefit (PCIe bandwidth), zero coupling to the VRAM wins. Follow-on initiative |
 
 Net: the initiative touches `candle-nn/src/kv_cache/` plus one narrow
-`candle-core` storage variant, one CUDA row-index change, and the scheduler's
-signal wiring — instead of a workspace-wide type refactor.
+`candle-core` storage variant, one CUDA row-index change, one
+`candle-conversation` persist-gather site (§5 step 1, site 7), and the
+scheduler's signal wiring — instead of a workspace-wide type refactor.
 
 ## 8. Audits and experiments (2026-08-07)
 
-Six audits and three throwaway experiments run before implementation. Two
-findings changed the design; one added a deletion; the rest confirmed it.
+Fifteen audits and three throwaway experiments run before implementation.
+Four findings changed the design (A1 + its amendment, A10/A13, A14); one added
+a deletion (A4); one re-priced a change (A15); the rest confirmed it.
 
 ### 8.1 Audits
 
@@ -1042,6 +1083,20 @@ pad, goldens would cover pad, and every migration would move pad over PCIe —
 invariant 5 violated. **Resolved**: split payload from stride (invariant 8);
 open question 2 is closed in favour of trim-to-format.
 
+*Amended after a full sweep of the length's consumers*: A1 named four sites;
+there are **seven**, and they span three crates. The three it missed are
+`resolve_sealed_chunk_ptrs` (`migrate.rs:199`), its per-gid variant
+(`:234`) — both returning `chunk_byte_stride` as the `len` half of a
+`(ptr, len)` pair that becomes the GPU gather's `split_sizes` — and
+`seal_to_chunk_images_cpu` (`transfer.rs:269`), which reserves a
+stride-sized blob slot per gid and then splits that blob by
+`sc.byte_size`. The last one sits in **candle-conversation**, outside the
+crate scope step 1 originally declared; the scope line and the step-1
+inventory are corrected accordingly. The lesson generalises: A1 audited the
+*persist path* and found the class of bug, but the length escapes through
+`(ptr, len)` return tuples that read like addresses. Audit the **consumers of
+a value**, not the paths you expect it to travel.
+
 **A2 — Gate coverage. Better than assumed.** The gate test spans `F16`,
 `BF16`, `Q8_0`, `Q4_0` **and adaptive `C0–C7`, `C9`, `C10`** (only `C8` is
 absent) at 1–48 contexts, and drives `record_turn` → `quantize_sealed_in_place`
@@ -1055,10 +1110,19 @@ multi-turn fork/CoW. The existing
 run them alongside the model test from step 1, since A1's payload/stride
 split lands there.
 
-**A3 — Test blast radius: small.** ~45 test-side references across the
-changed surfaces (`*_arenas()` 19, `ArenaKey` ctors 11, `arena_gid_stride` 8,
-`arena_chunks_for_format` 4, defrag/compact 2, `PagedKvArenas` 1). Classify
-each as delete / rewrite / must-pass before step 1 starts.
+**A3 — Test blast radius: small; total surface larger than first counted.**
+Re-measured across `candle-nn` + `candle-transformers` + `candle-conversation`
+as `(total references, of which in test files)`: `*_arenas()` **19 / 13**,
+`ArenaKey::` **61 / 28**, `arena_gid_stride` **55 / 8**,
+`arena_chunks_for_format` **37 / 4**, `PagedKvArenas` **4 / 1**,
+defrag/compact **48 / 1**. The original "~45 test-side references" counted
+constructor calls in tests only; the *test* blast radius survives that
+correction (≈55 test-side references, two thirds of them `ArenaKey::`
+constructions in fixtures), but the **production** surface for
+`arena_gid_stride` and `ArenaKey::` is 3–5× what was recorded, which is why
+the fixed-stride change is graded as a hot-path win rather than a tidy-up
+(see step 1). Classify each test reference as delete / rewrite / must-pass
+before step 1 starts.
 
 **A4 — Deletion safety. FINDING: one more subsystem dies.** See the
 `migrate_guard` entry in step 5 — a permanent reservation makes base-pointer
@@ -1166,6 +1230,33 @@ geometry at all), and geometry enters only when *selecting* a class for a
 format, where `sub_head_dim` is passed explicitly. Keep an assert that
 `sub_head_dim × CHUNK_SIZE` matches the class-selection input.
 
+**A14 — The selection-gid validator survives classes. FINDING: it was absent
+from the step-1 inventory.** `validate_selection_gids`
+(`backing.rs:1499-1541`) runs before every selection table upload and rejects
+two host-state corruptions the kernel cannot detect: a gid whose arena is
+**absent** from storage (freed under a live gid → zeroed row → near-null
+deref), and a gid whose `chunk_idx` exceeds its arena's per-format capacity
+(the arena index re-tenanted under a live gid, so `old_chunk_idx × new_stride`
+walks past the slab — the code comment records this as sanitizer-confirmed at
+exactly slab end). Both failure modes get *rarer* under size classes and
+neither disappears: a region returned to the free list and re-stamped with a
+different class has a different stride, which is bit-for-bit the same hazard.
+The validator is therefore **ported** (bound becomes `chunks_for_class`), not
+deleted with the per-format machinery around it. Recorded because it is
+exactly the shape of thing a deletion sweep removes by association — it reads
+like format bookkeeping and is actually a memory-safety net.
+
+**A15 — `arena_gid_stride()` is on the refcount hot path.** Not a defect in
+the design, a correction to how the fixed-stride change was *valued*. The
+function iterates all 22 `QuantFormat` variants (via `strum`) plus 3 float
+dtypes, computing a division per variant, and is called from
+`ChunkGid::clone` / `drop` / `arena_idx` / `chunk_idx` / `strong_count` — the
+five operations every COW share, every window drop, and every gid walk go
+through. It is not `const fn`; the fold is plausible under LTO but unproven.
+`GID_STRIDE = 1 << 16` removes the question. Watch for this in the step-1 gate
+numbers: if the fold was *not* happening, the win shows up as a broad
+host-side drop, not a serialize-path one.
+
 ### 8.2 Experiments (throwaway; reverted)
 
 
@@ -1217,6 +1308,13 @@ scratchpad (`vmm_probe.py`, `vmm_release_probe.py`, `vmm_overcommit_probe.py`).
 | Exactly one production relief closure — the gallery, under `AllocClass::Kv`; `Expert` gets a tally only | `scheduler/mod.rs:2363` vs `quantized_qwen3_moe.rs:1922-1926` (`set_class`) |
 | All 30 symbols in step 5's deletion inventory exist | grep sweep across the four crates |
 | 18 relief call sites in `prefill.rs`, 1 unforced in `run.rs:484` | grep count |
+| Attention reads per-band ptr/fmt/scale with no arena involvement | `slot_types.cuh:187-221` (`kvhead_k_ptr/k_fmt/k_scale` index by palette `p`) |
+| Format ⇒ arena is created in exactly one closure | `compress.rs:728-738` (`alloc_side` → `ArenaKey::gpu_quant(fmt)`), run per `(chunk, head, side)` |
+| Seven payload/stride consumers, spanning three crates | `chunk_ops.rs:1987/2206/2755`, `head_gids.rs:156-186`, `migrate.rs:199/234`, `transfer.rs:269` |
+| `seal_to_chunk_images_cpu` reserves by stride, splits by `byte_size` | `transfer.rs:269-289` (`blob.resize(start + stride)` vs `let n = sc.byte_size`) |
+| The selection-gid validator bounds `chunk_idx` per format (A14) | `backing.rs:1523-1534` (`arena_chunks_for_format(arena.format())`) |
+| `arena_gid_stride()` is called from all five `ChunkGid` refcount ops (A15) | `gid_pool.rs:462`, `:495`, `:500`, `:517`, `:539`; definition iterates `QuantFormat::iter()` at `types.rs:50-68` |
+| `alloc_side` already prefers a contiguous `N_PALETTE` run per uniform group | `compress.rs:729-730` — classes are coarser than formats, so run eligibility *rises* |
 
 **Proven by probe**
 
