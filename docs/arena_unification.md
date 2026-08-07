@@ -41,11 +41,17 @@ impossible in both cases.
 1. **Claim once, free never.** Every steady-state byte comes from a
    reservation mapped at startup. No CUDA allocation, no CUDA free, on any
    inference or maintenance path.
-2. **Segregate by lifetime, not by consumer.** Turn-or-longer allocations
-   live in the left region pool; wave-scoped transients live in the right
-   bump side; process-lifetime scratch sits at the fixed right tip. Mixing
-   lifetimes in one pool is the root fragmentation mechanism (§3.10) and is
-   forbidden by layout.
+2. **Lifetime determines allocator, and there are only three.**
+   Wave-scoped → the bump side. Turn-or-longer → the region pool.
+   Process-lifetime → the static shelf. Mixing lifetimes in one pool is the
+   root fragmentation mechanism (§3.10) and is forbidden by layout.
+   **Corollary — anything that outlives a wave is arena-managed, never
+   buffer-allocated.** The small reserve is for odd-shaped *transients* we
+   chose not to convert; it is not a home for long-lived state. A long-lived
+   consumer left on the CUDA pool means recurring `cuMemAlloc`/`cuMemFree`
+   in steady state, which is principle 1 violated by another name — and if
+   it also *grows*, it drags §1.3's pool-slack mechanism back in with it
+   (audit A13).
 3. **Fixed strides only.** Every allocator hands out fixed-size units
    (class slots, whole regions, or a bump cursor that resets wholesale).
    Variable-size allocation — the precondition for fragmentation that needs
@@ -790,17 +796,29 @@ Candidates, in order of confidence:
 - grow-only scratches: `ProvSignScratch`, `KvSamplerGpu`, MoE routing
   buffers — moved to the static shelf.
 
-**Explicitly NOT bump-side: `GpuChunks` device buffers** (audit A10). The
-per-`(layer, batch_idx)` decode slot-state buffer is **cached across waves** —
+**Not bump-side, and not the pool remnant either: `GpuChunks` device buffers
+move to the REGION tier** (audits A10, A13). The per-`(layer, batch_idx)`
+decode slot-state buffer is **cached across waves** —
 `sync_decode_gpu_chunks` returns `DecodeGpuChunksSyncKind::Reuse` with the
-existing `raw_device_ptr()` whenever the chunk count still matches. A
-per-wave cursor reset would recycle it under a live sequence. It is
-long-lived per-sequence state, so it **stays on the pool remnant**: it is
-small (~16 B/chunk; order 15 MiB across 48 layers × 64 slots at depth), it
-already works, and putting it in the KV region tier would mix a
-resize-on-demand buffer into the class pools for no benefit. Any transient
-buffer whose lifetime is *not* provably within one wave gets the same
-treatment — the debug assert on mid-wave allocation is what catches a
+existing `raw_device_ptr()` whenever the chunk count still matches — so a
+per-wave cursor reset would recycle it under a live sequence. By principle 2
+it is turn-or-longer, therefore arena-managed:
+
+- **A doubling class family** (4 KiB, 8, 16, … 1 MiB), one slot per
+  `(layer, batch slot)`. Growth is a **promotion**: claim the next class up,
+  copy, release the old slot — exactly what `resize` does today, minus the
+  allocator and minus the stream sync. A 1 MiB slot holds 65,536 chunks
+  ≈ 2 M tokens per sequence per layer; a 16 MiB region caps at ~33 M.
+- **Contiguity is preserved.** The kernel reads the buffer linearly from
+  `raw_device_ptr`; a region slot is contiguous, so it stays a plain pointer.
+  No paging, and the paged-output contingency remains unbuilt.
+- **The cost is a rounding error**: 16 B of slot-state per chunk against
+  ~37 KB of KV for that same chunk (32 bands × ~1152 B) = **0.04 %**.
+
+The host-side `PinnedBuf` half has the same problem and the same answer, but
+its home is the pinned host reservation (S7, follow-on); until then it stays
+as-is. Any buffer whose lifetime is not provably within one wave gets this
+same classification — the mid-wave-allocation debug assert is what catches a
 misclassification.
 
 Build the unified `BumpArena` abstraction by generalizing `PinnedStager`
@@ -838,7 +856,8 @@ loudly.
 **The paged-output contingency is not built.** The audit it was waiting on is
 done (A10/A11, §8): the only buffer that outlives its wave is `GpuChunks`,
 and that is host-built metadata uploaded by memcpy, not a kernel output — it
-stays on the pool remnant. No kernel output needs paging, so no
+goes to the region tier as a contiguous slot (§5 step 2), so it needs no
+paging either. No kernel output needs paging, so no
 `page_table`/`PagedTensor`/paged-`QTensor` work happens. `PAGE_BYTES` stays a
 reserved constant (§3.5) so the option survives if a future buffer needs it;
 nothing implements against it today.
@@ -988,7 +1007,7 @@ buy. None erodes a §1.1 benefit.
 | **S2** | `Arena::Float`/`Arena::Quantized` duality + the `PagedKvArenas` trait | **62** match sites across 6 files; trait deletion verified to compile clean (E2) | Under size classes the storage need not know the format (it is chunk metadata). Resulting primitives are *simpler than today's*: memset instead of `Tensor::zeros`+`slice_set`, memcpy instead of `narrow`/`flatten_all`/`to_vec1` |
 | **S3** | The 6144 gallery-page class only | 1 of 8 classes | It exists solely for the gallery arena, which is out of scope (S5). **Quant coverage is kept in full**: the remaining seven classes cover all 22 `QuantFormat` variants and all four float dtypes. Sizing the ladder to the *current* candidate lists was rejected — those tables are provisional/per-model, overrides can force any format, and cold-loaded chunks carry persisted tags (§3.4) |
 | **S4** | `PlanBuf<'gen>` + slot tables + disjointness bookkeeping | a whole handle-type layer | A bump allocator returns disjoint ranges by construction; the buffer set is just locals held across the layer loop. Canaries survive as an optional debug feature for device-side overruns |
-| **S5** | Gallery-arena and meta-pool fold-in | two subsystem migrations | Both work today and are small. The only coupling — the gallery holding the sole `register_relief` — is answered by driving its LRU from the free-region counter (a few lines), not by absorbing it |
+| **S5** | Gallery-arena and meta-pool fold-in | two subsystem migrations | Both work today and are small. Crucially both **already obey principle 2's corollary** — they are arenas (slab allocators), just parallel implementations — so folding them in is *consolidation*, not correctness. Contrast `GpuChunks`, which genuinely buffer-allocates and therefore moves now (A13). The only coupling — the gallery holding the sole `register_relief` — is answered by driving its LRU from the free-region counter (a few lines), not by absorbing it |
 | **S6** | Floating boundary *motion* in step 4 (layout still lands) | regulator + hysteresis + boundary-press-vs-writers interaction | The **layout** carries the segregation (§3.10 problem 1) and contiguity benefits; **motion** only removes a tuning knob. Fixed boundary from measured peaks first; add motion in step 6 only if it strands real memory |
 | **S7** | Pinned host (warm-tier) reservation | a second reservation subsystem | Different memory (host RAM), different benefit (PCIe bandwidth), zero coupling to the VRAM wins. Follow-on initiative |
 
@@ -1073,10 +1092,36 @@ whenever the chunk count matches (`types.rs:946-957`, the `Reuse` arm), with
 a `PinnedBuf` + `CudaSlice<u8>` pair resized on demand
 (`gpu_chunks.rs:104-130`). It was listed as a step-2 bump candidate; that was
 wrong and is corrected — a per-wave cursor reset would recycle it under a
-live sequence. It stays on the pool remnant. **This is the answer to "does
-any buffer outlive its wave?" — yes, but it is host-built metadata uploaded
-by memcpy, not a kernel output, so it does not force the paged-output
-contingency.** That contingency stays unbuilt.
+live sequence. **This is the answer to "does any buffer outlive its wave?" —
+yes, but it is host-built metadata uploaded by memcpy, not a kernel output,
+so it does not force the paged-output contingency.** That contingency stays
+unbuilt. (A first revision parked it on the pool remnant; A13 overturns
+that.)
+
+**A13 — …and the pool remnant was the wrong home: it is a live decode-path
+cost.** `GpuChunksGuard::clear` (`gpu_chunks.rs:275-287`) performs a **full
+`stream.synchronize()`**, then drops the `PinnedBuf` (`cuMemFreeHost` —
+page-unpinning) and the `CudaSlice` (`cuMemFree`). `clear` is invoked by
+*every* structural mutation — `push_chunk`, `truncate_chunks`,
+`extend_chunks`, `split_off_chunks`, `drain_front_chunks`,
+`prepend_chunks`, `replace_chunks`, `invalidate_gpu_chunks` — and
+`push_chunk` fires **every time a sequence crosses a 32-token boundary**. The
+following decode then hits `rebuild_decode` → `resize` → a fresh
+`PinnedBuf::alloc_owned` (`cuMemHostAlloc`) plus `stream.alloc`.
+
+Steady-state decode therefore pays, per sequence per 32 tokens across 48
+layers: 48 stream syncs + 48 host-pinned frees + 48 device frees, then 48
+host-pinned allocs + 48 device allocs — **≈ 3,000 alloc/free/sync cycles per
+32 decoded tokens at batch 64**. Full stream syncs serialise the pipeline and
+`cuMemHostAlloc` pins pages in the OS. Leaving this on the pool remnant would
+preserve a decode-path performance bug *inside* a design whose stated purpose
+is deleting exactly this, and the buffer grows with context depth — unbounded
+by the engine's premise — so a "small reserve" sized for it would drag
+§1.3's pool-slack mechanism back in. Resolution: the region tier with a
+doubling class family (§5 step 2), which removes every one of those calls
+(promotion is a copy between preallocated slots). **Generalised as principle
+2's corollary: anything outliving a wave is arena-managed, never
+buffer-allocated.**
 
 **A11 — Sampling holds no device state; logits are wave-scoped.**
 `BatchedSampler` (`batched_sampler.rs:362-377`) carries only `device`,
@@ -1196,10 +1241,13 @@ derive from `sub_head_dim` explicitly and assert the identity.
 1. ~~Logits/sampling buffer placement~~ -> **bump side** (A11). Sampling holds
    no device state; logits die with the wave. `KvSamplerGpu` scratch -> static
    shelf.
-2. ~~Does any buffer outlive its wave?~~ -> **yes, `GpuChunks`** (A10) - and it
-   stays on the pool remnant. Because it is host-built metadata rather than a
-   kernel output, the **paged-output contingency stays unbuilt**; `PAGE_BYTES`
-   remains a reserved constant with no implementation behind it.
+2. ~~Does any buffer outlive its wave?~~ -> **yes, `GpuChunks`** (A10), which
+   therefore goes to the **region tier** under principle 2's corollary, not
+   the pool remnant (A13 — leaving it there would have preserved ~3,000
+   alloc/free/sync cycles per 32 decoded tokens). Because it is host-built
+   metadata rather than a kernel output, the **paged-output contingency stays
+   unbuilt**; `PAGE_BYTES` remains a reserved constant with no implementation
+   behind it.
 3. ~~Small-end class granularity~~ -> **a decision rule, not a question**
    (A12): split the low end only if sub-320 formats exceed ~2 % of live slots.
    Instrument by adding a per-format tally to `compression_bpe`'s existing slot
