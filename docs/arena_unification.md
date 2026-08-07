@@ -1,8 +1,10 @@
 # Unified Arena Memory — One Reservation, Two Directions, No Defragmentation
 
-> **Status**: **FINAL** — design approved, audited against the code, probed on
-> the target hardware, and scoped. Implementation staged in seven gated steps;
-> step 1 is unblocked. Three open questions remain (§10), none blocking.
+> **Status**: **FINAL** — design approved, audited against the code (A1–A12),
+> probed on the target hardware, scoped, and with **no open questions
+> remaining** (§10). Implementation staged in seven gated steps; step 1 is
+> unblocked. What is left is measurement, and every measurement has a named
+> hook and a threshold.
 > **Gate** (run after every step, all configs must pass, perf recorded in
 > `docs/arena_unification_results.md`):
 >
@@ -478,14 +480,13 @@ Consumers: chunk-meta rows, per-head tables, head-gid uploads, selection
 tables, migration descriptors, migration staging (`copy_stream.alloc`
 today), inter-layer hidden states, attention and MoE combine outputs.
 
-**Paged buffers survive only as a contingency** (§5 step 3): a buffer that
+**Paged buffers are a reserved option, not a deliverable** (audits A10/A11 found no kernel output that outlives its wave, so none is built). Were one ever to appear: a buffer that
 must *outlive its wave* cannot live in the bump side and, if it also should
 not occupy the small reserve, allocates `PAGE_BYTES = 64 KiB` pages from a
 region plus a device page table. With the compiled page constant the
 kernel-side page math is shift/mask (`page = row >> LOG2_ROWS_PER_PAGE`); a
 `PagedTensor` (or a paged `QTensor` storage variant) wraps
-`(page_table, logical shape)` for the Rust side. The gate decides in step 3
-whether any buffer actually needs this.
+`(page_table, logical shape)` for the Rust side.
 
 ### 3.7 Memory ownership in the type system
 
@@ -779,12 +780,28 @@ unchanged by the swap.
 Candidates, in order of confidence:
 
 - kernel argument/metadata blobs: chunk-meta rows, per-head tables, head-gid
-  uploads, selection tables (`PagedSelectionGpuInputs`), decode slot-state
-  buffers (`GpuChunks` device side), migration descriptors;
+  uploads, selection tables (`PagedSelectionGpuInputs`), migration
+  descriptors;
 - migration staging slices (`copy_stream.alloc`, ≤ 512 MiB cap) — allocated
   from the persistence domain's sub-range;
-- grow-only scratches: `ProvSignScratch`, sampler scratch, MoE routing
+- **logits** (audit A11: wave-scoped — produced by the forward, consumed by
+  sampling in the same wave; `BatchedSampler` holds *no* device state at
+  all, so nothing else from sampling needs placement);
+- grow-only scratches: `ProvSignScratch`, `KvSamplerGpu`, MoE routing
   buffers — moved to the static shelf.
+
+**Explicitly NOT bump-side: `GpuChunks` device buffers** (audit A10). The
+per-`(layer, batch_idx)` decode slot-state buffer is **cached across waves** —
+`sync_decode_gpu_chunks` returns `DecodeGpuChunksSyncKind::Reuse` with the
+existing `raw_device_ptr()` whenever the chunk count still matches. A
+per-wave cursor reset would recycle it under a live sequence. It is
+long-lived per-sequence state, so it **stays on the pool remnant**: it is
+small (~16 B/chunk; order 15 MiB across 48 layers × 64 slots at depth), it
+already works, and putting it in the KV region tier would mix a
+resize-on-demand buffer into the class pools for no benefit. Any transient
+buffer whose lifetime is *not* provably within one wave gets the same
+treatment — the debug assert on mid-wave allocation is what catches a
+misclassification.
 
 Build the unified `BumpArena` abstraction by generalizing `PinnedStager`
 (host-pinned + device instances, shared `Generation` lifecycle), the
@@ -818,13 +835,13 @@ allocation shape CUDA graph capture wants). Anything allocated inside the
 scope that must outlive the wave becomes a leak the counted reset detects
 loudly.
 
-The **paged-output contingency** activates only for a buffer that must
-outlive its wave and so cannot live in the bump side: extend the relevant
-kernels with a paged-write mode (`page_table` + compiled `PAGE_BYTES` math,
-§3.5) and add `PagedTensor` (or a paged `QTensor` storage variant) wrapping
-`(page_table, logical shape)`. If the audit finds no such buffer, this step
-delivers only the bump-resident intermediates and the contingency stays
-unbuilt — the gate decides.
+**The paged-output contingency is not built.** The audit it was waiting on is
+done (A10/A11, §8): the only buffer that outlives its wave is `GpuChunks`,
+and that is host-built metadata uploaded by memcpy, not a kernel output — it
+stays on the pool remnant. No kernel output needs paging, so no
+`page_table`/`PagedTensor`/paged-`QTensor` work happens. `PAGE_BYTES` stays a
+reserved constant (§3.5) so the option survives if a future buffer needs it;
+nothing implements against it today.
 
 *Gate*: correctness (bit-identical where the op is deterministic);
 per-forward latency within noise of baseline on decode and wide-prefill
@@ -952,7 +969,6 @@ pre-unification baselines.
 | Boundary thrash / press stalled by un-evictable writers — **only if motion is built** | Region-aligned quantum (16 MiB) + regulator hysteresis + the free-region gap at the frontier make free-region claims the common case; admission throttling drains writers toward seal; the regulator's time constant absorbs turn-granularity waits (§3.6). Deferred to step 6 precisely so this interaction is faced with data. |
 | Buffer aliasing / use-after-reset (no allocator left to catch them) | Counted reset refuses while any lease is live (log + quarantine the half, never scribble); no-mid-wave-allocation debug assert; bump arithmetic is one audited function and returns disjoint ranges by construction; optional debug canaries for device-side overruns (§3.7). |
 | Cursor reset races an in-flight kernel of the prior wave | A/B halves + event-fenced reset (the `PinnedStager` sync-then-reset discipline, ported to the device instance). |
-| Paged-write kernel overhead (contingency path only) | Row-major pages preserve coalescing; compiled `PAGE_BYTES` keeps page math shift/mask. Verified in step 3's gate before anything depends on it. |
 | VMM path fails on a future driver/platform | Fallback probed and working: a single giant `cuMemAlloc` (14 GiB verified on the target machine) — same single-span design, coarser (whole-buffer) WDDM eviction unit. Runtime capability probe picks the path at startup. |
 | Silent over-commit while mapping the reservation (`cuMemCreate` never refuses — §3.2) | Stop signal is a failed **touch**, checked per granule, failing granule unmapped+released; extent additionally capped by the existing balloon back-off policy so the desktop keeps headroom. Never treat `cuMemCreate` success as capacity. |
 | Selection path reads a wrong format tag under mixed-format regions | The per-`(chunk, head)` re-index of the selection table (§5 step 1) must land in the *same commit* as the class switch; the gate test exercises the quantize-selection path on every config. |
@@ -1051,6 +1067,40 @@ path has **never executed with non-identical entries**, so step 1's gate run
 is its first real exercise. Treat the C-level configs as the acceptance
 signal for it specifically.
 
+**A10 — `GpuChunks` is cross-wave. FINDING: it must not go bump-side.** The
+decode slot-state buffer is cached per `(layer, batch_idx)` and reused
+whenever the chunk count matches (`types.rs:946-957`, the `Reuse` arm), with
+a `PinnedBuf` + `CudaSlice<u8>` pair resized on demand
+(`gpu_chunks.rs:104-130`). It was listed as a step-2 bump candidate; that was
+wrong and is corrected — a per-wave cursor reset would recycle it under a
+live sequence. It stays on the pool remnant. **This is the answer to "does
+any buffer outlive its wave?" — yes, but it is host-built metadata uploaded
+by memcpy, not a kernel output, so it does not force the paged-output
+contingency.** That contingency stays unbuilt.
+
+**A11 — Sampling holds no device state; logits are wave-scoped.**
+`BatchedSampler` (`batched_sampler.rs:362-377`) carries only `device`,
+`vocab_size`, `max_recent_len`, a host `TokenBuffer`, and a log path — no
+device buffers. Logits arrive as a forward-produced `Tensor` and are consumed
+in the same wave (`flatten_to_2d` → `index_select` → `sample_full_vocab`), so
+they belong on the bump side like any other intermediate. The only persistent
+sampler-adjacent device memory is `KvSamplerGpu`'s grow-only scratch → static
+shelf. Note `index_select` allocates its output through candle, i.e. the
+step-3 baseline-(a) case: interior op outputs stay on the pool remnant unless
+`WaveAllocScope` lands.
+
+**A12 — Small-end granularity has a break-even, not just a measurement.**
+Splitting the 320 class into {64, 160, 320} saves 256 B/slot on Q0/Q0_V/Q0_X
+and 160 B/slot on Q0_M2/Q1_S (Q1_A, Q0_M4, Q2_S, Q2_A unchanged), at the cost
+of two extra classes whose steady-state partial tails run ≈ ½ region each
+≈ 16 MiB total. Break-even is therefore ≈ 16 MiB ÷ ~200 B ≈ **65–84 K live
+slots** in sub-320 formats — roughly **2 % of a ~4.8 M-slot pool** on this
+card. **Decision rule: split the low end only if sub-320 formats exceed ~2 %
+of live slots.** Expected to fail at C4/C5 (production default, which never
+selects them) and to be worth re-checking at C9/C10. The instrumentation is
+nearly free: `compression_bpe` (`backing.rs:1874-1892`) already walks every
+`(head, palette, K/V)` slot — add a per-format tally to that walk.
+
 **A9 — `arena_bytes_per_chunk`'s `CHUNK_SIZE²` coupling dissolves.** Today
 chunk bytes are computed as `CHUNK_SIZE × CHUNK_SIZE` elements
 (`types.rs:22-32`) while arenas are *shaped*
@@ -1139,25 +1189,29 @@ slots ≈ 3.4 regions") assumes the Qwen3-30B-A3B geometry of 48 layers ×
 different `head_dim` silently mis-sizes every class. The class table should
 derive from `sub_head_dim` explicitly and assert the identity.
 
-## 10. Open questions (resolve during the step that touches them)
+## 10. Open questions
 
-Only three remain, and none blocks the start of step 1.
+**None.** The three that survived the §8 sweep were closed by audits A10-A12:
 
-1. **Whether logits/sampling buffers join the bump side or stay in the small
-   reserve** — pure scoping, decided when step 3 enumerates the wave's
-   buffer set.
-2. **Whether any buffer genuinely outlives its wave** and so forces the
-   paged-output contingency to be built (§3.6). Expected answer: none —
-   everything in the wave dies with the wave — but the step 3 audit
-   confirms rather than assumes.
-3. **Whether the small-end class granularity needs revisiting** once C9/C10
-   per-class occupancy is measured (§3.4). The only *quantitative* question
-   left in the design; the promoted E1 harness recomputes the ladder from a
-   single constant, so acting on the answer is cheap.
+1. ~~Logits/sampling buffer placement~~ -> **bump side** (A11). Sampling holds
+   no device state; logits die with the wave. `KvSamplerGpu` scratch -> static
+   shelf.
+2. ~~Does any buffer outlive its wave?~~ -> **yes, `GpuChunks`** (A10) - and it
+   stays on the pool remnant. Because it is host-built metadata rather than a
+   kernel output, the **paged-output contingency stays unbuilt**; `PAGE_BYTES`
+   remains a reserved constant with no implementation behind it.
+3. ~~Small-end class granularity~~ -> **a decision rule, not a question**
+   (A12): split the low end only if sub-320 formats exceed ~2 % of live slots.
+   Instrument by adding a per-format tally to `compression_bpe`'s existing slot
+   walk; evaluate at step 6 against C9/C10.
 
-Deferred with the warm-tier reservation (S7, follow-on): the host-side lease
-for `CpuStorage`'s `Vec` — the same upgrade/leak question with no cudarc
-equivalent, likely `ManuallyDrop` over `Vec::from_raw_parts`.
+One item is deferred *by scope*, not unresolved: the host-side lease for
+`CpuStorage`'s `Vec` travels with the warm-tier reservation (S7, follow-on) -
+the same upgrade/leak question with no cudarc equivalent, likely
+`ManuallyDrop` over `Vec::from_raw_parts`.
+
+Everything the design needs to decide is decided. What remains is measurement,
+and every measurement has a named hook and a threshold.
 
 *Resolved by §7 (scope)*: gallery/meta-pool fold-in (S5 — out of scope),
 size-class count (S3 — seven, full quant coverage retained), buffer-plan
