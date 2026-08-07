@@ -1,6 +1,8 @@
 # Unified Arena Memory — One Reservation, Two Directions, No Defragmentation
 
-> **Status**: design approved, implementation staged in seven gated steps.
+> **Status**: **FINAL** — design approved, audited against the code, probed on
+> the target hardware, and scoped. Implementation staged in seven gated steps;
+> step 1 is unblocked. Three open questions remain (§10), none blocking.
 > **Gate** (run after every step, all configs must pass, perf recorded in
 > `docs/arena_unification_results.md`):
 >
@@ -158,18 +160,25 @@ Load-bearing facts the design builds on:
     builder (`KvHeadHost::from_gids`, `slot_state.rs:147-153`) derives those
     tags from `arena_info[arena].k_format_tag` and must be inverted.
   - **Selection / probe (`select_kv_format_palette4_paged*`,
-    `sample_quant_errors_*`, `reduce_head_format_stats`): per-ARENA.**
-    `resolve_band_source` (`select_kv_format.cuh:1461-1463`) computes
-    `arena_idx = gid / arena_chunks`, looks up
-    `per_head_lookup(table, arena_idx, head, n_kv_head)`, and takes the format
-    **from that arena row**; the row is built per-arena from `arena.format()`
-    in `per_head_table_host` (`backing.rs:1549-1655`). This path **relies on
-    format ⇒ arena** — today's per-band format variety works precisely
-    *because* each format has its own arena. Size classes break that
-    implication, so this table must become per-`(chunk, head)` (§5 step 1).
-    The kernel's row-indexing arithmetic is the only kernel-visible change,
-    and the 36-column row layout already supports per-chunk rows (see
-    `tests/kv_stats_tests.rs:930`, which builds exactly that).
+    `sample_quant_errors_*`, `reduce_head_format_stats`): per-ARENA, and it
+    discards the palette dimension.** `resolve_band_source`
+    (`select_kv_format.cuh:1461-1463`) computes `arena_idx = gid /
+    arena_chunks` and looks up `load_per_head_entry(table, arena_idx, head,
+    n_kv_head)` — which bottoms out in `per_head_lookup`, returning
+    **`.palette[0]`** (`arena_table.cuh:114`), *ignoring* the `palette`
+    argument `resolve_band_source` was given. The row is built per-arena from
+    `arena.format()` in `per_head_table_host` (`backing.rs:1549-1655`), which
+    fills all four sub-entries **identically**.
+
+    So today's per-band format variety is produced entirely by
+    **`arena_idx` varying per band** — format ⇒ arena is load-bearing, and
+    the `Palette4` sub-entry structure is a present-but-unused capability
+    carrying four identical copies. Size classes put bands of different
+    formats in one region, collapsing `arena_idx`, so this path needs the
+    sub-entry dimension *activated*: index rows by `(chunk, head)` and read
+    `.palette[p]`. The row layout already provides it (see
+    `tests/kv_stats_tests.rs:930`, which builds per-chunk rows), so no struct
+    or launch change — see §5 step 1.
 - **Per-band format metadata already exists on two of three paths.** The
   cold-load path carries per-band `k_formats`/`v_formats`
   (`BlockAllocSpec`), and the substrate log persists per-chunk format tags
@@ -679,9 +688,10 @@ Capture the **baseline** run before step 1.
 
 ### Step 1 — Unify allocation across quants and arena types (size classes)
 
-*Scope*: the `candle-core` storage layer (`Backing::Lease`, `TensorG`) and
-`candle-nn/src/kv_cache/`. The CUDA allocator is still called per region;
-defrag/compaction still exist (they fire far less).
+*Scope*: `candle-nn/src/kv_cache/`, one `candle-core` storage variant
+(`Backing::Lease`), and one CUDA function (`resolve_band_source`). The CUDA
+allocator is still called per region; defrag/compaction still exist (they
+fire far less).
 
 - Introduce the **`Backing::Lease` storage variant** (§3.7) — needed here
   only so the legacy `read_contiguous`/`write_contiguous` façade can take
@@ -698,16 +708,27 @@ defrag/compaction still exist (they fire far less).
   (`sequence_ops.rs:1791`); `bucket_quant_chunks` eligibility
   (`compress.rs:409-423`); `gpu_format_stats` (`gid_pool.rs:1588`);
   `PalHeadDesc` build in `compress.rs`.
-- **Re-index the selection table per `(chunk, head)`** (§2): the selection
-  kernel's `resolve_band_source` currently derives a band's format from its
-  arena row. Rebuild `per_head_table_host` as one row per `(chunk, head)`
-  fed from the chunk's own format tags, and change the kernel's row index
-  from `arena_idx * n_kv_head + head` to `chunk_slot * n_kv_head + head`.
-  The 36-column row layout is unchanged (`tests/kv_stats_tests.rs:930`
-  already builds per-chunk rows), so this is an indexing + host-build change,
-  not a kernel-internals change. This is the **one kernel-visible edit**
-  size classes require; it must land in the same commit as the class switch
-  or selection silently reads wrong formats.
+- **Re-index the selection table per `(chunk, head)` and activate the
+  palette sub-entry** (§2) — the **one kernel-visible edit** size classes
+  require. It must land in the same commit as the class switch, or selection
+  silently reads wrong formats. Three parts, all local:
+  1. **Kernel**: inside `resolve_band_source` alone, drop
+     `arena_idx = gid / arena_chunks` as the row key and index by the
+     `chunk_idx` it is already passed, then take `.palette[palette]` instead
+     of `per_head_lookup`'s hard-coded `.palette[0]`. `chunk_in_arena =
+     gid % stride` still comes from the gid for the address offset. **All
+     five `resolve_band_source` call sites already pass `chunk_idx` and stay
+     unmodified**; no struct, grid, or launch-config change.
+  2. **Host**: rebuild `per_head_table_host` as one row per `(chunk, head)`,
+     populating each of the four sub-entries from *that band's own* gid →
+     region pointer + the chunk's own format tag. This is the same loop
+     `KvHeadHost::from_gids` already runs for the attention path — the two
+     builders converge, and the per-layer `arena_offset`/`gid_off` rebasing
+     in `from_head_gids_multi` disappears (rows simply concatenate).
+  3. **Delete** `ArenaEntry`'s per-arena `k_format_tag`/`v_format_tag` and
+     `actual_kv_format_tags`: audit Q1 confirms their only readers are
+     `arena.rs:928-929` and the two table builders at `backing.rs:1613-1616`
+     / `:1713-1716` — precisely the code being rewritten here.
 - Introduce `SizeClass` and the ladder table (§3.4); `ArenaKey` →
   `(SizeClass, ArenaLocation)`; `arena_chunks_for_format` →
   `chunks_for_class`; `arena_gid_stride()` → the fixed 65,536; scarcity-only
@@ -728,9 +749,15 @@ defrag/compaction still exist (they fire far less).
   and per-chunk Fletcher goldens). Leave every `base + idx × stride`
   addressing site on `chunk_byte_stride`, and leave `zero_chunk_at` on the
   stride.
-- Land three **permanent** invariant tests (the E1 harness, promoted): every
-  `QuantFormat` and float dtype maps to a class; every class yields
-  ≤ 65,535 chunks/region; `GID_STRIDE` exceeds the max chunks/region.
+- Land four **permanent** invariant tests. Three are the E1 harness,
+  promoted: every `QuantFormat` and float dtype maps to a class; every class
+  yields ≤ 65,535 chunks/region; `GID_STRIDE` exceeds the max chunks/region.
+  The fourth is **new and load-bearing**: assert that a sealed chunk's
+  `byte_size` equals the sum of its bands' **format** bytes, independently
+  computed — because the existing round-trip tests cannot catch a
+  payload/stride confusion (audit A7, §8: they read
+  `chunk_byte_size_of(arena)` on *both* sides, so they compare equal even if
+  both sides copy pad).
 - Delete the vestigial `gpu_quant_kv` constructor and update the stale
   `docs/kv_cache_unification.md` references in `arena.rs` to this document.
 - Class-occupancy logging (per-class regions / live / free) replaces
@@ -859,6 +886,15 @@ Deletion inventory (all now dead by construction):
   elevate, so it is a latency win as well as a deletion. Keep
   `migrate_in_flight` as a plain advisory counter — it drives a non-safety
   deferral (avoiding double-conversion), not a correctness guarantee.
+
+**The gallery arena's relief registration** goes with the ladder, but its
+*eviction* must not. Today `scheduler/mod.rs:2351-2371` registers
+`evict_lru(want)` under `AllocClass::Kv` at `Criticality::Cheap`, so the
+governor sheds resident galleries before touching model KV. Replacement: the
+scheduler already owns `gallery_arena`, so the free-region pressure response
+calls `arena.evict_lru(want)` **directly, ahead of** KV evacuation — the same
+priority, expressed as call order instead of rung numbers. Delete the
+registration block; keep `evict_lru` and `resident_bytes`.
 
 Every deletion lands with its tests either deleted (tests of removed
 behavior) or rewritten against the region model (tests of surviving
@@ -995,7 +1031,39 @@ the `alloc_gate → tables` order.
 (`select_kv_format.cuh:1556-1599`). In kernels `chunk_byte_stride` appears
 only as an address step. Trailing pad is never read as data.
 
+**A7 — Second-gate sensitivity. FINDING: the round-trip tests are blind to
+the A1 bug.** `gpu_cpu_gpu_round_trip_*_is_byte_identical` compares byte
+vectors built by `bytes_of_cpu_sealed`, which reads
+`chunk_byte_size_of(arena)` bytes per slot — the *arena-derived* length — on
+**both** sides of the round trip. A payload/stride confusion changes both
+sides identically, so the test passes while pad is copied and persisted.
+These tests prove round-trip *fidelity of whatever length is copied*, not
+that the length is correct. Step 1 therefore adds a direct assertion on
+`byte_size` against independently-computed format bytes (§5 step 1). This is
+the one place the existing suite would have handed us a false pass.
+
+**A8 — Palette sub-entry is vestigial today.** `per_head_lookup` returns
+`.palette[0]` unconditionally, and `per_head_table_host` writes four
+identical sub-entries; per-band format variety comes solely from `arena_idx`
+differing per band (§2). The selection change therefore *activates* an
+existing structure rather than adding one — but it also means the sub-entry
+path has **never executed with non-identical entries**, so step 1's gate run
+is its first real exercise. Treat the C-level configs as the acceptance
+signal for it specifically.
+
+**A9 — `arena_bytes_per_chunk`'s `CHUNK_SIZE²` coupling dissolves.** Today
+chunk bytes are computed as `CHUNK_SIZE × CHUNK_SIZE` elements
+(`types.rs:22-32`) while arenas are *shaped*
+`(chunks, CHUNK_SIZE, sub_head_dim)` — equal only because
+`head_dim / N_PALETTE = 32 = CHUNK_SIZE`, so any other `head_dim` silently
+mis-sizes every arena. Size classes remove the hazard structurally rather
+than papering it: region capacity becomes `REGION_BYTES / class` (no
+geometry at all), and geometry enters only when *selecting* a class for a
+format, where `sub_head_dim` is passed explicitly. Keep an assert that
+`sub_head_dim × CHUNK_SIZE` matches the class-selection input.
+
 ### 8.2 Experiments (throwaway; reverted)
+
 
 **E1 — Size-class harness driven by the real `QuantFormat` table.** Three
 assertions, all passing: full coverage (22 quant formats + 4 float dtypes,
@@ -1039,7 +1107,7 @@ scratchpad (`vmm_probe.py`, `vmm_release_probe.py`, `vmm_overcommit_probe.py`).
 | u16 recycle-link overflow hazard (§2.1) | `gid_pool.rs:89-102` (overlapped refcount/link word) + the verified block sizes |
 | Per-chunk format tags already persisted | `transfer.rs:221` (`to_tag`), `pipeline.rs:529-542` (`from_tag`) |
 | Cold-load carries per-band formats | `BlockAllocSpec.k_formats/v_formats`, `chunk_ops.rs:183-193` |
-| `Tensor` is an `Arc` newtype (so `TensorG<'a>` is additive) | `tensor.rs:68` `pub struct Tensor(Arc<Tensor_>)` |
+| `Tensor` is an `Arc` newtype (so a lease travels with views/reshapes) | `tensor.rs:68` `pub struct Tensor(Arc<Tensor_>)` |
 | cudarc pool is CUDA's stream-ordered mempool | `cuda_backend/device.rs:358-393` (`cuMemPool*`) |
 | Gallery = 16 MiB slabs ÷ 6144 B pages | `gallery_arena/pool.rs:18`, `pages.rs:13-20` (`PAGE_TOKENS × wpt(24) × 8`) |
 | Exactly one production relief closure — the gallery, under `AllocClass::Kv`; `Expert` gets a tally only | `scheduler/mod.rs:2363` vs `quantized_qwen3_moe.rs:1922-1926` (`set_class`) |
@@ -1073,29 +1141,37 @@ derive from `sub_head_dim` explicitly and assert the identity.
 
 ## 10. Open questions (resolve during the step that touches them)
 
-1. Exact residual reader set of `ArenaEntry`'s per-arena k/v format tags (the
-   CP3 note in `arena.rs`) — confirm fully superseded by sub-entries before
-   step 1 deletes the per-arena tags.
-2. Whether logits/sampling buffers join the bump side or stay in the reserve
-   (step 3 scoping).
-3. Whether any buffer genuinely outlives its wave and forces the paged-output
-   contingency to be built (step 3 audit).
-4. Whether `read_contiguous`/`write_contiguous` (the legacy `KvCache` façade,
-   the only production consumer forcing `Backing::Lease` into step 1) is
-   still reachable in the daemon's paths at all — if it is dead, the lease
-   variant defers to step 3 and step 1 touches candle-core not at all.
-5. Host-side lease for `CpuStorage`'s `Vec` (warm arenas) — same
-   upgrade/leak question, no cudarc equivalent; likely `ManuallyDrop` over
-   `Vec::from_raw_parts`. Only bites when the warm tier moves to a
-   reservation (S7, follow-on).
-6. Whether the small-end class granularity needs revisiting once C9/C10
-   per-class occupancy is measured (§3.4, step 6).
+Only three remain, and none blocks the start of step 1.
+
+1. **Whether logits/sampling buffers join the bump side or stay in the small
+   reserve** — pure scoping, decided when step 3 enumerates the wave's
+   buffer set.
+2. **Whether any buffer genuinely outlives its wave** and so forces the
+   paged-output contingency to be built (§3.6). Expected answer: none —
+   everything in the wave dies with the wave — but the step 3 audit
+   confirms rather than assumes.
+3. **Whether the small-end class granularity needs revisiting** once C9/C10
+   per-class occupancy is measured (§3.4). The only *quantitative* question
+   left in the design; the promoted E1 harness recomputes the ladder from a
+   single constant, so acting on the answer is cheap.
+
+Deferred with the warm-tier reservation (S7, follow-on): the host-side lease
+for `CpuStorage`'s `Vec` — the same upgrade/leak question with no cudarc
+equivalent, likely `ManuallyDrop` over `Vec::from_raw_parts`.
 
 *Resolved by §7 (scope)*: gallery/meta-pool fold-in (S5 — out of scope),
 size-class count (S3 — seven, full quant coverage retained), buffer-plan
 formalism (S4 — none), tensor lifetimes (S1 — none), warm-tier reservation
 (S7 — follow-on).
+
 *Resolved by §8 (audits/experiments)*: trim-vs-stride on migration copies
-(A1 — trim, via invariant 8), `Backing::Lease` mechanics
-(E3 — upgrade + leak), region-tier locking (A5 — none needed),
-kernel pad reads (A6 — safe).
+(A1 — trim, via invariant 8); region-tier locking (A5 — no new lock);
+kernel pad reads (A6 — safe); second-gate sensitivity (A7 — blind, so step 1
+adds a direct `byte_size` assertion); `CHUNK_SIZE²` coupling (A9 — dissolves
+under classes); `ArenaEntry` per-arena format tags (Q1 — only readers are the
+three sites being rewritten, so they are deleted in step 1);
+`read_contiguous`/`write_contiguous` reachability (Q4 — **production**, via
+`batched_inference.rs:2749/2772` and `prefill_utils.rs:2557`, so
+`Backing::Lease` stays in step 1); gallery relief replacement (call
+`evict_lru` ahead of KV evacuation); `Backing::Lease` mechanics
+(E3 — `upgrade_device_ptr` + `leak`).
