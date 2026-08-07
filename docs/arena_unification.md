@@ -770,8 +770,37 @@ fire far less).
 - Class-occupancy logging (per-class regions / live / free) replaces
   `gpu_format_stats`'s float/quant split, keeping the slack observable.
 
-*Gate*: correctness across all configs; expect a measurable drop in arena
-count and reserved-vs-live gap in the logs; no perf regression.
+**Move `GpuChunks` device buffers to the region tier** (audits A10, A13) —
+neither bump-side nor the pool remnant. The per-`(layer, batch_idx)`
+decode slot-state buffer is **cached across waves** —
+`sync_decode_gpu_chunks` returns `DecodeGpuChunksSyncKind::Reuse` with the
+existing `raw_device_ptr()` whenever the chunk count still matches — so a
+per-wave cursor reset would recycle it under a live sequence. By principle 2
+it is turn-or-longer, therefore arena-managed:
+
+- **A doubling class family** (4 KiB, 8, 16, … 1 MiB), one slot per
+  `(layer, batch slot)`. Growth is a **promotion**: claim the next class up,
+  copy, release the old slot — exactly what `resize` does today, minus the
+  allocator and minus the stream sync. A 1 MiB slot holds 65,536 chunks
+  ≈ 2 M tokens per sequence per layer; a 16 MiB region caps at ~33 M.
+- **Contiguity is preserved.** The kernel reads the buffer linearly from
+  `raw_device_ptr`; a region slot is contiguous, so it stays a plain pointer.
+  No paging, and the paged-output contingency remains unbuilt.
+- **The cost is a rounding error**: 16 B of slot-state per chunk against
+  ~37 KB of KV for that same chunk (32 bands × ~1152 B) = **0.04 %**.
+
+The host-side `PinnedBuf` half has the same problem and the same answer, but
+its home is the pinned host reservation (S7, follow-on); until then it stays
+as-is. This lands in step 1 because it needs only the class machinery, and it
+retires the decode-path churn A13 measured — a win the step-1 gate should
+show directly.
+
+*Gate*: correctness across all configs; a measurable drop in arena count and
+reserved-vs-live gap; **decode-path allocator traffic falls to ~zero** (A13's
+per-32-token alloc/free/sync cycles disappear — check `KV_ARENA_STATS` and
+pool counters, and watch for a decode-latency improvement); no perf
+regression. Run the migration byte-identity round-trip tests alongside the
+model test (audit A2's second gate), plus the new `byte_size` assertion.
 
 ### Step 2 — Port transient buffers to the bump side
 
@@ -796,29 +825,9 @@ Candidates, in order of confidence:
 - grow-only scratches: `ProvSignScratch`, `KvSamplerGpu`, MoE routing
   buffers — moved to the static shelf.
 
-**Not bump-side, and not the pool remnant either: `GpuChunks` device buffers
-move to the REGION tier** (audits A10, A13). The per-`(layer, batch_idx)`
-decode slot-state buffer is **cached across waves** —
-`sync_decode_gpu_chunks` returns `DecodeGpuChunksSyncKind::Reuse` with the
-existing `raw_device_ptr()` whenever the chunk count still matches — so a
-per-wave cursor reset would recycle it under a live sequence. By principle 2
-it is turn-or-longer, therefore arena-managed:
-
-- **A doubling class family** (4 KiB, 8, 16, … 1 MiB), one slot per
-  `(layer, batch slot)`. Growth is a **promotion**: claim the next class up,
-  copy, release the old slot — exactly what `resize` does today, minus the
-  allocator and minus the stream sync. A 1 MiB slot holds 65,536 chunks
-  ≈ 2 M tokens per sequence per layer; a 16 MiB region caps at ~33 M.
-- **Contiguity is preserved.** The kernel reads the buffer linearly from
-  `raw_device_ptr`; a region slot is contiguous, so it stays a plain pointer.
-  No paging, and the paged-output contingency remains unbuilt.
-- **The cost is a rounding error**: 16 B of slot-state per chunk against
-  ~37 KB of KV for that same chunk (32 bands × ~1152 B) = **0.04 %**.
-
-The host-side `PinnedBuf` half has the same problem and the same answer, but
-its home is the pinned host reservation (S7, follow-on); until then it stays
-as-is. Any buffer whose lifetime is not provably within one wave gets this
-same classification — the mid-wave-allocation debug assert is what catches a
+**`GpuChunks` is deliberately absent from the candidate list above** — it is
+cross-wave state and moved to the region tier in step 1 (A10/A13). Any buffer
+whose lifetime is not provably within one wave gets that same classification — the mid-wave-allocation debug assert is what catches a
 misclassification.
 
 Build the unified `BumpArena` abstraction by generalizing `PinnedStager`
@@ -1118,7 +1127,7 @@ preserve a decode-path performance bug *inside* a design whose stated purpose
 is deleting exactly this, and the buffer grows with context depth — unbounded
 by the engine's premise — so a "small reserve" sized for it would drag
 §1.3's pool-slack mechanism back in. Resolution: the region tier with a
-doubling class family (§5 step 2), which removes every one of those calls
+doubling class family (§5 step 1), which removes every one of those calls
 (promotion is a copy between preallocated slots). **Generalised as principle
 2's corollary: anything outliving a wave is arena-managed, never
 buffer-allocated.**
