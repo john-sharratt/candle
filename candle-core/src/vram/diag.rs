@@ -1,7 +1,7 @@
 //! Diagnostics: a structured budget snapshot that renders as a table and that
 //! unit tests assert against — the same view a human debugs with.
 
-use super::{AllocClass, Criticality, VramGovernor};
+use super::{AllocClass, VramGovernor};
 
 /// One per-class row of the budget table (loose reserved tally).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,12 +27,6 @@ pub struct BudgetTable {
     pub rows: [BudgetRow; AllocClass::COUNT],
     /// KV floor (`3 GiB + 15% × (C − Weights)`).
     pub kv_floor: u64,
-    /// The five ladder trip points, indexed by [`Criticality`].
-    pub thresholds: [u64; 5],
-    /// Reversibly-evictable KV (up to `Moderate`) — the forecast input.
-    pub evictable_reversible: u64,
-    /// The last relief episode `(deepest tier, bytes freed)`.
-    pub last_relief: Option<(Criticality, u64)>,
 }
 
 impl BudgetTable {
@@ -68,13 +62,6 @@ impl VramGovernor {
                 reserved: self.class_reserved(AllocClass::Kv),
             },
         ];
-        let thresholds = [
-            self.tier_threshold(Criticality::Trivial),
-            self.tier_threshold(Criticality::Cheap),
-            self.tier_threshold(Criticality::Moderate),
-            self.tier_threshold(Criticality::Costly),
-            self.tier_threshold(Criticality::Critical),
-        ];
         BudgetTable {
             capacity_c: self.capacity(),
             total: reading.total,
@@ -82,9 +69,6 @@ impl VramGovernor {
             source: reading.source,
             rows,
             kv_floor: self.kv_floor(),
-            thresholds,
-            evictable_reversible: self.evictable_estimate(Criticality::Moderate),
-            last_relief: self.last_relief(),
         }
     }
 
@@ -107,19 +91,6 @@ impl VramGovernor {
                 mib(row.reserved)
             ));
         }
-        s.push_str(&format!(
-            "  thresholds MiB: Trivial={} Cheap={} Moderate={} Costly={} Critical={}\n",
-            mib(t.thresholds[0]),
-            mib(t.thresholds[1]),
-            mib(t.thresholds[2]),
-            mib(t.thresholds[3]),
-            mib(t.thresholds[4]),
-        ));
-        s.push_str(&format!(
-            "  evictable(≤Moderate)={}MiB last_relief={:?}",
-            mib(t.evictable_reversible),
-            t.last_relief.map(|(tier, b)| (tier, mib(b)))
-        ));
         s
     }
 

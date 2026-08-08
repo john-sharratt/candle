@@ -586,7 +586,7 @@ fn allocator_worker(
                 // construction.
                 let t_resolve = Instant::now();
                 let dst_ptrs_per_rec =
-                    backings[li].resolve_block_ptrs_from_hgids(&hgids, &arena_info)?;
+                    backings[li].resolve_block_ptrs_from_hgids(&hgids, &specs, &arena_info)?;
                 resolve_ptrs_us += t_resolve.elapsed().as_micros() as u64;
                 n_resolve_calls += 1;
 

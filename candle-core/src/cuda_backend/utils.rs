@@ -25,6 +25,7 @@ pub trait Map1 {
             S::F32(s) => S::F32(self.f(s, d, l)?),
             S::F64(s) => S::F64(self.f(s, d, l)?),
             S::F8E4M3(s) => S::F8E4M3(self.f(s, d, l)?),
+            S::Moved => S::unreachable_moved(),
         };
         Ok(out)
     }
@@ -154,6 +155,7 @@ pub trait Map1Any {
             S::F32(s) => self.f(s, d, l, S::F32)?,
             S::F64(s) => self.f(s, d, l, S::F64)?,
             S::F8E4M3(s) => self.f(s, d, l, S::F8E4M3)?,
+            S::Moved => S::unreachable_moved(),
         };
         Ok(out)
     }

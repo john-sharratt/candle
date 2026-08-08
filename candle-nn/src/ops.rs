@@ -90,7 +90,7 @@ impl candle::CustomOp1 for Sigmoid {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = storage.device();
         let shape = layout.shape();
@@ -163,6 +163,7 @@ impl candle::CustomOp1 for Sigmoid {
         let dst = candle::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -391,7 +392,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = storage.device();
         let stream = dev.cuda_stream();
@@ -451,6 +452,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -585,7 +587,7 @@ impl candle::CustomOp2 for RmsNorm {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -661,6 +663,7 @@ impl candle::CustomOp2 for RmsNorm {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -806,7 +809,7 @@ impl candle::CustomOp2 for SiluMul {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -892,6 +895,7 @@ impl candle::CustomOp2 for SiluMul {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -1008,7 +1012,7 @@ impl candle::CustomOp3 for LayerNorm {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -1099,6 +1103,7 @@ impl candle::CustomOp3 for LayerNorm {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }

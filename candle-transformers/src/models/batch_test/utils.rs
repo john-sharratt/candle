@@ -782,7 +782,6 @@ impl TestParams {
         }
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
-        let _ = session.compact_check()?;
         let prompt_duration = prompt_start.elapsed();
         let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
@@ -834,7 +833,6 @@ impl TestParams {
         }
         self.device.synchronize()?;
         pipeline_record("bench:decode_total", t_decode_total);
-        let _ = session.compact_check()?;
 
         let generate_duration = generate_start.elapsed();
         let generate_tokens = steps_run * config.num_contexts;
@@ -899,8 +897,7 @@ impl TestParams {
         // Note: empty k_pal / v_pal is valid and means "use the shared identity palette".
         for &seq_idx in &sequence_indices {
             if let Some(backing) = session.backings().first() {
-                let arena_infos = backing.resolve_arena_info().expect("resolve_arena_info");
-                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
+                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx) {
                     for (ci, chunk) in chunks.iter().enumerate() {
                         if !chunk.k_pal.is_empty() && chunk.k_pal.iter().all(|&b| b == 0) {
                             panic!(
@@ -923,9 +920,11 @@ impl TestParams {
         for &seq_idx in &sequence_indices {
             session.free_sequence(seq_idx)?;
         }
-        let t_cleanup_compact = profile_now();
-        let _ = session.compact(); // Ignore errors, just trying to free memory
-        pipeline_record("bench:cleanup_compact", t_cleanup_compact);
+        let t_cleanup_sweep = profile_now();
+        // Return the freed sequences' regions to the pool before the next
+        // config claims them.
+        let _ = session.release_empty_arenas();
+        pipeline_record("bench:cleanup_sweep", t_cleanup_sweep);
         drop(session);
         self.device.synchronize()?;
 

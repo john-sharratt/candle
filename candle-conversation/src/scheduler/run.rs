@@ -259,16 +259,29 @@ impl Scheduler {
             // 1b. Drain any background-compression VRAM-starvation signal. A
             // persistence hot→warm compress-to-free that couldn't allocate its
             // quant arena leaves its turn hot-float + consistent (retried next
-            // pass) but signals the governor; escalate recovery here so that retry
-            // has room, before we admit more prefills that would tighten VRAM
+            // pass) but signals the governor; make room here so that retry has
+            // some, before we admit more prefills that would tighten VRAM
             // further. Cheap atomic swap in the common (no-starvation) case.
+            //
+            // Starvation used to get its own escalated recovery path — a
+            // footprint reclaim, then a bulk eviction that overrode the "only
+            // evict when `used` is high" watermark. It needed the override
+            // because the watermark was a guess about the card; the free-region
+            // count is not, and a compressor that could not get an arena is
+            // exactly the state the ordinary pressure signal reports. So it
+            // takes the ordinary path, at the load setpoint.
             let starved = self
                 .session
                 .vram_governor()
                 .map(|g| g.take_starvation())
                 .unwrap_or(0);
             if starved > 0 {
-                self.relieve_compression_starvation(starved);
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    starvation_events = starved,
+                    "background compression starved of VRAM"
+                );
+                self.relieve_vram_pressure("starvation", VramPhase::Load);
             }
 
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
@@ -417,18 +430,37 @@ impl Scheduler {
                     .zip(self.session.vram_pool_stats())
                     .map(|(budget, (used, _reserved))| (budget, used));
                 let backlog = self.pending_prefill_tokens();
-                // Resident-arena format split for the arena panel. `mem_get_info`
-                // returns bytes → convert to MiB here so the ring fields match
-                // their `_mib` names (and the dashboard's GiB scale).
+                // Resident-arena occupancy for the arena panel, split small vs
+                // large half of the size-class ladder. `mem_get_info` returns
+                // bytes → convert to MiB here so the ring fields match their
+                // `_mib` names (and the dashboard's GiB scale).
+                //
+                // The panel used to split float vs quant, which is not a
+                // question an arena can answer any more — it holds whatever
+                // fits its slots. The ladder split carries the same signal:
+                // compression moves occupancy DOWN the ladder, so a working
+                // compress-to-free rung shows the large half falling.
                 let mib = |b: usize| (b >> 20) as u64;
-                let fmt = self.session.kv_gpu_format_stats().map(|fs| {
+                let fmt = self.session.kv_gpu_class_stats().map(|cs| {
+                    let half = cs.classes.len() / 2;
+                    let sum = |rows: &[candle_nn::kv_cache::ClassOccupancy]| {
+                        rows.iter().fold((0usize, 0usize, 0usize), |acc, c| {
+                            (
+                                acc.0 + c.arenas,
+                                acc.1 + c.reserved_bytes,
+                                acc.2 + c.live_bytes,
+                            )
+                        })
+                    };
+                    let (l_arenas, l_res, l_live) = sum(&cs.classes[half..]);
+                    let (s_arenas, s_res, s_live) = sum(&cs.classes[..half]);
                     (
-                        fs.float_arenas as u32,
-                        mib(fs.float_reserved_bytes),
-                        mib(fs.float_live_bytes),
-                        fs.quant_arenas as u32,
-                        mib(fs.quant_reserved_bytes),
-                        mib(fs.quant_live_bytes),
+                        l_arenas as u32,
+                        mib(l_res),
+                        mib(l_live),
+                        s_arenas as u32,
+                        mib(s_res),
+                        mib(s_live),
                     )
                 });
                 // Whole-card VRAM decomposition: KV-pool reserved footprint +
@@ -467,20 +499,14 @@ impl Scheduler {
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.
                 self.publish_memory_report();
-                // Return freed KV VRAM to the OS every wave. FIRST release
-                // now-empty arenas: compression (hot→warm) and eviction leave
-                // arenas fully free but still *reserved*, and the async pool never
-                // reclaims them on its own — so without this they pile up (~14 GiB
-                // / 871 arenas observed) and drive the driver's real free toward
-                // zero. When real free craters, a wide prefill's CONTIGUOUS
-                // transient activation peak — which the scattered pool free-list
-                // (counted in `vram_budget_available`) can't satisfy — spills to
-                // host memory, a multi-second stall the budget never saw coming.
-                // THEN trim the pool so `pool_reserved` (the card's real
-                // footprint) tracks `pool_used`. Sweeping every wave keeps real
-                // OS-free healthy; cheap and KV-preserving (only fully-empty
-                // arenas), i.e. the relief ladder's Trivial rung run ahead of the
-                // pressure instead of reactively after a forward already stalled.
+                // Return emptied regions to the free list. Compression
+                // (hot→warm) and eviction free chunks scattered across arenas,
+                // and an arena only gives its region back once its last chunk
+                // goes — so nothing surfaces without a sweep looking for it.
+                // Running it here, ahead of pressure, is what keeps the
+                // free-region count honest: the setpoint is compared against
+                // regions that are genuinely claimable, not against a count
+                // that would only be right after the next relief pass.
                 let swept = self.session.release_empty_arenas().unwrap_or(0);
                 if swept > 0 {
                     relief_trace::note("sched", "arena_sweep", swept as u64, 0);
@@ -490,21 +516,7 @@ impl Scheduler {
                         "proactive empty-arena sweep (per-wave)"
                     );
                 }
-                self.trim_kv_pool();
-                // NOTE: the gentle-early ingest demote + admission backpressure now
-                // run PER-WAVE (above), not on this 2 s cadence — they're cheap and
-                // must track CFW's fast per-wave KV growth to hold `used` at the
-                // demote watermark. Only the expensive footprint defrag stays here.
-                // Footprint reclaim: defrag the fragmented reserved gap when it
-                // nears capacity (so a wide forward's transient peak can't push the
-                // card into WDDM paging), and bulk-evict resident KV only when
-                // `used` itself nears capacity. No-op (cheap stats read) when
-                // comfortably below both watermarks.
-                // (Any KV eviction inside reclaim is accounted at the
-                // `evict_cold_tail` chokepoint; the defrag/trim bytes it also sheds
-                // are pool-footprint reclaim, not eviction, so they aren't counted
-                // as eviction volume here.)
-                self.reclaim_footprint();
+                self.log_kv_memory();
                 // Last resort under heavy backlog: block the wave loop on a
                 // device sync so ingest stops outrunning the drain and the
                 // primary stream empties — letting the (short, batched) hot→warm
@@ -566,79 +578,108 @@ impl Scheduler {
             .add_phase(WavePhase::Section, t.elapsed().as_millis() as u64);
     }
 
-    /// Trim the CUDA pool's reserved-but-free fragmentation back to the OS,
-    /// keeping a slack floor of `pool_used + TRIM_SLACK` reserved so the next
-    /// allocations reuse pool memory instead of re-hitting the OS.
+    /// Publish the KV memory picture at the wave loop's slow cadence: the CUDA
+    /// pool, the reservation's regions, the transient domains, and the
+    /// slot-state slabs.
     ///
-    /// Keeps `pool_reserved` (the card's physical footprint) tracking
-    /// `pool_used` (what [`vram_budget_available`] measures), so the budget
-    /// never under-reads the true occupancy and lets KV oversubscribe VRAM.
-    /// No-op on non-CUDA / when the pool allocator is unavailable.
-    ///
-    /// [`vram_budget_available`]: candle_nn::kv_cache::vram_budget_available
-    pub(super) fn trim_kv_pool(&self) {
-        let Some((used, reserved)) = self.session.vram_pool_stats() else {
-            return;
-        };
+    /// This used to also *trim* the pool — return its reserved-but-free
+    /// fragmentation to the OS, keeping a `pool_used + slack` floor — and every
+    /// relief rung called it after freeing anything. That mattered when KV was
+    /// pool memory: freed arenas stayed reserved, `pool_reserved` climbed away
+    /// from `pool_used`, and the driver's real free went to zero. None of it
+    /// applies now. KV comes from the reservation, so releasing an arena moves a
+    /// region between two lists and changes no pool accounting at all; what is
+    /// left in the pool is the model, the expert cache and the few remaining
+    /// grow-only scratches, which reach their size and stay there.
+    /// `cuMemPoolTrimTo` on that is work with nothing to reclaim — and it
+    /// synchronously unmaps, which is why it needed a guard against in-flight
+    /// kernels holding captured pointers. Dropping the trim drops the guard.
+    pub(super) fn log_kv_memory(&self) {
         let mib = |b: usize| b / (1024 * 1024);
-        // Slack floor of ready blocks retained so a single wave's seal/realloc
-        // churn reuses pool memory rather than re-allocating from the OS every
-        // trim. Default 2 GiB; override with `CANDLE_KV_POOL_TRIM_SLACK_MB`.
-        let slack = std::env::var("CANDLE_KV_POOL_TRIM_SLACK_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(2048)
-            .saturating_mul(1024 * 1024);
-        let keep = used.saturating_add(slack);
-        // Diagnostic: surface the pool's true physical footprint every wave so we
-        // can watch `reserved` track (or diverge from) `used` — the number the
-        // VRAM budget can't see. Once per ~2 s, so cheap.
-        tracing::debug!(
-            "kv-pool: used={}MiB reserved={}MiB gap={}MiB keep={}MiB",
-            mib(used),
-            mib(reserved),
-            mib(reserved.saturating_sub(used)),
-            mib(keep),
-        );
-        // Split the resident GPU arenas into float (the live decode/prefill
-        // working set + not-yet-compressed completed turns — reusable, and what
-        // the compress-to-free rung shrinks) vs quant (sealed attended-over
-        // context, held). Its own line: these are GidPool arena-slab bytes, NOT a
-        // partition of the CUDA-pool `gap` above (that also holds segment slack
-        // the GidPool never sees). Watch `float` fall across a pressure episode
-        // to confirm compress is bringing quantization forward.
-        if let Some(fs) = self.session.kv_gpu_format_stats() {
+        if let Some((used, reserved)) = self.session.vram_pool_stats() {
+            // What is left of the pool once KV moved out. Flat is the healthy
+            // shape: growth here means something outside the reservation is
+            // still allocating per-wave.
             tracing::debug!(
-                "kv-pool fmt: float={}arenas/{}MiB (live {}MiB) quant={}arenas/{}MiB (live {}MiB)",
-                fs.float_arenas,
-                mib(fs.float_reserved_bytes),
-                mib(fs.float_live_bytes),
-                fs.quant_arenas,
-                mib(fs.quant_reserved_bytes),
-                mib(fs.quant_live_bytes),
+                "kv-pool: used={}MiB reserved={}MiB gap={}MiB",
+                mib(used),
+                mib(reserved),
+                mib(reserved.saturating_sub(used)),
             );
         }
-        // Nothing to reclaim if the pool is already within the slack floor.
-        if reserved <= keep {
-            return;
+        // Resident GPU arena occupancy, one line per occupied size class. Watch
+        // occupancy move from the large classes to the small ones across a
+        // pressure episode to confirm compress-to-free is bringing
+        // quantization forward.
+        if let Some(cs) = self.session.kv_gpu_class_stats() {
+            let rows: Vec<String> = cs
+                .classes
+                .iter()
+                .filter(|c| c.arenas > 0)
+                .map(|c| {
+                    format!(
+                        "{}B={}a/{}MiB(live {}MiB)",
+                        c.slot_bytes,
+                        c.arenas,
+                        mib(c.reserved_bytes),
+                        mib(c.live_bytes)
+                    )
+                })
+                .collect();
+            tracing::debug!("kv-pool classes: {}", rows.join(" "));
         }
-        // Best-effort return of whole free segments to the OS. The pool usually
-        // can't release much — freed chunks are scattered inside partially-used
-        // segments — but that reserved-but-free memory is REUSABLE by new KV with
-        // no new OS allocation, and `vram_budget_available` now counts it, so a
-        // large `gap` is not a problem to chase. No sync here (it reclaimed 0
-        // anyway; the memory is fragmented, not merely pending-free).
-        if let Some((before, after)) = self.session.trim_kv_pool(keep) {
-            let freed = before.saturating_sub(after);
-            if freed > 0 {
-                relief_trace::note("sched", "pool_trim", before as u64, after as u64);
-            }
+        // The reservation's KV side. `free` is the pressure signal admission
+        // reads; `peak_live` against `total` says how close the startup
+        // partition came to binding, which is what step 7 tunes.
+        if let Some(r) = candle_nn::kv_cache::region_stats(0) {
             tracing::debug!(
-                "trimmed KV pool: reserved {}MiB -> {}MiB (freed {}MiB, kept used {}MiB + slack)",
-                mib(before),
-                mib(after),
-                mib(freed),
-                mib(used),
+                "kv-regions: live={} peak={} free={} of {} ({}MiB) | transient carved={}MiB of {}MiB",
+                r.live,
+                r.peak_live,
+                r.free,
+                r.total,
+                mib(r.total * candle_nn::kv_cache::REGION_BYTES),
+                mib(r.transient_carved),
+                mib(r.transient_bytes),
+            );
+        }
+        // Per-domain transient peaks, the terms the transient tier is sized
+        // from: `S = 2*W_wave + W_persist + shelf`.
+        if let Some((cursor, peak, cap)) = candle_nn::kv_cache::persistence_domain_stats(0) {
+            if peak > 0 {
+                tracing::debug!(
+                    "kv-transient persist: cursor={}MiB peak={}MiB cap={}MiB",
+                    mib(cursor),
+                    mib(peak),
+                    mib(cap),
+                );
+            }
+        }
+        // The `W_wave` term of the same equation. Both halves, because the span
+        // has to hold the larger of the two.
+        if let Some(halves) = candle_nn::kv_cache::wave_domain_stats(0) {
+            let peak = halves.iter().map(|h| h.1).max().unwrap_or(0);
+            if peak > 0 {
+                tracing::debug!(
+                    "kv-transient wave: peak={}MiB (a={}MiB b={}MiB) cap={}MiB each",
+                    mib(peak),
+                    mib(halves[0].1),
+                    mib(halves[1].1),
+                    mib(halves[0].2),
+                );
+            }
+        }
+        // Slot-state slabs: the region tier's answer to audit A13. `slabs`
+        // settling and then staying flat while sequences deepen is the evidence
+        // that the decode path has stopped calling the allocator — it used to
+        // free and re-allocate this buffer every time a sequence crossed a
+        // 32-token boundary, per layer.
+        let (live, slabs, bytes) = candle_nn::kv_cache::slot_state_stats();
+        if slabs > 0 {
+            tracing::debug!(
+                "kv-slotstate: live={live} slabs={slabs} reserved={}MiB promotions={}",
+                mib(bytes),
+                candle_nn::kv_cache::class_promotion_count(),
             );
         }
     }

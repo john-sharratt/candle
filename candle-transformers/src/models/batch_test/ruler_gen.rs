@@ -703,7 +703,7 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
     for &idx in &seq_indices {
         session.free_sequence(idx)?;
     }
-    session.compact()?;
+    session.release_empty_arenas()?;
 
     // Decode token IDs to strings.
     prompt_tokens

@@ -1349,17 +1349,19 @@ __device__ __forceinline__ float k_threshold_scaled(
 // kernel in this file. Layout matches `paged_decode_kernel` exactly so
 // the selection kernel sees the same bytes the attention kernel will:
 //
-//   - Palette4PerHeadEntry (28 × i64): per (arena, kv_head) with 4
-//     sub-entries; compatibility lookup returns the palette-0 sub-entry.
-//   - PerHeadTableEntry (7 × i64): per (arena, kv_head) with pre-
-//     resolved byte offsets and chunk byte strides.
+//   - Palette4PerHeadEntry (36 × i64): one row per (chunk, kv_head),
+//     indexed `chunk_idx * n_kv_head + head_idx`, holding four palette
+//     sub-entries. Each sub-entry describes ONE band: its own base
+//     pointer, byte offset, slot stride, format tag and outer scale.
+//   - PerHeadTableEntry (9 × i64): one such sub-entry.
 //   - head_gids: per-chunk per-head K/V global chunk IDs (interleaved).
-//   - GID decomposition:
-//        arena_idx = gid / arena_chunks
-//        chunk_idx = gid % arena_chunks
-//   - per_head_lookup → per_head_k_ptr / per_head_v_ptr for byte-level
+//   - The gid supplies only the band's slot index within its region:
+//        chunk_in_region = gid % arena_chunks
+//     The row key comes from `chunk_idx`, not from the gid, so bands of
+//     one head may sit in different regions and different formats.
+//   - load_band_entry → per_head_k_ptr / per_head_v_ptr for byte-level
 //     addressing.
-//   - Format tags come from per-head metadata, not a global dtype param.
+//   - Format tags come from per-band metadata, not a global dtype param.
 
 // Float arena formats in `ArenaFormat::*` map directly onto the
 // `SELECT_INPUT_*` codes used by `load_as_float`: F32=0, F16=1, BF16=2.
@@ -1417,28 +1419,40 @@ __device__ __forceinline__ float dequant_q_element(const void* block_ptr, int id
     return 0.0f;
 }
 
-// Look up the per-head table entry for (arena, head). Wraps
-// `per_head_lookup` to bridge the raw int64 buffer the host passes in
-// to the typed `Palette4PerHeadEntry` view.
-__device__ __forceinline__ PerHeadTableEntry load_per_head_entry(
+// Look up one palette band's sub-entry from the (chunk, head) row of the
+// selection table. Bridges the raw int64 buffer the host passes in to the
+// typed `Palette4PerHeadEntry` view.
+//
+// Rows are keyed by `chunk_idx * n_kv_head + head_idx`, and each of the four
+// sub-entries describes that band alone — its own base pointer, slot stride,
+// format tag and outer scale. Keying by arena instead would force every band
+// of a head to share one arena and one format, which is exactly what size
+// classes remove (see `docs/arena_unification.md` §2).
+__device__ __forceinline__ PerHeadTableEntry load_band_entry(
     const int64_t* __restrict__ per_head_table_raw,
-    int arena_idx,
+    int chunk_idx,
     int head_idx,
-    int n_kv_head
+    int n_kv_head,
+    int palette
 ) {
     const Palette4PerHeadEntry* per_head_table =
         reinterpret_cast<const Palette4PerHeadEntry*>(per_head_table_raw);
-    return per_head_lookup(per_head_table, arena_idx, head_idx, n_kv_head);
+    return palette4_sub_entry(per_head_table[chunk_idx * n_kv_head + head_idx], palette);
 }
 
 // Resolve one palette band's source view (chunk base pointer, storage format,
-// outer scale) from that band's OWN gid and per-head table row.
+// outer scale) from that band's OWN gid and its OWN table sub-entry.
 //
 // Each (head, palette) band is an independent arena slot: bands of one head
 // may live in different arenas, at non-contiguous chunk indices, and in
 // different formats (format selection is per-(head, palette)). The selection
 // kernels therefore address every band through its own gid; nothing here
 // assumes band contiguity or format uniformity across a head.
+//
+// The gid supplies only the band's *chunk index within its region*; the base
+// pointer, stride and format come from the (chunk, head) row's palette
+// sub-entry, so a region shared by several formats resolves each band
+// correctly.
 //
 // The head_gids buffer carries all GIDS_PER_HEAD gids per (chunk, head), in
 // HeadGids order: head * GIDS_PER_HEAD + palette * 2 + is_v.
@@ -1460,7 +1474,7 @@ __device__ __forceinline__ void resolve_band_source(
         + head_idx * GIDS_PER_HEAD + palette * 2 + (is_v ? 1 : 0)]);
     const int arena_idx      = (int)(gid / (int64_t)arena_chunks);
     const int chunk_in_arena = (int)(gid - (int64_t)arena_idx * (int64_t)arena_chunks);
-    PerHeadTableEntry e = load_per_head_entry(per_head_table_raw, arena_idx, head_idx, n_kv_head);
+    PerHeadTableEntry e = load_band_entry(per_head_table_raw, chunk_idx, head_idx, n_kv_head, palette);
     if (is_v) {
         *ptr_out   = per_head_v_ptr(e) + (int64_t)chunk_in_arena * e.v_chunk_byte_stride;
         *fmt_out   = per_head_get_v_format(e);

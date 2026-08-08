@@ -48,11 +48,6 @@ pub use cuda::{
     MmapRegistration,
 };
 #[cfg(feature = "cuda")]
-pub use cuda::{
-    arena_compact_copy, arena_compact_copy_async, arena_compact_patch, arena_compact_patch_async,
-    CompactMove,
-};
-#[cfg(feature = "cuda")]
 pub use cuda::{load_repacked, load_repacked_on_stream, repack_to_host, repacked_size_bytes};
 
 #[cfg(target_feature = "neon")]
@@ -1593,6 +1588,38 @@ impl QTensor {
             QStorage::Cuda(s) => s.copy_to_host_on_stream(dst, stream),
             _ => crate::bail!("copy_data_to_host_on_stream requires CUDA storage"),
         }
+    }
+
+    /// A `QTensor` over quantized device memory it does **not** own.
+    ///
+    /// The quantized counterpart of [`crate::Tensor::from_leased_cuda_ptr`],
+    /// and the way a KV arena slot is handed to the block quantize /
+    /// dequantize paths now that an arena is a run of untyped byte slots
+    /// (`docs/archived/arena_unification.md` principle 8). Writes through the returned
+    /// tensor land in the caller's memory — which is the point: cloning a
+    /// `QTensor` is a device-to-device **copy**, so "clone the arena and write
+    /// to it" silently writes to a throwaway.
+    ///
+    /// The view has no matrix-row padding, so it must not be used as a matmul
+    /// operand; the block quantize / dequantize kernels do not read past the
+    /// data and are the only intended consumers.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `ceil(elem_count / block_size) *
+    /// type_size` bytes of device memory that stays live, and un-aliased for
+    /// writes, for the tensor's lifetime.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_leased_cuda_ptr(
+        ptr: u64,
+        dtype: GgmlDType,
+        elem_count: usize,
+        device: &crate::CudaDevice,
+    ) -> Result<Self> {
+        let storage = cuda::QCudaStorage::from_leased_device_ptr(ptr, elem_count, dtype, device)?;
+        Ok(Self {
+            storage: QStorage::Cuda(storage),
+            shape: Shape::from(elem_count),
+        })
     }
 
     /// Get the CUDA device pointer for the raw quantized data.

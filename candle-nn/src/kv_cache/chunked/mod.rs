@@ -22,6 +22,8 @@
 mod alloc;
 mod arena;
 mod backing;
+#[cfg(feature = "cuda")]
+pub(crate) mod bump_arena;
 mod chunk_ops;
 mod compress;
 mod compression_policy;
@@ -37,9 +39,16 @@ mod head_gids;
 mod io;
 mod meta_pool;
 pub mod migrate;
-pub mod migrate_guard;
+pub mod migrate_flight;
+#[cfg(feature = "cuda")]
+pub(crate) mod region_pool;
+#[cfg(feature = "cuda")]
+pub(crate) mod reservation;
 pub mod sampled_selection;
 mod sequence_ops;
+mod size_class;
+#[cfg(feature = "cuda")]
+pub(crate) mod slot_state_arena;
 mod types;
 
 #[cfg(test)]
@@ -62,13 +71,15 @@ pub use compression_policy::{
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
-pub use gid_pool::{ChunkGid, ChunkGidPool, GpuArenaFormatStats};
+pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
-pub use migrate_guard::{
-    enter_migrate, migrate_in_flight, try_enter_relief, MigrateGuard, ReliefGuard,
+pub use migrate_flight::{migrate_flight, migrate_in_flight, MigrateFlight};
+pub use size_class::{
+    all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
+    payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
-pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};
+pub use types::{ChunkMeta, CHUNK_SIZE};
 pub use types::{LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
 
 // Re-export for use within submodules and tests
@@ -83,8 +94,16 @@ pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 // `location` field is the coarse-grained tier tag).
 pub use super::arena_table::ArenaLocation;
 
-// The allocator's own remaining arena budget — admission clamps to this.
-pub use alloc::kv_alloc_headroom;
+pub use alloc::class_promotion_count;
+#[cfg(feature = "cuda")]
+pub use bump_arena::{
+    begin_wave, persistence_domain_stats, wave_alloc, wave_domain_stats, BumpRange,
+    Generation as WaveGeneration,
+};
+#[cfg(feature = "cuda")]
+pub use region_pool::{region_stats, RegionStats, REGION_BYTES};
+#[cfg(feature = "cuda")]
+pub use slot_state_arena::stats as slot_state_stats;
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 #[cfg(feature = "cuda")]
 pub use alloc::vram_budget_available;

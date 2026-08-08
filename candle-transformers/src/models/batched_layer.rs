@@ -12,6 +12,8 @@ use candle::quantized::cuda::{DynamicActs, Q8a128Operand};
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::begin_wave;
 use candle_nn::kv_cache::KvCache;
 
 #[cfg(feature = "cuda")]
@@ -383,6 +385,17 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     } else {
         act_dtype
     };
+    // The layer's other transient scope, and the same shape as the attention
+    // one: it spans the FFN through the residual add that consumes its result,
+    // after which nothing the expert forward produced is live. The MoE combine
+    // target is what this bounds — it is returned from `ffn_forward`, so no
+    // scope inside the MoE code could have bounded it (§3.6, and see
+    // `wave_buffers`).
+    #[cfg(feature = "cuda")]
+    let ffn_wave = match x.as_cat_tensor().device() {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
+        _ => None,
+    };
     let mut h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode())?;
         layer.ffn_forward(acts, mlp_dtype)?
@@ -390,6 +403,9 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     h2.to_dtype_mut(orig_dtype)?;
     x.to_dtype_mut(orig_dtype)?;
     x.add_mut(&h2)?;
+    drop(h2);
+    #[cfg(feature = "cuda")]
+    drop(ffn_wave);
     Ok(())
 }
 
@@ -554,6 +570,20 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     // with no standalone quantize. Only on the paged CUDA decode path; false → FP context.
     let want_q8 = layer.int8mode().is_int8() && use_paged && seq_len == 1 && head_dim == 128;
 
+    // The attention context lives on the wave's transient half, and this guard
+    // is what bounds it: it spans exactly attention -> o_proj, after which the
+    // context is dead (o_proj's result is its own tensor). Scoping it to the
+    // layer rather than the whole forward is what keeps consumption at one
+    // layer's working set instead of accumulating every layer's — the reuse the
+    // ping-pong buffer set of `docs/archived/arena_unification.md` §3.6 calls for.
+    // Halves alternate per layer, so layer N's reads are separated from layer
+    // N+2's writes by a whole layer of same-stream work.
+    #[cfg(feature = "cuda")]
+    let layer_wave = match q.device() {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
+        _ => None,
+    };
+
     let outputs = if use_paged && seq_len == 1 {
         paged_decode_attention(
             caches,
@@ -588,6 +618,9 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
         layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
     };
     profile_sync(attn_out.device());
+    // The context is consumed; release the half for the next layer.
+    #[cfg(feature = "cuda")]
+    drop(layer_wave);
     pipeline_record("decode:out_proj", t_out_proj);
 
     TensorCat::from_tensors(0, std::iter::once(attn_out))
@@ -696,6 +729,20 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     // positioning every column by its chunk `rope_base` (`slice_rope`) and
     // masking each glue token by `cpos > row_pos + fwd_ahead[t]`. Everything else
     // (ordinary prefill, non-128 head dims) stays on the plain prefill kernel.
+    // The attention context lives on the wave's transient half, and this guard
+    // is what bounds it: it spans exactly attention -> o_proj, after which the
+    // context is dead (o_proj's result is its own tensor). Scoping it to the
+    // layer rather than the whole forward is what keeps consumption at one
+    // layer's working set instead of accumulating every layer's — the reuse the
+    // ping-pong buffer set of `docs/archived/arena_unification.md` §3.6 calls for.
+    // Halves alternate per layer, so layer N's reads are separated from layer
+    // N+2's writes by a whole layer of same-stream work.
+    #[cfg(feature = "cuda")]
+    let layer_wave = match q.device() {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
+        _ => None,
+    };
+
     let out_packed = match glue_meta {
         Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
             caches,
@@ -756,6 +803,9 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         layer.output_projection(DynamicActs::Float(reshaped_ctx), dt)?
     };
     profile_sync(output.device());
+    // The context is consumed; release the half for the next layer.
+    #[cfg(feature = "cuda")]
+    drop(layer_wave);
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;

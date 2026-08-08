@@ -97,7 +97,7 @@ impl candle::CustomOp3 for RotaryEmbI {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -201,6 +201,7 @@ impl candle::CustomOp3 for RotaryEmbI {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -418,7 +419,7 @@ impl candle::CustomOp3 for RotaryEmb {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -524,6 +525,7 @@ impl candle::CustomOp3 for RotaryEmb {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -728,7 +730,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -832,6 +834,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, l1.shape().clone()))
     }

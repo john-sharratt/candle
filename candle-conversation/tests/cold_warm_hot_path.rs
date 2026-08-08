@@ -40,9 +40,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::substrate::TierState;
 use candle_conversation::turn::Role;
-use candle_nn::kv_cache::{
-    ArenaKey, ArenaLocation, ChunkedKvBacking, KvFormat, QuantFormat, SealedChunk, SealedSequence,
-};
+use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat, SealedSequence};
 use half::bf16;
 
 mod common;
@@ -511,63 +509,75 @@ fn full_cold_warm_hot_round_trip() {
 // Quant blend round-trip
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Compress a freshly-sealed sequence into `format`, in place.
+///
+/// This is the production quantize path with the format forced, and it is now
+/// the *only* way to change what a chunk's bands are: a slot move is
+/// byte-verbatim (`docs/archived/arena_unification.md` principle 8), so the old
+/// "re-point every GID into an arena of the target format" trick no longer
+/// exists. Going through the real kernel also makes these fixtures exercise
+/// the path production takes.
+fn compress_sealed_to(
+    backing: &ChunkedKvBacking,
+    sealed: SealedSequence,
+    format: KvFormat,
+    device: &Device,
+) -> SealedSequence {
+    let KvFormat::Quantized(qf) = format else {
+        // A float target is what the backing already produced.
+        return sealed;
+    };
+    let policy = CompressionPolicy {
+        override_k_quant: Some(qf),
+        override_v_quant: Some(qf),
+        ..CompressionPolicy::default()
+    };
+    let Device::Cuda(cuda) = device else {
+        panic!("compress_sealed_to requires a CUDA device");
+    };
+    let stream = cuda.cuda_context().new_stream().unwrap();
+    let mut pinned = None;
+    candle_nn::kv_cache::quantize_sealed_in_place(
+        backing,
+        &[&sealed],
+        &policy,
+        device,
+        &stream,
+        &mut pinned,
+    )
+    .expect("forced quantize must succeed")
+    .pop()
+    .expect("one sequence in, one out")
+}
+
 fn make_backings_f16(device: &Device, head_dim: usize) -> Vec<ChunkedKvBacking> {
+    make_backings_in_format(device, head_dim, None)
+}
+
+/// Backings whose sealed chunks land in `format`, or F16 when `None`.
+///
+/// The seeding helpers used to write F16 and then re-point every GID into an
+/// arena of the target format. That is no longer expressible, and was never
+/// quite honest: a slot move is byte-verbatim and does not convert
+/// (`docs/archived/arena_unification.md` principle 8). Configuring the backing produces
+/// chunks genuinely tagged with the target format, which is what the cold-load
+/// round-trip is actually about.
+fn make_backings_in_format(
+    device: &Device,
+    head_dim: usize,
+    format: Option<KvFormat>,
+) -> Vec<ChunkedKvBacking> {
+    let f = format.unwrap_or(KvFormat::Float(DType::F16));
     (0..N_LAYERS)
         .map(|_| {
-            ChunkedKvBacking::new(4, N_KV_HEAD, head_dim, DType::F16, device, ARENA_CAPACITY)
+            ChunkedKvBacking::new_with_format(4, N_KV_HEAD, head_dim, f, f, device, ARENA_CAPACITY)
                 .unwrap()
         })
         .collect()
 }
 
-/// Re-point a SealedSequence's chunk GIDs into a fresh arena of
-/// `target_format` on `target_location`. Each chunk's GIDs are migrated
-/// one-to-one via [`ChunkedKvBacking::migrate_chunk`], which handles
-/// the format conversion (e.g. F16 → R16 layout repack, F16 → Q8_0
-/// quantization) and produces brand-new `ChunkGid`s.
-///
-/// Returns a `SealedSequence` whose chunks address the migrated arena.
-/// The original sealed sequence's GIDs are dropped — the old arena
-/// chunks become reclaimable.
-fn migrate_sealed_to_format(
-    backing: &ChunkedKvBacking,
-    sealed: SealedSequence,
-    target_format: KvFormat,
-    target_location: ArenaLocation,
-) -> SealedSequence {
-    let key = ArenaKey::uniform(target_format, target_location);
-    let mut new_chunks = Vec::with_capacity(sealed.chunks.len());
-    for chunk in &sealed.chunks {
-        let new_gids = chunk
-            .gids
-            .map_unique(|gid| backing.migrate_chunk(gid.raw(), key.clone()))
-            .expect("migrate_chunk must succeed");
-        // Recompute `byte_size` against the post-migrate arenas:
-        // the source arena's per-slot stride no longer applies once
-        // GIDs point at the target arena (Float→Quantized changes
-        // bytes-per-chunk). Without this re-derivation the cold-load
-        // round-trip would compare the original arena's byte_size
-        // against the new arena's natively-computed byte_size and
-        // mismatch on length.
-        let arena_infos = backing.resolve_arena_info().unwrap();
-        let byte_size = new_gids.arena_byte_size(&arena_infos);
-        new_chunks.push(SealedChunk {
-            gids: new_gids,
-            byte_size,
-            ..chunk.clone()
-        });
-    }
-    SealedSequence {
-        chunks: new_chunks,
-        token_count: sealed.token_count,
-        chunk_size: sealed.chunk_size,
-        location: target_location,
-    }
-}
-
-/// Seed a turn in the backings' default format, then optionally
-/// migrate every chunk to `target_k_format` / `target_v_format`.
-/// `None` keeps the chunk in the source format.
+/// Seed a turn, optionally compressing it into `target_format` through the
+/// production quantize path.
 fn seed_turn_with_format(
     conv: &Conversation,
     backings: &[ChunkedKvBacking],
@@ -600,7 +610,7 @@ fn seed_turn_with_format(
         backing.set_len(slot, n_tokens);
         let mut sealed = backing.record_turn(slot).unwrap();
         if let Some(target) = target_format {
-            sealed = migrate_sealed_to_format(backing, sealed, target, ArenaLocation::Gpu);
+            sealed = compress_sealed_to(backing, sealed, target, device);
         }
         sealed_per_layer.push(sealed);
     }
@@ -1883,19 +1893,17 @@ fn quantize_on_evict_cold_reload_round_trip() {
         .read()
         .turn_sealed_of(timeline, key.index)
         .expect("post-elevate turn must be hot");
-    for (backing, seq) in backings.iter().zip(sealed.iter()) {
-        let arena_info = backing.resolve_arena_info().unwrap();
+    for (_backing, seq) in backings.iter().zip(sealed.iter()) {
         for chunk in &seq.chunks {
-            for gid in chunk.gids.as_slice() {
-                let arena_idx = gid.arena_idx();
-                let info = &arena_info[arena_idx];
+            // The chunk's own tags are what the cold-load path persisted and
+            // restored; the arenas its gids point into are untyped byte slots
+            // and cannot report a format.
+            for (gid, tag) in chunk.bands() {
                 assert!(
-                    info.k_format_tag.is_quantized() || info.v_format_tag.is_quantized(),
-                    "post-cold-load gid {} arena_idx {arena_idx} must live in a \
-                     quantized arena, got {:?} / {:?}",
+                    tag.is_quantized(),
+                    "post-cold-load gid {} must be recorded as quantized \
+                     (elevation must preserve the persisted format), got {tag:?}",
                     gid.raw(),
-                    info.k_format_tag,
-                    info.v_format_tag,
                 );
             }
         }
@@ -2833,7 +2841,7 @@ use candle_conversation::persistence::streams::ContentAddress;
 use candle_nn::kv_cache::quantize_sealed_in_place;
 
 /// Seed a section in `backings` at `head_dim` width and `n_tokens`
-/// length, optionally migrating every chunk to `target_format`.  Mirrors
+/// length, optionally compressed into `target_format`.  Mirrors
 /// [`seed_turn_with_format`] but writes through
 /// [`set_section_full`] instead of `record_turn`.  Returns the
 /// [`ResidenceIndex`] of the newly-installed section so the test can
@@ -2871,7 +2879,7 @@ fn seed_section_with_format(
         backing.set_len(slot, n_tokens);
         let mut sealed = backing.record_turn(slot).unwrap();
         if let Some(target) = target_format {
-            sealed = migrate_sealed_to_format(backing, sealed, target, ArenaLocation::Gpu);
+            sealed = compress_sealed_to(backing, sealed, target, device);
         }
         sealed_per_layer.push(sealed);
     }

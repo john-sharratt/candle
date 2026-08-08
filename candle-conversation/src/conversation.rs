@@ -508,6 +508,16 @@ impl Sequence {
                     // them at projection time, but do NOT add them
                     // to fixed_prefix — the priming projection must
                     // be coherent for the empty-collection case.
+                    //
+                    // This is also why these members cannot be offloaded as the
+                    // section tree's embedded collections are: those never enter
+                    // `linear_prefix`, so nothing prefills against them once
+                    // their branch is sealed. These do. Offloading them here
+                    // costs every later section its prefix — `prepare_section_
+                    // ingest` finds no sealed substrate entry and skips it,
+                    // building a silently wrong system prompt. The cold-boot hot
+                    // set is therefore bounded by the whole collection span, not
+                    // by one collection, and the KV reservation must cover it.
                     for sec in &coll.sections {
                         if sec.is_template {
                             continue;

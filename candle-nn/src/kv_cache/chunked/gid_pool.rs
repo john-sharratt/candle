@@ -52,7 +52,6 @@
 //! arena and lets drops touch a single cache line.
 
 use ahash::{AHashMap, AHashSet};
-use candle::DType;
 use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
@@ -65,10 +64,20 @@ use std::{
 use strum::IntoEnumIterator;
 
 use super::arena::ArenaKey;
-use crate::kv_cache::chunked::types::{
-    arena_chunks_for_format, arena_gid_stride, TARGET_ARENA_BYTES,
-};
-use crate::kv_cache::{ArenaLocation, KvFormat, QuantFormat};
+use super::size_class::SizeClass;
+use crate::kv_cache::chunked::types::{GID_STRIDE, TARGET_ARENA_BYTES};
+use crate::kv_cache::ArenaLocation;
+
+/// The class the pool's own convenience allocator and its unit tests use.
+///
+/// Rung 5 is **640 B** (`Q4_KS`), which puts 26,214 slots in a 16 MiB region —
+/// well above the 15,420 of `Q8_0`'s 1088 B rung. The point is to exercise the
+/// free list and the `u16` recycle links near their busiest, not to mirror the
+/// most common sealed format, so a *small* class is the stronger choice here.
+///
+/// (This said "2048 B … holds `Q8_0`". Both halves were wrong: rung 5 is 640 B,
+/// and 2048 B is the `F16`/`BF16` rung — `Q8_0` sits at 1088.)
+const TEST_CLASS: SizeClass = SizeClass::at(5);
 
 /// Per-arena refcount table. Lives behind an `Arc` shared by every
 /// `ChunkGid` allocated from this arena. Lock-free: all mutation is via
@@ -390,24 +399,6 @@ impl ArenaRefcounts {
     fn free_count(&self) -> usize {
         self.arena_chunks.saturating_sub(self.live_count())
     }
-
-    /// Iterate over the raw gids currently allocated in this arena.
-    /// Slow path used by diagnostics / live-gid queries — scans every
-    /// slot. Only called from the CUDA-gated defrag path.
-    #[cfg(feature = "cuda")]
-    fn live_gids(&self) -> Vec<i64> {
-        let base = (self.arena_idx * arena_gid_stride()) as i64;
-        let mut out = Vec::with_capacity(self.live_count());
-        for i in 0..self.arena_chunks {
-            // `counts[i]` is now overlapped (refcount when occupied, free-list
-            // link when free), so the occupancy bit is the free/occupied
-            // discriminator — not `counts > 0`.
-            if self.occupancy[i / 64].load(Ordering::Acquire) & (1u64 << (i % 64)) != 0 {
-                out.push(base + i as i64);
-            }
-        }
-        out
-    }
 }
 
 /// Refcount backing for a [`ChunkGid`].
@@ -459,7 +450,7 @@ impl ChunkGid {
     pub fn strong_count(&self) -> usize {
         match &self.backing {
             GidBacking::Pooled(t) => {
-                let chunk_idx = (self.id as usize) % arena_gid_stride();
+                let chunk_idx = (self.id as usize) % GID_STRIDE;
                 t.load(chunk_idx) as usize
             }
             GidBacking::Detached(c) => c.load(Ordering::Relaxed) as usize,
@@ -491,13 +482,13 @@ impl ChunkGid {
     /// Arena index this gid belongs to.
     #[inline]
     pub fn arena_idx(&self) -> usize {
-        self.id as usize / arena_gid_stride()
+        self.id as usize / GID_STRIDE
     }
 
     /// Chunk offset within its arena.
     #[inline]
     pub fn chunk_idx(&self) -> usize {
-        self.id as usize % arena_gid_stride()
+        self.id as usize % GID_STRIDE
     }
 
     /// Arena routing key (format + location) this gid was allocated
@@ -514,7 +505,7 @@ impl Clone for ChunkGid {
     fn clone(&self) -> Self {
         match &self.backing {
             GidBacking::Pooled(t) => {
-                let chunk_idx = (self.id as usize) % arena_gid_stride();
+                let chunk_idx = (self.id as usize) % GID_STRIDE;
                 t.inc(chunk_idx);
                 Self {
                     id: self.id,
@@ -536,7 +527,7 @@ impl Drop for ChunkGid {
     fn drop(&mut self) {
         match &self.backing {
             GidBacking::Pooled(t) => {
-                let chunk_idx = (self.id as usize) % arena_gid_stride();
+                let chunk_idx = (self.id as usize) % GID_STRIDE;
                 t.dec(chunk_idx);
             }
             GidBacking::Detached(c) => {
@@ -620,18 +611,6 @@ impl CapacityBitmap {
     }
 }
 
-/// One defragmentation pass's drain plan for a single format pool, produced by
-/// [`ArenaPool::drain_plan`].
-#[cfg(feature = "cuda")]
-#[derive(Debug, Default)]
-pub struct DrainPlan {
-    /// Arenas to empty this pass, emptiest-first.
-    pub sources: Vec<usize>,
-    /// Arenas that must not receive a relocated chunk: every source, plus every
-    /// arena that is already empty and so is about to be released for free.
-    pub blocked: AHashSet<usize>,
-}
-
 /// (rare); allocation walks the tables read-locked and operates lock-
 /// free against the chosen arena's counts.
 #[derive(Debug)]
@@ -668,12 +647,12 @@ struct ArenaPool {
 }
 
 impl ArenaPool {
-    fn new(format: KvFormat) -> Self {
+    fn new(class: SizeClass) -> Self {
         Self {
             tables: RwLock::new(BTreeMap::new()),
             total_arenas: AtomicUsize::new(0),
             total_live: Arc::new(AtomicUsize::new(0)),
-            arena_chunks: arena_chunks_for_format(format),
+            arena_chunks: class.chunks_per_region(),
             alloc_gate: Mutex::new(()),
             capacity: Arc::new(CapacityBitmap::new()),
         }
@@ -709,7 +688,7 @@ impl ArenaPool {
     /// skipped, and `None` means the caller must register a fresh arena.
     fn allocate_run(&self, len: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
         let _gate = self.alloc_gate.lock().unwrap();
-        let stride = arena_gid_stride();
+        let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
         let mut indices: Vec<usize> = tables.keys().copied().collect();
         indices.sort_unstable();
@@ -741,7 +720,7 @@ impl ArenaPool {
         // Same gate as every claim walk: `try_claim_run` is load-then-store on
         // `hwm` and is only sound serialized.
         let _gate = self.alloc_gate.lock().unwrap();
-        let stride = arena_gid_stride();
+        let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
         let table = tables.get(&arena_idx)?;
         let first = table.try_claim_run(len)?;
@@ -757,7 +736,7 @@ impl ArenaPool {
         // with a relaxed load (no per-slot locked RMW) without 128 threads
         // ping-ponging the same cache lines. Drops stay lock-free.
         let _gate = self.alloc_gate.lock().unwrap();
-        let stride = arena_gid_stride();
+        let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
         // Fast path: the capacity bitmap points at the lowest arena with a free
         // slot (find-first-set = lowest-first packing), skipping the full-arena
@@ -823,7 +802,7 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
         // Same lowest-first BTreeMap walk as `allocate_any`, draining each
         // arena before moving up — one read lock, no index collect + sort.
-        let stride = arena_gid_stride();
+        let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
         for (&arena_idx, table) in tables.iter() {
             if out.len() == n {
@@ -854,93 +833,27 @@ impl ArenaPool {
             Arc::clone(tables.get(&arena_idx)?)
         };
         let chunk_idx = table.try_claim_one()?;
-        let stride = arena_gid_stride();
+        let stride = GID_STRIDE;
         Some(((arena_idx * stride + chunk_idx) as i64, table))
     }
 
-    /// Allocate a gid from any arena outside `blocked`. Used during arena
-    /// drain so a relocated chunk never lands somewhere that cancels the
-    /// move — see [`DrainPlan`]. CUDA-only, like the defrag path that uses it.
-    #[cfg(feature = "cuda")]
-    fn allocate_avoiding(&self, blocked: &AHashSet<usize>) -> Option<(i64, Arc<ArenaRefcounts>)> {
-        // Serialize with the other claim walks (see `allocate_any`).
-        let _gate = self.alloc_gate.lock().unwrap();
-        let stride = arena_gid_stride();
-        let tables = self.tables.read().unwrap();
-        for (&arena_idx, table) in tables.iter() {
-            if blocked.contains(&arena_idx) {
-                continue;
-            }
-            if let Some(chunk_idx) = table.try_claim_one() {
-                if table.is_full() {
-                    self.capacity.clear(arena_idx);
-                }
-                return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
-            }
-        }
-        None
-    }
-
-    /// Plan one defragmentation pass over this pool: which arenas to drain,
-    /// and which arenas the drained chunks may NOT be relocated into.
+    /// Find a fully-free arena and tombstone it, returning its index. Skips
+    /// arenas in `protected_arenas`. `None` when no arena is fully free.
     ///
-    /// The plan is bounded by the pool's slot balance. Perfect packing needs
-    /// `ceil(total_live / arena_chunks)` arenas, so at most
-    /// `total_arenas - needed` can ever come back; picking more sources than
-    /// that is arithmetically self-defeating, because the surplus arenas'
-    /// chunks have nowhere to go except into another arena in the same pass.
-    /// Unbounded emptiest-first draining does exactly that and the pass moves
-    /// chunks in a circle: measured live as `moves=5588 arenas_compacted=0
-    /// arenas_released=0` with the pool wedged at 0 t/s — every arena request
-    /// refused because compaction kept promising memory it could not deliver.
+    /// This used to refuse when releasing would leave under 10 % of an arena's
+    /// slots free across the remaining pool, to stop steady-state churn —
+    /// release an arena, immediately re-create it, each one a `cuMemAlloc` and
+    /// a `Tensor::zeros` of 16 MiB. That guard's condition was "the pool is
+    /// nearly full", which is exactly when reclaim was being asked for, so it
+    /// needed a `force` bypass for the pressure path and the two disagreed
+    /// about when reclaim was allowed at all.
     ///
-    /// Already-empty arenas spend the same budget (the empty sweep releases
-    /// them without a single move) and are blocked as destinations: refilling
-    /// one cancels the arena it was about to give back.
-    ///
-    /// Protected arenas are never sources — they are the per-format warm set,
-    /// held for the process lifetime, and `try_tombstone` refuses them however
-    /// empty they get — but they remain perfectly good destinations.
-    #[cfg(feature = "cuda")]
-    fn drain_plan(&self, protected: &AHashSet<usize>) -> DrainPlan {
-        let by_live = self.arenas_sorted_by_live();
-        let live: usize = by_live.iter().map(|&(_, l)| l).sum();
-        let needed = if live == 0 {
-            0
-        } else {
-            live.div_ceil(self.arena_chunks)
-        };
-        let mut budget = by_live.len().saturating_sub(needed);
-
-        let mut plan = DrainPlan::default();
-        for (idx, live_count) in by_live {
-            if budget == 0 {
-                break;
-            }
-            if live_count == 0 {
-                budget -= 1;
-                plan.blocked.insert(idx);
-                continue;
-            }
-            if protected.contains(&idx) {
-                continue;
-            }
-            budget -= 1;
-            plan.blocked.insert(idx);
-            plan.sources.push(idx);
-        }
-        plan
-    }
-
-    /// Find a fully-free arena and tombstone it. Returns the arena's
-    /// index. Skips arenas in `protected_arenas`.
-    ///
-    /// Returns `None` when:
-    ///   - No arena is fully free, OR
-    ///   - Releasing would leave < 10% of `arena_chunks` of headroom
-    ///     across the remaining pool (matches prior behaviour to avoid
-    ///     thrashing).
-    fn try_tombstone(&self, protected_arenas: &AHashSet<usize>, force: bool) -> Option<usize> {
+    /// Under the reservation there is no churn to guard against: releasing is a
+    /// push onto the free-region list and creating is a pop, both O(1) and
+    /// neither touching the driver. So an empty arena is always released, and
+    /// its region is immediately available to *any* class — §3.8's first
+    /// pressure response, with nothing to decide.
+    fn try_tombstone(&self, protected_arenas: &AHashSet<usize>) -> Option<usize> {
         // Held across BOTH the emptiness test and the removal. Claims are gated
         // (`allocate_any` and friends take this before `tables.read()`), so with
         // it held no slot in the candidate can be occupied between observing
@@ -955,30 +868,6 @@ impl ArenaPool {
         // `next_tombstone` holds `metadata` outside this, and no claim path
         // takes `metadata`, so the two nest without a cycle.
         let _gate = self.alloc_gate.lock().unwrap();
-
-        // Free-headroom check first — derived in O(1) from the running
-        // counters. After releasing one arena we'd have
-        // `(total_arenas - 1) * arena_chunks - total_live` free slots;
-        // bail if that's under the 10% thrash threshold without even
-        // taking the tables read lock.
-        //
-        // `force` bypasses it. The guard exists to stop steady-state churn
-        // (release an arena, immediately re-create it), and it is right for
-        // that — but its condition is "the pool is nearly full", which is
-        // exactly when reclaim is being asked for. Left unconditional it makes
-        // the relief ladder a no-op at the moment it matters and the pool can
-        // never shrink back inside the card: full because it cannot shrink,
-        // unable to shrink because it is full. Under real VRAM pressure one
-        // extra create/destroy cycle is cheap and a wedged pool is not.
-        let arenas = self.total_arenas.load(Ordering::Relaxed);
-        if arenas == 0 {
-            return None;
-        }
-        let total_slots_after = arenas.saturating_sub(1).saturating_mul(self.arena_chunks);
-        let after_release = total_slots_after.saturating_sub(self.total_live());
-        if !force && after_release < self.arena_chunks / 10 {
-            return None;
-        }
 
         let tables = self.tables.read().unwrap();
         // Lowest-index fully-free, non-protected arena. `creation_pending` is
@@ -1046,20 +935,6 @@ impl ArenaPool {
         total_slots.saturating_sub(self.total_live())
     }
 
-    fn defragmentable_ratio(&self) -> f32 {
-        let arenas = self.total_arenas.load(Ordering::Relaxed);
-        if arenas == 0 {
-            return 0.0;
-        }
-        let live = self.total_live();
-        let needed = if live == 0 {
-            0
-        } else {
-            live.div_ceil(self.arena_chunks)
-        };
-        (arenas.saturating_sub(needed)) as f32 / arenas as f32
-    }
-
     /// Whole arenas this pool could free via perfect defragmentation:
     /// `total_arenas - ceil(total_live / arena_chunks)`. Zero means the pool is
     /// packed to within a single arena of free space, so a compaction pass
@@ -1073,31 +948,6 @@ impl ArenaPool {
             live.div_ceil(self.arena_chunks)
         };
         arenas.saturating_sub(needed)
-    }
-
-    /// CUDA-only: list every live gid in a specific arena. Used by the
-    /// defrag/eviction path to remap chunks before tombstoning the
-    /// drained arena.
-    #[cfg(feature = "cuda")]
-    fn live_gids_for_arena(&self, arena_idx: usize) -> Vec<i64> {
-        let tables = self.tables.read().unwrap();
-        tables
-            .get(&arena_idx)
-            .map(|t| t.live_gids())
-            .unwrap_or_default()
-    }
-
-    /// CUDA-only: arenas sorted by live-slot count (emptiest first) for
-    /// the defrag/eviction pass to pick drain targets.
-    #[cfg(feature = "cuda")]
-    fn arenas_sorted_by_live(&self) -> Vec<(usize, usize)> {
-        let tables = self.tables.read().unwrap();
-        let mut arenas: Vec<(usize, usize)> = tables
-            .iter()
-            .map(|(&idx, t)| (idx, t.live_count()))
-            .collect();
-        arenas.sort_by_key(|&(_, live)| live);
-        arenas
     }
 
     #[cfg(test)]
@@ -1134,45 +984,64 @@ struct GidPoolInner {
 }
 
 fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
-    // Locations × (DType variants + QuantFormat variants). With current
-    // enums this is ~58 entries; 64 leaves room without rehashing on
-    // first registration.
-    let mut pools = AHashMap::with_capacity(64);
+    // Locations × size classes — 14 entries, down from ~58 under per-format
+    // pools. That collapse is the whole point: every format sharing a class
+    // now shares one pool and one free list, so a slot freed by any of them is
+    // allocatable by all of them (`docs/archived/arena_unification.md` §3.4).
+    let mut pools = AHashMap::with_capacity(ArenaLocation::iter().count() * SizeClass::COUNT);
     for location in ArenaLocation::iter() {
-        for dtype in DType::iter() {
-            pools.insert(
-                ArenaKey::new(KvFormat::Float(dtype), location),
-                ArenaPool::new(KvFormat::Float(dtype)),
-            );
-        }
-        for qf in QuantFormat::iter() {
-            pools.insert(
-                ArenaKey::new(KvFormat::Quantized(qf), location),
-                ArenaPool::new(KvFormat::Quantized(qf)),
-            );
+        for class in SizeClass::all() {
+            pools.insert(ArenaKey::new(class, location), ArenaPool::new(class));
         }
     }
     pools
 }
 
-/// GPU arena occupancy split by float vs quant format — the diagnostic the
-/// compress-to-free relief rung is judged by. Compress shrinks the float side
-/// (working-set arenas the persistence thread would quantize anyway) while the
-/// quant side grows less, so a working rung shows float bytes dropping across a
-/// pressure episode. `reserved` counts whole ~16 MiB slabs
-/// ([`TARGET_ARENA_BYTES`]); `live` counts occupied chunk slots at the format's
-/// per-chunk size. These are GidPool arena-slab quantities, distinct from the
-/// CUDA stream-ordered pool's `reserved`/`used` (which include segment slack the
-/// GidPool never sees) — report them on their own line, not as a partition of
-/// the CUDA-pool gap.
+/// Occupancy of one size class's GPU arenas.
+///
+/// `reserved` counts whole ~16 MiB slabs ([`TARGET_ARENA_BYTES`]); `live`
+/// counts occupied chunk slots at this class's stride. Both are GidPool
+/// arena-slab quantities, distinct from the CUDA stream-ordered pool's
+/// `reserved`/`used` (which include segment slack the GidPool never sees) —
+/// report them on their own line, not as a partition of the CUDA-pool gap.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct GpuArenaFormatStats {
-    pub float_arenas: usize,
-    pub float_reserved_bytes: usize,
-    pub float_live_bytes: usize,
-    pub quant_arenas: usize,
-    pub quant_reserved_bytes: usize,
-    pub quant_live_bytes: usize,
+pub struct ClassOccupancy {
+    /// Slot stride for this class, in bytes — its identity in a report.
+    pub slot_bytes: usize,
+    pub arenas: usize,
+    pub reserved_bytes: usize,
+    pub live_bytes: usize,
+}
+
+/// GPU arena occupancy per size class — the diagnostic the compress-to-free
+/// relief rung is judged by.
+///
+/// This replaces the old float-vs-quant split, which cannot be computed any
+/// more and was never quite the right question: an arena has no format, and
+/// what the rung actually moves is occupancy *down the ladder* as bands
+/// compress into smaller classes. A working rung shows the large classes'
+/// live bytes falling while the small classes' rise by less.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuArenaClassStats {
+    /// One entry per rung of the ladder, in ascending stride order.
+    pub classes: [ClassOccupancy; SizeClass::COUNT],
+}
+
+impl GpuArenaClassStats {
+    /// Total GPU arenas across every class.
+    pub fn total_arenas(&self) -> usize {
+        self.classes.iter().map(|c| c.arenas).sum()
+    }
+
+    /// Total slab bytes reserved across every class.
+    pub fn total_reserved_bytes(&self) -> usize {
+        self.classes.iter().map(|c| c.reserved_bytes).sum()
+    }
+
+    /// Total bytes in occupied slots across every class.
+    pub fn total_live_bytes(&self) -> usize {
+        self.classes.iter().map(|c| c.live_bytes).sum()
+    }
 }
 
 /// Pool for allocating and recycling gids, partitioned by ArenaKey.
@@ -1219,7 +1088,7 @@ impl ChunkGidPool {
             if arena_idx >= state.arena_registry.len() {
                 state.arena_registry.resize(arena_idx + 1, None);
             }
-            state.arena_registry[arena_idx] = Some(key.clone());
+            state.arena_registry[arena_idx] = Some(key);
             arena_idx
         };
         let pool = self
@@ -1254,7 +1123,7 @@ impl ChunkGidPool {
                 state.arena_registry[arena_idx].is_none(),
                 "register_arena_at: arena index {arena_idx} already registered"
             );
-            state.arena_registry[arena_idx] = Some(key.clone());
+            state.arena_registry[arena_idx] = Some(key);
         }
         let pool = self
             .inner
@@ -1349,84 +1218,22 @@ impl ChunkGidPool {
         })
     }
 
-    /// Allocate a gid for `key` from any arena **except**
-    /// any arena in `blocked`. Used during arena drain — see [`DrainPlan`].
-    #[cfg(feature = "cuda")]
-    pub fn allocate_for_avoiding(
-        &self,
-        key: ArenaKey,
-        blocked: &AHashSet<usize>,
-    ) -> Option<ChunkGid> {
-        let pool = self.inner.pools.get(&key)?;
-        let (id, table) = pool.allocate_avoiding(blocked)?;
-        Some(ChunkGid {
-            id,
-            backing: GidBacking::Pooled(table),
-        })
-    }
-
-    /// Return the live gids for `arena_idx` (slots with refcount > 0).
-    #[cfg(feature = "cuda")]
-    pub fn live_gids_for_arena(&self, arena_idx: usize) -> Vec<i64> {
-        let key = {
-            let Ok(state) = self.inner.metadata.lock() else {
-                return Vec::new();
-            };
-            match state.arena_registry.get(arena_idx) {
-                Some(Some(k)) => k.clone(),
-                _ => return Vec::new(),
-            }
-        };
-        self.inner
-            .pools
-            .get(&key)
-            .map(|pool| pool.live_gids_for_arena(arena_idx))
-            .unwrap_or_default()
-    }
-
-    /// Plan one defragmentation pass over `key`'s pool — see [`DrainPlan`].
-    ///
-    /// Two things the plan gets right that emptiest-first-drain-everything did
-    /// not, both measured as passes that moved thousands of chunks and freed
-    /// nothing:
-    ///
-    /// - **Protected arenas are never sources.** They are the per-format warm
-    ///   set, held for the process lifetime, and `try_tombstone` refuses them
-    ///   however empty they get — yet a warm arena is lightly used almost by
-    ///   definition, so emptiest-first picked them FIRST
-    ///   (`compact_moves=15994`, `empty_arenas=1 protected=1`).
-    /// - **The source count is bounded by the slot balance.** Draining more
-    ///   arenas than the pool can actually give back sends chunks into arenas
-    ///   that are themselves being drained (`moves=5588 arenas_released=0`).
-    #[cfg(feature = "cuda")]
-    pub fn drain_plan_for_key(&self, key: &ArenaKey) -> DrainPlan {
-        let protected = {
-            let state = self.inner.metadata.lock().unwrap();
-            state.protected_arenas.clone()
-        };
-        self.inner
-            .pools
-            .get(key)
-            .map(|pool| pool.drain_plan(&protected))
-            .unwrap_or_default()
-    }
-
     /// Convenience: allocate a gid using a default test key.
     pub fn allocate(&self) -> ChunkGid {
-        let key = ArenaKey::gpu_float(candle::DType::BF16);
-        if let Some(gid) = self.allocate_for(key.clone()) {
+        let key = ArenaKey::new(TEST_CLASS, ArenaLocation::Gpu);
+        if let Some(gid) = self.allocate_for(key) {
             return gid;
         }
-        self.register_arena(key.clone());
+        self.register_arena(key);
         self.allocate_for(key)
             .expect("just registered arena, must have capacity")
     }
 
     /// Find a fully-free arena of this format and release it.
-    pub fn next_tombstone(&self, key: ArenaKey, force: bool) -> Option<usize> {
+    pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
-        let arena_idx = pool.try_tombstone(&state.protected_arenas, force)?;
+        let arena_idx = pool.try_tombstone(&state.protected_arenas)?;
         state.arena_registry[arena_idx] = None;
         state.free_arenas.push_back(arena_idx);
         Some(arena_idx)
@@ -1488,36 +1295,9 @@ impl ChunkGidPool {
         let state = self.inner.metadata.lock().unwrap();
         let mut out: AHashSet<ArenaKey> = AHashSet::new();
         for key in state.arena_registry.iter().flatten() {
-            out.insert(key.clone());
+            out.insert(*key);
         }
         out.into_iter().collect()
-    }
-
-    /// Lock-free hint: return true if any key can free at least
-    /// `threshold` of its currently registered arenas via perfect
-    /// defragmentation.
-    pub(crate) fn needs_defragmentation(&self, threshold: f32) -> bool {
-        if threshold <= 0.0 {
-            return self
-                .inner
-                .pools
-                .values()
-                .any(|pool| pool.total_arenas.load(Ordering::Relaxed) > 0);
-        }
-        self.inner
-            .pools
-            .values()
-            .any(|pool| pool.defragmentable_ratio() > threshold)
-    }
-
-    /// Lock-free defragmentable ratio for a specific key.
-    #[allow(dead_code)]
-    pub(crate) fn defragmentable_ratio_for(&self, key: &ArenaKey) -> f32 {
-        self.inner
-            .pools
-            .get(key)
-            .map(|pool| pool.defragmentable_ratio())
-            .unwrap_or(0.0)
     }
 
     /// Maximum gid currently in circulation (for compaction bound checks).
@@ -1526,7 +1306,7 @@ impl ChunkGidPool {
         let mut max: i64 = -1;
         for (idx, entry) in state.arena_registry.iter().enumerate() {
             if entry.is_some() {
-                let arena_top = ((idx + 1) * arena_gid_stride()) as i64 - 1;
+                let arena_top = ((idx + 1) * GID_STRIDE) as i64 - 1;
                 if arena_top > max {
                     max = arena_top;
                 }
@@ -1582,11 +1362,15 @@ impl ChunkGidPool {
             .sum()
     }
 
-    /// GPU arena occupancy split float vs quant. Reads the lock-free per-pool
-    /// atomics (`O(registered formats)`, ~58 entries most empty) — cheap enough
-    /// for the per-wave `kv-pool` diagnostic. See [`GpuArenaFormatStats`].
-    pub(crate) fn gpu_format_stats(&self) -> GpuArenaFormatStats {
-        let mut s = GpuArenaFormatStats::default();
+    /// GPU arena occupancy per size class. Reads the lock-free per-pool
+    /// atomics (`O(classes × locations)` = 14 entries, most empty) — cheap
+    /// enough for the per-wave `kv-pool` diagnostic. See
+    /// [`GpuArenaClassStats`].
+    pub(crate) fn gpu_class_stats(&self) -> GpuArenaClassStats {
+        let mut s = GpuArenaClassStats::default();
+        for (i, c) in s.classes.iter_mut().enumerate() {
+            c.slot_bytes = SizeClass::from_index(i).map_or(0, |cl| cl.bytes());
+        }
         for (key, pool) in self.inner.pools.iter() {
             if key.location != ArenaLocation::Gpu {
                 continue;
@@ -1595,22 +1379,11 @@ impl ChunkGidPool {
             if arenas == 0 {
                 continue;
             }
-            let reserved = arenas.saturating_mul(TARGET_ARENA_BYTES);
-            // Slab is ~TARGET_ARENA_BYTES regardless of format, so per-chunk
-            // bytes = slab / chunks-per-slab; live bytes = occupied slots × that.
-            let per_chunk = TARGET_ARENA_BYTES
-                .checked_div(pool.arena_chunks)
-                .unwrap_or(0);
-            let live = pool.total_live().saturating_mul(per_chunk);
-            if matches!(key.format, KvFormat::Float(_)) {
-                s.float_arenas += arenas;
-                s.float_reserved_bytes += reserved;
-                s.float_live_bytes += live;
-            } else {
-                s.quant_arenas += arenas;
-                s.quant_reserved_bytes += reserved;
-                s.quant_live_bytes += live;
-            }
+            let row = &mut s.classes[key.class.index()];
+            row.arenas += arenas;
+            row.reserved_bytes += arenas.saturating_mul(TARGET_ARENA_BYTES);
+            // Every slot in a class costs its stride, whatever occupies it.
+            row.live_bytes += pool.total_live().saturating_mul(key.slot_stride());
         }
         s
     }
@@ -1640,14 +1413,12 @@ impl fmt::Debug for ChunkGidPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::DType;
-
     fn float_key() -> ArenaKey {
-        ArenaKey::gpu_float(DType::BF16)
+        ArenaKey::new(TEST_CLASS, ArenaLocation::Gpu)
     }
 
     fn test_arena_chunks() -> usize {
-        arena_chunks_for_format(KvFormat::Float(DType::BF16))
+        TEST_CLASS.chunks_per_region()
     }
 
     /// The fix for the "fresh arena cannot fit palette run" race: a run claimed
@@ -1659,33 +1430,33 @@ mod tests {
         let pool = ChunkGidPool::new();
         let key = float_key();
         let cap = test_arena_chunks();
-        let idx = pool.register_arena(key.clone());
+        let idx = pool.register_arena(key);
 
         // Simulate the race: a rival's global walk consumes most of the fresh
         // arena's tail before our targeted claim.
         let rival = pool
-            .allocate_run_for(key.clone(), cap - 2)
+            .allocate_run_for(key, cap - 2)
             .expect("rival run fits the fresh arena");
         assert_eq!(rival.len(), cap - 2);
 
         // The global walk can no longer fit 3 — but the targeted claim reports
         // that the SPECIFIC arena is exhausted (None), not a phantom "no arena
         // anywhere", so the caller knows to register another…
-        assert!(pool.allocate_run_for(key.clone(), 3).is_none());
-        assert!(pool.allocate_run_for_in(key.clone(), idx, 3).is_none());
+        assert!(pool.allocate_run_for(key, 3).is_none());
+        assert!(pool.allocate_run_for_in(key, idx, 3).is_none());
 
         // …and a run that still fits the tail lands in exactly that arena.
         let run = pool
-            .allocate_run_for_in(key.clone(), idx, 2)
+            .allocate_run_for_in(key, idx, 2)
             .expect("2 slots remain at the high-water tail");
         assert_eq!(run.len(), 2);
         assert!(run.iter().all(|g| g.arena_idx() == idx));
 
         // A fresh registration + targeted claim succeeds for the full length —
         // the loop the allocator runs.
-        let idx2 = pool.register_arena(key.clone());
+        let idx2 = pool.register_arena(key);
         let run2 = pool
-            .allocate_run_for_in(key.clone(), idx2, cap)
+            .allocate_run_for_in(key, idx2, cap)
             .expect("fresh arena serves a full-capacity run");
         assert_eq!(run2.len(), cap);
         assert!(run2.iter().all(|g| g.arena_idx() == idx2));
@@ -1694,34 +1465,28 @@ mod tests {
         assert!(pool.allocate_run_for_in(key, 9999, 1).is_none());
     }
 
-    /// The free-headroom guard must not stand between the relief ladder and a
-    /// fully-drained arena.
+    /// An empty arena is always reclaimed, however full the rest of the pool is.
     ///
-    /// Unforced it refuses once the pool is nearly full — which is the exact
-    /// state reclaim is called for, so the pool could never shrink back inside
-    /// the card: full because it could not shrink, unable to shrink because it
-    /// was full. `force` bypasses it; steady-state churn is still guarded on
-    /// the unforced path (the per-wave proactive sweep).
+    /// A 10 % free-headroom guard used to hold it back to stop create/destroy
+    /// churn, and needed a `force` bypass because its condition ("the pool is
+    /// nearly full") was exactly the state reclaim was being asked to fix.
+    /// Under the reservation an arena's storage is a region handle, so there is
+    /// no churn left to guard: this is the state that used to refuse.
     #[test]
-    fn a_forced_sweep_reclaims_what_the_headroom_guard_refuses() {
+    fn an_empty_arena_is_reclaimed_even_with_no_headroom_left() {
         let pool = ChunkGidPool::new();
         let key = float_key();
         let cap = test_arena_chunks();
 
         // Two arenas; fill BOTH completely, then free exactly one arena's worth.
-        // Live is then `cap` across 2 arenas, so releasing one would leave
-        // `1*cap - cap = 0` free slots — under `cap/10`, so the guard refuses.
-        pool.register_arena(key.clone());
-        let a: Vec<_> = (0..cap)
-            .map(|_| pool.allocate_for(key.clone()).unwrap())
-            .collect();
-        pool.register_arena(key.clone());
-        let b: Vec<_> = (0..cap)
-            .map(|_| pool.allocate_for(key.clone()).unwrap())
-            .collect();
+        // Live is then `cap` across 2 arenas, so releasing one leaves zero free
+        // slots — the case the old guard refused.
+        pool.register_arena(key);
+        let a: Vec<_> = (0..cap).map(|_| pool.allocate_for(key).unwrap()).collect();
+        pool.register_arena(key);
+        let b: Vec<_> = (0..cap).map(|_| pool.allocate_for(key).unwrap()).collect();
         assert_eq!(a.len() + b.len(), cap * 2);
 
-        // Drop one arena's worth so exactly one arena is empty.
         let freed_idx = b[0].arena_idx();
         assert!(
             b.iter().all(|g| g.arena_idx() == freed_idx),
@@ -1729,225 +1494,134 @@ mod tests {
         );
         drop(b);
 
-        assert!(
-            pool.next_tombstone(key.clone(), false).is_none(),
-            "unforced: the headroom guard holds the empty arena back"
+        assert_eq!(
+            pool.next_tombstone(key),
+            Some(freed_idx),
+            "the empty arena is reclaimed"
         );
-
-        let got = pool.next_tombstone(key.clone(), true);
-        assert_eq!(got, Some(freed_idx), "forced: the empty arena is reclaimed");
 
         drop(a);
-    }
-
-    /// Defrag must never target a PROTECTED arena as a drain victim.
-    ///
-    /// Protected arenas are the per-format warm set, held for the process
-    /// lifetime; `try_tombstone` refuses them however empty they get. Since the
-    /// target list is sorted emptiest-first and a warm arena is lightly used by
-    /// definition, they were picked FIRST — so the whole move budget drained
-    /// arenas that could never be reclaimed (measured: 15,994 moves, 1 empty
-    /// arena in 194, and that one protected).
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn defrag_targets_exclude_protected_arenas() {
-        let pool = ChunkGidPool::new();
-        let key = float_key();
-
-        // Arena 0 is the warm/protected one, left nearly empty (one chunk).
-        // Placement is explicit: `allocate_for` packs lowest-first, so it would
-        // put every chunk in arena 0 and leave arena 1 empty.
-        let warm_idx = pool.register_arena(key.clone());
-        pool.protect_arena(warm_idx);
-        let _warm_live = pool.allocate_from_arena(key.clone(), warm_idx).unwrap();
-
-        // Arena 1 carries real load — the arena defrag SHOULD be draining.
-        let busy_idx = pool.register_arena(key.clone());
-        let _busy: Vec<_> = (0..8)
-            .map(|_| pool.allocate_from_arena(key.clone(), busy_idx).unwrap())
-            .collect();
-
-        let plan = pool.drain_plan_for_key(&key);
-        assert!(
-            !plan.sources.contains(&warm_idx),
-            "the protected warm arena must not be a drain source: {plan:?}"
-        );
-        assert!(
-            plan.sources.contains(&busy_idx),
-            "reclaimable arenas must still be offered: {plan:?}"
-        );
-        assert!(
-            !plan.blocked.contains(&warm_idx),
-            "a protected arena is still a valid destination: {plan:?}"
-        );
-    }
-
-    /// The drain set must be bounded by the pool's slot balance.
-    ///
-    /// With every arena more than half full, no arena can be released: the
-    /// chunks of any source have to land in another arena that is itself a
-    /// source, so the pass moves data in a circle. Live, that was
-    /// `moves=5588 arenas_compacted=0 arenas_released=0` with the pool wedged
-    /// at 0 t/s — compaction kept promising memory it could never deliver, so
-    /// every fresh-arena request stayed refused.
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn drain_plan_refuses_a_pass_that_cannot_free_an_arena() {
-        let pool = ChunkGidPool::new();
-        let key = float_key();
-
-        // Fill three arenas, then hollow the first one out. The pool is now
-        // badly fragmented — arena 0 holds a single chunk — but 2*cap+1 live
-        // chunks still need all three arenas, so nothing can be released.
-        let arenas: Vec<usize> = (0..3).map(|_| pool.register_arena(key.clone())).collect();
-        let mut held: Vec<ChunkGid> = Vec::new();
-        while let Some(gid) = pool.allocate_for(key.clone()) {
-            held.push(gid);
-        }
-        held.retain(|g| g.arena_idx() != arenas[0] || g.chunk_idx() == 0);
-        assert_eq!(
-            held.iter().filter(|g| g.arena_idx() == arenas[0]).count(),
-            1,
-            "arena 0 hollowed out to one live chunk"
-        );
-
-        let plan = pool.drain_plan_for_key(&key);
-        assert!(
-            plan.sources.is_empty(),
-            "fragmented, but no arena can be freed — nothing may be drained: {plan:?}"
-        );
-
-        // Hollow arena 1 out by half and the balance tips: the survivors fit in
-        // two arenas, so the emptiest becomes drainable.
-        held.retain(|g| g.arena_idx() != arenas[1] || g.chunk_idx() % 2 != 0);
-        let plan = pool.drain_plan_for_key(&key);
-        assert_eq!(
-            plan.sources,
-            vec![arenas[0]],
-            "the emptiest arena is the one source: {plan:?}"
-        );
-        assert_eq!(
-            plan.blocked.len(),
-            1,
-            "only the source is barred; the rest must stay available: {plan:?}"
-        );
-    }
-
-    /// An arena that is already empty is released by the empty sweep for free,
-    /// so it must not be a relocation destination — refilling it cancels the
-    /// arena it was about to give back — and it spends drain budget just the
-    /// same as one that has to be moved out of.
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn drain_plan_blocks_already_empty_arenas_as_destinations() {
-        let pool = ChunkGidPool::new();
-        let key = float_key();
-
-        // Arenas 0 and 1 hold one chunk each; arena 2 is fully empty.
-        let arenas: Vec<usize> = (0..3).map(|_| pool.register_arena(key.clone())).collect();
-        let mut held: Vec<ChunkGid> = Vec::new();
-        while let Some(gid) = pool.allocate_for(key.clone()) {
-            held.push(gid);
-        }
-        held.retain(|g| g.arena_idx() != arenas[2] && g.chunk_idx() == 0);
-
-        let plan = pool.drain_plan_for_key(&key);
-        assert!(
-            plan.blocked.contains(&arenas[2]),
-            "the empty arena must not receive chunks: {plan:?}"
-        );
-        assert!(
-            !plan.sources.contains(&arenas[2]),
-            "an empty arena has nothing to drain: {plan:?}"
-        );
-        // Two live arenas could each fit in the other, but only two arenas can
-        // come back in total and the empty one already accounts for one of them.
-        assert_eq!(
-            plan.sources,
-            vec![arenas[0]],
-            "the empty arena spends drain budget like any other: {plan:?}"
-        );
-
-        held.clear();
     }
 
     #[test]
     fn test_register_and_allocate() {
         let pool = ChunkGidPool::new();
         let key = float_key();
-        let arena_idx = pool.register_arena(key.clone());
+        let arena_idx = pool.register_arena(key);
         assert_eq!(arena_idx, 0);
 
-        let gid1 = pool.allocate_for(key.clone()).unwrap();
+        let gid1 = pool.allocate_for(key).unwrap();
         assert_eq!(gid1.raw(), 0);
-        let gid2 = pool.allocate_for(key.clone()).unwrap();
+        let gid2 = pool.allocate_for(key).unwrap();
         assert_eq!(gid2.raw(), 1);
     }
 
+    /// Occupancy is reported **per size class**, and a class's live bytes are
+    /// its slot count times its stride — whatever formats happen to occupy it.
     #[test]
-    fn test_gpu_format_stats_splits_float_and_quant() {
-        use crate::kv_cache::QuantFormat;
+    fn gpu_class_stats_report_per_class_occupancy() {
         let pool = ChunkGidPool::new();
-        let fkey = ArenaKey::gpu_float(DType::BF16);
-        let qkey = ArenaKey::gpu_quant(QuantFormat::Q8_0);
+        let small = ArenaKey::new(SizeClass::at(0), ArenaLocation::Gpu);
+        let large = ArenaKey::new(SizeClass::at(6), ArenaLocation::Gpu);
 
-        // Two float arenas with three live slots; one quant arena with five.
-        pool.register_arena(fkey.clone());
-        pool.register_arena(fkey.clone());
-        pool.register_arena(qkey.clone());
-        let _f: Vec<_> = (0..3)
-            .map(|_| pool.allocate_for(fkey.clone()).unwrap())
-            .collect();
-        let _q: Vec<_> = (0..5)
-            .map(|_| pool.allocate_for(qkey.clone()).unwrap())
-            .collect();
+        // Two arenas in the small class with three live slots; one arena in
+        // the large class with five.
+        pool.register_arena(small);
+        pool.register_arena(small);
+        pool.register_arena(large);
+        let _s: Vec<_> = (0..3).map(|_| pool.allocate_for(small).unwrap()).collect();
+        let _l: Vec<_> = (0..5).map(|_| pool.allocate_for(large).unwrap()).collect();
 
-        let s = pool.gpu_format_stats();
+        let stats = pool.gpu_class_stats();
+        let row = |c: SizeClass| stats.classes[c.index()];
 
-        // Per-chunk bytes derive from the same slab-capacity helper the accessor
-        // uses, so the expected live bytes are exact, not tolerance-based.
-        let f_per_chunk =
-            TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Float(DType::BF16));
-        let q_per_chunk =
-            TARGET_ARENA_BYTES / arena_chunks_for_format(KvFormat::Quantized(QuantFormat::Q8_0));
+        assert_eq!(row(small.class).slot_bytes, small.slot_stride());
+        assert_eq!(row(small.class).arenas, 2);
+        assert_eq!(row(small.class).reserved_bytes, 2 * TARGET_ARENA_BYTES);
+        assert_eq!(row(small.class).live_bytes, 3 * small.slot_stride());
 
-        assert_eq!(s.float_arenas, 2);
-        assert_eq!(s.float_reserved_bytes, 2 * TARGET_ARENA_BYTES);
-        assert_eq!(s.float_live_bytes, 3 * f_per_chunk);
-        assert_eq!(s.quant_arenas, 1);
-        assert_eq!(s.quant_reserved_bytes, TARGET_ARENA_BYTES);
-        assert_eq!(s.quant_live_bytes, 5 * q_per_chunk);
+        assert_eq!(row(large.class).arenas, 1);
+        assert_eq!(row(large.class).reserved_bytes, TARGET_ARENA_BYTES);
+        assert_eq!(row(large.class).live_bytes, 5 * large.slot_stride());
+
+        assert_eq!(stats.total_arenas(), 3);
+        assert_eq!(
+            stats.total_live_bytes(),
+            3 * small.slot_stride() + 5 * large.slot_stride()
+        );
+    }
+
+    /// **Two formats sharing a class share a pool.** This is the property the
+    /// whole initiative exists to obtain, and it is visible here: allocating
+    /// for two different formats that map to one class grows a single row, not
+    /// two, and never registers a second arena.
+    #[test]
+    fn formats_sharing_a_class_share_one_pool() {
+        use crate::kv_cache::{KvFormat, QuantFormat};
+        const ELEMS: usize = 1024;
+        let pool = ChunkGidPool::new();
+        // Q4_1 and Q4_KS are both 640 B payloads, so one rung, one key.
+        let a = ArenaKey::for_format(
+            KvFormat::Quantized(QuantFormat::Q4_1),
+            ELEMS,
+            ArenaLocation::Gpu,
+        )
+        .unwrap();
+        let b = ArenaKey::for_format(
+            KvFormat::Quantized(QuantFormat::Q4_KS),
+            ELEMS,
+            ArenaLocation::Gpu,
+        )
+        .unwrap();
+        assert_eq!(a, b, "the two formats must resolve to one key");
+
+        pool.register_arena(a);
+        let g1 = pool.allocate_for(a).expect("first format claims a slot");
+        let g2 = pool
+            .allocate_for(b)
+            .expect("second format claims from the SAME pool");
+        assert_eq!(g1.arena_idx(), g2.arena_idx());
+
+        let stats = pool.gpu_class_stats();
+        assert_eq!(stats.total_arenas(), 1, "one arena serves both formats");
+        assert_eq!(
+            stats.classes[a.class.index()].live_bytes,
+            2 * a.slot_stride()
+        );
     }
 
     #[test]
-    fn test_gpu_format_stats_empty_pool_is_zero() {
-        // A pool with registered-but-unallocated formats reports nothing: the
+    fn gpu_class_stats_on_an_empty_pool_are_zero() {
+        // A pool with registered-but-unallocated classes reports nothing: the
         // per-wave diagnostic must not count preallocated empty pool-table
         // entries as resident arenas.
-        let pool = ChunkGidPool::new();
-        let s = pool.gpu_format_stats();
-        assert_eq!(s.float_arenas, 0);
-        assert_eq!(s.quant_arenas, 0);
-        assert_eq!(s.float_reserved_bytes, 0);
-        assert_eq!(s.quant_reserved_bytes, 0);
+        let stats = ChunkGidPool::new().gpu_class_stats();
+        assert_eq!(stats.total_arenas(), 0);
+        assert_eq!(stats.total_reserved_bytes(), 0);
+        assert_eq!(stats.total_live_bytes(), 0);
+        // The slot_bytes column is still populated, so a report shows the
+        // whole ladder rather than a ragged subset.
+        for (i, c) in stats.classes.iter().enumerate() {
+            assert_eq!(c.slot_bytes, SizeClass::at(i).bytes());
+        }
     }
 
     #[test]
     fn test_gid_drop_returns_to_pool() {
         let pool = ChunkGidPool::new();
         let key = float_key();
-        pool.register_arena(key.clone());
+        pool.register_arena(key);
 
-        let gid1 = pool.allocate_for(key.clone()).unwrap();
+        let gid1 = pool.allocate_for(key).unwrap();
         let gid1_raw = gid1.raw();
         drop(gid1);
 
         // After drop, the slot is free again — total free == capacity.
-        assert_eq!(pool.free_list_len_for(key.clone()), test_arena_chunks());
+        assert_eq!(pool.free_list_len_for(key), test_arena_chunks());
 
         // Allocating again should reuse it — the freed slot is popped straight
         // back off the recycle stack, so the same gid comes out.
-        let gid2 = pool.allocate_for(key.clone()).unwrap();
+        let gid2 = pool.allocate_for(key).unwrap();
         assert_eq!(gid2.raw(), gid1_raw);
     }
 
@@ -1955,22 +1629,22 @@ mod tests {
     fn test_gid_clone_no_early_return() {
         let pool = ChunkGidPool::new();
         let key = float_key();
-        pool.register_arena(key.clone());
+        pool.register_arena(key);
 
-        let gid1 = pool.allocate_for(key.clone()).unwrap();
+        let gid1 = pool.allocate_for(key).unwrap();
         let gid1_clone = gid1.clone();
         let gid1_raw = gid1.raw();
-        let free_after_alloc = pool.free_list_len_for(key.clone());
+        let free_after_alloc = pool.free_list_len_for(key);
 
         // Drop original — clone still holds a refcount.
         drop(gid1);
-        assert_eq!(pool.free_list_len_for(key.clone()), free_after_alloc);
+        assert_eq!(pool.free_list_len_for(key), free_after_alloc);
 
         // Drop clone — now freed.
         drop(gid1_clone);
-        assert_eq!(pool.free_list_len_for(key.clone()), free_after_alloc + 1);
+        assert_eq!(pool.free_list_len_for(key), free_after_alloc + 1);
 
-        let gid2 = pool.allocate_for(key.clone()).unwrap();
+        let gid2 = pool.allocate_for(key).unwrap();
         assert_eq!(gid2.raw(), gid1_raw);
     }
 
@@ -1978,7 +1652,7 @@ mod tests {
     fn test_strong_count_tracks_clones() {
         let pool = ChunkGidPool::new();
         let key = float_key();
-        pool.register_arena(key.clone());
+        pool.register_arena(key);
         let gid = pool.allocate_for(key).unwrap();
         assert_eq!(gid.strong_count(), 1);
         assert!(gid.is_unique());
@@ -2020,28 +1694,12 @@ mod tests {
     fn test_arena_register_grows_table() {
         let pool = ChunkGidPool::new();
         let key = float_key();
-        let a = pool.register_arena(key.clone());
-        let b = pool.register_arena(key.clone());
+        let a = pool.register_arena(key);
+        let b = pool.register_arena(key);
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         // Each arena contributes `arena_chunks` of capacity.
         assert_eq!(pool.free_list_len_for(key), test_arena_chunks() * 2);
-    }
-
-    #[test]
-    fn test_defragmentation_ratio_only_triggers_when_arenas_can_be_freed() {
-        let pool = ChunkGidPool::new();
-        let key = float_key();
-        pool.register_arena(key.clone());
-        pool.register_arena(key.clone());
-
-        // Force sparse live chunks across two arenas.
-        let _a0 = pool.allocate_from_arena(key.clone(), 0).unwrap();
-        let _a1 = pool.allocate_from_arena(key.clone(), 1).unwrap();
-
-        // 2 lives, 2 arenas, capacity per arena `arena_chunks`. live ÷
-        // arena_chunks rounded up = 1 arena needed; 1 of 2 reclaimable.
-        assert!(pool.defragmentable_ratio_for(&key) > 0.0);
     }
 
     #[test]
@@ -2050,15 +1708,15 @@ mod tests {
         let key = float_key();
         // One arena holding a live chunk: less than a whole arena of free space,
         // so a forced compaction can release nothing.
-        pool.register_arena(key.clone());
-        let _a0 = pool.allocate_from_arena(key.clone(), 0).unwrap();
+        pool.register_arena(key);
+        let _a0 = pool.allocate_from_arena(key, 0).unwrap();
         assert!(
             !pool.can_reclaim_arena(),
             "1 arena with a live chunk: nothing whole to reclaim"
         );
         // Add a second, empty arena: a whole arena's worth of free space is now
         // recoverable (needed = ceil(1 live / arena_chunks) = 1, of 2 arenas).
-        pool.register_arena(key.clone());
+        pool.register_arena(key);
         assert!(
             pool.can_reclaim_arena(),
             "2 arenas, 1 live chunk: one whole arena is reclaimable"
@@ -2083,7 +1741,7 @@ mod tests {
 
         let pool = Arc::new(ChunkGidPool::new());
         let key = float_key();
-        pool.register_arena(key.clone());
+        pool.register_arena(key);
 
         let n_threads = 12;
         let batch = 400; // batches of live gids so arenas fill and empty
@@ -2091,17 +1749,17 @@ mod tests {
         let handles: Vec<_> = (0..n_threads)
             .map(|_| {
                 let pool = Arc::clone(&pool);
-                let key = key.clone();
+                let key = key;
                 thread::spawn(move || {
                     for _ in 0..rounds {
                         let mut held = Vec::with_capacity(batch);
                         for _ in 0..batch {
                             // Mirror `alloc_chunk_for_key`: register on exhaustion.
                             let g = loop {
-                                if let Some(g) = pool.allocate_for(key.clone()) {
+                                if let Some(g) = pool.allocate_for(key) {
                                     break g;
                                 }
-                                pool.register_arena(key.clone());
+                                pool.register_arena(key);
                             };
                             held.push(g);
                         }
@@ -2118,10 +1776,10 @@ mod tests {
 
         // Everything dropped ⇒ the pool is fully free. Drain it and prove every
         // free slot is reachable via the bitmap fast path + the fallback scan.
-        let cap = pool.free_list_len_for(key.clone());
+        let cap = pool.free_list_len_for(key);
         assert!(cap > 0);
         let mut drained = Vec::new();
-        while let Some(g) = pool.allocate_for(key.clone()) {
+        while let Some(g) = pool.allocate_for(key) {
             drained.push(g);
         }
         assert_eq!(

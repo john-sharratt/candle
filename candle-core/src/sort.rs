@@ -172,12 +172,13 @@ impl crate::CustomOp1 for ArgSort {
         layout: &crate::Layout,
     ) -> Result<(crate::CudaStorage, crate::Shape)> {
         use crate::backend::BackendStorage;
-        use crate::cuda_backend::Map1Any;
+        use crate::cuda_backend::{Backing, Map1Any};
         let dev = storage.device();
         let slice = self.map(&storage.slice, dev, layout)?;
         let dst = crate::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: Backing::Owned,
         };
         Ok((dst, layout.shape().clone()))
     }

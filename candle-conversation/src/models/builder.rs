@@ -9,8 +9,9 @@ use crate::error::ConversationError;
 use crate::models::DialectType;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tree::ConversationTreeConfig;
-use candle::Device;
-use candle_nn::{arena_chunks_for_format, CHUNK_SIZE};
+use candle::{DType, Device};
+use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
+use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::BatchedInference;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -875,8 +876,21 @@ impl ModelBuilder {
         // Auto-derive max_hot_turns from arena geometry unless the caller
         // overrode it. Must happen before conversation_config() is called below.
         if self.max_hot_turns == 0 {
-            let arena_chunks =
-                arena_chunks_for_format(candle_nn::kv_cache::KvFormat::Float(candle::DType::F16));
+            // A hot turn's active K/V is F16, so the F16 size class is what
+            // bounds how many turns a region holds. The class is a function of
+            // the *model's* palette sub-band width — `head_dim / N_PALETTE` —
+            // not of `CHUNK_SIZE`; those coincide only at `head_dim == 128`.
+            let head_dim = model.model_core_properties().head_dim;
+            let elems = elems_per_chunk((head_dim / N_PALETTE).max(1));
+            let class = class_for_format(KvFormat::Float(DType::F16), elems).ok_or_else(|| {
+                ConversationError::Other(format!(
+                    "no size class holds an F16 chunk of {elems} elements \
+                     (head_dim {head_dim}); the ladder's top rung is \
+                     {} bytes",
+                    SizeClass::at(SizeClass::COUNT - 1).bytes(),
+                ))
+            })?;
+            let arena_chunks = class.chunks_per_region();
             self.max_hot_turns =
                 pick_max_hot_turns(arena_chunks, CHUNK_SIZE, self.max_response_tokens);
             tracing::debug!(

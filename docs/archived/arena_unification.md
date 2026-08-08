@@ -252,10 +252,32 @@ sized at startup: the boundary adapts to the workload.
   (RTX 4090 Mobile, driver 596.08, WDDM): VMM supported, min granularity
   2 MiB, and a boundary-straddling write across independently-mapped granules
   verified contiguous.
-- **Fallback, also probed**: a single giant `cuMemAlloc` (14 GiB succeeded in
-  15.6 ms with the desktop resident; full touch at 38.5 GiB/s). Same
-  single-span design, coarser (whole-buffer) eviction unit. A runtime
-  capability probe picks the path at startup. Superslabs are never needed.
+- **No fallback. VMM is a hard requirement, and its absence is a named
+  failure.** This section originally specified a runtime capability probe
+  choosing between VMM and a single giant `cuMemAlloc` (probed and working:
+  14 GiB in 15.6 ms with the desktop resident, full touch at 38.5 GiB/s). That
+  is not built, and should not be — the second path is not a smaller version of
+  the first, it is a different one on three axes:
+
+  1. **Eviction granularity.** VMM's unit is the 2 MiB granule, so WDDM pressure
+     sheds cold granules. One giant allocation's unit is the whole buffer: the
+     entire reservation goes to host and faults back over PCIe on the next
+     touch. On a 16 GiB card driving a display that is the difference between a
+     hiccup and a stall.
+  2. **No partial release.** The probed release-then-reuse trick
+     (`vmm_release_probe.py`) has no `cuMemAlloc` equivalent — a giant
+     allocation must be sized right once and can never give a byte back.
+  3. **Capacity measurement changes shape.** Map-and-touch per granule is
+     self-terminating and doubles as the region tier's zero-fill. `cuMemAlloc`
+     is all-or-nothing, so extent would have to be binary-searched over whole
+     allocations, each failed probe costing an allocate/free cycle.
+
+  So `Reservation::reserve` queries
+  `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED` first and fails with
+  a message naming the capability, the reason there is no fallback, and where
+  VMM is commonly absent (WSL2, vGPU/MIG, older drivers). A device test asserts
+  the attribute, so an unsupported target reports it in the suite rather than at
+  the first KV cache of a benchmark run. Superslabs are never needed either way.
 - **Physical VRAM fragmentation from other processes is a non-issue by
   construction**: WDDM2 GPU memory is page-table virtualized per process, so
   allocation success depends on total commit only, and VidMm evicts other
@@ -276,34 +298,59 @@ sized at startup: the boundary adapts to the workload.
   back-off policy (`C = min(frac × total, total − headroom_abs)`), because
   mapping to the touch-failure point leaves the desktop with zero headroom.
   Do **not** treat `cuMemCreate` success as evidence of capacity.
-- **Startup sequence** (probed end-to-end, `vmm_release_probe.py`): reserve
-  the VA span → map + **touch** granules under the policy cap, stopping on a
-  touch failure (this both measures `C` and claims it) → **release** the
-  granules the partition assigns to dense weights, the expert cache, and the
-  small reserve → those load through the CUDA pool into the freed memory →
-  the granules still mapped are the reservation. Probe result: after
-  releasing 8 of 64 granules, an ordinary `cuMemAlloc(1920 MiB)` succeeded
-  into the freed space **and the surviving 14,336 MiB of mapped reservation
-  read back intact**. The measurement and the claim are one act; there is no
-  release-and-hope-to-reclaim window. (On the giant-`cuMemAlloc` fallback,
-  partial release is impossible, so the classic order applies — measure,
-  release, load weights, then claim the remainder — accepting a brief claim
-  race.)
+- **Startup sequence — as built (2026-08-08), and the order is inverted from
+  what this section originally specified.** The plan was: reserve the VA span →
+  map + **touch** granules under the policy cap → **release** the granules the
+  partition assigns to dense weights, the expert cache and the small reserve →
+  load those through the CUDA pool into the freed memory → the granules still
+  mapped are the reservation. That sequence was probed end-to-end and works
+  (`vmm_release_probe.py`: after releasing 8 of 64 granules an ordinary
+  `cuMemAlloc(1920 MiB)` succeeded into the freed space **and** the surviving
+  14,336 MiB read back intact).
+
+  It is not buildable, because **the partition is not knowable before the
+  load**. `expert_budget()` is by construction a live measurement taken *during*
+  the load, and the dense-weight total is only known once the loader has walked
+  the GGUF — predicting either means duplicating the loader's tensor walk and
+  keeping the duplicate in sync forever.
+
+  So: the governor's balloon measures `C` and frees (unchanged) → the model
+  loads (unchanged) → the reservation is claimed at the first KV cache, sized
+  `usable − scratch_margin` and filled granule by granule, each **written**
+  before it counts. What the original order was protecting — that measuring `C`
+  and claiming it are one act, with no window to lose it in — is preserved
+  exactly, because the refusal point of that fill *is* the reservation's extent.
+  Only the position relative to the model load moved, and the thing that moves
+  into that window is our own weight loading, which is what is supposed to
+  happen there.
 
 ### 3.3 Region tier
 
 - `region[i]` base = `reservation_base + i × 16 MiB` (a clean multiple of the
   2 MiB granularity). `TARGET_ARENA_BYTES` stays 16 MiB.
-- **The free-region list already exists — no new lock.**
-  `GidPoolState.free_arenas: VecDeque<usize>` under the existing `metadata`
-  mutex *is* the free-region list today: `register_arena` pops it,
-  `next_tombstone` pushes, `drain_free_arenas_above` trims it. The region
-  tier reuses it verbatim, so the documented lock order
-  (`alloc_gate → tables`, `metadata` outside both) gains **no new edge**
-  (audit A5, §8). A region is **stamped with a size class** when popped and
-  returns to the list when its live count reaches zero (the existing
-  `creation_pending` / `live == 0` tombstone logic, minus the storage release
-  and the CUDA free).
+- **The free-region list is its own — this section originally claimed
+  otherwise, and that claim is wrong.** It said `GidPoolState.free_arenas`
+  under the `metadata` mutex *is* the free-region list, so the region tier
+  reuses it verbatim and adds no lock. It cannot: `register_arena` pops that
+  queue **regardless of `ArenaLocation`**, so a tombstoned CPU arena's index is
+  handed to the next GPU arena and vice versa. An arena index therefore says
+  nothing about position in the span, and using it as a region index would
+  place GPU regions at addresses that were never mapped.
+
+  As built, `region_pool` keeps its own free list — a min-heap, lowest-first
+  per principle 5 — behind its own mutex. Audit A5's conclusion survives: that
+  mutex is a **leaf**, taken by nothing else and taking nothing, so the
+  documented lock order (`alloc_gate → tables`, `metadata` outside both) still
+  gains no edge. A region is claimed by `create_arena`, held by the `Arena` for
+  its lifetime, and returned when the arena drops — release, truncate, or the
+  backing going away all work, because ownership does the bookkeeping.
+- **Recycling a region needs an explicit quiesce.** A region returns to the
+  free list when no host-side gid names it, which does not mean no kernel is
+  still reading it. The allocator used to supply that ordering for free —
+  `cuMemFreeAsync`/`cuMemAllocAsync` on one stream — and a free-list push does
+  not, so a device-wide synchronise precedes the zero-fill of a *recycled*
+  region. Device-wide because the persistence thread's copy stream is one of
+  the readers. Found by the candle-nn suite as `CUDA_ERROR_ILLEGAL_ADDRESS`.
 - Regions allocate lowest-first (the capacity bitmap's find-first-set),
   keeping live data left-packed per principle 5.
 - `ResolvedArenaInfo.base_ptr` becomes pure arithmetic; the
@@ -433,9 +480,11 @@ adjacent in VRAM and therefore one contiguous span — run as per-domain
   and later resets its cursor to zero — one store, no per-buffer RAII, no
   frees, **zero allocator traffic on the wave path in steady state**. The
   wave domain is double-buffered (A/B halves) so wave `N+1`'s assembly can
-  allocate while wave `N`'s kernels drain; the half being reset fences on the
-  completing wave's stream event (the `PinnedStager` sync-then-reset
-  discipline).
+  allocate while wave `N`'s kernels drain. That double-buffering is also what
+  makes the reset free: the two halves share one stream, so a whole wave's
+  work separates a half's last read from its next write and no fence is
+  needed. Cross-stream domains (persistence staging) do fence — the
+  `PinnedStager` sync-then-reset discipline — but the wave path does not.
 - **The wave buffer set — no mid-wave allocation, ever.** Pure bump-no-free
   would turn peak usage from O(max concurrent) into O(total allocated during
   the wave) — a ~`n_layers`× blowup for per-layer intermediates. Instead,
@@ -454,11 +503,42 @@ adjacent in VRAM and therefore one contiguous span — run as per-domain
   persistence thread (migration/quantize staging) own disjoint sub-ranges
   with independent generations, so neither resets the other's live buffers;
   process-lifetime grow-only scratches (`ProvSignScratch`, sampler scratch,
-  MoE routing buffers) sit on the **static shelf** at the reservation's
-  absolute right tip — the only address the boundary never moves — outside
-  every reset. The span requirement is the sum of the domain budgets:
-  `S = 2·W_wave + W_persist + shelf`, where each `W` is that domain's
-  watermark (max plan/staging bytes over a recent window + margin).
+  MoE routing buffers) keep growing from the CUDA pool, which `scratch_margin`
+  already covers. The span requirement is the sum of the domain budgets:
+  `S = 2·W_wave + W_persist` = **192 MiB**.
+
+  **`W` is not always a watermark (2026-08-08).** For the wave it is: 30.75 MiB
+  measured, 64 MiB taken. For the persistence domain it is a **declared
+  budget** — `MIGRATION_STAGING_CAP_BYTES` — because a migration batch *bisects
+  itself* to fit whatever the span is. Size a domain from its watermark only
+  when the domain cannot shrink to fit.
+
+  **The span is priced in KV regions, so a declared budget still has to be
+  argued (2026-08-08).** `S` was 704 MiB — 44 regions taken off the KV side
+  before one is carved, on a card where those regions decide whether the expert
+  cache is fed. Two of the three terms were unearned:
+
+  - The **shelf** held 64 MiB for an allocator that was never built. Removed;
+    reinstate it when something allocates from it, priced in regions like
+    everything else.
+  - **`W_persist` was 512 MiB.** "It bisects to fit" argues the span can be
+    *small*, not that it should be large — the cost of a big one is paid in KV
+    regions on every boot, while the cost of a small one is paid in DtoH syncs
+    on the hot→warm path only. Sized instead from the floor the batch-halving
+    retry already handles (a single ~30 MB layer): **64 MiB**, two layers plus
+    headroom, ~22 syncs for a ~1.4 GiB pass against the per-layer 48 that made
+    `copy_ms` the bottleneck.
+
+  **The `W_persist` cut was reverted on review; only the shelf removal stands,
+  so `S = 128 + 512 = 640 MiB`.** "It bisects to fit" is true of exactly one of
+  the three staging sites. `migrate_sealed_to_gpu_batch_async` (warm→hot
+  elevate, issued **once per layer across every warm item**) and the hot→warm
+  per-layer gather each do a single `bump.alloc(total_bytes)` with no batching,
+  so for them the span is a hard ceiling and 64 MiB turns a deep elevate into a
+  failed forward. The 29,696 B peak that argued for the cut was measured on runs
+  where the elevate path never executed. **Make those two sites batch like the
+  third and this term becomes tunable**; until then it stays at the size the
+  elevate was written against.
 - **Two time scales.** A **fast per-domain gate**: wave assembly gates width
   against its half's *current* capacity using the plan's byte total — exact
   by construction, not a forecast — hard, never blocks on eviction; a wave
@@ -526,8 +606,30 @@ Cross-cutting machinery used by both sides of the reservation.
   ```
 
   `ArenaLease` = `{generation_id, Arc<AtomicUsize> live_count}` —
-  incremented at construction, decremented on storage drop. Two consumers
-  only: the legacy contiguous `KvCache` façade
+  incremented at construction, decremented on storage drop.
+
+  **As built (2026-08-07): `Backing::Lease` is a bare marker, and the count
+  lives on the allocator instead.** Region-tier leases need no count — a
+  region is never reset or reclaimed under a live chunk, so there is nothing
+  for a count to refuse. The bump side does need one, and `BumpArena` carries
+  it directly: its `Generation` guard is counted, and the cursor refuses to
+  rewind while any guard is live. Same refusal, one owner instead of two.
+
+  Wave intermediates (step 3) do not change this. They are handed to candle ops
+  as `Tensor`s and outlive the scope that allocated them, so they cannot pin the
+  cursor themselves — **the wave holds one generation guard for its whole
+  duration** instead. That is not a weaker guarantee but a stronger one: a
+  per-lease count would let the cursor rewind mid-wave the moment the last
+  intermediate happened to drop, while a kernel enqueued earlier was still
+  draining. The wave-scoped guard is exactly the lifetime every intermediate
+  needs, and it is what the A/B-half buffer set already implies.
+  **Step 3 must re-check this**: wave intermediates handed to candle ops as
+  `Tensor`s will outlive the scope that opened the generation, so either the
+  lease starts carrying the count as originally drafted, or the wave's
+  buffer-set guard is held for the whole wave (which the wave-domain design
+  already implies). Do not assume the current shape suffices.
+
+  Two consumers only: the legacy contiguous `KvCache` façade
   (`read_contiguous`/`write_contiguous`, which need on-demand tensor views
   over region bytes) and, from step 3, wave intermediates that candle ops
   must consume. Views/reshapes share the `Arc<Storage>` and the lease travels
@@ -574,6 +676,18 @@ Cross-cutting machinery used by both sides of the reservation.
   2. **Event fence.** Host bookkeeping cannot observe stream asynchrony: the
      reset fences on the completing wave's stream event before the cursor
      moves.
+
+     **As built (2026-08-07): the fence is a per-domain policy, and the wave
+     domain does not need it.** A domain declares how its reset is made safe.
+     The persistence domain fences, because it stages on the copy stream while
+     the compute stream runs and nothing else orders the two. The wave halves
+     do not, because they are double-buffered on a single stream: by the time a
+     half is handed out again, an entire other wave's work sits between the
+     reads and the writes *on that stream*, and same-stream launches complete
+     in issue order. Fencing there would add a full device sync to every
+     forward — a stall on the wave path, which is the cost §3.6 exists to
+     remove. The A/B structure is not merely an overlap optimization; it is
+     what makes the wave reset free.
   3. **Debug canaries** (optional). Rust cannot observe device writes:
      canary words between buffers catch a kernel overrunning its output.
      This guards a hazard that exists identically with today's pool
@@ -588,18 +702,62 @@ Cross-cutting machinery used by both sides of the reservation.
 
 - The VRAM governor's *runtime* regulator role ends. It keeps its **startup**
   role: balloon-measure `C` (mapping the reservation as it goes, §3.2), size
-  the expert cache, then freeze the partition.
-- Pressure = `free_regions < setpoint`. Responses, in order:
+  the expert cache, then freeze the partition. Built 2026-08-08: `relief.rs` is
+  deleted entire, along with `Criticality`, the five `LadderTier` trip points,
+  the sync and reuse hooks, `available()`, `forecast_units`, the OOM-retry
+  `allocate`, and the Windows budget-change watcher thread. What remains is the
+  balloon, `usable()`/`expert_budget()`/`kv_floor()`, the per-class tallies
+  (reporting only), and the starvation signal.
+- Pressure = `free_regions < setpoint`.
+
+  **As built (2026-08-08), with two corrections.** The setpoint is
+  `max(span/8, 24 regions)` under load and `max(span/16, 8)` in decode, clamped
+  to half the span; it scales to the *reservation*, not the card, so one set of
+  constants holds across machines. Step 6 tunes both terms.
+
+  First correction: this section's list omits **compress-to-free**, which is a
+  real response and survives as the step between the gallery and evacuation. It
+  is a *shrink in place* rather than a move — the turn stays resident and
+  attended-over, only its float working set goes — so it is strictly cheaper
+  than eviction, which has to be reloaded if the turn is re-attended. It sits
+  where the governor's ladder had it, one rung above eviction.
+
+  Second: the gallery arena sheds **before** all of this. Its pages rebuild from
+  the substrate blob on demand, so dropping one costs only the rebuild, which
+  makes it cheaper than anything involving model KV. §5 already specifies the
+  mechanism (call `evict_lru` directly rather than registering a relief rung);
+  this is where it lands in the order.
+
+  So, in full, each step run only if the one before it left pressure standing:
   1. steal an empty region from any class (O(1)),
-  2. **evict-as-evacuation**: demote the **rightmost** occupied regions'
-     sealed chunks to warm via the existing
+  1b. evict resident gallery pages,
+  1c. compress-to-free: bring the float→quant conversion forward,
+  2. **evict-as-evacuation**: demote sealed chunks to warm via the existing
      `migrate_sealed_layers_to_cpu_batch` + install path (the hot tier is a
      cache; demotion is its defining operation — this replaces GPU→GPU
-     defragmentation entirely). With lowest-first packing, rightmost ≈
-     emptiest, so one *positional* eviction order serves both cross-class
-     reclaim and boundary movement (§3.6),
+     defragmentation entirely).
+
+     **As built (2026-08-08): no rightmost scan, and none is wanted.** This
+     originally specified demoting the *rightmost* occupied regions. But
+     lowest-first packing already makes the high end the least-populated, so
+     the scheduler's existing budget-aware eviction — now driven by the exact
+     free-region count instead of three disagreeing driver estimates — empties
+     the right edge without needing to know that is what it is doing. §3.10
+     states the same identity ("rightmost ≈ emptiest"); a separate positional
+     scan would be a second mechanism for what the packing policy already
+     does. If boundary motion is ever built (step 6), *that* needs an explicit
+     rightmost order, because it must empty a specific region rather than
+     merely enough of them,
   3. throttle admission (the existing regulated setpoint, now driven by an
      exact, latency-free counter instead of driver headroom).
+
+     As built, the admission *ceiling* is `(free_regions − setpoint) ×
+     REGION_BYTES` — the setpoint is subtracted because those regions are the
+     relief pass's working room, not admission's to spend. It carries neither of
+     the two corrections the driver-derived version needed: pinned KV holds live
+     regions, so it is excluded by construction rather than by discount, and
+     evictable KV shows up as free regions the moment the relief pass ahead of
+     admission evicts it. Measured, not forecast.
 - The transient side is governed by §3.6's two time scales: the fast
   per-domain gate against current capacity, and the slow watermark regulator
   positioning the boundary to maximize admitted work while minimizing
@@ -700,17 +858,25 @@ exact counters.
    (min class 320 B ⇒ 52,428).
 7. **Lifetime segregation** (principle 2): no transient allocation in a
    class region, no class chunk in the bump side, at any time.
-8. **Payload bytes ≠ address stride.** `ResolvedArenaInfo` carries *two*
-   lengths: `chunk_byte_stride` (the class stride — address arithmetic only,
-   `base + idx × stride`) and `chunk_payload_bytes` (the format's real bytes
-   — every copy length, `arena_byte_size`, and the persist blob). Zeroing
-   uses the **stride** (invariant 4: the next tenant may be any format);
-   copying and persisting use the **payload**. Conflating them makes every
+8. **Payload bytes ≠ address stride.** Two lengths, and they have *different
+   owners*. The **stride** is the arena's: `ResolvedArenaInfo.chunk_byte_stride`
+   is the class stride, used for address arithmetic only
+   (`base + idx × stride`) and for zeroing on recycle (invariant 4 — the next
+   tenant may be any format). The **payload** is the *chunk's*: it comes from
+   the band's own format tag via `payload_bytes_for_tag`, and it is every copy
+   length, `arena_byte_size`, and the persist blob. Conflating them makes every
    hot→warm migration move pad over PCIe and silently changes on-disk image
    sizes and their Fletcher goldens. **Seven** sites consume the length as a
    copy/extent rather than an address step, and they span three crates —
    enumerated in §5 step 1; A1 found the class, and the sweep that followed
    found the rest.
+
+   **As built (2026-08-07):** an earlier draft of this invariant put *both*
+   lengths on `ResolvedArenaInfo`. That was wrong in the same way the whole
+   initiative is about — an arena holds whatever fits its slots and cannot say
+   what format a given slot is, so it cannot supply a payload. The field was
+   removed along with the struct's two format tags; the payload now comes from
+   the tag, which is also the byte the substrate persisted.
 
 ---
 
@@ -740,16 +906,52 @@ defrag/compaction still exist (they fire far less).
   (E0004 / E0063), so there is no silent-failure surface; budget it as an
   afternoon of mechanical edits, not a refactor.
 - Add per-band format tags to `ChunkWindow` and `SealedChunk` (parallel to
-  `gids`; `Arc`-shared per block like pal/scale). Invert every
-  format-from-arena derivation — the verified site list:
-  `KvHeadHost::from_gids` (`slot_state.rs:147-153`, `arena_info[..].k_format_tag`
-  → chunk metadata) and `build_meta_records`; `per_head_table_host`
-  (`backing.rs:1549-1655`, both `k_tag`/`v_tag` and the `arena.format()`-derived
-  `chunk_byte_stride`); `kv_formats_for_gids` (`chunk_ops.rs:1630`); migration
-  source resolve; `ensure_writable_tail`'s any-quantized check
-  (`sequence_ops.rs:1791`); `bucket_quant_chunks` eligibility
-  (`compress.rs:409-423`); `gpu_format_stats` (`gid_pool.rs:1588`);
-  `PalHeadDesc` build in `compress.rs`.
+  `gids`; `Arc`-shared per block like pal/scale), then invert every
+  format-from-arena derivation.
+
+  **Corrected by the 1.4 sweep — there are thirteen readers, not the nine
+  listed here originally.** Eleven are inverted in 1.4; two are structurally
+  blocked on later sub-steps and are recorded with their reason rather than
+  papered over. Two further sites turned out to be dead code and are deleted.
+
+  | # | Site | Disposition |
+  |---|---|---|
+  | 1 | `KvHeadHost::from_gids` (`slot_state.rs`) | takes per-head `k_fmt`/`v_fmt`; arena supplies the address only |
+  | 2 | `serialize_kv_heads` (`meta_pool.rs`) | the resident-record twin of #1; **absent from the original list** |
+  | 3 | `per_head_table_host` (`backing.rs`) | **deferred to the re-index** — the row *is* the arena, so inverting it and re-keying it are the same edit |
+  | 4 | `kv_formats_for_gids` (`chunk_ops.rs`) | **deleted.** Its three consumers all mapped the result through `KvFormat::to_tag`, which is defined as `ArenaFormatTag::from_kv_format(..).as_u8()` — i.e. the chunk's tag bytes already. They now copy `SealedChunk::format_tags()` |
+  | 5 | `ensure_writable_tail` (`sequence_ops.rs`) | **deleted — zero callers.** See the note below |
+  | 6 | `bucket_quant_chunks` (`compress.rs`) | format from `SealedChunk::bands()`, location still from the arena |
+  | 7 | `gpu_format_stats` (`gid_pool.rs`) | **deferred to class-occupancy logging** — it aggregates over *pool keys*, not chunks, so it has no chunk to read from until `ArenaKey` carries a class |
+  | 8 | `PalHeadDesc` source probe, quantize (`compress.rs`) | `k_is_r16`/`v_is_r16` from the source chunk's tags |
+  | 9 | `build_meta_records` (`backing.rs`) | takes `ChunkRecordSrc`, feeds #2 |
+  | 10 | `sealed_has_compressible_chunk` (`backing.rs`) | same predicate as #6 |
+  | 11 | `dequantize_sealed_in_place` bucketing (`compress.rs`) | **new** — same shape as #6, separate call site |
+  | 12 | `resolve_src` closure, dequantize (`compress.rs`) | **new** — resolved `(ptr, GgmlDType)` from `arena.format()`; now from the band tag via `KvFormat::from_tag` |
+  | 13 | The `[pal4]` verbose grid (`batched_inference.rs`) | **new** — a diagnostic, but the one that *displays* per-band format variety. Built from arena state it would print every band of a shared region identically, i.e. it would lie about exactly the property this design introduces |
+
+  Two functions in the sweep turned out to be dead and are deleted rather than
+  ported: **`ensure_writable_tail`** (`sequence_ops.rs`, zero callers — and its
+  `any_quantized` probe was already vacuous on GPU, where the active K arena is
+  `Quantized(R16)`, so it would have pushed a fresh block on every call) and
+  **`Cache::chunked_per_head_table_and_sync`** (`cache.rs`, zero callers, with a
+  doc comment claiming it feeds the decode kernel — false, and plausibly the
+  origin of the belief that attention depends on the per-head table).
+
+  Also deleted: **`ArenaFormatTag::from_ggml_index`** — zero callers, and a
+  byte-for-byte duplicate of the tag-decode table, under a name and doc comment
+  that describe GGML type indices it does not actually map (its own doc says
+  `Q4_0=2` while the body maps `2 => BF16`). The surviving decoder is
+  `ArenaFormatTag::from_u8`, the declared inverse of `as_u8`.
+
+  **The gate is the proof, not the assert.** 1.3's `debug_assert_tags_match_arenas`
+  is compiled out under `--release`, so it can never fire during the gate. What
+  makes 1.4 safe is stronger: after the inversion the model's attention and
+  selection paths read formats *only* from chunk tags, so a wrong or missing tag
+  produces mis-decoded KV and a failed validity check. Sixteen green configs
+  spanning `F16`/`BF16`/`Q8_0`/`Q4_0` and `C0–C7`, `C9` are therefore direct
+  evidence that the tags are correct on the real workload — which is what §1.5
+  needs before it deletes the arena's copy.
 - **Re-index the selection table per `(chunk, head)` and activate the
   palette sub-entry** (§2) — the **one kernel-visible edit** size classes
   require. It must land in the same commit as the class switch, or selection
@@ -771,10 +973,32 @@ defrag/compaction still exist (they fire far less).
      `actual_kv_format_tags`: audit Q1 confirms their only readers are
      `arena.rs:928-929` and the two table builders at `backing.rs:1613-1616`
      / `:1713-1716` — precisely the code being rewritten here.
+
+  **Corrected: "must land in the same commit as the class switch" is
+  one-directional.** It forbids the class switch from *preceding* the re-index;
+  it does not force them together. Populating each palette sub-entry from its
+  own band's gid is behaviour-neutral while bands are still one-arena-per-format
+  — the four sub-entries carry exactly what the single palette-0 row carried —
+  so the re-index lands and gates on its own, and the class switch then arrives
+  into a selection path that already reads per-band data. That ordering was
+  taken, and it paid: it isolated two defects (a table not narrowed alongside
+  its gids in `select_chunks`, and eleven stale hand-built table fixtures, three
+  of them still on the pre-palette4 7-column layout) that would otherwise have
+  landed tangled with the allocator rewrite. See
+  `arena_unification_results.md` §1.5a.
 - Introduce `SizeClass` and the ladder table (§3.4); `ArenaKey` →
   `(SizeClass, ArenaLocation)`; `arena_chunks_for_format` →
   `chunks_for_class`; `arena_gid_stride()` → the fixed 65,536; scarcity-only
   class promotion in the allocator.
+
+  **This bullet and the byte-slab bullet below are one change, not two.** Once
+  `ArenaKey` carries no `KvFormat`, `create_arena` has nothing to construct an
+  `Arena::Float { dtype }` or `Arena::Quantized { format }` with — the storage
+  variant is selected by the key's format today. Carrying a "representative
+  format" on the arena so the constructor still type-checks would be
+  optionality-as-a-feature-flag, and it would resurrect the second answer to
+  "what format is this?" that step 1's reader inversion exists to remove. The
+  class key and the byte-slab collapse land together.
 
   The fixed stride is a bigger win than "cheaper gid decode in the serialize
   paths" implies. `arena_gid_stride()` re-derives the maximum over **all 22
@@ -805,26 +1029,51 @@ defrag/compaction still exist (they fire far less).
   every `base + idx × stride` addressing site on `chunk_byte_stride`, and
   leave `zero_chunk_at` on the stride. The verified inventory:
 
+  **Corrected by the step-0 pre-flight — there are nine sites in two
+  opposite-facing categories, and one of the seven listed here was
+  misclassified.** The verified inventory (all landed in 1.2):
+
+  **Category A — payload inferred from stride** (→ `chunk_payload_bytes`):
+
   | # | Site | Role of the length |
   |---|---|---|
-  | 1 | `chunk_ops.rs:1987` | DtoH gather copy length |
-  | 2 | `chunk_ops.rs:2206` | cross-layer gather copy length |
-  | 3 | `chunk_ops.rs:2755` | HtoD scatter copy length |
-  | 4 | `head_gids.rs:156-186` | `arena_byte_size` → `SealedChunk.byte_size` |
-  | 5 | `migrate.rs:199` | `resolve_sealed_chunk_ptrs` → `(ptr, len)` pairs |
-  | 6 | `migrate.rs:234` | `resolve_sealed_chunk_ptrs_per_gid`, same |
-  | 7 | `transfer.rs:269` | `seal_to_chunk_images_cpu` blob slot reservation |
+  | A1 | `chunk_ops.rs:1987` | DtoH gather copy length (and the `src_ptrs` len half) |
+  | A2 | `chunk_ops.rs:2206` | cross-layer gather copy length |
+  | A3 | `head_gids.rs:185` | `arena_byte_size` → `SealedChunk.byte_size` |
+  | A4 | `migrate.rs:199` | `resolve_sealed_chunk_ptrs` → `(ptr, len)` |
+  | A5 | `migrate.rs:234` | `resolve_sealed_chunk_ptrs_per_gid`, same |
+  | A6 | `migrate.rs:423` | `resolve_block_ptrs_from_hgids` — **missed**; feeds cold-load via `pipeline.rs:589` |
+  | A7 | `transfer.rs:269` | `seal_to_chunk_images_cpu` blob slot reservation |
+  | A8 | `chunk_ops.rs:2597` | `chunk_byte_size_of(arena)` in the HtoD scatter — **missed**, and not a `chunk_byte_stride` expression at all |
 
-  Sites 5–7 are the ones the first pass missed, and **7 is the dangerous
-  one**. `seal_to_chunk_images_cpu` appends a **stride**-sized slot to the
+  **Category B — stride inferred from payload** (→ the slot stride, via the
+  new `slot_stride_of` helper). A category the original sweep did not have:
+
+  | # | Site | Expression |
+  |---|---|---|
+  | B1 | `chunk_ops.rs:166` | `read_chunk_into_pinned_bytes`: `byte_offset = chunk_idx * dst.len()` |
+  | B2 | `chunk_ops.rs:2498` | `write_chunk_from_pinned_bytes`: `byte_offset = chunk_idx * bytes.len()` |
+
+  Category B fails in the *opposite* direction from A: these derive the
+  **address step** from the **payload length**, so under classes they address
+  slot `n` at `n × payload` and read or write a neighbour. That is data
+  corruption, not a size mismatch, and no length assertion would catch it.
+  They take their stride from the arena inside the callee rather than from a
+  caller-passed value, so there is no way to pass a wrong one.
+
+  **`chunk_ops.rs:2755` is addressing-only and must be LEFT on the stride** —
+  the previous listing had it as a payload site. Its length comes from
+  `gid_byte_range`, populated at A8, so fixing A8 fixes the scatter
+  transitively and "fixing" 2755 would break it.
+
+  **A7 is the dangerous one.** `seal_to_chunk_images_cpu` appends a slot to the
   blob per unique gid, then splits that blob by `sc.byte_size`. Today the two
-  agree by construction. The moment `byte_size` becomes payload-summed while
-  the gather still reserves stride, the blob and the split disagree — the
-  visible outcome is `seal_to_chunk_images_cpu: blob underrun`, the invisible
-  one is every chunk after the first landing on shifted boundaries in
-  persisted data. Site 5 feeds `seal_to_chunk_images_gpu`'s `split_sizes` the
-  same way. **All seven must move in one commit**; a partial conversion is
-  worse than none, because sites that still agree mask the ones that don't.
+  agree by construction. The moment `byte_size` goes payload-summed while the
+  gather still reserves stride, they disagree — visibly as
+  `seal_to_chunk_images_cpu: blob underrun`, invisibly as every chunk after the
+  first landing on shifted boundaries in persisted data. **All ten must move in
+  one commit**; a partial conversion is worse than none, because sites that
+  still agree mask the ones that don't.
 - Land four **permanent** invariant tests. Three are the E1 harness,
   promoted: every `QuantFormat` and float dtype maps to a class; every class
   yields ≤ 65,535 chunks/region; `GID_STRIDE` exceeds the max chunks/region.
@@ -877,10 +1126,84 @@ makes and neither is visible in tokens/s:
 - **Fused selection-table bytes** (E5): expect a fall at typical drain
   widths — 17.7 MiB → ~1.7 MiB at 336 arenas / a 1000-token turn — and the
   scaling to switch from arena count to chunk count.
-- **Where the `GID_STRIDE` win lands** (A15): if LLVM was *not* folding
-  `arena_gid_stride()`, the gain shows up as a broad host-side drop across
-  every refcount operation, not a serialize-path one. Which of the two it is
-  tells us whether the fold was happening.
+- ~~**Where the `GID_STRIDE` win lands** (A15)~~ — **answered: nowhere.** The
+  swap measured no change at all (115.70 s vs a 119.37 s baseline, every config
+  at or above it), so LLVM was folding `arena_gid_stride()`'s `strum` iterator.
+  The constant stays — it is a precondition for the class switch and it retires
+  an unproven assumption — but it buys no speed. Recorded so nobody re-derives
+  the expectation later.
+
+---
+
+#### Step 1 as built (2026-08-07) — where the plan above and reality diverged
+
+The plan above is left as written; this records what actually landed and every
+place it differs. Measurements are in `docs/arena_unification_results.md`.
+**Gate: 16/16, 124.47 s** against a 114–120 s band.
+
+**Predictions that held.**
+
+- The class ladder covers the whole format space; the gid pool table collapsed
+  from ~58 per-format pools to **14** (7 classes × 2 locations).
+- The contiguous-run eligibility test became a question about *keys*, so bands
+  in different formats that share a class can still form one run — it fires
+  strictly more often, as predicted.
+- `PagedKvArenas` and the `Arena::Float`/`Quantized` duality deleted clean, as
+  E2 said they would.
+- Every payload/stride site moved together, and none needed a second pass.
+
+**Predictions that did not.**
+
+- **`arena_gid_stride()` → `GID_STRIDE` bought nothing.** Measured at parity;
+  LLVM was folding the `strum` iterator. The constant stays — it is a
+  precondition for the class switch — but it is not a speedup. (Already
+  corrected in the step-1 text above.)
+- **`GpuChunks` on the region tier is currently a ~6 % *cost*, not a win.**
+  A13's alloc/free/sync cycles are gone, but its slabs have nowhere to live
+  until step 4 and so compete with KV for the same pool. Kept rather than
+  reverted because the mechanism is right and step 4 removes the contention by
+  construction; the residual 6 % is not visible in per-config throughput and
+  needs a profile. See §1.8 of the results log.
+
+**Things the plan did not know about.**
+
+- **`QTensor::from_leased_cuda_ptr` had to be built.** The byte-slab arena
+  removes the typed `QTensor` that `quantize_into` writes *through*, and
+  1.5b(i)'s `Backing::Lease` covered plain `Tensor` only. Two details are
+  load-bearing: `Clone` must return `Backing::Owned`, because
+  `CudaSlice::clone` is a device-to-device **copy**; and the view carries no
+  matrix-row padding, so it is a block-quantize operand and never a matmul one.
+- **`migrate_chunk` cannot convert formats, and never needed to.** Every
+  production caller — hot→warm demote, warm→hot elevate, fork — is
+  format-preserving; the converting arms were reachable only from tests. It is
+  now a byte-verbatim slot relocation that *requires* equal classes.
+- **Scarcity promotion must reuse, not re-stamp.** Every class's region is the
+  same size, so walking up the ladder stamping regions fails identically at
+  every rung while paying `ensure_vram_budget`'s global compaction each time.
+  Promotion takes a free slot from a class that already has a region, or it
+  does not happen.
+- **Two allocation-order dependencies surfaced** once slots were bounds-checked:
+  `read_raw_sealed_chunk` sized a read as a whole head and issued it against
+  palette 0's slot, reaching the rest only because runs are *usually*
+  contiguous; and `write_contiguous`'s quantized arm wrote into a
+  `data.clone()` — a deep copy — and dropped it.
+
+**Deletions beyond the inventory.** `ArenaEntry` and its tensor-row codec, the
+CUDA `ArenaTableEntry` struct and its eight accessors, `actual_kv_format_tags`,
+`count_quantized_arenas`, `chunked_live_chunks_as_sealed_with`,
+`tensor_ptr_at_offset` / `qtensor_ptr_at_byte_offset`, and
+`convert_chunk_data_static` — all dead once formats left the arena.
+
+**Naming.** `chunks_for_class` is `SizeClass::chunks_per_region`;
+`slot_stride_of(arena)` is `Arena::slot_stride`; `gpu_format_stats` is
+`gpu_class_stats` returning per-rung `ClassOccupancy`. `ResolvedArenaInfo` lost
+`chunk_payload_bytes` and both format tags — a band's payload comes from its
+own tag via `payload_bytes_for_tag`, which is the single path from a persisted
+byte back to a byte length.
+
+**A12 is now answerable.** `ChunkedKvBacking::class_histogram` reports live
+slots per class and, separately, those in formats narrower than the 320 B
+floor — the numerator of the ~2 % decision rule. Step 6 makes the call.
 
 ### Step 2 — Port transient buffers to the bump side
 
@@ -957,6 +1280,13 @@ shapes.
 
 ### Step 4 — Static reservation: consume the memory at startup
 
+> **Built 2026-08-08.** Gate green: `pool_reserved` flat at 8,858,370,048 B
+> across configs 1–15 of the MoE gate, 562 arena creations at 0.029 ms each,
+> every region returned. Five corrections to this document came out of it — the
+> startup order (§3.2), the free-region list (§3.3), `W_persist` (§3.6),
+> positional evacuation (§3.8), and the unbuilt `cuMemAlloc` fallback (§3.2) —
+> each recorded inline above. Full record in `arena_unification_results.md`.
+
 - Startup sequence per §3.2: reserve the VA span; the balloon maps granules
   to the driver's refusal (measuring `C` and claiming it in one act);
   release the partition's granules for dense weights + expert cache + small
@@ -978,6 +1308,29 @@ shapes.
 steady state (`KV_ARENA_STATS` / pool counters flat).
 
 ### Step 5 — Rip out everything no longer needed
+
+> **Built 2026-08-08.** Every item below is deleted. Gate green: MoE
+> `test_parallel_batched_forwarding` 120.32 s, candle-nn 423/0, candle-core
+> `vram::` 30/0, candle-conversation 950/0, both `cargo check` branches clean,
+> clippy 227 (below the 235 baseline). Step 5 as a whole: 77 files,
+> 6,395 insertions / 10,974 deletions. Full record in
+> `arena_unification_results.md`.
+>
+> Nine symbols beyond the inventory came out with it, each because its last
+> caller was inside the deleted set: `VramGovernor::{allocate, reserve,
+> forecast_units, available, do_sync, with_sync_hook, with_reuse_hook,
+> spawn_budget_watcher}` and `CudaDevice::trim_pool`'s runtime callers (the
+> method survives for the startup balloon alone). The pressure signal and the
+> admission ceiling were *rewritten*, not merely stripped — see §3.8 and the
+> results doc.
+>
+> Two defects surfaced while deleting, neither related to what was being
+> deleted. Every `#[cfg(feature = "cuda")]` block in `candle-conversation` is
+> dead code — the crate has no such feature, it forces the feature on its
+> dependencies — which had silently disabled all of step 4's `kv-regions`
+> telemetry. And `demote_cold_ingest_if_pressured` was gating on `pool_used`
+> against a fraction of `C`, a reading that stopped describing KV when KV left
+> the pool, so it would have fired on every wave.
 
 Deletion inventory (all now dead by construction):
 
@@ -1030,6 +1383,29 @@ sustained load.
 
 ### Step 6 — Optimize steady state in the gated test
 
+> **Built 2026-08-08. Gate green: 16/16 configs at or above the step-0
+> baseline** (table in `arena_unification_results.md`). Two changes carried it,
+> both found by measurement rather than by the list below:
+>
+> - **The recycled-region quiesce cost 2,837 ms of a 120 s run** — 7.18 ms
+>   average over 395 claims. Step 4 had measured it as free; step 5 invalidated
+>   that by removing the per-wave `device.synchronize()` it had been riding on.
+>   Fixed with a **quiesce epoch** rather than the per-region release event this
+>   section proposed: one `cuCtxSynchronize` retires every kernel on every
+>   stream, so it discharges every region released before it, and regions are
+>   released and re-claimed in bulk. 395 waits → 15, 2,837 ms → 0.5 ms. The
+>   release event stays unbuilt, now for a measured reason.
+> - **The class ladder padded `Q8_0` (5.6 %) and `Q4_0` (10.0 %)** — the two
+>   fixed formats, derived after the C-level ones. `Q8_0×20` and `Q4_0×20` were
+>   the gate's only two configs below baseline, five runs of five. Ladder
+>   7 → 13 rungs on the rule **coarse where region stranding dominates, exact
+>   where read bandwidth does**: one catch-all rung absorbing everything ≤320 B,
+>   an exact rung for every format above it. Both configs moved above baseline.
+>
+> **Boundary motion is now never built** (§9 S6's condition): KV peaked at 167 of
+> 226 regions, so the fixed split strands nothing. The A12 low-end split also
+> stays unbuilt — zero class promotions fired, so no class was starved.
+
 - Profile the allocation fast path (claim, run claim, region pop), the
   transient generation reset, and eviction cadence under the widest gate
   config.
@@ -1037,8 +1413,17 @@ sustained load.
   step 4 measurably strands memory (transient span idle while KV starves, or
   vice versa), add the hysteretic watermark regulator and rightmost-first
   boundary evacuation. If the fixed split holds, this is never built.
-- Evaluate `WaveAllocScope` (step 3's deferred option (b)) — adopt if the
-  leak counter stays clean and it measurably shrinks pool-remnant traffic.
+- ~~Evaluate `WaveAllocScope`~~ (step 3's deferred option (b)) — **evaluated
+  2026-08-08, not adopted.** The leak counter is clean, so the gate opened; the
+  second condition is what failed. The CUDA pool reserves once during load
+  (30 → 7,232 MiB, flat across the cold-ingest peak *and* six concurrent
+  conversations) and never grows again, with `used` swinging ~370 MiB inside it.
+  Interior op outputs cost no VRAM, so routing them to the wave returns nothing
+  to the expert cache or the KV side. Same verdict, same evidence, for the
+  threaded pipeline's `ys` — which additionally needs the combine target to stop
+  crossing a thread boundary by channel. Both become earned if `scratch_margin`
+  must go under the ~370 MiB working swing (it is at 512 MiB), or if CUDA graph
+  capture is pursued, which is the case the scope was really for.
 - Tune the class ladder against the observed histogram; tune the free-region
   setpoint; verify the stride-65,536 decode shows up as a win in the
   serialize paths.
@@ -1047,6 +1432,65 @@ sustained load.
 record the final table.
 
 ### Step 7 — Switch to the daemon; tune the partition
+
+> **Partly built 2026-08-08.** The conversion was a no-op: `zend` has no
+> allocator of its own, which is what one hopes from a change made at the right
+> altitude. Two partition defects found and fixed, both by measurement:
+>
+> - **`scratch_margin` was double-booked** — subtracted when sizing the KV span
+>   *and* the transient tier added on top of the result. A forward's activations
+>   have come from the transient tier since step 3, so the cushion and the tier
+>   were the same memory, reserved twice with opposite signs. The reservation is
+>   now exactly `kv_floor`, both sides, with the cushion left outside it for what
+>   still allocates from the CUDA pool.
+> - **`expert_budget()` reserved against a card that had not finished loading.**
+>   It runs before the per-layer dense tensors, so `usable` included memory
+>   already promised to them and the KV side paid the difference. Declaring the
+>   weights early was necessary but *insufficient* — `kv_floor` is
+>   `abs + pct × (C − Weights)`, so declaring them lowers the floor and hands the
+>   experts more (measured: KV 182 → 176 regions, the wrong way). The pending
+>   bytes had to come off the **budget** at the loader's call site, which is the
+>   only place that knows what has not loaded yet.
+>
+> **KV capacity +19.8 %** on the 16 GiB card (182 → 218 regions), `usable` at
+> first KV cache 4,640 → 5,216 MiB, zero truncation, MoE gate green.
+>
+> **The partition is now measured, and the knob is retired.** Cold-booting the
+> real `mind` corpus, KV demand is **70 regions (1,120 MiB) in steady state** and
+> **284 regions (4,544 MiB) at the cold-boot peak** — boot needs 4× what running
+> needs, and it is the peak that decides whether the daemon comes up. The
+> `kv_floor` sweep:
+>
+> | `kv_floor_abs` | KV span | expert slots | residency | decode | boot |
+> |---|---|---|---|---|---|
+> | 3 GiB (old default) | 218 regions | 2618 | 42.6 % | — | dies |
+> | 4 GiB | 274 regions | 2267 | 36.9 % | 57 ms/fwd | ready |
+> | 5 GiB | 328 regions | 1917 | 31.2 % | 67 ms/fwd | clean |
+> | 6 GiB (the workaround) | 384 regions | 1566 | 25.5 % | 80 ms/fwd | clean, 100 regions unused |
+>
+> (measured with the 704 MiB transient tier; trimming it to 192 MiB moved
+> 3.5 GiB to **278 regions / 2443 slots / 39.8 % / 57 ms**. **Shipped default is
+> 3840 MiB** — interpolated between the 3.5 and 4 GiB points, not measured
+> directly.)
+>
+> **1024 MiB of `kv_floor_abs` buys 56 KV regions and costs 351 expert slots,
+> worth ~13 % of decode throughput.** The old 6144 workaround was the single
+> worst point on this curve — it was sized against pre-unification arena slack
+> that no longer exists, and it starved the expert cache to hold regions nothing
+> ever occupied. Default is now 4 GiB and the workaround is deleted, not carried:
+> **decode is 29 % faster per forward than the configuration this repo has been
+> running.**
+>
+> Two things the sweep exposed, both fixed: `kv_floor` is routinely **not
+> achieved** (the expert budget is taken before the dense weights finish loading,
+> so the KV claim comes up ~1,079 MiB short) and *nothing reported it* —
+> `shortfall` measures only the granule touch refusing. `[reservation]` now
+> carries `floor_deficit` and warns. And the post-priming quantize drain ran
+> without relieving first, so at a cold build's high-water mark it failed for want
+> of one slot while relief stood ready to free 41 regions.
+>
+> **Still not done**: aggregate ingest t/s and warm-restart/concurrency probes
+> against the pre-unification baselines.
 
 - Move `zend` onto the unified allocator; re-run the daemon measurement
   suite (cold ingest, warm restart, concurrency probes with distinct
@@ -1076,8 +1520,8 @@ pre-unification baselines.
 | Fixed boundary (step 4) mis-sized — one side strands memory | Sized from step 2's *measured* per-domain peaks, not a guess; step 6 adds boundary motion if measurement shows real stranding (§9 S6). Until then the failure mode is bounded slack, not a wedge. |
 | Boundary thrash / press stalled by un-evictable writers — **only if motion is built** | Region-aligned quantum (16 MiB) + regulator hysteresis + the free-region gap at the frontier make free-region claims the common case; admission throttling drains writers toward seal; the regulator's time constant absorbs turn-granularity waits (§3.6). Deferred to step 6 precisely so this interaction is faced with data. |
 | Buffer aliasing / use-after-reset (no allocator left to catch them) | Counted reset refuses while any lease is live (log + quarantine the half, never scribble); no-mid-wave-allocation debug assert; bump arithmetic is one audited function and returns disjoint ranges by construction; optional debug canaries for device-side overruns (§3.7). |
-| Cursor reset races an in-flight kernel of the prior wave | A/B halves + event-fenced reset (the `PinnedStager` sync-then-reset discipline, ported to the device instance). |
-| VMM path fails on a future driver/platform | Fallback probed and working: a single giant `cuMemAlloc` (14 GiB verified on the target machine) — same single-span design, coarser (whole-buffer) WDDM eviction unit. Runtime capability probe picks the path at startup. |
+| Cursor reset races an in-flight kernel of the prior wave | A/B halves on one stream: a whole wave's work separates the reads from the writes, and same-stream launches complete in order. Domains that *are* cross-stream (persistence staging) fence instead — see §3.6's `Reclaim` note. |
+| VMM path fails on a future driver/platform | **Accepted, not mitigated** — the allocator requires VMM and says so. `Reservation::reserve` probes `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED` and fails with a message naming the capability and the reason there is no second path (§3.2); a device test asserts it. The giant-`cuMemAlloc` variant differs in eviction unit, partial release and capacity measurement, so it is a distinct implementation to be written against a real unsupported target, not carried untested. |
 | Silent over-commit while mapping the reservation (`cuMemCreate` never refuses — §3.2) | Stop signal is a failed **touch**, checked per granule, failing granule unmapped+released; extent additionally capped by the existing balloon back-off policy so the desktop keeps headroom. Never treat `cuMemCreate` success as capacity. |
 | Selection path reads a wrong format tag under mixed-format regions | The per-`(chunk, head)` re-index of the selection table (§5 step 1) must land in the *same commit* as the class switch; the gate test exercises the quantize-selection path on every config. |
 | Class ladder mismatch with a future model's format mix | Ladder is one constant table; per-class occupancy logging makes drift visible; re-derivation is a constants change. |
@@ -1140,8 +1584,9 @@ inventory are corrected accordingly. The lesson generalises: A1 audited the
 a value**, not the paths you expect it to travel.
 
 **A2 — Gate coverage. Better than assumed.** The gate test spans `F16`,
-`BF16`, `Q8_0`, `Q4_0` **and adaptive `C0–C7`, `C9`, `C10`** (only `C8` is
-absent) at 1–48 contexts, and drives `record_turn` → `quantize_sealed_in_place`
+`BF16`, `Q8_0`, `Q4_0` **and adaptive `C0–C7`, `C9`** (only `C8` is
+absent) at 1–20 contexts (the baseline run corrected this from "1–48"; there is
+also no `C10` config — 16 configs total), and drives `record_turn` → `quantize_sealed_in_place`
 in-session (`batched_inference.rs:1254-1259`). It therefore exercises seal,
 per-`(chunk, head, palette)` selection across nearly the whole format space,
 multi-format arena allocation, and wave concurrency. **Blind spots**:
@@ -1298,6 +1743,15 @@ through. It is not `const fn`; the fold is plausible under LTO but unproven.
 `GID_STRIDE = 1 << 16` removes the question. Watch for this in the step-1 gate
 numbers: if the fold was *not* happening, the win shows up as a broad
 host-side drop, not a serialize-path one.
+
+**Answered: the fold was happening.** The swap landed with the u16 clamp in
+`1.5b(ii-a)` and measured **115.70 s against a 119.37 s baseline, every config
+at or above baseline** — i.e. no win at all. LLVM was folding the `strum`
+iterator. The change stands, because it is a precondition for the class switch
+and it removes an unproven assumption, but it must **not** be carried as a
+performance improvement. This is the one place A-series pricing was wrong in
+the optimistic direction; §5 step 1's "two numbers to record" is updated
+accordingly.
 
 ### 8.2 Experiments (throwaway; reverted)
 

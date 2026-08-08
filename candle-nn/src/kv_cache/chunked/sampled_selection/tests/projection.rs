@@ -23,6 +23,8 @@
 //!   cargo test --release --features cuda --lib --package candle-transformers \
 //!     quantized_llama::tests::kv_dump::test_dump_kv_cache_data -- --ignored --nocapture
 
+use crate::kv_cache::arena_table::N_PALETTE;
+
 use super::{candidate_formats, make_synthetic_batch, CHUNK_SIZE};
 #[cfg(feature = "cuda")]
 use crate::kv_cache::chunked::sampled_selection::PagedSelectionGpuInputs;
@@ -2026,6 +2028,11 @@ fn test_cuda_selection_matches_cpu() {
     );
     let chunk_byte_stride = (blocks_per_chunk * 32 * 4) as i64; // F32: 4 bytes per elem
 
+    // Unity outer scale, and one `Palette4PerHeadEntry` row per (chunk, head):
+    // four 9-value sub-entries. Every band of this fixture shares one buffer,
+    // so the four are identical — but each must be present, because the kernel
+    // resolves a band through its own sub-entry, not through palette 0.
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
         .map(|cg| {
@@ -2035,7 +2042,7 @@ fn test_cuda_selection_matches_cpu() {
             //                     k_chunk_byte_stride, v_chunk_byte_stride, metadata]
             // metadata: (k_format_tag << 16) | (v_format_tag << 8) | location
             // ArenaFormat::F32 = 0, so metadata = 0
-            [
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -2043,7 +2050,10 @@ fn test_cuda_selection_matches_cpu() {
                 chunk_byte_stride,
                 chunk_byte_stride,
                 0i64,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            sub.repeat(N_PALETTE)
         })
         .flatten()
         .collect();
@@ -2561,6 +2571,11 @@ fn test_cuda_per_head_matches_cpu() {
         .all(|cg| cg.num_blocks == blocks_per_chunk));
     let chunk_byte_stride = (blocks_per_chunk * 32 * 4) as i64; // F32: 4 bytes/elem
 
+    // Unity outer scale, and one `Palette4PerHeadEntry` row per (chunk, head):
+    // four 9-value sub-entries. Every band of this fixture shares one buffer,
+    // so the four are identical — but each must be present, because the kernel
+    // resolves a band through its own sub-entry, not through palette 0.
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
         .map(|cg| {
@@ -2569,7 +2584,7 @@ fn test_cuda_per_head_matches_cpu() {
             // [k_ptr, v_ptr, k_byte_offset, v_byte_offset,
             //  k_chunk_byte_stride, v_chunk_byte_stride, metadata]
             // metadata=0 → F32 format, GPU location
-            [
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -2577,7 +2592,10 @@ fn test_cuda_per_head_matches_cpu() {
                 chunk_byte_stride,
                 chunk_byte_stride,
                 0i64,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            sub.repeat(N_PALETTE)
         })
         .flatten()
         .collect();
@@ -3183,6 +3201,11 @@ fn test_cuda_r16_qproj_matches_cpu() {
     let k_chunk_byte_stride = (blocks_per_chunk * 128) as i64; // R16: 128 bytes per block
     let v_chunk_byte_stride = (blocks_per_chunk * 32 * 2) as i64; // F16: 2 bytes per elem
 
+    // Unity outer scale, and one `Palette4PerHeadEntry` row per (chunk, head):
+    // four 9-value sub-entries. Every band of this fixture shares one buffer,
+    // so the four are identical — but each must be present, because the kernel
+    // resolves a band through its own sub-entry, not through palette 0.
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
         .map(|cg| {
@@ -3191,7 +3214,7 @@ fn test_cuda_r16_qproj_matches_cpu() {
             // metadata: (k_format_tag << 16) | (v_format_tag << 8) | location
             // ArenaFormat::R16 = 39, ArenaFormat::F16 = 1
             let metadata = (39i64 << 16) | (1i64 << 8) | 0i64;
-            [
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -3199,7 +3222,10 @@ fn test_cuda_r16_qproj_matches_cpu() {
                 k_chunk_byte_stride,
                 v_chunk_byte_stride,
                 metadata,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            sub.repeat(N_PALETTE)
         })
         .flatten()
         .collect();

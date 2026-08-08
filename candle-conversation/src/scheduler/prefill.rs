@@ -1,59 +1,44 @@
 use super::admission::{
-    admit_quantum, available_bytes, backlog_admit_action, budget_notches, decode_reserve_bytes,
-    evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes, plan_admission,
-    prefill_cost_bytes, BacklogAction, BandParams, ThrottleReason,
+    admit_quantum, backlog_admit_action, budget_notches, decode_reserve_bytes, evidence_admit_grow,
+    evidence_ticks_for, per_block_kv_bytes, plan_admission, prefill_cost_bytes, BacklogAction,
+    BandParams, ThrottleReason,
 };
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
-use candle::vram::Criticality;
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 
-/// Default pool-budget headroom we keep free by offloading hot KV — see
-/// [`vram_budget_band`]. 2 GiB: sized **above** a wide ragged prefill forward's
-/// transient allocation peak (per-sequence activations × batch width + MoE
-/// expert gather), which on a memory-tight card is far larger than a lone
-/// decode's. Relieving only near ~1 GiB let a 20-wide upload forward's peak tip
-/// the card into WDDM host-memory spill — tens of seconds per forward — so we now
-/// keep a wider margin and shed hot KV earlier to defend it.
-const DEFAULT_VRAM_BUDGET_BAND_MB: usize = 2048;
+/// Free KV regions kept in hand before [`Scheduler::vram_under_pressure_for`]
+/// calls it pressure, as a divisor of the reservation's KV side plus an absolute
+/// floor in regions. This is §3.8's setpoint.
+///
+/// It replaced a band of *bytes* derived from the driver — headroom held against
+/// a wide forward's transient activation peak. That quantity is no longer the KV
+/// side's business: transients come from the reservation's other end (§3.6), and
+/// what a seal pass needs is simply somewhere to put its chunks. So the setpoint
+/// asks the only question that remains, and asks it of an exact counter: are
+/// there enough free regions to absorb the work already admitted?
+///
+/// Scaled to the span rather than fixed, so the same numbers hold on a 3.6 GiB
+/// KV side and on the workstation's. Step 6 tunes both terms against the
+/// observed claim rate; the floors are what keeps a small card from setting a
+/// setpoint of two regions and stalling mid-seal.
+const LOAD_SETPOINT_DIVISOR: usize = 8;
+const LOAD_SETPOINT_FLOOR_REGIONS: usize = 24;
+/// Decode's setpoint is half of load's: a decode step advances one token per
+/// sequence, so KV grows by ~one chunk per sequence per 32 steps — orders of
+/// magnitude slower than a prefill's upload, and the whole point of unbounded
+/// context is to leave KV resident rather than evict it defensively.
+const DECODE_SETPOINT_DIVISOR: usize = 16;
+const DECODE_SETPOINT_FLOOR_REGIONS: usize = 8;
 
-/// Pool-budget headroom kept free (bytes), overridable at process start via
-/// `CANDLE_VRAM_BUDGET_BAND_MB` so it can be tuned to a specific card/model without
-/// a rebuild — the right value depends on the model's per-token activation
-/// footprint and the prefill batch width, which vary per deployment. Cached on
-/// first read. `0`/unparseable falls back to [`DEFAULT_VRAM_BUDGET_BAND_MB`].
-fn vram_budget_band() -> usize {
-    static BAND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BAND.get_or_init(|| {
-        let mb = std::env::var("CANDLE_VRAM_BUDGET_BAND_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_BUDGET_BAND_MB);
-        mb * 1024 * 1024
-    })
-}
-/// Decode-phase pressure/relief reserve band (bytes), overridable via
-/// `CANDLE_VRAM_DECODE_BAND_MB`. Default 1.5 GiB — thinner than the load band
-/// because in decode the working set is stable (~1 chunk/token/step), so the
-/// freed-float free-list (`reserved − used`) is genuinely spare and counts as
-/// available; we keep only a small safety margin for the per-step forward +
-/// MoE expert gather, letting the maximum KV stay resident (the whole point of
-/// unbounded context). `0`/unparseable falls back to the default.
-const DEFAULT_VRAM_DECODE_BAND_MB: usize = 1536;
-fn vram_decode_band() -> usize {
-    static BAND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BAND.get_or_init(|| {
-        let mb = std::env::var("CANDLE_VRAM_DECODE_BAND_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_DECODE_BAND_MB);
-        mb * 1024 * 1024
-    })
+fn env_regions(var: &str) -> Option<usize> {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Per-**sequence** transient-activation reserve for a LOAD-phase (prefill /
@@ -77,94 +62,50 @@ fn per_seq_load_bytes() -> usize {
     })
 }
 
-/// Per-sequence reserve for a DECODE-phase forward, in bytes. Much smaller than
-/// the load coefficient — a decode step advances ~1 token per sequence, so the
-/// activation buffers are tiny and only the MoE expert gather is shared across
-/// the batch. Default 48 MiB; override with `CANDLE_VRAM_PER_SEQ_DECODE_MB`.
-const DEFAULT_VRAM_PER_SEQ_DECODE_MB: usize = 48;
-fn per_seq_decode_bytes() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let mb = std::env::var("CANDLE_VRAM_PER_SEQ_DECODE_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_PER_SEQ_DECODE_MB);
-        mb * 1024 * 1024
-    })
+/// The region quantum in bytes.
+fn region_bytes() -> u64 {
+    candle_nn::kv_cache::REGION_BYTES as u64
 }
 
-/// Combine the card-fraction `base` band with the width-scaled term
-/// (`width × per_seq`), clamping the width term to a third of `capacity` so a
-/// width spike can never strand the whole device. Pure — the arithmetic core of
-/// `vram_band_for`, unit-tested in isolation.
-fn combine_band(base: usize, width: usize, per_seq: usize, capacity: usize) -> usize {
-    let width_term = width.saturating_mul(per_seq).min(capacity / 3);
-    base.max(width_term)
+/// The free-region setpoint for `phase`, in regions, given a KV side of
+/// `total` regions. Pure — unit-tested in isolation.
+fn setpoint_regions(phase: VramPhase, total: usize) -> usize {
+    let (divisor, floor) = match phase {
+        VramPhase::Load => (LOAD_SETPOINT_DIVISOR, LOAD_SETPOINT_FLOOR_REGIONS),
+        VramPhase::Decode => (DECODE_SETPOINT_DIVISOR, DECODE_SETPOINT_FLOOR_REGIONS),
+    };
+    let floor = match phase {
+        VramPhase::Load => env_regions("CANDLE_KV_FREE_REGIONS_LOAD").unwrap_or(floor),
+        VramPhase::Decode => env_regions("CANDLE_KV_FREE_REGIONS_DECODE").unwrap_or(floor),
+    };
+    // Never ask for more than half the span: on a card too small to hold the
+    // setpoint, demanding it would mean permanent pressure and an eviction pass
+    // per wave that can never succeed.
+    (total / divisor).max(floor).min(total / 2)
 }
 
-/// The phase a VRAM pressure/relief decision is made in. The freed-float
-/// free-list (`pool_reserved − pool_used`) is genuinely reusable working space,
-/// but *what it is available FOR* differs by phase, so the reserve band does too:
+/// The phase a VRAM pressure decision is made in. Both phases read the same
+/// exact counter — free regions — and differ only in how many they insist on:
 ///
 /// - [`Load`](VramPhase::Load) — bringing KV into VRAM *before* attention
-///   (prefill upload, section/scope ingest, warm→hot elevation). The free-list
-///   is the **destination** of the incoming KV — the forward will consume it —
-///   and a wide ragged forward has a large transient activation peak. So the
-///   free-list is not spare admission capacity here: we keep the wide band
-///   (`max(capacity/10, 2 GiB)`) and relieve early, making real headroom before
-///   the load competes for it. (We still *count* the free-list in `available`,
-///   so the WDDM false-pressure fix stands — the phase only sets the band.)
-/// - [`Decode`](VramPhase::Decode) — the working set is stable, so the free-list
-///   is genuinely spare: a thin band ([`vram_decode_band`]) keeps KV maximally
-///   resident.
+///   (prefill upload, section/scope ingest, warm→hot elevation). A wide ragged
+///   forward claims regions fast, so the setpoint is wide enough that a seal
+///   pass never finds the free list empty mid-wave.
+/// - [`Decode`](VramPhase::Decode) — one token per sequence per step, so KV
+///   grows slowly and predictably. A thin setpoint keeps the maximum KV
+///   resident, which is the whole point of unbounded context.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum VramPhase {
     Load,
     Decode,
 }
 
-/// Pool reuse headroom (reserved-but-free pool bytes) below which the
-/// stream-ordered pool can no longer absorb a new allocation without growing
-/// our OS footprint — only then does a low driver `free` count as pressure
-/// (mirrors `vram_has_room`'s `os_needed`). A fresh arena is small, so unlike
-/// the budget band this stays tight; it is the OS-safety floor, not the
-/// keep-forwards-fast headroom.
-const VRAM_REUSE_BAND: usize = 512 * 1024 * 1024;
-/// Bytes of hot KV to shed per pressure episode. The eviction overshoots the
-/// trigger by this much, so the pool budget oscillates in
-/// `[band, band + VRAM_EVICT_BAND]` (band = [`vram_budget_band`]) and we don't
-/// re-trip on the very next wave.
-const VRAM_EVICT_BAND: u64 = 1024 * 1024 * 1024;
-/// Eviction hysteresis for the footprint reclaim, as **percentages of resident
-/// capacity C** so they scale to any card (a 16 GB 4090 and a 72 GB workstation
-/// alike — never an absolute GiB margin sized for one machine). Eviction of
-/// resident KV starts only when `used` climbs within [`vram_evict_high_pct`] of C
-/// (genuinely too much resident data — not the gap-inflated `reserved`), and then
-/// evicts in ONE bulk pass down to [`vram_evict_low_pct`] below C, so it's a rare
-/// decisive exit that coasts for many waves rather than per-wave nibbling (which
-/// caused reload-churn stalls). Both env-tunable; `low` must exceed `high` or
-/// eviction no-ops. The fragmented gap worth compacting is likewise a percentage
-/// of C ([`VRAM_MIN_COMPACT_GAP_PCT`]).
-const DEFAULT_VRAM_EVICT_HIGH_PCT: usize = 8; // evict when used > 92% of C
-const VRAM_EVICT_HIGH_FLOOR_MB: usize = 1024;
-const DEFAULT_VRAM_EVICT_LOW_PCT: usize = 20; // bulk-evict down to 80% of C
-const VRAM_EVICT_LOW_FLOOR_MB: usize = 2048;
-/// Below this fraction of C the reserved-but-free gap is just trim slack —
-/// compaction (GPU chunk moves + a device sync) isn't worth it.
-const VRAM_MIN_COMPACT_GAP_PCT: usize = 3;
-const VRAM_MIN_COMPACT_GAP_FLOOR_MB: usize = 512;
-/// Min interval between footprint-reclaim attempts. Without it, a `reserved`
-/// pinned just over the compact-ceiling — a fragmented gap the engine keeps
-/// reusing, which compaction can't lower — trips the pressure gate on every
-/// scheduler-loop iteration and fires relief 5–7×/second with no effect. Relief
-/// still runs when genuinely needed, just no faster than this.
-const FOOTPRINT_RELIEF_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(2000);
-/// Hysteresis: the footprint gate ignores `reserved` overshooting the compact-
-/// ceiling by less than this — a small overage is just the pool high-water
-/// sitting harmlessly below the card, not worth relieving. Fixed (not % of C):
-/// it's a "don't sweat a tiny overage" band, small on any card.
-const FOOTPRINT_HYSTERESIS: usize = 256 * 1024 * 1024;
+/// Regions the relief sequence frees past the setpoint, so a pass that just
+/// clears pressure does not re-trip on the very next wave. Eviction is bulk and
+/// coarse by nature — one turn's hot copy spans many chunks — so overshooting
+/// deliberately is cheaper than nibbling every wave, which is what caused the
+/// reload churn the old watermark ladder was built to damp.
+const RELIEF_OVERSHOOT_REGIONS: usize = 8;
 
 /// How long prefill throughput must be COMPLETELY silent (no forward
 /// completing) under surviving VRAM pressure before the promote path halves
@@ -188,31 +129,9 @@ fn env_pct(var: &str, default: usize, max: usize) -> usize {
         .filter(|&p| p >= 1 && p <= max)
         .unwrap_or(default)
 }
-fn vram_evict_high_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        env_pct(
-            "CANDLE_VRAM_EVICT_HIGH_PCT",
-            DEFAULT_VRAM_EVICT_HIGH_PCT,
-            50,
-        )
-    })
-}
-fn vram_evict_low_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_VRAM_EVICT_LOW_PCT", DEFAULT_VRAM_EVICT_LOW_PCT, 90))
-}
-
-/// A reclaim watermark margin (bytes) below resident capacity C: `max(pct% of C,
-/// floor)`. The percentage scales to any card; the absolute floor keeps the
-/// margin sane on a small (16 GB) card where a raw percentage would be too tight.
-fn cap_margin(capacity: usize, pct: usize, floor_mb: usize) -> usize {
-    (capacity / 100 * pct).max(floor_mb * 1024 * 1024)
-}
-
 /// Capacity fraction (%) at which cold **ingest** KV starts demoting to the warm
-/// (RAM) tier — the gentle-early ladder rung, far below the near-cap eviction
-/// watermarks (`vram_evict_high_pct` etc.). Ingest KV is zero-reload-cost (never
+/// (RAM) tier — gentle and early, well before the free-region setpoint is
+/// approached at all. Ingest KV is zero-reload-cost (never
 /// re-attended until query time; it re-elevates warm→hot on demand), so it is the
 /// cheapest relief and sheds first. Env `CANDLE_INGEST_DEMOTE_PCT`, default 50.
 fn ingest_demote_pct() -> usize {
@@ -295,23 +214,6 @@ const DEFAULT_VRAM_COMPRESS_MAX_MB: usize = 1024;
 /// it overshoots the immediate shortfall a little and coasts rather than
 /// re-tripping on the very next wave.
 const VRAM_COMPRESS_HYSTERESIS: u64 = 4;
-/// Base chunk-move budget for one bounded compaction pass. The relief ladder
-/// escalates it as it climbs — a light defrag first (`reclaim_footprint`, Cheap
-/// rung), a bigger one deeper (Costly rung) — so a large fragmented gap
-/// consolidates over several bounded passes instead of one long blocking
-/// compaction (a 20 s `compact_forced` was the symptom). Env-tunable; the
-/// `candle_nn::kv_cache::compact` timing log shows the moves→ms ratio to tune it.
-const DEFAULT_COMPACT_BASE_MOVES: usize = 4000;
-fn compact_base_moves() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_VRAM_COMPACT_BASE_MOVES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_COMPACT_BASE_MOVES)
-    })
-}
 fn vram_compress_max() -> u64 {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -337,174 +239,143 @@ impl Scheduler {
     /// `active_prefills` set. Emits the initial `Prefill` and
     /// `PrefillProgress(0, total)` events so callers see their submission
     /// was picked up.
-    /// Under VRAM pressure, shed hot KV to the substrate to reopen budget, and
-    /// report whether pressure **survived** the attempt. Three steps:
+    /// Under VRAM pressure, shed until the free-region setpoint is met again,
+    /// and report whether pressure **survived** the attempt.
     ///
-    ///  1. Give substrate offload complete priority: synchronously drain the
-    ///     pending hot→warm migration so just-sealed turns gain a warm (RAM) copy
-    ///     — only warm-backed turns can be evicted hot→warm.
-    ///  2. Evict the least-recently-used hot turns across the resident
-    ///     conversations (drop the hot copy, keep warm), returning their VRAM
-    ///     chunks to the pool free-list.
-    ///  3. Release the arenas the eviction emptied back to the pool, which is what
-    ///     actually lowers `pool_used` and restores budget. The cheap release only
-    ///     frees fully-empty arenas; if that leaves pressure unrelieved and a
-    ///     forced defrag could reclaim a fragmented arena, fall back to the
-    ///     chunk-moving compaction (guarded by `can_reclaim_arena`) rather than let
-    ///     an admitted prefill spill to host memory and thrash to death.
+    /// Cheapest first, each step run only if the one before it left pressure
+    /// standing:
     ///
-    /// Returns `true` if VRAM is **still** under pressure afterward — the caller's
-    /// signal to narrow the admission window and stop admitting this pass.
-    /// `whence` tags the log line with the calling gate (`promote` / `pump`);
-    /// `phase` sets the reserve band (see [`VramPhase`]).
+    ///  1. **Release empty arenas.** Under the reservation this is a free-list
+    ///     push per region with no device work at all, so it is always worth
+    ///     trying first — §3.8's "steal an empty region from any class".
+    ///  2. **Evict resident galleries.** Belief-scan pages rebuild on demand
+    ///     from the substrate blob, so dropping one costs only the rebuild.
+    ///     They go before model KV for exactly that reason.
+    ///  3. **Compress to free.** Bring forward the float→quant the persistence
+    ///     thread would do anyway. A shrink in place rather than a move: the
+    ///     turn stays resident and attended-over, and only its float working
+    ///     set goes. Cheaper than eviction, which has to be reloaded if the
+    ///     turn is re-attended.
+    ///  4. **Evacuate.** Flush the pending hot→warm so just-sealed turns have a
+    ///     warm copy — only warm-backed turns are evictable — then drop the hot
+    ///     copies of the oldest ones. This is §3.8's evict-as-evacuation, and
+    ///     it runs through the demotion path the tiering already owns; there is
+    ///     no GPU→GPU compaction behind it any more.
+    ///
+    /// This ordering used to be the VRAM governor's relief ladder, each step a
+    /// numbered `Criticality` rung with the governor re-measuring driver
+    /// headroom between them to decide whether to climb. The rungs are gone:
+    /// against an exact free-region count there is nothing to re-measure and
+    /// nothing to arbitrate, so the priority is expressed as call order
+    /// (`docs/archived/arena_unification.md` §5).
+    ///
+    /// Returns `true` if pressure is **still** on afterwards — the caller's
+    /// signal to narrow the admission window, which is §3.8's third and last
+    /// response. `whence` tags the log line with the calling gate.
     pub(super) fn relieve_vram_pressure(&mut self, whence: &str, phase: VramPhase) -> bool {
         let t = std::time::Instant::now();
-        // Footprint reclaim FIRST: when the pool's RESERVED footprint nears the
-        // card, the budget-based ladder below short-circuits as "already relieved"
-        // (the reuse-inflated budget still reads healthy), so it would never act.
-        // Defrag the fragmented gap / bulk-evict resident KV back under capacity
-        // here, measured against physical capacity rather than the budget. No-op
-        // when comfortably below both watermarks.
-        self.reclaim_footprint();
-        // The VRAM Governor owns the relief POLICY — measure the honest free VRAM,
-        // run the ladder cheapest-rung-first, escalate only while below the restore
-        // target, GPU-sync only at Critical. We execute each rung's MECHANISM via a
-        // borrowed driver (`SchedulerReliefDriver`), so hot eviction runs on this
-        // (the scheduler) thread with full working-set context — never off-thread
-        // racing a live forward. See `docs/vram_governor_design.md` §8.
-        let band = self.vram_band_for(phase) as u64;
-        let (freed, deepest, flushed, evicted, compressed, released) =
-            if let Some(gov) = self.session.vram_governor() {
-                // Restore headroom to band + 50% — enough to clear pressure with
-                // margin, but reachable in a single eviction pass (2× band asked for
-                // ~9 GiB on a 73 GiB card, which one pass can't free, so the ladder
-                // reported `relieved=false` and pointlessly climbed to Critical).
-                let target = band.saturating_add(band / 2);
-                let mut driver = SchedulerReliefDriver {
-                    sched: self,
-                    evicted: crate::substrate::EvictionReport { count: 0, bytes: 0 },
-                    compressed: 0,
-                    flushed: false,
-                    released: 0,
-                };
-                let freed = gov
-                    .relieve_with(target, &mut driver)
-                    .map(|r| r.freed())
-                    .unwrap_or(0);
-                let deepest = gov.last_relief().map(|(tier, _)| tier);
-                let SchedulerReliefDriver {
-                    evicted,
-                    compressed,
-                    flushed,
-                    released,
-                    ..
-                } = driver;
-                (freed, deepest, flushed, evicted, compressed, released)
-            } else {
-                // Non-CUDA / no governor: direct cheapest-first ladder.
-                let mut released = self.session.release_empty_arenas_forced().unwrap_or(0);
-                self.trim_kv_pool();
-                if self.vram_under_pressure_for(phase) && self.session.can_reclaim_arena() {
-                    let _ = self.session.defragment_bounded(compact_base_moves());
-                    released += self.session.release_empty_arenas_forced().unwrap_or(0);
-                    self.trim_kv_pool();
+        let Some(want) = self.relief_shortfall_bytes(phase) else {
+            return false;
+        };
+
+        let mut released = self.session.release_empty_arenas().unwrap_or(0);
+        let mut gallery_freed = 0u64;
+        let mut compressed = 0usize;
+        let mut flushed = false;
+        let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+
+        // Gallery eviction — **this cannot clear the pressure below it**, and is
+        // not here to.
+        //
+        // `evict_lru` drops `PageRun`s, returning pages to the gallery's own
+        // `PagePool`. The VRAM behind them is `GalleryArena`'s `storage.slabs`,
+        // which is only ever appended to (`add_slab`) and never shrunk, and
+        // those slabs come from the CUDA pool rather than the KV reservation.
+        // So `region_stats().free` is unchanged by this call and the next
+        // `vram_under_pressure_for` is still true — `gallery_freed` counts bytes
+        // returned to a free list, not to the card.
+        //
+        // Gallery growth is bounded by the arena itself now — it evicts to its
+        // own ceiling at admission — so this no longer has to be the only limit,
+        // and it must not fire merely because KV is tight. It used to: the test
+        // was KV pressure alone, which this call cannot clear, so every episode
+        // shed belief-scan residency that the next scan rebuilt from the
+        // substrate. Now it only runs when the arena is *itself* over its
+        // ceiling, which is the one case where evicting is the right answer and
+        // the bytes are genuinely reclaimable.
+        if self.vram_under_pressure_for(phase) {
+            if let Some(arena) = self.gallery_arena.as_ref() {
+                let cap = arena.cap_bytes();
+                let resident = arena.resident_bytes();
+                if resident > cap {
+                    gallery_freed = arena.evict_lru((resident - cap).max(want));
                 }
-                let mut flushed = false;
-                let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
-                if self.vram_under_pressure_for(phase) {
-                    flushed = super::timed_wait(|| {
-                        self.persist_trigger
-                            .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT)
-                    });
-                    evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
-                    released += self.session.release_empty_arenas_forced().unwrap_or(0);
-                    self.trim_kv_pool();
-                }
-                // No governor ⇒ non-CUDA / no compress-to-free (quantize is CUDA-only).
-                (released as u64, None, flushed, evicted, 0, released)
-            };
-        let still = self.vram_under_pressure_for(phase);
-        if freed > 0 || evicted.count > 0 || compressed > 0 {
-            relief_trace::note("sched", "governor_relieve", freed, evicted.bytes as u64);
+            }
         }
-        // (Eviction volume is accounted at the `evict_cold_tail` chokepoint, not
-        // here, so the governor driver's evictions aren't double-counted.)
-        if let Some((free, total)) = self.session.vram_free_total() {
-            let (pool_used, pool_reserved) = self.session.vram_pool_stats().unwrap_or((0, 0));
-            let offload_ms = t.elapsed().as_millis() as u64;
-            let evicted_mib = evicted.bytes / (1 << 20);
-            let freed_mib = freed / (1 << 20);
-            let rung = deepest
-                .map(|r| format!("{r:?}"))
-                .unwrap_or_else(|| "none".into());
-            // Our footprint vs the OS-reserved high-water: this, not `vram_free`,
-            // says what's actually consuming the card.
-            let pool_used_mib = (pool_used / (1 << 20)) as u64;
-            let pool_reserved_mib = (pool_reserved / (1 << 20)) as u64;
-            let vram_free_mib = (free / (1 << 20)) as u64;
-            let vram_total_mib = (total / (1 << 20)) as u64;
-            let relieved = !still;
-            // INFO only when the pass actually freed something — an eviction that
-            // reclaimed hot turns or arenas is a real event worth surfacing. When it
-            // was a no-op (nothing evictable, pressure persists) log at DEBUG: this
-            // runs from both the promote and pump gates every scheduler loop, so
-            // under a sustained upload burst an unconditional INFO floods the log.
-            macro_rules! emit {
-                ($lvl:ident) => {
-                    tracing::$lvl!(
-                        target: "candle_conversation::scheduler::timing",
-                        whence,
-                        deepest_rung = %rung,
-                        freed_mib,
-                        offload_ms,
-                        warm_flushed = flushed,
-                        turns_compressed = compressed,
-                        turns_evicted = evicted.count,
-                        evicted_mib,
-                        arenas_released = released,
-                        pool_used_mib,
-                        pool_reserved_mib,
-                        vram_free_mib,
-                        vram_total_mib,
-                        relieved,
-                        "VRAM relief (governor ladder)"
-                    )
-                };
+
+        if self.vram_under_pressure_for(phase) {
+            // Bound the batch so a large backlog drains over several episodes
+            // rather than one multi-second blocking pass over everything
+            // pending; the persistence thread is working the same queue.
+            let budget = want
+                .saturating_mul(VRAM_COMPRESS_HYSTERESIS)
+                .min(vram_compress_max());
+            compressed = self.compress_pending_turns(budget);
+            released += self.session.release_empty_arenas().unwrap_or(0);
+        }
+
+        if self.vram_under_pressure_for(phase) {
+            evicted = self.evict_cold_tail(want);
+            if evicted.bytes < want {
+                // The blocking flush is only paid when the already-warm turns
+                // were not enough: under sustained pressure there are usually
+                // plenty of them, and this wait is measured in seconds.
+                flushed = super::timed_wait(|| {
+                    self.persist_trigger
+                        .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT)
+                });
+                let more = self.evict_cold_tail(want.saturating_sub(evicted.bytes));
+                evicted.count += more.count;
+                evicted.bytes += more.bytes;
             }
-            if evicted.count > 0 || compressed > 0 || released > 0 {
-                emit!(info);
-            } else {
-                emit!(debug);
-            }
+            released += self.session.release_empty_arenas().unwrap_or(0);
+        }
+
+        let still = self.vram_under_pressure_for(phase);
+        let acted = released > 0 || gallery_freed > 0 || compressed > 0 || evicted.count > 0;
+        if acted {
+            relief_trace::note("sched", "relieve", want, evicted.bytes as u64);
+        }
+        let (free, setpoint) = self.kv_region_state(phase).unwrap_or((0, 0));
+        // INFO when the pass actually shed something — that is a real event.
+        // DEBUG otherwise: this runs from several gates every scheduler loop,
+        // so an unconditional INFO floods the log under a sustained burst.
+        macro_rules! emit {
+            ($lvl:ident) => {
+                tracing::$lvl!(
+                    target: "candle_conversation::scheduler::timing",
+                    whence,
+                    want_mib = want / (1 << 20),
+                    relief_ms = t.elapsed().as_millis() as u64,
+                    warm_flushed = flushed,
+                    gallery_freed_mib = gallery_freed / (1 << 20),
+                    turns_compressed = compressed,
+                    turns_evicted = evicted.count,
+                    evicted_mib = evicted.bytes / (1 << 20),
+                    arenas_released = released,
+                    free_regions = free,
+                    setpoint_regions = setpoint,
+                    relieved = !still,
+                    "KV region relief"
+                )
+            };
+        }
+        if acted {
+            emit!(info);
+        } else {
+            emit!(debug);
         }
         still
-    }
-
-    /// Per-rung relief trace: emit a DEBUG line each time a ladder rung actually
-    /// recovers VRAM, naming the rung + mechanism, the shortfall it was asked to
-    /// cover (`want`), the bytes it recovered, and a rung-specific detail
-    /// (arenas released, turns compressed/evicted, pool-used delta). The
-    /// per-episode INFO summary in [`relieve_vram_pressure`] aggregates these; this
-    /// is the granular breakdown for diagnosing which mechanism did the work.
-    fn log_relief_event(
-        &self,
-        tier: &str,
-        mechanism: &str,
-        want: u64,
-        freed: u64,
-        dur_ms: u64,
-        detail: String,
-    ) {
-        tracing::debug!(
-            target: "candle_conversation::scheduler::vram_relief",
-            tier,
-            mechanism,
-            want_mib = want / (1 << 20),
-            freed_mib = freed / (1 << 20),
-            dur_ms,
-            %detail,
-            "VRAM relief rung acted"
-        );
     }
 
     /// Bytes one 32-token KV block costs across the whole model, in the formats
@@ -532,73 +403,41 @@ impl Scheduler {
     /// What the card can actually deliver to admission right now — the live
     /// ceiling [`Scheduler::admit_budget`] is clamped to on every read.
     ///
-    /// Honest allocatable bytes plus reversibly-evictable KV, minus the hot KV
-    /// the drain is skipping because it is pinned, minus the load-phase reserve
-    /// band. The pinned discount is what keeps the forecast from reading its most
-    /// optimistic exactly when the hot→warm drain has stalled: those bytes are
-    /// counted as evictable but cannot be reclaimed at any price.
+    /// Free reservation bytes plus reversibly-evictable KV, minus the hot KV the
+    /// drain is skipping because it is pinned. The pinned discount is what keeps
+    /// the forecast from reading its most optimistic exactly when the hot→warm
+    /// drain has stalled: those bytes are counted as evictable but cannot be
+    /// reclaimed at any price.
     ///
-    /// Without a governor (non-CUDA) there is no evictable estimate to add, so
-    /// this degrades to the pool-budget availability less the band.
+    /// The first term used to be a contest between three driver-derived
+    /// estimates — governor headroom, the pool's reserved-but-free gap, and the
+    /// allocator's own `init_free − pool_used − reserve` — clamped to whichever
+    /// looked smallest, because each was wrong in a different regime. The worst
+    /// was the reuse gap: admission once read 3045 MiB of it while `vram_free`
+    /// was 0 and the pool held 15168 of 16375 MiB, admitted six prefills onto
+    /// memory WDDM had already spilled, and the run aborted at ~3 tok/s. None of
+    /// that survives the reservation. KV comes from regions that were claimed at
+    /// startup, so what admission can spend is a count of the free ones, and no
+    /// driver reading enters into it.
+    ///
+    /// Two corrections went with those estimates. One added what registered
+    /// relievers claimed they could reversibly free; the other subtracted hot KV
+    /// the drain was skipping because it was pinned, which the first had counted
+    /// and could not actually reclaim. Both existed because the base number
+    /// described *the card*. A free-region count describes what this process has
+    /// claimed and not yet spent, so pinned KV is excluded by construction — it
+    /// holds live regions — and evictable KV shows up as free regions the moment
+    /// the relief pass ahead of admission actually evicts it. Measured, not
+    /// forecast, which is why nothing has to be added back or discounted.
     pub(super) fn admit_budget_ceiling(&self) -> u64 {
         // No forward reserve is subtracted here: it is width-dependent, and
         // `plan_admission` holds it back at the width it is choosing. See
-        // `admit_band_params`.
-        let pinned = self.persist_trigger.pinned_undrainable_bytes();
-
-        // Room a NEW arena can come from: the device total minus what the pool has
-        // ALREADY reserved. This clamp is the difference between admission and the
-        // relief ladder.
-        //
-        // `VramGovernor::available()` is `headroom + pool reuse gap`, which is the
-        // right number for relief (eviction grows the reuse pool without moving
-        // DXGI headroom) and the WRONG one for admission. A prefill needs *fresh*
-        // arenas — `try_claim_run` only takes contiguous never-used slots at the
-        // high-water mark — and the reuse gap cannot back one. Worse, once the pool
-        // nears the card, that gap is exactly the part WDDM has spilled to host
-        // memory, so counting it admits work whose KV then pages over PCIe.
-        //
-        // Measured: admission read `available=3045 MiB` from the reuse gap while
-        // `vram_free=0` and `reserved=15168` of `16375`; it admitted six prefills,
-        // decode fell to ~3 tok/s on paged KV, arena creation failed, and the run
-        // aborted. `vram_under_pressure_for` already documents this trap — the
-        // budget accounting "still reads GiBs free" while the card is spilling.
-        let unreserved = match (
-            self.session.vram_free_total(),
-            self.session.vram_pool_stats(),
-        ) {
-            (Some((_, total)), Some((_, reserved))) => total.saturating_sub(reserved) as u64,
-            _ => u64::MAX,
+        // `admit_band_params`. The setpoint IS subtracted — those regions are
+        // the relief pass's working room, not admission's to spend.
+        let Some((free, setpoint)) = self.kv_region_state(VramPhase::Load) else {
+            return 0;
         };
-
-        // AND the allocator's own remaining budget. `unreserved` above bounds
-        // what the OS can still give the pool; this bounds what the arena gate
-        // will actually permit us to take (`init_free − pool_used − reserve`).
-        // They are different numbers, and admitting against the larger one is
-        // what wedged the ingest: the governor reported GiBs of driver headroom
-        // while the allocator's budget had gone NEGATIVE, so every admitted
-        // sequence's first arena creation failed. See `kv_alloc_headroom`.
-        let alloc_headroom = self
-            .session
-            .kv_alloc_headroom()
-            .map(|b| b as u64)
-            .unwrap_or(u64::MAX);
-        let unreserved = unreserved.min(alloc_headroom);
-
-        match self.session.vram_governor() {
-            Some(gov) => available_bytes(
-                gov.measure().map(|r| r.headroom).unwrap_or(0),
-                gov.evictable_estimate(Criticality::Moderate),
-                pinned,
-                unreserved,
-            ),
-            None => available_bytes(
-                self.session.vram_budget_available().unwrap_or(0) as u64,
-                0,
-                pinned,
-                unreserved,
-            ),
-        }
+        (free.saturating_sub(setpoint) as u64).saturating_mul(region_bytes())
     }
 
     /// Bytes the work already in flight will still allocate this pass: every
@@ -791,56 +630,6 @@ impl Scheduler {
         }
     }
 
-    /// True when VRAM is under pressure — the signal to offload hot KV to the
-    /// substrate (and, failing that, to stop admitting more concurrent
-    /// prefills).
-    ///
-    /// Two complementary gates, pressure if **either** trips:
-    /// - **Pool budget low** — [`vram_budget_available`] (`init_free -
-    ///   pool_used - reserve`) drops below [`vram_budget_band`]. Pool-aware, so
-    ///   it doesn't false-fire when KV is freed back into our stream-ordered
-    ///   pool (which the driver `free` can't see), robust to WDDM's polluted
-    ///   driver free, and the gate hot-tier eviction can actually relieve
-    ///   (dropping a hot copy lowers `pool_used`). The band sits above the
-    ///   per-forward transient peak so we relieve *before* forwards stall.
-    /// - **Driver free below the reserve floor *and* the pool can't absorb the
-    ///   next allocation by reuse** — `free < max(10% total, 1 GiB)` while the
-    ///   pool's reserved-but-free headroom (`pool_reserved - pool_used`) is
-    ///   under [`VRAM_REUSE_BAND`]. The reuse-headroom qualifier mirrors
-    ///   [`vram_has_room`]'s `os_needed` gate: a low driver free while the pool
-    ///   still holds freed blocks to reuse is *not* pressure (reusing them
-    ///   costs zero new OS memory, so `free` never moves) — without this
-    ///   qualifier the floor false-fires on WDDM, where the pool's own
-    ///   reservation pins driver free low, and needlessly throttles admission
-    ///   while gigabytes of pool budget remain.
-    ///
-    /// `false` on non-CUDA / when the queries are unavailable.
-    ///
-    /// [`vram_budget_available`]: super::super::BatchedInferenceSession::vram_budget_available
-    /// [`vram_has_room`]: candle_nn::kv_cache
-    /// Phase-independent default (`Load`, the conservative wide band). Prefer
-    /// [`vram_under_pressure_for`](Self::vram_under_pressure_for) at call sites
-    /// that know their phase (the decode loop passes `Decode` for a thinner band).
-    pub(super) fn vram_under_pressure(&self) -> bool {
-        self.vram_under_pressure_for(VramPhase::Load)
-    }
-
-    /// Whether the futile-defrag latch holds for the CURRENT pool stats: a
-    /// prior defrag pass moved chunks but shed ~nothing, and neither `used`
-    /// nor `reserved` has moved by more than the hysteresis band since — the
-    /// allocation landscape compaction already failed against. See
-    /// [`Scheduler::defrag_futile_at`].
-    fn defrag_futile(&self, used: usize, reserved: usize) -> bool {
-        self.defrag_futile_at.is_some_and(|(r0, u0, streak)| {
-            // The re-probe bar doubles with each consecutive futile pass (one
-            // hysteresis band up to 8x), so ordinary KV drift does not re-run
-            // a ~100 ms proven-futile compaction every 256 MiB forever; a
-            // successful shed resets the latch entirely.
-            let bar = FOOTPRINT_HYSTERESIS << streak.min(3);
-            reserved.abs_diff(r0) < bar && used.abs_diff(u0) < bar
-        })
-    }
-
     /// The load-phase band's terms, for admission to evaluate at the width it is
     /// choosing rather than the width already in flight. Same `base`, `per_seq`
     /// and capacity clamp the pressure/relief gates use via
@@ -870,145 +659,33 @@ impl Scheduler {
         }
     }
 
-    /// The band's **card-fraction term only** — the reserve held regardless of
-    /// how wide the batch is. [`Self::vram_band_for`] combines it with the
-    /// width-scaled term for the pressure/relief gates.
-    fn vram_base_band_for(&self, phase: VramPhase) -> usize {
-        let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
-            // No governor (legacy / non-WDDM path): fixed band, no capacity term
-            // to reason against.
-            return vram_budget_band();
-        };
-        match phase {
-            VramPhase::Load => (c / 10).max(vram_budget_band()),
-            VramPhase::Decode => (c / 20).max(vram_decode_band()),
-        }
-    }
-
-    /// The pressure/relief reserve band for `phase`. `Load` keeps the wide
-    /// transient-peak reserve; `Decode` keeps only a thin safety margin so the
-    /// freed-float free-list counts as available and KV stays maximally resident.
-    /// See [`VramPhase`]. Without a governor, falls back to the fixed load band
-    /// (the capacity + width terms need the governor).
+    /// Free KV regions right now, and the setpoint for `phase` — the two
+    /// numbers every pressure and admission decision is made from.
     ///
-    /// The band is the larger of two adaptive terms:
-    /// - a **card fraction** (`capacity/10` load, `/20` decode) — scales with the
-    ///   device, and
-    /// - a **width term** (`co-batched sequences × per-seq activation`) — scales
-    ///   with the batch actually in flight.
+    /// `None` before the reservation exists, which the callers read as "no
+    /// pressure, nothing to spend": there is no KV on the device yet to be
+    /// under pressure about.
+    fn kv_region_state(&self, phase: VramPhase) -> Option<(usize, usize)> {
+        let stats = self.kv_regions()?;
+        Some((stats.free, setpoint_regions(phase, stats.total)))
+    }
+
+    /// The KV side's region counters, or `None` before the reservation exists.
+    fn kv_regions(&self) -> Option<candle_nn::kv_cache::RegionStats> {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        candle_nn::kv_cache::region_stats(gpu_id)
+    }
+
+    /// The card's resident capacity C (bytes) — the balloon-measured limit
+    /// below which our footprint stays resident (no WDDM paging). Falls back to
+    /// the driver's physical total until the balloon has measured C
+    /// (`capacity()` is 0 then), so a threshold scaled by it is never a
+    /// spurious zero at startup. `None` when unavailable.
     ///
-    /// The width term is the fix for wide-batch OOM: a big card admits a wide
-    /// ingest co-batch whose transient activation peak exceeds the flat card
-    /// fraction (with larger model weights leaving less spare, that peak spills →
-    /// `CUDA_ERROR_OUT_OF_MEMORY`). Reserving in proportion to the width in flight
-    /// makes real headroom before the forward competes for it. A small card only
-    /// admits a narrow batch, so the width term stays under the card fraction and
-    /// the reserve is unchanged there. Clamped to a third of the card so a width
-    /// spike can never strand the whole device.
-    fn vram_band_for(&self, phase: VramPhase) -> usize {
-        let Some(c) = self.session.vram_governor().map(|g| g.capacity() as usize) else {
-            // No governor (legacy / non-WDDM path): fixed band, no capacity or
-            // width term to reason against.
-            return vram_budget_band();
-        };
-        let base = self.vram_base_band_for(phase);
-        let (width, per_seq) = match phase {
-            VramPhase::Load => (
-                self.prefill_width() + self.section_ingest_width(),
-                per_seq_load_bytes(),
-            ),
-            VramPhase::Decode => (self.decode_width(), per_seq_decode_bytes()),
-        };
-        combine_band(base, width, per_seq, c)
-    }
-
-    /// Phase-aware VRAM pressure signal — see [`VramPhase`] for why the band
-    /// differs by phase. The availability number is identical across phases
-    /// (`headroom + reuse`); only the reserve band it is compared against changes.
-    pub(super) fn vram_under_pressure_for(&self, phase: VramPhase) -> bool {
-        // With a VRAM governor installed, `vram_budget_available` is the honest
-        // real free VRAM (headroom + reusable pool free-list). Trip eviction while
-        // there is still a phase-appropriate safety margin so a forward's
-        // transient activations can't oversubscribe the card before relief fires.
-        let band = self.vram_band_for(phase);
-        let pool_low = self
-            .session
-            .vram_budget_available()
-            .is_some_and(|avail| avail < band);
-        let driver_below_floor = match (
-            self.session.vram_free_total(),
-            self.session.vram_pool_stats(),
-        ) {
-            (Some((free, total)), Some((used, reserved))) => {
-                let reuse_headroom = reserved.saturating_sub(used);
-                // Trip on low physical free when EITHER the reusable pool is small
-                // (the original case — genuine pressure, nothing to reuse) OR the
-                // pool has OVER-SUBSCRIBED the card (`reserved > total`). In the
-                // over-subscription case the "reuse" gap lives in WDDM host memory,
-                // so it's un-usable for a contiguous activation allocation — which
-                // spills and degrades throughput (the 62→65 GiB grind) while the
-                // budget/reuse accounting still reads GiBs "free". Eviction must fire
-                // regardless of the gap's size, shedding whole arenas until reserved
-                // drops back under the card. Without the `reserved > total` arm, a
-                // large un-returnable gap silently suppresses all relief here.
-                free < (total / 10).max(1usize << 30)
-                    && (reuse_headroom < VRAM_REUSE_BAND || reserved > total)
-            }
-            _ => false,
-        };
-        // Footprint pressure, but only when it is *actionable*:
-        // - **Defrag** — reserved over the ceiling by more than the hysteresis
-        //   band AND a reclaimable arena exists. The reserved-but-free gap has two
-        //   flavours: fragmented free *inside live arenas* (compaction consolidates
-        //   it, `can_reclaim_arena` is true) vs. free that has already fallen to the
-        //   CUDA pool's own free-list with no whole arena recoverable
-        //   (`can_reclaim_arena` false; `trim` frees nothing, compaction has nothing
-        //   to move). Only the first is actionable — firing on the second churns a
-        //   no-op reclaim every wave (`shed=0`) while `reserved` sits high on
-        //   un-returnable free memory. `used` staying far below C means that gap is
-        //   free headroom, not a paging risk.
-        // - **Evict** — resident `used` nears C. This is the real paging signal
-        //   (the working set, not the gap-inflated footprint), independent of the
-        //   un-returnable gap.
-        //
-        // [`reclaim_footprint`]: Self::reclaim_footprint
-        let raw_footprint = match (self.session.vram_pool_stats(), self.resident_capacity()) {
-            (Some((used, reserved)), Some(capacity)) => {
-                let compact_ceiling = capacity
-                    .saturating_sub(vram_budget_band())
-                    .saturating_add(FOOTPRINT_HYSTERESIS);
-                let evict_high = capacity.saturating_sub(cap_margin(
-                    capacity,
-                    vram_evict_high_pct(),
-                    VRAM_EVICT_HIGH_FLOOR_MB,
-                ));
-                // The defrag arm is silenced while the futile latch holds: a
-                // gap compaction has PROVEN it cannot lower must not read as
-                // pressure every wave (that pinned the admission window at the
-                // floor and throttled prefill to single-sequence forwards).
-                (reserved > compact_ceiling
-                    && self.session.can_reclaim_arena()
-                    && !self.defrag_futile(used, reserved))
-                    || used > evict_high
-            }
-            _ => false,
-        };
-        // Rate-limit: don't re-trip the footprint gate within the cooldown of the
-        // last footprint reclaim. Reserved hugging the ceiling (a fragmented gap
-        // the engine reuses, which compaction can't lower) would otherwise fire
-        // relief every loop iteration; the budget gates above are unaffected.
-        let footprint_pressure = raw_footprint
-            && self
-                .last_footprint_relief
-                .map_or(true, |t| t.elapsed() >= FOOTPRINT_RELIEF_COOLDOWN);
-        pool_low || driver_below_floor || footprint_pressure
-    }
-
-    /// The card's resident capacity C (bytes) — the balloon-measured limit below
-    /// which the pool footprint stays resident (no WDDM paging). Falls back to the
-    /// driver's physical total until the balloon has measured C (`capacity()` is 0
-    /// then), so the reclaim's ceilings are never a spurious `0 − margin` at
-    /// startup. `None` on non-CUDA / when unavailable.
+    /// Only the host-side warm-tier thresholds still scale by C; the KV side's
+    /// own pressure is counted in regions, not measured against the card.
     fn resident_capacity(&self) -> Option<usize> {
         self.session
             .vram_governor()
@@ -1017,245 +694,45 @@ impl Scheduler {
             .or_else(|| self.session.vram_free_total().map(|(_, total)| total))
     }
 
-    /// Reclaim VRAM footprint with two independent, hysteretic controllers so it
-    /// neither oversubscribes the card nor thrashes. Runs on the scheduler thread
-    /// between forwards; a cheap stats-read no-op when comfortably below both
-    /// watermarks. Returns reserved-footprint bytes shed.
+    /// True when the KV side has fewer free regions than the setpoint — the
+    /// signal to shed, and failing that to stop admitting.
     ///
-    /// - **Defrag (manages `reserved`):** when the reserved footprint nears
-    ///   resident capacity C *and a whole arena is reclaimable*, the gap is
-    ///   fragmented free *inside* live arenas that `trim` can't return — so
-    ///   `reserved` sticks high even though `used` is far lower. Consolidate it with
-    ///   a bounded compaction whose budget ramps with the overshoot (reclaiming that
-    ///   space for KV, NOT evicting it), then release + trim. Fires only when the gap
-    ///   is genuinely large (compaction is expensive) AND recoverable: a gap of free
-    ///   that has already fallen to the CUDA pool's own free-list (no reclaimable
-    ///   arena) is left alone — `trim` can't return it and compaction has nothing to
-    ///   move, and with `used` far below C it is free headroom, not a paging risk.
-    /// - **Evict (manages `used`):** only when the REAL resident data `used` —
-    ///   not the gap-inflated `reserved` — climbs within [`vram_evict_high_pct`]
-    ///   of C does it evict, and then in BULK down to [`vram_evict_low_pct`] below C
-    ///   (hysteresis), a rare decisive exit that coasts rather than the per-wave
-    ///   nibbling that caused reload-churn stalls. The working-set keep-list
-    ///   protects what's being attended. At moderate `used` this evicts nothing.
+    /// This used to be three gates in disjunction: a byte budget derived from
+    /// `init_free − pool_used − reserve`, a driver-free floor qualified by how
+    /// much the CUDA pool could still absorb by reuse, and a footprint gate on
+    /// `pool_reserved` versus a compaction ceiling. Each existed because the
+    /// other two were wrong in some regime, and the footprint gate needed a
+    /// cooldown and a futility latch on top because a fragmented gap the engine
+    /// kept reusing would otherwise report pressure on every scheduler loop.
     ///
-    /// Emits `compact_ms`/`evict_ms` timing so a stall can be attributed to the
-    /// reclaim's own GPU/lock work vs. downstream reprojection reloads.
-    pub(super) fn reclaim_footprint(&mut self) -> u64 {
-        let (Some(capacity), Some((used, reserved))) =
-            (self.resident_capacity(), self.session.vram_pool_stats())
-        else {
-            return 0;
-        };
-        // Watermarks (see the constants for the % / floor scaling).
-        let compact_ceiling = capacity.saturating_sub(vram_budget_band());
-        let evict_high = capacity.saturating_sub(cap_margin(
-            capacity,
-            vram_evict_high_pct(),
-            VRAM_EVICT_HIGH_FLOOR_MB,
-        ));
-        // Actionable pressure only. Defrag is actionable when `reserved` overshoots
-        // the ceiling AND a whole arena is reclaimable (compaction has something to
-        // consolidate). A reserved overshoot on un-returnable CUDA-pool free memory
-        // (`can_reclaim_arena` false) is NOT: `trim` frees nothing and compaction
-        // has nothing to move, so entering the path would stamp the cooldown and
-        // log a `shed=0` no-op every wave while `reserved` sits high on free
-        // headroom. Evict is actionable when resident `used` nears C. Neither → bail
-        // without touching the cooldown so a genuine future trigger isn't
-        // suppressed. (Empty-arena release still runs per-wave in the run loop.)
-        let defrag_actionable = reserved > compact_ceiling.saturating_add(FOOTPRINT_HYSTERESIS)
-            && self.session.can_reclaim_arena()
-            && !self.defrag_futile(used, reserved);
-        let evict_actionable = used > evict_high;
-        if !defrag_actionable && !evict_actionable {
-            return 0;
-        }
-        // Entering the pressure path: stamp the cooldown now (even if we can't
-        // lower `reserved` this pass — e.g. the gap is fragmented) so the gate
-        // doesn't re-fire this reclaim every loop iteration.
-        self.last_footprint_relief = Some(std::time::Instant::now());
-        let before = reserved;
-        let mut compact_ms = 0u64;
-        let mut compact_moves = 0usize;
-        let mut evict_ms = 0u64;
-        let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
-
-        // ── Defrag controller ───────────────────────────────────────────────
-        if reserved > compact_ceiling {
-            let _ = self.session.release_empty_arenas_forced();
-            self.trim_kv_pool();
-            let (u2, r2) = self.session.vram_pool_stats().unwrap_or((used, reserved));
-            // Compact only when the release+trim above didn't clear it AND the gap
-            // is genuinely large — the fragmented-free-inside-live-arenas state
-            // that `trim` alone can't touch.
-            // Gap threshold scales with the card (% of C) with a floor, never a
-            // fixed GiB sized for one machine.
-            let min_compact_gap = cap_margin(
-                capacity,
-                VRAM_MIN_COMPACT_GAP_PCT,
-                VRAM_MIN_COMPACT_GAP_FLOOR_MB,
-            ) as u64;
-            if r2 > compact_ceiling
-                && (r2.saturating_sub(u2) as u64) > min_compact_gap
-                && self.session.can_reclaim_arena()
-            {
-                // Ramp the compaction budget with how far `reserved` overshoots the
-                // ceiling: one base budget just past it, up to ~4× as `reserved`
-                // nears C, so a fast-growing *compactable* gap is consolidated in
-                // step instead of trailing a fixed per-wave base budget. Bounded at
-                // the top so a pass never becomes the multi-second blocking
-                // compaction the base budget replaced. Same ramp shape as the
-                // eviction controller below.
-                let over = r2.saturating_sub(compact_ceiling);
-                let span = capacity.saturating_sub(compact_ceiling).max(1); // ceiling → C
-                let mult10 = 10 + 30 * over.min(span) / span; // ×1 .. ×4
-                let budget = compact_base_moves().saturating_mul(mult10) / 10;
-                let t = std::time::Instant::now();
-                compact_moves = self.session.defragment_bounded(budget).unwrap_or(0);
-                relief_trace::note("sched", "defrag", budget as u64, compact_moves as u64);
-                let _ = self.session.release_empty_arenas_forced();
-                super::timed_synchronize(&self.device);
-                self.trim_kv_pool();
-                compact_ms = t.elapsed().as_millis() as u64;
-            }
-        }
-
-        // ── Eviction controller (watermarks computed above) ─────────────────
-        let used_now = self
-            .session
-            .vram_pool_stats()
-            .map(|(u, _)| u)
-            .unwrap_or(used);
-        if used_now > evict_high {
-            // Ramp the eviction depth with how far `used` is past the soft
-            // threshold, so eviction is gradual and converges to steady state
-            // rather than one bulk dump: shed ~1.5× the overage just past the
-            // threshold, ramping to ~6× (capped at the deep low watermark) as
-            // `used` nears capacity.
-            let evict_low = capacity.saturating_sub(cap_margin(
-                capacity,
-                vram_evict_low_pct(),
-                VRAM_EVICT_LOW_FLOOR_MB,
-            ));
-            let overage = used_now.saturating_sub(evict_high);
-            let deep = used_now.saturating_sub(evict_low);
-            let span = capacity.saturating_sub(evict_high).max(1);
-            let mult10 = 15 + 45 * overage.min(span) / span; // ×1.5 .. ×6
-            let target = overage.saturating_mul(mult10) / 10;
-            let target = target.min(deep).max(1) as u64;
-            let t = std::time::Instant::now();
-            evicted = self.evict_cold_tail(target);
-            relief_trace::note("sched", "evict_cold_tail", target, evicted.bytes as u64);
-            if evicted.count > 0 {
-                if self.session.can_reclaim_arena() {
-                    let moves = self
-                        .session
-                        .defragment_bounded(compact_base_moves())
-                        .unwrap_or(0);
-                    relief_trace::note("sched", "defrag_post_evict", 0, moves as u64);
-                }
-                let _ = self.session.release_empty_arenas_forced();
-                super::timed_synchronize(&self.device);
-                self.trim_kv_pool();
-            }
-            evict_ms = t.elapsed().as_millis() as u64;
-        }
-
-        let after = self
-            .session
-            .vram_pool_stats()
-            .map(|(_, r)| r)
-            .unwrap_or(before);
-        let shed = before.saturating_sub(after) as u64;
-        // Futility latch: a defrag that moved chunks yet shed ~nothing proves
-        // the gap is unreclaimable in this allocation landscape (pinned chunks
-        // hold every arena open) — stop re-running it, and stop reporting it as
-        // pressure, until the landscape moves. Any real shed (or eviction)
-        // re-arms the controller.
-        if shed >= FOOTPRINT_HYSTERESIS as u64 || evicted.count > 0 {
-            self.defrag_futile_at = None;
-        } else if compact_moves > 0 {
-            let used_after = self
-                .session
-                .vram_pool_stats()
-                .map(|(u, _)| u)
-                .unwrap_or(used);
-            let streak = self
-                .defrag_futile_at
-                .map(|(_, _, n)| n.saturating_add(1))
-                .unwrap_or(0u32);
-            self.defrag_futile_at = Some((after, used_after, streak));
-        }
-        // Always log once we're in the pressure path (past the early-return),
-        // including the case where we couldn't lower `reserved` (compact_ms=0,
-        // shed=0) — that "attempted but stuck" state is exactly what the rapid-fire
-        // symptom looked like, so the telemetry should show it.
-        tracing::info!(
-            target: "candle_conversation::scheduler::vram_relief",
-            capacity_mib = capacity / (1 << 20),
-            used_mib = used / (1 << 20),
-            reserved_before_mib = before / (1 << 20),
-            reserved_after_mib = after / (1 << 20),
-            gap_mib = before.saturating_sub(used) / (1 << 20),
-            turns_evicted = evicted.count,
-            evicted_mib = evicted.bytes / (1 << 20),
-            shed_mib = shed / (1 << 20),
-            compact_ms,
-            compact_moves,
-            evict_ms,
-            "footprint reclaim"
-        );
-        shed
+    /// None of it survives the reservation. KV comes from regions claimed at
+    /// startup, so the question "is there room?" has one exact answer that no
+    /// driver reading enters into, and it cannot disagree with itself.
+    ///
+    /// Phase-independent default (`Load`, the wider setpoint). Prefer
+    /// [`vram_under_pressure_for`](Self::vram_under_pressure_for) at call sites
+    /// that know their phase.
+    pub(super) fn vram_under_pressure(&self) -> bool {
+        self.vram_under_pressure_for(VramPhase::Load)
     }
 
-    /// Escalated recovery after a background compressor signalled VRAM starvation
-    /// ([`VramGovernor::signal_starvation`]): it couldn't allocate its transient
-    /// quant arena, so the compress-to-free that would relieve pressure is itself
-    /// blocked by lack of VRAM. The starved turn is unharmed (still hot-float +
-    /// consistent, retried next persistence pass); this frees the room that retry
-    /// needs. First run the normal footprint reclaim (its defrag alone often frees
-    /// the small arena the compressor needs); if `reserved` is still near capacity,
-    /// force a bulk eviction **regardless of the `used` watermark** — starvation
-    /// means we need room NOW, overriding the "only evict when used is high" gate.
-    pub(super) fn relieve_compression_starvation(&mut self, count: u64) {
-        let mut shed = self.reclaim_footprint();
-        let still_tight = matches!(
-            (self.resident_capacity(), self.session.vram_pool_stats()),
-            (Some(cap), Some((_, reserved))) if reserved > cap.saturating_sub(vram_budget_band())
-        );
-        let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
-        let mut evict_ms = 0u64;
-        if still_tight {
-            let before = self.session.vram_pool_stats().map(|(_, r)| r).unwrap_or(0);
-            let t = std::time::Instant::now();
-            evicted = self.evict_cold_tail(vram_budget_band().saturating_mul(2) as u64);
-            if evicted.count > 0 {
-                if self.session.can_reclaim_arena() {
-                    // Starvation is acute — use the deeper (Costly-level) budget.
-                    let _ = self
-                        .session
-                        .defragment_bounded(compact_base_moves().saturating_mul(3));
-                }
-                let _ = self.session.release_empty_arenas_forced();
-                super::timed_synchronize(&self.device);
-                self.trim_kv_pool();
-            }
-            evict_ms = t.elapsed().as_millis() as u64;
-            let after = self
-                .session
-                .vram_pool_stats()
-                .map(|(_, r)| r)
-                .unwrap_or(before);
-            shed = shed.saturating_add(before.saturating_sub(after) as u64);
+    /// Phase-aware pressure signal — see [`VramPhase`] for why the setpoint
+    /// differs by phase.
+    pub(super) fn vram_under_pressure_for(&self, phase: VramPhase) -> bool {
+        self.kv_region_state(phase)
+            .is_some_and(|(free, setpoint)| free < setpoint)
+    }
+
+    /// Bytes one relief pass should aim to free: enough to reach the setpoint
+    /// plus [`RELIEF_OVERSHOOT_REGIONS`]. `None` when there is no pressure, so
+    /// a relief call on a healthy cache costs one counter read.
+    fn relief_shortfall_bytes(&self, phase: VramPhase) -> Option<u64> {
+        let (free, setpoint) = self.kv_region_state(phase)?;
+        if free >= setpoint {
+            return None;
         }
-        tracing::warn!(
-            target: "candle_conversation::scheduler::vram_relief",
-            starvation_events = count,
-            turns_evicted = evicted.count,
-            evict_ms,
-            shed_mib = shed / (1 << 20),
-            "escalated VRAM recovery after background-compression starvation"
-        );
+        let target = setpoint.saturating_add(RELIEF_OVERSHOOT_REGIONS);
+        Some((target.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
     /// Shed least-recently-used hot turn KV to the warm (RAM) tier across the
@@ -1313,29 +790,45 @@ impl Scheduler {
         report
     }
 
-    /// Gentle-early ingest relief — the bottom rung of the pressure ladder.
-    /// Once resident `used` crosses the ingest demote watermark
-    /// ([`ingest_demote_pct`], ~50% of C — far below the near-cap footprint
-    /// controllers), shed the sealed, warm-backed KV of append-only ingest
-    /// timelines down to a small rolling hot window ([`ingest_hot_window`]).
-    /// Zero reload cost: ingest KV is never re-attended until query time, when it
-    /// re-elevates warm→hot on demand — so this is the cheapest relief and fires
-    /// first, keeping a bulk repo ingest from pinning the whole corpus hot up to
-    /// the aggressive eviction watermark. No-op when nothing is ingesting or
-    /// `used` is below the watermark. Runs per-wave on the scheduler thread.
+    /// Gentle-early ingest relief, run per-wave and long before the setpoint is
+    /// approached. Once the KV side is more than [`ingest_demote_pct`] occupied
+    /// (~50 % of its regions), shed the sealed, warm-backed KV of append-only
+    /// ingest timelines down to a small rolling hot window
+    /// ([`ingest_hot_window`]).
+    ///
+    /// Zero reload cost: ingest KV is never re-attended until query time, when
+    /// it re-elevates warm→hot on demand. So it is the cheapest thing to shed
+    /// and it sheds first, which is what keeps a bulk repo ingest from pinning
+    /// a whole corpus hot until real pressure forces a much more expensive
+    /// eviction of turns that are actually being attended.
+    ///
+    /// The watermark used to be `pool_used` against a fraction of the card.
+    /// That reading no longer describes KV at all — the pool holds the model,
+    /// the expert cache and a few scratches, so it sits at a high, flat
+    /// fraction of C forever and the gate would fire on every wave regardless
+    /// of how much ingest is resident. Occupancy of the KV span is the same
+    /// question asked of the right counter.
     pub(super) fn demote_cold_ingest_if_pressured(&mut self) {
         if self.ingest_timelines.is_empty() {
             return;
         }
-        let (Some(capacity), Some((used, _))) =
-            (self.resident_capacity(), self.session.vram_pool_stats())
-        else {
+        let Some(stats) = self.kv_regions() else {
             return;
         };
-        let watermark = capacity / 100 * ingest_demote_pct();
-        if used <= watermark {
+        // Multiply before dividing. The same expression read `capacity / 100 *
+        // pct` when `capacity` was bytes (~1.6e10), where the truncation was
+        // invisible; `stats.total` is a region *count* in the hundreds, so
+        // dividing first quantises the watermark to whole percent-of-100 steps
+        // — and on any span below 100 regions it truncates to **zero**, which
+        // the `live <= watermark` early-return below can never satisfy. That
+        // turns the gentle-early rung into an unconditional full demote of the
+        // ingest tail on every wave.
+        let watermark = stats.total * ingest_demote_pct() / 100;
+        if stats.live <= watermark {
             return;
         }
+        let used = stats.live.saturating_mul(region_bytes() as usize);
+        let watermark = watermark.saturating_mul(region_bytes() as usize);
         let window = ingest_hot_window();
         // Relieve back to the watermark, no further: `target` bounds the LRU walk
         // so the demote sheds the least-recently-active ingest tail just enough to
@@ -1360,20 +853,23 @@ impl Scheduler {
         //    already mid-pass — a blocking wait would stall the scheduler for the
         //    full timeout while draining nothing sooner. A `fire()` is a no-op when
         //    a pass is already queued, so it never adds latency.
-        let nudged = if self
-            .session
-            .vram_pool_stats()
-            .is_some_and(|(u, _)| u > watermark)
-        {
+        //    The test is whether step 1 *could* shed what it needed to, which is
+        //    `report.bytes` against `target_bytes` — not the CUDA pool. This read
+        //    the pool's `used`, which since KV moved to the reservation holds the
+        //    model, the expert cache and the scratches: ~6.5 GiB against a
+        //    region-derived watermark of ~2.4 GiB, so it was true on every wave
+        //    and `nudged` recorded nothing. It is the same trap the doc comment
+        //    above this function describes for the other gate.
+        let nudged = if report.bytes < target_bytes {
             self.persist_trigger.fire();
             true
         } else {
             false
         };
         if report.count > 0 {
-            // Freed hot arenas → release + trim so `reserved` can actually fall.
-            let _ = self.session.release_empty_arenas_forced();
-            self.trim_kv_pool();
+            // Freed hot arenas → release, so their regions return to the free
+            // list where the pressure signal can see them.
+            let _ = self.session.release_empty_arenas();
             tracing::debug!(
                 target: "candle_conversation::scheduler::vram_relief",
                 used_mib = used / (1 << 20),
@@ -3241,216 +2737,35 @@ impl Scheduler {
     }
 }
 
-/// Executes the VRAM Governor's relief ladder on the scheduler thread, borrowing
-/// `&mut Scheduler` so each rung's mechanism (release / compact / hot→warm evict)
-/// runs with full working-set context — never off-thread racing a live forward.
-/// The governor calls [`relieve`](candle::vram::KvReliefDriver::relieve)
-/// cheapest-rung-first and re-measures reality between rungs
-/// (`docs/vram_governor_design.md` §8).
-struct SchedulerReliefDriver<'a> {
-    sched: &'a mut Scheduler,
-    evicted: crate::substrate::EvictionReport,
-    compressed: usize,
-    flushed: bool,
-    released: usize,
-}
+#[cfg(test)]
+mod setpoint_tests {
+    use super::{setpoint_regions, VramPhase};
 
-impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
-    fn relieve(&mut self, tier: candle::vram::Criticality, want: u64) -> u64 {
-        use candle::vram::Criticality;
-        // Nominal arena size for the freed-bytes estimate; the governor re-measures
-        // the real headroom between rungs, so this only feeds logging/escalation.
-        const ARENA_BYTES: u64 = 16 * 1024 * 1024;
-        match tier {
-            // Trivial: return empty arenas + reserved-but-free pool fragmentation
-            // to the OS. No data movement, no hit-rate cost.
-            Criticality::Trivial => {
-                let t = std::time::Instant::now();
-                let arenas = self
-                    .sched
-                    .session
-                    .release_empty_arenas_forced()
-                    .unwrap_or(0);
-                self.released += arenas;
-                self.sched.trim_kv_pool();
-                let freed = arenas as u64 * ARENA_BYTES;
-                if arenas > 0 {
-                    self.sched.log_relief_event(
-                        "Trivial",
-                        "release-empty+trim",
-                        want,
-                        freed,
-                        t.elapsed().as_millis() as u64,
-                        format!("arenas_released={arenas}"),
-                    );
-                }
-                freed
-            }
-            // Cheap: lossless compaction reclaims fragmented free space.
-            Criticality::Cheap => {
-                if self.sched.session.can_reclaim_arena() {
-                    // Bounded defrag (one base budget); the ladder escalates the
-                    // budget at Costly below. Consolidates the emptiest arenas
-                    // first, then releases them.
-                    let t = std::time::Instant::now();
-                    let moves = self
-                        .sched
-                        .session
-                        .defragment_bounded(compact_base_moves())
-                        .unwrap_or(0);
-                    let arenas = self
-                        .sched
-                        .session
-                        .release_empty_arenas_forced()
-                        .unwrap_or(0);
-                    self.released += arenas;
-                    self.sched.trim_kv_pool();
-                    let freed = arenas as u64 * ARENA_BYTES;
-                    if arenas > 0 || moves > 0 {
-                        self.sched.log_relief_event(
-                            "Cheap",
-                            "compact",
-                            want,
-                            freed,
-                            t.elapsed().as_millis() as u64,
-                            format!("moves={moves} arenas_compacted={arenas}"),
-                        );
-                    }
-                    freed
-                } else {
-                    0
-                }
-            }
-            // Moderate: compress-to-free. Bring forward the quantization of
-            // completed still-float turns — a NET SHRINK the persistence thread
-            // would do anyway (float→quant in place), so it is cheaper than
-            // eviction (which is a move to RAM, reloaded if re-attended). The
-            // turn stays resident and attended-over; only the reusable float
-            // working set shrinks. Ordered before `Costly` (evict) for exactly
-            // that reason. The freed bytes are the real pool-used drop across the
-            // pass + a sync (the float arenas free via `cuMemFreeAsync` as the old
-            // hot `Arc`s drop; retire those frees so `pool_used` — and the reuse
-            // term (`reserved − used`) the governor measures — reflects it).
-            Criticality::Moderate => {
-                let t = std::time::Instant::now();
-                let used_before = self
-                    .sched
-                    .session
-                    .vram_pool_stats()
-                    .map(|(u, _)| u)
-                    .unwrap_or(0);
-                // Bound the batch: compress ~`want` (×hysteresis to coast) of
-                // float per episode, capped, so a big backlog drains over several
-                // episodes rather than one 66 s blocking pass of everything.
-                let budget = want
-                    .saturating_mul(VRAM_COMPRESS_HYSTERESIS)
-                    .min(vram_compress_max());
-                let compress_t = std::time::Instant::now();
-                let turns = self.sched.compress_pending_turns(budget);
-                let compress_ms = compress_t.elapsed().as_millis() as u64;
-                self.compressed += turns;
-                let arenas = self
-                    .sched
-                    .session
-                    .release_empty_arenas_forced()
-                    .unwrap_or(0);
-                self.released += arenas;
-                super::timed_synchronize(&self.sched.device);
-                self.sched.trim_kv_pool();
-                let used_after = self
-                    .sched
-                    .session
-                    .vram_pool_stats()
-                    .map(|(u, _)| u)
-                    .unwrap_or(used_before);
-                let freed = used_before.saturating_sub(used_after) as u64;
-                if turns > 0 || arenas > 0 {
-                    self.sched.log_relief_event(
-                        "Moderate",
-                        "compress-to-free",
-                        want,
-                        freed,
-                        t.elapsed().as_millis() as u64,
-                        format!(
-                            "turns_compressed={turns} compress_ms={compress_ms} budget_mib={} arenas_released={arenas} pool_used {}->{}MiB",
-                            budget / (1 << 20),
-                            used_before / (1 << 20),
-                            used_after / (1 << 20),
-                        ),
-                    );
-                }
-                freed
-            }
-            // Costly: drop the hot copies of the oldest warm-backed turns (a MOVE
-            // to RAM, reloaded if re-attended — hence below compress), then
-            // RECLAIM the freed VRAM.
-            Criticality::Costly => {
-                let t = std::time::Instant::now();
-                // Evict already-warm turns first (cheap); only pay a short blocking
-                // flush if that wasn't enough (under sustained pressure there are
-                // usually plenty of warm turns, so we skip the multi-second wait).
-                let evict_t = std::time::Instant::now();
-                let mut rep = self.sched.evict_cold_tail(want);
-                if rep.bytes < want {
-                    self.flushed |= super::timed_wait(|| {
-                        self.sched
-                            .persist_trigger
-                            .flush_blocking(std::time::Duration::from_secs(1))
-                    });
-                    let more = self.sched.evict_cold_tail(want.saturating_sub(rep.bytes));
-                    rep.count += more.count;
-                    rep.bytes += more.bytes;
-                }
-                let evict_ms = evict_t.elapsed().as_millis() as u64;
-                self.evicted.count += rep.count;
-                self.evicted.bytes += rep.bytes;
-                // Reclaim. Eviction frees CHUNKS scattered across arenas, so the
-                // arenas never go empty on their own and `cuMemFreeAsync` frees do
-                // not retire without a sync — which is why `release`/`trim` were
-                // reclaiming 0 and the ladder pointlessly escalated to Critical.
-                // Consolidate the freed chunks into empty arenas (compact), retire
-                // all the async frees + compaction copies with ONE sync, release
-                // the now-empty arenas, and return the pool to the OS.
-                // Deeper in the ladder ⇒ a bigger (but still bounded) defrag
-                // budget than the Cheap rung — the "builds to more aggressive"
-                // escalation.
-                if self.sched.session.can_reclaim_arena() {
-                    let _ = self
-                        .sched
-                        .session
-                        .defragment_bounded(compact_base_moves().saturating_mul(3));
-                }
-                let arenas = self
-                    .sched
-                    .session
-                    .release_empty_arenas_forced()
-                    .unwrap_or(0);
-                self.released += arenas;
-                super::timed_synchronize(&self.sched.device);
-                self.sched.trim_kv_pool();
-                let freed = rep.bytes + arenas as u64 * ARENA_BYTES;
-                if rep.count > 0 || arenas > 0 {
-                    self.sched.log_relief_event(
-                        "Costly",
-                        "hot->warm evict",
-                        want,
-                        freed,
-                        t.elapsed().as_millis() as u64,
-                        format!(
-                            "turns_evicted={} evicted_mib={} evict_ms={evict_ms} arenas_released={arenas} flush={}",
-                            rep.count,
-                            rep.bytes / (1 << 20),
-                            self.flushed,
-                        ),
-                    );
-                }
-                freed
-            }
-            // Critical (warm→cold drop + expert-pool shrink) runs asynchronously
-            // in the persistence thread the Costly flush kicked — no extra
-            // synchronous work here.
-            Criticality::Critical => 0,
-        }
+    /// The setpoint scales with the span so the same constants hold on this
+    /// card's 226-region KV side and on the workstation's, and decode always
+    /// insists on less than load — KV grows a chunk per sequence per 32 steps
+    /// there, so evicting defensively would just cost reloads.
+    #[test]
+    fn the_setpoint_scales_with_the_span_and_decode_asks_for_less() {
+        let load = setpoint_regions(VramPhase::Load, 800);
+        let decode = setpoint_regions(VramPhase::Decode, 800);
+        assert_eq!(load, 100, "load is span/8 once the span clears the floor");
+        assert_eq!(decode, 50, "decode is span/16");
+        assert!(decode < load);
+    }
+
+    /// On a span too small for the floors, the setpoint stops at half the span.
+    /// Asking for more would mean permanent pressure: every wave would run a
+    /// relief pass that cannot possibly reach a setpoint the card can't hold.
+    #[test]
+    fn a_small_span_clamps_to_half_rather_than_demanding_the_floor() {
+        assert_eq!(setpoint_regions(VramPhase::Load, 32), 16);
+        assert_eq!(setpoint_regions(VramPhase::Decode, 8), 4);
+        assert_eq!(
+            setpoint_regions(VramPhase::Load, 0),
+            0,
+            "no span, no demand"
+        );
     }
 }
 
@@ -3464,50 +2779,5 @@ mod warm_budget_tests {
     fn default_slack_clears_a_healthy_drain_pipeline() {
         let slack = warm_pipeline_slack_bytes();
         assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
-    }
-}
-
-#[cfg(test)]
-mod vram_band_tests {
-    use super::combine_band;
-
-    const MIB: usize = 1024 * 1024;
-    const GIB: usize = 1024 * MIB;
-
-    #[test]
-    fn width_scales_the_band_and_clamps_to_a_third_of_the_card() {
-        let cap = 72 * GIB;
-        let per_seq = 384 * MIB;
-        let base = cap / 10; // 7.2 GiB card fraction (Load)
-
-        // Narrow batch (small-card / laptop-like admission): the card fraction
-        // dominates — the reserve is unchanged.
-        assert_eq!(combine_band(base, 4, per_seq, cap), base);
-
-        // Wide batch (big card admits 30 seqs): the width term dominates, so the
-        // reserve grows to cover the wider transient peak.
-        let wide = combine_band(base, 30, per_seq, cap);
-        assert_eq!(wide, 30 * per_seq);
-        assert!(wide > base);
-
-        // A width spike can never strand more than a third of the device.
-        assert_eq!(combine_band(base, 100_000, per_seq, cap), cap / 3);
-    }
-
-    #[test]
-    fn small_card_narrow_batch_keeps_the_floor_unchanged() {
-        // 16 GiB laptop: the Load base floors at 2 GiB (16/10 < 2). A narrow
-        // admitted batch keeps the width term under that floor, so the laptop's
-        // headroom is the same as before the width term existed.
-        let cap = 16 * GIB;
-        let base = (cap / 10).max(2 * GIB); // = 2 GiB floor
-        let per_seq = 384 * MIB;
-        for width in [1usize, 2, 4] {
-            assert_eq!(
-                combine_band(base, width, per_seq, cap),
-                base,
-                "narrow width {width} must not raise the small-card band"
-            );
-        }
     }
 }

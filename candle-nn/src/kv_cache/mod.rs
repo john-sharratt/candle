@@ -27,8 +27,8 @@
 //! cache.set_chunked_backing(&backing, batch_idx, None)?;
 //! ```
 
-use candle::quantized::{GgmlDType, QTensor};
-use candle::{DType, Tensor};
+use candle::quantized::GgmlDType;
+use candle::DType;
 
 mod arena_table;
 mod cache;
@@ -36,13 +36,21 @@ mod chunked;
 mod rotating;
 
 pub use arena_table::{
-    ArenaEntry, ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable,
-    ResolvedArenaInfo, N_PALETTE,
+    ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable, ResolvedArenaInfo,
+    N_PALETTE,
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
+pub use chunked::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
-pub use chunked::kv_alloc_headroom;
+#[cfg(feature = "cuda")]
+pub use chunked::persistence_domain_stats;
+#[cfg(feature = "cuda")]
+pub use chunked::slot_state_stats;
+#[cfg(feature = "cuda")]
+pub use chunked::{begin_wave, wave_alloc, wave_domain_stats, BumpRange, WaveGeneration};
+#[cfg(feature = "cuda")]
+pub use chunked::{region_stats, RegionStats, REGION_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
@@ -55,25 +63,26 @@ pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub use chunked::{
-    arena_chunks_for_format, arena_gid_stride, LiveChunkRef, MetaGid, SealedChunk, SealedSequence,
-    WriterTail, CHUNK_SIZE,
+    all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
+    payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
-pub use chunked::{enter_migrate, migrate_in_flight, try_enter_relief, MigrateGuard, ReliefGuard};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
-    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvErrorThresholdFactors,
-    LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS,
-    PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS,
-    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS,
+    ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
+    KvErrorThresholdFactors, LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS,
 };
 pub use chunked::{ArenaKey, StoragePolicy};
+pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };
@@ -109,37 +118,6 @@ pub fn active_kv_formats(k_format: KvFormat, on_gpu: bool) -> (KvFormat, KvForma
             KvFormat::Float(candle::DType::F16),
             KvFormat::Float(candle::DType::F16),
         ),
-    }
-}
-
-// ==================== Paged KV Arenas Trait ====================
-
-/// Trait for accessing paged KV arenas.
-///
-/// This abstraction allows attention kernels to work with any paged KV storage
-/// implementation, and enables testing with mock implementations.
-pub trait PagedKvArenas {
-    /// Number of KV heads.
-    fn n_kv_head(&self) -> usize;
-
-    /// Dimension of each head.
-    fn head_dim(&self) -> usize;
-
-    /// Storage format for K cache.
-    fn k_format(&self) -> KvFormat;
-
-    /// Storage format for V cache.
-    fn v_format(&self) -> KvFormat;
-
-    /// Get float arenas (K, V). Returns None if using quantized storage.
-    fn float_arenas(&self) -> Option<(Vec<Tensor>, Vec<Tensor>)>;
-
-    /// Get quantized arenas (K, V). Returns None if using float storage.
-    fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)>;
-
-    /// Returns true if using quantized storage.
-    fn is_quantized(&self) -> bool {
-        self.k_format().is_quantized() || self.v_format().is_quantized()
     }
 }
 

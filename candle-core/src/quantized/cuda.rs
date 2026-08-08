@@ -1,6 +1,7 @@
 use super::{GgmlDType, Int8Mode, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 
+use crate::cuda_backend::Backing;
 use crate::quantized::k_quants::GgmlType;
 use crate::{CudaDevice, CudaStorage, Result, Shape};
 use half::f16;
@@ -10,10 +11,10 @@ use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
 
 // Import the FFI dispatcher functions
 use candle_kernels::simple::quantized::{
-    run_arena_compact_copy, run_arena_compact_patch, run_dequantize_block, run_dequantize_ko,
-    run_dequantize_mul_mat_vec, run_dequantize_q8a128, run_mul_mat, run_mul_mat_vec_q8_1,
-    run_quantize_block, run_quantize_ko, run_quantize_palette4_convert, run_quantize_q8_1,
-    run_quantize_q8a128, run_quantize_transposed_batched, run_quantize_transposed_batched_typed,
+    run_dequantize_block, run_dequantize_ko, run_dequantize_mul_mat_vec, run_dequantize_q8a128,
+    run_mul_mat, run_mul_mat_vec_q8_1, run_quantize_block, run_quantize_ko,
+    run_quantize_palette4_convert, run_quantize_q8_1, run_quantize_q8a128,
+    run_quantize_transposed_batched, run_quantize_transposed_batched_typed,
     run_reduce_head_stats_format, run_sample_quant_errors_kv_paged, run_sample_quant_errors_paged,
     run_select_kv_format_palette4_paged, run_select_winners_kv_paged,
     run_summarize_winners_side_paged, DequantOutDType, QType,
@@ -219,11 +220,120 @@ struct PaddedCudaSlice {
     len: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct QCudaStorage {
-    data: PaddedCudaSlice,
+    /// `ManuallyDrop` so [`Drop`] can move the slice out without constructing a
+    /// stand-in. `leak` is by-value while `drop` has only `&mut self`, and the
+    /// stand-in used to come from `upgrade_device_ptr(0, 0)` — which is not
+    /// free: under cudarc's event tracking (on for every production device) it
+    /// creates and destroys two `CudaEvent`s and can fail, and it `unwrap`s.
+    /// Fallible CUDA work on a drop path panics *inside* `Drop`, which aborts
+    /// during an unwind. `CudaStorage` avoids this with its `Empty` slice
+    /// variant; this is the same trick for a struct that has no spare variant.
+    ///
+    /// Every read still goes through `Deref`, so `self.data.inner` is unchanged
+    /// at the ~18 use sites. The obligation this adds is that **every path that
+    /// destroys or replaces `data` must dispose of the old value explicitly** —
+    /// [`Drop`] and [`Self::quantize`] are the only two.
+    data: std::mem::ManuallyDrop<PaddedCudaSlice>,
     dtype: GgmlDType,
     device: CudaDevice,
+    /// Whether dropping this storage may free its device memory.
+    /// [`Backing::Owned`] for everything allocated here — which is everything
+    /// except the slot views built by [`QCudaStorage::from_leased_device_ptr`].
+    backing: Backing,
+}
+
+impl Clone for QCudaStorage {
+    /// A clone is always **owned**, never a second lease.
+    ///
+    /// `CudaSlice::clone` is a device-to-device copy, so a clone has its own
+    /// allocation regardless of what the source was. Carrying `Lease` across
+    /// would leak that fresh allocation on every clone.
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+            backing: Backing::Owned,
+        }
+    }
+}
+
+impl Drop for QCudaStorage {
+    fn drop(&mut self) {
+        if self.backing != Backing::Lease {
+            // Owned: dispose normally. `data` is `ManuallyDrop`, so without
+            // this the allocation is never freed.
+            // SAFETY: `self` is being destroyed; `data` is not read again and
+            // is dropped exactly once (this arm and the lease arm below are
+            // mutually exclusive and both return).
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.data) };
+            return;
+        }
+        // Same discipline as `CudaStorage::drop`: calling `leak` rather than
+        // merely suppressing the drop is load-bearing — it waits on the
+        // slice's read/write events, destroys them, and decrements the
+        // stream's `Arc`. Bare suppression would strand two `CudaEvent`s and a
+        // stream refcount per lease, and leases are minted per band per
+        // forward.
+        //
+        // SAFETY: `self` is being destroyed and `data` is never read again;
+        // `ManuallyDrop::take` is the move-out that `leak`'s by-value signature
+        // needs, and it touches no CUDA API on the way (see the field's note).
+        let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
+        data.inner.leak();
+    }
+}
+
+impl QCudaStorage {
+    /// Wrap `elem_count` elements of quantized device memory at `ptr` as a
+    /// storage that does **not** own them.
+    ///
+    /// This is the quantized counterpart of
+    /// [`CudaStorage::from_leased_device_ptr`], and it exists for exactly one
+    /// caller: a KV arena slot. Under size classes an arena is a run of untyped
+    /// byte slots, so the quantize / dequantize kernels can no longer be handed
+    /// "the arena's QTensor" — they are handed a view of one slot instead. See
+    /// `docs/archived/arena_unification.md` principle 8.
+    ///
+    /// The view carries **no matrix-row padding**, unlike
+    /// [`Self::zeros`]: a slot is exactly its own bytes and the next slot
+    /// belongs to another chunk. That makes it unsuitable for the matmul
+    /// kernels, which read into the padding — and correct for the block
+    /// quantize / dequantize paths, which do not.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `ceil(elem_count / block_size) * type_size`
+    /// bytes of device memory that stays live, and un-aliased for writes, for
+    /// the storage's lifetime.
+    pub unsafe fn from_leased_device_ptr(
+        ptr: u64,
+        elem_count: usize,
+        dtype: GgmlDType,
+        device: &CudaDevice,
+    ) -> Result<Self> {
+        if elem_count % dtype.block_size() != 0 {
+            crate::bail!(
+                "leased quantized view of {elem_count} elements is not a whole number of \
+                 {dtype:?} blocks ({})",
+                dtype.block_size()
+            );
+        }
+        let size_in_bytes = (elem_count / dtype.block_size()) * dtype.type_size();
+        let inner = device
+            .cuda_stream()
+            .upgrade_device_ptr::<u8>(ptr, size_in_bytes);
+        Ok(QCudaStorage {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
+                inner,
+                len: size_in_bytes,
+            }),
+            device: device.clone(),
+            dtype,
+            backing: Backing::Lease,
+        })
+    }
 }
 
 static FORCE_DMMV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -748,189 +858,6 @@ pub fn quantize_palette4_convert(
             num_chunks as i32,
             if is_k { 1 } else { 0 },
             head_dim as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
-// ============================================================================
-// Arena compaction wrappers
-// ============================================================================
-
-/// CompactMove struct matching the CUDA side (24 bytes, padded).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct CompactMove {
-    pub dst: u64, // device pointer
-    pub src: u64, // device pointer
-    pub stride_bytes: u32,
-    pub _pad: u32,
-}
-
-// SAFETY: CompactMove is #[repr(C)] with no padding holes and contains only
-// plain-old-data types. It is safe to copy to/from GPU memory.
-unsafe impl cudarc::driver::DeviceRepr for CompactMove {}
-// SAFETY: CompactMove is all POD (u64, u64, u32, u32) — all-zeros is valid.
-unsafe impl cudarc::driver::ValidAsZeroBits for CompactMove {}
-
-/// Launch the arena compaction copy kernel for one bucket.
-///
-/// `moves` must contain `CompactMove` structs with valid device pointers.
-/// Each move carries its own `stride_bytes`, so mixed formats work in one call.
-/// `block_dim` controls threads per block (128 recommended).
-pub fn arena_compact_copy(
-    moves: &CudaSlice<CompactMove>,
-    num_moves: usize,
-    block_dim: usize,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<()> {
-    if num_moves == 0 {
-        return Ok(());
-    }
-    let (moves_ptr, _guard) = moves.device_ptr(stream);
-    unsafe {
-        run_arena_compact_copy(
-            moves_ptr as *const std::ffi::c_void,
-            num_moves as i32,
-            block_dim as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
-/// Fully async arena compaction copy: pinned-alloc → async H2D → kernel launch.
-///
-/// Takes host-side `moves` slice, uploads via the provided [`PinnedStager`] so
-/// the entire pipeline (alloc + copy + launch) is non-blocking on the host.
-/// The stager manages deferred freeing of spent pinned buffers — keep it alive
-/// for the duration of the batch to get full async benefits.
-///
-/// `block_dim` controls threads per block (128 recommended).
-pub fn arena_compact_copy_async(
-    moves: &[CompactMove],
-    block_dim: usize,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    stager: &super::pinned_staging::PinnedStager,
-) -> Result<()> {
-    let num_moves = moves.len();
-    if num_moves == 0 {
-        return Ok(());
-    }
-
-    // Allocate pinned host buffer, copy moves into it, then async-upload.
-    let byte_len = num_moves * std::mem::size_of::<CompactMove>();
-    let mut pinned = stager.alloc(byte_len)?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            moves.as_ptr() as *const u8,
-            pinned.as_mut_slice().as_mut_ptr(),
-            byte_len,
-        );
-    }
-    let moves_gpu = stager.submit(pinned)?;
-
-    // Launch kernel — reinterpret the u8 slice as CompactMove pointers.
-    let moves_ptr = moves_gpu.dev_ptr();
-    unsafe {
-        run_arena_compact_copy(
-            moves_ptr as *const std::ffi::c_void,
-            num_moves as i32,
-            block_dim as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
-/// Launch the arena compaction patch kernel.
-///
-/// Rewrites `block_table` entries in-place: any entry matching a `src_gid`
-/// is replaced with the corresponding `dst_gid`. `src_gids` must be sorted
-/// ascending.
-pub fn arena_compact_patch(
-    block_table: &mut CudaSlice<i32>,
-    num_entries: usize,
-    src_gids: &CudaSlice<i32>,
-    dst_gids: &CudaSlice<i32>,
-    num_moves: usize,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<()> {
-    if num_entries == 0 || num_moves == 0 {
-        return Ok(());
-    }
-    let (bt_ptr, _bt_guard) = block_table.device_ptr_mut(stream);
-    let (src_ptr, _src_guard) = src_gids.device_ptr(stream);
-    let (dst_ptr, _dst_guard) = dst_gids.device_ptr(stream);
-    unsafe {
-        run_arena_compact_patch(
-            bt_ptr as *mut i32,
-            num_entries as i32,
-            src_ptr as *const i32,
-            dst_ptr as *const i32,
-            num_moves as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
-/// Fully async arena compaction patch: pinned-alloc → async H2D → kernel launch.
-///
-/// Like [`arena_compact_patch`] but uploads `src_gids` and `dst_gids` from host
-/// slices via the [`PinnedStager`] so the entire pipeline is non-blocking.
-/// `block_table` must already be on the GPU.
-pub fn arena_compact_patch_async(
-    block_table: &mut CudaSlice<i32>,
-    num_entries: usize,
-    src_gids: &[i32],
-    dst_gids: &[i32],
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    stager: &super::pinned_staging::PinnedStager,
-) -> Result<()> {
-    let num_moves = src_gids.len();
-    if num_entries == 0 || num_moves == 0 {
-        return Ok(());
-    }
-    assert_eq!(src_gids.len(), dst_gids.len());
-
-    let i32_bytes = std::mem::size_of::<i32>();
-
-    // Upload src_gids via pinned staging
-    let src_byte_len = num_moves * i32_bytes;
-    let mut src_pinned = stager.alloc(src_byte_len)?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            src_gids.as_ptr() as *const u8,
-            src_pinned.as_mut_slice().as_mut_ptr(),
-            src_byte_len,
-        );
-    }
-    let src_gpu = stager.submit(src_pinned)?;
-
-    // Upload dst_gids via pinned staging
-    let dst_byte_len = num_moves * i32_bytes;
-    let mut dst_pinned = stager.alloc(dst_byte_len)?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            dst_gids.as_ptr() as *const u8,
-            dst_pinned.as_mut_slice().as_mut_ptr(),
-            dst_byte_len,
-        );
-    }
-    let dst_gpu = stager.submit(dst_pinned)?;
-
-    let (bt_ptr, _bt_guard) = block_table.device_ptr_mut(stream);
-    let src_ptr = src_gpu.dev_ptr();
-    let dst_ptr = dst_gpu.dev_ptr();
-    unsafe {
-        run_arena_compact_patch(
-            bt_ptr as *mut i32,
-            num_entries as i32,
-            src_ptr as *const i32,
-            dst_ptr as *const i32,
-            num_moves as i32,
             stream.cu_stream() as *mut _,
         );
     }
@@ -2796,12 +2723,13 @@ impl QCudaStorage {
             ceil_div(el_count + MATRIX_ROW_PADDING, dtype.block_size()) * dtype.type_size();
         let inner = device.alloc_zeros::<u8>(padded_size_in_bytes)?;
         Ok(QCudaStorage {
-            data: PaddedCudaSlice {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
                 inner,
                 len: size_in_bytes,
-            },
+            }),
             device: device.clone(),
             dtype,
+            backing: Backing::Owned,
         })
     }
 
@@ -2850,12 +2778,13 @@ impl QCudaStorage {
         device.memcpy_htod(pinned_slice, &mut inner.slice_mut(..size_in_bytes))?;
 
         let storage = QCudaStorage {
-            data: PaddedCudaSlice {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
                 inner,
                 len: size_in_bytes,
-            },
+            }),
             device: device.clone(),
             dtype,
+            backing: Backing::Owned,
         };
         Ok((storage, guard))
     }
@@ -2993,7 +2922,11 @@ impl QCudaStorage {
     }
 
     pub fn bytes_mut(&mut self) -> cudarc::driver::CudaViewMut<'_, u8> {
-        self.data.inner.slice_mut(..self.data.len)
+        // `len` is read out first: `data` is `ManuallyDrop`, so both halves of
+        // this expression go through one `DerefMut` borrow rather than being
+        // disjoint field accesses.
+        let len = self.data.len;
+        self.data.inner.slice_mut(..len)
     }
 
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {
@@ -3012,10 +2945,30 @@ impl QCudaStorage {
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
             .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
-        self.data = PaddedCudaSlice {
+        // Dispose of the buffer being replaced before overwriting it: `data` is
+        // `ManuallyDrop`, so an assignment alone would leak it. A lease must be
+        // `leak`ed rather than dropped — its memory belongs to an arena — while
+        // an owned buffer is freed.
+        // SAFETY: the old value is moved out exactly once and not read again.
+        let old = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
+        if self.backing == Backing::Lease {
+            old.inner.leak();
+        } else {
+            drop(old);
+        }
+        self.data = std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
             len: data.len(),
-        };
+        });
+        // The buffer identity just changed, so the old `backing` no longer
+        // describes it. On a storage built by `from_leased_device_ptr` this is
+        // load-bearing twice over: the quantized bytes have landed in the fresh
+        // allocation rather than the arena slot the lease pointed at, and
+        // leaving `Lease` set makes `Drop` `leak()` that fresh allocation —
+        // a permanent VRAM leak of `padded_len` per call. `Clone` was already
+        // taught to force `Owned` for exactly this reason; this is the other
+        // place the buffer is replaced.
+        self.backing = Backing::Owned;
         Ok(())
     }
 
@@ -3458,6 +3411,21 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // A leased view is exactly `payload` bytes of somebody else's arena
+        // slot; it carries no `MATRIX_ROW_PADDING`. Both matmul kernels below
+        // gate on `data.len / type_size * block_size >= ncols * nrows` and then
+        // address `pad(ncols, MATRIX_ROW_PADDING)` columns, so a lease passes
+        // the guard and reads up to 512 elements past the slot — into the next
+        // chunk's bytes, or past the region at the last slot. The restriction is
+        // documented on `from_leased_device_ptr` and `QTensor::from_leased_cuda_ptr`
+        // but nothing enforced it, and `backing` is right here to check.
+        if self.backing == Backing::Lease {
+            crate::bail!(
+                "QMatMul on a leased quantized view: a lease is exactly its payload and \
+                 carries no {MATRIX_ROW_PADDING}-element row padding, which both matmul \
+                 kernels address unconditionally. Copy it into an owned QTensor first."
+            )
+        }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
@@ -3659,12 +3627,13 @@ impl QCudaStorage {
         }
 
         Ok(Self {
-            data: PaddedCudaSlice {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
                 inner: dst_data,
                 len: new_size,
-            },
+            }),
             dtype: self.dtype,
             device: self.device.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -3705,12 +3674,13 @@ impl QCudaStorage {
             }
         }
         Ok(Self {
-            data: PaddedCudaSlice {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
                 inner: out,
                 len: bytes,
-            },
+            }),
             dtype: ko_dtype,
             device: self.device.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -3748,12 +3718,13 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
     Ok(QStorage::Cuda(QCudaStorage {
-        data: PaddedCudaSlice {
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
             len: data.len(),
-        },
+        }),
         device: device.clone(),
         dtype,
+        backing: Backing::Owned,
     }))
 }
 
@@ -3784,12 +3755,13 @@ pub fn load_quantized_on_stream<T: super::GgmlType + Send + Sync + 'static>(
         .memcpy_htod(data, &mut inner.slice_mut(..data.len()))
         .map_err(crate::Error::wrap)?;
     Ok(QStorage::Cuda(QCudaStorage {
-        data: PaddedCudaSlice {
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
             len: data.len(),
-        },
+        }),
         device: device.clone(),
         dtype,
+        backing: Backing::Owned,
     }))
 }
 
@@ -3817,9 +3789,10 @@ pub fn load_repacked_on_stream(
         .memcpy_htod(repacked_data, &mut inner.slice_mut(..len))
         .map_err(crate::Error::wrap)?;
     Ok(QStorage::Cuda(QCudaStorage {
-        data: PaddedCudaSlice { inner, len },
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len }),
         device: device.clone(),
         dtype,
+        backing: Backing::Owned,
     }))
 }
 
@@ -3833,9 +3806,10 @@ pub fn load_repacked(
     let mut inner = unsafe { device.alloc::<u8>(len)? };
     device.memcpy_htod(repacked_data, &mut inner.slice_mut(..len))?;
     Ok(QStorage::Cuda(QCudaStorage {
-        data: PaddedCudaSlice { inner, len },
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len }),
         device: device.clone(),
         dtype,
+        backing: Backing::Owned,
     }))
 }
 

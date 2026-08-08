@@ -3,7 +3,7 @@
 //! This module provides `Cache` for single-tensor caches and `KvCache` for
 //! paired key-value caches, supporting both contiguous and chunked backing.
 
-use super::chunked::{arena_gid_stride, ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE};
+use super::chunked::{ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE, GID_STRIDE};
 use ahash::HashMap;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
@@ -43,14 +43,6 @@ impl ChunkedCache {
     /// Get the max_blocks for this cache.
     pub(crate) fn max_blocks(&self) -> usize {
         self.backing.max_blocks()
-    }
-
-    pub(crate) fn k_arenas(&self) -> Vec<Tensor> {
-        self.backing.k_arenas()
-    }
-
-    pub(crate) fn v_arenas(&self) -> Vec<Tensor> {
-        self.backing.v_arenas()
     }
 
     /// Execute a read operation on the arena storage.
@@ -177,26 +169,10 @@ impl Cache {
         }
     }
 
-    /// Get the K arenas for chunked caches.
-    pub fn chunked_k_arenas(&self) -> Option<Vec<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.k_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
-    /// Get the V arenas for chunked caches.
-    pub fn chunked_v_arenas(&self) -> Option<Vec<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.v_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Get the number of chunks per arena for chunked caches.
     pub fn chunked_arena_chunks(&self) -> Option<usize> {
         match &self.storage {
-            CacheStorage::Chunked(_) => Some(arena_gid_stride()),
+            CacheStorage::Chunked(_) => Some(GID_STRIDE),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -286,17 +262,6 @@ impl Cache {
         }
     }
 
-    /// Count the number of quantized arenas.
-    ///
-    /// Returns (quantized_count, total_count) tuple.
-    /// Useful for validating that quantization is actually occurring.
-    pub fn count_quantized_arenas(&self) -> Option<candle::Result<(usize, usize)>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.backing.count_quantized_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Calculate the percentage of a sequence's tokens stored in quantized arenas.
     ///
     /// Returns (quantized_tokens, total_tokens) based on which ChunkRefs point to quantized arenas.
@@ -356,28 +321,13 @@ impl Cache {
         }
     }
 
-    /// Get the per-head table tensor for decode kernel consumption.
-    ///
-    /// Returns the GPU tensor of shape `(num_arenas * n_kv_head, 7)` i64,
-    /// synced to GPU. Each row is a `PerHeadTableEntry` with pre-resolved
-    /// pointers, byte offsets, byte strides, and format metadata per head.
-    pub fn chunked_per_head_table_and_sync(&self) -> Option<candle::Result<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.backing.per_head_table_sync()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Get sealed chunk descriptors for this cache slot's live sequence.
     ///
     /// Returns `None` for contiguous caches or if the backing has no live sequence
     /// for this slot's batch index.
     pub fn chunked_live_chunks_as_sealed(&self) -> Option<Vec<super::SealedChunk>> {
         match &self.storage {
-            CacheStorage::Chunked(c) => {
-                let arena_infos = c.backing.resolve_arena_info().ok()?;
-                c.backing.live_chunks_as_sealed(c.batch_idx, &arena_infos)
-            }
+            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -393,26 +343,9 @@ impl Cache {
     ) -> Option<candle::Result<Vec<super::HostSealedChunk>>> {
         match &self.storage {
             CacheStorage::Chunked(c) => {
-                let arena_info = match c.backing.resolve_arena_info() {
-                    Ok(a) => a,
-                    Err(e) => return Some(Err(e)),
-                };
-                let chunks = c.backing.live_chunks_as_sealed(c.batch_idx, &arena_info)?;
+                let chunks = c.backing.live_chunks_as_sealed(c.batch_idx)?;
                 Some(c.backing.dump_sealed_to_host(&chunks, device))
             }
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
-    /// Like [`Self::chunked_live_chunks_as_sealed`] but reuses an already-resolved
-    /// `arena_info` instead of resolving it again — the caller (e.g.
-    /// `build_slot_headers`) resolves it once per forward and passes it per cache.
-    pub fn chunked_live_chunks_as_sealed_with(
-        &self,
-        arena_info: &[super::ResolvedArenaInfo],
-    ) -> Option<Vec<super::SealedChunk>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx, arena_info),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -1109,14 +1042,6 @@ impl KvCache {
             CacheStorage::Chunked(c) => c.read_contiguous(offset, len),
             _ => candle::bail!("chunked_read_kv requires chunked backing"),
         }
-    }
-
-    /// Count the number of quantized arenas.
-    ///
-    /// Returns (quantized_count, total_count) tuple, or None if not chunked.
-    /// Useful for validating that quantization is actually occurring.
-    pub fn count_quantized_arenas(&self) -> Option<candle::Result<(usize, usize)>> {
-        self.k.count_quantized_arenas()
     }
 
     /// Calculate the percentage of a sequence's tokens stored in quantized arenas.

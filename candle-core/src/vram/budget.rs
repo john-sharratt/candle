@@ -1,35 +1,16 @@
-//! The evolving budget: configuration, the KV floor (absolute + percentage), and
-//! the relief-ladder thresholds (also absolute + percentage).
+//! The startup budget: configuration, and the KV floor as an absolute plus a
+//! percentage of what is left after weights.
 //!
-//! Nothing here is a predicted footprint. `kv_floor` and the ladder thresholds
-//! are derived from the balloon-measured capacity `C` and the resident weight
-//! bytes — the only two things known before inference — and everything else is
-//! observed from the live measurement (see `docs/vram_governor_design.md` §7–§8).
+//! Nothing here is a predicted footprint. `kv_floor` is derived from the
+//! balloon-measured capacity `C` and the resident weight bytes — the only two
+//! things known before inference — and everything else is observed from the live
+//! measurement (see `docs/vram_governor_design.md` §7).
+//!
+//! This also held the relief ladder's trip points: five `LadderTier` rungs of
+//! `kv_floor + abs + pct × C`, each the headroom at which one rung engaged. They
+//! went with the ladder (`docs/archived/arena_unification.md` §5).
 
-use super::{AllocClass, Criticality, VramGovernor};
-
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// One rung of the relief ladder: the headroom margin *above the KV floor* at
-/// which this tier engages, expressed as an absolute term plus a fraction of the
-/// total capacity `C`. The hybrid keeps margins sane on a 16 GiB card (the
-/// absolute term dominates) and scaling on a 73 GiB card (the percentage term
-/// dominates).
-#[derive(Clone, Copy, Debug)]
-pub struct LadderTier {
-    pub abs: u64,
-    pub pct: f64,
-}
-
-impl LadderTier {
-    pub const fn new(abs: u64, pct: f64) -> Self {
-        Self { abs, pct }
-    }
-    /// Bytes of margin above the floor for capacity `c`.
-    pub fn margin(&self, c: u64) -> u64 {
-        self.abs.saturating_add((self.pct * c as f64) as u64)
-    }
-}
+use super::{AllocClass, VramGovernor};
 
 /// Static configuration for a governor. Defaults encode the reviewed decisions
 /// (`docs/vram_governor_design.md` §15); every field is overridable for tests
@@ -55,12 +36,38 @@ pub struct GovernorConfig {
     pub kv_floor_abs: u64,
     /// KV floor fraction of `(C − Weights)` (default 0.15).
     pub kv_floor_pct: f64,
-    /// Cushion left above the KV floor when computing the expert budget so the
-    /// first forward's scratch lands before any KV eviction (default 1 GiB).
+    /// Cushion left outside the KV reservation, for the allocations that still
+    /// come from the CUDA pool: the gallery arena's slabs, the grow-only
+    /// sampler / provenance / MoE-routing scratches, and the threaded expert
+    /// pipeline's per-layer combine target (default 1 GiB).
+    ///
+    /// It was "the cushion the first forward's scratch lands in". That is no
+    /// longer what it holds — a forward's activations come from the
+    /// reservation's transient tier now — and while it was still described that
+    /// way it got subtracted a second time when sizing the KV span, against a
+    /// transient tier that was then added back on top. Same bytes, two places,
+    /// opposite signs.
+    ///
+    /// **Now re-derived against the pool, as that fix asked for.** Measured on
+    /// the daemon across a full cold boot and six concurrent conversations: the
+    /// CUDA pool reserves **once** during load (30 MiB → 7,232 MiB, three
+    /// distinct values in 60 samples) and **never grows again** — not through
+    /// the cold-ingest peak, not under concurrency. Its `used` swings ~370 MiB
+    /// *inside* what it already holds, so serving draws nothing from this
+    /// cushion.
+    ///
+    /// At 512 MiB the card peaks at 14,309 MiB of 16,376 under six concurrent
+    /// conversations, which puts the process ~512 MiB below `capacity_c`
+    /// (14,592) — that is this cushion, **untouched at peak**. It is not sized
+    /// against serving, which needs none of it; it covers pool growth between
+    /// `expert_budget` being computed and load finishing, and that window is
+    /// what the clean cold boot at this value evidences.
+    ///
+    /// Every MiB beyond it is a MiB neither the expert cache nor the KV side can
+    /// use. (The further ~1.8 GiB the card shows free is not claimable: it is
+    /// where the driver refused the balloon, which is what makes `capacity_c`
+    /// 14,592 rather than 16,376.)
     pub scratch_margin: u64,
-    /// The five ladder rungs, indexed by [`Criticality`]. `Critical` is always
-    /// `{0, 0.0}` — it engages exactly at the floor.
-    pub ladder: [LadderTier; 5],
     /// Fraction of total VRAM the balloon tries to claim (default 0.95).
     pub balloon_target_frac: f64,
     /// Absolute headroom (bytes) the balloon always leaves below `total`,
@@ -97,32 +104,90 @@ pub struct GovernorConfig {
     pub balloon_floor: u64,
     /// Balloon growth granularity in bytes (default 256 MiB).
     pub balloon_chunk: u64,
-    /// Minimum wall-clock between two `Critical`-tier syncs, in milliseconds
-    /// (default 250). Tests set 0 so every `Critical` proceeds deterministically.
-    pub critical_min_interval_ms: u64,
 }
 
 /// The shipped defaults, in the units their `CANDLE_VRAM_*` overrides use, so
 /// [`GovernorConfig::default`] and [`GovernorConfig::defaults_ignoring_env`]
 /// cannot drift apart.
-const DEFAULT_KV_FLOOR_MB: u64 = 3 * 1024;
+/// Sized against the **cold-ingest high-water mark**, not the steady state.
+///
+/// Measured on the 16 GiB card against the real `mind` corpus: a cold boot
+/// climbs to **284 live regions (4,544 MiB)** while the system prompt's
+/// collections prefill, then falls to **69 regions (1,104 MiB)** and stays
+/// there. Steady state needs a sixth of what the boot transient does, and it is
+/// the transient that decides whether the daemon comes up at all — at
+/// `3 GiB + 15 %` the span is 218 regions and boot wedges with every region
+/// occupied, relief freeing nothing because the content is pinned and not yet
+/// warm-backed.
+///
+/// Measured span against this term, cold-booting the same `mind` corpus, with
+/// decode probed at matched context depth (kv/fwd 550–736):
+///
+/// | `kv_floor_abs` | KV span | expert slots | residency | decode | boot |
+/// |---|---|---|---|---|---|
+/// | 3 GiB | 218 regions | 2618 | 42.6 % | — | dies: retry storm, no forwards |
+/// | 4 GiB | 274 regions | 2267 | 36.9 % | — | ready |
+/// | 5 GiB | 328 regions | 1917 | 31.2 % | 67 ms/fwd | clean |
+/// | 6 GiB | 384 regions | 1566 | 25.5 % | 80 ms/fwd | clean, 100 regions unused |
+///
+/// **Every MiB here is a MiB the expert cache does not get, and the expert
+/// cache is what pays for decode**: 1024 MiB of this term buys 56 KV regions and
+/// costs 351 expert slots, worth ~16 % of decode throughput per step of the
+/// table. So this is sized to what KV *needs*, never to what is spare.
+///
+/// Steady-state KV is **70 regions (1,120 MiB)**. What forces the term above
+/// that is the cold-boot transient: the system prompt's collections must stay
+/// resident until the last section that prefills over them is built, so the hot
+/// set peaks at **284 regions** and only then collapses. That peak is structural
+/// — see `docs/archived/arena_unification_results.md` for why it cannot be offloaded away
+/// — and it is what this term has to clear.
+///
+/// The transient tier gave back 512 MiB (a shelf backing no allocator, and a
+/// 512 MiB migration staging span against a 29,696 B peak), so this term buys
+/// 32 more regions than it used to for the same expert budget.
+///
+/// **This term moved with `scratch_margin`, not against the expert cache.**
+/// `expert_budget` is `usable − kv_floor − scratch_margin`, so raising this by
+/// exactly what `scratch_margin` gave up (512 MiB) leaves the expert budget
+/// identical while the KV span — `usable − scratch_margin − transient` — gains
+/// the whole amount. 32 regions for nothing, which is what pays for clearing
+/// the 284-region cold-boot peak.
+///
+/// Spending it there rather than on more experts is what the decode curve says
+/// to do:
+///
+/// | expert slots | 1566 | 1917 | 2267 | 2355 | 2443 |
+/// |---|---|---|---|---|---|
+/// | decode median | 80 ms | 67 ms | 57 ms | 63 ms | 57 ms |
+///
+/// The first three are a real trend. The last three are **one flat band inside
+/// run-to-run noise** — 2355 measuring slower than 2267 is what says so, since
+/// residency cannot make decode worse. So the expert cache stops paying
+/// somewhere near 2,300 slots on this model and slots past that are free to
+/// spend, while a span clearing the 284-region peak removes a reproducible
+/// first-boot casualty (the post-priming quantize drain, which needs a slot to
+/// compress a section into before it can release the native one).
+///
+/// The percentage term tracks the card; the absolute term tracks the corpus,
+/// and only the card is knowable here. A workspace with one very large
+/// collection needs `CANDLE_VRAM_KV_FLOOR_MB` raised — the failure names the
+/// exhausted reservation, so the symptom points at this knob.
+const DEFAULT_KV_FLOOR_MB: u64 = 4352;
 const DEFAULT_KV_FLOOR_PCT: f64 = 0.15;
-const DEFAULT_SCRATCH_MARGIN_MB: u64 = 1024;
+const DEFAULT_SCRATCH_MARGIN_MB: u64 = 512;
 const DEFAULT_BALLOON_FRAC: f64 = 0.95;
-const DEFAULT_BALLOON_HEADROOM_MB: u64 = 1024;
+/// Tracks [`DEFAULT_SCRATCH_MARGIN_MB`], which is the invariant
+/// `the_balloon_reserve_does_not_double_book_the_scratch_cushion` pins: this is
+/// a cap on what the balloon may *try*, not a second reserve, so anything above
+/// the cushion books the same bytes twice.
+///
+/// It does not bind on this card in any case — `C = min(frac × total, total −
+/// this)` targets 15,864 MiB of the 16,376 MiB card, while the balloon actually
+/// stops at 14,592 MiB where the driver refuses. The refusal is the honest
+/// ceiling; this only stops the balloon reaching for something absurd.
+const DEFAULT_BALLOON_HEADROOM_MB: u64 = 512;
 const DEFAULT_BALLOON_FLOOR_MB: u64 = 512;
 const DEFAULT_BALLOON_CHUNK_MB: u64 = 256;
-const DEFAULT_CRITICAL_MIN_INTERVAL_MS: u64 = 250;
-
-/// Trivial/Cheap engage early at zero hit-rate cost; Moderate/Costly (KV
-/// eviction) are withheld until near the floor; Critical == floor.
-const DEFAULT_LADDER: [LadderTier; 5] = [
-    LadderTier::new(2 * GIB, 0.040),     // Trivial
-    LadderTier::new(3 * GIB / 2, 0.030), // Cheap
-    LadderTier::new(GIB, 0.015),         // Moderate
-    LadderTier::new(GIB / 2, 0.005),     // Costly
-    LadderTier::new(0, 0.0),             // Critical
-];
 
 impl GovernorConfig {
     /// The shipped defaults with **no** `CANDLE_VRAM_*` override applied.
@@ -136,12 +201,10 @@ impl GovernorConfig {
             kv_floor_abs: DEFAULT_KV_FLOOR_MB * 1024 * 1024,
             kv_floor_pct: DEFAULT_KV_FLOOR_PCT,
             scratch_margin: DEFAULT_SCRATCH_MARGIN_MB * 1024 * 1024,
-            ladder: DEFAULT_LADDER,
             balloon_target_frac: DEFAULT_BALLOON_FRAC,
             balloon_headroom_abs: DEFAULT_BALLOON_HEADROOM_MB * 1024 * 1024,
             balloon_floor: DEFAULT_BALLOON_FLOOR_MB * 1024 * 1024,
             balloon_chunk: DEFAULT_BALLOON_CHUNK_MB * 1024 * 1024,
-            critical_min_interval_ms: DEFAULT_CRITICAL_MIN_INTERVAL_MS,
         }
     }
 }
@@ -152,7 +215,6 @@ impl Default for GovernorConfig {
             kv_floor_abs: env_bytes_mb("CANDLE_VRAM_KV_FLOOR_MB", DEFAULT_KV_FLOOR_MB),
             kv_floor_pct: env_f64("CANDLE_VRAM_KV_FLOOR_PCT", DEFAULT_KV_FLOOR_PCT),
             scratch_margin: env_bytes_mb("CANDLE_VRAM_SCRATCH_MARGIN_MB", DEFAULT_SCRATCH_MARGIN_MB),
-            ladder: DEFAULT_LADDER,
             balloon_target_frac: env_f64("CANDLE_VRAM_BALLOON_FRAC", DEFAULT_BALLOON_FRAC),
             balloon_headroom_abs: env_bytes_mb(
                 "CANDLE_VRAM_BALLOON_HEADROOM_MB",
@@ -160,7 +222,6 @@ impl Default for GovernorConfig {
             ),
             balloon_floor: env_bytes_mb("CANDLE_VRAM_BALLOON_FLOOR_MB", DEFAULT_BALLOON_FLOOR_MB),
             balloon_chunk: env_bytes_mb("CANDLE_VRAM_BALLOON_CHUNK_MB", DEFAULT_BALLOON_CHUNK_MB),
-            critical_min_interval_ms: DEFAULT_CRITICAL_MIN_INTERVAL_MS,
         }
     }
 }
@@ -236,8 +297,18 @@ impl VramGovernor {
         }
     }
 
-    /// The KV minimum working set we never evict below, and the reserve the
-    /// expert budget must leave free: `3 GiB + 15% × (C − Weights)`.
+    /// **The VRAM the KV subsystem owns**, transient tier included, and so the
+    /// reserve the expert budget must leave free: `3 GiB + 15% × (C − Weights)`.
+    ///
+    /// The expert loader takes `usable − kv_floor − scratch_margin`, so what
+    /// survives to the first KV cache is `kv_floor + scratch_margin`; the
+    /// reservation then claims exactly `kv_floor` across its two sides and
+    /// leaves the cushion on the pool. `region_pool`'s
+    /// `the_reservation_claims_exactly_the_kv_floor` pins that identity.
+    ///
+    /// It is no longer a *floor* in the evict-no-further sense — nothing evicts
+    /// against a watermark any more (`docs/archived/arena_unification.md` §5). It is the
+    /// partition knob, and step 7 tunes it.
     pub fn kv_floor(&self) -> u64 {
         let c = self.capacity();
         let weights = self.class_reserved(AllocClass::Weights);
@@ -245,14 +316,6 @@ impl VramGovernor {
         self.config
             .kv_floor_abs
             .saturating_add((self.config.kv_floor_pct * base as f64) as u64)
-    }
-
-    /// The headroom trip point for `tier`: `kv_floor + abs + pct × C`. When live
-    /// headroom drops to/below this, the tier engages.
-    pub fn tier_threshold(&self, tier: Criticality) -> u64 {
-        let c = self.capacity();
-        self.kv_floor()
-            .saturating_add(self.config.ladder[tier.idx()].margin(c))
     }
 
     /// The scratch cushion held above the floor when sizing experts (§11).

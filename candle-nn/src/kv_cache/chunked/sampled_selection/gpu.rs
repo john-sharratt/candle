@@ -2,11 +2,12 @@ use super::params::SELECT_BLOCK;
 use super::profile::sampled_profile_record_duration;
 use super::CompressionSummary;
 use super::{ErrorSurface, SampleFormat, SampleSide, SampledSelectionBenchmarkResult};
+use crate::kv_cache::arena_table::PerHeadEntry;
 use crate::kv_cache::chunked::backing::BackingInner;
-use crate::kv_cache::chunked::head_gids::GIDS_PER_HEAD;
+use crate::kv_cache::chunked::head_gids::{ChunkBands, GIDS_PER_HEAD};
 use crate::kv_cache::QuantFormat;
-use crate::kv_cache::{arena_gid_stride, ChunkedKvBacking, HeadGids, KvFormat, N_PALETTE};
-use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr};
+use crate::kv_cache::{ChunkedKvBacking, KvFormat, GID_STRIDE, N_PALETTE};
+use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaSlice, CudaStream};
 use candle::quantized::{
     cuda::{
         reduce_head_format_stats, sample_quant_errors_kv_paged_staged, sample_quant_errors_paged,
@@ -19,6 +20,39 @@ use candle::quantized::{
 use candle::Result;
 use std::sync::Arc;
 
+/// Stage `bytes` where a kernel can read them.
+///
+/// Three paths, in preference order:
+///
+/// 1. A caller-supplied [`Generation`] — the host-pinned, device-mapped arena.
+///    The GPU reads over PCIe with no device copy at all, so this stays the
+///    best option when the caller has one.
+/// 2. The **persistence domain's transient span** — one bump and an H2D. This
+///    replaced `memcpy_stod`, which allocated and freed a device buffer per
+///    selection table, per call (`docs/archived/arena_unification.md` §3.6).
+/// 3. A plain device allocation, when there is no stream to bump against
+///    (CPU-backed tests).
+///
+/// The returned `GpuBuf` borrows in case 2: the span outlives it, and the
+/// caller's generation guard is what keeps the cursor from rewinding
+/// underneath it.
+/// The transient-span guard a freshly-built input set must hold.
+///
+/// `Some` exactly when [`stage_bytes_as_gpu_buf`] took the bump path — i.e.
+/// when the caller supplied no pinned generation — because that is the only
+/// case where the returned `GpuBuf`s borrow the span.
+fn bump_generation(
+    generation: Option<&Generation>,
+    dev: &candle::CudaDevice,
+) -> Option<super::super::bump_arena::Generation> {
+    if generation.is_some() {
+        return None;
+    }
+    super::super::bump_arena::persistence_domain(&dev.cuda_stream())
+        .ok()
+        .map(|b| b.generation())
+}
+
 fn stage_bytes_as_gpu_buf(
     bytes: &[u8],
     generation: Option<&Generation>,
@@ -27,11 +61,23 @@ fn stage_bytes_as_gpu_buf(
     if let Some(generation) = generation {
         let mut pinned = generation.alloc(bytes.len())?;
         pinned.as_mut_slice().copy_from_slice(bytes);
-        generation.submit(pinned)
-    } else {
-        let gpu_u8 = dev.memcpy_stod(bytes)?;
-        Ok(GpuBuf::from_raw_owned(gpu_u8, dev))
+        return generation.submit(pinned);
     }
+    let stream = dev.cuda_stream();
+    let bump = super::super::bump_arena::persistence_domain(&stream)?;
+    let range = bump.alloc(bytes.len(), 256)?;
+    // SAFETY: `range` is `bytes.len()` of the domain's span, kept live by the
+    // caller's `_bump_gen` guard; `bytes` is a host slice alive for this call;
+    // and the copy is enqueued on the same stream the kernel reads from.
+    unsafe {
+        candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
+            range.ptr,
+            bytes,
+            stream.cu_stream(),
+        )
+    }
+    .map_err(|e| candle::Error::Msg(format!("selection table upload: {e}")))?;
+    Ok(GpuBuf::from_borrowed(range.ptr, range.len))
 }
 
 fn stage_i64_slice(
@@ -65,6 +111,24 @@ fn stage_f32_slice(
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
     };
     stage_bytes_as_gpu_buf(bytes, generation, dev)
+}
+
+/// Upload a selection table to the device as an owned buffer.
+///
+/// Owned, never the pinned-stager arena: the selection kernel reads the table
+/// asynchronously, and an arena-backed `GpuBuf` is valid only while its staging
+/// generation chain lives — a last-generation drop on another thread syncs one
+/// stream and resets the arena, recycling these bytes under the in-flight
+/// kernel. The table is small; the owned slice is freed stream-ordered after
+/// the kernel. Same reasoning as the `head_gids` upload beside it.
+///
+/// An empty job list still needs a non-null pointer for the launch, so it
+/// uploads one zeroed row.
+fn stage_table(table: &[i64], dev: &candle::CudaDevice) -> Result<GpuBuf> {
+    if table.is_empty() {
+        return stage_i64_slice(&vec![0i64; PerHeadEntry::COLS], None, dev);
+    }
+    stage_i64_slice(table, None, dev)
 }
 
 pub enum SelectionBackend<'a> {
@@ -600,10 +664,17 @@ impl PendingKvSummaries {
 }
 
 pub struct PagedSelectionGpuInputs {
-    // Live per-block GIDs keep the arena chunk allocations resident.
-    chunk_gids_keepalive: Vec<HeadGids>,
-    // Keeps the per-head table tensor (and thus its device memory) alive.
-    _per_head_table_tensor: Option<candle::Tensor>,
+    // Live per-block GIDs keep the arena chunk allocations resident; the band
+    // format tags beside them are what the selection table's sub-entries are
+    // built from.
+    chunk_gids_keepalive: Vec<ChunkBands>,
+    // Host copy of the selection table, one `PerHeadEntry` row per
+    // `(chunk, head)` in `chunk_gids_keepalive` order. Kept host-side for the
+    // same reason `head_gids` is: `select_chunks` narrows to a chunk sub-range
+    // and must re-upload **both** buffers. Sharing the parent's table there was
+    // correct only while rows were keyed by arena — under a `(chunk, head)`
+    // key, chunk `start + i` of the slice would read the parent's row `i`.
+    per_head_table: Vec<i64>,
     per_head_table_buf: GpuBuf,
     head_gids: Vec<i64>,
     head_gids_buf: GpuBuf,
@@ -611,6 +682,13 @@ pub struct PagedSelectionGpuInputs {
     n_kv_head: usize,
     arena_chunks: usize,
     dev: candle::CudaDevice,
+    /// Keeps the transient span's cursor from rewinding while
+    /// `per_head_table_buf` / `head_gids_buf` still point into it.
+    ///
+    /// `None` when the buffers came from a caller-supplied pinned generation
+    /// or a plain allocation — in both cases they own or borrow memory this
+    /// struct does not have to pin.
+    _bump_gen: Option<super::super::bump_arena::Generation>,
 }
 
 impl PagedSelectionGpuInputs {
@@ -821,17 +899,15 @@ impl PagedSelectionGpuInputs {
     ) -> Result<Self> {
         let mut chunk_gids_keepalive = Vec::with_capacity(batch_indices.len());
         for &batch_idx in batch_indices {
-            let sealed = backing
-                .live_chunks_as_sealed(batch_idx, &[])
-                .ok_or_else(|| {
-                    candle::Error::Msg(format!("missing live chunks for batch slot {batch_idx}"))
-                })?;
+            let sealed = backing.live_chunks_as_sealed(batch_idx).ok_or_else(|| {
+                candle::Error::Msg(format!("missing live chunks for batch slot {batch_idx}"))
+            })?;
             let chunk = sealed.first().ok_or_else(|| {
                 candle::Error::Msg(format!(
                     "no paged chunk recorded for batch slot {batch_idx}"
                 ))
             })?;
-            chunk_gids_keepalive.push(chunk.gids.clone());
+            chunk_gids_keepalive.push(ChunkBands::from_sealed(chunk));
         }
 
         Self::from_head_gids(
@@ -853,29 +929,17 @@ impl PagedSelectionGpuInputs {
 
     pub fn from_head_gids(
         backing: Arc<BackingInner>,
-        chunk_gids_keepalive: &[HeadGids],
+        chunk_gids_keepalive: &[ChunkBands],
         generation: Option<&Generation>,
         dev: &candle::CudaDevice,
     ) -> Result<Self> {
         // Refuse to launch the selection kernel over gids that don't match the
         // current storage arenas — a named host error beats a silent GPU OOB.
         backing.validate_selection_gids(chunk_gids_keepalive, "single-layer")?;
-        let per_head_table = backing.per_head_table_sync()?;
-        let per_head_table_buf = {
-            let (storage, layout) = per_head_table.storage_and_layout();
-            match &*storage {
-                candle::Storage::Cuda(cuda) => {
-                    let slice = cuda.as_cuda_slice::<i64>()?;
-                    let stream = dev.cuda_stream();
-                    let (ptr, _guard) = slice.device_ptr(&stream);
-                    let len = layout.shape().elem_count() * std::mem::size_of::<i64>();
-                    GpuBuf::from_borrowed(ptr, len)
-                }
-                _ => candle::bail!("paged selection backing must be on CUDA"),
-            }
-        };
-
+        let per_head_table = backing.per_head_table_host(chunk_gids_keepalive)?;
+        let per_head_table_buf = stage_table(&per_head_table, dev)?;
         let n_kv_head = backing.n_kv_head;
+
         let blocks_per_chunk = n_kv_head * backing.head_dim;
         let chunk_gids_keepalive = chunk_gids_keepalive.to_vec();
         // Stage every palette band's gid (HeadGids natural order:
@@ -884,7 +948,8 @@ impl PagedSelectionGpuInputs {
         // band 0.
         let head_gids: Vec<i64> = chunk_gids_keepalive
             .iter()
-            .flat_map(|gids| {
+            .flat_map(|c| {
+                let gids = &c.gids;
                 (0..n_kv_head).flat_map(move |head_idx| {
                     (0..N_PALETTE).flat_map(move |p| {
                         [
@@ -907,14 +972,16 @@ impl PagedSelectionGpuInputs {
 
         Ok(Self {
             chunk_gids_keepalive,
-            _per_head_table_tensor: Some(per_head_table),
+            per_head_table,
             per_head_table_buf,
             head_gids,
             head_gids_buf,
             blocks_per_chunk,
             n_kv_head,
-            arena_chunks: arena_gid_stride(),
+            arena_chunks: GID_STRIDE,
             dev: dev.clone(),
+            // Staged with `None` above, so the buffers always borrow the span.
+            _bump_gen: bump_generation(None, dev),
         })
     }
 
@@ -932,11 +999,10 @@ impl PagedSelectionGpuInputs {
     /// reads by pointer, and chunks never interact across the selection.
     pub fn from_head_gids_multi(
         backings: &[Arc<BackingInner>],
-        chunk_gids_per_layer: &[Vec<HeadGids>],
+        chunk_gids_per_layer: &[Vec<ChunkBands>],
         generation: Option<&Generation>,
         dev: &candle::CudaDevice,
     ) -> Result<(Self, Vec<usize>)> {
-        use crate::kv_cache::arena_table::PerHeadEntry;
         if backings.len() != chunk_gids_per_layer.len() {
             candle::bail!("from_head_gids_multi: backings/gids layer count mismatch");
         }
@@ -945,13 +1011,11 @@ impl PagedSelectionGpuInputs {
         }
         let n_kv_head = backings[0].n_kv_head;
         let head_dim = backings[0].head_dim;
-        let arena_chunks = arena_gid_stride() as i64;
 
         let mut unified_table: Vec<i64> = Vec::new();
         let mut unified_head_gids: Vec<i64> = Vec::new();
         let mut chunk_counts: Vec<usize> = Vec::with_capacity(backings.len());
-        let mut chunk_gids_keepalive: Vec<HeadGids> = Vec::new();
-        let mut arena_offset: usize = 0; // running arena count, in arenas
+        let mut chunk_gids_keepalive: Vec<ChunkBands> = Vec::new();
 
         for (layer_idx, (backing, gids_layer)) in
             backings.iter().zip(chunk_gids_per_layer).enumerate()
@@ -962,66 +1026,53 @@ impl PagedSelectionGpuInputs {
             // Refuse to launch the fused selection over gids that don't match
             // this layer's current storage arenas (see validate_selection_gids).
             backing.validate_selection_gids(gids_layer, &format!("multi layer {layer_idx}"))?;
-            let (table, num_arenas) = backing.per_head_table_host()?;
-            // Append this layer's dense [0, num_arenas) arena rows; the offset
-            // makes its local arena_idx land at global (arena_offset + idx).
-            unified_table.extend_from_slice(&table);
-            let gid_off = arena_offset as i64 * arena_chunks;
-            for gids in gids_layer.iter() {
+            // Rows are keyed by (chunk, head) and chunks concatenate, so each
+            // layer's rows land at the right global index by appending — no
+            // arena rebasing, and no `gid_off` added to the gids. That rebasing
+            // existed only because the row key came *from* the gid; it does
+            // not any more.
+            unified_table.extend_from_slice(&backing.per_head_table_host(gids_layer)?);
+            for c in gids_layer.iter() {
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
-                        unified_head_gids.push(gids.k_gid_pal(h, p).raw() + gid_off);
-                        unified_head_gids.push(gids.v_gid_pal(h, p).raw() + gid_off);
+                        unified_head_gids.push(c.gids.k_gid_pal(h, p).raw());
+                        unified_head_gids.push(c.gids.v_gid_pal(h, p).raw());
                     }
                 }
             }
             chunk_counts.push(gids_layer.len());
             chunk_gids_keepalive.extend(gids_layer.iter().cloned());
-            arena_offset += num_arenas;
         }
 
-        let total_arenas = arena_offset;
-        let device = candle::Device::Cuda(dev.clone());
-        let per_head_table = if total_arenas == 0 {
-            candle::Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, &device)?
-        } else {
-            candle::Tensor::from_vec(
-                unified_table,
-                (total_arenas * n_kv_head, PerHeadEntry::COLS),
-                &device,
-            )?
-        };
-        let per_head_table_buf = {
-            let (storage, layout) = per_head_table.storage_and_layout();
-            match &*storage {
-                candle::Storage::Cuda(cuda) => {
-                    let slice = cuda.as_cuda_slice::<i64>()?;
-                    let stream = dev.cuda_stream();
-                    let (ptr, _guard) = slice.device_ptr(&stream);
-                    let len = layout.shape().elem_count() * std::mem::size_of::<i64>();
-                    GpuBuf::from_borrowed(ptr, len)
-                }
-                _ => candle::bail!("paged selection backing must be on CUDA"),
-            }
-        };
-        // OWNED upload — same staging-lifetime hazard as `from_head_gids`: the
-        // fused selection kernel reads this asynchronously, and an arena-backed
-        // staging buffer can be reset+recycled under it by a last-generation
-        // drop on another thread. See the comment there.
+        // Fused selection-table size. Worth logging because this step changes
+        // the table's *exponent*, not just its constant: keyed by arena it grew
+        // with the arena count — i.e. with the fragmentation this initiative
+        // exists to delete, so a sicker pool made every drain more expensive.
+        // Keyed by chunk it grows with the work actually being selected. See
+        // `docs/archived/arena_unification.md` E5.
+        tracing::debug!(
+            layers = backings.len(),
+            chunks = chunk_gids_keepalive.len(),
+            rows = chunk_gids_keepalive.len() * n_kv_head,
+            bytes = unified_table.len() * std::mem::size_of::<i64>(),
+            "fused selection table"
+        );
+        let per_head_table_buf = stage_table(&unified_table, dev)?;
         let _ = generation;
         let head_gids_buf = stage_i64_slice(&unified_head_gids, None, dev)?;
 
         Ok((
             Self {
                 chunk_gids_keepalive,
-                _per_head_table_tensor: Some(per_head_table),
+                per_head_table: unified_table,
                 per_head_table_buf,
                 head_gids: unified_head_gids,
                 head_gids_buf,
                 blocks_per_chunk: n_kv_head * head_dim,
                 n_kv_head,
-                arena_chunks: arena_gid_stride(),
+                arena_chunks: GID_STRIDE,
                 dev: dev.clone(),
+                _bump_gen: bump_generation(generation, dev),
             },
             chunk_counts,
         ))
@@ -1044,14 +1095,23 @@ impl PagedSelectionGpuInputs {
         let head_gids =
             self.head_gids[start_chunk * gids_per_chunk..end_chunk * gids_per_chunk].to_vec();
         let chunk_gids_keepalive = self.chunk_gids_keepalive[start_chunk..end_chunk].to_vec();
+        // The table is keyed by (chunk, head), so it narrows with the gids —
+        // the kernel's `chunk_idx` is relative to *this* buffer. Sharing the
+        // parent's table would make chunk `start_chunk + i` read row `i`.
+        let rows_per_chunk = self.n_kv_head * PerHeadEntry::COLS;
+        let per_head_table =
+            self.per_head_table[start_chunk * rows_per_chunk..end_chunk * rows_per_chunk].to_vec();
         // OWNED upload — same staging-lifetime hazard as `from_head_gids`.
         let _ = generation;
         let head_gids_buf = stage_i64_slice(&head_gids, None, &self.dev)?;
+        let per_head_table_buf = stage_table(&per_head_table, &self.dev)?;
 
         Ok(Self {
+            // Re-uploaded with `None` above, so these borrow the span.
+            _bump_gen: bump_generation(None, &self.dev),
             chunk_gids_keepalive,
-            _per_head_table_tensor: self._per_head_table_tensor.clone(),
-            per_head_table_buf: self.per_head_table_buf.clone(),
+            per_head_table,
+            per_head_table_buf,
             head_gids,
             head_gids_buf,
             blocks_per_chunk: self.blocks_per_chunk,

@@ -994,6 +994,11 @@ impl PipelineState {
         };
 
         let (num_tokens, hidden) = req.input.shape()?;
+        // Not a wave buffer, and cannot be one: this runs on the pipeline
+        // thread, and the tensor is handed back to the caller over a channel —
+        // so the scope that would have to hold it open belongs to a different
+        // thread than the one that allocated it. Restructuring who owns the
+        // combine target is what a transient domain here would need first.
         let mut ys = Tensor::zeros((num_tokens, hidden), req.out_dtype, &self.device)?;
         // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
         #[cfg(not(feature = "cuda"))]

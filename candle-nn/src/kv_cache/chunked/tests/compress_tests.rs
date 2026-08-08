@@ -132,7 +132,7 @@ fn quantize_to_cpu_basic_round_trip_shape() {
         .storage
         .read(|storage| {
             for chunk in &warm.chunks {
-                for gid in chunk.gids.as_slice() {
+                for (gid, tag) in chunk.bands() {
                     let key = storage
                         .arena_key(gid.arena_idx())
                         .expect("warm gid arena exists");
@@ -142,9 +142,8 @@ fn quantize_to_cpu_basic_round_trip_shape() {
                         "warm gid must live in a GPU arena"
                     );
                     assert!(
-                        matches!(key.format, KvFormat::Quantized(_)),
-                        "warm gid must live in a quantized arena, got {:?}",
-                        key.format
+                        tag.is_quantized(),
+                        "warm gid must live in a quantized arena, got {tag:?}",
                     );
                 }
             }
@@ -549,17 +548,16 @@ fn quantize_to_cpu_quantizes_partial_tail() {
         .storage
         .read(|storage| {
             for (ci, chunk) in warm.chunks.iter().enumerate() {
-                for gid in chunk.gids.as_slice() {
+                for (gid, tag) in chunk.bands() {
                     let key = storage
                         .arena_key(gid.arena_idx())
                         .expect("chunk arena exists");
                     assert_eq!(key.location, ArenaLocation::Gpu);
                     assert!(
-                        matches!(key.format, KvFormat::Quantized(_)),
+                        tag.is_quantized(),
                         "chunk {ci} gid {} must live in a Quantized GPU arena \
-                         (partials quantize like full chunks), got {:?}",
+                         (partials quantize like full chunks), got {tag:?}",
                         gid.raw(),
-                        key.format,
                     );
                 }
             }
@@ -572,8 +570,7 @@ fn quantize_to_cpu_quantizes_partial_tail() {
     // field `install_warm` writes into the residence's `byte_size`
     // accounting, and the whole point of quantizing tails: a float
     // partial pinned a full F16 chunk slot per layer.
-    let arena_infos = backing.resolve_arena_info().unwrap();
-    let partial_bytes = warm.chunks[1].gids.arena_byte_size(&arena_infos);
+    let partial_bytes = warm.chunks[1].byte_size(backing.elems_per_chunk());
     let f16_footprint = (N_KV_HEAD * 2 * HEAD_DIM * 32 * 2) as u64;
     assert!(
         partial_bytes < f16_footprint,
@@ -621,28 +618,17 @@ fn quantize_to_cpu_requantizes_filled_partials() {
     let warm = &warm[0];
     assert_eq!(warm.chunks.len(), 2);
 
-    // Both chunks must be quantized — no skipping.
-    backing
-        .inner
-        .storage
-        .read(|storage| {
-            for chunk in &warm.chunks {
-                for gid in chunk.gids.as_slice() {
-                    let key = storage.arena_key(gid.arena_idx()).unwrap();
-                    assert!(
-                        matches!(key.format, KvFormat::Quantized(_)),
-                        "filled chunk gid {} must be quantized on the next \
-                         persist pass (post-resume re-quantize cycle), got \
-                         {:?}",
-                        gid.raw(),
-                        key.format,
-                    );
-                }
-            }
-            Ok::<(), candle::Error>(())
-        })
-        .unwrap()
-        .unwrap();
+    // Both chunks must be quantized — no skipping. The chunk's own tags are
+    // the record; the arenas its gids point into are untyped byte slots.
+    for chunk in &warm.chunks {
+        for (gid, tag) in chunk.bands() {
+            assert!(
+                tag.is_quantized(),
+                "filled chunk gid {} must be quantized on the next persist pass                  (post-resume re-quantize cycle), got {tag:?}",
+                gid.raw(),
+            );
+        }
+    }
 }
 
 /// **End-to-end resume + extend + re-quantize cycle.**
@@ -728,28 +714,26 @@ fn cold_load_partial_extend_then_requantize() {
         .inner
         .storage
         .read(|storage| {
-            for gid in elevated_seq.chunks[1].gids.as_slice() {
+            for (gid, tag) in elevated_seq.chunks[1].bands() {
                 let key = storage.arena_key(gid.arena_idx()).unwrap();
                 assert_eq!(key.location, ArenaLocation::Gpu);
                 assert!(
-                    matches!(key.format, KvFormat::Quantized(_)),
+                    tag.is_quantized(),
                     "cold-loaded partial gid {} must elevate back to a GPU \
-                     Quantized arena (format-preserving round-trip), got {:?}",
+                     Quantized arena (format-preserving round-trip), got {tag:?}",
                     gid.raw(),
-                    key.format,
                 );
             }
             // Also sanity-check that the elevated full chunk is on GPU
             // in some Quantized arena (the borrowed-already-quantized
             // case that turn 2's re-quantize must skip).
-            for gid in elevated_seq.chunks[0].gids.as_slice() {
+            for (gid, tag) in elevated_seq.chunks[0].bands() {
                 let key = storage.arena_key(gid.arena_idx()).unwrap();
                 assert_eq!(key.location, ArenaLocation::Gpu);
                 assert!(
-                    matches!(key.format, KvFormat::Quantized(_)),
-                    "elevated full chunk gid {} should land in GPU Quantized, got {:?}",
+                    tag.is_quantized(),
+                    "elevated full chunk gid {} should land in GPU Quantized, got {tag:?}",
                     gid.raw(),
-                    key.format,
                 );
             }
             Ok::<(), candle::Error>(())
@@ -852,7 +836,7 @@ fn cold_load_partial_extend_then_requantize() {
         .storage
         .read(|storage| {
             let check = |chunk_idx: usize, label: &str| {
-                for gid in warm_t2_seq.chunks[chunk_idx].gids.as_slice() {
+                for (gid, tag) in warm_t2_seq.chunks[chunk_idx].bands() {
                     let key = storage.arena_key(gid.arena_idx()).unwrap();
                     assert_eq!(
                         key.location,
@@ -861,11 +845,10 @@ fn cold_load_partial_extend_then_requantize() {
                         gid.raw()
                     );
                     assert!(
-                        matches!(key.format, KvFormat::Quantized(_)),
+                        tag.is_quantized(),
                         "warm_t2 chunk {chunk_idx} ({label}) gid {} must be \
-                         in a Quantized GPU arena, got {:?}",
+                         in a Quantized GPU arena, got {tag:?}",
                         gid.raw(),
-                        key.format,
                     );
                 }
             };

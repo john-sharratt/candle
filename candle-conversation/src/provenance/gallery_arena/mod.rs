@@ -228,6 +228,13 @@ impl GalleryArena {
             sigs.first().map(|s| s.words.len()).unwrap_or(0),
             self.wpt
         );
+        // Keep the arena under its own ceiling before admitting anything new.
+        // This is where gallery growth is bounded: `alloc_and_upload` adds a
+        // slab whenever the page pool is empty, and nothing else ever shrinks
+        // the arena. Doing it here — under `res`, before `inner` is taken —
+        // respects the residency→inner lock order and skips pins, so an active
+        // scan's working set is never evicted out from under it.
+        self.evict_to_cap_locked(res);
         let lru = self.lru_clock.fetch_add(1, Ordering::Relaxed);
         let gids = if let Some(rt) = res.get_mut(&sid) {
             if rt.fingerprint == fingerprint {
@@ -396,6 +403,15 @@ impl GalleryArena {
     /// blob. Pinned turns (an active scan's working set) are never evicted.
     pub fn evict_lru(&self, want: u64) -> u64 {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        self.evict_lru_locked(&mut res, want)
+    }
+
+    /// [`evict_lru`](Self::evict_lru) under a residency guard the caller holds.
+    ///
+    /// Split out so admission can bound the arena *before* growing a slab
+    /// (see [`Self::cap_bytes`]); the residency mutex is not reentrant, so
+    /// `ensure_locked` cannot call the public entry point.
+    fn evict_lru_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>, want: u64) -> u64 {
         // Order candidates by LRU ascending (oldest first), skipping pins.
         let mut cands: Vec<(u64, StreamId, usize)> = res
             .iter()
@@ -413,6 +429,45 @@ impl GalleryArena {
             freed += pages_for(n_tokens) as u64 * self.page_bytes;
         }
         freed
+    }
+
+    /// The arena's own VRAM ceiling, in bytes (`ZEN_GALLERY_CAP_MB`, default
+    /// 512 MiB).
+    ///
+    /// **This is what bounds gallery growth.** `alloc_and_upload` adds a slab
+    /// whenever the page pool is empty and the arena never evicts itself, so
+    /// without a ceiling here the only limit was an outside `evict_lru` call
+    /// from the scheduler's KV-pressure relief — a signal this arena cannot
+    /// move (its slabs come from the CUDA pool and are never returned), so that
+    /// call fired on every pressure episode and shed belief-scan residency the
+    /// next scan had to rebuild from the substrate.
+    ///
+    /// Enforced at admission in `ensure_locked`, where no lock is held that
+    /// eviction needs.
+    pub fn cap_bytes(&self) -> u64 {
+        static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            let mb = std::env::var("ZEN_GALLERY_CAP_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(512);
+            tracing::info!(cap_mb = mb, "gallery arena VRAM ceiling");
+            mb * 1024 * 1024
+        })
+    }
+
+    /// Evict oldest turns until the arena is back under [`Self::cap_bytes`].
+    ///
+    /// Returns bytes freed. Pinned turns are skipped, so a scan's working set
+    /// larger than the cap is served rather than refused — the cap bounds
+    /// *growth*, it does not fail requests.
+    fn evict_to_cap_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>) -> u64 {
+        let cap = self.cap_bytes();
+        let resident = self.resident_bytes();
+        if resident <= cap {
+            return 0;
+        }
+        self.evict_lru_locked(res, resident - cap)
     }
 }
 

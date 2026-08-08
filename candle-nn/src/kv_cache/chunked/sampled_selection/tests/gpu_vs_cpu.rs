@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
+use crate::kv_cache::arena_table::N_PALETTE;
 #[allow(unused_imports)]
 use candle::quantized::pinned_staging::GpuBuf;
 
@@ -65,13 +66,18 @@ fn gpu_matches_cpu_real_data() {
 
     let k_chunk_byte_stride = ((header.chunk_size * header.head_dim) / CHUNK_SIZE * 128) as i64;
     let v_chunk_byte_stride = (header.chunk_size * header.head_dim * 2) as i64;
+    // Unity outer scale, and one `Palette4PerHeadEntry` row per (chunk, head):
+    // four 9-value sub-entries. Every band of this fixture shares one buffer,
+    // so the four are identical — but each must be present, because the kernel
+    // resolves a band through its own sub-entry, not through palette 0.
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
         .map(|cg| {
             let (k_ptr, _) = cg.k_gpu.device_ptr(&stream);
             let (v_ptr, _) = cg.v_gpu.device_ptr(&stream);
             let metadata = (39i64 << 16) | (1i64 << 8) | 0i64;
-            [
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -79,7 +85,10 @@ fn gpu_matches_cpu_real_data() {
                 k_chunk_byte_stride,
                 v_chunk_byte_stride,
                 metadata,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            sub.repeat(N_PALETTE)
         })
         .flatten()
         .collect();

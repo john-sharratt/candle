@@ -838,7 +838,6 @@ mod tests {
     /// decl/chunk for X, then a `Tombstone` for X.  The
     /// compactor's `collect_live_records` output must contain
     /// neither the Label nor the chunk.
-    #[test]
     /// A tombstoned timeline that is ALSO distilled is the provenance corpus —
     /// calibration exemplars, archived then distilled `ProvenanceOnly` then
     /// tombstoned so they leave the live gather while still answering the belief

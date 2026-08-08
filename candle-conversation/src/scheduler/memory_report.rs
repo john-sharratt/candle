@@ -7,8 +7,8 @@
 //! host-RAM floor read an 11 GB pinned expert pool as pressure, and none of the
 //! numbers involved were visible in one place. This report puts every quantity
 //! the throttles reason about side by side — what the driver says, what the
-//! pool has reserved, what the governor believes is evictable, what is pinned
-//! and can never move — so a wrong inference is attributable from a single log
+//! pool has reserved, how many KV regions are free, what is pinned and can
+//! never move — so a wrong inference is attributable from a single log
 //! line instead of a night of cross-referencing.
 //!
 //! Process-global slot (the [`phase_ring`](super::phase_ring) pattern): the
@@ -21,8 +21,8 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use candle::vram::{host_pinned_bytes, AllocClass, Criticality};
-use candle_nn::kv_cache::{global_arena_memory_report, GpuArenaFormatStats};
+use candle::vram::{host_pinned_bytes, AllocClass};
+use candle_nn::kv_cache::global_arena_memory_report;
 use serde::Serialize;
 
 use super::admission::admit_quantum;
@@ -66,9 +66,9 @@ pub struct WeightSection {
 ///
 /// The arena allocates 16 MiB device slabs directly and holds them for its
 /// lifetime, outside both the KV pool and the governor's class tallies, so it
-/// appears in no other field of this report. It is registered for relief (its
-/// pages are evictable and rebuild from the substrate on demand), but relief
-/// registration reports what *could* be freed, not what is currently held.
+/// appears in no other field of this report. Its pages are evictable and rebuild
+/// from the substrate on demand, which is why the relief sequence sheds them
+/// before it touches model KV.
 #[derive(Debug, Clone, Serialize)]
 pub struct GallerySection {
     /// VRAM held by the arena's slabs right now.
@@ -102,11 +102,9 @@ pub struct GovernorSection {
     pub capacity_bytes: u64,
     /// Live measured headroom (honest, excludes the pool reuse gap).
     pub headroom_bytes: u64,
-    /// KV floor the relief ladder never evicts below.
+    /// KV floor the startup partition leaves for the KV reservation.
     pub kv_floor_bytes: u64,
     pub scratch_margin_bytes: u64,
-    /// What registered relievers report they could reversibly free (≤ Moderate).
-    pub evictable_moderate_bytes: u64,
     /// Loose per-class reserved tallies (reporting, not availability gates).
     pub reserved_weights_bytes: u64,
     pub reserved_expert_bytes: u64,
@@ -117,15 +115,24 @@ pub struct GovernorSection {
 /// KV arena occupancy, whole-process.
 #[derive(Debug, Clone, Serialize)]
 pub struct KvSection {
-    /// Float vs quant split of the resident GPU arenas.
-    pub float_arenas: usize,
-    pub float_reserved_bytes: u64,
-    pub float_live_bytes: u64,
-    pub quant_arenas: usize,
-    pub quant_reserved_bytes: u64,
-    pub quant_live_bytes: u64,
+    /// One row per occupied size class of the resident GPU arenas.
+    ///
+    /// This replaced a float-vs-quant split, which is no longer a question an
+    /// arena can answer: a size-class arena holds whatever fits its slots. The
+    /// ladder carries the same signal — compression moves occupancy down it.
+    pub classes: Vec<KvClassRow>,
     /// Per-backing per-format rows from every registered `ChunkedKvBacking`.
     pub arenas: Vec<ArenaRow>,
+}
+
+/// One size class's share of the resident GPU arenas.
+#[derive(Debug, Clone, Serialize)]
+pub struct KvClassRow {
+    /// Slot stride in bytes — the class's identity.
+    pub slot_bytes: usize,
+    pub arenas: usize,
+    pub reserved_bytes: u64,
+    pub live_bytes: u64,
 }
 
 /// One `(backing, format)` arena row.
@@ -145,8 +152,8 @@ pub struct WarmSection {
     pub resident_count: usize,
     /// Drainable hot→warm deficit (the ingest backpressure signal).
     pub pending_warm_bytes: u64,
-    /// Hot KV the drain is skipping because it is pinned — counted evictable by
-    /// the forecast but unreclaimable while the pin holds.
+    /// Hot KV the drain is skipping because it is pinned — unreclaimable while
+    /// the pin holds, so an eviction pass cannot turn it back into free regions.
     pub pinned_undrainable_bytes: u64,
     /// Bytes held by warm copies — the one host-side quantity admission can shrink.
     pub resident_bytes: u64,
@@ -270,7 +277,6 @@ impl Scheduler {
                 headroom_bytes: gov.measure().map(|r| r.headroom).unwrap_or(0),
                 kv_floor_bytes: gov.kv_floor(),
                 scratch_margin_bytes: gov.scratch_margin(),
-                evictable_moderate_bytes: gov.evictable_estimate(Criticality::Moderate),
                 reserved_weights_bytes: gov.class_reserved(AllocClass::Weights),
                 reserved_expert_bytes: gov.class_reserved(AllocClass::Expert),
                 reserved_scratch_bytes: gov.class_reserved(AllocClass::Scratch),
@@ -287,17 +293,22 @@ impl Scheduler {
         });
 
         // ── KV arenas ───────────────────────────────────────────────────────
-        let fs = self
+        let classes = self
             .session
-            .kv_gpu_format_stats()
-            .unwrap_or(GpuArenaFormatStats {
-                float_arenas: 0,
-                float_reserved_bytes: 0,
-                float_live_bytes: 0,
-                quant_arenas: 0,
-                quant_reserved_bytes: 0,
-                quant_live_bytes: 0,
-            });
+            .kv_gpu_class_stats()
+            .map(|cs| {
+                cs.classes
+                    .iter()
+                    .filter(|c| c.arenas > 0)
+                    .map(|c| KvClassRow {
+                        slot_bytes: c.slot_bytes,
+                        arenas: c.arenas,
+                        reserved_bytes: c.reserved_bytes as u64,
+                        live_bytes: c.live_bytes as u64,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let arenas = global_arena_memory_report()
             .into_iter()
             .map(|(backing, format, arenas, bytes)| ArenaRow {
@@ -307,15 +318,7 @@ impl Scheduler {
                 bytes: bytes as u64,
             })
             .collect();
-        let kv = KvSection {
-            float_arenas: fs.float_arenas,
-            float_reserved_bytes: fs.float_reserved_bytes as u64,
-            float_live_bytes: fs.float_live_bytes as u64,
-            quant_arenas: fs.quant_arenas,
-            quant_reserved_bytes: fs.quant_reserved_bytes as u64,
-            quant_live_bytes: fs.quant_live_bytes as u64,
-            arenas,
-        };
+        let kv = KvSection { classes, arenas };
 
         // ── Warm tier ───────────────────────────────────────────────────────
         let warm = WarmSection {
@@ -435,7 +438,6 @@ mod tests {
                     headroom_bytes: 7,
                     kv_floor_bytes: 8,
                     scratch_margin_bytes: 9,
-                    evictable_moderate_bytes: 10,
                     reserved_weights_bytes: 11,
                     reserved_expert_bytes: 12,
                     reserved_scratch_bytes: 13,
@@ -443,12 +445,12 @@ mod tests {
                 }),
             }),
             kv: KvSection {
-                float_arenas: 1,
-                float_reserved_bytes: 2,
-                float_live_bytes: 3,
-                quant_arenas: 4,
-                quant_reserved_bytes: 5,
-                quant_live_bytes: 6,
+                classes: vec![KvClassRow {
+                    slot_bytes: 1152,
+                    arenas: 1,
+                    reserved_bytes: 2,
+                    live_bytes: 3,
+                }],
                 arenas: vec![ArenaRow {
                     backing: 0,
                     format: "R16".into(),
@@ -510,8 +512,6 @@ mod tests {
             "driver_free_bytes",
             "pool_reserved_bytes",
             "headroom_bytes",
-            "evictable_moderate_bytes",
-            "float_live_bytes",
             "\"arenas\"",
             "pending_warm_bytes",
             "pinned_undrainable_bytes",

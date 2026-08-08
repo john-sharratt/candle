@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
+use crate::cuda_backend::Backing;
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -366,21 +367,24 @@ impl CudaDevice {
     }
 
     /// Release reserved-but-free pool memory back to the OS, keeping at least
-    /// `keep_bytes` reserved. Wraps `cuMemPoolTrimTo` on the default async pool.
+    /// `keep_bytes` reserved.
     ///
-    /// cudarc allocates via `cuMemAllocAsync`, whose pool only returns freed
-    /// blocks to the OS when the stream goes idle — which never happens under
-    /// continuous inference. So `pool_reserved` (the physical footprint) climbs
-    /// to its fragmentation high-water mark and stays there, oversubscribing the
-    /// card while `pool_used` (what the VRAM budget measures) reads far lower.
-    /// An explicit trim releases that fragmentation immediately, so
-    /// `pool_reserved` tracks `pool_used` and the budget stays physically
-    /// accurate. `keep_bytes` leaves a slack floor of ready blocks so the very
-    /// next allocation reuses pool memory instead of re-hitting the OS.
+    /// One caller: the startup balloon, which allocates pool tensors to measure
+    /// resident capacity `C` and must hand those bytes back before the model
+    /// loads into them — the async pool would otherwise retain them and the
+    /// post-balloon measurement would read them as still in use.
+    ///
+    /// It is not a runtime reclaim path. It was once called from the governor's
+    /// relief hook and after every scheduler pressure episode, when KV lived in
+    /// this pool and its freed arenas were worth returning; KV is regions now
+    /// and what remains here reaches its size and stays. `cuMemPoolTrimTo`
+    /// **synchronously unmaps** — not stream-ordered — so a caller must be sure
+    /// no kernel holds a pointer into the freed blocks. At startup, before any
+    /// kernel runs, that is trivially true. Anywhere else it is a hazard, which
+    /// is why the runtime callers are gone rather than guarded.
     ///
     /// Only trims memory nothing is using — never touches live allocations.
-    /// Errors if the device doesn't use the async pool allocator (callers treat
-    /// that as "trim unavailable" and skip).
+    /// Errors if the device doesn't use the async pool allocator.
     pub fn trim_pool(&self, keep_bytes: usize) -> Result<()> {
         use cudarc::driver::sys;
         self.context.bind_to_thread().w()?;
@@ -479,6 +483,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -515,6 +520,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -555,6 +561,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -597,6 +604,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -638,6 +646,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -679,6 +688,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 
@@ -720,6 +730,7 @@ impl BackendDevice for CudaDevice {
         Ok(CudaStorage {
             slice,
             device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 

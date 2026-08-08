@@ -145,29 +145,33 @@ mod tests {
             assert!(arena_count_after_8 >= arena_count_after_4);
         }
 
+        /// Writing a sequence materialises arenas, and each band's slot is a
+        /// run of the class's bytes. There is no "float arena" to ask for any
+        /// more — an arena holds whatever fits its stride.
         #[test]
-        fn test_float_arena_kv_access() {
+        fn writing_a_sequence_materialises_class_arenas() {
             let backing = create_test_backing();
 
             backing.ensure_for_offset(0, 0, 32).unwrap();
 
-            let k_arenas = backing.k_arenas();
-            let v_arenas = backing.v_arenas();
+            let (count, strides) = backing
+                .with_arenas(|arenas| {
+                    let mut strides: Vec<usize> =
+                        arenas.values().map(|a| a.slot_stride()).collect();
+                    strides.sort_unstable();
+                    strides.dedup();
+                    (arenas.len(), strides)
+                })
+                .unwrap();
 
-            assert_eq!(k_arenas.len(), 1);
-            assert_eq!(v_arenas.len(), 1);
-
-            // Palette-split arenas store one head, one side, one palette band.
-            // With head_dim=32 and N_PALETTE=4 this becomes (8192, 32, 8).
-            assert_eq!(k_arenas[0].dims(), &[8192, 32, 8]);
-            assert_eq!(v_arenas[0].dims(), &[8192, 32, 8]);
+            assert!(count > 0, "a written sequence must have arenas behind it");
+            for stride in strides {
+                assert!(
+                    crate::kv_cache::chunked::LADDER.contains(&stride),
+                    "every arena's stride must be a rung of the ladder, got {stride}"
+                );
+            }
         }
-    }
-
-    // ==================== Chunk Allocation Tests ====================
-
-    mod chunk_allocation_tests {
-        use super::*;
 
         #[test]
         fn test_sequential_chunk_allocation() {
@@ -399,16 +403,123 @@ mod tests {
             );
         }
 
+        // ── Scarcity-only class promotion ────────────────────────────────
+        //
+        // A chunk may occupy a slot of the next class up when its own class
+        // has no free slot AND no region can be had for it. Strictly
+        // scarcity-gated: under any region availability a class gets its own
+        // (`docs/archived/arena_unification.md` §3.4).
+
+        /// **The gate.** Under normal conditions — regions freely available —
+        /// nothing promotes, however many chunks are claimed. If this ever
+        /// fails, promotion has become a background mixing vector and the
+        /// per-class occupancy numbers stop meaning anything.
+        #[test]
+        fn ordinary_allocation_never_promotes() {
+            use crate::kv_cache::chunked::class_promotion_count;
+
+            let before = class_promotion_count();
+            let backing = create_test_backing();
+            for i in 0..3 {
+                backing.alloc_sequence().unwrap();
+                let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+                let v = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+                backing.write_contiguous(i, 0, &k, &v).unwrap();
+            }
+            assert_eq!(
+                class_promotion_count(),
+                before,
+                "a well-fed allocator must never widen a chunk's class"
+            );
+        }
+
+        /// A promoted chunk is still addressed correctly, because reads take
+        /// their extent from the band's *format* bytes and never from the
+        /// slot stride. The wider slot changes only the pad.
+        #[test]
+        fn a_wider_slot_still_round_trips_its_band() {
+            use crate::kv_cache::chunked::size_class::SizeClass;
+
+            // Write a BF16 band's worth of bytes into a slot two rungs above
+            // the one it would normally take, and read exactly its payload
+            // back out.
+            let class = SizeClass::at(6);
+            let bytes = class.chunks_per_region() * class.bytes();
+            let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
+            let mut arena = crate::kv_cache::chunked::Arena::new(
+                data,
+                class,
+                crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                0,
+            );
+
+            let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+            let src = Tensor::from_slice(&payload, payload.len(), &Device::Cpu).unwrap();
+            arena.write_slot_bytes(3, &src).unwrap();
+
+            let back = arena
+                .slot_bytes(3, payload.len())
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap();
+            assert_eq!(back, payload, "the band reads back exactly");
+
+            // And the pad past it is untouched — it belongs to no chunk.
+            let pad = arena
+                .slot_bytes(3, class.bytes())
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap();
+            assert!(
+                pad[payload.len()..].iter().all(|&b| b == 0),
+                "the pad past the payload must stay zero"
+            );
+        }
+
+        /// Promotion walks **one rung at a time** and gives up at the top
+        /// rather than wrapping. The top class failing is the honest answer:
+        /// there is nowhere wider to go.
+        #[test]
+        fn promotion_walks_the_ladder_and_stops() {
+            use crate::kv_cache::chunked::size_class::SizeClass;
+
+            let mut class = SizeClass::at(0);
+            let mut widths = vec![class.bytes()];
+            while let Some(next) = class.promote() {
+                assert!(
+                    next.bytes() > class.bytes(),
+                    "a promotion must always widen"
+                );
+                class = next;
+                widths.push(class.bytes());
+            }
+            assert_eq!(widths.len(), SizeClass::COUNT);
+            assert!(
+                class.promote().is_none(),
+                "the top class has nowhere to promote to"
+            );
+        }
+
         /// GIDs encode arena_idx and chunk_idx. Verify the encoding is correct
         /// for the first two arenas.
         #[test]
         fn test_gid_encodes_arena_and_chunk_indices_correctly() {
-            let arena_chunks =
-                crate::arena_chunks_for_format(crate::kv_cache::KvFormat::Float(DType::BF16));
-            let gid_stride = crate::arena_gid_stride();
+            // Capacity is the SIZE CLASS's slot count, not a per-format one.
+            // This backing's BF16 band is 32 tokens x 8 dims x 2 B = 512 B,
+            // which lands on the 640 B rung.
+            let class = crate::kv_cache::chunked::class_for_format(
+                crate::kv_cache::KvFormat::Float(DType::BF16),
+                crate::CHUNK_SIZE * (32 / crate::kv_cache::arena_table::N_PALETTE),
+            )
+            .expect("BF16 is covered by the ladder");
+            let arena_chunks = class.chunks_per_region();
+            let gid_stride = crate::GID_STRIDE;
             // Each block uses GIDS_PER_HEAD*n_kv_head = 8*4 = 32 GIDs.
             // To spill into arena 1 we need more than one arena worth of K-head slots.
-            let seqs_per_arena = arena_chunks / 32;
+            // Enough sequences that the pool must register a second arena:
+            // each block claims GIDS_PER_HEAD * n_kv_head = 32 slots, and a run
+            // never straddles an arena, so round UP before adding one.
+            let seqs_per_arena = arena_chunks.div_ceil(32);
             let n_seqs = seqs_per_arena + 1;
             let backing =
                 ChunkedKvBacking::new(n_seqs + 1, 4, 32, DType::BF16, &Device::Cpu, 32).unwrap();
@@ -420,16 +531,20 @@ mod tests {
                 backing.write_contiguous(i, 0, &k, &v).unwrap();
             }
 
-            // The last sequence's K head-0 GID should be in arena 1
-            let last_gid = k_gid_snapshot(&backing)[seqs_per_arena][0];
+            // The last sequence's K head-0 GID must have spilled into arena 1,
+            // and must decode as `(raw / GID_STRIDE, raw % GID_STRIDE)` — the
+            // shift/mask split the CUDA side performs.
+            let last_gid = k_gid_snapshot(&backing)[seqs_per_arena][0] as usize;
 
             assert_eq!(
-                last_gid as usize, gid_stride,
-                "GID {} should be the base of arena 1 = {}",
-                last_gid, gid_stride
+                last_gid / gid_stride,
+                1,
+                "GID {last_gid} should have spilled into arena 1                  (arena 0 holds {arena_chunks} slots)"
             );
-            assert_eq!(last_gid as usize / gid_stride, 1, "arena_idx should be 1");
-            assert_eq!(last_gid as usize % gid_stride, 0, "chunk_idx should be 0");
+            assert!(
+                last_gid % gid_stride < arena_chunks,
+                "the chunk index must be inside the arena's capacity"
+            );
         }
 
         /// Allocate multiple blocks per sequence. Verify all GIDs are unique
@@ -496,9 +611,20 @@ mod tests {
 
         /// migrate_chunk must return a GID from the pool (not a raw mint), and
         /// the returned GID must be distinct from the source.
+        /// The CPU key a gid's slot relocates into: same size class, warm tier.
+        fn cpu_key_of(backing: &ChunkedKvBacking, raw: i64) -> crate::kv_cache::chunked::ArenaKey {
+            use crate::kv_cache::arena_table::ArenaLocation;
+            use crate::kv_cache::chunked::{ArenaKey, GID_STRIDE};
+            let arena_idx = (raw as usize) / GID_STRIDE;
+            let key = backing
+                .with_arenas(|a| a.get(&arena_idx).map(|a| a.arena_key()))
+                .unwrap()
+                .expect("source arena exists");
+            ArenaKey::new(key.class, ArenaLocation::Cpu)
+        }
+
         #[test]
         fn test_migrate_chunk_gid_comes_from_pool_not_stolen() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = create_test_backing();
             backing.alloc_sequence().unwrap();
             let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
@@ -507,8 +633,9 @@ mod tests {
 
             let src_gid = k_gid_snapshot(&backing)[0][0];
 
-            // Migrate to CPU (same dtype, different location — triggers alloc_chunk_for_key)
-            let target = ArenaKey::cpu_float(DType::BF16);
+            // Relocate to CPU: same class, different location — the shape
+            // every production migrate has (a slot move never converts).
+            let target = cpu_key_of(&backing, src_gid);
             let new_gid = backing.migrate_chunk(src_gid, target).unwrap();
 
             // The new GID must be distinct from the source
@@ -520,7 +647,6 @@ mod tests {
         /// and is placed in the same arena format (no new arena needed if one exists).
         #[test]
         fn test_migrate_chunk_same_format_stays_in_same_arena_pool() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = ChunkedKvBacking::new(4, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
 
             // Allocate 2 sequences
@@ -534,8 +660,8 @@ mod tests {
             let before = backing.arena_count().unwrap();
 
             let src = k_gid_snapshot(&backing)[0][0];
-            // Migrate to same format (cpu-float BF16 → cpu-float BF16 copy)
-            let target = ArenaKey::cpu_float(DType::BF16);
+            // Relocate within the same class — the copy path.
+            let target = cpu_key_of(&backing, src);
             let new_gid = backing.migrate_chunk(src, target).unwrap();
 
             let after = backing.arena_count().unwrap();
@@ -552,7 +678,6 @@ mod tests {
         /// all N GIDs come from pool allocations, none are double-allocated.
         #[test]
         fn test_migrate_multiple_chunks_unique_gids() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = create_test_backing();
 
             // Allocate 3 sequences
@@ -563,8 +688,6 @@ mod tests {
                 backing.write_contiguous(i, 0, &k, &v).unwrap();
             }
 
-            let target = ArenaKey::cpu_float(DType::BF16);
-
             let src_gids: Vec<i64> = {
                 let snap = k_gid_snapshot(&backing);
                 (0..3).map(|i| snap[i][0]).collect()
@@ -572,7 +695,10 @@ mod tests {
             // Keep the returned ChunkGids alive so RAII doesn't immediately return them
             let held_gids: Vec<_> = src_gids
                 .iter()
-                .map(|src| backing.migrate_chunk(*src, target.clone()).unwrap())
+                .map(|src| {
+                    let target = cpu_key_of(&backing, *src);
+                    backing.migrate_chunk(*src, target).unwrap()
+                })
                 .collect();
             let new_gids: Vec<i64> = held_gids.iter().map(|g| g.raw()).collect();
 

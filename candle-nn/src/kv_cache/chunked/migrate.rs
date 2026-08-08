@@ -22,6 +22,29 @@ use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
 use candle::cuda::cudarc::driver::CudaStream;
 
+/// Bytes one band occupies, from the band's own format tag.
+///
+/// The migration plan's copy lengths come from here rather than from the
+/// arena: a size-class arena holds whatever fits its slots, so its stride is an
+/// upper bound on a band's bytes, never the bytes themselves
+/// (`docs/archived/arena_unification.md` invariant 8). A tag that names no storage
+/// format has no length, and a plan built on a guessed length would move the
+/// wrong bytes — so it is an error, not a default.
+#[cfg(feature = "cuda")]
+fn band_payload(
+    tag: crate::kv_cache::ArenaFormatTag,
+    elems_per_chunk: usize,
+) -> candle::Result<i64> {
+    super::size_class::payload_bytes_for_tag(tag, elems_per_chunk)
+        .map(|b| b as i64)
+        .ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "migration plan: band tag {tag:?} names no storage format, so its byte \
+                 length is unknown"
+            ))
+        })
+}
+
 /// One copy in a migration plan: `byte_len` bytes from `src_ptr` to
 /// `dst_ptr`, both raw device addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +199,11 @@ impl super::ChunkedKvBacking {
         chunks: &[super::SealedChunk],
     ) -> candle::Result<Vec<(i64, i64)>> {
         let arena_info = self.resolve_arena_info()?;
+        let elems = self.inner.elems_per_chunk();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for chunk in chunks {
-            for gid in chunk.gids.0.iter() {
+            for (gid, tag) in chunk.bands() {
                 let arena_idx = gid.arena_idx();
                 let chunk_idx = gid.chunk_idx();
                 if !seen.insert((arena_idx, chunk_idx)) {
@@ -196,7 +220,7 @@ impl super::ChunkedKvBacking {
                     ));
                 }
                 let ptr = arena.base_ptr as i64 + chunk_idx as i64 * arena.chunk_byte_stride;
-                out.push((ptr, arena.chunk_byte_stride));
+                out.push((ptr, band_payload(tag, elems)?));
             }
         }
         Ok(out)
@@ -214,10 +238,11 @@ impl super::ChunkedKvBacking {
         chunks: &[super::SealedChunk],
     ) -> candle::Result<Vec<Vec<(i64, i64)>>> {
         let arena_info = self.resolve_arena_info()?;
+        let elems = self.inner.elems_per_chunk();
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let mut per = Vec::with_capacity(chunk.gids.0.len());
-            for gid in chunk.gids.0.iter() {
+            for (gid, tag) in chunk.bands() {
                 let arena_idx = gid.arena_idx();
                 let chunk_idx = gid.chunk_idx();
                 let arena = arena_info.get(arena_idx).ok_or_else(|| {
@@ -231,7 +256,7 @@ impl super::ChunkedKvBacking {
                     ));
                 }
                 let ptr = arena.base_ptr as i64 + chunk_idx as i64 * arena.chunk_byte_stride;
-                per.push((ptr, arena.chunk_byte_stride));
+                per.push((ptr, band_payload(tag, elems)?));
             }
             out.push(per);
         }
@@ -270,12 +295,12 @@ impl super::ChunkedKvBacking {
             }
             let kv_bytes = blob[cursor..cursor + n].to_vec();
             cursor += n;
-            let (k_formats, v_formats) = self.kv_formats_for_gids(&sc.gids)?;
+            let (k_formats, v_formats) = sc.format_tags()?;
             out.push(HostSealedChunk {
                 offset: sc.offset,
                 token_count: sc.token_count,
-                k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
-                v_formats: v_formats.iter().map(|f| f.to_tag()).collect(),
+                k_formats: k_formats.to_vec(),
+                v_formats: v_formats.to_vec(),
                 k_pal: (*sc.k_pal).clone(),
                 v_pal: (*sc.v_pal).clone(),
                 k_scale: (*sc.k_scale).clone(),
@@ -360,7 +385,7 @@ impl super::ChunkedKvBacking {
         // Resolve per-chunk device (ptr, len) destinations in the same gid-walk
         // order the dump used, then scatter each chunk's captured bytes onto its
         // freshly-claimed device slots.
-        let block_ptrs = self.resolve_block_ptrs_from_hgids(&hgids, &arena_info)?;
+        let block_ptrs = self.resolve_block_ptrs_from_hgids(&hgids, &specs, &arena_info)?;
         if block_ptrs.len() != chunks.len() {
             return Err(candle::Error::Msg(format!(
                 "load_sealed_from_host: resolved {} block ptr sets for {} chunks",
@@ -401,12 +426,27 @@ impl super::ChunkedKvBacking {
     pub fn resolve_block_ptrs_from_hgids(
         &self,
         hgids: &[super::head_gids::HeadGids],
+        specs: &[BlockAllocSpec],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> candle::Result<Vec<Vec<(i64, i64)>>> {
+        if specs.len() != hgids.len() {
+            return Err(candle::Error::Msg(format!(
+                "resolve_block_ptrs_from_hgids: {} specs for {} blocks",
+                specs.len(),
+                hgids.len()
+            )));
+        }
+        let elems = self.inner.elems_per_chunk();
         let mut out: Vec<Vec<(i64, i64)>> = Vec::with_capacity(hgids.len());
-        for block in hgids {
+        for (block, spec) in hgids.iter().zip(specs) {
+            // The block was allocated from these formats, so they are also the
+            // authority on how many bytes each of its bands holds. Reading the
+            // length off the arena instead would give the class stride, which
+            // is generally larger (invariant 8).
+            let k_fmt: Vec<u8> = spec.k_formats.iter().map(|f| f.to_tag()).collect();
+            let v_fmt: Vec<u8> = spec.v_formats.iter().map(|f| f.to_tag()).collect();
             let mut block_ptrs: Vec<(i64, i64)> = Vec::with_capacity(block.0.len());
-            for gid in block.0.iter() {
+            for (gid, tag) in super::head_gids::band_tags(block, &k_fmt, &v_fmt) {
                 let arena_idx = gid.arena_idx();
                 let chunk_idx = gid.chunk_idx();
                 let arena = arena_info.get(arena_idx).ok_or_else(|| {
@@ -420,7 +460,7 @@ impl super::ChunkedKvBacking {
                     ));
                 }
                 let ptr = arena.base_ptr as i64 + chunk_idx as i64 * arena.chunk_byte_stride;
-                block_ptrs.push((ptr, arena.chunk_byte_stride));
+                block_ptrs.push((ptr, band_payload(tag, elems)?));
             }
             out.push(block_ptrs);
         }

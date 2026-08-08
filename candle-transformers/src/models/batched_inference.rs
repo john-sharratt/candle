@@ -33,7 +33,7 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvCache, KvFormat,
+    ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
     QuantFormat,
 };
 use std::collections::{HashMap, HashSet};
@@ -45,7 +45,6 @@ use super::batched_model::{BatchedInference, BatchedModelCore, WavePhase};
 use super::tensor_cat::TensorCat;
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
-use crate::models::profile::{pipeline_record, profile_now};
 
 /// Inference mode specifying both compute dtype and KV cache storage format.
 ///
@@ -836,7 +835,7 @@ impl BatchedInferenceSession {
             let entry_start = pm_flat.len();
             pm_seq_byte_offsets.push(entry_start * 4);
             let chunks = self.backings[0]
-                .live_chunks_as_sealed(seq_idx, &[])
+                .live_chunks_as_sealed(seq_idx)
                 .unwrap_or_default();
             for (sidx, c) in chunks.iter().enumerate() {
                 let base = (sidx as u32) << 16;
@@ -1296,139 +1295,26 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
-    /// Cheap session-level compaction check.
+    /// Sweep fully-empty KV arenas across all backings, returning their regions
+    /// to the free list. Returns arenas freed.
     ///
-    /// This only inspects backing state and does not move or free anything.
-    pub fn compact_check(&self) -> Result<bool> {
-        let t_check = profile_now();
-        let mut should_run = false;
-        for backing in &self.backings {
-            should_run |= backing.needs_compaction()?;
-        }
-        pipeline_record("session:kv_compact_check", t_check);
-        Ok(should_run)
-    }
-
-    /// Compact all arena backings to release unused tail arenas.
+    /// Runs per-wave, and it is cheap: an arena release is a free-list push and
+    /// nothing more. It used to be neither. Releasing an arena unmapped its
+    /// slab, so this took the process-global arena-topology write lock — the
+    /// migrate's per-head table captured raw base pointers of every arena and
+    /// dereferenced them from a kernel with no lock held — and then paid a full
+    /// `device.synchronize()` to retire trailing kernels before the unmap.
+    /// A whole-device sync, every wave, on the sweep path.
     ///
-    /// Call this after freeing sequences to reclaim GPU memory.
-    /// Returns the total number of arenas freed across all layers.
-    pub fn compact(&self) -> Result<usize> {
-        // Exclude pointer captures (hot→warm migrate / warm→hot elevate) for the
-        // WHOLE compaction: relocating/freeing an arena a capture's kernel is
-        // mid-read (cross-thread, unfenced) → CUDA_ERROR_ILLEGAL_ADDRESS. The
-        // guard is a held write lock, not an advisory check — a capture starting
-        // mid-compaction blocks until the compaction finishes. On contention we
-        // skip; relief resumes next wave (captures run in ~hundreds of ms).
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        if !self.compact_check()? {
-            return Ok(0);
-        }
-        // Quiesce in-flight kernels before unmapping: wave kernels don't take
-        // the topology lock — their uploaded tables pin chunks host-side only —
-        // so a trailing (deep-queued) kernel may still be reading arenas that
-        // emptied after its launch. One bounded sync per relief pass, at the
-        // only chokepoint where device memory actually unmaps.
-        self.device.synchronize()?;
-        let t_compact = profile_now();
-        let mut total_freed = 0;
-        for backing in &self.backings {
-            total_freed += backing.compact()?;
-        }
-        pipeline_record("session:kv_compact_run", t_compact);
-        Ok(total_freed)
-    }
-
-    /// Force compaction across all backings (defrag threshold 0) and release
-    /// reclaimed arenas. Used by the scheduler's VRAM-pressure backpressure
-    /// path, where reclaiming any arena is worth it. Returns arenas freed.
-    pub fn compact_forced(&self) -> Result<usize> {
-        // See `compact` — held for the whole forced pass, quiesced before it.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        self.device.synchronize()?;
-        let mut total_freed = 0;
-        for backing in &self.backings {
-            total_freed += backing.compact_forced()?;
-        }
-        Ok(total_freed)
-    }
-
-    /// Bounded forced defragment across backings: relocate at most `max_moves`
-    /// chunks total (the budget is threaded across layers so a large fragmented
-    /// gap consolidates over several bounded passes instead of one long blocking
-    /// compaction). Does NOT release the emptied arenas — pair with
-    /// [`release_empty_arenas`](Self::release_empty_arenas). Returns chunks moved.
-    pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
-        // See `compact` — relocation reindexes arenas a capture's frozen gids
-        // address, so the exclusion covers the whole bounded pass.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        let n = self.backings.len();
-        if n == 0 {
-            return Ok(0);
-        }
-        // See `compact` — quiesce before relocating (a move frees the source).
-        self.device.synchronize()?;
-        let mut remaining = max_moves;
-        let mut moved = 0;
-        for (i, backing) in self.backings.iter().enumerate() {
-            if remaining == 0 {
-                break;
-            }
-            // Fair share of the remaining budget for the backings still to
-            // visit, so an early fragmented layer can't consume the whole
-            // budget and starve the rest (which would leave later layers'
-            // reserved gaps un-compacted). Layers that use less than their
-            // share leave the remainder for later ones (the divisor shrinks),
-            // so the full budget is still spent when work exists.
-            let share = remaining.div_ceil(n - i);
-            let m = backing.defragment_bounded(share)?;
-            remaining = remaining.saturating_sub(m);
-            moved += m;
-        }
-        Ok(moved)
-    }
-
-    /// Release fully-empty KV arenas across all backings **without** the
-    /// chunk-moving defrag — cheap VRAM relief for the scheduler's pressure
-    /// path (the costly speculative defrag is left to the allocation-time OOM
-    /// retry). Returns arenas freed.
+    /// Under the reservation nothing unmaps: the region stays mapped at the
+    /// same address forever and only changes which list names it. The wait that
+    /// genuinely is needed moved to where re-tenanting happens, in
+    /// `region_pool::claim_region`, where it is paid once per claim instead of
+    /// once per wave.
     pub fn release_empty_arenas(&self) -> Result<usize> {
-        // See `compact`. The migrate's dense per-head table addresses EVERY
-        // arena — including fully-empty ones — so even this "only frees what
-        // nothing uses" sweep is a pointer invalidator: the capture's own source
-        // arenas are Arc-pinned (never `live==0`), but empty neighbour arenas in
-        // the table are exactly what this sweep unmaps. Held for the whole sweep
-        // so a capture starting mid-sweep waits instead of racing it.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        // See `compact` — quiesce before unmapping. An arena that emptied this
-        // wave may still be addressed by that wave's in-flight trailing kernels.
-        self.device.synchronize()?;
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.release_empty_arenas()?;
-        }
-        Ok(total_freed)
-    }
-
-    /// [`Self::release_empty_arenas`] with the anti-churn free-headroom guard
-    /// bypassed, for callers that only run under VRAM pressure (the relief
-    /// ladder, the footprint reclaim). Same topology guard and quiesce.
-    pub fn release_empty_arenas_forced(&self) -> Result<usize> {
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        self.device.synchronize()?;
-        let mut total_freed = 0;
-        for backing in &self.backings {
-            total_freed += backing.release_empty_arenas_forced()?;
         }
         Ok(total_freed)
     }
@@ -1445,13 +1331,9 @@ impl BatchedInferenceSession {
         None
     }
 
-    /// Pool-aware KV-VRAM budget headroom in bytes (`init_free - pool_used -
-    /// reserve`), or `None` on non-CUDA / query failure. Unlike
-    /// [`Self::vram_free_total`] (the volatile driver `cuMemGetInfo` free, which
-    /// our stream-ordered pool's reserved-but-free memory hides from and which
-    /// WDDM pollutes with other processes' resident memory), this counts only
-    /// *our* live footprint — so KV freed back into the pool registers as
-    /// headroom. This is the number the per-arena budget gate already uses.
+    /// Bytes of KV the reservation can still hold — free regions × the region
+    /// size, an exact count. `None` on non-CUDA, or before this device has a
+    /// reservation. See [`candle_nn::kv_cache::vram_budget_available`].
     pub fn vram_budget_available(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         return candle_nn::kv_cache::vram_budget_available(&self.device);
@@ -1468,14 +1350,6 @@ impl BatchedInferenceSession {
             return candle::vram::get(gpu_id);
         }
         None
-    }
-
-    /// True when a forced compaction could free at least one whole arena from
-    /// any KV backing. When false, the cache is packed to within a single arena
-    /// of free space and compaction would reclaim nothing — the scheduler uses
-    /// this to skip a futile compaction pass under VRAM pressure.
-    pub fn can_reclaim_arena(&self) -> bool {
-        self.backings.iter().any(|b| b.can_reclaim_arena())
     }
 
     /// Our CUDA memory pool's `(used, reserved)` bytes — what our allocations
@@ -1495,12 +1369,6 @@ impl BatchedInferenceSession {
         )
     }
 
-    /// Bytes a new KV arena may still take before the allocator refuses — see
-    /// [`candle_nn::kv_cache::kv_alloc_headroom`]. Admission clamps to this.
-    pub fn kv_alloc_headroom(&self) -> Option<usize> {
-        candle_nn::kv_cache::kv_alloc_headroom(&self.device)
-    }
-
     pub fn vram_pool_stats(&self) -> Option<(usize, usize)> {
         #[cfg(feature = "cuda")]
         {
@@ -1513,46 +1381,11 @@ impl BatchedInferenceSession {
         None
     }
 
-    /// GPU KV arena occupancy split float vs quant. Reads the shared GID pool
+    /// GPU KV arena occupancy per size class. Reads the shared GID pool
     /// via layer 0's backing (arenas pool globally across same-config layers, so
     /// one backing is the whole model). `None` when there are no backings.
-    pub fn kv_gpu_format_stats(&self) -> Option<GpuArenaFormatStats> {
-        self.backings.first().map(|b| b.gpu_arena_format_stats())
-    }
-
-    /// Release reserved-but-free CUDA pool memory back to the OS, keeping at
-    /// least `keep_bytes` reserved. Returns the `(reserved_before,
-    /// reserved_after)` bytes on success so callers can log what was reclaimed,
-    /// or `None` on non-CUDA / when the pool allocator is unavailable.
-    ///
-    /// The async pool only returns freed blocks to the OS when the stream idles,
-    /// which never happens under continuous inference — so `pool_reserved`
-    /// climbs to its fragmentation high-water and oversubscribes the card while
-    /// `pool_used` (the budget's denominator) reads far lower. Trimming keeps
-    /// `pool_reserved` tracking `pool_used` so the VRAM budget stays physically
-    /// accurate. Only releases memory nothing is using; never touches live KV.
-    pub fn trim_kv_pool(&self, keep_bytes: usize) -> Option<(usize, usize)> {
-        // `cuMemPoolTrimTo` SYNCHRONOUSLY unmaps freed pool memory (not
-        // stream-ordered) — the sharpest form of the free-under-read crash — so
-        // the exclusion is held across the trim itself (see `compact`).
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return None;
-        };
-        // See `compact` — quiesce before the (synchronous, non-stream-ordered)
-        // pool unmap.
-        self.device.synchronize().ok()?;
-        #[cfg(feature = "cuda")]
-        {
-            if let Device::Cuda(d) = &self.device {
-                let before = d.pool_reserved_bytes().ok()?;
-                d.trim_pool(keep_bytes).ok()?;
-                let after = d.pool_reserved_bytes().unwrap_or(before);
-                return Some((before, after));
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        let _ = keep_bytes;
-        None
+    pub fn kv_gpu_class_stats(&self) -> Option<GpuArenaClassStats> {
+        self.backings.first().map(|b| b.gpu_arena_class_stats())
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.
@@ -2038,14 +1871,7 @@ impl BatchedInferenceSession {
             }
         };
 
-        let arena_infos = match backing.resolve_arena_info() {
-            Ok(a) => a,
-            Err(e) => {
-                println!("[pal4] seq={seq_idx}: resolve_arena_info failed: {e}");
-                return;
-            }
-        };
-        let chunks = match backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
+        let chunks = match backing.live_chunks_as_sealed(seq_idx) {
             Some(c) => c,
             None => {
                 println!("[pal4] seq={seq_idx}: not allocated");
@@ -2060,30 +1886,18 @@ impl BatchedInferenceSession {
         let n_kv_head = backing.n_kv_head();
         let head_dim = backing.head_dim();
 
-        // Snapshot arena format info once. Kept strongly typed — string
-        // conversion happens only at the point where a label is needed
-        // (tally display or grid short-label).
-        let fmt_map: Vec<Option<KvFormat>> = backing
-            .with_arenas(|arenas| {
-                let max_idx = arenas.keys().max().copied().unwrap_or(0);
-                let mut v = vec![None; max_idx + 1];
-                for (&idx, arena) in arenas.iter() {
-                    v[idx] = Some(arena.format());
-                }
-                v
-            })
-            .unwrap_or_default();
-
-        let gid_fmt = |gid: &candle_nn::kv_cache::ChunkGid| -> Option<KvFormat> {
-            if gid.is_empty() {
-                None
-            } else {
-                fmt_map.get(gid.arena_idx()).copied().flatten()
-            }
+        // Band formats come from the chunk's own tags. A grid built from arena
+        // state would report every band of a shared size-class region
+        // identically, which is exactly the mixed-format variety this grid
+        // exists to display. Kept strongly typed — string conversion happens
+        // only where a label is needed (tally display or grid short-label).
+        let band_fmt = |tags: &[u8], h: usize, p: usize| -> Option<KvFormat> {
+            tags.get(h * N_PALETTE + p)
+                .copied()
+                .and_then(KvFormat::from_tag)
         };
-        let gid_is_quant = |gid: &candle_nn::kv_cache::ChunkGid| -> bool {
-            !gid.is_empty()
-                && matches!(gid_fmt(gid), Some(KvFormat::Quantized(qf)) if qf != QuantFormat::R16)
+        let is_real_quant = |fmt: Option<KvFormat>| -> bool {
+            matches!(fmt, Some(KvFormat::Quantized(qf)) if qf != QuantFormat::R16)
         };
 
         // Full label for tally/headline output (e.g. "Q8_0", "F16", "NULL").
@@ -2185,11 +1999,9 @@ impl BatchedInferenceSession {
                 let mut hk_row = Vec::with_capacity(N_PALETTE);
                 let mut hv_row = Vec::with_capacity(N_PALETTE);
                 for p in 0..N_PALETTE {
-                    let k_gid = chunk.gids.k_gid_pal(h, p);
-                    let v_gid = chunk.gids.v_gid_pal(h, p);
-                    let kf = gid_fmt(k_gid);
-                    let vf = gid_fmt(v_gid);
-                    has_quant |= gid_is_quant(k_gid) || gid_is_quant(v_gid);
+                    let kf = band_fmt(&chunk.k_fmt, h, p);
+                    let vf = band_fmt(&chunk.v_fmt, h, p);
+                    has_quant |= is_real_quant(kf) || is_real_quant(vf);
                     hk_row.push(fmt_grid_label(kf));
                     hv_row.push(fmt_grid_label(vf));
                     *k_counts.entry(kf).or_insert(0) += 1;

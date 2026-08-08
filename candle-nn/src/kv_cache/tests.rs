@@ -31,6 +31,20 @@ fn make_chunked_kvcache(backing: &ChunkedKvBacking) -> Result<KvCache> {
     Ok(kv)
 }
 
+/// Read the head of one band's slot back as `f32`.
+///
+/// The arena is a run of untyped bytes, so the dtype is the caller's to
+/// supply — these fixtures write `F32` through `write_contiguous`.
+fn band_f32(backing: &ChunkedKvBacking, raw: usize, elems: usize) -> Result<Vec<f32>> {
+    backing.with_arenas(|arenas| {
+        arenas
+            .get(&(raw / GID_STRIDE))
+            .expect("gid must point at a live arena")
+            .read_slot_typed(raw % GID_STRIDE, DType::F32, elems)?
+            .to_vec1::<f32>()
+    })?
+}
+
 #[test]
 fn test_kvcache_fork_chunked() -> Result<()> {
     use crate::kv_cache::cache::CacheStorage;
@@ -313,15 +327,8 @@ fn test_share_preserves_source_data() -> Result<()> {
     backing.write_contiguous(1, 32, &k1, &v1)?;
 
     // Read back and verify seq 0's data is unchanged
-    let k_arenas = backing.k_arenas();
     let table = k_gid_snapshot(&backing);
-
-    let seq0_gid = table[0][0] as usize;
-    let arena_idx = seq0_gid / arena_gid_stride();
-    let chunk_idx = seq0_gid % arena_gid_stride();
-
-    let chunk = k_arenas[arena_idx].narrow(0, chunk_idx, 1)?;
-    let values = chunk.flatten_all()?.to_vec1::<f32>()?;
+    let values = band_f32(&backing, table[0][0] as usize, CHUNK_SIZE)?;
 
     // Seq 0's chunk should still be all 1.0
     assert!(values.iter().all(|&x| (x - 1.0).abs() < 1e-6));
@@ -490,16 +497,10 @@ fn test_fork_sequence_preserves_data() -> Result<()> {
     backing.fork_sequence(0, 1, 50)?;
 
     // Read back from seq 1's partial block and verify data
-    let k_arenas = backing.k_arenas();
     let table = k_gid_snapshot(&backing);
 
     // Check the copied partial block (block 1)
-    let seq1_gid = table[1][1] as usize;
-    let arena_idx = seq1_gid / arena_gid_stride();
-    let chunk_idx = seq1_gid % arena_gid_stride();
-
-    let chunk = k_arenas[arena_idx].narrow(0, chunk_idx, 1)?;
-    let first_val = chunk.flatten_all()?.to_vec1::<f32>()?[0];
+    let first_val = band_f32(&backing, table[1][1] as usize, 1)?[0];
     assert!((first_val - 42.0).abs() < 0.01, "data should be preserved");
 
     Ok(())
@@ -527,15 +528,8 @@ fn test_fork_sequence_append_independence() -> Result<()> {
     backing.write_contiguous(1, 50, &k1, &v1)?;
 
     // Verify seq 0's partial block data unchanged
-    let k_arenas = backing.k_arenas();
     let table = k_gid_snapshot(&backing);
-
-    let seq0_gid = table[0][1] as usize;
-    let arena_idx = seq0_gid / arena_gid_stride();
-    let chunk_idx = seq0_gid % arena_gid_stride();
-
-    let chunk = k_arenas[arena_idx].narrow(0, chunk_idx, 1)?;
-    let first_val = chunk.flatten_all()?.to_vec1::<f32>()?[0];
+    let first_val = band_f32(&backing, table[0][1] as usize, 1)?[0];
     assert!(
         (first_val - 1.0).abs() < 0.01,
         "seq 0 data should be unchanged"
@@ -1788,56 +1782,35 @@ fn test_float_read_contiguous() -> Result<()> {
     Ok(())
 }
 
-// ==================== PagedKvArenas Trait Tests ====================
+// ==================== Backing configuration accessors ====================
 
+/// The backing reports the geometry and the *configured* formats. Note what it
+/// no longer reports: which arenas are float and which are quantized. An arena
+/// is a run of fixed-stride byte slots and holds whatever fits, so that
+/// question has no answer (`docs/archived/arena_unification.md` principle 8) — a band's
+/// format lives on its chunk.
 #[test]
-fn test_paged_kv_arenas_trait_float() -> Result<()> {
-    use crate::kv_cache::{ChunkedKvBacking, KvFormat};
-
-    let device = Device::Cpu;
-    let n_kv_head = 4;
-    let head_dim = 64;
-    let backing = ChunkedKvBacking::new(1, n_kv_head, head_dim, DType::F32, &device, 256)?;
-
-    // Test trait methods
-    assert_eq!(backing.n_kv_head(), n_kv_head);
-    assert_eq!(backing.head_dim(), head_dim);
-    assert_eq!(backing.k_format(), KvFormat::Float(DType::F32));
-    assert!(!backing.is_quantized());
-
-    // Float arenas should be available
-    assert!(backing.float_arenas().is_some());
-    assert!(backing.quantized_arenas().is_none());
-
-    Ok(())
-}
-
-#[test]
-fn test_paged_kv_arenas_trait_quantized() -> Result<()> {
+fn backing_reports_its_geometry_and_configured_formats() -> Result<()> {
     use crate::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat};
 
     let device = Device::Cpu;
     let n_kv_head = 4;
     let head_dim = 64;
-    let backing = ChunkedKvBacking::new_with_format(
-        1,
-        n_kv_head,
-        head_dim,
-        KvFormat::Quantized(QuantFormat::Q8_0),
-        KvFormat::Quantized(QuantFormat::Q8_0),
-        &device,
-        256,
-    )?;
 
-    // Test trait methods
-    assert_eq!(backing.n_kv_head(), n_kv_head);
-    assert_eq!(backing.head_dim(), head_dim);
-    assert_eq!(backing.k_format(), KvFormat::Quantized(QuantFormat::Q8_0));
-    assert!(backing.is_quantized());
+    let float = ChunkedKvBacking::new(1, n_kv_head, head_dim, DType::F32, &device, 256)?;
+    assert_eq!(float.n_kv_head(), n_kv_head);
+    assert_eq!(float.head_dim(), head_dim);
+    assert_eq!(float.k_format(), KvFormat::Float(DType::F32));
+    assert!(!float.is_quantized());
 
-    // Quantized arenas should be available
-    assert!(backing.float_arenas().is_none());
-    assert!(backing.quantized_arenas().is_some());
+    let q8 = KvFormat::Quantized(QuantFormat::Q8_0);
+    let quant = ChunkedKvBacking::new_with_format(1, n_kv_head, head_dim, q8, q8, &device, 256)?;
+    assert_eq!(quant.k_format(), q8);
+    assert!(quant.is_quantized());
+
+    // Geometry drives every size-class question, so it is exposed and pinned:
+    // head_dim 64 / N_PALETTE 4 = 16, times CHUNK_SIZE 32.
+    assert_eq!(quant.elems_per_chunk(), 32 * 16);
 
     Ok(())
 }

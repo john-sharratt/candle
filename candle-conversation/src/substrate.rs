@@ -1623,9 +1623,9 @@ impl Substrate {
                 // Skip residences pinned into the current wave's working set: a
                 // slot the in-flight decode is actively attending is about to be
                 // (or is being) elevated warm→hot on the shared copy stream and
-                // under the same `enter_migrate()` guard this drain holds. Backing
-                // it up hot→warm right now is redundant work that MONOPOLISES the
-                // persistence thread + guard + stream against the very elevation
+                // on the persistence thread this drain runs on. Backing it up
+                // hot→warm right now is redundant work that MONOPOLISES the
+                // persistence thread + stream against the very elevation
                 // the decode is blocked on — the tier-migration livelock where the
                 // same working set churns hot→warm every pass while the decode
                 // lands zero forwards. Defer its warm copy until it leaves the
@@ -1752,8 +1752,8 @@ impl Substrate {
                 // analogue of the hot→warm skip in `snapshot_pending_warm` (the fix
                 // 47a9c5ba applied only to the hot→warm leg). A just-cold-recalled
                 // working set lands warm-resident and would be gathered warm→cold on
-                // the very next pass; that GPU gather runs OUTSIDE the `enter_migrate`
-                // guard and shares the copy stream + the sealed arenas the in-flight
+                // the very next pass; that GPU gather shares the copy stream and
+                // the sealed arenas the in-flight
                 // decode is still creeping into (Arc-shared via `inject_arc_sealed`),
                 // so it de-syncs the slot's per-layer fill (layer 0 races a chunk
                 // ahead) and the concurrent reproject's `reserve_glue_gap` trips
@@ -7009,7 +7009,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The distill-inclusive lookup admits a tombstoned timeline ONLY when it is
     /// distilled, and an ordinary tombstone stays invisible.
     ///

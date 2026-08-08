@@ -5,19 +5,16 @@
 //!
 //! - [`ArenaLocation`] - Where arena data lives (GPU or CPU)
 //! - [`ArenaFormatTag`] - Storage format identifier for kernel dispatch
-//! - [`ArenaEntry`] - Per-arena metadata (pointers, format, location)
-//! - [`ArenaTable`] - Persistent GPU tensor of arena metadata (1 row per arena)
 //! - [`PaletteSubEntry`] - Per-palette sub-entry metadata (9 fields)
 //! - [`PerHeadEntry`] - Per-head metadata covering all N_PALETTE palette sub-bands (36 fields)
 //! - [`PerHeadTable`] - Persistent GPU tensor of per-head metadata
 //!
 //! # Kernel Interface
 //!
-//! The [`ArenaTable`] maintains a GPU tensor of shape `(num_arenas, 3)` with dtype i64.
-//! Each row contains `[k_ptr, v_ptr, metadata]` where:
-//! - `k_ptr`: Device pointer to K cache data (0 if CPU-only)
-//! - `v_ptr`: Device pointer to V cache data (0 if CPU-only)
-//! - `metadata`: `(k_format_tag << 16) | (v_format_tag << 8) | location`
+//! There is no per-arena table. An arena is a run of fixed-stride byte slots and
+//! carries no format of its own, so the only per-arena quantity a kernel could
+//! want — the base pointer — reaches it inside the per-head row that names the
+//! band. See `docs/archived/arena_unification.md` principle 8.
 //!
 //! The [`PerHeadTable`] maintains a GPU tensor of shape `(num_arenas * n_kv_head, 36)`.
 //! Indexed by `pal0_arena_idx * n_kv_head + head_idx`. Each row contains N_PALETTE=4
@@ -144,51 +141,61 @@ impl ArenaFormatTag {
         }
     }
 
-    /// Convert from GGML type index (as used in GgmlDType::from_gguf_file_code)
+    /// The inverse of [`Self::from_kv_format`].
     ///
-    /// GGML indices: Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q8_1=9
-    ///               Q2K=10, Q3K=11, Q4K=12, Q5K=13, Q6K=14, Q8K=15
-    ///               AWQ=100, AWQG64=101
-    pub fn from_ggml_index(idx: u32) -> Self {
-        match idx {
-            0 => Self::F32,
-            1 => Self::F16,
-            2 => Self::BF16,
-            3 => Self::R16,
-            4 => Self::P2,
-            5 => Self::QAWQ,
-            6 => Self::QAWQ_G64,
-            7 => Self::Q8_0,
-            8 => Self::Q8_1,
-            9 => Self::Q8_K,
-            10 => Self::Q8_KS,
-            11 => Self::Q6_K,
-            12 => Self::Q5_0,
-            13 => Self::Q5_1,
-            14 => Self::Q5_K,
-            15 => Self::Q4_0,
-            16 => Self::Q4_1,
-            17 => Self::Q4_K,
-            18 => Self::Q4_KS,
-            19 => Self::Q3_0,
-            20 => Self::Q3_1,
-            21 => Self::Q3_K,
-            22 => Self::Q2_0,
-            23 => Self::Q2_1,
-            24 => Self::Q2_K,
-            25 => Self::Q2_S,
-            26 => Self::Q2_A,
-            27 => Self::Q1_S,
-            28 => Self::Q0_V,
-            29 => Self::Q1_A,
-            30 => Self::Q0_X,
-            31 => Self::Q0_M2,
-            32 => Self::Q0_M4,
-            33 => Self::Q0,
-            34 => Self::F8E4M3,
-            35 => Self::F8E5M2,
-            _ => Self::Invalid,
-        }
+    /// `None` for the tags that name a storage format the KV cache never
+    /// allocates (`P2`, the QAWQ pair, the GGML K-quants, `F8E5M2`) and for
+    /// `Invalid`. Those are legal *bytes* — a corrupt or future tag decodes to
+    /// one — so a caller that needs a chunk's byte length must treat the
+    /// absence as an error rather than assume a width.
+    ///
+    /// This is how a band's payload length is recovered now that arenas are
+    /// size-class byte slabs and no longer carry a format: the chunk's tag is
+    /// the only record of what its bytes are (`docs/archived/arena_unification.md`
+    /// principle 8). Round-tripping every `KvFormat` through
+    /// `from_kv_format` and back is pinned by
+    /// [`every_kv_format_round_trips_through_its_tag`](tests).
+    pub fn to_kv_format(self) -> Option<KvFormat> {
+        let q = match self {
+            Self::F32 => return Some(KvFormat::Float(DType::F32)),
+            Self::F16 => return Some(KvFormat::Float(DType::F16)),
+            Self::BF16 => return Some(KvFormat::Float(DType::BF16)),
+            Self::F8E4M3 => return Some(KvFormat::Float(DType::F8E4M3)),
+            Self::Q4_0 => QuantFormat::Q4_0,
+            Self::Q4_1 => QuantFormat::Q4_1,
+            Self::Q5_0 => QuantFormat::Q5_0,
+            Self::Q5_1 => QuantFormat::Q5_1,
+            Self::Q8_0 => QuantFormat::Q8_0,
+            Self::Q8_1 => QuantFormat::Q8_1,
+            Self::Q4_KS => QuantFormat::Q4_KS,
+            Self::Q8_KS => QuantFormat::Q8_KS,
+            Self::Q2_0 => QuantFormat::Q2_0,
+            Self::Q3_0 => QuantFormat::Q3_0,
+            Self::R16 => QuantFormat::R16,
+            Self::Q0 => QuantFormat::Q0,
+            Self::Q1_S => QuantFormat::Q1_S,
+            Self::Q2_S => QuantFormat::Q2_S,
+            Self::Q2_A => QuantFormat::Q2_A,
+            Self::Q2_1 => QuantFormat::Q2_1,
+            Self::Q3_1 => QuantFormat::Q3_1,
+            Self::Q0_V => QuantFormat::Q0_V,
+            Self::Q1_A => QuantFormat::Q1_A,
+            Self::Q0_X => QuantFormat::Q0_X,
+            Self::Q0_M2 => QuantFormat::Q0_M2,
+            Self::Q0_M4 => QuantFormat::Q0_M4,
+            Self::P2
+            | Self::QAWQ
+            | Self::QAWQ_G64
+            | Self::Q8_K
+            | Self::Q6_K
+            | Self::Q5_K
+            | Self::Q4_K
+            | Self::Q3_K
+            | Self::Q2_K
+            | Self::F8E5M2
+            | Self::Invalid => return None,
+        };
+        Some(KvFormat::Quantized(q))
     }
 
     /// Convert to DType (for float formats only).
@@ -221,96 +228,15 @@ impl ArenaFormatTag {
     }
 }
 
-// ==================== Arena Entry ====================
-
-/// A single entry in the arena table, representing one arena's metadata.
-///
-/// This is laid out for efficient GPU access:
-/// - `k_ptr`: device pointer to K data (0 if CPU-only)
-/// - `v_ptr`: device pointer to V data (0 if CPU-only)
-/// - `k_format_tag`: [`ArenaFormatTag`] for K cache
-/// - `v_format_tag`: [`ArenaFormatTag`] for V cache
-/// - `location`: [`ArenaLocation`] as u8
-///
-/// The struct is stored as a row of i64 values in the GPU tensor for alignment:
-/// `[k_ptr, v_ptr, (k_format_tag << 16) | (v_format_tag << 8) | location]`
-#[derive(Debug, Clone, Copy)]
-pub struct ArenaEntry {
-    /// Device pointer to K cache data (0 if arena is on CPU)
-    pub k_ptr: u64,
-    /// Device pointer to V cache data (0 if arena is on CPU)
-    pub v_ptr: u64,
-    /// Storage format tag for K cache
-    pub k_format_tag: ArenaFormatTag,
-    /// Storage format tag for V cache
-    pub v_format_tag: ArenaFormatTag,
-    /// Where this arena's data lives
-    pub location: ArenaLocation,
-}
-
-impl ArenaEntry {
-    /// Create a new entry with null pointers (for CPU arenas or placeholder)
-    pub fn new_cpu(k_format_tag: ArenaFormatTag, v_format_tag: ArenaFormatTag) -> Self {
-        Self {
-            k_ptr: 0,
-            v_ptr: 0,
-            k_format_tag,
-            v_format_tag,
-            location: ArenaLocation::Cpu,
-        }
-    }
-
-    /// Create a new entry with GPU pointers
-    pub fn new_gpu(
-        k_ptr: u64,
-        v_ptr: u64,
-        k_format_tag: ArenaFormatTag,
-        v_format_tag: ArenaFormatTag,
-    ) -> Self {
-        Self {
-            k_ptr,
-            v_ptr,
-            k_format_tag,
-            v_format_tag,
-            location: ArenaLocation::Gpu,
-        }
-    }
-
-    /// Encode K/V format tags and location into a single i64 for storage
-    /// Format: [unused:40][k_format_tag:8][v_format_tag:8][location:8]
-    fn encode_metadata(&self) -> i64 {
-        ((self.k_format_tag.as_u8() as i64) << 16)
-            | ((self.v_format_tag.as_u8() as i64) << 8)
-            | (self.location as i64)
-    }
-
-    /// Convert to GPU tensor row format: [k_ptr, v_ptr, metadata]
-    pub fn to_tensor_row(&self) -> [i64; 3] {
-        [self.k_ptr as i64, self.v_ptr as i64, self.encode_metadata()]
-    }
-
-    /// Decode from GPU tensor row format
-    pub fn from_tensor_row(row: [i64; 3]) -> Self {
-        let k_ptr = row[0] as u64;
-        let v_ptr = row[1] as u64;
-        let metadata = row[2];
-        let k_format_tag = Self::decode_format_byte(((metadata >> 16) & 0xFF) as u8);
-        let v_format_tag = Self::decode_format_byte(((metadata >> 8) & 0xFF) as u8);
-        let location = match (metadata & 0xFF) as u8 {
-            0 => ArenaLocation::Gpu,
-            _ => ArenaLocation::Cpu,
-        };
-        Self {
-            k_ptr,
-            v_ptr,
-            k_format_tag,
-            v_format_tag,
-            location,
-        }
-    }
-
-    /// Decode a format byte into an ArenaFormatTag.
-    fn decode_format_byte(byte: u8) -> ArenaFormatTag {
+impl ArenaFormatTag {
+    /// Decode a format byte (as produced by [`Self::as_u8`]) back into a tag.
+    ///
+    /// This is the inverse every per-chunk format tag goes through: chunks
+    /// record their bands' formats as these bytes (`SealedChunk::k_fmt`), the
+    /// substrate persists the same bytes, and both are decoded here.
+    /// Unrecognised bytes become [`Self::Invalid`] rather than panicking — a
+    /// corrupt or future tag must fail the format checks, not the process.
+    pub fn from_u8(byte: u8) -> ArenaFormatTag {
         match byte {
             0 => ArenaFormatTag::F32,
             1 => ArenaFormatTag::F16,
@@ -627,20 +553,33 @@ impl PerHeadTable {
 /// The GPU address for a specific chunk is:
 ///   `base_ptr + chunk_idx * chunk_byte_stride`
 /// where `chunk_idx = gid.chunk_idx()`.
+///
+/// # What is deliberately absent
+///
+/// A format. An arena is a run of fixed-stride byte slots whose tenants may be
+/// any formats that fit, so "the arena's format" is not a question with an
+/// answer. A band's format — and therefore its payload length, its persisted
+/// image, and its checksum — comes from the owning chunk's tag
+/// (`SealedChunk::k_fmt`), never from here. See `docs/archived/arena_unification.md`
+/// principle 8 and invariant 8.
 #[derive(Clone, Debug)]
 pub struct ResolvedArenaInfo {
-    /// Base device pointer for this arena's combined K+V buffer (0 for CPU arenas).
+    /// Base device pointer for this arena's byte slab (0 for CPU arenas).
     pub base_ptr: u64,
-    /// Byte stride between consecutive chunks in this arena.
+    /// Byte stride between consecutive chunk **slots** — the address step,
+    /// `base_ptr + chunk_idx * chunk_byte_stride`, and the extent that must be
+    /// zeroed when a slot is recycled (the next tenant may be a different
+    /// format, so stale bytes past its payload would be read as data by the
+    /// persist quantize pass).
+    ///
+    /// This is the *class* stride and is generally **larger** than the payload
+    /// of the format that happens to occupy a given slot. Never use it as a
+    /// copy length.
     pub chunk_byte_stride: i64,
-    /// Format tag for K data in this arena.
-    pub k_format_tag: ArenaFormatTag,
-    /// Format tag for V data in this arena.
-    pub v_format_tag: ArenaFormatTag,
-    /// Number of chunk slots this arena actually holds. Format-specific and
-    /// generally SMALLER than `arena_gid_stride()` (the raw-GID namespace is
-    /// sized for the densest format), so a gid's `chunk_idx` can be in-range
-    /// for the namespace yet out of range for its arena — addressing past the
-    /// arena's end. Validators compare `chunk_idx` against this, not the stride.
+    /// Number of chunk slots this arena actually holds — `chunks_per_region`
+    /// for its class. Generally much smaller than `GID_STRIDE` (the raw-GID
+    /// namespace is one fixed power of two), so a gid's `chunk_idx` can be
+    /// in-range for the namespace yet past this arena's end. Validators compare
+    /// `chunk_idx` against this, not against the stride.
     pub chunk_capacity: u32,
 }

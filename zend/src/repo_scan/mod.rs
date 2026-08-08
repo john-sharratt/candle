@@ -117,12 +117,13 @@ fn max_live_conversations() -> Option<usize> {
 }
 
 /// Total reserved KV arena bytes in a memory report — the quantity the arena
-/// allocator's ceiling actually counts, across both backings.
+/// allocator's ceiling actually counts, summed over every size class.
 fn kv_reserved(report: &MemoryReport) -> u64 {
     report
         .kv
-        .float_reserved_bytes
-        .saturating_add(report.kv.quant_reserved_bytes)
+        .classes
+        .iter()
+        .fold(0u64, |acc, c| acc.saturating_add(c.reserved_bytes))
 }
 
 /// The count bound, as arithmetic over the report's figures alone.

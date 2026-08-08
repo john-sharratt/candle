@@ -121,6 +121,11 @@ impl KvHeadHost {
     ///   bytes each). Empty slice → identity routing.
     /// - `k_scale_data` / `v_scale_data`: per-head outer scales (`N_PALETTE`
     ///   f32s each). Empty slice → all-1.0 (no outer scaling).
+    /// - `k_fmt_data` / `v_fmt_data`: per-head band format tags (`N_PALETTE`
+    ///   bytes each), read from the **chunk**. The arena is consulted only for
+    ///   the band's address: under size classes a region holds whatever fits
+    ///   its stride and cannot say how to decode a slot
+    ///   (`docs/archived/arena_unification.md` principle 8).
     #[allow(clippy::too_many_arguments)]
     pub fn from_gids(
         head_idx: usize,
@@ -131,6 +136,8 @@ impl KvHeadHost {
         v_pal_data: &[u8],
         k_scale_data: &[f32],
         v_scale_data: &[f32],
+        k_fmt_data: &[u8],
+        v_fmt_data: &[u8],
     ) -> Self {
         let mut k_ptr = [0u64; N_PALETTE];
         let mut v_ptr = [0u64; N_PALETTE];
@@ -146,11 +153,15 @@ impl KvHeadHost {
 
             if let Some(ai) = arena_info.get(k_arena) {
                 k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                k_fmt[p] = ai.k_format_tag.as_u8();
             }
             if let Some(ai) = arena_info.get(v_arena) {
                 v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                v_fmt[p] = ai.v_format_tag.as_u8();
+            }
+            if let Some(&t) = k_fmt_data.get(p) {
+                k_fmt[p] = t;
+            }
+            if let Some(&t) = v_fmt_data.get(p) {
+                v_fmt[p] = t;
             }
         }
 
@@ -284,6 +295,8 @@ impl TokenSliceHost {
             &chunk.v_pal,
             &chunk.k_scale,
             &chunk.v_scale,
+            &chunk.k_fmt,
+            &chunk.v_fmt,
             rope_base,
             n_kv_head,
             head_dim,
@@ -310,6 +323,8 @@ impl TokenSliceHost {
             c.v_pal,
             c.k_scale,
             c.v_scale,
+            c.k_fmt,
+            c.v_fmt,
             rope_base,
             n_kv_head,
             head_dim,
@@ -327,6 +342,8 @@ impl TokenSliceHost {
         v_pal: &[u8],
         k_scale: &[f32],
         v_scale: &[f32],
+        k_fmt: &[u8],
+        v_fmt: &[u8],
         rope_base: u32,
         n_kv_head: usize,
         head_dim: usize,
@@ -390,6 +407,16 @@ impl TokenSliceHost {
                     } else {
                         &[][..]
                     };
+                    let k_fmt_head = if k_fmt.len() >= (h + 1) * N_PALETTE {
+                        &k_fmt[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    } else {
+                        &[][..]
+                    };
+                    let v_fmt_head = if v_fmt.len() >= (h + 1) * N_PALETTE {
+                        &v_fmt[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    } else {
+                        &[][..]
+                    };
                     KvHeadHost::from_gids(
                         h,
                         head_dim,
@@ -399,6 +426,8 @@ impl TokenSliceHost {
                         v_pal_head,
                         k_scale_head,
                         v_scale_head,
+                        k_fmt_head,
+                        v_fmt_head,
                     )
                 })
                 .collect()

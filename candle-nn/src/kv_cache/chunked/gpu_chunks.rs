@@ -8,11 +8,12 @@
 //! coalesces adjacent indices into runs and, because of the two sections, issues
 //! two `stream.memcpy_htod` per run (the headers range + the records range).
 
+use super::slot_state_arena::{self, SlotStateSlot};
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(test)]
 use crate::kv_cache::arena_table::N_PALETTE;
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
 use std::sync::Arc;
@@ -22,22 +23,32 @@ pub(crate) struct GpuChunks {
     /// Pinned write-combined host buffer containing serialised `TokenSlice` bytes.
     /// Starts empty (len = 0); grown on first `update` call.
     buf: PinnedBuf,
-    /// Device-side backing buffer, always the same byte length as `buf`.
-    /// `None` until the first non-empty update.
-    gpu: Option<CudaSlice<u8>>,
+    /// Device-side backing: a slot from the region tier's doubling class
+    /// family (`slot_state_arena`), **not** an allocation. `None` until the
+    /// first non-empty update. Its capacity is a class width, so it is
+    /// generally larger than `buf.len()`; the kernel's walk is bounded by
+    /// `n_chunks`, never by the slot.
+    slot: Option<SlotStateSlot>,
     /// Stream used for all async H→D copies. `None` for CPU-backed tests even
     /// when the crate is compiled with the CUDA feature enabled.
     stream: Option<Arc<CudaStream>>,
     /// Byte size of one serialised chunk entry (e.g. one `TokenSliceHost`).
     /// Zero until the first call to [`GpuChunksGuard::update`].
     chunk_byte_size: usize,
+    /// Entries currently live.
+    ///
+    /// Kept explicitly because both buffers are now **capacities**: the pinned
+    /// host buffer is grow-only and the device slot is a class width, so
+    /// neither length divides down to the entry count any more.
+    n_chunks: usize,
 }
 
 impl std::fmt::Debug for GpuChunks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuChunks")
-            .field("bytes", &self.buf.len())
+            .field("host_capacity", &self.buf.len())
             .field("chunk_byte_size", &self.chunk_byte_size)
+            .field("n_chunks", &self.n_chunks)
             .finish()
     }
 }
@@ -47,9 +58,10 @@ impl GpuChunks {
         Self {
             // alloc_owned(0) returns a zero-len Bump variant — no CUDA call.
             buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
-            gpu: None,
+            slot: None,
             stream,
             chunk_byte_size: 0,
+            n_chunks: 0,
         }
     }
 
@@ -63,22 +75,25 @@ impl GpuChunks {
     /// Returns the raw GPU device pointer for this sequence's slot-state buffer.
     /// Returns 0 if the buffer has not been allocated yet (no chunks).
     pub(crate) fn raw_device_ptr(&self) -> u64 {
-        match (self.gpu.as_ref(), self.stream.as_ref()) {
-            (Some(s), Some(stream)) => {
-                let (ptr, _guard) = s.device_ptr(stream);
-                ptr
-            }
-            _ => 0,
+        self.slot.as_ref().map_or(0, |s| s.ptr)
+    }
+
+    /// Release the device slot back to its class, if one is held.
+    ///
+    /// No fence. Every sequence's copies run on the device's *primary* stream,
+    /// so a slot handed straight back out cannot be written before the copies
+    /// that read it have run — they are enqueued ahead. This is what lets the
+    /// full `stream.synchronize()` this path used to perform on every
+    /// structural mutation disappear rather than merely move (audit A13).
+    fn release_slot(&mut self) {
+        if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {
+            slot_state_arena::release(stream, slot);
         }
     }
 
     /// Number of serialised chunk entries currently in the buffer.
     pub(crate) fn n_chunks(&self) -> usize {
-        if self.chunk_byte_size > 0 {
-            self.buf.len() / self.chunk_byte_size
-        } else {
-            0
-        }
+        self.n_chunks
     }
 }
 
@@ -96,45 +111,70 @@ pub(crate) struct GpuChunksGuard<'a> {
 }
 
 impl GpuChunksGuard<'_> {
-    /// Resize both the pinned host buffer and the GPU backing allocation to
-    /// hold exactly `n_chunks` entries of `chunk_byte_size` bytes each.
+    /// Ensure the host buffer and the device slot can hold `n_chunks` entries
+    /// of `chunk_byte_size` bytes.
     ///
-    /// Existing content is preserved up to the smaller of the old and new
-    /// sizes; any extension is zeroed.
+    /// **Content is not preserved, and does not need to be.** The buffer has
+    /// two sections — `[ slice headers | records ]` — so the records section
+    /// moves whenever `n_chunks` changes, and the only caller
+    /// ([`Self::rebuild_decode`]) rewrites every entry immediately after. The
+    /// old code copied `min(old, new)` bytes forward and zeroed the rest,
+    /// which was work spent producing bytes nobody read.
+    ///
+    /// Growth on the device is a **promotion**: claim a wider slot from the
+    /// next class up and release the old one. No allocator call, no sync — and
+    /// no copy, per the paragraph above. Growth on the host is grow-only: the
+    /// pinned buffer is reused whenever it is already big enough, so a
+    /// sequence crossing a 32-token boundary no longer pays a `cuMemFreeHost` +
+    /// `cuMemHostAlloc` pair per layer.
     fn resize(&mut self, n_chunks: usize, chunk_byte_size: usize) -> candle::Result<()> {
         let byte_len = n_chunks
             .checked_mul(chunk_byte_size)
             .expect("overflow in resize");
-        let mut new_buf = PinnedBuf::alloc_owned(byte_len)?;
-        {
-            let new_slice = new_buf.as_mut_slice();
-            let copy_bytes = self.inner.buf.len().min(byte_len);
-            new_slice[..copy_bytes].copy_from_slice(&self.inner.buf.as_slice()[..copy_bytes]);
-            new_slice[copy_bytes..].fill(0);
+        self.inner.chunk_byte_size = chunk_byte_size;
+        self.inner.n_chunks = n_chunks;
+
+        if byte_len == 0 {
+            self.inner.release_slot();
+            return Ok(());
         }
-        // Sync before dropping the old GPU allocation: any in-flight
-        // memcpy_htod issued by a prior guard drop may still be writing to it.
-        if self.inner.gpu.is_some() {
+
+        // Host capacity follows the SAME doubling ladder as the device slot,
+        // not `byte_len` exactly.
+        //
+        // Growing to the exact size would re-allocate on every `push_chunk` —
+        // the very churn this change exists to remove — and, worse, would drop
+        // the old pinned buffer while an async `memcpy_htod` may still be
+        // reading it. Rounding to the ladder makes the reallocation
+        // logarithmic in depth instead of linear, which is what makes the
+        // `stream.synchronize()` below affordable: it now guards a rare event
+        // rather than one per 32 tokens per layer.
+        let want = slot_state_arena::class_bytes_for(byte_len)?;
+        if self.inner.buf.len() < want {
             if let Some(stream) = self.inner.stream.as_ref() {
+                // `cuMemFreeHost` unpins pages an in-flight H2D may still be
+                // sourcing from, so the old buffer cannot be dropped until the
+                // stream drains.
                 stream.synchronize().w()?;
             }
-        }
-        // Dropping the old PinnedBuf calls cuMemFreeHost (no-op for len=0 Bump).
-        self.inner.buf = new_buf;
-        self.inner.chunk_byte_size = chunk_byte_size;
-
-        if byte_len > 0 {
-            if let Some(stream) = self.inner.stream.as_ref() {
-                // SAFETY: alloc is untyped; caller fills before use.
-                let gpu = unsafe { stream.alloc::<u8>(byte_len).w()? };
-                self.inner.gpu = Some(gpu);
-            } else {
-                self.inner.gpu = None;
-            }
-        } else {
-            self.inner.gpu = None;
+            self.inner.buf = PinnedBuf::alloc_owned(want)?;
         }
 
+        // Device: keep the slot if it still fits, else promote.
+        let Some(stream) = self.inner.stream.as_ref().cloned() else {
+            self.inner.slot = None;
+            return Ok(());
+        };
+        let fits = self
+            .inner
+            .slot
+            .as_ref()
+            .is_some_and(|s| s.capacity() >= byte_len);
+        if !fits {
+            let next = slot_state_arena::claim(&stream, byte_len)?;
+            self.inner.release_slot();
+            self.inner.slot = Some(next);
+        }
         Ok(())
     }
 
@@ -152,8 +192,14 @@ impl GpuChunksGuard<'_> {
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<()> {
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim);
+        // The LIVE entry count, not one derived from the buffer length. Both
+        // buffers are capacities now — the host side is grow-only and the
+        // device slot is a class width — and `records_off` below is
+        // `n * SLICE_HEADER_BYTES`, so a capacity-derived count would place
+        // the records section past where `rebuild_decode` wrote it and point
+        // every `kvheads_ptr` at unwritten bytes.
         let current_n = if self.inner.chunk_byte_size == chunk_byte_size && chunk_byte_size > 0 {
-            self.inner.buf.len() / chunk_byte_size
+            self.inner.n_chunks
         } else {
             0
         };
@@ -274,18 +320,16 @@ impl GpuChunksGuard<'_> {
     /// a sequence's slot-state is fully invalidated (e.g. evicted or freed).
     pub(crate) fn clear(&mut self) {
         self.dirty_chunks.clear();
-        // Sync before dropping the GPU allocation: in-flight memcpy_htod
-        // operations from a prior guard drop may still be writing to it.
-        if self.inner.gpu.is_some() {
-            if let Some(stream) = self.inner.stream.as_ref() {
-                if let Err(e) = stream.synchronize().w() {
-                    log::warn!("GpuChunksGuard::clear: stream sync failed: {e:?}");
-                }
-            }
-        }
-        self.inner.buf = PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail");
-        self.inner.gpu = None;
+        // No sync and no free: the device side goes back to its class free
+        // list (see `GpuChunks::release_slot`), and the pinned host buffer is
+        // kept for the next fill rather than unpinned and re-pinned. `clear`
+        // is called by *every* structural mutation — `push_chunk` alone fires
+        // each time a sequence crosses a 32-token boundary — so what used to
+        // happen here was the bulk of audit A13's ~3,000 alloc/free/sync
+        // cycles per 32 decoded tokens at batch 64.
+        self.inner.release_slot();
         self.inner.chunk_byte_size = 0;
+        self.inner.n_chunks = 0;
     }
 }
 
@@ -301,18 +345,19 @@ impl Drop for GpuChunksGuard<'_> {
         self.dirty_chunks.sort_unstable();
         self.dirty_chunks.dedup();
 
-        // Split the borrow so we can hold &[u8] from buf alongside &mut gpu.
         let GpuChunks {
             buf,
-            gpu,
+            slot,
             stream,
             chunk_byte_size,
+            n_chunks,
         } = &mut *self.inner;
         let chunk_byte_size = *chunk_byte_size;
-        if chunk_byte_size == 0 {
+        let n_chunks = *n_chunks;
+        if chunk_byte_size == 0 || n_chunks == 0 {
             return;
         }
-        let Some(gpu) = gpu.as_mut() else {
+        let Some(slot) = slot.as_ref() else {
             return;
         };
         let Some(stream) = stream.as_ref() else {
@@ -322,33 +367,36 @@ impl Drop for GpuChunksGuard<'_> {
 
         // Two-section buffer: slice headers [0 .. n*16), then records. A
         // coalesced run of adjacent chunk indices is contiguous in *both*
-        // sections, so each run uploads two ranges: the 16-byte headers and the
-        // records. n_chunks / records_off / rec_bytes are derived from the
-        // stored per-chunk footprint.
-        let n_chunks = host.len() / chunk_byte_size;
+        // sections, so each run uploads two ranges: the 16-byte headers and
+        // the records.
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
         let records_off = n_chunks * SLICE_HEADER_BYTES;
-        let upload_run = |start: usize, end: usize, gpu: &mut CudaSlice<u8>| {
-            // Slice-header region.
-            let (hs, he) = (start * SLICE_HEADER_BYTES, end * SLICE_HEADER_BYTES);
-            if let Err(e) = stream
-                .memcpy_htod(&host[hs..he], &mut gpu.slice_mut(hs..he))
-                .w()
-            {
-                log::warn!("GpuChunksGuard: header memcpy_htod [{hs}..{he}] error: {e:?}");
+        let upload = |range: std::ops::Range<usize>, what: &str| {
+            // SAFETY: `range` lies inside the live entry count, which
+            // `resize` sized the slot to hold; `host` is the pinned staging
+            // buffer, alive for this call; and the copy is enqueued on the
+            // same primary stream every reader of this slot uses.
+            let res = unsafe {
+                candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
+                    slot.ptr + range.start as u64,
+                    &host[range.clone()],
+                    stream.cu_stream(),
+                )
+            };
+            if let Err(e) = res {
+                log::warn!("GpuChunksGuard: {what} memcpy_htod {range:?} error: {e:?}");
             }
-            // Records region.
+        };
+        let upload_run = |start: usize, end: usize| {
+            upload(
+                start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES,
+                "header",
+            );
             if rec_bytes > 0 {
-                let (rs, re) = (
-                    records_off + start * rec_bytes,
-                    records_off + end * rec_bytes,
+                upload(
+                    records_off + start * rec_bytes..records_off + end * rec_bytes,
+                    "record",
                 );
-                if let Err(e) = stream
-                    .memcpy_htod(&host[rs..re], &mut gpu.slice_mut(rs..re))
-                    .w()
-                {
-                    log::warn!("GpuChunksGuard: record memcpy_htod [{rs}..{re}] error: {e:?}");
-                }
             }
         };
 
@@ -358,22 +406,25 @@ impl Drop for GpuChunksGuard<'_> {
             if idx == end {
                 end += 1;
             } else {
-                upload_run(start, end, gpu);
+                upload_run(start, end);
                 start = idx;
                 end = idx + 1;
             }
         }
-        upload_run(start, end, gpu);
+        upload_run(start, end);
     }
 }
 
 impl Drop for GpuChunks {
     fn drop(&mut self) {
-        // Synchronise the stream before the pinned host buffer and GPU
-        // allocation are freed.  Any in-flight memcpy_htod issued by a
-        // prior GpuChunksGuard drop must complete before cuMemFreeHost
-        // and cuMemFree are called on the backing buffers.
-        if self.gpu.is_some() {
+        // The device slot goes back to its class free list, which needs no
+        // fence (see `release_slot`). The pinned host buffer still needs one:
+        // `cuMemFreeHost` unpins pages an in-flight `memcpy_htod_async` may
+        // still be reading, and unlike the device side there is no free list
+        // holding it until the stream catches up. That half moves to the
+        // pinned host reservation in step 7.
+        self.release_slot();
+        if !self.buf.is_empty() {
             if let Some(stream) = self.stream.as_ref() {
                 if let Err(e) = stream.synchronize().w() {
                     log::warn!("GpuChunks::drop: stream sync failed: {e:?}");
@@ -389,9 +440,10 @@ impl Clone for GpuChunks {
         // sequences start fresh on the same stream.
         Self {
             buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
-            gpu: None,
+            slot: None,
             stream: self.stream.clone(),
             chunk_byte_size: 0,
+            n_chunks: 0,
         }
     }
 }
@@ -461,11 +513,15 @@ fn write_record_for_chunk(
 ) {
     super::meta_pool::serialize_kv_heads(
         dst,
-        &chunk.gids,
-        chunk.k_pal.as_slice(),
-        chunk.v_pal.as_slice(),
-        chunk.k_scale.as_slice(),
-        chunk.v_scale.as_slice(),
+        &super::meta_pool::ChunkRecordSrc {
+            gids: &chunk.gids,
+            k_pal: chunk.k_pal.as_slice(),
+            v_pal: chunk.v_pal.as_slice(),
+            k_scale: chunk.k_scale.as_slice(),
+            v_scale: chunk.v_scale.as_slice(),
+            k_fmt: chunk.k_fmt.as_slice(),
+            v_fmt: chunk.v_fmt.as_slice(),
+        },
         n_kv_head,
         head_dim,
         arena_info,

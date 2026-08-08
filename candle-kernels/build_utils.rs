@@ -20,11 +20,10 @@ use std::path::{Path, PathBuf};
 
 // Simple CUDA kernels: basic operations, indexed operations, and simple transformations
 // NOTE: Only include properly formed dispatcher files that use <<<...>>> kernel launch syntax.
-const SIMPLE_KERNELS: [&str; 43] = [
+const SIMPLE_KERNELS: [&str; 42] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     // Kernel implementations
     "src/simple/add_at_indices.cu",
-    "src/simple/arena_compact.cu",
     "src/simple/gather_r16_kv.cu",
     "src/simple/gather_rows.cu",
     "src/simple/prov_sign_pack.cu",

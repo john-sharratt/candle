@@ -31,41 +31,36 @@
 //!   new block only every [`CHUNK_SIZE`] steps. Its cost is a *rate*, charged
 //!   amortised — one thirty-second of a block per sequence per pass
 //!   ([`decode_reserve_bytes`]) rather than a full block at the boundary. The
-//!   boundary spike is real but small, and the relief ladder answers it far
-//!   faster than a setpoint could; charging it up front would reserve 32x what
-//!   decodes hold and starve prefill outright.
+//!   boundary spike is real but small, and a relief pass answers it far faster
+//!   than a setpoint could; charging it up front would reserve 32x what decodes
+//!   hold and starve prefill outright.
 //!
 //! KV that is already resident is *not* modelled here — it is already absent
 //! from the live headroom measurement. Only growth is charged.
 //!
 //! # What the budget is worth right now
 //!
-//! [`available_bytes`] converts the live device measurement into the ceiling the
-//! setpoint is clamped to: honest free headroom, plus KV that registered
-//! relievers could reversibly evict, **minus** KV that is evictable in principle
-//! but pinned in practice.
-//!
-//! The pinned subtraction is the one that matters. The forecast counts every
-//! evictable byte as headroom, but a pinned working set that the hot->warm drain
-//! is skipping cannot be turned back into space at any price — and it is largest
-//! at exactly the moment the drain has stalled, so without the subtraction the
-//! budget reads its most optimistic when the card is least able to deliver.
+//! `Scheduler::admit_budget_ceiling` — free KV regions, less the setpoint the
+//! relief pass keeps in hand. It used to live here as `available_bytes`, a live
+//! device measurement plus what registered relievers claimed they could evict,
+//! minus the evictable-but-pinned working set the hot->warm drain was skipping.
+//! Both corrections existed because the base term described *the card*. A region
+//! count describes what this process has claimed and not yet spent, and needs
+//! neither.
 //!
 //! # The forward reserve
 //!
 //! A prefill forward's transient peak — dominated by the MoE expert gather, which
-//! the whole batch shares — is held back by [`reserve_for_width`]: `max(base,
-//! width x per_seq)`, the same law the pressure and relief gates use. What
-//! differs is WHERE it is evaluated. Those gates ask about the width already in
-//! flight; admission must ask about the width it is *choosing*, which is why
+//! the whole batch shares — is held back by [`reserve_for_width`]:
+//! `width x per_seq`, clamped to a third of the card. This is the one place a
+//! reserve is still expressed in bytes against capacity, because it is about
+//! *transient activations*, not KV — the KV side's own headroom is the
+//! free-region setpoint. It must be evaluated at the width admission is
+//! *choosing*, not the width already in flight, which is why
 //! [`plan_admission`] re-evaluates the reserve at every candidate count it
 //! considers. Evaluating it once — at an in-flight width that is typically zero
 //! when admission runs — reserves nothing for the batch about to be formed, and
 //! is what let nine sequences through and OOMed a 16 GB card.
-//!
-//! Because the terms combine with max rather than sum, the first several
-//! sequences ride inside `base` at no marginal cost; width only begins to bind
-//! once it overtakes the card-fraction reserve.
 //!
 //! # Admission order
 //!
@@ -199,20 +194,21 @@ pub(super) struct BandParams {
     pub(super) capacity: u64,
 }
 
-/// The reserve to hold back when `width` sequences are co-batched.
-/// **Deliberately excludes the pressure band's card-fraction base.** That base
-/// (`max(capacity/10, 2 GiB)`) is a POLICY THRESHOLD for the relief ladder —
-/// "start shedding hot KV below this" — not a claim that a forward needs that
-/// much free to run. Using it as an admission floor starved this scheduler:
-/// with ~1150 MiB available and a 2048 MiB base, `available - reserve`
-/// saturated to zero at EVERY width, so nothing could be admitted and only the
-/// keep-one-alive fallback ran. Decode width never grew past ~3, and a MoE
-/// forward amortised over 3 sequences decodes at ~3 tok/s.
+/// The reserve to hold back when `width` sequences are co-batched: the marginal
+/// transient cost per sequence, clamped to a third of the card so a width spike
+/// can never strand the whole device.
 ///
-/// Forwards run fine at those widths with that much free — that is the evidence
-/// the base was never a requirement. The per-sequence term IS the real transient
-/// estimate and is kept. The pressure and relief gates keep the full
-/// `max(base, width x per_seq)` band unchanged; only admission drops the base.
+/// **Deliberately carries no card-fraction base.** A flat base of
+/// `max(capacity/10, 2 GiB)` once sat under this, borrowed from the VRAM
+/// pressure gate's band. It starved the scheduler: with ~1150 MiB available and
+/// a 2048 MiB base, `available - reserve` saturated to zero at EVERY width, so
+/// nothing could be admitted and only the keep-one-alive fallback ran. Decode
+/// width never grew past ~3, and a MoE forward amortised over 3 sequences
+/// decodes at ~3 tok/s. Forwards run fine at those widths with that much free,
+/// which is the evidence the base was never a requirement — it was a policy
+/// threshold about when to start shedding, borrowed as if it were a physical
+/// one. The per-sequence term is the real transient estimate, and it is all
+/// that remains.
 pub(super) fn reserve_for_width(width: usize, p: &BandParams) -> u64 {
     (width as u64).saturating_mul(p.per_seq).min(p.capacity / 3)
 }
@@ -222,26 +218,6 @@ pub(super) fn reserve_for_width(width: usize, p: &BandParams) -> u64 {
 /// token, which is one [`CHUNK_SIZE`]th of a block.
 pub(super) fn decode_reserve_bytes(width: usize, per_block: u64) -> u64 {
     (width as u64).saturating_mul(per_block) / CHUNK_SIZE as u64
-}
-
-/// The live ceiling the budget setpoint is clamped to.
-///
-/// `available` is the honest allocatable measurement (free headroom plus the
-/// reusable pool free-list); `evictable` is what registered relievers report
-/// they could reversibly free; `pinned_undrainable` is hot KV the drain is
-/// skipping because it is pinned, which is counted inside `evictable` but cannot
-/// actually be reclaimed; `band` is the phase reserve transient activations
-/// need and admission must never eat into.
-pub(super) fn available_bytes(
-    headroom: u64,
-    evictable: u64,
-    pinned_undrainable: u64,
-    device_unreserved: u64,
-) -> u64 {
-    headroom
-        .saturating_add(evictable)
-        .saturating_sub(pinned_undrainable)
-        .min(device_unreserved)
 }
 
 /// Multiplicative decrease of the budget: halve, but never below `floor`.
@@ -501,7 +477,6 @@ mod tests {
         assert_eq!(per_block_kv_bytes(0, 0, 0, r16, r16), 0);
     }
 
-    #[test]
     /// Admission must price a candidate in the formats a LIVE sequence occupies,
     /// not the sealed ones it settles into.
     ///
@@ -712,57 +687,6 @@ mod tests {
     /// the card.
     ///
     /// Replays the measured abort: `headroom=0`, pool `reserved=15168` of a
-    /// `16375 MiB` card, and a 3073 MiB reuse gap that `VramGovernor::available()`
-    /// would have reported as free. Admission must see ~1.2 GB of genuinely
-    /// unreserved device memory, not 3 GB of gap.
-    #[test]
-    fn availability_is_clamped_to_unreserved_device_memory() {
-        const MIB: u64 = 1 << 20;
-        let (total, reserved) = (16375 * MIB, 15168 * MIB);
-        let unreserved = total - reserved; // 1207 MiB
-
-        // Honest headroom is zero; evictable KV is real but cannot exceed the
-        // room a fresh arena could occupy.
-        let got = available_bytes(0, 4096 * MIB, 0, unreserved);
-        assert_eq!(got, unreserved, "must clamp to unreserved device memory");
-        assert!(
-            got < 3045 * MIB,
-            "must not report the reuse gap as available"
-        );
-
-        // With the card wide open the clamp is inert and evictable rules.
-        assert_eq!(
-            available_bytes(512 * MIB, 1024 * MIB, 0, u64::MAX),
-            1536 * MIB
-        );
-        // Pinned still comes off before the clamp.
-        assert_eq!(
-            available_bytes(0, 1024 * MIB, 256 * MIB, u64::MAX),
-            768 * MIB
-        );
-        // A fully reserved pool admits nothing, whatever the evictable estimate.
-        assert_eq!(available_bytes(0, 8192 * MIB, 0, 0), 0);
-    }
-
-    /// Pinned-but-unevictable KV must be subtracted, or the budget reads its
-    /// most optimistic exactly when the drain has stalled.
-    #[test]
-    fn available_subtracts_pinned_and_band() {
-        // Free 1 GiB, 4 GiB nominally evictable, 270 MiB of it pinned and
-        // undrainable, device not the binding constraint.
-        let got = available_bytes(1024 * MIB, 4096 * MIB, 270 * MIB, u64::MAX);
-        assert_eq!(got, (1024 + 4096 - 270) * MIB);
-
-        // Without the pinned discount the same state reads 270 MiB richer.
-        assert_eq!(
-            available_bytes(1024 * MIB, 4096 * MIB, 0, u64::MAX) - got,
-            270 * MIB
-        );
-
-        // Pinned exceeding evictable floors rather than wrapping.
-        assert_eq!(available_bytes(0, MIB, 8 * MIB, u64::MAX), 0);
-    }
-
     #[test]
     fn budget_aimd_converges_and_recovers() {
         let quantum = 256 * MIB;

@@ -177,6 +177,43 @@ pub(crate) fn from_storage<S: Into<Shape>>(
 }
 
 impl Tensor {
+    /// Build a tensor that **views** device memory this process owns elsewhere,
+    /// rather than memory allocated from the pool.
+    ///
+    /// The resulting storage is [`crate::cuda_backend::Backing::Lease`]: dropping
+    /// it releases the view and never frees the memory. This is how tensor-shaped
+    /// operations reach into a KV arena slot — the arena owns the bytes for the
+    /// process lifetime, so a pool free on them would be a correctness error, not
+    /// a leak. See `docs/archived/arena_unification.md` §3.7.
+    ///
+    /// Views and reshapes share the underlying `Arc<Storage>`, so the lease
+    /// travels with them.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `shape.elem_count()` elements of `dtype`,
+    /// be correctly aligned, and remain live — and not written through another
+    /// alias — for as long as this tensor or any view of it exists.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_leased_cuda_ptr<S: Into<Shape>>(
+        ptr: u64,
+        dtype: DType,
+        shape: S,
+        device: &Device,
+    ) -> Result<Self> {
+        let Device::Cuda(cuda) = device else {
+            crate::bail!("from_leased_cuda_ptr: expected a CUDA device, got {device:?}");
+        };
+        let shape = shape.into();
+        let storage =
+            crate::CudaStorage::from_leased_device_ptr(ptr, shape.elem_count(), dtype, cuda)?;
+        Ok(from_storage(
+            Storage::Cuda(storage),
+            shape,
+            BackpropOp::none(),
+            false,
+        ))
+    }
+
     pub(crate) fn ones_impl<S: Into<Shape>>(
         shape: S,
         dtype: DType,

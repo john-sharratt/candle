@@ -854,7 +854,7 @@ function renderMemory(d){
     if(g){
       hdr('vram governor');
       row('honest headroom', fmtB(g.headroom_bytes));
-      row('evictable (\u2264 moderate)', fmtB(g.evictable_moderate_bytes));
+      row('capacity C', fmtB(g.capacity_bytes));
       row('kv floor / scratch margin', fmtB(g.kv_floor_bytes)+' '+dim('/ '+fmtB(g.scratch_margin_bytes)));
       row('reserved w\u00b7e\u00b7s\u00b7k',
         fmtB(g.reserved_weights_bytes)+' '+dim('\u00b7')+' '+fmtB(g.reserved_expert_bytes)+' '
@@ -862,13 +862,25 @@ function renderMemory(d){
     }
   }
 
-  hdr('kv arenas');
-  row('float '+dim('('+kv.float_arenas+' arenas)'),
-      fmtB(kv.float_live_bytes)+' '+dim('live / '+fmtB(kv.float_reserved_bytes)),
-      kv.float_reserved_bytes?kv.float_live_bytes/kv.float_reserved_bytes:0);
-  row('quant '+dim('('+kv.quant_arenas+' arenas)'),
-      fmtB(kv.quant_live_bytes)+' '+dim('live / '+fmtB(kv.quant_reserved_bytes)),
-      kv.quant_reserved_bytes?kv.quant_live_bytes/kv.quant_reserved_bytes:0);
+  // One row per occupied size class. This replaced a float-vs-quant split,
+  // which a size-class arena can no longer answer — it holds whatever fits its
+  // slots. Compression shows up as occupancy moving down the ladder.
+  hdr('kv size classes');
+  const classes=(kv&&kv.classes)||[];
+  if(!classes.length){
+    row('(no resident gpu arenas)','');
+  } else {
+    let tr=0,tl=0,ta=0;
+    for(const c of classes){
+      tr+=c.reserved_bytes; tl+=c.live_bytes; ta+=c.arenas;
+      row(fmtB(c.slot_bytes)+' '+dim('('+c.arenas+' arenas)'),
+          fmtB(c.live_bytes)+' '+dim('live / '+fmtB(c.reserved_bytes)),
+          c.reserved_bytes?c.live_bytes/c.reserved_bytes:0);
+    }
+    row('total '+dim('('+ta+' arenas)'),
+        fmtB(tl)+' '+dim('live / '+fmtB(tr)),
+        tr?tl/tr:0);
+  }
 
   hdr('warm tier (host kv)');
   row('warm residents', w.resident_count+' '+dim('('+fmtB(w.resident_bytes)+')'));

@@ -26,6 +26,8 @@ use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::HeadGids;
 
+use crate::models::wave_buffers::KernelOutput;
+
 /// Uploaded per-slot `SlotHeader[b]` payloads for a chunked attention launch.
 ///
 /// Holds the GPU-resident headers + the host `SlotStateHost` per slot (its
@@ -655,7 +657,7 @@ fn paged_prefill_batched_impl(
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
         match first.k_cache().chunked_storage_policy() {
             Some(policy) => {
-                let is_quant = policy.to_arena_key().is_quantized();
+                let is_quant = policy.is_quantized();
                 if is_quant && !policy.is_kernel_native() {
                     candle::bail!(
                         "storage policy uses a quantized format that the kernel cannot read natively; \
@@ -1035,7 +1037,7 @@ impl PagedPrefillInt8 {
         .slice(v_packed_l.start_offset()..);
 
         let elem_count = q_l.shape().elem_count();
-        let dst = unsafe { dev.alloc::<O>(elem_count)? };
+        let dst = KernelOutput::<O>::new(dev, elem_count)?;
 
         // Compute q_dtype code from Q's actual dtype
         // q_dtype codes: 0=F32, 1=F16, 2=BF16, 3=F8E4M3
@@ -1118,7 +1120,7 @@ impl PagedPrefillInt8 {
             );
         }
 
-        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        let dst = dst.into_storage(dev.clone());
         Ok((dst, q_l.shape().clone()))
     }
 }
@@ -1365,7 +1367,7 @@ impl PagedGlueChunks {
         let (cs_ptr, _csg) = cs_slice.device_ptr(&stream);
 
         let elem_count = q_l.shape().elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count)? };
+        let dst = KernelOutput::<T>::new(dev, elem_count)?;
 
         unsafe {
             let (dst_ptr, _dg) = dst.device_ptr(&stream);
@@ -1396,7 +1398,7 @@ impl PagedGlueChunks {
             );
         }
 
-        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        let dst = dst.into_storage(dev.clone());
         Ok((dst, q_l.shape().clone()))
     }
 }
@@ -1501,7 +1503,7 @@ pub fn paged_glue_attn(
             .first()
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
         match first.k_cache().chunked_storage_policy() {
-            Some(policy) => policy.to_arena_key().is_quantized(),
+            Some(policy) => policy.is_quantized(),
             None => false,
         }
     };
@@ -1778,7 +1780,7 @@ impl PagedDecode {
         let stream = dev.cuda_stream();
 
         let out_elem = self.num_active_slots * self.n_q_head * self.head_dim;
-        let dst = unsafe { dev.alloc::<O>(out_elem)? };
+        let dst = KernelOutput::<O>::new(&dev, out_elem)?;
 
         {
             let q_slice = q.as_cuda_slice::<Q>()?.slice(q_l.start_offset()..);
@@ -1838,7 +1840,7 @@ impl PagedDecode {
             }
         } // all guards dropped here, dst no longer borrowed
 
-        let dst_cs = candle::CudaStorage::wrap_cuda_slice(dst, dev);
+        let dst_cs = dst.into_storage(dev);
         let out_shape = Shape::from_dims(&[self.num_active_slots, self.n_q_head, self.head_dim]);
         Ok((dst_cs, out_shape))
     }
@@ -1872,7 +1874,7 @@ impl PagedDecode {
         let stream = dev.cuda_stream();
 
         let q8_bytes = self.q8_byte_size();
-        let dst = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        let dst = KernelOutput::<u8>::new(&dev, q8_bytes)?;
 
         {
             let q_slice = q.as_cuda_slice::<Q>()?.slice(q_l.start_offset()..);
@@ -1927,7 +1929,7 @@ impl PagedDecode {
             }
         } // all guards dropped here, dst no longer borrowed
 
-        let dst_cs = candle::CudaStorage::wrap_cuda_slice(dst, dev);
+        let dst_cs = dst.into_storage(dev);
         Ok((dst_cs, Shape::from_dims(&[q8_bytes])))
     }
 }

@@ -648,6 +648,11 @@ impl ExpertCache {
         };
 
         let (num_tokens, hidden) = input.shape()?;
+        // The inline twin of the threaded pipeline's combine target. It runs on
+        // the caller's thread and stream, so the layer's FFN generation *would*
+        // bound it — but this mode exists only when there is no pipeline thread,
+        // which production never configures, so it stays an ordinary allocation
+        // rather than a second wave consumer for a path nothing takes.
         let mut ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
         let mut _inline_prof = ProfileAccumulator::new();
         #[cfg(feature = "cuda")]

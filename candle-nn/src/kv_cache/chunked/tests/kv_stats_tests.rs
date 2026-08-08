@@ -927,8 +927,12 @@ fn kernel_drop_cheap_format_blocks(
             })
             .collect();
 
-        // per_head_table: 36 i64 per (chunk, head) row. Palette[0] populated;
-        // 1..3 zeroed. metadata = K=R16 (3<<16), V=F32.
+        // per_head_table: 36 i64 per (chunk, head) row = four palette
+        // sub-entries of 9. Every band of this fixture lives in the same
+        // buffer at the same stride, so all four sub-entries are identical —
+        // but they must all be *populated*: the kernel reads the sub-entry for
+        // the band it is resolving, not palette 0.
+        // metadata = K=R16 (3<<16), V=F32.
         let outer_one_bits = 1.0_f32.to_bits() as i64;
         let metadata_kr16_vf32: i64 = (3i64 << 16) | (0i64 << 8);
         let mut per_head_table: Vec<i64> = Vec::with_capacity(n_chunks * src_n_kv_head * 36);
@@ -937,7 +941,7 @@ fn kernel_drop_cheap_format_blocks(
             let (vp, _g2) = cg.v_gpu.device_ptr(&stream);
             for h in 0..src_n_kv_head {
                 let head_off = (h as i64) * single_head_bytes;
-                per_head_table.extend_from_slice(&[
+                let sub = [
                     kp as i64,
                     vp as i64,
                     head_off,
@@ -947,8 +951,10 @@ fn kernel_drop_cheap_format_blocks(
                     metadata_kr16_vf32,
                     outer_one_bits,
                     outer_one_bits,
-                ]);
-                per_head_table.extend_from_slice(&[0i64; 27]);
+                ];
+                for _ in 0..N_PALETTE {
+                    per_head_table.extend_from_slice(&sub);
+                }
             }
         }
         let per_head_table_gpu = dev.memcpy_stod(&per_head_table).expect("phtab upload");
@@ -1249,6 +1255,7 @@ fn load_kv_blocks_for_q0_v_tests() -> Option<LoadedKvBlocks> {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_q0_v_kernel_roundtrip_pass_rates() {
+    use crate::kv_cache::arena_table::N_PALETTE;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Device;
     use rayon::prelude::*;
@@ -1736,8 +1743,9 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             let (vp, _) = cg.v_gpu.device_ptr(&stream);
             for h in 0..n_kv_head {
                 let head_off = (h as i64) * single_head_bytes;
-                // palette[0]: real entry pointing at this head's slice.
-                per_head_table_host.extend_from_slice(&[
+                // All four palette sub-entries point at this head's slice:
+                // the kernel resolves each band through its own sub-entry.
+                let sub = [
                     kp as i64,
                     vp as i64,
                     head_off,
@@ -1747,9 +1755,10 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
                     metadata_kr16_vf32,
                     outer_one_bits,
                     outer_one_bits,
-                ]);
-                // palette[1..3]: zeroed (unused by the 2-candidate path).
-                per_head_table_host.extend_from_slice(&[0i64; 27]);
+                ];
+                for _ in 0..N_PALETTE {
+                    per_head_table_host.extend_from_slice(&sub);
+                }
             }
         }
         let per_head_table_gpu = dev

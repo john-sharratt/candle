@@ -25,6 +25,7 @@ use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use crate::models::routing_capture;
+use crate::models::wave_buffers::wave_zeros;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
@@ -36,7 +37,7 @@ use candle::quantized::cuda::{
 use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::try_enter_relief, kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -450,7 +451,13 @@ impl SparseMoeBlock {
         let down_out = down_out.to_dtype(out_dtype)?;
 
         // 4. Deterministic scatter — identical accumulation order to the host path.
-        let ys = Tensor::zeros((num_tokens, hidden_dim), out_dtype, &device)?;
+        // The combine target is the layer's largest transient, and it is
+        // scattered into rather than overwritten, so it has to start zeroed.
+        // `wave_zeros` gives it a range of the wave's half when the layer has a
+        // generation open around `ffn_forward` — which `forward_layer_batched_mixed`
+        // does, spanning this call through the residual add that consumes the
+        // result.
+        let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device)?;
         fused_deterministic_scatter(
             &ys,
             &down_out,
@@ -1078,6 +1085,32 @@ pub fn read_hf_config(model_dir: &std::path::Path) -> HFModelConfig {
 ///
 /// Tries `qwen3moe`, `qwen2moe`, then falls back to whatever
 /// `general.architecture` says. Returns the prefix string (e.g. "qwen2moe").
+/// Is `name` an MoE expert weight, in **either** GGUF layout?
+///
+/// The loader accepts two: the 3D merged form, where a layer's experts are one
+/// `blk.{i}.ffn_{gate,up,down}_exps.weight`, and the 2D per-expert fallback,
+/// where each expert is its own `blk.{i}.ffn_{gate,up,down}.{j}.weight`. Only
+/// the first has a distinguishing suffix, so matching on `_exps.weight` alone
+/// silently classifies every tensor of a 2D checkpoint as dense.
+///
+/// The numeric segment is what separates an expert from a *dense* layer's
+/// `blk.{i}.ffn_gate.weight`, which must stay counted as dense.
+fn is_expert_tensor(name: &str) -> bool {
+    if name.ends_with("_exps.weight") {
+        return true;
+    }
+    let Some(rest) = name.strip_suffix(".weight") else {
+        return false;
+    };
+    let Some((head, idx)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    head.ends_with(".ffn_gate") || head.ends_with(".ffn_up") || head.ends_with(".ffn_down")
+}
+
 fn detect_arch_prefix(metadata: &HashMap<String, gguf_file::Value>) -> String {
     // Check general.architecture first
     if let Some(v) = metadata.get("general.architecture") {
@@ -1558,20 +1591,6 @@ impl ModelWeights {
         };
         #[cfg(feature = "cuda")]
         if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
-            // Guard the governor's Critical-rung pool trim against the hot→warm
-            // migrate's captured arena base pointers. The trim's `cuMemPoolTrimTo`
-            // synchronously unmaps pool memory process-wide, and the sync-hook lives
-            // in candle-core (below candle-nn) so it can't reach candle-nn's
-            // arena-topology relief guard. Registered here (candle-transformers is
-            // above candle-nn): the wrapper holds `try_enter_relief` across the trim,
-            // and skips it while a migrate is capturing pointers — otherwise the
-            // in-flight select/quantize/kv_migrate kernels read an unmapped base
-            // pointer (`CUDA_ERROR_ILLEGAL_ADDRESS`).
-            candle::vram::set_pool_trim_guard(Box::new(|trim| {
-                if let Some(_relief) = try_enter_relief() {
-                    trim();
-                }
-            }));
             match candle::vram::VramGovernor::from_device(device, gpu_id) {
                 Ok(gov) => {
                     let mut balloon =
@@ -1856,14 +1875,80 @@ impl ModelWeights {
             let total_experts = num_moe_layers * n_expert;
             let total_expert_bytes = total_experts * max_expert_size;
 
+            // ── Declare the dense weights BEFORE sizing the expert cache ──
+            //
+            // `expert_budget()` reserves `kv_floor + scratch_margin` out of what
+            // is free *at this instant*, so everything that loads after this
+            // point is spent from that reserve. The per-layer dense tensors are
+            // ~1 GiB of it and they have not loaded yet: the loader reaches them
+            // below, and the post-load `set_class(Weights, ...)` that records
+            // them runs ~260 lines further on. Until that was accounted here,
+            // the KV side paid for the model's own weights — measured at
+            // 2,912 MiB where the partition intends ~4,439
+            // (`docs/archived/arena_unification_results.md`, step 7b).
+            //
+            // Summed from the GGUF tensor table rather than measured, for the
+            // same reason the post-load tally is summed: a driver delta cannot
+            // see through the caching allocator. Experts are excluded — they are
+            // what this budget is *for* — and so is the embedding, whose VRAM
+            // contribution `dense_bytes` already carries, because the
+            // host-vs-device decision for it was made above.
+            //
+            // The later `set_class` is not redundant: it replaces this estimate
+            // with the true summed total once every tensor is resident. This one
+            // exists to inform the decision; that one to be correct afterwards.
+            #[cfg(feature = "cuda")]
+            let pending_dense_bytes: usize = if matches!(device, Device::Cuda(_)) {
+                let planned: usize = ct
+                    .tensor_infos
+                    .iter()
+                    .filter(|(name, _)| {
+                        !is_expert_tensor(name) && name.as_str() != "token_embd.weight"
+                    })
+                    .map(|(_, info)| {
+                        let blocks = info.shape.elem_count() / info.ggml_dtype.block_size();
+                        blocks * info.ggml_dtype.type_size()
+                    })
+                    .sum();
+                tracing::info!(
+                    target: "candle_transformers::quantized_qwen3_moe",
+                    loaded_mib = dense_bytes.get() >> 20,
+                    still_to_load_mib = planned >> 20,
+                    "declaring dense weights before the expert budget"
+                );
+                if let Some(g) = candle::vram::get(gpu_id) {
+                    g.set_class(
+                        candle::vram::AllocClass::Weights,
+                        (dense_bytes.get() + planned) as u64,
+                    );
+                }
+                planned
+            } else {
+                0
+            };
+            #[cfg(not(feature = "cuda"))]
+            let pending_dense_bytes: usize = 0;
+
             // ── VRAM budget for expert LRU cache ──
             // Preferred: the VRAM Governor computes it from the live measurement
-            // at this instant (weights already resident), leaving the KV floor +
-            // scratch cushion free so experts can never starve KV
+            // at this instant, with the dense weights declared just above, so the
+            // KV floor + scratch cushion it leaves free are computed against the
+            // whole model rather than the part of it that happens to be resident
             // (`docs/vram_governor_design.md` §11). Fallback (no governor): the
             // legacy `min(max(free−5GB, free×50%), total_expert_bytes)`.
+            //
+            // The pending dense bytes come off the budget, not out of the floor.
+            // Declaring them above makes `kv_floor` honest for every later
+            // reader, but the floor is `abs + pct x (C - weights)` — declaring
+            // weights *lowers* it, which hands the experts more, and the weights
+            // still load from the remainder afterwards. Measured: the
+            // declaration alone moved KV 182 -> 176 regions, the wrong way. What
+            // `expert_budget()` cannot know is that `usable` includes memory
+            // already promised to tensors the loader has not reached yet.
             #[cfg(feature = "cuda")]
-            let gov_budget = candle::vram::get(gpu_id).and_then(|g| g.expert_budget().ok());
+            let gov_budget = candle::vram::get(gpu_id)
+                .and_then(|g| g.expert_budget().ok())
+                .map(|b| b.saturating_sub(pending_dense_bytes as u64));
             #[cfg(not(feature = "cuda"))]
             let gov_budget: Option<u64> = None;
             let expert_budget = match gov_budget {
@@ -2175,6 +2260,35 @@ mod tests {
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
+
+    /// Expert tensors must be recognised in **both** GGUF layouts, because the
+    /// pre-load weight declaration subtracts everything it does *not* classify
+    /// as an expert from the expert budget. Matching only the 3D `_exps.weight`
+    /// suffix counted a 2D checkpoint's whole expert set as dense, which
+    /// saturates `expert_budget` to zero and builds the LRU cache with no GPU
+    /// slots at all — a silently crippled load, not a crash.
+    #[test]
+    fn expert_tensors_are_recognised_in_both_gguf_layouts() {
+        // 3D merged: one tensor per (layer, projection).
+        assert!(is_expert_tensor("blk.0.ffn_gate_exps.weight"));
+        assert!(is_expert_tensor("blk.47.ffn_down_exps.weight"));
+
+        // 2D per-expert fallback: one tensor per (layer, projection, expert).
+        assert!(is_expert_tensor("blk.0.ffn_gate.0.weight"));
+        assert!(is_expert_tensor("blk.12.ffn_up.127.weight"));
+        assert!(is_expert_tensor("blk.47.ffn_down.63.weight"));
+
+        // A dense layer's FFN has no expert index and must stay dense.
+        assert!(!is_expert_tensor("blk.0.ffn_gate.weight"));
+        assert!(!is_expert_tensor("blk.0.ffn_up.weight"));
+        assert!(!is_expert_tensor("blk.0.ffn_down.weight"));
+
+        // Everything else is dense.
+        assert!(!is_expert_tensor("blk.0.attn_q.weight"));
+        assert!(!is_expert_tensor("token_embd.weight"));
+        assert!(!is_expert_tensor("output_norm.weight"));
+        assert!(!is_expert_tensor("blk.0.ffn_gate.0.bias"));
+    }
 
     #[test]
     #[ignore] // Run with: cargo test --release --features cuda --lib --package candle-transformers quantized_qwen3_moe::tests::test_parallel_batched_forwarding -- --ignored --nocapture

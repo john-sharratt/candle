@@ -1957,10 +1957,6 @@ pub(crate) struct Scheduler {
     /// shared across conversations). `None` on non-CUDA devices — the reproject
     /// then falls back to the CPU per-file scan. See `docs/paged_gallery_arena.md`.
     gallery_arena: Option<Arc<GalleryArena>>,
-    /// Keeps the gallery arena's VRAM-governor relief registration alive (dropping
-    /// it unregisters). The arena is registered at a cheap relief rung so the
-    /// governor sheds resident galleries before it ever evicts model KV.
-    _gallery_relief: Option<candle::vram::ReliefHandle>,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
     /// Persistent sampling state per sequence ID (survives across turns).
@@ -2181,24 +2177,6 @@ pub(crate) struct Scheduler {
     /// refreshed at most once per `HOST_RAM_PROBE_INTERVAL`, never per wave.
     host_ram_probe: Option<(std::time::Instant, u64, u64)>,
 
-    /// When the footprint reclaim last ran, to rate-limit it. Without this, a
-    /// `reserved` pinned just over the compact-ceiling (a fragmented gap the
-    /// engine keeps reusing, which compaction can't lower) trips the pressure
-    /// gate on every scheduler-loop iteration and fires relief many times/second.
-    /// See `Scheduler::reclaim_footprint` / `vram_under_pressure_for`.
-    last_footprint_relief: Option<std::time::Instant>,
-
-    /// Futile-defrag latch: `(reserved, used, futile_streak)` observed when a
-    /// defrag pass moved chunks but shed ~nothing — the reserved gap is
-    /// fragmented across arenas that pinned chunks (hot sections, working
-    /// sets, cached glue islands) keep from ever emptying, so compaction
-    /// cannot lower `reserved` no matter how often it runs. While the pool
-    /// stats sit within the latch's re-probe bar (one hysteresis band,
-    /// doubling per consecutive futile pass up to 8×), the defrag arm neither
-    /// re-fires nor reports footprint pressure. Cleared when a pass sheds or
-    /// the landscape moves past the bar.
-    defrag_futile_at: Option<(usize, usize, u32)>,
-
     /// Consecutive progress observations (new prefill tokens forwarded
     /// OOM-free) while growth was blocked ONLY by the VRAM-pressure bit — the
     /// evidence streak that reopens a wedged budget. Consumed by BOTH reopen
@@ -2347,28 +2325,13 @@ impl Scheduler {
         // geometry: 12 heads × 2 words (head_dim 128) = wpt 24, 3 layer-groups.
         // `new` errors (→ None) on a non-CUDA device; it allocates no VRAM until
         // the first turn is made resident.
+        //
+        // The arena used to register an eviction closure with the VRAM
+        // governor, at a cheap relief rung, so the governor would shed resident
+        // galleries before it ever evicted model KV. The rungs are gone;
+        // `relieve_vram_pressure` calls `evict_lru` directly and does it before
+        // touching KV, which is the same priority expressed as call order.
         let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
-        // Register the arena with the VRAM governor at a CHEAP relief rung so the
-        // governor sheds resident galleries before it ever evicts model KV (a
-        // Costly rung). The relief closure evicts LRU turns (skipping the active
-        // scan's pinned working set); dropped pages recycle and rebuild on demand
-        // from the substrate blob, so eviction is lossless. See §9 of the design.
-        let _gallery_relief = gallery_arena.as_ref().and_then(|arena| {
-            let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
-                return None;
-            };
-            candle::vram::get(gpu_id).map(|gov| {
-                let evict = arena.clone();
-                let report = arena.clone();
-                gov.register_relief(
-                    candle::vram::AllocClass::Kv,
-                    candle::vram::Criticality::Cheap,
-                    move |req| candle::vram::ReliefOutcome::new(evict.evict_lru(req.want)),
-                    move || report.resident_bytes(),
-                )
-            })
-        });
-
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
@@ -2383,7 +2346,6 @@ impl Scheduler {
             model,
             session,
             gallery_arena,
-            _gallery_relief,
             tokenizer,
             eos_tokens,
             device,
@@ -2423,14 +2385,12 @@ impl Scheduler {
             next_turn_seal_id: 0,
             admit_budget: Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
             host_ram_probe: None,
-            defrag_futile_at: None,
             admit_grow_streak: 0,
             admit_ok_tokens_seen: 0,
             last_level_cut: None,
             last_admit_starved_log: None,
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
-            last_footprint_relief: None,
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
@@ -3427,7 +3387,7 @@ impl Scheduler {
                 };
                 // The demote returned the hot chunks to the pool free-list;
                 // release now-empty arenas so `pool_used` actually drops.
-                let _ = self.session.release_empty_arenas_forced();
+                let _ = self.session.release_empty_arenas();
                 let _ = response_tx.send(Ok(demoted));
                 true
             }
@@ -5946,11 +5906,16 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
-        // Defer while a hot→warm migrate is in flight: the quantize frees/swaps
-        // the section's float source arenas, and the migrate's dense per-head
-        // table addresses every arena — freeing one under it → the persist
-        // convert kernel reads a stale base pointer (illegal address, layer 2
-        // @42553ca3). Leave the sections pending; they drain next wave.
+        // Defer while a hot→warm migrate is in flight: it is converting the
+        // same residences float→quant, so quantizing them here would redo work
+        // already under way. Leave the sections pending; they drain next wave.
+        //
+        // This was once a safety deferral — the migrate's per-head table was
+        // dense over storage, so freeing any arena under it left the persist
+        // convert kernel reading a stale base pointer (illegal address, layer 2
+        // @42553ca3). The table is sized from the job list now, so every
+        // pointer in it comes from a gid the migrate has pinned, and a pinned
+        // arena cannot be freed. What remains is the duplicated work.
         if candle_nn::kv_cache::migrate_in_flight() {
             return Ok(());
         }
@@ -5977,7 +5942,7 @@ impl Scheduler {
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
         // See `quantize_pending_sections` — deferred during a hot→warm migrate
-        // so the member quantize doesn't free arenas the migrate's table reads.
+        // so the member quantize doesn't redo the conversion it is performing.
         if candle_nn::kv_cache::migrate_in_flight() {
             return Ok(());
         }
@@ -6829,8 +6794,13 @@ impl Scheduler {
             // Ample VRAM — keep the whole working set hot.
             return crate::substrate::EvictionReport { count: 0, bytes: 0 };
         }
-        // Tight: reclaim partial-arena free space first, then re-measure.
-        let _ = self.session.compact();
+        // Tight: sweep emptied arenas back to the free list first, then
+        // re-measure. This used to be a compaction — relocate chunks GPU→GPU to
+        // consolidate partial arenas. Under the reservation there is nothing to
+        // consolidate for: an arena holds one region whether it is one chunk
+        // full or entirely full, so the only thing that returns a region is the
+        // arena's last chunk going, and the sweep is what notices.
+        let _ = self.session.release_empty_arenas();
         let avail = candle_nn::kv_cache::vram_budget_available(&device)
             .map(|a| a as u64)
             .unwrap_or(avail);

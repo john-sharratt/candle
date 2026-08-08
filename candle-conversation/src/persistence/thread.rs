@@ -829,19 +829,17 @@ fn run_pass(
     let mut select_ms = 0u64;
     let mut alloc_ms = 0u64;
     let mut convert_ms = 0u64;
-    // Hold the migration-in-flight guard across the whole hot→warm GPU window —
-    // from before `per_head_table_host` captures arena base pointers (inside
-    // `migrate_group_hot_to_warm`) through the post-migrate `device.synchronize()`
-    // below. While held, the scheduler defers arena free / defrag / trim
-    // (`BatchedInferenceSession::{release_empty_arenas,compact,defragment_bounded,
-    // trim_kv_pool}`), so the `run_select_kv_format_palette4_paged` kernel can't
-    // read a base pointer that a concurrent `cuMemPoolTrimTo` has unmapped.
-    // Dropped right after the sync (below), before install — by then the kernel
-    // has retired, so the install's own arena frees are safe.
-    // LOAD-BEARING HOLD: this guard must span the whole build->launch->readback
-    // ->sync window. Shortening it to "reduce lock time" re-opens the arena
-    // base-pointer corruption it exists to prevent. Do not narrow.
-    let migrate_guard = candle_nn::kv_cache::enter_migrate();
+    // Mark the hot→warm window in flight so the scheduler leaves the same
+    // residences alone: a section quantize that converted them float→quant now
+    // would be redoing the conversion this pass is already doing. Advisory
+    // only — it excludes nothing and guarantees nothing.
+    //
+    // It used to be a process-global read lock over arena topology, held from
+    // before `per_head_table_host` captured base pointers through the
+    // post-migrate sync, because the scheduler was otherwise free to unmap
+    // those arenas underneath the select kernel. Nothing unmaps any more; see
+    // `candle_nn::kv_cache::migrate_flight`.
+    let migrate_guard = candle_nn::kv_cache::migrate_flight();
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);
         migrate_group_hot_to_warm(

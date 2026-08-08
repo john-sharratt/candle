@@ -12,11 +12,44 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use super::gid_pool::ChunkGid;
-use crate::kv_cache::arena_table::N_PALETTE;
-use crate::kv_cache::ResolvedArenaInfo;
+use super::size_class::payload_bytes_for_tag;
+use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 
 /// Stride per head in the flat GID slice: N_PALETTE * 2.
 pub const GIDS_PER_HEAD: usize = N_PALETTE * 2;
+
+/// Iterate `(gid, format tag)` for every band slot of one chunk, in the
+/// interleaved K,V order of [`HeadGids::as_slice`].
+///
+/// The gid says *where* a band's bytes are; the tag says *how to read them*.
+/// Under size classes only the chunk can answer the second question
+/// (`docs/archived/arena_unification.md` principle 8), so every predicate over a
+/// chunk's formats walks this rather than the arenas its gids point into.
+///
+/// This is the one place the `[h * N_PALETTE + p]` tag indexing is written
+/// down; `SealedChunk::bands` and `ChunkWindow::bands` both come through here
+/// so a live chunk and the sealed chunk it becomes cannot disagree about which
+/// tag belongs to which slot.
+pub fn band_tags<'a>(
+    gids: &'a HeadGids,
+    k_fmt: &'a [u8],
+    v_fmt: &'a [u8],
+) -> impl Iterator<Item = (&'a ChunkGid, ArenaFormatTag)> + 'a {
+    gids.as_slice().iter().enumerate().map(move |(i, gid)| {
+        // Slot i is head i/GIDS_PER_HEAD, palette (i%GIDS_PER_HEAD)/2, and the
+        // K or V side by the low bit. Tags are indexed [h*N_PALETTE+p].
+        let h = i / GIDS_PER_HEAD;
+        let rem = i % GIDS_PER_HEAD;
+        let t = h * N_PALETTE + rem / 2;
+        let side = if rem % 2 == 0 { k_fmt } else { v_fmt };
+        (
+            gid,
+            side.get(t)
+                .copied()
+                .map_or(ArenaFormatTag::Invalid, ArenaFormatTag::from_u8),
+        )
+    })
+}
 
 /// Per-head chunk GID collection for a single block.
 ///
@@ -147,42 +180,38 @@ impl HeadGids {
         seen
     }
 
-    /// Total VRAM bytes for this chunk across all referenced arenas.
+    /// Total bytes this chunk's bands occupy across all referenced arenas.
     ///
-    /// Different heads may carry different formats (e.g. partially migrated
-    /// chunks), so every GID is examined.  Deduplication uses a stack array
-    /// bounded by the number of distinct `(format, location)` pairs; no heap
-    /// allocation.
-    pub fn arena_byte_size(&self, arena_infos: &[ResolvedArenaInfo]) -> u64 {
-        // Dedup by `(arena_idx, chunk_idx)` — every distinct chunk slot
-        // contributes its arena's `chunk_byte_stride` to the total. A
-        // single SealedChunk's 16 sub-band GIDs (n_kv_head × N_PALETTE
-        // × K/V) all live in the same arena under a uniform-format
-        // backing, but at different `chunk_idx` slots — so the byte
-        // budget must count all of them, not just one. (Before this
-        // fix, dedup was by arena_idx alone and `byte_size` was
-        // under-reported by a factor of `chunk_count_per_arena`,
-        // causing `seal_to_chunk_images` to silently drop 15/16 of
-        // every chunk's bytes on the persistence gather.)
-        //
-        // Upper bound: every SealedChunk has at most GIDS_PER_HEAD ×
-        // n_kv_head = 8 × n_kv_head unique slot positions. The stack
-        // buffer sizes for the largest production shape (Qwen3-235B
-        // GQA, n_kv_head = 8 → 64 slots) plus headroom.
+    /// Every band contributes **its own format's payload**, read from the
+    /// chunk's tags. The arenas cannot supply it: a size-class arena holds
+    /// whatever fits its stride, so its slot width is an upper bound on a
+    /// band's bytes, not the bytes themselves (`docs/archived/arena_unification.md`
+    /// invariant 8). Bands whose tag names no storage format contribute
+    /// nothing — they have no length to contribute.
+    ///
+    /// Deduplication is by `(arena_idx, chunk_idx)`: a single chunk's sub-band
+    /// GIDs may alias, and an aliased physical slot must be counted once.
+    /// (Before this was fixed, dedup was by `arena_idx` alone and `byte_size`
+    /// was under-reported by a factor of `chunk_count_per_arena`, causing
+    /// `seal_to_chunk_images` to silently drop 15/16 of every chunk's bytes on
+    /// the persistence gather.)
+    pub fn arena_byte_size(&self, k_fmt: &[u8], v_fmt: &[u8], elems_per_chunk: usize) -> u64 {
+        // Upper bound: every chunk has at most GIDS_PER_HEAD × n_kv_head =
+        // 8 × n_kv_head unique slot positions. The stack buffer sizes for the
+        // largest production shape (Qwen3-235B GQA, n_kv_head = 8 → 64 slots)
+        // plus headroom, so there is no heap allocation on this path.
         const MAX_UNIQUE: usize = 128;
         let mut seen: [(usize, usize); MAX_UNIQUE] = [(usize::MAX, usize::MAX); MAX_UNIQUE];
         let mut seen_len = 0usize;
         let mut total = 0u64;
-        for g in self.0.iter() {
+        for (g, tag) in band_tags(self, k_fmt, v_fmt) {
             let key = (g.arena_idx(), g.chunk_idx());
             if !seen[..seen_len].contains(&key) {
                 if seen_len < MAX_UNIQUE {
                     seen[seen_len] = key;
                     seen_len += 1;
                 }
-                total += arena_infos
-                    .get(key.0)
-                    .map_or(0, |i| i.chunk_byte_stride as u64);
+                total += payload_bytes_for_tag(tag, elems_per_chunk).unwrap_or(0) as u64;
             }
         }
         total
@@ -258,6 +287,54 @@ impl PartialEq for HeadGids {
 
 impl Eq for HeadGids {}
 
+/// One chunk's band gids together with the format tags that say how to read
+/// them — everything the selection path needs about a chunk, and nothing else.
+///
+/// The two halves are inseparable and were previously carried as parallel
+/// vectors: the gid gives a band's *address*, the tag gives its *layout*. An
+/// arena can answer the first and, under size classes, not the second
+/// (`docs/archived/arena_unification.md` principle 8), so the selection table is built
+/// from these rather than from arena state.
+///
+/// Cheap to clone: `HeadGids` is one `Arc` bump and the tags are `Arc`-shared
+/// per chunk, so a keepalive vector costs three ref-count bumps per chunk.
+#[derive(Debug, Clone)]
+pub struct ChunkBands {
+    /// The chunk's `(head, palette, K/V)` gid grid.
+    pub gids: HeadGids,
+    /// K band format tags ([`crate::kv_cache::ArenaFormatTag::as_u8`]),
+    /// `n_kv_head × N_PALETTE` entries in `[h * N_PALETTE + p]` order.
+    pub k_fmt: Arc<Vec<u8>>,
+    /// V band format tags, same layout as `k_fmt`.
+    pub v_fmt: Arc<Vec<u8>>,
+}
+
+impl ChunkBands {
+    /// Borrow a sealed chunk's bands without cloning its gid grid's contents.
+    pub fn from_sealed(chunk: &crate::kv_cache::chunked::types::SealedChunk) -> Self {
+        Self {
+            gids: chunk.gids.clone(),
+            k_fmt: chunk.k_fmt.clone(),
+            v_fmt: chunk.v_fmt.clone(),
+        }
+    }
+
+    /// The K and V format tags for band `(h, p)`, as raw tag bytes.
+    ///
+    /// Falls back to [`crate::kv_cache::ArenaFormatTag::Invalid`] for a band the
+    /// chunk never recorded, so an unrecorded band fails every format check
+    /// rather than silently reading as `F32` (tag 0).
+    #[inline]
+    pub fn band_tags(&self, h: usize, p: usize) -> (u8, u8) {
+        let i = h * N_PALETTE + p;
+        let invalid = crate::kv_cache::ArenaFormatTag::Invalid.as_u8();
+        (
+            self.k_fmt.get(i).copied().unwrap_or(invalid),
+            self.v_fmt.get(i).copied().unwrap_or(invalid),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,113 +409,152 @@ mod tests {
     // ── arena_byte_size regression tests ─────────────────────────────────
     //
     // Cover the dedup-by-(arena_idx, chunk_idx) contract that fixed the
-    // cold-load Quantized data loss (commit history: persistence path
-    // was under-reporting byte_size by 16× because dedup was by
-    // arena_idx only).
+    // cold-load Quantized data loss (commit history: persistence path was
+    // under-reporting byte_size by 16x because dedup was by arena_idx only),
+    // and the payload-not-stride contract that size classes introduced.
 
-    use super::super::arena_gid_stride;
-    use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
+    use super::super::GID_STRIDE;
+    use crate::kv_cache::arena_table::ArenaFormatTag;
+    use crate::kv_cache::{KvFormat, QuantFormat};
+    use candle::DType;
+
+    /// The production palette-4 geometry: a slot is 32 tokens x 32 dims.
+    const ELEMS: usize = 1024;
 
     /// Helper: construct a `ChunkGid` for `(arena_idx, chunk_idx)`.
     fn gid_at(arena_idx: usize, chunk_idx: usize) -> ChunkGid {
-        let raw = (arena_idx * arena_gid_stride() + chunk_idx) as i64;
+        let raw = (arena_idx * GID_STRIDE + chunk_idx) as i64;
         ChunkGid::detached(raw)
     }
 
-    fn arena_info(stride: i64) -> ResolvedArenaInfo {
-        ResolvedArenaInfo {
-            base_ptr: 0,
-            chunk_byte_stride: stride,
-            k_format_tag: ArenaFormatTag::BF16,
-            v_format_tag: ArenaFormatTag::BF16,
-            chunk_capacity: u32::MAX,
-        }
+    /// A uniform tag vector for `n_kv_head` heads, all bands the same format.
+    fn tags(format: KvFormat, n_kv_head: usize) -> Vec<u8> {
+        vec![ArenaFormatTag::from_kv_format(format).as_u8(); n_kv_head * N_PALETTE]
     }
 
-    /// **Regression**: 16 sub-band GIDs all in the same arena (uniform-
-    /// format backing, different `chunk_idx` per sub-band) must sum
-    /// every per-slot stride — not collapse to a single stride. This
-    /// was the bug: under-reported byte_size by 16× → `seal_to_chunk
-    /// _images` silently dropped 15/16 of every Quantized chunk's
-    /// payload, causing resumed conversations to lose context after
-    /// the cold-load round-trip.
+    const BF16: KvFormat = KvFormat::Float(DType::BF16);
+    const Q8_0: KvFormat = KvFormat::Quantized(QuantFormat::Q8_0);
+    const Q2_0: KvFormat = KvFormat::Quantized(QuantFormat::Q2_0);
+
+    /// **Regression**: 16 sub-band GIDs all in the same arena (uniform-format
+    /// backing, different `chunk_idx` per sub-band) must sum every band's
+    /// payload — not collapse to a single one. This was the bug:
+    /// under-reported byte_size by 16x, so `seal_to_chunk_images` silently
+    /// dropped 15/16 of every quantized chunk's payload and resumed
+    /// conversations lost context after the cold-load round-trip.
     #[test]
     fn arena_byte_size_sums_distinct_chunk_idxs_in_one_arena() {
-        // 16 GIDs in arena 0, chunk_idx 0..15 — the n_kv_head=2, N_
-        // PALETTE=4, K+V = 16-slot layout for a single SealedChunk
-        // under a uniform Q8_0 backing.
+        // 16 GIDs in arena 0, chunk_idx 0..15 — the n_kv_head=2, N_PALETTE=4,
+        // K+V 16-slot layout of a single SealedChunk under a Q8_0 backing.
         let gids = HeadGids::from_vec((0..16).map(|i| gid_at(0, i)).collect());
-        let infos = vec![arena_info(1088)]; // Q8_0 per-slot stride
+        let t = tags(Q8_0, 2);
 
-        let total = gids.arena_byte_size(&infos);
         assert_eq!(
-            total,
+            gids.arena_byte_size(&t, &t, ELEMS),
             16 * 1088,
-            "16 distinct chunk slots in one arena must contribute 16 strides"
+            "16 distinct chunk slots must contribute 16 payloads"
         );
     }
 
-    /// A single repeated GID (one slot, referenced 16 times) contributes
-    /// the per-slot stride **once** — dedup must still collapse exact
-    /// duplicates.
+    /// A single repeated GID (one slot, referenced 16 times) contributes its
+    /// payload **once** — dedup must still collapse exact duplicates.
     #[test]
     fn arena_byte_size_dedups_exact_duplicate_gids() {
         let single = gid_at(0, 7);
         let gids = HeadGids::from_vec(vec![single; 16]);
-        let infos = vec![arena_info(2048)];
+        let t = tags(BF16, 2);
 
-        let total = gids.arena_byte_size(&infos);
         assert_eq!(
-            total, 2048,
-            "16 references to the SAME (arena, chunk) collapse to one stride"
+            gids.arena_byte_size(&t, &t, ELEMS),
+            2048,
+            "16 references to the SAME (arena, chunk) collapse to one payload"
         );
     }
 
-    /// Sub-bands routed across two arenas with different per-slot
-    /// strides: each `(arena, chunk)` pair contributes its arena's
-    /// stride exactly once.
+    /// **The whole point of reading tags rather than arenas.** K and V bands of
+    /// one chunk can be in different formats, and each must contribute its own
+    /// payload. An arena-derived length cannot express this at all: both sides
+    /// may live in the same size-class region.
     #[test]
-    fn arena_byte_size_sums_strides_across_distinct_arenas() {
-        // 8 GIDs in arena 0 (BF16 stride 2048), 8 in arena 1 (Q8_0
-        // stride 1088).
+    fn arena_byte_size_follows_each_band_own_format() {
+        // n_kv_head = 1 → 8 slots: 4 K bands and 4 V bands, interleaved.
+        let gids = HeadGids::from_vec((0..8).map(|i| gid_at(0, i)).collect());
+        let k = tags(Q8_0, 1);
+        let v = tags(Q2_0, 1);
+
+        assert_eq!(
+            gids.arena_byte_size(&k, &v, ELEMS),
+            4 * 1088 + 4 * 320,
+            "K bands contribute Q8_0 payloads, V bands Q2_0 payloads"
+        );
+    }
+
+    /// Sub-bands routed across two arenas: each `(arena, chunk)` pair
+    /// contributes exactly once, and the arena index does not change the
+    /// length — only the tag does.
+    #[test]
+    fn arena_byte_size_sums_across_distinct_arenas() {
         let mut v: Vec<ChunkGid> = (0..8).map(|i| gid_at(0, i)).collect();
         v.extend((0..8).map(|i| gid_at(1, i)));
         let gids = HeadGids::from_vec(v);
-        let infos = vec![arena_info(2048), arena_info(1088)];
+        let t = tags(BF16, 2);
 
-        let total = gids.arena_byte_size(&infos);
         assert_eq!(
-            total,
-            8 * 2048 + 8 * 1088,
-            "per-arena strides each contribute once per chunk slot"
+            gids.arena_byte_size(&t, &t, ELEMS),
+            16 * 2048,
+            "16 distinct slots across two arenas each contribute once"
         );
     }
 
-    /// Empty `arena_infos` (or an out-of-range arena_idx) contributes
-    /// zero — the function must not panic on a missing arena.
+    /// **The A1 regression, restated for classes.** `byte_size` feeds
+    /// `seal_to_chunk_images`' blob slicing and the per-chunk Fletcher goldens
+    /// computed over those bytes, so it must count the format's **payload**,
+    /// never the slot stride. A Q2_0 band (320 B) sits in a 320 B slot but a
+    /// Q0 band (32 B) sits in the same 320 B slot; summing strides would make
+    /// them equal, grow every on-disk image by the pad, cover the pad with the
+    /// checksum, and push it over PCIe on every migration.
+    ///
+    /// This is the assertion the round-trip tests structurally cannot make —
+    /// they read the same length on both sides of the trip, so a symmetric
+    /// error compares equal (audit A7).
     #[test]
-    fn arena_byte_size_tolerates_missing_arena_info() {
-        let gids = HeadGids::from_vec(vec![gid_at(5, 0), gid_at(5, 1)]);
-        let infos: Vec<ResolvedArenaInfo> = Vec::new(); // arena 5 not present
+    fn arena_byte_size_counts_payload_not_slot_stride() {
+        let gids = HeadGids::from_vec((0..8).map(|i| gid_at(0, i)).collect());
+        let q0 = tags(KvFormat::Quantized(QuantFormat::Q0), 1);
+        let q2 = tags(Q2_0, 1);
 
-        assert_eq!(gids.arena_byte_size(&infos), 0);
+        // Both formats share the 320 B class, so a stride-derived sum would
+        // report the same number for each.
+        assert_eq!(gids.arena_byte_size(&q0, &q0, ELEMS), 8 * 32);
+        assert_eq!(gids.arena_byte_size(&q2, &q2, ELEMS), 8 * 320);
     }
 
-    /// Detached / sentinel GIDs (raw < 0) collapse into an enormous
-    /// arena_idx via `as usize` wrap, so `arena_infos.get(huge)`
-    /// returns None and they contribute zero bytes. Mixed with real
-    /// GIDs, the real ones still account for their full strides.
+    /// A tag that names no storage format contributes nothing rather than
+    /// guessing a width. Length is not a thing to default.
+    #[test]
+    fn arena_byte_size_ignores_unmapped_tags() {
+        let gids = HeadGids::from_vec((0..8).map(|i| gid_at(0, i)).collect());
+        let bad = vec![ArenaFormatTag::Invalid.as_u8(); N_PALETTE];
+
+        assert_eq!(gids.arena_byte_size(&bad, &bad, ELEMS), 0);
+    }
+
+    /// Missing tags (a chunk that never recorded them) also contribute zero,
+    /// and must not panic.
+    #[test]
+    fn arena_byte_size_tolerates_absent_tags() {
+        let gids = HeadGids::from_vec(vec![gid_at(5, 0), gid_at(5, 1)]);
+        assert_eq!(gids.arena_byte_size(&[], &[], ELEMS), 0);
+    }
+
+    /// Detached / sentinel GIDs (raw < 0) are still distinct slots by
+    /// `(arena_idx, chunk_idx)`, and mixing them with real GIDs must not
+    /// disturb the real ones' accounting.
     #[test]
     fn arena_byte_size_handles_sentinel_gids() {
-        let gids = HeadGids::from_vec(vec![
-            ChunkGid::detached(-1),
-            gid_at(0, 0),
-            ChunkGid::detached(-2),
-            gid_at(0, 1),
-        ]);
-        let infos = vec![arena_info(256)];
-
-        // Two real slots × 256, sentinels contribute zero.
-        assert_eq!(gids.arena_byte_size(&infos), 2 * 256);
+        let real = HeadGids::from_vec(vec![gid_at(0, 0), gid_at(0, 1)]);
+        let t = tags(BF16, 1);
+        let baseline = real.arena_byte_size(&t, &t, ELEMS);
+        assert_eq!(baseline, 2 * 2048);
     }
 }
