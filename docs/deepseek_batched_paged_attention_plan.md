@@ -652,14 +652,21 @@ double-buffer of the 8-key latent = +8 KB → 3 blocks/SM; skip it — occupancy
 `acc += c · scaleQ[h][p] · scaleK[key][p]`. **PV:** FP `fmaf` over the reused staged latent (or int8
 read-through when all palettes are read-through formats — one arena, so the gate is per-slot cheap).
 **Sink:** fold per head at the end — `m'=max(m,sink[h]); l = l·e^{m−m'} + e^{sink−m'}`.
-**RoPE:** computed **in-kernel** from the `rope_head_dim/2` YaRN-adjusted frequencies — the fork
-does **not** inherit the position-indexed `rope_cs` table (`int8_decode_kernel.cuh:56`), which at
-1M positions is hundreds of MB of device memory growing with N (§L). The angle `pos·freq` is
-reduced to a quadrant + residual **in f64** (an f32 product is unusable at depth: ulp(10⁶ rad)
-≈ 0.06 rad, and `__sincosf` degrades outside the principal range), then sin/cos come from the
-fork's own plain-arithmetic minimax polynomials (`rope_angle`/`ds_sincos`, built from `_rn`
-intrinsics so the compiler cannot contract them) — accurate at any position AND reproduced
-bit-for-bit by the CPU mirror oracle.
+**RoPE:** read from a **factored cos/sin table** (`rope_lookup`, `latent_common.cuh`) — neither the
+flat position-indexed `rope_cs` table (`int8_decode_kernel.cuh:56`; hundreds of MB growing with N,
+§L) nor per-key in-kernel trig (f64 runs at 1/64 rate on consumer Blackwell, and every key needs
+`rope_head_dim/2` angles per tile). The position splits at bit 10 — `pos = hi·2¹⁰ + lo` — and the
+angle-addition identity `sin θ = s_hi c_lo + c_hi s_lo`, `cos θ = c_hi c_lo − s_hi s_lo` recombines
+two tiny blocks: (sin, cos) of `(hi·2¹⁰)·f` and of `lo·f`, `(2048+1024)×NF` float2 ≈ **768 KB per
+frequency set** — L2-resident, covering every position below 2M (context hard-cap 1M) with size
+independent of N. The table is built **once per frequency set at model load**
+(`latent_rope_table_kernel` → `build_rope_table`) using the fork's exact trig primitives: the angle
+`pos·freq` reduced to quadrant + residual **in f64** (an f32 product is unusable at depth:
+ulp(10⁶ rad) ≈ 0.06 rad, and `__sincosf` degrades outside the principal range), sin/cos from
+plain-arithmetic minimax polynomials (`rope_angle`/`ds_sincos`, `_rn` intrinsics so the compiler
+cannot contract them). The runtime combination is 2 float2 loads + 6 exact-rounded f32 ops per
+(key, pair) — accurate at any position AND reproduced bit-for-bit by the CPU mirror oracle
+(`table_sincos`), gated by `rope_table_device_matches_mirror` + the bit-exact mirror suite.
 
 **Hybrid loop (one online-softmax, two key sources):**
 - **Window pass** — the stock gap-aware sequential slice-scan over the slot's window chunks, bounded
@@ -770,15 +777,29 @@ of that is true for DeepSeek:
   `window + top-k ≈ 640` keys** (§B, Part III) instead of the full O(N) history, plus a **pooled
   compressed corpus** (§C) instead of one KV entry per token.
 
-**Decision — window-KV format:** store the window latent as **FP8 E4M3**. The arena already has the
-leaf (`F8E4M3 = 34`, arena_table.cuh:263) and DeepSeek's own reference FP8-quantizes the latent dims
-(config.rs:116 `nope_head_dim` doc). One fixed format, no adaptive C-level. _Already supported
-end-to-end: `KvFormat::Float(DType::F8E4M3)` is a first-class KV dtype (kv_cache/mod.rs:375
-`FLOAT_DTYPES`) and the paged path runs it today (`test_fp8_hd128.rs` via `force_dtype`) — no new
-`QuantFormat` needed. Note `InferenceMode::is_quantized()` (batched_inference.rs:304) is false for
-float modes, so the old ratio gate would silently skip FP8 — acceptable only because the new
-accounting below replaces that gate entirely._ The compressed-corpus entries stay **float**
-(`FloatGalleryArena` `[G,512]`+`[G,128]`, §C/§D) — their job is retrieval, not compression.
+**Decision — window-KV format (REVISED): FP8 E4M3 writer + adaptive per-BAND compression on sealed
+chunks.** The WRITER chunk stores the latent as FP8 E4M3 (`F8E4M3 = 34`; the fused/glue scatters
+write FP8 only). At seal time, the **latent band compressor**
+(`candle-kernels/src/quantize/latent_band_quant.cuh` + `quantize_sealed_latent` in
+`kv_cache/chunked/compress.rs`) selects ONE format per (chunk, 128-dim band) from the level's K
+candidate ladder — whole-band round-trip rel-L2 against the level threshold, first passing wins,
+no-pass preserves FP8 — and re-encodes the band as token-oriented GGML blocks. The paged-latent
+kernels dispatch per band on the KvHead format tags (`load_band_elem`), so mixed FP8/quant chunks
+read directly. This SUPERSEDES the earlier "one fixed format, no adaptive C-level" decision: the
+original objection (the C0–C10 tables assume Qwen's per-head K/V shape) was answered by selecting at
+the latent's own granularity — the four per-band KvHead slots — rather than retrofitting the
+palette4 machinery (whose per-32-dim selection is structurally wrong for this shape, 16 sub-palette
+picks vs 4 band slots). Q8_KS's fine-scaled sub-block (elements 0–3) maps to the chunk's first four
+TOKENS in the token-oriented layout — the attention-sink protection carries over intact. Byte-wise,
+Q8 ≈ FP8 (quality rung, not size); the size wins start at Q4 (≈1.78×) and grow down-ladder, selected
+only where the threshold proves them. Gates: `latent_band_select_convert_matches_codec` (GPU/CPU
+codec byte contract), `mirror_bit_exact_mixed_band_formats` (decode dispatch, bit-exact),
+`prefill_mixed_rows_equal_decode_steps` (prefill dispatch), `latent_compressed_arena_roundtrip_decode`
+(the full production seal→compress→decode chain). The in-session seal
+(`quantize_and_seal_sequences`) drives compression; the persistence thread's hot→warm drain moves
+single-latent chunks format-preserving (the latent path is immediate-only — no deferred-descs
+contract). The compressed-corpus entries stay **float** (`FloatGalleryArena` `[G,512]`+`[G,128]`,
+§C/§D) — their job is retrieval, not compression.
 
 **Decision — the ratio we report:** re-baseline against *traditional FP16 linear attention*, as
 requested. Add `fp16_linear_baseline_bytes(n_tokens) = n_tokens · head_dim · 2 (K and V) · 2 B
@@ -813,7 +834,8 @@ bounded window + a pooled corpus.
    facts, load-bearing for the prefill/glue forks too: the SM80+ `fast_exp` runs its PTX-asm
    variant with different FMA-tuned coefficients (mirror THAT); all fork trig is own-polynomial
    `_rn`-intrinsic code (`rope_angle`/`ds_sincos` — `__sincosf` is neither mirrorable nor accurate
-   at depth); and the kernel quantizes int8 from roped f32 registers while PV reads the bf16-staged
+   at depth; the attention path reads them through the factored table + `_rn` angle-addition,
+   mirrored by `table_sincos`); and the kernel quantizes int8 from roped f32 registers while PV reads the bf16-staged
    latent — the mirror keeps both (zero-rope tests cannot catch this: fp8 ⊂ bf16). Device-vs-mirror
    bit probes for `ds_exp`/`ds_sincos` + a nullable kernel stage-dump are permanent regression
    infrastructure (`deepseek4/paged.rs`)._
@@ -871,17 +893,21 @@ Today `window_size = 128` (config.rs:82) and `max_seq = 512` (engine.rs:309, a p
 constant). Scaling to 1M does **not** grow the per-query attended set — that stays bounded at
 `window + top-k ≈ 640` (the O(1) budget, and the entire premise). What must become dynamic:
 
-- **RoPE to 1M — compute per-position, never grow a table (IMPLEMENTED).** The inherited kernels
+- **RoPE to 1M — a factored table with N-independent size (IMPLEMENTED).** The inherited kernels
   index a position-sized `rope_cs` table (`int8_decode_kernel.cuh:56`); at 1M positions that table
   is hundreds of MB of device memory growing with N — a quiet violation of the fixed-budget
-  principle. The `paged-deepseek` fork computes RoPE in-kernel from the `rope_head_dim/2`
-  YaRN-adjusted frequencies (constant memory, `sincosf`; §G.4), so nothing position-sized exists on
-  the kernel path. The host `RotaryCache` (`deepseek4/rope.rs`) is now **table-free too**: it holds
-  only the `rope_head_dim/2` `yarn_freqs` and computes `cos`/`sin` per call for exactly the
-  positions requested (`apply(start, seq)` / `apply_positions(&[u32])`), same `f64`-angle math as
-  the old table so every consumer's numerics are unchanged (the `max_seq` constructor argument is
-  gone — 15 call sites updated). A query at position 10⁶ costs the same host memory as one at
-  position 10; the indexer/compressor projections and reference forwards are all position-unbounded.
+  principle. The `paged-latent` fork splits the position at bit 10 and recombines two tiny cos/sin
+  blocks via the angle-addition identity (`rope_lookup`, §G.4): ≈768 KB per frequency set covering
+  all positions below 2M, size **independent of N** — the fixed-budget principle holds because the
+  factorization is logarithmic in extent, not because the table was banished. Entries are built once
+  at load by `latent_rope_table_kernel` with the exact f64-reduction + minimax-polynomial trig, so
+  the per-key cost drops from an f64 reduction (1/64 rate on consumer Blackwell) to 2 cache-hot
+  float2 loads + 6 f32 ops, bit-mirrorable as before. The host `RotaryCache` (`deepseek4/rope.rs`)
+  is **table-free**: it holds only the `rope_head_dim/2` `yarn_freqs` and computes `cos`/`sin` per
+  call for exactly the positions requested (`apply(start, seq)` / `apply_positions(&[u32])`), same
+  `f64`-angle math (the `max_seq` constructor argument is gone — 15 call sites updated). A query at
+  position 10⁶ costs the same memory as one at position 10; the indexer/compressor projections and
+  reference forwards are all position-unbounded.
 - **Corpus tier budget (IMPLEMENTED).** The `FloatGallery` splits its storage by access pattern:
   the sign/pos **index** (`signs` [G, sign_words] u32 + `pos` [G] u32, `sign_words·4 + 4` B/entry)
   stays GPU-resident at any depth — the BDP recall scan reads all of it, and it is tiny (≈105 MB at

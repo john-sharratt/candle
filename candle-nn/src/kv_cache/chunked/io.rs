@@ -8,7 +8,7 @@
 use std::cmp;
 
 use super::{arena_chunks_for_format, Arena, ChunkedKvBacking};
-use crate::{kv_cache::arena_table::N_PALETTE, CHUNK_SIZE};
+use crate::CHUNK_SIZE;
 use candle::{Result, Tensor};
 
 impl ChunkedKvBacking {
@@ -92,16 +92,27 @@ impl ChunkedKvBacking {
                         ))
                     })?;
 
-                // Palette4 path: each head owns N_PALETTE K/V sub-chunks, each storing
-                // CHUNK_SIZE × (head_dim / N_PALETTE) elements.
+                // Band path: each head owns `n_palette` K/V sub-chunks, each
+                // storing CHUNK_SIZE × (head_dim / n_palette) elements (4 for
+                // GQA, LATENT_N_BANDS for the single latent).
                 {
-                    let sub_head_dim = (head_dim / N_PALETTE).max(1);
+                    let np = self.inner.n_palette();
+                    let sub_head_dim = (head_dim / np).max(1);
+                    // The single latent splits its bands across two arenas of
+                    // different dtypes (nope FP8 ‖ rope BF16); `Tensor::cat`
+                    // needs a uniform dtype, so promote every band to F32 before
+                    // concatenating. Uniform-format (GQA) reads keep their
+                    // native dtype (cast only when single latent).
+                    let single_latent = self
+                        .inner
+                        .single_latent
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     let mut k_head_slices = Vec::with_capacity(n_kv_head);
                     let mut v_head_slices = Vec::with_capacity(n_kv_head);
                     for h in 0..n_kv_head {
-                        let mut k_pal_slices = Vec::with_capacity(N_PALETTE);
-                        let mut v_pal_slices = Vec::with_capacity(N_PALETTE);
-                        for p in 0..N_PALETTE {
+                        let mut k_pal_slices = Vec::with_capacity(np);
+                        let mut v_pal_slices = Vec::with_capacity(np);
+                        for p in 0..np {
                             let k_gid = cw.gids.k_gid_pal(h, p);
                             let v_gid = cw.gids.v_gid_pal(h, p);
 
@@ -124,6 +135,11 @@ impl ChunkedKvBacking {
                                 .narrow(0, k_ci, 1)?
                                 .narrow(1, in_blk, 1)?
                                 .unsqueeze(1)?;
+                            let k_slice = if single_latent {
+                                k_slice.to_dtype(candle::DType::F32)?
+                            } else {
+                                k_slice
+                            };
                             k_pal_slices.push(k_slice);
 
                             let v_ai = v_gid.arena_idx();
@@ -145,6 +161,11 @@ impl ChunkedKvBacking {
                                 .narrow(0, v_ci, 1)?
                                 .narrow(1, in_blk, 1)?
                                 .unsqueeze(1)?;
+                            let v_slice = if single_latent {
+                                v_slice.to_dtype(candle::DType::F32)?
+                            } else {
+                                v_slice
+                            };
                             v_pal_slices.push(v_slice);
                         }
                         k_head_slices.push(Tensor::cat(&k_pal_slices, 3)?);
@@ -224,20 +245,31 @@ impl ChunkedKvBacking {
     ) -> Result<()> {
         let (_, _, len, _) = k.dims4()?;
 
+        let single_latent = self
+            .inner
+            .single_latent
+            .load(std::sync::atomic::Ordering::Relaxed);
+
         // For quantized configs, arenas are created as F16 float (matching dequantize_f16).
         // For float configs, use the configured dtype.
+        //
+        // The single latent stores its bands across two arenas of DIFFERENT
+        // dtypes (nope FP8 ‖ rope BF16), so a single up-front cast can't serve
+        // both — and casting the whole latent to the nope FP8 dtype would strip
+        // the rope tail's BF16 precision before it ever reaches its arena. Keep
+        // the source precision here and cast each band to its own arena's dtype
+        // at the slice_set below.
         let storage_dtype = self.inner.storage.dtype().unwrap_or(candle::DType::F16);
 
-        let k = if k.dtype() != storage_dtype {
-            k.to_dtype(storage_dtype)?
-        } else {
-            k.clone()
+        let cast = |t: &Tensor| -> Result<Tensor> {
+            if single_latent || t.dtype() == storage_dtype {
+                Ok(t.clone())
+            } else {
+                t.to_dtype(storage_dtype)
+            }
         };
-        let v = if v.dtype() != storage_dtype {
-            v.to_dtype(storage_dtype)?
-        } else {
-            v.clone()
-        };
+        let k = cast(k)?;
+        let v = cast(v)?;
 
         self.ensure_for_offset(batch_idx, offset, len)?;
 
@@ -286,17 +318,19 @@ impl ChunkedKvBacking {
                 let k_seg = k.narrow(2, src_pos, seg)?.contiguous()?;
                 let v_seg = v.narrow(2, src_pos, seg)?.contiguous()?;
 
-                // Palette4 path: each head has N_PALETTE K/V sub-chunks of width
-                // head_dim / N_PALETTE. Quantized K arenas (e.g. active R16) are
+                // Band path: each head has `n_palette` K/V sub-chunks of width
+                // head_dim / n_palette (4 for GQA, LATENT_N_BANDS for the
+                // single latent). Quantized K arenas (e.g. active R16) are
                 // written via QTensor::quantize_into at the proper flat element offset.
                 {
                     let arenas = arena_state.arenas();
-                    let sub_head_dim = (self.inner.head_dim / N_PALETTE).max(1);
+                    let np = self.inner.n_palette();
+                    let sub_head_dim = (self.inner.head_dim / np).max(1);
                     for h in 0..n_kv_head {
                         let k_head = k_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
                         let v_head = v_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
 
-                        for p in 0..N_PALETTE {
+                        for p in 0..np {
                             let d_start = p * sub_head_dim;
                             let k_band = k_head.narrow(2, d_start, sub_head_dim)?.contiguous()?;
                             let v_band = v_head.narrow(2, d_start, sub_head_dim)?.contiguous()?;
@@ -310,7 +344,17 @@ impl ChunkedKvBacking {
                                 candle::Error::Msg(format!("arena {} not found", k_ai))
                             })?;
                             match k_arena {
-                                Arena::Float { data, .. } => {
+                                Arena::Float { data, dtype, .. } => {
+                                    // Cast this band to its own arena's dtype:
+                                    // the single latent's nope bands are FP8 and
+                                    // its rope bands BF16, so the band width
+                                    // alone doesn't fix the element type. A
+                                    // no-op for uniform-format (GQA) backings.
+                                    let k_band = if k_band.dtype() != *dtype {
+                                        k_band.to_dtype(*dtype)?
+                                    } else {
+                                        k_band
+                                    };
                                     let k_target = data.narrow(0, k_ci, 1)?;
                                     k_target.slice_set(&k_band, 1, in_blk)?;
                                 }
@@ -327,11 +371,7 @@ impl ChunkedKvBacking {
                                 }
                             }
 
-                            if self
-                                .inner
-                                .single_latent
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
+                            if single_latent {
                                 // K≡V: the V band aliases the K band just
                                 // written — nothing separate to store.
                                 continue;
@@ -489,7 +529,8 @@ impl ChunkedKvBacking {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
         let chunk_size = CHUNK_SIZE;
-        let sub_head_dim = head_dim / N_PALETTE;
+        let np = self.inner.n_palette();
+        let sub_head_dim = head_dim / np;
 
         // Snapshot (k_arena_idx, k_chunk_idx, v_arena_idx, v_chunk_idx) for every
         // (head, palette) pair while holding the state lock.
@@ -514,7 +555,7 @@ impl ChunkedKvBacking {
             })?;
             (0..n_kv_head)
                 .flat_map(|h| {
-                    (0..N_PALETTE).map(move |p| {
+                    (0..np).map(move |p| {
                         let kg = cw.gids.k_gid_pal(h, p);
                         let vg = cw.gids.v_gid_pal(h, p);
                         (
@@ -535,8 +576,8 @@ impl ChunkedKvBacking {
             let arenas = s.arenas();
             let mut bands = Vec::with_capacity(head_gids.len());
             for (idx, &(k_ai, k_ci, v_ai, v_ci)) in head_gids.iter().enumerate() {
-                let _h = idx / N_PALETTE;
-                let _p = idx % N_PALETTE;
+                let _h = idx / np;
+                let _p = idx % np;
 
                 // Quant/R16 arenas store each chunk DIM-major: block `pd` holds
                 // 32 tokens of dim `pd`, so the dequant flat is `[pd][t]`. The
@@ -595,8 +636,8 @@ impl ChunkedKvBacking {
         let mut k_out = vec![0.0f32; n_kv_head * head_dim * chunk_size];
         let mut v_out = vec![0.0f32; n_kv_head * head_dim * chunk_size];
         for (idx, (k_flat, v_flat)) in bands.into_iter().enumerate() {
-            let h = idx / N_PALETTE;
-            let p = idx % N_PALETTE;
+            let h = idx / np;
+            let p = idx % np;
             for pd in 0..sub_head_dim {
                 let d = p * sub_head_dim + pd;
                 for t in 0..chunk_size {

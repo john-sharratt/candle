@@ -3,7 +3,7 @@
 // =============================================================================
 // Native-MXFP4 exponent-collapse weights × q8a128 int8 activations on the m16n8k32
 // tensor core, F32 output. MXFP4_KO is INT8-ONLY (no FP GEMX kernel): the routed
-// DeepSeek-V4 experts are trained MXFP4 and only ever run through this path. The two
+// MXFP4-trained routed experts only ever run through this path. The two
 // int8 kernels (grouped + dense) are fully generic over the block type — the only
 // format-specific code is the collapse dequant in ../loader/mxfp4.cuh.
 //

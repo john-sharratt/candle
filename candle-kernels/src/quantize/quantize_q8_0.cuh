@@ -67,7 +67,7 @@ __device__ __forceinline__ void quantize_block_q8_0_vec(
     
     // Lane 0 stores the scale
     if (lane == 0) {
-        dst->d = __float2half_rn(amax / 127.0f);
+        dst->d = __float2half_rn(amax * (1.0f / 127.0f));
     }
 }
 
@@ -97,7 +97,7 @@ __device__ __forceinline__ void quantize_block_q8_0(
     
     // Lane 0 stores the scale
     if (lane == 0) {
-        dst->d = __float2half_rn(amax / 127.0f);
+        dst->d = __float2half_rn(amax * (1.0f / 127.0f));
     }
 }
 
@@ -158,7 +158,7 @@ __device__ __forceinline__ void quantize_blocks_q8_0(
         }
         
         if (lane == 0) {
-            block_dst->d = __float2half_rn(amax / 127.0f);
+            block_dst->d = __float2half_rn(amax * (1.0f / 127.0f));
         }
     }
 }

@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 
 // Simple CUDA kernels: basic operations, indexed operations, and simple transformations
 // NOTE: Only include properly formed dispatcher files that use <<<...>>> kernel launch syntax.
-const SIMPLE_KERNELS: [&str; 44] = [
+// (`src/simple/quantized_dispatcher.cu` — the seal-time quantize/select
+// kernels — compiles in its own group under the bit-exact mirror contract
+// flags; see the `quantize_dispatch` group below.)
+const SIMPLE_KERNELS: [&str; 43] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     // Kernel implementations
     "src/simple/add_at_indices.cu",
@@ -31,7 +34,7 @@ const SIMPLE_KERNELS: [&str; 44] = [
     "src/simple/fletcher32.cu",
     "src/simple/moe_bucketize.cu",
     "src/simple/sinkhorn.cu",
-    "src/simple/deepseek_bdp.cu",
+    "src/simple/bdp.cu",
     "src/simple/moe_scatter.cu",
     "src/simple/affine.cu",
     "src/simple/binary.cu",
@@ -58,7 +61,6 @@ const SIMPLE_KERNELS: [&str; 44] = [
     "src/simple/conv_dispatcher.cu",
     "src/simple/fill_dispatcher.cu",
     "src/simple/multinomial_dispatcher.cu",
-    "src/simple/quantized_dispatcher.cu",
     "src/simple/reduce_dispatcher.cu",
     "src/simple/repeat_penalty_dispatcher.cu",
     "src/simple/scatter_op_dispatcher.cu",
@@ -140,8 +142,8 @@ const FLASH_KERNELS: [&str; 13] = [
     // Paged glue: reprojection glue forward (decode-derivative; fp16, bf16)
     "src/paged-glue/paged_glue_api_fp16.cu",
     "src/paged-glue/paged_glue_api_bf16.cu",
-    // DeepSeek hybrid decode: single-latent K≡V window + compressed top-k
-    "src/paged-deepseek/paged_deepseek_api_bf16.cu",
+    // Paged latent attention: single-latent K≡V window + compressed top-k
+    "src/paged-latent/paged_latent_api_bf16.cu",
 ];
 
 /// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
@@ -262,9 +264,38 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
     groups.push(ArchiveGroup {
         name: "simple".to_string(),
         kernels: SIMPLE_KERNELS.iter().map(|s| s.to_string()).collect(),
-        compile_args: simple_args,
+        compile_args: simple_args.clone(),
         include_dirs: simple_includes.clone(),
     });
+
+    // 1b. Seal-time quantize/select dispatcher — its own group under the
+    //     bit-exact mirror contract flags. The CPU codecs (the latent band
+    //     `band_chunk_roundtrip`, the Qwen selection oracles) replicate the
+    //     encoders and error measurements op-for-op; `--use_fast_math`'s
+    //     approximate division and implicit fma contraction break that at
+    //     .5 rounding boundaries (measured: one-code quant flips). These
+    //     kernels run at seal time, not on the decode hot path, so the
+    //     precise-math cost is irrelevant.
+    {
+        let quantize_dispatch_args: Vec<String> = simple_args
+            .iter()
+            .cloned()
+            .chain(
+                [
+                    "-fmad=false".to_string(),
+                    "-prec-div=true".to_string(),
+                    "-prec-sqrt=true".to_string(),
+                ]
+                .into_iter(),
+            )
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "quantize_dispatch".to_string(),
+            kernels: vec!["src/simple/quantized_dispatcher.cu".to_string()],
+            compile_args: quantize_dispatch_args,
+            include_dirs: simple_includes.clone(),
+        });
+    }
 
     // 2. Quantized kernels — split per quant type
     {
@@ -367,26 +398,36 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         });
     }
 
-    // 7. DeepSeek hybrid decode (decode-derivative fork: single-latent K≡V,
+    // 7. Paged latent attention (decode-derivative fork: single-latent K≡V,
     //    HEAD_DIM=512). Same flags as the stock decode PLUS `-fmad=false`:
     //    implicit mul+add contraction is disabled so the CPU mirror oracle can
     //    reproduce the kernel bit-for-bit — fused multiply-adds exist only
     //    where the kernel writes an explicit `__fmaf_rn`.
+    //
+    //    NOTE: this group keeps `--use_fast_math` (from base_args) for the
+    //    hot path — `-prec-div` cost a measured ~8% on prefill/decode. The
+    //    handful of divisions that must match the mirror bit-for-bit (the
+    //    int8-requant reciprocal, the per-128 constant scales) are written
+    //    as explicit IEEE ops in the kernel (`__frcp_rn`, `x*(1.f/K)`), so
+    //    they are precise regardless of the fast-math flag. The seal-time
+    //    quantize/select kernels — where the encoders run — DO compile under
+    //    `-prec-div=true` (the `quantize_dispatch` group), since perf is
+    //    irrelevant at seal time.
     {
-        let deepseek_kernels: Vec<String> = FLASH_KERNELS
+        let latent_kernels: Vec<String> = FLASH_KERNELS
             .iter()
-            .filter(|k| k.contains("paged-deepseek") || k.contains("paged_deepseek"))
+            .filter(|k| k.contains("paged-latent") || k.contains("paged_latent"))
             .map(|s| s.to_string())
             .collect();
-        let deepseek_args: Vec<String> = decode_args
+        let latent_args: Vec<String> = decode_args
             .iter()
             .cloned()
             .chain(std::iter::once("-fmad=false".to_string()))
             .collect();
         groups.push(ArchiveGroup {
-            name: "paged_deepseek".to_string(),
-            kernels: deepseek_kernels,
-            compile_args: deepseek_args,
+            name: "paged_latent".to_string(),
+            kernels: latent_kernels,
+            compile_args: latent_args,
             include_dirs: flash_includes,
         });
     }

@@ -136,7 +136,7 @@ pub(crate) struct BoundaryMarkers {
     pub(crate) assistant_start_str: String,
     /// When set, inter-turn glue attends **backward-unbounded, strictly causal**
     /// — no forward bridge into the turn it introduces (`fwd_ahead ≡ 0`, §E).
-    /// The `paged-deepseek` glue kernel is causal-only; the forward-window path
+    /// The `paged-latent` glue kernel is causal-only; the forward-window path
     /// is a Qwen-only feature. Keyed on the dialect at construction.
     pub(crate) causal_only_glue: bool,
 }

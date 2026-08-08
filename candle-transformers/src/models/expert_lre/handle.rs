@@ -336,6 +336,7 @@ impl ExpertCache {
                     &mmap,
                     &host_refs,
                     cuda_dev,
+                    _gguf_path,
                     progress,
                 );
 

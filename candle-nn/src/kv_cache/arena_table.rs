@@ -355,8 +355,26 @@ impl ArenaEntry {
 
 // ==================== Palette Sub-Entry ====================
 
-/// Number of palette sub-bands per head (splits head_dim into N_PALETTE equal parts).
+/// Number of palette sub-bands per head (splits head_dim into N_PALETTE equal
+/// parts) for the GQA / palette4 path. The single-latent (DeepSeek) path uses
+/// [`LATENT_N_BANDS`] instead — a per-backing choice via `n_palette()`.
 pub const N_PALETTE: usize = 4;
+
+/// Band count for the single-latent (DeepSeek K≡V) path. 16 × 32-dim bands over
+/// the 512-dim latent isolate the 64 RoPE dims into the last two bands (14,15 =
+/// dims [448,480),[480,512)), so the asymmetric seal keeps rope BF16-exact
+/// while the 14 nope bands compress at 32-dim granularity. The per-dim palette
+/// map is 4-bit (names all 16 palettes).
+pub const LATENT_N_BANDS: usize = 16;
+
+/// Band split for the single-latent two-region window store. The reference
+/// format keeps the non-RoPE span `[0, 448)` in FP8 E4M3 (the writer format)
+/// and the RoPE tail `[448, 512)` in BF16. At `SUB = 512/16 = 32` dims/band the
+/// split lands exactly on band 14 (`448 / 32 = 14`), so bands `[0, 14)` back the
+/// nope region and bands `[14, 16)` back the 64-dim rope region — no band
+/// straddles the boundary. Used by `alloc_block_chunks` to route each band to
+/// its region's arena; the KvHead record still carries all 16 bands.
+pub const LATENT_NOPE_BANDS: usize = 14;
 
 /// Single per-palette metadata sub-entry.
 ///

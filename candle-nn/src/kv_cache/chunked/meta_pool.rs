@@ -59,13 +59,18 @@ const _: () = assert!(
 ///
 /// Layout: `k_pal[head_dim/4] + v_pal[head_dim/4] + k_ptr[4]·8 + v_ptr[4]·8 +
 /// k_fmt[4] + v_fmt[4] + k_scale[4]·4 + v_scale[4]·4`.
-pub(crate) fn kv_head_record_bytes(head_dim: usize) -> usize {
-    (head_dim / 4) * 2 + 32 + 32 + 4 + 4 + 16 + 16
+///
+/// `n_palette` is the per-head band count: 4 (GQA / palette4) or the
+/// single-latent `LATENT_N_BANDS`. The pal_map stays `head_dim/4` bytes per side
+/// (2-bit packing density — independent of the band count); only the
+/// pointer/fmt/scale block scales with `n_palette` (`n_palette * 26`).
+pub(crate) fn kv_head_record_bytes(head_dim: usize, n_palette: usize) -> usize {
+    (head_dim / 4) * 2 + n_palette * 26
 }
 
 /// Bytes of one chunk's full `KvHead[n_kv_head]` record.
-pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize) -> usize {
-    n_kv_head * kv_head_record_bytes(head_dim)
+pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize, n_palette: usize) -> usize {
+    n_kv_head * kv_head_record_bytes(head_dim, n_palette)
 }
 
 /// Serialize a chunk's `KvHead[n_kv_head]` record into `dst` (length must equal
@@ -87,6 +92,7 @@ pub(crate) fn serialize_kv_heads(
     v_scale: &[f32],
     n_kv_head: usize,
     head_dim: usize,
+    n_palette: usize,
     arena_info: &[ResolvedArenaInfo],
 ) {
     debug_assert!(
@@ -95,11 +101,16 @@ pub(crate) fn serialize_kv_heads(
     );
     debug_assert_eq!(
         dst.len(),
-        chunk_record_bytes(n_kv_head, head_dim),
+        chunk_record_bytes(n_kv_head, head_dim, n_palette),
         "record dst must be exactly chunk_record_bytes"
     );
     let pal_bytes = head_dim / 4;
+    // pal_map identity uses the 2-bit density (N_PALETTE), NOT the band count —
+    // the map is unused on the single-latent identity-only path and cannot name
+    // >4 bands anyway; only the pointer/fmt/scale block below scales to
+    // `n_palette`. GID stride per head is `n_palette*2` (K,V per band).
     let sub_hd = (head_dim / N_PALETTE).max(1);
+    let stride = n_palette * 2;
     let mut pos = 0usize;
 
     macro_rules! put {
@@ -141,13 +152,16 @@ pub(crate) fn serialize_kv_heads(
             }
         }
 
-        let mut k_ptr = [0u64; N_PALETTE];
-        let mut v_ptr = [0u64; N_PALETTE];
-        let mut k_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-        let mut v_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-        for p in 0..N_PALETTE {
-            let k_gid = gids.k_gid_pal(h, p);
-            let v_gid = gids.v_gid_pal(h, p);
+        let mut k_ptr = vec![0u64; n_palette];
+        let mut v_ptr = vec![0u64; n_palette];
+        let mut k_fmt = vec![ArenaFormatTag::BF16.as_u8(); n_palette];
+        let mut v_fmt = vec![ArenaFormatTag::BF16.as_u8(); n_palette];
+        // Index the flat GID slice at the record's own stride (n_palette*2), so
+        // an 8-band single-latent head reads its 16 GIDs correctly regardless of
+        // the global GIDS_PER_HEAD (which stays 4-palette for GQA).
+        for p in 0..n_palette {
+            let k_gid = &gids.as_slice()[h * stride + p * 2];
+            let v_gid = &gids.as_slice()[h * stride + p * 2 + 1];
             if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
                 k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
                 k_fmt[p] = ai.k_format_tag.as_u8();
@@ -165,12 +179,12 @@ pub(crate) fn serialize_kv_heads(
         }
         put!(&k_fmt);
         put!(&v_fmt);
-        let scale_base = h * N_PALETTE;
-        for p in 0..N_PALETTE {
+        let scale_base = h * n_palette;
+        for p in 0..n_palette {
             let s = k_scale.get(scale_base + p).copied().unwrap_or(1.0);
             put!(&s.to_le_bytes());
         }
-        for p in 0..N_PALETTE {
+        for p in 0..n_palette {
             let s = v_scale.get(scale_base + p).copied().unwrap_or(1.0);
             put!(&s.to_le_bytes());
         }
@@ -397,8 +411,11 @@ struct DeviceSlab {
 pub struct MetaPool {
     slabs: Mutex<SlabSet>,
     // record_bytes/device are only read on CUDA (device addressing + upload).
+    // Atomic so `set_record_bytes` can resize the record stride once, before any
+    // slab is allocated (the single-latent path flips to 8-band records after
+    // construction but before its first chunk — see `set_single_latent`).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    record_bytes: usize,
+    record_bytes: std::sync::atomic::AtomicUsize,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: Device,
 }
@@ -421,9 +438,26 @@ impl MetaPool {
                 #[cfg(feature = "cuda")]
                 device: Vec::new(),
             }),
-            record_bytes,
+            record_bytes: std::sync::atomic::AtomicUsize::new(record_bytes),
             device,
         }
+    }
+
+    /// Resize the per-record stride. Valid only before any slab is allocated
+    /// (all slabs share one stride); the single-latent path calls this from
+    /// `set_single_latent`, which runs before its first chunk allocation.
+    pub fn set_record_bytes(&self, record_bytes: usize) {
+        debug_assert!(
+            self.slabs.lock().expect("meta pool lock poisoned").refs.is_empty(),
+            "set_record_bytes must run before any record is allocated"
+        );
+        self.record_bytes
+            .store(record_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn record_bytes(&self) -> usize {
+        self.record_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(feature = "cuda")]
@@ -477,7 +511,7 @@ impl MetaPool {
         #[cfg(feature = "cuda")]
         {
             if let Some(dev) = s.device.get(slab_idx) {
-                return dev.base_ptr + (record_idx * self.record_bytes) as u64;
+                return dev.base_ptr + (record_idx * self.record_bytes()) as u64;
             }
         }
         0
@@ -512,7 +546,7 @@ impl MetaPool {
                 Some(s) => s,
                 None => return Ok(()),
             };
-            let rb = self.record_bytes;
+            let rb = self.record_bytes();
             use std::collections::HashMap;
             let mut by_slab: HashMap<usize, Vec<(usize, &[u8])>> = HashMap::new();
             for (gid, bytes) in items {
@@ -572,7 +606,7 @@ impl MetaPool {
         let stream = self
             .cuda_stream()
             .ok_or_else(|| candle::Error::Msg("meta pool: no cuda stream".into()))?;
-        let byte_len = META_SLAB_RECORDS * self.record_bytes;
+        let byte_len = META_SLAB_RECORDS * self.record_bytes();
         // SAFETY: untyped alloc; zeroed below so an unwritten slot reads as
         // null pointers / zero scales rather than garbage.
         let mut gpu = unsafe { stream.alloc::<u8>(byte_len).w()? };
@@ -679,7 +713,7 @@ mod tests {
     fn serialize_kv_heads_golden_single_palette() {
         let head_dim = 4usize;
         let n_kv_head = 1usize;
-        let rec = chunk_record_bytes(n_kv_head, head_dim);
+        let rec = chunk_record_bytes(n_kv_head, head_dim, N_PALETTE);
         assert_eq!(rec, head_dim / 2 + 104); // 106
 
         // One arena, base_ptr=0x1000, stride=512. All 8 sub-band GIDs point at
@@ -703,6 +737,7 @@ mod tests {
             &[],
             n_kv_head,
             head_dim,
+            N_PALETTE,
             &arena_info,
         );
 
@@ -744,7 +779,7 @@ mod tests {
     fn serialize_kv_heads_multi_arena_pointers() {
         let head_dim = 4usize;
         let n_kv_head = 1usize;
-        let rec = chunk_record_bytes(n_kv_head, head_dim);
+        let rec = chunk_record_bytes(n_kv_head, head_dim, N_PALETTE);
 
         // GID layout per head: slot = palette*2 + is_value, over N_PALETTE=4.
         // Put K-palette-0 in arena 0 chunk 1, K-palette-1 in arena 1 chunk 2.
@@ -781,6 +816,7 @@ mod tests {
             &[],
             n_kv_head,
             head_dim,
+            N_PALETTE,
             &arena_info,
         );
         // k_ptr[0] = 0x1000 + 1*256 = 0x1100; k_ptr[1] = 0x9000 + 2*128 = 0x9100.

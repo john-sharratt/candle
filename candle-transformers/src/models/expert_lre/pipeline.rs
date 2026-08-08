@@ -127,6 +127,164 @@ fn mmap_evict_expert(mmap: &memmap2::Mmap, r: &MmapExpertRef) {
 // Two-tier startup: GGUF → GPU repack → VRAM or pinned RAM
 // ============================================================================
 
+/// Positioned block read that fills `buf` entirely from `offset` (looping over
+/// short reads). Uses the OS positioned-read primitive so many threads can read
+/// disjoint regions of one file concurrently without a shared cursor.
+#[cfg(all(feature = "cuda", windows))]
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short read",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+#[cfg(all(feature = "cuda", unix))]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+/// MXFP4_KO fast startup: the on-disk bytes are already the final GPU layout, so
+/// this is pure I/O. Slots are assigned serially (cheap), then every expert's
+/// bytes are read STRAIGHT from the file into its destination with positioned
+/// block reads across the rayon pool — pinned slots filled in place (disjoint,
+/// so no aliasing), VRAM experts staged in bounded chunks and H2D'd serially
+/// (the CUDA context is single-threaded). No mmap fault storm, no intermediate
+/// copy. Returns `(vram_count, pinned_count, errors)`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn startup_two_tier_ko_blockread(
+    inner: &mut ExpertCacheInner,
+    pinned_pool: &mut PinnedPool,
+    expert_locations: &mut [Vec<ExpertLocation>],
+    layer_geometries: &[LayerGeometry],
+    host_refs: &[Vec<MmapExpertRef>],
+    cuda_dev: &candle::CudaDevice,
+    gguf_path: &std::path::Path,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> (usize, usize, usize) {
+    use std::fs::File;
+    let num_moe = host_refs.len();
+    let num_exp = host_refs[0].len();
+
+    // Pass 1 — serial slot assignment (bookkeeping only, no I/O). VRAM fills
+    // first (matching the free-list order), the remainder goes pinned.
+    let mut vram_jobs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut pinned_jobs: Vec<(usize, usize, usize)> = Vec::new();
+    for moe in 0..num_moe {
+        for exp in 0..num_exp {
+            if let Some(s) = inner.free_slots.pop() {
+                expert_locations[moe][exp] = ExpertLocation::Vram { slot_idx: s };
+                vram_jobs.push((moe, exp, s));
+            } else if let Some(p) = pinned_pool.alloc() {
+                expert_locations[moe][exp] = ExpertLocation::Pinned { slot_idx: p };
+                pinned_jobs.push((moe, exp, p));
+            }
+        }
+    }
+    let mut errors = 0usize;
+
+    // Pass 2a — pinned experts: parallel positioned reads DIRECT into the pinned
+    // slot bytes (each `p` is unique ⇒ the destination ranges are disjoint).
+    let t_pin = std::time::Instant::now();
+    let base = pinned_pool.base_ptr() as usize;
+    let slot_size = pinned_pool.slot_size();
+    let pin_errs: usize = pinned_jobs
+        .par_iter()
+        .map_init(
+            || File::open(gguf_path).ok(),
+            |file, &(moe, exp, p)| {
+                let Some(file) = file.as_ref() else {
+                    return 1usize;
+                };
+                let geom = &layer_geometries[moe];
+                let r = &host_refs[moe][exp];
+                let (g, u, d) = (
+                    geom.gate_repacked_size,
+                    geom.up_repacked_size,
+                    geom.down_repacked_size,
+                );
+                // SAFETY: `p` is a unique slot index, so this range does not
+                // overlap any other worker's range; the pool outlives the fill.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut((base + p * slot_size) as *mut u8, g + u + d)
+                };
+                let ok = read_exact_at(file, &mut dst[..g], r.gate_offset as u64).is_ok()
+                    && read_exact_at(file, &mut dst[g..g + u], r.up_offset as u64).is_ok()
+                    && read_exact_at(file, &mut dst[g + u..g + u + d], r.down_offset as u64)
+                        .is_ok();
+                usize::from(!ok)
+            },
+        )
+        .sum();
+    errors += pin_errs;
+    let pin_secs = t_pin.elapsed().as_secs_f64();
+
+    // Pass 2b — VRAM experts: parallel positioned reads into bounded chunks of
+    // host buffers, then serial H2D + install (CUDA is single-threaded).
+    let t_vram = std::time::Instant::now();
+    let mut vram_count = 0usize;
+    const CHUNK: usize = 512;
+    let mut done = pinned_jobs.len();
+    for chunk in vram_jobs.chunks(CHUNK) {
+        let bufs: Vec<Option<(usize, usize, usize, Vec<u8>, Vec<u8>, Vec<u8>)>> = chunk
+            .par_iter()
+            .map_init(
+                || File::open(gguf_path).ok(),
+                |file, &(moe, exp, s)| {
+                    let file = file.as_ref()?;
+                    let geom = &layer_geometries[moe];
+                    let r = &host_refs[moe][exp];
+                    let mut gate = vec![0u8; geom.gate_repacked_size];
+                    let mut up = vec![0u8; geom.up_repacked_size];
+                    let mut down = vec![0u8; geom.down_repacked_size];
+                    read_exact_at(file, &mut gate, r.gate_offset as u64).ok()?;
+                    read_exact_at(file, &mut up, r.up_offset as u64).ok()?;
+                    read_exact_at(file, &mut down, r.down_offset as u64).ok()?;
+                    Some((moe, exp, s, gate, up, down))
+                },
+            )
+            .collect();
+        for b in bufs {
+            match b {
+                Some((moe, exp, s, gate, up, down)) => {
+                    let geom = &layer_geometries[moe];
+                    match build_slot_from_repacked_with_device(&gate, &up, &down, geom, cuda_dev) {
+                        Ok(slot) => {
+                            inner.install(s, moe, exp, slot);
+                            vram_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("startup(ko): wrap failed L{moe}E{exp}: {e}");
+                            inner.free_slots.push(s);
+                            errors += 1;
+                        }
+                    }
+                }
+                None => errors += 1,
+            }
+        }
+        done += chunk.len();
+        if let Some(cb) = progress {
+            cb(done, num_moe * num_exp);
+        }
+    }
+    let vram_secs = t_vram.elapsed().as_secs_f64();
+    eprintln!(
+        "[stage-ko] pinned(direct,parallel)={:.1}s vram(read+h2d)={:.1}s",
+        pin_secs, vram_secs
+    );
+    (vram_count, pinned_jobs.len(), errors)
+}
+
 /// Fill the VRAM cache and pinned pool from the GGUF mmap.
 ///
 /// For each expert, reads GGML bytes from GGUF, GPU-repacks to K/128, then:
@@ -143,6 +301,7 @@ pub(crate) fn startup_two_tier(
     mmap: &[u8],
     host_refs: &[Vec<MmapExpertRef>],
     cuda_dev: &candle::CudaDevice,
+    gguf_path: Option<&std::path::Path>,
     progress: Option<&dyn Fn(usize, usize)>,
 ) {
     let num_moe_layers = host_refs.len();
@@ -157,6 +316,40 @@ pub(crate) fn startup_two_tier(
         return;
     }
     let total_experts = num_moe_layers * num_experts;
+
+    // Fast path for the pre-repacked (MXFP4_KO) model: the on-disk bytes are the
+    // final layout, so loading is pure I/O. mmap page-faults (4 KB at a time,
+    // ~1.7 GB/s here) are the wrong access pattern — explicit positioned block
+    // reads over many threads hit ~8× that. Read every expert's bytes STRAIGHT
+    // from the file into its destination slot (pinned in parallel, VRAM staged +
+    // H2D), no intermediate `Vec`, no mmap fault storm.
+    let all_ko = layer_geometries.iter().all(|g| {
+        use candle::quantized::GgmlDType::MXFP4_KO;
+        g.gate_dtype == MXFP4_KO && g.up_dtype == MXFP4_KO && g.down_dtype == MXFP4_KO
+    });
+    if all_ko {
+        if let Some(path) = gguf_path {
+            let t0 = std::time::Instant::now();
+            let (v, p, err) = startup_two_tier_ko_blockread(
+                inner,
+                pinned_pool,
+                expert_locations,
+                layer_geometries,
+                host_refs,
+                cuda_dev,
+                path,
+                progress,
+            );
+            eprintln!(
+                "[stage] done in {:.1}s (block-read KO path) — {} VRAM + {} pinned ({} errors)",
+                t0.elapsed().as_secs_f64(),
+                v,
+                p,
+                err,
+            );
+            return;
+        }
+    }
 
     tracing::info!(
         "startup: repacking {}×{} experts → {} VRAM + {} pinned slots …",

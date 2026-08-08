@@ -27,5 +27,5 @@ pub mod paged_prefill;
 #[path = "paged-glue/api.rs"]
 pub mod paged_glue;
 
-#[path = "paged-deepseek/api.rs"]
-pub mod paged_deepseek;
+#[path = "paged-latent/api.rs"]
+pub mod paged_latent;

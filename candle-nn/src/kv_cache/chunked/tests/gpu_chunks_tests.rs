@@ -5,6 +5,7 @@
 
 #[cfg(feature = "cuda")]
 mod tests {
+    use crate::kv_cache::arena_table::N_PALETTE;
     use crate::kv_cache::chunked::gpu_chunks::{
         kv_head_serialized_size, token_slice_serialized_size, write_identity_pal_map,
         write_slice_header, SLICE_HEADER_BYTES,
@@ -34,10 +35,10 @@ mod tests {
         // kv_head_size(8) = 8/4*2 + 32 + 32 + 4 + 4 + 16 + 16 = 4 + 104 = 108
         // k_pal[2] + v_pal[2] + k_ptr[4×8] + v_ptr[4×8] + k_fmt[4] + v_fmt[4]
         //   + k_scale[4×f32] + v_scale[4×f32]
-        assert_eq!(kv_head_serialized_size(8), 108);
+        assert_eq!(kv_head_serialized_size(8, N_PALETTE), 108);
         // Two-section footprint: 16-byte slice header + the out-of-line record.
-        assert_eq!(token_slice_serialized_size(1, 8), 16 + 108);
-        assert_eq!(token_slice_serialized_size(2, 8), 16 + 2 * 108);
+        assert_eq!(token_slice_serialized_size(1, 8, N_PALETTE), 16 + 108);
+        assert_eq!(token_slice_serialized_size(2, 8, N_PALETTE), 16 + 2 * 108);
     }
 
     /// The 16-byte slice header (offset/len/rope/kvheads_ptr) the kernel reads.

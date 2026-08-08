@@ -191,6 +191,19 @@ impl PinnedPool {
         self.num_slots
     }
 
+    /// Raw base pointer + uniform slot size — for filling many disjoint slots
+    /// in parallel at startup (each worker writes `base + slot_idx*slot_size`,
+    /// non-overlapping, so no aliasing). The pointer is carried across threads
+    /// as a `usize`; the pool outlives the parallel fill.
+    #[inline]
+    pub(crate) fn base_ptr(&self) -> *mut u8 {
+        self.base
+    }
+    #[inline]
+    pub(crate) fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
     /// Create an empty pool (no allocation).
     ///
     /// Used when running on a non-CUDA device but the `cuda` feature is enabled.

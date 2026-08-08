@@ -29,7 +29,7 @@ __device__ __forceinline__ void quantize_block_q3_1_vec(
     vmax = __shfl_sync(0xffffffff, vmax, 0, 32);
     vmin = __shfl_sync(0xffffffff, vmin, 0, 32);
 
-    const float d = (vmax - vmin) / 7.0f;
+    const float d = (vmax - vmin) * (1.0f / 7.0f);
     const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
 
     if (lane < 8) {
@@ -79,7 +79,7 @@ __device__ __forceinline__ void quantize_block_q3_1(
         vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, offset, 32));
     }
 
-    const float d = (vmax - vmin) / 7.0f;
+    const float d = (vmax - vmin) * (1.0f / 7.0f);
     const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
     const uint8_t q = (uint8_t)fminf(7.0f, fmaxf(0.0f, roundf((xi - vmin) * id)));
 
@@ -127,7 +127,7 @@ __device__ __forceinline__ void quantize_blocks_q3_1(
             vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, offset, 32));
         }
 
-        const float d = (vmax - vmin) / 7.0f;
+        const float d = (vmax - vmin) * (1.0f / 7.0f);
         const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
         const uint8_t q = (uint8_t)fminf(7.0f, fmaxf(0.0f, roundf((xi - vmin) * id)));
 

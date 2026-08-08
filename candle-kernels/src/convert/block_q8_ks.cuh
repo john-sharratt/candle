@@ -8,8 +8,8 @@
 
 static __device__ __forceinline__ float q8_ks_decode(const block_q8_ks* src, int idx) {
     const float cd = __half2float(src->d);
-    const float da = cd * (src->sa / 255.0f);
-    const float db = cd * (src->sb / 255.0f);
+    const float da = cd * (src->sa * INV_255);
+    const float db = cd * (src->sb * INV_255);
     return ((idx < 4) ? da : db) * (float)src->qs[idx];
 }
 
@@ -60,6 +60,6 @@ template <> struct BlockConverter<block_q8_ks, __nv_fp8_e4m3> {
 template <> struct BlockInt8<block_q8_ks> {
     static __device__ __forceinline__ Int8Sample load(const block_q8_ks* b, int e) {
         const float fine = (e < 4) ? (float)b->sa : (float)b->sb;
-        return Int8Sample{ b->qs[e], __half2float(b->d) * fine * (1.0f / 255.0f) };
+        return Int8Sample{ b->qs[e], __half2float(b->d) * fine * INV_255 };
     }
 };

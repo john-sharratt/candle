@@ -33,6 +33,12 @@
 // SCALAR CONVERSION HELPERS
 // =============================================================================
 
+// Reciprocal of the 255-step fine-scale quantum (Q4_KS/Q8_KS sub-block scales
+// are stored as a uint8 fraction of the coarse `d`). A named compile-time
+// constant so the decode reconstruction reads `sa * INV_255` rather than an
+// inline `1.0f / 255.0f`; nvcc folds it to the same immediate.
+static constexpr float INV_255 = 1.0f / 255.0f;
+
 // Convert any supported type to float
 template <typename T>
 __device__ __forceinline__ float to_float(T v);

@@ -20,6 +20,8 @@
 //! path is layered on top separately.
 
 mod attention;
+#[cfg(feature = "cuda")]
+pub mod bench;
 mod compressor;
 mod config;
 #[cfg(feature = "cuda")]
@@ -59,7 +61,7 @@ pub use linear::QLinear;
 pub use loader::{config_from_gguf, GgufModel};
 pub use moe::{Expert, Gate, MoE, ScoreFunc};
 #[cfg(feature = "cuda")]
-pub use paged::{paged_deepseek_decode, paged_deepseek_decode_raw, SyntheticSlots};
+pub use paged::{paged_latent_decode, paged_latent_decode_raw, CorpusCache, SyntheticSlots};
 pub use rope::yarn_freqs;
 pub use rope::RotaryCache;
 pub use streaming::StreamingModel;

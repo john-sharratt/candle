@@ -82,10 +82,13 @@ __device__ __forceinline__ void resolve_pos(
 // Byte-size helpers (compile-time for HEAD_DIM, runtime for n_kv_head)
 // ============================================================================
 
-// Byte size of one KvHead entry for a given HEAD_DIM template parameter.
-template <int HD>
+// Byte size of one KvHead entry for a given HEAD_DIM and palette count NP.
+// Layout: k_pal[HD/4] + v_pal[HD/4] + k_ptr[NP]*8 + v_ptr[NP]*8 + k_fmt[NP] +
+// v_fmt[NP] + k_scale[NP]*4 + v_scale[NP]*4 = HD/2 + NP*26. NP defaults to 4
+// (GQA / palette4); the single-latent path instantiates NP = LATENT_N_BANDS.
+template <int HD, int NP = 4>
 __device__ __host__ constexpr int kv_head_byte_size() {
-    return HD / 2 + 104;  // k_pal[HD/4] + v_pal[HD/4] + k_ptr[4]*8 + v_ptr[4]*8 + k_fmt[4] + v_fmt[4] + k_scale[4]*4 + v_scale[4]*4
+    return HD / 2 + NP * 26;
 }
 
 // Byte size of one TokenSlice — fixed at 16 (offset/len/rope + kvheads_ptr).
@@ -142,19 +145,19 @@ __device__ __forceinline__ void slice_increment_len(uint8_t* slice) {
 // Get a pointer to KvHead[head_idx] for a slice. The slice stores a device
 // pointer to its KvHead[n_kv_head] record at byte offset 8; dereference and
 // index by head.
-template <int HD>
+template <int HD, int NP = 4>
 __device__ __forceinline__ const uint8_t* get_head(const uint8_t* slice, int head_idx) {
     uint64_t kvheads_ptr = *reinterpret_cast<const uint64_t*>(slice + 8);
     return reinterpret_cast<const uint8_t*>(kvheads_ptr)
-        + (int64_t)head_idx * kv_head_byte_size<HD>();
+        + (int64_t)head_idx * kv_head_byte_size<HD, NP>();
 }
 
 // Mutable version.
-template <int HD>
+template <int HD, int NP = 4>
 __device__ __forceinline__ uint8_t* get_head_mut(uint8_t* slice, int head_idx) {
     uint64_t kvheads_ptr = *reinterpret_cast<const uint64_t*>(slice + 8);
     return reinterpret_cast<uint8_t*>(kvheads_ptr)
-        + (int64_t)head_idx * kv_head_byte_size<HD>();
+        + (int64_t)head_idx * kv_head_byte_size<HD, NP>();
 }
 
 // k_pal map: HD/4 bytes at offset 0 within the head entry.
@@ -184,38 +187,45 @@ __device__ __forceinline__ bool pal_map_equal(const uint8_t* a, const uint8_t* b
     return true;
 }
 
+// The palette block starts at HD/2 (after k_pal + v_pal). Slot offsets within
+// it are parameterized on NP so a single-latent record (NP = LATENT_N_BANDS)
+// and a GQA record (NP = 4, the default) share one accessor family:
+//   k_ptr  @ HD/2 + p*8          v_ptr  @ HD/2 + NP*8 + p*8
+//   k_fmt  @ HD/2 + NP*16 + p    v_fmt  @ HD/2 + NP*17 + p
+//   k_scale@ HD/2 + NP*18 + p*4  v_scale@ HD/2 + NP*22 + p*4
+
 // k_ptr[p]: uint64_t at offset (HD/2 + p*8).
-template <int HD>
+template <int HD, int NP = 4>
 __device__ __forceinline__ uint64_t kvhead_k_ptr(const uint8_t* head, int p) {
     return *reinterpret_cast<const uint64_t*>(head + HD / 2 + p * 8);
 }
 
-// v_ptr[p]: uint64_t at offset (HD/2 + 32 + p*8).
-template <int HD>
+// v_ptr[p]: uint64_t at offset (HD/2 + NP*8 + p*8).
+template <int HD, int NP = 4>
 __device__ __forceinline__ uint64_t kvhead_v_ptr(const uint8_t* head, int p) {
-    return *reinterpret_cast<const uint64_t*>(head + HD / 2 + 32 + p * 8);
+    return *reinterpret_cast<const uint64_t*>(head + HD / 2 + NP * 8 + p * 8);
 }
 
-// k_fmt[p]: uint8_t at offset (HD/2 + 64 + p).
-template <int HD>
+// k_fmt[p]: uint8_t at offset (HD/2 + NP*16 + p).
+template <int HD, int NP = 4>
 __device__ __forceinline__ int kvhead_k_fmt(const uint8_t* head, int p) {
-    return (int)*(head + HD / 2 + 64 + p);
+    return (int)*(head + HD / 2 + NP * 16 + p);
 }
 
-// v_fmt[p]: uint8_t at offset (HD/2 + 68 + p).
-template <int HD>
+// v_fmt[p]: uint8_t at offset (HD/2 + NP*17 + p).
+template <int HD, int NP = 4>
 __device__ __forceinline__ int kvhead_v_fmt(const uint8_t* head, int p) {
-    return (int)*(head + HD / 2 + 68 + p);
+    return (int)*(head + HD / 2 + NP * 17 + p);
 }
 
-// k_scale[p]: float at offset (HD/2 + 72 + p*4).
-template <int HD>
+// k_scale[p]: float at offset (HD/2 + NP*18 + p*4).
+template <int HD, int NP = 4>
 __device__ __forceinline__ float kvhead_k_scale(const uint8_t* head, int p) {
-    return *reinterpret_cast<const float*>(head + HD / 2 + 72 + p * 4);
+    return *reinterpret_cast<const float*>(head + HD / 2 + NP * 18 + p * 4);
 }
 
-// v_scale[p]: float at offset (HD/2 + 88 + p*4).
-template <int HD>
+// v_scale[p]: float at offset (HD/2 + NP*22 + p*4).
+template <int HD, int NP = 4>
 __device__ __forceinline__ float kvhead_v_scale(const uint8_t* head, int p) {
-    return *reinterpret_cast<const float*>(head + HD / 2 + 88 + p * 4);
+    return *reinterpret_cast<const float*>(head + HD / 2 + NP * 22 + p * 4);
 }

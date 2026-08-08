@@ -75,7 +75,7 @@ pub enum ModelArch {
     /// `quantized_llama::ModelWeights`
     Llama,
     /// `deepseek4::DeepSeekBatched` over the resident `Dsv4Engine` (offline
-    /// KO-repacked GGUF; paged-deepseek kernel attention).
+    /// KO-repacked GGUF; paged-latent kernel attention).
     DeepSeekV4,
 }
 

@@ -154,6 +154,10 @@ pub(crate) struct BackingInner {
     /// `v_ptr == k_ptr` without further special-casing. Set once, before any
     /// chunk is allocated.
     pub(crate) single_latent: std::sync::atomic::AtomicBool,
+    /// Sticky: some sealed chunk carries a non-identity pal_map (the latent
+    /// band compressor regrouped it) — attention launches must use the
+    /// MAPPED kernel instantiation.
+    pub(crate) mapped_sealed: std::sync::atomic::AtomicBool,
 }
 
 /// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
@@ -176,6 +180,18 @@ impl std::fmt::Debug for ProvSignScratch {
 }
 
 impl BackingInner {
+    /// Per-head band count for the arena/record layout: [`LATENT_N_BANDS`] on
+    /// the single-latent path, [`N_PALETTE`] for GQA. Every band-count use in
+    /// allocation, arena sub-band sizing, and record serialization goes through
+    /// this so the single-latent path can carry 8 bands while GQA stays at 4.
+    pub(crate) fn n_palette(&self) -> usize {
+        if self.single_latent.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::kv_cache::arena_table::LATENT_N_BANDS
+        } else {
+            crate::kv_cache::arena_table::N_PALETTE
+        }
+    }
+
     fn needs_compaction(&self, fragmentation_threshold: f32) -> Result<bool> {
         if self.pool.has_reclaimable() || self.pool.needs_defragmentation(fragmentation_threshold) {
             return Ok(true);
@@ -735,12 +751,60 @@ impl ChunkedKvBacking {
         self.inner
             .single_latent
             .store(on, std::sync::atomic::Ordering::Relaxed);
+        // Resize the resident-record stride to match the new band count
+        // (single-latent = 8 bands, GQA = 4). Must run before any chunk is
+        // allocated — the meta-pool slabs are still empty here — otherwise
+        // serialize_kv_heads would overrun the 4-band slots. Idempotent.
+        let rb = super::meta_pool::chunk_record_bytes(
+            self.inner.n_kv_head,
+            self.inner.head_dim,
+            self.inner.n_palette(),
+        );
+        self.inner.meta_pool.set_record_bytes(rb);
+        // The constructor's `warm_protected_arenas` ran while single_latent was
+        // still false, so it minted the writer/candidate arenas at the GQA band
+        // width (`head_dim / N_PALETTE` = 128). The single latent needs them at
+        // its own width (`head_dim / 16` = 32) — the width `resolve_arena_info`
+        // and the band writes both assume. Nothing has allocated a chunk yet
+        // (this runs immediately after construction, before any write), so drop
+        // the mis-sized warm arenas; the pool keeps their registrations and the
+        // next allocation recreates each at the single-latent width. GQA never
+        // calls this, so its warm set is untouched.
+        if on {
+            let _ = self.inner.storage.truncate_arenas(0);
+        }
     }
 
     /// Whether single-latent (K≡V) mode is active.
     pub fn single_latent(&self) -> bool {
         self.inner
             .single_latent
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Per-head band count for KvHead records: [`LATENT_N_BANDS`] on the
+    /// single-latent path, [`N_PALETTE`] for GQA / palette4. Drives the KvHead
+    /// record layout (host serializer + device accessors must agree).
+    pub fn n_palette(&self) -> usize {
+        if self.single_latent() {
+            crate::kv_cache::arena_table::LATENT_N_BANDS
+        } else {
+            crate::kv_cache::arena_table::N_PALETTE
+        }
+    }
+
+    /// Mark that a sealed chunk now carries a non-identity pal_map (sticky).
+    pub fn set_mapped_sealed(&self) {
+        self.inner
+            .mapped_sealed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether any sealed chunk carries a non-identity pal_map — attention
+    /// launches must then use the MAPPED kernel instantiation.
+    pub fn has_mapped_sealed(&self) -> bool {
+        self.inner
+            .mapped_sealed
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -826,12 +890,19 @@ impl ChunkedKvBacking {
             },
             pinned_stager,
             meta_pool: super::meta_pool::MetaPool::new(
-                super::meta_pool::chunk_record_bytes(n_kv_head, head_dim),
+                // GQA record stride (4-band); single-latent backings resize this
+                // to 8-band via `set_single_latent`, before any chunk allocates.
+                super::meta_pool::chunk_record_bytes(
+                    n_kv_head,
+                    head_dim,
+                    crate::kv_cache::arena_table::N_PALETTE,
+                ),
                 device.clone(),
             ),
             #[cfg(feature = "cuda")]
             prov_sign_scratch: Mutex::new(None),
             single_latent: std::sync::atomic::AtomicBool::new(false),
+            mapped_sealed: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Register for cooperative compaction
@@ -917,13 +988,15 @@ impl ChunkedKvBacking {
         }
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
-        let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim);
+        let n_palette = self.inner.n_palette();
+        let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
         let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::with_capacity(chunks.len());
         for (gids, k_pal, v_pal, k_scale, v_scale) in chunks {
             let handle = self.inner.meta_pool.allocate()?;
             let mut bytes = vec![0u8; rb];
             super::meta_pool::serialize_kv_heads(
-                &mut bytes, gids, k_pal, v_pal, k_scale, v_scale, n_kv_head, head_dim, arena_info,
+                &mut bytes, gids, k_pal, v_pal, k_scale, v_scale, n_kv_head, head_dim, n_palette,
+                arena_info,
             );
             items.push((handle, bytes));
         }
@@ -1691,11 +1764,17 @@ impl BackingInner {
         &self,
         needed: Option<&std::collections::HashSet<usize>>,
     ) -> Result<Vec<ResolvedArenaInfo>> {
-        use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
+        use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
         use crate::kv_cache::chunked::arena_chunks_for_format;
 
         let chunk_size = CHUNK_SIZE;
-        let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
+        // Per-band arena width tracks the backing's band count: `head_dim /
+        // n_palette()` = 32 for the single latent (16 bands over 512) and 128
+        // for GQA (4 palettes over 512). It MUST match the width the arenas are
+        // physically created at (`ensure_arena_exists` / `alloc_chunk_with_arenas`
+        // both use `n_palette()`); a mismatch strides the per-band pointers off
+        // the stored bytes. GQA is byte-identical (`n_palette()` == `N_PALETTE`).
+        let sub_head_dim = (self.head_dim / self.n_palette()).max(1);
 
         self.storage.read(|s| {
             let arenas = s.arenas();

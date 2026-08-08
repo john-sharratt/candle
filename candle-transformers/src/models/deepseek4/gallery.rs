@@ -17,23 +17,33 @@ fn sign_words(dim: usize) -> usize {
     dim.div_ceil(32)
 }
 
-/// Entry count past which the float corpus pair (`attn` + `keys`) spills from
-/// the GPU (hot) to CPU RAM (warm). The `signs` + `pos` index stays GPU-
-/// resident at any depth (the BDP scan reads all of it, and it is tiny —
-/// `sign_words·4 + 4` bytes/entry). Below the threshold a gallery is fully
-/// hot, so short conversations and the reference paths pay nothing; beyond it
-/// the resident footprint is bounded to the index while the corpus grows in
-/// RAM and the bounded shortlist/selection is gathered back per query. At
-/// 8192 entries (`ratio 4` ⇒ ~32k tokens) the hot float pair is ≤16 MB/gallery.
+/// Entry count past which the HOT tier — the position-free two-region cache
+/// (`nope_i8`/`nope_scale`/`rope_bf`) plus the Indexer `keys` — spills from the
+/// GPU (hot) to CPU RAM (warm). The `signs` + `pos` index stays GPU-resident at
+/// any depth (the BDP scan reads all of it, and it is tiny — `sign_words·4 + 4`
+/// bytes/entry); the canonical `attn` f32 is always CPU-archival. Below the
+/// threshold a gallery is fully hot, so short conversations and the reference
+/// paths pay nothing; beyond it the resident footprint is bounded to the index
+/// while the corpus grows in RAM and the bounded selection is gathered back per
+/// query (int8, ~576 B/entry — 3.5× cheaper to re-heat than the old f32 pair).
+/// At 8192 entries (`ratio 4` ⇒ ~32k tokens) the hot cache is ≤4.7 MB/gallery.
 const HOT_ENTRY_CAP: usize = 8192;
 
-/// Compressed-corpus pair with a packed sign index. The `signs`/`pos` index is
-/// always GPU-resident; the `attn`/`keys` float pair spills to CPU RAM past
-/// [`HOT_ENTRY_CAP`] entries (`spilled`), keeping the resident footprint
-/// bounded at unbounded depth (§L). Grows by doubling.
+/// Compressed-corpus store with a packed sign index. The `signs`/`pos` index is
+/// always GPU-resident and `attn` is always CPU-archival; the HOT two-region
+/// cache + `keys` spill to CPU RAM past [`HOT_ENTRY_CAP`] entries (`spilled`),
+/// keeping the resident footprint bounded at unbounded depth (§L). Grows by
+/// doubling.
 pub struct FloatGallery {
-    attn: Tensor,  // [cap, head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
+    attn: Tensor,  // [cap, head_dim] f32, pre-RoPE — CANONICAL, always CPU-archival
     keys: Tensor,  // [cap, index_head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
+    // The HOT retrieval artifact: the position-free two-region cache, built from
+    // `attn` on append. The decode/prefill readers rotate the rope bands at read
+    // time; the f32 `attn` is only needed to (re)build this. GPU while hot, CPU
+    // when spilled (re-heated per query by `gather_corpus`).
+    nope_i8: Tensor,   // [cap, nope_dim] u8  (nope int8)
+    nope_scale: Tensor, // [cap, nope_bands] f32 (per-nope-band amax)
+    rope_bf: Tensor,   // [cap, rope_dim] bf16 (rope pre-rotation)
     signs: Tensor, // [cap, sign_words] u32 — always GPU
     pos: Tensor,   // [cap] u32 group-start positions — always GPU
     len: usize,
@@ -41,9 +51,15 @@ pub struct FloatGallery {
     head_dim: usize,
     index_head_dim: usize,
     device: Device,
-    /// True once `attn`/`keys` have moved to CPU RAM (the warm tier).
+    /// True once the two-region cache + `keys` have moved to CPU RAM (warm tier).
     spilled: bool,
 }
+
+/// Latent geometry for the two-region cache (single-latent DeepSeek-V4).
+const NOPE_DIM: usize = 448;
+const ROPE_DIM: usize = 64;
+const SUB_DIM: usize = 32;
+const NOPE_BANDS: usize = NOPE_DIM / SUB_DIM; // 14
 
 impl FloatGallery {
     pub fn new(
@@ -52,10 +68,28 @@ impl FloatGallery {
         index_head_dim: usize,
         initial_cap: usize,
     ) -> Result<Self> {
+        // The two-region cache builder + readers are specialized to the
+        // single-latent geometry (`HEAD_DIM = NOPE_DIM + ROPE_DIM = 512`): the
+        // buffers below are sized by those constants and the build/decode
+        // kernels are compiled at `<512, 64>`. A gallery of any other `head_dim`
+        // would silently mis-stride, so reject it up front.
+        if head_dim != NOPE_DIM + ROPE_DIM {
+            candle::bail!(
+                "FloatGallery head_dim {} must equal NOPE_DIM+ROPE_DIM ({}) for the two-region corpus cache",
+                head_dim,
+                NOPE_DIM + ROPE_DIM,
+            );
+        }
         let cap = initial_cap.max(1);
         Ok(Self {
-            attn: Tensor::zeros((cap, head_dim), DType::F32, device)?,
+            // `attn` is ARCHIVAL (CPU) — the two-region cache is the hot artifact,
+            // built from the incoming GPU rows on append, so the canonical f32 is
+            // only needed to (re)build it and never sits in VRAM.
+            attn: Tensor::zeros((cap, head_dim), DType::F32, &Device::Cpu)?,
             keys: Tensor::zeros((cap, index_head_dim), DType::F32, device)?,
+            nope_i8: Tensor::zeros((cap, NOPE_DIM), DType::U8, device)?,
+            nope_scale: Tensor::zeros((cap, NOPE_BANDS), DType::F32, device)?,
+            rope_bf: Tensor::zeros((cap, ROPE_DIM), DType::BF16, device)?,
             signs: Tensor::zeros((cap, sign_words(index_head_dim)), DType::U32, device)?,
             pos: Tensor::zeros(cap, DType::U32, device)?,
             len: 0,
@@ -72,8 +106,9 @@ impl FloatGallery {
         self.spilled
     }
 
-    /// The device the `attn`/`keys` float pair currently lives on (CPU once
-    /// spilled). `signs`/`pos` are always on [`Self::device`].
+    /// The device the spillable tier — the two-region cache + Indexer `keys` —
+    /// currently lives on (CPU once spilled). `signs`/`pos` are always on
+    /// [`Self::device`]; `attn` is always CPU-archival.
     fn float_device(&self) -> Device {
         if self.spilled {
             Device::Cpu
@@ -131,8 +166,13 @@ impl FloatGallery {
             nt.slice_set(t, 0, 0)?;
             Ok(nt)
         };
-        self.attn = grow(&self.attn, self.head_dim, DType::F32, &fdev)?;
+        self.attn = grow(&self.attn, self.head_dim, DType::F32, &Device::Cpu)?;
         self.keys = grow(&self.keys, self.index_head_dim, DType::F32, &fdev)?;
+        // The two-region cache lives on the spillable tier alongside `keys`
+        // (GPU while hot, CPU once spilled).
+        self.nope_i8 = grow(&self.nope_i8, NOPE_DIM, DType::U8, &fdev)?;
+        self.nope_scale = grow(&self.nope_scale, NOPE_BANDS, DType::F32, &fdev)?;
+        self.rope_bf = grow(&self.rope_bf, ROPE_DIM, DType::BF16, &fdev)?;
         self.signs = grow(
             &self.signs,
             sign_words(self.index_head_dim),
@@ -144,18 +184,19 @@ impl FloatGallery {
         Ok(())
     }
 
-    /// Move the float corpus pair (`attn`/`keys`) from the GPU to CPU RAM once
-    /// the entry count crosses [`HOT_ENTRY_CAP`]. One-way: the corpus only
-    /// grows, and re-heating a whole spilled pair would defeat the bound —
-    /// per-query gathers pull the bounded working set back instead.
+    /// Move the HOT tier — the two-region cache + Indexer `keys` — from GPU to
+    /// CPU RAM once the entry count crosses [`HOT_ENTRY_CAP`] (`attn` is already
+    /// CPU-archival; `signs`/`pos` stay GPU). One-way: the corpus only grows,
+    /// and re-heating the whole spilled tier would defeat the bound — per-query
+    /// gathers pull the bounded working set back instead.
     fn maybe_spill(&mut self, prospective_len: usize) -> Result<()> {
         if self.spilled || prospective_len <= HOT_ENTRY_CAP || !self.device.is_cuda() {
             return Ok(());
         }
-        // Move the live prefix to CPU (the capacity tail is zeros — reallocate
-        // at the current cap so the CPU buffers match the GPU layout).
-        self.attn = self.attn.to_device(&Device::Cpu)?;
         self.keys = self.keys.to_device(&Device::Cpu)?;
+        self.nope_i8 = self.nope_i8.to_device(&Device::Cpu)?;
+        self.nope_scale = self.nope_scale.to_device(&Device::Cpu)?;
+        self.rope_bf = self.rope_bf.to_device(&Device::Cpu)?;
         self.spilled = true;
         Ok(())
     }
@@ -189,13 +230,46 @@ impl FloatGallery {
         let pos_t = Tensor::from_vec(positions.to_vec(), n, &self.device)?;
 
         self.grow_to(self.len + n)?;
+        // Build the HOT two-region cache from the incoming GPU rows (the build
+        // kernel is GPU-only). While the cache is hot its buffers are GPU, so
+        // build straight into the destination rows; once spilled they are CPU,
+        // so build into GPU scratch and copy the int8/bf16 rows down to RAM.
+        let attn_gpu = attn_rows.to_device(&self.device)?;
+        if self.spilled {
+            let nope_tmp = Tensor::zeros((n, NOPE_DIM), DType::U8, &self.device)?;
+            let scale_tmp = Tensor::zeros((n, NOPE_BANDS), DType::F32, &self.device)?;
+            let rope_tmp = Tensor::zeros((n, ROPE_DIM), DType::BF16, &self.device)?;
+            build_corpus_cache_into(&attn_gpu, &nope_tmp, &scale_tmp, &rope_tmp, 0, n)?;
+            self.nope_i8
+                .slice_set(&nope_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
+            self.nope_scale
+                .slice_set(&scale_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
+            self.rope_bf
+                .slice_set(&rope_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
+        } else {
+            build_corpus_cache_into(
+                &attn_gpu,
+                &self.nope_i8,
+                &self.nope_scale,
+                &self.rope_bf,
+                self.len,
+                n,
+            )?;
+        }
+        // Cross the spill threshold AFTER the hot build (so the just-built rows
+        // move down with the rest of the tier on the crossing append).
         self.maybe_spill(self.len + n)?;
-        // The float pair may now live on CPU; place the incoming rows on the
-        // same tier before writing them in.
-        let fdev = self.float_device();
-        let attn_rows = attn_rows.to_device(&fdev)?;
-        let key_rows = key_rows.to_device(&fdev)?;
-        self.attn.slice_set(&attn_rows, 0, self.len)?;
+        // Archive the canonical f32 to CPU (`attn` is never hot). When the
+        // incoming rows are already CPU, archive them directly rather than
+        // round-tripping through the GPU copy. Place the Indexer keys on their
+        // current tier (GPU until the spill).
+        let attn_cpu = if attn_rows.device().is_cpu() {
+            attn_rows.clone()
+        } else {
+            attn_gpu.to_device(&Device::Cpu)?
+        };
+        let key_rows = key_rows.to_device(&self.float_device())?;
+        self.attn.slice_set(&attn_cpu, 0, self.len)?;
         self.keys.slice_set(&key_rows, 0, self.len)?;
         self.pos.slice_set(&pos_t, 0, self.len)?;
         self.signs.slice_set(&new_signs, 0, self.len)?;
@@ -212,18 +286,48 @@ impl FloatGallery {
     #[cfg(feature = "cuda")]
     pub fn gather_selected(&self, gids: &Tensor) -> Result<(Tensor, Tensor)> {
         let pos = self.positions()?.index_select(gids, 0)?; // GPU
-        let attn = if self.spilled {
-            // Float pair is on CPU: read the k indices back (bounded), gather
-            // on CPU, upload the compacted rows.
-            let gids_cpu = gids.to_device(&Device::Cpu)?;
-            self.attn
-                .narrow(0, 0, self.len.max(1))?
-                .index_select(&gids_cpu, 0)?
-                .to_device(&self.device)?
-        } else {
-            self.attn_entries()?.index_select(gids, 0)?
-        };
+        // `attn` is CPU-archival: read the k indices back (bounded), gather on
+        // CPU, upload the compacted rows. (The hot path is `gather_corpus`; this
+        // canonical-f32 gather is only for rebuild/reference callers.)
+        let gids_cpu = gids.to_device(&Device::Cpu)?;
+        let attn = self
+            .attn
+            .narrow(0, 0, self.len.max(1))?
+            .index_select(&gids_cpu, 0)?
+            .to_device(&self.device)?;
         Ok((attn.contiguous()?, pos.contiguous()?))
+    }
+
+    /// Gather the HOT two-region cache for `gids` into a COMPACTED GPU tuple —
+    /// `(nope_i8 [k, NOPE_DIM], nope_scale [k, NOPE_BANDS], rope_bf [k, ROPE_DIM],
+    /// pos [k])`. This is what decode/prefill attend. Tier-aware: in place on the
+    /// GPU while hot, re-heated from CPU RAM when spilled — touching only the `k`
+    /// selected rows (~576 B each), so the transfer is bounded at any depth. `pos`
+    /// is always GPU-resident and gathered in place.
+    #[cfg(feature = "cuda")]
+    pub fn gather_corpus(&self, gids: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let live = self.len.max(1);
+        let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?.contiguous()?;
+        if self.spilled {
+            let gids_cpu = gids.to_device(&Device::Cpu)?;
+            let sel = |t: &Tensor| -> Result<Tensor> {
+                t.narrow(0, 0, live)?
+                    .index_select(&gids_cpu, 0)?
+                    .to_device(&self.device)?
+                    .contiguous()
+            };
+            Ok((
+                sel(&self.nope_i8)?,
+                sel(&self.nope_scale)?,
+                sel(&self.rope_bf)?,
+                pos,
+            ))
+        } else {
+            let sel = |t: &Tensor| -> Result<Tensor> {
+                t.narrow(0, 0, live)?.index_select(gids, 0)?.contiguous()
+            };
+            Ok((sel(&self.nope_i8)?, sel(&self.nope_scale)?, sel(&self.rope_bf)?, pos))
+        }
     }
 
     /// Gather the scoring `keys` for `ids` (GPU u32) onto the GPU — from CPU
@@ -339,6 +443,63 @@ impl FloatGallery {
     }
 }
 
+/// Build the two-region position-free cache (`latent_build_corpus_cache_kernel`)
+/// for `n` rows of `attn_gpu` `[n, HEAD_DIM]` f32 into the gallery buffers at
+/// `[row_lo, row_lo+n)`. The output views carry the row offset in their device
+/// pointer, so the kernel (gid `0..n`, reading `attn_gpu[gid]`) writes exactly
+/// those rows.
+#[cfg(feature = "cuda")]
+fn build_corpus_cache_into(
+    attn_gpu: &Tensor,
+    nope_i8: &Tensor,
+    nope_scale: &Tensor,
+    rope_bf: &Tensor,
+    row_lo: usize,
+    n: usize,
+) -> Result<()> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::Storage;
+    if n == 0 {
+        return Ok(());
+    }
+    let dev = match attn_gpu.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle::bail!("build_corpus_cache_into requires CUDA"),
+    };
+    let stream = dev.cuda_stream();
+    let ni8 = nope_i8.narrow(0, row_lo, n)?;
+    let nsc = nope_scale.narrow(0, row_lo, n)?;
+    let rbf = rope_bf.narrow(0, row_lo, n)?;
+    macro_rules! p {
+        ($t:expr, $ty:ty) => {{
+            let (storage, layout) = $t.storage_and_layout();
+            match &*storage {
+                Storage::Cuda(c) => {
+                    let (ptr, _g) = c.as_cuda_slice::<$ty>()?.device_ptr(&stream);
+                    ptr + (layout.start_offset() * std::mem::size_of::<$ty>()) as u64
+                }
+                _ => candle::bail!("expected CUDA storage"),
+            }
+        }};
+    }
+    let comp_p = p!(attn_gpu, f32);
+    let ni8_p = p!(&ni8, u8);
+    let nsc_p = p!(&nsc, f32);
+    let rbf_p = p!(&rbf, half::bf16);
+    unsafe {
+        candle_kernels::paged_latent::run_latent_build_corpus_cache(
+            comp_p as *const f32,
+            ni8_p as *mut u8,
+            nsc_p as *mut f32,
+            rbf_p as *mut core::ffi::c_void,
+            0,
+            n as i32,
+            stream.cu_stream() as *mut core::ffi::c_void,
+        );
+    }
+    Ok(())
+}
+
 /// Exact top-`m` entry ids by bounded u32 key (recall shortlist selector) —
 /// valid at any entry count, fully on-device. Tie order is arbitrary: any
 /// M-superset is a valid recall shortlist (the float rescore re-ranks it).
@@ -378,7 +539,7 @@ pub fn topm_select(counts: &Tensor, m: usize, bins: usize) -> Result<Tensor> {
             _ => unreachable!(),
         };
         let code = unsafe {
-            candle_kernels::simple::deepseek_bdp::run_deepseek_topm_select(
+            candle_kernels::simple::bdp::run_topm_select(
                 cp as *const u32,
                 hp as *mut u32,
                 mp as *mut u32,
@@ -422,7 +583,7 @@ pub fn sign_pack(x: &Tensor) -> Result<Tensor> {
             _ => unreachable!(),
         };
         let code = unsafe {
-            candle_kernels::simple::deepseek_bdp::run_deepseek_sign_pack(
+            candle_kernels::simple::bdp::run_sign_pack(
                 xp as *const f32,
                 op as *mut u32,
                 n as i32,
@@ -471,7 +632,7 @@ pub fn bdp_recall(q_signs: &Tensor, signs: &Tensor, dim: usize) -> Result<Tensor
             _ => unreachable!(),
         };
         let code = unsafe {
-            candle_kernels::simple::deepseek_bdp::run_deepseek_bdp_recall(
+            candle_kernels::simple::bdp::run_bdp_recall(
                 qp as *const u32,
                 sp as *const u32,
                 cp as *mut u32,
@@ -483,7 +644,7 @@ pub fn bdp_recall(q_signs: &Tensor, signs: &Tensor, dim: usize) -> Result<Tensor
             )
         };
         if code != 0 {
-            candle::bail!("deepseek_bdp_recall launch failed: cuda error {code}");
+            candle::bail!("bdp_recall launch failed: cuda error {code}");
         }
     }
     Ok(counts)
@@ -1059,6 +1220,12 @@ mod tests {
             !gal.keys.device().is_cuda(),
             "keys must be on CPU when spilled"
         );
+        assert!(
+            !gal.nope_i8.device().is_cuda()
+                && !gal.nope_scale.device().is_cuda()
+                && !gal.rope_bf.device().is_cuda(),
+            "the two-region cache must be on CPU when spilled (bounded hot VRAM)"
+        );
         assert!(gal.signs.device().is_cuda(), "signs must stay GPU-resident");
         assert!(gal.pos.device().is_cuda(), "pos must stay GPU-resident");
 
@@ -1076,12 +1243,27 @@ mod tests {
             "spilled two-stage top-k must equal the planted set (== oracle)"
         );
 
-        // gather_selected feeds the kernel a compacted GPU pair of the right
-        // shape, gathered from CPU RAM.
+        // gather_selected feeds the reference path a compacted GPU pair of the
+        // canonical f32, gathered from CPU-archival RAM.
         let (comp, comp_pos) = gal.gather_selected(&sel_t)?;
         assert_eq!(comp.dims(), &[top_k, HD]);
         assert_eq!(comp_pos.dims(), &[top_k]);
         assert!(comp.device().is_cuda() && comp_pos.device().is_cuda());
+
+        // gather_corpus re-heats the bounded two-region selection from the
+        // spilled RAM tier back onto the GPU (the hot decode/prefill path).
+        let (ni8, nsc, rbf, cpos) = gal.gather_corpus(&sel_t)?;
+        assert_eq!(ni8.dims(), &[top_k, NOPE_DIM]);
+        assert_eq!(nsc.dims(), &[top_k, NOPE_BANDS]);
+        assert_eq!(rbf.dims(), &[top_k, ROPE_DIM]);
+        assert_eq!(cpos.dims(), &[top_k]);
+        assert!(
+            ni8.device().is_cuda()
+                && nsc.device().is_cuda()
+                && rbf.device().is_cuda()
+                && cpos.device().is_cuda(),
+            "gather_corpus must return GPU tensors even when spilled"
+        );
         Ok(())
     }
 }

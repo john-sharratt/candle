@@ -16,8 +16,6 @@
 #[cfg(feature = "cuda")]
 use super::chunk_ops::BlockAllocSpec;
 #[cfg(feature = "cuda")]
-use crate::kv_cache::arena_table::N_PALETTE;
-#[cfg(feature = "cuda")]
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
 use candle::cuda::cudarc::driver::CudaStream;
@@ -303,7 +301,7 @@ impl super::ChunkedKvBacking {
         if chunks.is_empty() {
             return self.record_turn(slot);
         }
-        let want = self.n_kv_head() * N_PALETTE;
+        let want = self.n_kv_head() * self.n_palette();
 
         let mut specs: Vec<BlockAllocSpec> = Vec::with_capacity(chunks.len());
         for (block_idx, hc) in chunks.iter().enumerate() {

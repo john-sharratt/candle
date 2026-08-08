@@ -77,7 +77,7 @@ __device__ __forceinline__ void quantize_block_q3_0_vec(
     }
 
     if (lane == 0)
-        dst->d = __float2half_rn(amax / 3.5f);
+        dst->d = __float2half_rn(amax * (1.0f / 3.5f));
 }
 
 // =============================================================================
@@ -95,7 +95,7 @@ __device__ __forceinline__ void quantize_block_q3_0(
     float amax = fabsf(xi);
     amax = quantize_warp_reduce_max(amax);
 
-    const float d = amax / 3.5f;
+    const float d = amax * (1.0f / 3.5f);
     const float id = (amax != 0.0f) ? 3.5f / amax : 0.0f;
 
     // q = clamp(round(xi * id + 3.5), 0, 7)
@@ -190,6 +190,6 @@ __device__ __forceinline__ void quantize_blocks_q3_0(
         }
 
         if (lane == 0)
-            block_dst->d = __float2half_rn(amax / 3.5f);
+            block_dst->d = __float2half_rn(amax * (1.0f / 3.5f));
     }
 }

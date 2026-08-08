@@ -8,8 +8,8 @@
 
 static __device__ __forceinline__ float q4_ks_decode(const block_q4_ks* src, int idx) {
     const float cd = __half2float(src->d);
-    const float da = cd * (src->sa / 255.0f);
-    const float db = cd * (src->sb / 255.0f);
+    const float da = cd * (src->sa * INV_255);
+    const float db = cd * (src->sb * INV_255);
     if (idx < 16) {
         const int nibble = (int)(src->qs[idx] & 0xF) - 8;
         return ((idx < 4) ? da : db) * (float)nibble;
@@ -68,6 +68,6 @@ template <> struct BlockInt8<block_q4_ks> {
         const uint8_t byte = b->qs[e & 15];
         const int nib = (e >= 16) ? (byte >> 4) : (byte & 0xF);
         const float fine = (e < 4) ? (float)b->sa : (float)b->sb;
-        return Int8Sample{ (int8_t)(nib - 8), __half2float(b->d) * fine * (1.0f / 255.0f) };
+        return Int8Sample{ (int8_t)(nib - 8), __half2float(b->d) * fine * INV_255 };
     }
 };

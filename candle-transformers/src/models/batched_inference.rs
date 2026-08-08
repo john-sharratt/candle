@@ -1236,7 +1236,9 @@ impl BatchedInferenceSession {
     /// quantized tail. Already-quantized chunks pass through the quantizer's
     /// preserve bucket unchanged, so this is safe to call after both prefill and
     /// decode. No-op when the mode is uncompressed, the device is not CUDA, or
-    /// `head_dim != 128` (the palette4 quantizer requires 128).
+    /// the shape is unquantizable (the palette4 quantizer requires
+    /// `head_dim == 128`; single-latent backings take the per-band latent
+    /// compressor at any band-divisible head_dim).
     #[cfg(feature = "cuda")]
     pub fn quantize_and_seal_sequences(
         &mut self,
@@ -1280,13 +1282,15 @@ impl BatchedInferenceSession {
             Device::Cuda(d) => d.cuda_stream(),
             _ => return Ok(()),
         };
-        // The fused palette4 quantizer requires head_dim == 128. If it isn't, we
-        // still collapse the layout below — just without quantizing.
-        let policy = if self.backings.first().map(|b| b.head_dim()) == Some(128) {
-            policy
-        } else {
-            None
-        };
+        // The fused palette4 quantizer requires head_dim == 128; single-latent
+        // backings route through the per-band latent compressor instead (any
+        // head_dim divisible by N_PALETTE). Other shapes still collapse the
+        // layout below — just without quantizing.
+        let quantizable = self
+            .backings
+            .first()
+            .is_some_and(|b| b.head_dim() == 128 || (b.single_latent() && b.head_dim() % 4 == 0));
+        let policy = if quantizable { policy } else { None };
 
         let mut scratch: Option<PinnedBuf> = None;
         for &seq_idx in seq_indices {

@@ -8,7 +8,11 @@ use crate::kv_cache::arena_table::ResolvedArenaInfo;
 
 /// Serialised byte-size of one `TokenSlice` entry (mirrors the real implementation).
 #[allow(dead_code)]
-pub(crate) fn token_slice_serialized_size(_n_kv_head: usize, _head_dim: usize) -> usize {
+pub(crate) fn token_slice_serialized_size(
+    _n_kv_head: usize,
+    _head_dim: usize,
+    _n_palette: usize,
+) -> usize {
     0
 }
 
@@ -50,6 +54,17 @@ impl GpuChunks {
 
     pub(crate) fn n_chunks(&self) -> usize {
         0
+    }
+
+    /// No-op stand-in for the CUDA snapshot copy (the pinned stager itself is
+    /// CUDA-only, so this path is unreachable without the feature).
+    pub(crate) fn snapshot_into_generation(
+        &mut self,
+        _generation: &candle::quantized::pinned_staging::Generation,
+        _write_idx: usize,
+        _write_len: u16,
+    ) -> candle::Result<u64> {
+        candle::bail!("GpuChunks::snapshot_into_generation requires the cuda feature")
     }
 }
 

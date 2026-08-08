@@ -369,7 +369,8 @@ impl GpuChunksGuard<'_> {
         rope_base: u32,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<()> {
-        let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim);
+        let n_palette = chunk_n_palette(chunk, n_kv_head);
+        let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
         let current_n = if self.inner.chunk_byte_size == chunk_byte_size && chunk_byte_size > 0 {
             self.inner.buf.len() / chunk_byte_size
         } else {
@@ -380,7 +381,7 @@ impl GpuChunksGuard<'_> {
                 "update_chunk: index {chunk_idx} out of range (buf holds {current_n} chunks)"
             );
         }
-        let rec_bytes = record_bytes(n_kv_head, head_dim);
+        let rec_bytes = record_bytes(n_kv_head, head_dim, n_palette);
         let records_off = current_n * SLICE_HEADER_BYTES;
         let base = self.inner.raw_device_ptr();
         let len = chunk.usage as u16;
@@ -395,6 +396,7 @@ impl GpuChunksGuard<'_> {
                     chunk,
                     n_kv_head,
                     head_dim,
+                    n_palette,
                     arena_info,
                 );
                 base + (records_off + chunk_idx * rec_bytes) as u64
@@ -435,13 +437,15 @@ impl GpuChunksGuard<'_> {
         }
         self.dirty_chunks.clear();
         let n = chunks.len();
-        let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim);
+        // All chunks in a backing share one band count; derive it from the first.
+        let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
+        let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
         self.resize(n, chunk_byte_size)?;
 
         // Two sections: slice headers [0 .. n*16), then records. Resolve the GPU
         // base once (the allocation is fixed for the buffer's lifetime) so each
         // header's kvheads_ptr can point into the records section.
-        let rec_bytes = record_bytes(n_kv_head, head_dim);
+        let rec_bytes = record_bytes(n_kv_head, head_dim, n_palette);
         let records_off = n * SLICE_HEADER_BYTES;
         let base = self.inner.raw_device_ptr();
 
@@ -467,6 +471,7 @@ impl GpuChunksGuard<'_> {
                         chunk,
                         n_kv_head,
                         head_dim,
+                        n_palette,
                         arena_info,
                     );
                     base + (records_off + i * rec_bytes) as u64
@@ -630,14 +635,9 @@ impl Clone for GpuChunks {
 /// The pal_map packs 4 dims/byte (2 bits per dim), so each side is `head_dim/4`
 /// bytes. The `/4` is the bit-packing density, *not* N_PALETTE — they
 /// coincidentally both equal 4 today but are independent constants.
-pub(crate) fn kv_head_serialized_size(head_dim: usize) -> usize {
-    (head_dim / 4) * 2 // k_pal + v_pal, each head_dim/4 bytes
-        + 32 // k_ptr: 4 × u64
-        + 32 // v_ptr: 4 × u64
-        + 4  // k_fmt: 4 × u8
-        + 4  // v_fmt: 4 × u8
-        + 16 // k_scale: 4 × f32 (outer scale per palette)
-        + 16 // v_scale: 4 × f32 (outer scale per palette)
+pub(crate) fn kv_head_serialized_size(head_dim: usize, n_palette: usize) -> usize {
+    (head_dim / 4) * 2 // k_pal + v_pal, each head_dim/4 bytes (2-bit density)
+        + n_palette * 26 // k_ptr+v_ptr (8 each) + k_fmt+v_fmt (1 each) + k_scale+v_scale (4 each)
 }
 
 /// Fixed byte-size of one `TokenSlice` header: offset(2) + len(2) + rope(4) +
@@ -645,8 +645,8 @@ pub(crate) fn kv_head_serialized_size(head_dim: usize) -> usize {
 pub(crate) const SLICE_HEADER_BYTES: usize = 16;
 
 /// Byte-size of one chunk's out-of-line `KvHead[n_kv_head]` record.
-pub(crate) fn record_bytes(n_kv_head: usize, head_dim: usize) -> usize {
-    n_kv_head * kv_head_serialized_size(head_dim)
+pub(crate) fn record_bytes(n_kv_head: usize, head_dim: usize, n_palette: usize) -> usize {
+    n_kv_head * kv_head_serialized_size(head_dim, n_palette)
 }
 
 /// Per-chunk footprint in the `GpuChunks` buffer: the 16-byte slice header plus
@@ -654,8 +654,12 @@ pub(crate) fn record_bytes(n_kv_head: usize, head_dim: usize) -> usize {
 /// `[ slice_header × n_chunks | record × n_chunks ]` — so slice headers stay a
 /// contiguous 16-byte-stride array (what the kernel's `get_slice` indexes) while
 /// each header's `kvheads_ptr` points into the records section.
-pub(crate) fn token_slice_serialized_size(n_kv_head: usize, head_dim: usize) -> usize {
-    SLICE_HEADER_BYTES + record_bytes(n_kv_head, head_dim)
+pub(crate) fn token_slice_serialized_size(
+    n_kv_head: usize,
+    head_dim: usize,
+    n_palette: usize,
+) -> usize {
+    SLICE_HEADER_BYTES + record_bytes(n_kv_head, head_dim, n_palette)
 }
 
 /// Write a 16-byte slice header (`offset`, `len`, `rope`, `kvheads_ptr`).
@@ -675,11 +679,24 @@ pub(crate) fn write_slice_header(
 /// Serialize one chunk's `KvHead[n_kv_head]` record into `dst` (length
 /// [`record_bytes`]). Delegates to the shared record serializer so the decode
 /// buffer and the resident meta-pool produce byte-identical records.
+/// Per-head band count for this chunk's KvHead record, derived from its GID
+/// count (`n_kv_head * n_palette * 2`): 8 for a single-latent chunk, 4 for GQA.
+/// Falls back to [`N_PALETTE`] for an empty/placeholder chunk.
+fn chunk_n_palette(chunk: &ChunkWindow, n_kv_head: usize) -> usize {
+    let g = chunk.gids.len();
+    if n_kv_head == 0 || g == 0 {
+        crate::kv_cache::arena_table::N_PALETTE
+    } else {
+        (g / (n_kv_head * 2)).max(1)
+    }
+}
+
 fn write_record_for_chunk(
     dst: &mut [u8],
     chunk: &ChunkWindow,
     n_kv_head: usize,
     head_dim: usize,
+    n_palette: usize,
     arena_info: &[ResolvedArenaInfo],
 ) {
     super::meta_pool::serialize_kv_heads(
@@ -691,6 +708,7 @@ fn write_record_for_chunk(
         chunk.v_scale.as_slice(),
         n_kv_head,
         head_dim,
+        n_palette,
         arena_info,
     );
 }

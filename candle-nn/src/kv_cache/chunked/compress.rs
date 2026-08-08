@@ -517,8 +517,6 @@ fn derive_layer_formats(
     })
 }
 
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn quantize_sealed_in_place_impl(
     backing: &ChunkedKvBacking,
     sequences: &[&SealedSequence],
@@ -551,6 +549,9 @@ fn quantize_sealed_in_place_impl(
 
     let n_kv_head = backing.n_kv_head();
     let head_dim = backing.head_dim();
+    if backing.single_latent() {
+        candle::bail!("single-latent KV is not adaptively compressed");
+    }
     if head_dim != identity_pal_map_128().len() * 4 {
         candle::bail!(
             "quantize_sealed_in_place: palette4 conversion requires head_dim=128, got {head_dim}"

@@ -164,9 +164,12 @@ impl Dsv4Engine {
         // per-forward activations. This is the razor's-edge knob between a device OOM (too small —
         // base overruns it) and a pinned-host OOM (too large — the shrunken VRAM pool pushes the
         // 152 GB of experts past the ~95 GB page-lock ceiling). ~152 GB experts vs VRAM+pinned is
-        // near-saturated. 10 GiB proved too small — the resident base OOM'd with only 9.5 GB left;
-        // 13 GiB gives base + working set room while keeping the VRAM pool large enough that the
-        // pinned remainder stays under the page-lock ceiling. Cheap to retune now that load is fast.
+        // near-saturated. 10 GiB proved too small — the resident base OOM'd with only 9.5 GB left.
+        // 152 GB experts vs VRAM+pinned is near-saturated. 10 GiB proved too small — the resident
+        // base OOM'd with only 9.5 GB left; 14 GiB pushed the pinned expert remainder to ~101 GB and
+        // `cuMemAllocHost` OOM'd at the page-lock ceiling. 13 GiB gives the resident base + KV +
+        // activations room while keeping the VRAM pool large enough that the pinned remainder stays
+        // under the ceiling. Cheap to retune now that load is fast.
         let headroom = 13usize << 30;
         let expert_budget = free_vram
             .saturating_sub(headroom)
@@ -514,7 +517,7 @@ impl Dsv4Engine {
     }
 
     /// The paged-kernel decode session: attention runs in the
-    /// `paged-deepseek` kernel over a production chunked-arena slot
+    /// `paged-latent` kernel over a production chunked-arena slot
     /// (single-latent FP8 window) + `FloatGallery` corpus; the host keeps the
     /// int8 projections and MoE. One sequence, one slot per layer group.
     pub fn kernel_session(&self) -> Result<KernelSession<'_>> {
@@ -548,6 +551,7 @@ impl Dsv4Engine {
         let seq = kv.create_sequence()?;
 
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
+        let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(&self.device)?);
         for (l, layer) in self.layers.iter().enumerate() {
             let (theta, orig) = self.cfg.rope_params(l);
             layers.push(super::kernel_attention::KernelAttnLayer::new(
@@ -558,6 +562,7 @@ impl Dsv4Engine {
                 self.cfg.beta_fast,
                 self.cfg.beta_slow,
                 self.cfg.index_head_dim,
+                ws.clone(),
                 &self.device,
             )?);
         }
@@ -721,7 +726,7 @@ mod tests {
     }
 
     /// RUNG 3 — the step-4 milestone: the engine answers "Paris" with the
-    /// attention running entirely in the `paged-deepseek` kernel (FP8 arena
+    /// attention running entirely in the `paged-latent` kernel (FP8 arena
     /// window + FloatGallery corpus + two-stage selection); host attention is
     /// gone from this path. Ignored (needs the merged file + CUDA).
     #[test]

@@ -342,6 +342,17 @@ impl BlockQ0V {
     pub(crate) fn centroid_idx(&self) -> usize {
         ((self.hi as usize) >> 4) & 0x0F
     }
+
+    /// The block's two raw bytes `[lo, hi]` — the exact storage layout, for
+    /// external codecs (e.g. the latent band mirror) that author arena bytes.
+    pub fn to_le_bytes(&self) -> [u8; 2] {
+        [self.lo, self.hi]
+    }
+
+    /// Reconstruct a block from its two raw storage bytes.
+    pub fn from_le_bytes(b: [u8; 2]) -> Self {
+        Self { lo: b[0], hi: b[1] }
+    }
 }
 
 /// Q1_A: 1-bit asymmetric â€” separate INT8 amplitude per sign + 32 sign bits

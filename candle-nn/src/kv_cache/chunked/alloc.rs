@@ -19,10 +19,9 @@ use candle::{DType, Device, Result, Tensor};
 use super::backing::KV_DEVICE_OOM_MARKER;
 use super::backing::{request_global_compact, ChunkedKvBacking};
 use super::gid_pool::ChunkGid;
-use super::head_gids::{HeadGids, GIDS_PER_HEAD};
+use super::head_gids::HeadGids;
 use super::types::{arena_chunks_for_format, ChunkWindow, CHUNK_SIZE};
 use super::{Arena, ArenaLocation};
-use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::ArenaStorageState;
 use crate::kv_cache::{KvFormat, QuantFormat};
@@ -580,7 +579,7 @@ impl ChunkedKvBacking {
         key: super::arena::ArenaKey,
     ) -> Result<ChunkGid> {
         let arena_chunks = arena_chunks_for_format(key.format);
-        let sub_head_dim = (self.inner.head_dim / N_PALETTE).max(1);
+        let sub_head_dim = (self.inner.head_dim / self.inner.n_palette()).max(1);
 
         if let Some(gid) = self.inner.pool.allocate_for(key.clone()) {
             let arena_idx = gid.arena_idx();
@@ -694,9 +693,21 @@ impl ChunkedKvBacking {
     ///
     /// HeadGids layout: `head * GIDS_PER_HEAD + palette * 2 + is_value`.
     pub(super) fn alloc_block_chunks(&self, usage: u32, offset: u16) -> Result<ChunkWindow> {
-        let n = GIDS_PER_HEAD * self.inner.n_kv_head;
+        // Band count per head: LATENT_N_BANDS (single-latent) or N_PALETTE (GQA).
+        let np = self.inner.n_palette();
+        let n = np * 2 * self.inner.n_kv_head;
         let k_key = self.active_k_arena_key();
         let v_key = self.active_v_arena_key();
+        // Rope-region key for the single latent: the 64 RoPE dims (bands
+        // [LATENT_NOPE_BANDS, np)) are pinned BF16 regardless of the writer
+        // format, matching the reference (`nope FP8 ‖ rope BF16`). When the
+        // writer format is already BF16 (the wave window) this equals `k_key`,
+        // so the store is uniform BF16 — the pre-existing behaviour, only the
+        // arena width narrows to the single-latent band width.
+        let rope_key = super::arena::ArenaKey::uniform(
+            KvFormat::Float(DType::BF16),
+            self.inner.storage.default_location(),
+        );
         let mut gids = Vec::with_capacity(n);
         // Per head: one CONTIGUOUS run of N_PALETTE K slots and one of V slots
         // (see `alloc_chunk_run_for_key`). Correctness does NOT depend on the
@@ -710,23 +721,35 @@ impl ChunkedKvBacking {
             .single_latent
             .load(std::sync::atomic::Ordering::Relaxed);
         for _h in 0..self.inner.n_kv_head {
-            let k_run = self
-                .inner
-                .alloc_chunk_run_for_key(k_key.clone(), N_PALETTE)?;
             if single_latent {
-                // K≡V: the V band aliases the K band. `ChunkGid` is a
-                // refcounted handle, so the double reference keeps the chunk
-                // alive until both drop — V storage costs nothing and every
-                // table consumer sees v_ptr == k_ptr.
-                for k_gid in k_run {
+                // Two-region window: bands [0, LATENT_NOPE_BANDS) back the 448-d
+                // nope span in the writer format (FP8 E4M3 for the reference
+                // config); bands [LATENT_NOPE_BANDS, np) back the 64-d rope tail
+                // in BF16. Each region is one contiguous chunk run; the KvHead
+                // record still fills all 16 band slots (bands resolve their
+                // per-band {ptr, fmt, scale} from their own gid's arena, so the
+                // format tag follows the region automatically).
+                //
+                // K≡V: the V band aliases the K band. `ChunkGid` is a refcounted
+                // handle, so the double reference keeps the chunk alive until
+                // both drop — V storage costs nothing and every table consumer
+                // sees v_ptr == k_ptr.
+                let nope_bands = crate::kv_cache::arena_table::LATENT_NOPE_BANDS.min(np);
+                let rope_bands = np - nope_bands;
+                let nope_run = self.inner.alloc_chunk_run_for_key(k_key.clone(), nope_bands)?;
+                let rope_run = if rope_bands > 0 {
+                    self.inner.alloc_chunk_run_for_key(rope_key.clone(), rope_bands)?
+                } else {
+                    Vec::new()
+                };
+                for k_gid in nope_run.into_iter().chain(rope_run) {
                     let v_gid = k_gid.clone();
                     gids.push(k_gid);
                     gids.push(v_gid);
                 }
             } else {
-                let v_run = self
-                    .inner
-                    .alloc_chunk_run_for_key(v_key.clone(), N_PALETTE)?;
+                let k_run = self.inner.alloc_chunk_run_for_key(k_key.clone(), np)?;
+                let v_run = self.inner.alloc_chunk_run_for_key(v_key.clone(), np)?;
                 for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
                     gids.push(k_gid);
                     gids.push(v_gid);
@@ -895,7 +918,7 @@ impl BackingInner {
         key: super::arena::ArenaKey,
     ) -> Result<()> {
         let arena_chunks = arena_chunks_for_format(key.format);
-        let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
+        let sub_head_dim = (self.head_dim / self.n_palette()).max(1);
         let shape = (arena_chunks, CHUNK_SIZE, sub_head_dim);
 
         let exists = self.storage.read(|s| s.has_arena(arena_idx))?;

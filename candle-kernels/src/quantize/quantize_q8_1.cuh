@@ -69,7 +69,7 @@ __device__ __forceinline__ void quantize_block_q8_1_vec(
     }
     
     if (lane == 0) {
-        dst->ds = make_half2(__float2half_rn(amax / 127.0f), __float2half_rn(sum));
+        dst->ds = make_half2(__float2half_rn(amax * (1.0f / 127.0f)), __float2half_rn(sum));
     }
 }
 
@@ -96,7 +96,7 @@ __device__ __forceinline__ void quantize_block_q8_1(
     dst->qs[lane] = q;
     
     if (lane == 0) {
-        dst->ds = make_half2(__float2half_rn(amax / 127.0f), __float2half_rn(sum));
+        dst->ds = make_half2(__float2half_rn(amax * (1.0f / 127.0f)), __float2half_rn(sum));
     }
 }
 
@@ -158,7 +158,7 @@ __device__ __forceinline__ void quantize_blocks_q8_1(
         }
         
         if (lane == 0) {
-            block_dst->ds = make_half2(__float2half_rn(amax / 127.0f), __float2half_rn(sum));
+            block_dst->ds = make_half2(__float2half_rn(amax * (1.0f / 127.0f)), __float2half_rn(sum));
         }
     }
 }

@@ -1,6 +1,6 @@
 //! DeepSeek-V4-Flash as a `ManagedBatchedModel`: the conversation engine's
 //! wave-forward over the resident [`Dsv4Engine`], with attention in the
-//! `paged-deepseek` kernels and the mHC hyper-connection loop private to this
+//! `paged-latent` kernels and the mHC hyper-connection loop private to this
 //! implementation (the scheduler sees only the trait surface — `WaveStep`
 //! residuals are opaque, so the multi-stream mHC state rides them directly).
 //!
@@ -21,7 +21,7 @@ use crate::models::batched_inference::{
 
 use super::attention::{rms_norm, rms_scale};
 use super::engine::Dsv4Engine;
-use super::kernel_attention::{kernel_attn_decode_step, KernelLayerSeqState, KernelLayerStatic};
+use super::kernel_attention::{KernelLayerSeqState, KernelLayerStatic};
 use super::paged::HEAD_DIM;
 use crate::models::profile::{pipeline_record, profile_now};
 
@@ -45,6 +45,9 @@ impl DeepSeekBatched {
     pub fn new(engine: Dsv4Engine) -> Result<Self> {
         let cfg = engine.cfg();
         let mut layer_static = Vec::with_capacity(cfg.n_layers);
+        let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(
+            engine.engine_device(),
+        )?);
         for l in 0..cfg.n_layers {
             let (theta, orig) = cfg.rope_params(l);
             layer_static.push(KernelLayerStatic::new(
@@ -54,6 +57,7 @@ impl DeepSeekBatched {
                 cfg.rope_factor,
                 cfg.beta_fast,
                 cfg.beta_slow,
+                ws.clone(),
                 engine.engine_device(),
             )?);
         }
@@ -144,12 +148,19 @@ impl ManagedBatchedModel for DeepSeekBatched {
 
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat};
-        // DeepSeek overrides the storage plan wholesale: fixed FP8 single-
-        // latent window, no adaptive compression levels.
+        // DeepSeek pins the WRITER format to the reference two-region latent
+        // window: the non-RoPE dims `[0,448)` are FP8 E4M3, the 64 RoPE dims
+        // `[448,512)` stay BF16 (the rope tail must not lose precision). The
+        // single-latent backing splits the two regions per head automatically
+        // (`alloc_block_chunks`): the nope bands take this writer format tag,
+        // the rope bands are pinned BF16. The fused scatter + fresh-diagonal
+        // quant dispatch on the per-band format tag. The window stores FP8 at
+        // unit scale (a per-64 ue8m0 scale would need per-token record scales —
+        // the window ring is written a token at a time into a per-chunk scalar
+        // record, so a non-unit scale is not representable here).
         let cfg = BatchedConfig {
             k_format: KvFormat::Float(DType::F8E4M3),
             v_format: KvFormat::Float(DType::F8E4M3),
-            compression_level: None,
             ..config
         };
         let first = ChunkedKvBacking::new_with_format_adaptive(
@@ -354,34 +365,36 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .copied()
             .filter(|s| !decode_seqs.contains(s) && !prefill_seqs.contains(s))
             .collect();
-        let n_snapshots = prefill_lens.iter().copied().max().unwrap_or(0).max(1);
-        let mut snaps = Vec::with_capacity(n_snapshots);
-        for t in 0..n_snapshots {
-            let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(prefill_seqs.len());
-            for (pi, &s) in prefill_seqs.iter().enumerate() {
-                let o = prefill_base[pi] + t.min(prefill_lens[pi].saturating_sub(1));
-                // The write chunk must exist BEFORE set_len: usage grows from
-                // the writer boundary, and when the boundary's chunk hasn't
-                // been allocated yet the growth would clamp back into the
-                // immutable prefix (writing where the seal range can't see).
-                for backing in session.backings() {
-                    backing.ensure_for_batch_entries(&[(s, o)], 1)?;
-                    backing.set_len(s, o);
-                }
-                overrides.push((s, o));
+        // Prefill absorbs each prompt in ONE `paged_latent_prefill` launch per
+        // layer (the per-token decode-step loop it replaces was the dominant
+        // wall-clock cost — see the wave profile). So each prefill seq needs a
+        // SINGLE header snapshot at its committed-prefix length `base` (the arena
+        // walk covers `[0,base)`; the fresh bf16 latents cover `[base,base+s)`),
+        // with its whole write-back range ensured up-front. Decode/glue seqs
+        // serialize their live offsets in the same snapshot.
+        let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(prefill_seqs.len());
+        for (pi, &s) in prefill_seqs.iter().enumerate() {
+            let base = prefill_base[pi];
+            // Ensure the FULL prompt range so the post-launch arena write-back
+            // has its chunks; the header stays at `base` (the committed prefix).
+            let ensure_to = base + prefill_lens[pi].saturating_sub(1);
+            for backing in session.backings() {
+                backing.ensure_for_batch_entries(&[(s, ensure_to)], 1)?;
+                backing.set_len(s, base);
             }
-            let (pm, headers, stride) = session.build_decode_metadata_at(
-                &all_seqs,
-                &generation,
-                &overrides,
-                &non_writer,
-                true,
-            )?;
-            let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
-            snaps.push((pm, headers, stride));
+            overrides.push((s, base));
         }
-        let hdr_of = |snap: usize, layer: usize, seq_slot: usize| -> u64 {
-            let (_, headers, stride) = &snaps[snap];
+        let (pm, headers, stride) = session.build_decode_metadata_at(
+            &all_seqs,
+            &generation,
+            &overrides,
+            &non_writer,
+            true,
+        )?;
+        let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
+        let snaps = [(pm, headers, stride)];
+        let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
+            let (_, headers, stride) = &snaps[0];
             headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
         };
         pipeline_record("deepseek:wave_metadata", t_meta);
@@ -422,9 +435,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     let dev = xs.device();
                     let sl = Tensor::from_vec(d.write_slice.clone(), g_len, dev)?;
                     let ib = Tensor::from_vec(d.write_in_blk.clone(), g_len, dev)?;
-                    super::paged::paged_deepseek_glue_scatter(
+                    super::paged::paged_latent_glue_scatter(
                         &kv_bf,
-                        hdr_of(0, l, decode_seqs.len() + prefill_seqs.len() + gi),
+                        hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
                         &sl,
                         &ib,
                     )?;
@@ -438,54 +451,231 @@ impl ManagedBatchedModel for DeepSeekBatched {
 
             let mut attn_rows: Vec<Tensor> = Vec::with_capacity(total_rows);
             // Decode rows: one kernel step per sequence.
+            // Decode rows: all sessions attend in ONE `paged_latent_decode`
+            // launch over every decode slot (grid.x = n_decode), instead of a
+            // per-session launch loop. Per session we run the same host
+            // projections + on-device corpus select/gather, then concatenate the
+            // gathered compressed blocks — each slot's selection is the dense
+            // range `[offset, offset+k)` into the concat, so per-session galleries
+            // stay isolated with no cross-bleed and no GID readback.
             let t_decode = profile_now();
-            for (i, &seq) in decode_seqs.iter().enumerate() {
-                let xi = x.narrow(1, i, 1)?;
-                let entry = state.get_mut(&seq).expect("ensured above");
-                let out = kernel_attn_decode_step(
-                    a,
-                    st,
-                    &mut entry.layers[l],
-                    &xi,
-                    rope,
-                    decode_pos[i],
-                    hdr_of(0, l, i),
-                )?;
-                attn_rows.push(out);
-                if l + 1 == n_layers {
-                    entry.absorbed = decode_pos[i] + 1;
-                }
-            }
             if !decode_seqs.is_empty() {
+                let n_dec = decode_seqs.len();
+                let mut q_rows = Vec::with_capacity(n_dec);
+                let mut kv_rows = Vec::with_capacity(n_dec);
+                // Per-slot HOT two-region cache blocks, concatenated across slots
+                // into one launch (each slot's selection is a dense offset range).
+                let mut nope_blocks: Vec<Tensor> = Vec::new();
+                let mut scale_blocks: Vec<Tensor> = Vec::new();
+                let mut rope_blocks: Vec<Tensor> = Vec::new();
+                let mut pos_blocks: Vec<Tensor> = Vec::new();
+                let mut cnts: Vec<u32> = Vec::with_capacity(n_dec);
+                let mut offsets: Vec<u32> = Vec::with_capacity(n_dec);
+                let mut off = 0u32;
+                for (i, &seq) in decode_seqs.iter().enumerate() {
+                    let xi = x.narrow(1, i, 1)?;
+                    let entry = state.get_mut(&seq).expect("ensured above");
+                    let (q_bf, kv_bf, block, k) =
+                        super::kernel_attention::kernel_attn_decode_prepare(
+                            a,
+                            &mut entry.layers[l],
+                            &xi,
+                            rope,
+                            decode_pos[i],
+                        )?;
+                    q_rows.push(q_bf);
+                    kv_rows.push(kv_bf);
+                    if let Some((ni8, nsc, rbf, cpos)) = block {
+                        nope_blocks.push(ni8);
+                        scale_blocks.push(nsc);
+                        rope_blocks.push(rbf);
+                        pos_blocks.push(cpos);
+                    }
+                    offsets.push(off);
+                    cnts.push(k as u32);
+                    off += k as u32;
+                    if l + 1 == n_layers {
+                        entry.absorbed = decode_pos[i] + 1;
+                    }
+                }
+                let q_all = Tensor::cat(&q_rows, 0)?; // [n_dec, H, hd]
+                let kv_all = Tensor::cat(&kv_rows, 0)?; // [n_dec, hd]
+                let dev = q_all.device();
+                let cache = if nope_blocks.is_empty() {
+                    st.empty_corpus_cache()?
+                } else {
+                    let nope = Tensor::cat(&nope_blocks, 0)?;
+                    let clen = nope.dim(0)?;
+                    super::paged::CorpusCache::from_gathered(
+                        nope,
+                        Tensor::cat(&scale_blocks, 0)?,
+                        Tensor::cat(&rope_blocks, 0)?,
+                        Tensor::cat(&pos_blocks, 0)?,
+                        clen,
+                    )?
+                };
+                let max_sel = cnts.iter().map(|&c| c as usize).max().unwrap_or(0).max(1);
+                // Each slot's selection is the dense range [offset, offset+k) —
+                // strictly ascending, the compressed-index contract the kernel
+                // documents (attention is order-independent, but the contract
+                // holds by construction here).
+                let mut idx_flat = vec![u32::MAX; n_dec * max_sel];
+                for i in 0..n_dec {
+                    for k in 0..cnts[i] as usize {
+                        idx_flat[i * max_sel + k] = offsets[i] + k as u32;
+                    }
+                }
+                let comp_idx = Tensor::from_vec(idx_flat, (n_dec, max_sel), dev)?;
+                let comp_cnt = Tensor::from_vec(cnts, n_dec, dev)?;
+                // Explicit per-slot query position (the decode kernel no longer
+                // derives it from the writer slice, so the windowless slot works
+                // and the compressed causal guard has a reference).
+                let q_pos_dec = Tensor::from_vec(
+                    (0..n_dec).map(|i| decode_pos[i] as u32).collect::<Vec<u32>>(),
+                    n_dec,
+                    dev,
+                )?;
+                // `cache` is the gathered two-region hot cache (built above from
+                // the gallery's pre-built int8 — no per-wave rebuild).
+                let out = super::paged::paged_latent_decode_raw(
+                    &q_all,
+                    hdr_of(l, 0),
+                    &kv_all,
+                    &cache,
+                    &comp_idx,
+                    &comp_cnt,
+                    &q_pos_dec,
+                    st.sinks(),
+                    st.rope_tab(),
+                    a.softmax_scale() as f32,
+                    a.window_size(),
+                    0,
+                    false,
+                    st.ws(),
+                    None,
+                )?;
+                for i in 0..n_dec {
+                    let oi = out.narrow(0, i, 1)?.to_dtype(DType::F32)?.reshape((
+                        1,
+                        a.n_heads(),
+                        1,
+                        a.head_dim(),
+                    ))?;
+                    attn_rows.push(a.output_proj(&oi, 1, 1)?);
+                }
                 pipeline_record("deepseek:decode_attn", t_decode);
             }
-            // Prefill rows: the prompt absorbs through the SAME per-token
-            // decode step the decode rows use — bit-identical to per-token
-            // stepping by construction (same kernel, same launch geometry,
-            // same bf16-staged diagonal). Token `t` launches against header
-            // snapshot `t` (its window is `[0, base+t]`). The wave's batching
-            // win stays in the MoE below.
+            // Prefill rows: each prompt is absorbed in ONE batched
+            // `paged_latent_prefill` launch per layer (argmax-equal to per-token
+            // decode absorption, validated by `wave_prefill_state_matches_decode_steps`),
+            // which replaced the per-token launch loop that dominated the profile.
             let t_prefill = profile_now();
             let mut row_cursor = decode_seqs.len();
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
                 let entry = state.get_mut(&seq).expect("ensured above");
-                let mut rows = Vec::with_capacity(s_len);
+                // One launch over the whole prompt. Per token: host projections +
+                // causal corpus-select (identical to the decode step's selection),
+                // then a single `paged_latent_prefill` reads the committed prefix
+                // `[0,base)` from the arena and the prompt `[base,base+s)` from the
+                // fresh bf16 latents (`kv_fresh`) — matching the per-token diagonal.
+                let mut q_rows = Vec::with_capacity(s_len);
+                let mut kv_rows = Vec::with_capacity(s_len);
+                let mut idx_rows: Vec<Vec<u32>> = Vec::with_capacity(s_len);
                 for t in 0..s_len {
                     let xi = x.narrow(1, row_cursor + t, 1)?;
-                    let out = kernel_attn_decode_step(
+                    let (q_bf, kv_bf, gids) = super::kernel_attention::kernel_attn_prefill_prepare(
                         a,
-                        st,
                         &mut entry.layers[l],
                         &xi,
                         rope,
                         base + t,
-                        hdr_of(t, l, decode_seqs.len() + pi),
                     )?;
-                    rows.push(out);
+                    q_rows.push(q_bf);
+                    kv_rows.push(kv_bf);
+                    idx_rows.push(gids);
                 }
-                attn_rows.push(Tensor::cat(&rows, 1)?);
+                let q_all = Tensor::cat(&q_rows, 0)?; // [s, H, hd]
+                let kv_all = Tensor::cat(&kv_rows, 0)?; // [s, hd]
+                let dev = q_all.device();
+                // Gather ONLY the union of selected entries onto the GPU (tier-
+                // aware — works when the gallery has spilled to CPU RAM past
+                // HOT_ENTRY_CAP), then remap each query's absolute GIDs to their
+                // dense index in that compacted set. `comp_idx` indexes the small
+                // union, so the launch never needs the whole (possibly-spilled)
+                // corpus resident.
+                let mut union: Vec<u32> = idx_rows.iter().flatten().copied().collect();
+                union.sort_unstable();
+                union.dedup();
+                let cache = match entry.layers[l].gallery.as_ref() {
+                    Some(g) if !union.is_empty() => {
+                        let ids = Tensor::from_vec(union.clone(), union.len(), dev)?;
+                        let (ni8, nsc, rbf, cpos) = g.gather_corpus(&ids)?;
+                        super::paged::CorpusCache::from_gathered(ni8, nsc, rbf, cpos, union.len())?
+                    }
+                    _ => st.empty_corpus_cache()?,
+                };
+                let remap: HashMap<u32, u32> = union
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &g)| (g, i as u32))
+                    .collect();
+                let max_sel = idx_rows.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
+                let mut idx_flat = vec![u32::MAX; s_len * max_sel];
+                let mut cnt_v = vec![0u32; s_len];
+                for (t, gids) in idx_rows.iter().enumerate() {
+                    // Contract: each row's compressed indices are strictly
+                    // ascending (the gallery returns ascending GIDs and the union
+                    // is sorted, so the remap is monotonic). The attention is
+                    // order-independent, but callers must uphold this.
+                    let mut prev: i64 = -1;
+                    for (j, &g) in gids.iter().enumerate() {
+                        let mapped = remap[&g];
+                        debug_assert!(
+                            (mapped as i64) > prev,
+                            "comp_idx row {t} not strictly ascending: {mapped} after {prev}"
+                        );
+                        prev = mapped as i64;
+                        idx_flat[t * max_sel + j] = mapped;
+                    }
+                    cnt_v[t] = gids.len() as u32;
+                }
+                let comp_idx = Tensor::from_vec(idx_flat, (s_len, max_sel), dev)?;
+                let comp_cnt = Tensor::from_vec(cnt_v, s_len, dev)?;
+                let q_pos = Tensor::from_vec(
+                    (base as u32..(base + s_len) as u32).collect::<Vec<_>>(),
+                    s_len,
+                    dev,
+                )?;
+                let out = super::paged::paged_latent_prefill_raw(
+                    &q_all,
+                    hdr_of(l, decode_seqs.len() + pi),
+                    &q_pos,
+                    Some((&kv_all, base)),
+                    &cache,
+                    &comp_idx,
+                    &comp_cnt,
+                    st.sinks(),
+                    st.rope_tab(),
+                    a.softmax_scale() as f32,
+                    a.window_size(),
+                    0,
+                    session.backings()[l].k_format().to_tag(),
+                    st.ws(),
+                )?;
+                // Write the prompt latents into the arena so FUTURE decode waves
+                // read them (this launch read the fresh bf16 diagonal, not the
+                // arena). K≡V single latent → k = v.
+                let kv_4d = kv_all.reshape((1, 1, s_len, a.head_dim()))?;
+                session.backings()[l].write_contiguous(seq, base, &kv_4d, &kv_4d)?;
+                session.backings()[l].set_len(seq, base + s_len);
+                let o = out
+                    .to_dtype(DType::F32)?
+                    .reshape((1, s_len, a.n_heads(), a.head_dim()))?
+                    .transpose(1, 2)?
+                    .contiguous()?;
+                attn_rows.push(a.output_proj(&o, 1, s_len)?);
                 if l + 1 == n_layers {
                     entry.absorbed = base + s_len;
                 }
@@ -515,20 +705,21 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let q_pos_t = Tensor::from_vec(glue_pos[gi].clone(), g_len, dev)?;
                 let empty_idx = Tensor::full(u32::MAX, (g_len, 1), dev)?;
                 let empty_cnt = Tensor::zeros(g_len, DType::U32, dev)?;
-                let out = super::paged::paged_deepseek_prefill_raw(
+                let out = super::paged::paged_latent_prefill_raw(
                     &q_bf,
-                    hdr_of(0, l, decode_seqs.len() + prefill_seqs.len() + gi),
+                    hdr_of(l, decode_seqs.len() + prefill_seqs.len() + gi),
                     &q_pos_t,
                     None,
-                    &st.empty_comp(),
-                    &st.empty_pos(),
+                    &st.empty_corpus_cache()?,
                     &empty_idx,
                     &empty_cnt,
                     st.sinks(),
-                    st.freqs(),
+                    st.rope_tab(),
                     a.softmax_scale() as f32,
                     a.window_size(),
                     1,
+                    session.backings()[l].k_format().to_tag(),
+                    st.ws(),
                 )?;
                 let o = out
                     .to_dtype(DType::F32)?

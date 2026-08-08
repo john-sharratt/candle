@@ -1,7 +1,7 @@
 // =============================================================================
-// deepseek_bdp.cu — sign-pack + BDP recall agreement for the DeepSeek
-// compressed-corpus two-stage selection (BDP recall in the Indexer's sign
-// space → Indexer float precision on the shortlist).
+// bdp.cu — sign-pack + BDP recall agreement for the compressed-corpus
+// two-stage selection (BDP recall in the Indexer's sign space → Indexer
+// float precision on the shortlist).
 //
 // Both kernels are tiny, launch-bound utilities that keep the corpus-selection
 // recall stage fully on-device (the decode hot path allows exactly one host
@@ -15,7 +15,7 @@
 // Pack the sign bits of `n` rows of `dim` f32 values into ceil(dim/32) u32
 // words per row (bit d of word w = sign(x[32w+d]) >= 0). One thread per row
 // word: grid-stride over n * words.
-extern "C" __global__ void deepseek_sign_pack_kernel(
+extern "C" __global__ void sign_pack_kernel(
     const float* __restrict__ x, // [n, dim]
     uint32_t* __restrict__ out,  // [n, words]
     int n,
@@ -42,7 +42,7 @@ extern "C" __global__ void deepseek_sign_pack_kernel(
 // BDP recall agreement: counts[g] = Σ_h Σ_w popcount(~(q_signs[h][w] ^
 // signs[g][w])) — total sign agreement between every query head and entry g.
 // One thread per entry.
-extern "C" __global__ void deepseek_bdp_recall_kernel(
+extern "C" __global__ void bdp_recall_kernel(
     const uint32_t* __restrict__ q_signs, // [n_heads, words]
     const uint32_t* __restrict__ signs,   // [g, words]
     uint32_t* __restrict__ counts,        // [g]
@@ -77,7 +77,7 @@ extern "C" __global__ void deepseek_bdp_recall_kernel(
 // histogram → suffix-scan for the threshold → compact (ties fill arbitrary —
 // any M-superset is a valid recall shortlist; the float rescore re-ranks it).
 
-extern "C" __global__ void deepseek_topm_hist_kernel(
+extern "C" __global__ void topm_hist_kernel(
     const uint32_t* __restrict__ counts, uint32_t* __restrict__ hist, int g, int bins
 ) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < g;
@@ -90,7 +90,7 @@ extern "C" __global__ void deepseek_topm_hist_kernel(
 
 // meta[0] = threshold bin, meta[1] = #entries strictly above threshold,
 // meta[2] = tie cursor (zeroed). Single block; bins ≤ a few thousand.
-extern "C" __global__ void deepseek_topm_threshold_kernel(
+extern "C" __global__ void topm_threshold_kernel(
     const uint32_t* __restrict__ hist, uint32_t* __restrict__ meta, int bins, int m
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -106,7 +106,7 @@ extern "C" __global__ void deepseek_topm_threshold_kernel(
     }
 }
 
-extern "C" __global__ void deepseek_topm_compact_kernel(
+extern "C" __global__ void topm_compact_kernel(
     const uint32_t* __restrict__ counts,
     uint32_t* __restrict__ meta,          // [thr, n_above, tie_cursor, above_cursor]
     uint32_t* __restrict__ out_ids,       // [m]
@@ -129,7 +129,7 @@ extern "C" __global__ void deepseek_topm_compact_kernel(
     }
 }
 
-extern "C" int32_t run_deepseek_topm_select(
+extern "C" int32_t run_topm_select(
     const uint32_t* counts,
     uint32_t* hist,    // [bins] scratch (zeroed here)
     uint32_t* meta,    // [4] scratch (zeroed here)
@@ -146,13 +146,13 @@ extern "C" int32_t run_deepseek_topm_select(
     int threads = 256;
     int blocks = (g + threads - 1) / threads;
     if (blocks > 4096) blocks = 4096;
-    deepseek_topm_hist_kernel<<<blocks, threads, 0, stream>>>(counts, hist, g, bins);
-    deepseek_topm_threshold_kernel<<<1, 32, 0, stream>>>(hist, meta, bins, m);
-    deepseek_topm_compact_kernel<<<blocks, threads, 0, stream>>>(counts, meta, out_ids, g, m);
+    topm_hist_kernel<<<blocks, threads, 0, stream>>>(counts, hist, g, bins);
+    topm_threshold_kernel<<<1, 32, 0, stream>>>(hist, meta, bins, m);
+    topm_compact_kernel<<<blocks, threads, 0, stream>>>(counts, meta, out_ids, g, m);
     return (int32_t)cudaGetLastError();
 }
 
-extern "C" int32_t run_deepseek_sign_pack(
+extern "C" int32_t run_sign_pack(
     const float* x, uint32_t* out, int32_t n, int32_t dim, void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
@@ -162,11 +162,11 @@ extern "C" int32_t run_deepseek_sign_pack(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (blocks > 4096) blocks = 4096;
-    deepseek_sign_pack_kernel<<<blocks, threads, 0, stream>>>(x, out, n, dim);
+    sign_pack_kernel<<<blocks, threads, 0, stream>>>(x, out, n, dim);
     return (int32_t)cudaGetLastError();
 }
 
-extern "C" int32_t run_deepseek_bdp_recall(
+extern "C" int32_t run_bdp_recall(
     const uint32_t* q_signs,
     const uint32_t* signs,
     uint32_t* counts,
@@ -180,7 +180,7 @@ extern "C" int32_t run_deepseek_bdp_recall(
     if (g <= 0) return 0;
     int threads = 256;
     int blocks = (g + threads - 1) / threads;
-    deepseek_bdp_recall_kernel<<<blocks, threads, 0, stream>>>(
+    bdp_recall_kernel<<<blocks, threads, 0, stream>>>(
         q_signs, signs, counts, n_heads, g, words, dim);
     return (int32_t)cudaGetLastError();
 }

@@ -31,7 +31,7 @@ __device__ __forceinline__ void quantize_block_q4_ks(
     float amax_b = quantize_warp_reduce_max(lane >= 4 ? axi : 0.0f);
     float amax = fmaxf(amax_a, amax_b);
 
-    const float coarse_d = (amax != 0.0f) ? amax / 7.0f : 0.0f;
+    const float coarse_d = (amax != 0.0f) ? amax * (1.0f / 7.0f) : 0.0f;
 
     uint8_t sa, sb;
     if (amax == 0.0f) {
@@ -42,8 +42,8 @@ __device__ __forceinline__ void quantize_block_q4_ks(
     }
 
     const float actual_d = (lane < 4)
-        ? (coarse_d * sa / 255.0f)
-        : (coarse_d * sb / 255.0f);
+        ? (coarse_d * sa * (1.0f / 255.0f))
+        : (coarse_d * sb * (1.0f / 255.0f));
 
     const int8_t q = (actual_d != 0.0f)
         ? (int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(xi / actual_d)))
@@ -85,7 +85,7 @@ __device__ __forceinline__ void quantize_block_q4_ks_vec(
     const float amax_a = quantize_warp_reduce_max((lane == 0) ? local_max : 0.0f);
     const float amax_b = quantize_warp_reduce_max((lane >= 1 && lane < 8) ? local_max : 0.0f);
     const float amax = fmaxf(amax_a, amax_b);
-    const float coarse_d = (amax != 0.0f) ? amax / 7.0f : 0.0f;
+    const float coarse_d = (amax != 0.0f) ? amax * (1.0f / 7.0f) : 0.0f;
     uint8_t sa, sb;
     if (amax == 0.0f) {
         sa = 255; sb = 255;
@@ -93,7 +93,7 @@ __device__ __forceinline__ void quantize_block_q4_ks_vec(
         sa = (uint8_t)fmaxf(1.0f, fminf(255.0f, roundf(amax_a / amax * 255.0f)));
         sb = (uint8_t)fmaxf(1.0f, fminf(255.0f, roundf(amax_b / amax * 255.0f)));
     }
-    const float actual_d = (lane == 0) ? (coarse_d * sa / 255.0f) : (coarse_d * sb / 255.0f);
+    const float actual_d = (lane == 0) ? (coarse_d * sa * (1.0f / 255.0f)) : (coarse_d * sb * (1.0f / 255.0f));
     // Four biased nibbles for this lane's elements, packed into one int for the cross-lane gather.
     uint8_t b0 = 8, b1 = 8, b2 = 8, b3 = 8;
     if (lane < 8 && actual_d != 0.0f) {
@@ -146,7 +146,7 @@ __device__ __forceinline__ void quantize_blocks_q4_ks(
         float amax_b = quantize_warp_reduce_max(lane >= 4 ? axi : 0.0f);
         float amax = fmaxf(amax_a, amax_b);
 
-        const float coarse_d = (amax != 0.0f) ? amax / 7.0f : 0.0f;
+        const float coarse_d = (amax != 0.0f) ? amax * (1.0f / 7.0f) : 0.0f;
 
         uint8_t sa, sb;
         if (amax == 0.0f) {
@@ -157,8 +157,8 @@ __device__ __forceinline__ void quantize_blocks_q4_ks(
         }
 
         const float actual_d = (lane < 4)
-            ? (coarse_d * sa / 255.0f)
-            : (coarse_d * sb / 255.0f);
+            ? (coarse_d * sa * (1.0f / 255.0f))
+            : (coarse_d * sb * (1.0f / 255.0f));
 
         const int8_t q = (actual_d != 0.0f)
             ? (int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(xi / actual_d)))
