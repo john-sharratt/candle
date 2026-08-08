@@ -410,6 +410,43 @@ pub(crate) enum DecodeGpuChunksSyncKind {
     Reuse,
 }
 
+/// Number of front chunks fully outside the sliding window — the pure
+/// decision behind [`SequenceState::evict_front_window`], factored out so the
+/// off-by-one boundary is unit-testable without arenas.
+///
+/// `usages[i]` is chunk `i`'s valid-token count; `writer_start` bounds how far
+/// the sweep may go (never evicts the writer or a shared prefix); `base_pos` is
+/// the absolute position of the first resident token; the window ends at
+/// `abs_pos` and spans `window_size` tokens. A chunk at absolute
+/// `[start, start+usage)` is evictable iff `start + usage ≤ abs_pos −
+/// window_size + 1` (its highest position is below the lowest in-window one).
+pub(crate) fn front_evict_count(
+    usages: &[u32],
+    writer_start: usize,
+    base_pos: u32,
+    window_size: usize,
+    abs_pos: usize,
+) -> usize {
+    if window_size == 0 {
+        return 0;
+    }
+    // Lowest absolute position still inside the window.
+    let lo = abs_pos.saturating_sub(window_size) + 1;
+    let max_evict = writer_start.min(usages.len());
+    let mut start = base_pos as usize;
+    let mut drained = 0usize;
+    for &usage in usages.iter().take(max_evict) {
+        let end = start + usage as usize; // one past the chunk's last token
+        if end <= lo {
+            drained += 1;
+            start = end;
+        } else {
+            break;
+        }
+    }
+    drained
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SequenceState {
     /// All blocks in token order.  Shared (prefix) and owned chunks
@@ -434,6 +471,14 @@ pub(crate) struct SequenceState {
     ///   the current writer boundary; the chunk itself is writer-owned
     ///   by construction)
     writer_start_idx: usize,
+    /// Absolute token position of the FIRST resident chunk's first token —
+    /// i.e. the count of tokens evicted off the front by the sliding-window
+    /// ring ([`Self::evict_front_window`]). Every chunk's serialised
+    /// `rope_base` and every [`Self::rope_pos`] is offset by this, so window
+    /// keys keep their ABSOLUTE positions after the front slides out. Zero for
+    /// every non-windowed slot (dialogue/section KV never evicts its front), so
+    /// those paths are byte-identical to a `base_pos == 0` derivation.
+    base_pos: u32,
 }
 
 impl SequenceState {
@@ -443,6 +488,7 @@ impl SequenceState {
             chunks: Vec::new(),
             gpu_chunks: GpuChunks::new(stream),
             writer_start_idx: 0,
+            base_pos: 0,
         }
     }
 
@@ -452,6 +498,7 @@ impl SequenceState {
             chunks: Vec::new(),
             gpu_chunks: GpuChunks::new(),
             writer_start_idx: 0,
+            base_pos: 0,
         }
     }
 
@@ -520,13 +567,51 @@ impl SequenceState {
         }
     }
 
-    /// Compute the RoPE base position for block `blk`.
-    ///
-    /// This is the cumulative token count of all preceding blocks.
+    /// Compute the ABSOLUTE RoPE base position for block `blk`: the count of
+    /// tokens evicted off the front (`base_pos`) plus the cumulative token
+    /// count of all preceding resident blocks. `base_pos` is zero until the
+    /// sliding-window ring evicts, so a non-windowed slot reads exactly the
+    /// cumulative-usage sum it always did.
     #[inline]
     pub(super) fn rope_pos(&self, blk: usize) -> i32 {
         let count = blk.min(self.chunks.len());
-        self.chunks.iter().take(count).map(|c| c.usage as i32).sum()
+        self.base_pos as i32 + self.chunks.iter().take(count).map(|c| c.usage as i32).sum::<i32>()
+    }
+
+    /// Slide the sliding-window ring: drop every FRONT chunk that has fully
+    /// exited the `window_size`-token window ending at absolute query position
+    /// `abs_pos`, returning the new [`Self::base_pos`] (total evicted tokens).
+    ///
+    /// A query at `abs_pos` attends window keys with `key_pos > abs_pos −
+    /// window_size` (the kernel's causal+window mask), so the lowest in-window
+    /// absolute position is `abs_pos − window_size + 1`. A front chunk spanning
+    /// absolute `[start, start+usage)` is fully out of window once
+    /// `start + usage ≤ abs_pos − window_size + 1` — none of its tokens can be
+    /// attended, so freeing it changes nothing the kernel reads while bounding
+    /// the resident set (and the per-step tile walk) to `O(window_size)`.
+    /// Older tokens are already folded into the compressed corpus (guaranteed
+    /// by `window_size ≥ compress_ratio`), so no attended information is lost.
+    ///
+    /// Never touches the writer chunk or anything at/after `writer_start_idx`.
+    /// Draining bumps `base_pos` (keeping remaining chunks' absolute positions
+    /// intact via [`Self::rope_pos`] / the serialised `rope_base`) and shifts
+    /// the writer boundary down by the number dropped.
+    pub(crate) fn evict_front_window(&mut self, window_size: usize, abs_pos: usize) -> u32 {
+        let usages: Vec<u32> = self.chunks.iter().map(|c| c.usage).collect();
+        let drained = front_evict_count(
+            &usages,
+            self.writer_start_idx,
+            self.base_pos,
+            window_size,
+            abs_pos,
+        );
+        if drained > 0 {
+            let evicted: u32 = usages[..drained].iter().copied().sum();
+            self.drain_front_chunks(drained); // RAII-frees GIDs + clears GPU buffer
+            self.base_pos = self.base_pos.wrapping_add(evicted);
+            self.writer_start_idx = self.writer_start_idx.saturating_sub(drained);
+        }
+        self.base_pos
     }
 
     // -----------------------------------------------------------------------
@@ -694,7 +779,8 @@ impl SequenceState {
         if self.gpu_chunks.n_chunks() == 0 {
             return Ok(());
         }
-        let rope_base: u32 = self.chunks[..blk].iter().map(|c| c.usage).sum();
+        let rope_base: u32 =
+            self.base_pos + self.chunks[..blk].iter().map(|c| c.usage).sum::<u32>();
         let SequenceState {
             ref chunks,
             ref mut gpu_chunks,
@@ -728,6 +814,9 @@ impl SequenceState {
         if block_indices.is_empty() || self.gpu_chunks.n_chunks() == 0 {
             return Ok(());
         }
+        // Seeded at `base_pos` so evicted-front slots keep absolute rope
+        // positions; captured before the disjoint-field destructure below.
+        let base_pos = self.base_pos;
         let SequenceState {
             ref chunks,
             ref mut gpu_chunks,
@@ -737,7 +826,7 @@ impl SequenceState {
         // is an O(1) lookup. The previous `chunks[..blk].iter().sum()`
         // was O(blk) per block — quadratic over a layer's blocks.
         let mut rope_bases: Vec<u32> = Vec::with_capacity(chunks.len());
-        let mut acc: u32 = 0;
+        let mut acc: u32 = base_pos;
         for c in chunks.iter() {
             rope_bases.push(acc);
             acc = acc.wrapping_add(c.usage);
@@ -913,6 +1002,7 @@ impl SequenceState {
         let write_len = seq_offset.saturating_sub(before_wi) as u16;
 
         // Borrow chunks and gpu_chunks as disjoint fields simultaneously.
+        let base_pos = self.base_pos;
         let SequenceState {
             ref chunks,
             ref mut gpu_chunks,
@@ -920,7 +1010,7 @@ impl SequenceState {
         } = *self;
         gpu_chunks
             .as_mut()
-            .rebuild_decode(chunks, n_kv_head, head_dim, arena_info, write_len, wi)?;
+            .rebuild_decode(chunks, n_kv_head, head_dim, arena_info, write_len, wi, base_pos)?;
 
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((ptr, n as u32, wi as u32))
@@ -1008,6 +1098,108 @@ impl BlockTableState {
             layer_idx,
             max_blocks,
             sequences: vec![None; batch],
+        }
+    }
+}
+
+#[cfg(test)]
+mod front_evict_tests {
+    use super::front_evict_count;
+    use crate::CHUNK_SIZE;
+
+    // Full 32-token chunks (the sliding-window ring's sealed chunks) plus a
+    // partial writer tail — the exact shape the DeepSeek FP8 window holds.
+    fn full_chunks(n: usize) -> Vec<u32> {
+        vec![CHUNK_SIZE as u32; n]
+    }
+
+    #[test]
+    fn window_zero_never_evicts() {
+        // window_size 0 means "no ring bound" — must never drop a chunk.
+        let usages = full_chunks(10);
+        assert_eq!(front_evict_count(&usages, 10, 0, 0, 10_000), 0);
+    }
+
+    #[test]
+    fn nothing_evicted_before_window_fills() {
+        // 4 full chunks = 128 tokens, window 128, query at pos 127 (the 128th
+        // token). Lowest in-window pos = 127 - 128 + 1 = 0, so chunk 0 (pos
+        // [0,32)) is still partly in window → evict nothing.
+        let usages = full_chunks(4);
+        // writer_start = 3: chunks 0..3 sealed, chunk 3 is the writer tail.
+        assert_eq!(front_evict_count(&usages, 3, 0, 128, 127), 0);
+    }
+
+    #[test]
+    fn evicts_exactly_when_front_chunk_fully_exits() {
+        // window 128; chunk 0 spans abs [0,32). Its last token (pos 31) leaves
+        // the window when the lowest in-window pos exceeds 31, i.e.
+        // abs_pos - 128 + 1 > 31 → abs_pos > 158 → abs_pos >= 159.
+        let usages = full_chunks(8);
+        let writer = 7;
+        // At 158: lowest in-window = 158-128+1 = 31 ≤ 31 → chunk 0 still touches.
+        assert_eq!(front_evict_count(&usages, writer, 0, 128, 158), 0);
+        // At 159: lowest in-window = 32 > 31 → chunk 0 fully out, evict exactly 1.
+        assert_eq!(front_evict_count(&usages, writer, 0, 128, 159), 1);
+        // At 191: lowest in-window = 64; chunks 0 (end 32) and 1 (end 64) both
+        // ≤ 64 → evict 2. Chunk 2 (end 96) > 64 stays.
+        assert_eq!(front_evict_count(&usages, writer, 0, 128, 191), 2);
+    }
+
+    #[test]
+    fn base_pos_shifts_the_absolute_frame() {
+        // After earlier eviction (base_pos = 64), chunk 0 now spans abs
+        // [64,96). Query at 223, window 128: lowest in-window = 96. Chunk 0
+        // (end 96) ≤ 96 → evictable; chunk 1 (abs [96,128), end 128) > 96 stays.
+        let usages = full_chunks(6);
+        assert_eq!(front_evict_count(&usages, 5, 64, 128, 223), 1);
+    }
+
+    #[test]
+    fn never_evicts_the_writer_or_beyond() {
+        // Even with a huge query position, the writer chunk (and anything at or
+        // past writer_start) is never dropped — the ring must keep a live tail.
+        let usages = full_chunks(4);
+        // writer_start = 1 → only chunk 0 is ever eligible.
+        assert_eq!(front_evict_count(&usages, 1, 0, 32, 1_000_000), 1);
+        // writer_start = 0 → nothing is eligible.
+        assert_eq!(front_evict_count(&usages, 0, 0, 32, 1_000_000), 0);
+    }
+
+    #[test]
+    fn resident_token_count_stays_bounded_past_window() {
+        // Faithful ring simulation: decode 2000 tokens one at a time, sealing a
+        // fresh 32-token writer chunk at each boundary and evicting fronts after
+        // each step. The resident token span must stay bounded ABOVE by
+        // `window + one partial chunk` (the ring is O(window), not O(N)), and
+        // never drop BELOW the in-window token count (no attended key is
+        // evicted). This is the property `window_bytes_flat_beyond_window_size`
+        // asserts of the accounting model — here proven of the real eviction.
+        let window = 128usize;
+        let mut resident: Vec<u32> = Vec::new(); // usages of resident chunks
+        let mut base = 0u32; // tokens evicted off the front
+        for tok in 0..2000usize {
+            if tok % CHUNK_SIZE == 0 {
+                resident.push(0); // new writer chunk at each 32-token boundary
+            }
+            *resident.last_mut().unwrap() += 1; // the just-decoded token
+            let live_before: usize = resident.iter().map(|&u| u as usize).sum();
+            let pos = base as usize + live_before - 1; // absolute pos of this token == tok
+            debug_assert_eq!(pos, tok);
+            let writer = resident.len() - 1; // only sealed fronts are evictable
+            let drained = front_evict_count(&resident, writer, base, window, pos);
+            base += resident[..drained].iter().sum::<u32>();
+            resident.drain(..drained);
+            let live: usize = resident.iter().map(|&u| u as usize).sum();
+            assert!(
+                live <= window + CHUNK_SIZE,
+                "ring unbounded: resident {live} > window+chunk at tok {tok}",
+            );
+            assert!(
+                live >= window.min(tok + 1),
+                "over-evicted an in-window key: resident {live} < {} at tok {tok}",
+                window.min(tok + 1),
+            );
         }
     }
 }

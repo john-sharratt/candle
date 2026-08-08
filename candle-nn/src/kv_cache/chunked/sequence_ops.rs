@@ -200,6 +200,42 @@ impl ChunkedKvBacking {
         }
     }
 
+    /// Slide the sliding-window ring for `batch_idx`: free every front chunk
+    /// that has fully exited the `window_size`-token window ending at absolute
+    /// query position `abs_pos`, returning the slot's new evicted-token count
+    /// (`base_pos` — the absolute position of the first resident token).
+    ///
+    /// This is what makes the raw window a bounded RING rather than an
+    /// unbounded arena: without it the slot accumulates one chunk per 32 tokens
+    /// forever and the decode kernel walks every one (masking all but the last
+    /// `window_size`). Evicting fully-out-of-window front chunks bounds both the
+    /// resident FP8 footprint and the per-step tile walk to `O(window_size)`.
+    /// Positions stay ABSOLUTE across the slide (the freed tokens' count folds
+    /// into `base_pos`, seeding every remaining chunk's serialised `rope_base`),
+    /// so the attention numerics are identical to the never-evicted arena — only
+    /// fully-masked keys are dropped. Safe because every evicted token has
+    /// already been folded into the compressed corpus (`window_size ≥
+    /// compress_ratio`). A no-op for `window_size == 0` or an empty slot.
+    pub fn evict_window_front(
+        &self,
+        batch_idx: usize,
+        window_size: usize,
+        abs_pos: usize,
+    ) -> Result<u32> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(seq) = state
+            .sequences
+            .get_mut(batch_idx)
+            .and_then(|s| s.as_mut())
+        else {
+            return Ok(0);
+        };
+        Ok(seq.evict_front_window(window_size, abs_pos))
+    }
+
     /// Set one block's window geometry — its skip `offset` and valid token
     /// `usage` — directly.
     ///

@@ -415,7 +415,9 @@ impl GpuChunksGuard<'_> {
     }
 
     /// Clear the buffer and re-serialise all `chunks` from scratch, computing
-    /// each chunk's `rope_base` from the cumulative usage of preceding chunks.
+    /// each chunk's `rope_base` as `base_pos` + the cumulative usage of
+    /// preceding chunks (`base_pos` = tokens evicted off the front by the
+    /// sliding-window ring; zero for non-windowed slots).
     ///
     /// `write_len` overrides the last chunk's serialised `len` field so callers
     /// can supply the true sequence-offset-derived length rather than the
@@ -430,6 +432,7 @@ impl GpuChunksGuard<'_> {
         arena_info: &[ResolvedArenaInfo],
         write_len: u16,
         write_idx: usize,
+        base_pos: u32,
     ) -> candle::Result<()> {
         if chunks.is_empty() {
             self.clear();
@@ -449,7 +452,10 @@ impl GpuChunksGuard<'_> {
         let records_off = n * SLICE_HEADER_BYTES;
         let base = self.inner.raw_device_ptr();
 
-        let mut rope_base = 0u32;
+        // Seeded at `base_pos` (tokens evicted off the front by the sliding
+        // window) so the serialised per-chunk `rope_base` stays ABSOLUTE after
+        // the ring slides; zero for non-windowed slots → byte-identical.
+        let mut rope_base = base_pos;
         for (i, chunk) in chunks.iter().enumerate() {
             // The writer chunk gets the seq_offset-derived `write_len`; every
             // other chunk (including trailing empties past the writer) keeps its

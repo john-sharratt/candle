@@ -299,6 +299,54 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
             .collect();
 
+        // Slide each writer sequence's sliding-window RING before sizing the
+        // arena for this wave: free the front chunks that have fully exited the
+        // `window_size` window ending at the sequence's EARLIEST query position
+        // in this wave. Decode has one query (`decode_pos`); a batched prefill
+        // spans `[base, base+len)`, whose earliest row (`base`) has the
+        // furthest-back window — evicting on `base` (the MIN, never the latest)
+        // is what keeps a prefill row from losing a window key it still needs.
+        // Glue rows scatter into reserved gap chunks and must not touch their
+        // block tables, so they never evict. Positions stay ABSOLUTE across the
+        // slide (the freed count folds into each backing's `base_pos`, seeding
+        // the serialised rope), so attention is unchanged and stays consistent
+        // with the absolute-positioned compressed corpus. All layers evict
+        // identically (lockstep chunk layout), so the evicted count is uniform;
+        // `resident = absolute − base_pos` is what the ARENA (set_len /
+        // write_contiguous / decode metadata) is addressed by, while q_pos, the
+        // fresh diagonal base, and the corpus stay absolute. `base_pos` is 0
+        // until a sequence first exceeds `window_size`, so short sequences are
+        // byte-identical to the never-evicted path.
+        let window = cfg.window_size;
+        let mut decode_base = vec![0u32; decode_seqs.len()];
+        for (i, (&s, &pos)) in decode_seqs.iter().zip(&decode_pos).enumerate() {
+            let mut bp = 0u32;
+            for backing in session.backings() {
+                bp = backing.evict_window_front(s, window, pos)?;
+            }
+            decode_base[i] = bp;
+        }
+        let mut prefill_base_ev = vec![0u32; prefill_seqs.len()];
+        for (pi, (&s, &base)) in prefill_seqs.iter().zip(&prefill_base).enumerate() {
+            let mut bp = 0u32;
+            for backing in session.backings() {
+                bp = backing.evict_window_front(s, window, base)?;
+            }
+            prefill_base_ev[pi] = bp;
+        }
+        // Resident (arena) offsets = absolute − evicted-front. Equal to the
+        // absolute values until the ring first slides.
+        let decode_resident: Vec<usize> = decode_pos
+            .iter()
+            .zip(&decode_base)
+            .map(|(&p, &b)| p - b as usize)
+            .collect();
+        let prefill_resident: Vec<usize> = prefill_base
+            .iter()
+            .zip(&prefill_base_ev)
+            .map(|(&b, &e)| b - e as usize)
+            .collect();
+
         // Per-seq corpus state (reset on slot reuse).
         for (&s, &base) in prefill_seqs.iter().zip(&prefill_base) {
             self.ensure_seq_state(s, base)?;
@@ -350,8 +398,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .copied()
             .collect();
         for backing in session.backings() {
-            for (&s, &pos) in decode_seqs.iter().zip(&decode_pos) {
-                backing.set_len(s, pos);
+            for (&s, &resident) in decode_seqs.iter().zip(&decode_resident) {
+                backing.set_len(s, resident);
             }
         }
         let t_meta = profile_now();
@@ -372,17 +420,25 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // walk covers `[0,base)`; the fresh bf16 latents cover `[base,base+s)`),
         // with its whole write-back range ensured up-front. Decode/glue seqs
         // serialize their live offsets in the same snapshot.
-        let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(prefill_seqs.len());
+        // Metadata offsets are RESIDENT (arena-relative). Decode seqs must be
+        // listed explicitly — `build_decode_metadata_at` otherwise falls back to
+        // the session's ABSOLUTE offset, which overshoots the arena once the ring
+        // has slid. Equal to absolute until the first eviction.
+        let mut overrides: Vec<(usize, usize)> =
+            Vec::with_capacity(prefill_seqs.len() + decode_seqs.len());
+        for (&s, &resident) in decode_seqs.iter().zip(&decode_resident) {
+            overrides.push((s, resident));
+        }
         for (pi, &s) in prefill_seqs.iter().enumerate() {
-            let base = prefill_base[pi];
+            let resident = prefill_resident[pi];
             // Ensure the FULL prompt range so the post-launch arena write-back
-            // has its chunks; the header stays at `base` (the committed prefix).
-            let ensure_to = base + prefill_lens[pi].saturating_sub(1);
+            // has its chunks; the header stays at the committed prefix (resident).
+            let ensure_to = resident + prefill_lens[pi].saturating_sub(1);
             for backing in session.backings() {
                 backing.ensure_for_batch_entries(&[(s, ensure_to)], 1)?;
-                backing.set_len(s, base);
+                backing.set_len(s, resident);
             }
-            overrides.push((s, base));
+            overrides.push((s, resident));
         }
         let (pm, headers, stride) = session.build_decode_metadata_at(
             &all_seqs,
@@ -666,10 +722,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 )?;
                 // Write the prompt latents into the arena so FUTURE decode waves
                 // read them (this launch read the fresh bf16 diagonal, not the
-                // arena). K≡V single latent → k = v.
+                // arena). K≡V single latent → k = v. The arena write lands at the
+                // RESIDENT offset (absolute `base` minus this seq's evicted front);
+                // the chunk it fills serialises its ABSOLUTE rope via `base_pos`.
+                let base_resident = base - prefill_base_ev[pi] as usize;
                 let kv_4d = kv_all.reshape((1, 1, s_len, a.head_dim()))?;
-                session.backings()[l].write_contiguous(seq, base, &kv_4d, &kv_4d)?;
-                session.backings()[l].set_len(seq, base + s_len);
+                session.backings()[l].write_contiguous(seq, base_resident, &kv_4d, &kv_4d)?;
+                session.backings()[l].set_len(seq, base_resident + s_len);
                 let o = out
                     .to_dtype(DType::F32)?
                     .reshape((1, s_len, a.n_heads(), a.head_dim()))?

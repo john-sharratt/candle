@@ -95,6 +95,7 @@ impl GpuChunksGuard<'_> {
         _arena_info: &[ResolvedArenaInfo],
         _write_len: u16,
         _write_idx: usize,
+        _base_pos: u32,
     ) -> candle::Result<()> {
         Ok(())
     }

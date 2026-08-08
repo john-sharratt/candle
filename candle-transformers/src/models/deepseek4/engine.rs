@@ -622,14 +622,33 @@ impl KernelSession<'_> {
             .to_device(&e.device)?;
         let mut h = e.hc.expand(&row)?;
 
+        // Slide the sliding-window ring BEFORE building this step's metadata:
+        // free every front chunk that has fully exited the `window_size`-token
+        // window ending at the query's absolute position (`self.pos`). Without
+        // this the FP8 window arena grows one chunk per 32 tokens forever and
+        // the decode kernel walks every one (masking all but the last
+        // `window_size`) — O(N) memory and per-step work. Evicting bounds both
+        // to O(window_size); positions stay ABSOLUTE (the freed count folds
+        // into each backing's `base_pos`), so the attention is unchanged.
+        // Every layer's slot has the identical chunk layout (they decode in
+        // lockstep), so the evicted count is uniform across backings.
+        let window = e.cfg.window_size;
+        let mut evicted = 0u32;
+        for b in &self.backings {
+            evicted = b.evict_window_front(self.seq, window, self.pos)?;
+        }
+        let resident = self.pos - evicted as usize;
+
         // Per-step slot metadata for ALL layers (24-byte SlotHeader each,
         // one pinned upload). Kept alive through the layer loop. The CPU-side
-        // chunk usage must mirror the tokens the GPU commits have written —
-        // `set_len` distributes `pos` across each layer's writer chunks
-        // before the headers serialize.
-        self.kv.set_sequence_offset(self.seq, self.pos)?;
+        // chunk usage must mirror the RESIDENT tokens the GPU commits have
+        // written (absolute `self.pos` minus the evicted front) — `set_len`
+        // distributes that across each layer's writer chunks before the
+        // headers serialize. The kernel still ropes at absolute positions
+        // (q_pos = `self.pos`, chunk `rope_base` = `base_pos` + cum-usage).
+        self.kv.set_sequence_offset(self.seq, resident)?;
         for b in &self.backings {
-            b.set_len(self.seq, self.pos);
+            b.set_len(self.seq, resident);
         }
         let generation = self.kv.begin_stager_generation();
         let (_pm, headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
