@@ -35,6 +35,8 @@ mod gpu_chunks;
 #[cfg(not(feature = "cuda"))]
 #[path = "gpu_chunks_dummy.rs"]
 mod gpu_chunks;
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_test_lock;
 mod head_gids;
 mod io;
 mod meta_pool;
@@ -97,7 +99,7 @@ pub use super::arena_table::ArenaLocation;
 pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
-    begin_wave, persistence_domain_stats, wave_alloc, wave_domain_stats, BumpRange,
+    begin_wave, persistence_domain_stats, wave_domain_stats, BumpRange,
     Generation as WaveGeneration,
 };
 #[cfg(feature = "cuda")]

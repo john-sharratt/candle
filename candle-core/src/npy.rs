@@ -25,7 +25,7 @@
 //! # Load multiple values from a npz file.
 //! values = np.loadz("test.npz")
 //! ```
-use crate::{DType, Device, Error, Result, Shape, Tensor};
+use crate::{DType, Device, Error, LiveTensor, Result, Shape, Tensor};
 use byteorder::{LittleEndian, ReadBytesExt};
 use float8::F8E4M3;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
@@ -198,7 +198,7 @@ impl Header {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     // TODO: Add the possibility to read directly to a device?
     pub(crate) fn from_reader<R: std::io::Read>(
         shape: Shape,
@@ -335,7 +335,7 @@ impl Tensor {
     }
 
     /// Writes multiple multi-dimensional arrays using the npz format.
-    pub fn write_npz<S: AsRef<str>, T: AsRef<Tensor>, P: AsRef<Path>>(
+    pub fn write_npz<S: AsRef<str>, T: AsRef<LiveTensor<'w>>, P: AsRef<Path>>(
         ts: &[(S, T)],
         path: P,
     ) -> Result<()> {

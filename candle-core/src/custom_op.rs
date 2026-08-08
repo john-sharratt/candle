@@ -1,5 +1,6 @@
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
+use crate::LiveTensor;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
 
@@ -151,14 +152,19 @@ pub trait CustomOp3 {
     }
 }
 
-impl Tensor {
-    /// Applies a unary custom op without backward support
-    pub fn apply_op1_no_bwd<C: CustomOp1>(&self, c: &C) -> Result<Self> {
+impl<'w> LiveTensor<'w> {
+    /// Applies a unary custom op without backward support.
+    ///
+    /// Returns an owned `Tensor` even from a wave-scoped receiver: a custom op
+    /// allocates its own output storage, so the result borrows nothing from the
+    /// input. (Our own wave-writing kernels are the exception, and they are not
+    /// on this path precisely because it cannot express their lifetime.)
+    pub fn apply_op1_no_bwd<C: CustomOp1>(&self, c: &C) -> Result<Tensor> {
         let (storage, shape) = self.storage().apply_op1(self.layout(), c)?;
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
     /// Applies a binary custom op without backward support
-    pub fn apply_op2_no_bwd<C: CustomOp2>(&self, rhs: &Self, c: &C) -> Result<Self> {
+    pub fn apply_op2_no_bwd<C: CustomOp2>(&self, rhs: &Self, c: &C) -> Result<Tensor> {
         let (storage, shape) =
             self.storage()
                 .apply_op2(self.layout(), &rhs.storage(), rhs.layout(), c)?;
@@ -166,7 +172,7 @@ impl Tensor {
     }
 
     /// Applies a ternary custom op without backward support
-    pub fn apply_op3_no_bwd<C: CustomOp3>(&self, t2: &Self, t3: &Self, c: &C) -> Result<Self> {
+    pub fn apply_op3_no_bwd<C: CustomOp3>(&self, t2: &Self, t3: &Self, c: &C) -> Result<Tensor> {
         let (storage, shape) = self.storage().apply_op3(
             self.layout(),
             &t2.storage(),
@@ -350,7 +356,7 @@ pub trait InplaceOp3 {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// Applies a unary custom op in place.
     pub fn inplace_op1<C: InplaceOp1>(&self, c: &C) -> Result<()> {
         self.storage_mut().inplace_op1(self.layout(), c)

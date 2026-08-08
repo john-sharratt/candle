@@ -221,7 +221,7 @@ pub struct ClassifiedExperts {
 pub enum MoeInput {
     Float(Tensor),
     #[cfg(feature = "cuda")]
-    Q8(candle::quantized::cuda::Q8a128Operand),
+    Q8(candle::quantized::cuda::Q8a128Operand<'static>),
 }
 
 impl MoeInput {

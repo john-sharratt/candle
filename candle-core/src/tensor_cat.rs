@@ -1,6 +1,6 @@
-use crate::{shape::Dim, Context, Error, Result, Shape, Tensor};
+use crate::{shape::Dim, Context, Error, LiveTensor, Result, Shape};
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// Concatenates two or more tensors along a particular dimension.
     ///
     /// All tensors must of the same rank, and the output will have
@@ -18,7 +18,7 @@ impl Tensor {
     /// assert_eq!(c.shape().dims(), &[2, 6]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn cat<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
+    pub fn cat<A: AsRef<LiveTensor<'w>>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
         }
@@ -64,7 +64,7 @@ impl Tensor {
         } else if dim == 0 {
             Self::cat0(args)
         } else {
-            let args: Vec<Tensor> = args
+            let args: Vec<Self> = args
                 .iter()
                 .map(|a| a.as_ref().transpose(0, dim))
                 .collect::<Result<Vec<_>>>()?;
@@ -73,7 +73,7 @@ impl Tensor {
         }
     }
 
-    fn cat0<A: AsRef<Tensor>>(args: &[A]) -> Result<Self> {
+    fn cat0<A: AsRef<LiveTensor<'w>>>(args: &[A]) -> Result<Self> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
         }
@@ -148,7 +148,7 @@ impl Tensor {
         Ok(crate::tensor::from_storage(storage, shape, op, false))
     }
 
-    fn cat_contiguous<A: AsRef<Tensor>>(args: &[A], dim: usize) -> Result<Self> {
+    fn cat_contiguous<A: AsRef<LiveTensor<'w>>>(args: &[A], dim: usize) -> Result<Self> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
         }

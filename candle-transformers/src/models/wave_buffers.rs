@@ -14,11 +14,21 @@
 //! alternate per layer, which puts a full layer of same-stream work between one
 //! layer's reads and the next reuse of that half.
 //!
+//! # The guard is the lifetime
+//!
+//! Every buffer here is allocated *through* a [`WaveGeneration`], so the
+//! resulting tensor is a `LiveTensor<'w>` borrowing that guard rather than a
+//! `Tensor` claiming `'static`. A wave buffer therefore cannot be named after
+//! the guard that frees it has dropped: the compiler rejects the program
+//! instead of the kernel reading recycled bytes. Ordering the drops by hand,
+//! which is what this replaced, was correct only for as long as everyone
+//! remembered to.
+//!
 //! Outside the inference loop — kernel tests, replay harnesses, the `decode_ab`
-//! and `prefill_ab` fixtures — there is no generation to bound the lifetime, so
-//! the caller allocates and owns its buffer as before. The absence is real
-//! state, not a mode: [`wave_alloc`] reports whether a wave is actually in
-//! flight.
+//! and `prefill_ab` fixtures — there is no wave, and the caller passes `None`.
+//! The absence is real state, not a mode: with no guard there is nothing to
+//! bound a lease, so the buffer is allocated and owned in the ordinary way, and
+//! `'w` is free because owned memory outlives every choice of it.
 //!
 //! # Scope
 //!
@@ -39,13 +49,15 @@
 //! same layer scoping the attention path uses, applied to the layer's other
 //! half.
 
+use std::marker::PhantomData;
+
 use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::{
     CudaSlice, CudaStream, DevicePtr, DeviceRepr, SyncOnDrop,
 };
 use candle::cuda_backend::CudaDType;
-use candle::{CudaDevice, CudaStorage, DType, Device, Result, Shape, Tensor};
-use candle_nn::kv_cache::wave_alloc;
+use candle::{CudaDevice, CudaStorage, DType, Device, LiveTensor, Result, Shape, Tensor};
+use candle_nn::kv_cache::WaveGeneration;
 
 /// Alignment for every wave buffer.
 ///
@@ -54,30 +66,49 @@ use candle_nn::kv_cache::wave_alloc;
 const WAVE_ALIGN: usize = 256;
 
 /// Where a kernel writes its output.
-pub(crate) enum KernelOutput<T> {
+///
+/// `'w` is the wave guard the buffer was taken from, and it is what makes the
+/// [`Self::into_tensor`] result honest: a leased output borrows the guard, an
+/// owned one is free to outlive everything.
+pub(crate) enum KernelOutput<'w, T> {
     /// A range of the in-flight wave's half. The wave owns it; this does not.
     ///
     /// `elems`, not bytes — `BumpRange::len` is bytes, and the two are the same
     /// number only for `u8` outputs.
-    Leased { ptr: u64, elems: usize },
+    Leased {
+        ptr: u64,
+        elems: usize,
+        wave: PhantomData<&'w ()>,
+    },
     /// This op's own allocation, freed when the storage drops.
     Owned(CudaSlice<T>),
 }
 
-impl<T: CudaDType + DeviceRepr> KernelOutput<T> {
+impl<'w, T: CudaDType + DeviceRepr> KernelOutput<'w, T> {
     /// Reserve room for `elem_count` elements of `T`.
-    pub(crate) fn new(dev: &CudaDevice, elem_count: usize) -> Result<Self> {
-        let bytes = elem_count * std::mem::size_of::<T>();
-        match wave_alloc(&dev.cuda_stream(), bytes, WAVE_ALIGN)? {
-            Some(range) => Ok(Self::Leased {
-                ptr: range.ptr,
-                elems: elem_count,
-            }),
+    ///
+    /// `wave` decides where the memory comes from, and it is the caller's
+    /// declared intent rather than an ambient lookup: with a guard the range is
+    /// the wave's and borrows it, without one the buffer is owned. There is no
+    /// third case where a lease is produced that nothing bounds.
+    pub(crate) fn new(
+        dev: &CudaDevice,
+        elem_count: usize,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<Self> {
+        let Some(wave) = wave else {
             // SAFETY: the storage is written by the kernel launched at the call
             // site before anything reads it, exactly as when it was allocated
             // inline there.
-            None => Ok(Self::Owned(unsafe { dev.alloc::<T>(elem_count)? })),
-        }
+            return Ok(Self::Owned(unsafe { dev.alloc::<T>(elem_count)? }));
+        };
+        let bytes = elem_count * std::mem::size_of::<T>();
+        let range = wave.alloc(bytes, WAVE_ALIGN)?;
+        Ok(Self::Leased {
+            ptr: range.ptr,
+            elems: elem_count,
+            wave: PhantomData,
+        })
     }
 
     /// The destination address, plus the stream guard the owned arm needs.
@@ -101,47 +132,58 @@ impl<T: CudaDType + DeviceRepr> KernelOutput<T> {
     }
 
     /// Hand the output to candle as storage.
-    pub(crate) fn into_storage(self, dev: CudaDevice) -> CudaStorage {
+    fn into_storage(self, dev: CudaDevice) -> CudaStorage {
         match self {
-            // SAFETY: `ptr` is `elems` elements of `T` in the current half,
-            // kept live by the layer's generation guard — which spans this
-            // kernel through `o_proj`, and so outlives every tensor derived
-            // from this storage.
-            Self::Leased { ptr, elems } => unsafe {
+            // SAFETY: `ptr` is `elems` elements of `T` in the half pinned by
+            // the guard this borrows, so the range outlives the returned
+            // storage by construction.
+            Self::Leased { ptr, elems, .. } => unsafe {
                 CudaStorage::wrap_leased_ptr::<T>(ptr, elems, dev)
             },
             Self::Owned(slice) => CudaStorage::wrap_cuda_slice(slice, dev),
         }
     }
+
+    /// Hand the output to candle as a tensor bounded by the wave it came from.
+    ///
+    /// The one place the kernel wrappers turn storage into a tensor. Going
+    /// through here rather than `CustomOp1` is what preserves `'w`: that trait
+    /// returns `(CudaStorage, Shape)`, which has nowhere to carry it.
+    pub(crate) fn into_tensor<S: Into<Shape>>(self, dev: CudaDevice, shape: S) -> LiveTensor<'w> {
+        let storage = self.into_storage(dev);
+        // SAFETY: the kernel at the call site wrote `shape.elem_count()`
+        // elements into this storage before we got here, and `'w` is the
+        // guard's own lifetime — carried on `Self` since `new`, so it cannot be
+        // widened here.
+        unsafe { LiveTensor::from_cuda_storage(storage, shape) }
+    }
 }
 
-/// A zeroed tensor on the in-flight wave's half, or an ordinary one when no
-/// wave is in flight.
+/// A zeroed tensor on the wave's half, or an ordinary one when there is no wave.
 ///
 /// For accumulators, where the caller needs the buffer to *start* at zero — the
 /// MoE combine target is scattered into, not overwritten, so it cannot take a
 /// wave range as-is. The fill is `memset` on the device's stream, which is the
 /// same work `Tensor::zeros` does; what it replaces is the allocate/free pair
 /// around it, one per MoE layer per forward.
-pub(crate) fn wave_zeros<S: Into<Shape>>(
+pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
     shape: S,
     dtype: DType,
     device: &Device,
-) -> Result<Tensor> {
+    wave: Option<&'w WaveGeneration>,
+) -> Result<LiveTensor<'w>> {
     let shape = shape.into();
-    let Device::Cuda(cuda) = device else {
+    let (Device::Cuda(cuda), Some(wave)) = (device, wave) else {
         return Tensor::zeros(shape, dtype, device);
     };
     let stream = cuda.cuda_stream();
     let bytes = shape.elem_count() * dtype.size_in_bytes();
-    let Some(range) = wave_alloc(&stream, bytes, WAVE_ALIGN)? else {
-        return Tensor::zeros(shape, dtype, device);
-    };
-    // SAFETY: `range` is `bytes` of the current half, held by the caller's
-    // generation guard, and nothing else addresses it within this generation.
+    let range = wave.alloc(bytes, WAVE_ALIGN)?;
+    // SAFETY: `range` is `bytes` of the half pinned by `wave`, and nothing else
+    // addresses it within this generation.
     unsafe { memset_d8_async(range.ptr, 0, bytes, stream.cu_stream()) }
         .map_err(|e| candle::Error::Msg(format!("zeroing a wave buffer: {e}")))?;
-    // SAFETY: as above — and the tensor never outlives the guard, because the
-    // layer drops it after the residual add that consumes this buffer.
-    unsafe { Tensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device) }
+    // SAFETY: as above, and the returned tensor borrows `wave`, so it cannot be
+    // named after the guard that reclaims the range has dropped.
+    unsafe { LiveTensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device) }
 }

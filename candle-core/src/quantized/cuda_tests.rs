@@ -3301,7 +3301,7 @@ fn quantize_acts_q8a128_test(
     act_data: &[f32],
     total_batch: usize,
     ncols: usize,
-) -> Result<Q8a128Operand> {
+) -> Result<Q8a128Operand<'static>> {
     let f32_dev = dev.memcpy_stod(act_data)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);

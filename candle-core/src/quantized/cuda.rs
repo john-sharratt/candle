@@ -4185,19 +4185,22 @@ pub fn grouped_matmul_gemx(
 /// The latter lets a producer that returns through `apply_op1` (e.g. the B2 decode op, whose
 /// output is a tensor) feed the int8 matmul WITHOUT a device copy — the operand just borrows the
 /// tensor's bytes. Both expose a device pointer via [`Q8a128Operand::with_device_ptr`].
-pub enum Q8a128Data {
+pub enum Q8a128Data<'w> {
     Owned(CudaSlice<u8>),
-    Tensor(crate::Tensor),
+    Tensor(crate::LiveTensor<'w>),
 }
 
-pub struct Q8a128Operand {
-    pub data: Q8a128Data,
+/// `'w` is the backing tensor's: the B2 decode context is written into an
+/// inference wave's transient half, so an operand wrapping it must not outlive
+/// that wave. The owned variant allocates and is free to pick any `'w`.
+pub struct Q8a128Operand<'w> {
+    pub data: Q8a128Data<'w>,
     pub rows: usize,      // M (flattened token count)
     pub cols: usize,      // K
     pub lead: Vec<usize>, // output leading dims; prod == rows (defaults to [rows])
 }
 
-impl Q8a128Operand {
+impl<'w> Q8a128Operand<'w> {
     /// Wrap owned q8a128 blocks of flattened logical shape `[rows × cols]`. `lead` defaults to
     /// `[rows]` (a 2D `[M, N]` output); use [`Self::with_lead`] to preserve higher activation
     /// ranks. The matmul mode (mode-1 vs mode-2 weight-reuse) is NOT stored here — it is a
@@ -4214,7 +4217,7 @@ impl Q8a128Operand {
 
     /// Wrap a contiguous `U8` [`Tensor`] of q8a1024 bytes as an operand, no copy. For producers
     /// that emit through `apply_op1` (the B2 decode context), whose result is a tensor.
-    pub fn from_tensor(data: crate::Tensor, rows: usize, cols: usize) -> Self {
+    pub fn from_tensor(data: crate::LiveTensor<'w>, rows: usize, cols: usize) -> Self {
         Self {
             data: Q8a128Data::Tensor(data),
             rows,
@@ -4290,19 +4293,19 @@ impl Q8a128Operand {
 /// mode: the int8 arm runs the q8a128 tensor-core path (mode-1/mode-2 chosen by the occupancy
 /// formula `q8a128_dense_use_mode2` at dispatch), the float arm derives it from the tensor's dtype.
 pub enum DynamicTensor<'a> {
-    Float(&'a crate::Tensor),
-    Int8(&'a Q8a128Operand),
+    Float(&'a crate::LiveTensor<'a>),
+    Int8(&'a Q8a128Operand<'a>),
 }
 
 /// Owned activation operand produced by [`to_dynamic`]: a float tensor ([`Int8Mode::Off`]) or
 /// pre-quantized q8a128 blocks (any int8 mode). `DynamicTensor` borrows, so this owns the
 /// chosen representation and hands out a borrow via [`DynamicActs::as_dynamic`] for the matmul.
-pub enum DynamicActs {
-    Float(crate::Tensor),
-    Int8(Q8a128Operand),
+pub enum DynamicActs<'w> {
+    Float(crate::LiveTensor<'w>),
+    Int8(Q8a128Operand<'w>),
 }
 
-impl DynamicActs {
+impl<'w> DynamicActs<'w> {
     /// Borrow as the matmul-facing [`DynamicTensor`].
     pub fn as_dynamic(&self) -> DynamicTensor<'_> {
         match self {
@@ -4319,7 +4322,11 @@ impl DynamicActs {
 /// [`Int8Mode::Performance`] and [`Int8Mode::Precision`] — only the weight twin differs — so this
 /// branches solely on [`Int8Mode::is_int8`]. Paired with `QMatMul::repack_for_optimization` on the
 /// weight side; the matmul's KO⇔int8 guard keeps the two consistent.
-pub fn to_dynamic(xs: &crate::Tensor, mode: Int8Mode, device: &CudaDevice) -> Result<DynamicActs> {
+pub fn to_dynamic<'a>(
+    xs: &'a crate::LiveTensor<'a>,
+    mode: Int8Mode,
+    device: &CudaDevice,
+) -> Result<DynamicActs<'a>> {
     use crate::cuda_backend::CudaStorageSlice;
     if !mode.is_int8() {
         return Ok(DynamicActs::Float(xs.clone()));
@@ -4378,7 +4385,7 @@ pub fn quantize_acts_q8a128(
     rows: usize,
     cols: usize,
     device: &CudaDevice,
-) -> Result<Q8a128Operand> {
+) -> Result<Q8a128Operand<'static>> {
     // q8a1024 flat-grouped: 8 × 128-tiles per 1152-byte super-block (see blocks.cuh).
     let total_tiles = rows * (cols / 128);
     let bytes = total_tiles.div_ceil(8) * 1152;
@@ -4412,7 +4419,7 @@ pub fn rms_norm_q8a128(
     alpha: &crate::Tensor,
     eps: f32,
     device: &CudaDevice,
-) -> Result<Q8a128Operand> {
+) -> Result<Q8a128Operand<'static>> {
     use crate::cuda_backend::CudaStorageSlice;
     let (rows, cols) = match xs.dims() {
         &[m, k] => (m, k),
@@ -4519,7 +4526,7 @@ pub fn silu_mul_q8a128(
     gate: &crate::Tensor,
     up: &crate::Tensor,
     device: &CudaDevice,
-) -> Result<Q8a128Operand> {
+) -> Result<Q8a128Operand<'static>> {
     use crate::cuda_backend::CudaStorageSlice;
     if gate.dims() != up.dims() {
         crate::bail!(
@@ -4917,7 +4924,7 @@ pub fn grouped_qmatmul(
 /// tests), same ascending-expert tile order, same kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_qmatmul_dev_q8a128(
-    op: &Q8a128Operand,
+    op: &Q8a128Operand<'_>,
     weight_ptrs_dev: &CudaSlice<u64>,
     expert_base: usize,
     n_experts: usize,
@@ -5033,7 +5040,7 @@ fn ko_fmt_code(dtype: GgmlDType) -> Result<i32> {
 ///
 /// `segments`: `(weight device ptr, KO dtype, N)` for each of q, k, v — N must be a multiple of 32.
 pub(crate) fn qkv_segmented_matmul(
-    op: &Q8a128Operand,
+    op: &Q8a128Operand<'_>,
     segments: &[(u64, GgmlDType, usize)],
     device: &CudaDevice,
 ) -> Result<crate::Tensor> {
@@ -5111,7 +5118,7 @@ pub(crate) fn qkv_segmented_matmul(
 /// chosen by [`q8a128_dense_use_mode2`]; the crossover benchmark calls it directly to time each mode
 /// at a fixed `(M, N, K)`. Result is the F32 `[lead.., N]` output (rank rebuilt from `op.lead`).
 pub(crate) fn q8a128_dense_matmul(
-    op: &Q8a128Operand,
+    op: &Q8a128Operand<'_>,
     weight_ptr: u64,
     weight_dtype: GgmlDType,
     nrows: usize,
@@ -5395,11 +5402,11 @@ pub fn moe_route(
 /// this is a byte-row copy of each token's `hidden/1024 · 1152` bytes — no gather-then-quantize.
 /// Mirrors [`fused_moe_gather`] for the int8 path; pairs with [`rms_norm_q8a128`]-fused ln2.
 pub fn fused_moe_gather_q8a128(
-    xs_q8: &Q8a128Operand,
+    xs_q8: &Q8a128Operand<'_>,
     ids_dev: &CudaSlice<u32>,
     total_rows: usize,
     device: &CudaDevice,
-) -> Result<Q8a128Operand> {
+) -> Result<Q8a128Operand<'static>> {
     let hidden = xs_q8.cols;
     if hidden % 1024 != 0 {
         crate::bail!(
@@ -5441,7 +5448,7 @@ pub fn fused_moe_gather_q8a128(
 ///
 /// `ys` is ACCUMULATED into (+=); initialize to zero before the first call.
 pub fn fused_deterministic_scatter(
-    ys: &crate::Tensor,
+    ys: &crate::LiveTensor<'_>,
     down_out: &crate::Tensor,
     perm: &CudaSlice<u32>,
     weights_flat: &crate::Tensor,

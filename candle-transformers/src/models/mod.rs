@@ -58,6 +58,8 @@ pub mod gemma3;
 pub mod glm4;
 pub mod glm4_new;
 pub mod gpu_backed;
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_test_lock;
 pub mod granite;
 pub mod granitemoehybrid;
 pub mod helium;

@@ -138,6 +138,11 @@ fn cpu_no_pass_uses_least_error_quant_fallback() {
 #[test]
 #[cfg(feature = "cuda")]
 fn gpu_palette4_reduction_does_not_invent_float_formats_from_uniform_quant_input() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let dev = candle::Device::cuda_if_available(0).expect("cuda_if_available");
     let cuda_dev = match &dev {
         candle::Device::Cuda(d) => d.clone(),
@@ -208,6 +213,11 @@ fn gpu_palette4_reduction_does_not_invent_float_formats_from_uniform_quant_input
 #[test]
 #[cfg(feature = "cuda")]
 fn gpu_no_pass_uses_least_error_quant_fallback() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let dev = candle::Device::cuda_if_available(0).expect("cuda_if_available");
     let cuda_dev = match &dev {
         candle::Device::Cuda(d) => d.clone(),
@@ -248,6 +258,11 @@ fn gpu_no_pass_uses_least_error_quant_fallback() {
 #[test]
 #[cfg(feature = "cuda")]
 fn gpu_quant_only_selector_never_returns_float_formats() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let dev = candle::Device::cuda_if_available(0).expect("cuda_if_available");
     let cuda_dev = match &dev {
         candle::Device::Cuda(d) => d.clone(),
@@ -1899,6 +1914,11 @@ fn ladder_distance(a: BlockFormat, b: BlockFormat) -> usize {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_selection_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_batched_raw, GgmlDType};
 
     // Use the shared SampleFormat -> GGML mapping.
@@ -2492,6 +2512,11 @@ fn test_cuda_selection_matches_cpu() {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_per_head_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_per_head, GgmlDType};
 
     let bf_to_ggml = |bf: BlockFormat| -> GgmlDType { bf.to_ggml_dtype() };
@@ -3098,6 +3123,11 @@ fn pack_f16(data: &[f32]) -> Vec<u8> {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_r16_qproj_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_batched_raw, GgmlDType};
 
     let bf_to_ggml = |bf: BlockFormat| -> GgmlDType { bf.to_ggml_dtype() };
@@ -4668,6 +4698,11 @@ fn test_threshold_sweep() {
 #[test]
 #[ignore]
 fn test_candidate_list_compression_curve() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let total_start = Instant::now();
     // Optional dataset filter: KV_DATASET=qwen3  → skip Llama secondary pass
     //                          KV_DATASET=llama  → use Llama as primary, skip Qwen3
@@ -5738,6 +5773,11 @@ fn test_candidate_list_compression_curve() {
 #[test]
 #[ignore]
 fn test_threshold_calibration() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     #[cfg(feature = "cuda")]
     let total_start = Instant::now();
     let sep = "=".repeat(115);

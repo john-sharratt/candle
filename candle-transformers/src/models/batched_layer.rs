@@ -29,6 +29,9 @@ use crate::utils::repeat_kv;
 use candle_kernels::CHUNK_SIZE;
 
 use super::tensor_cat::TensorCat;
+use candle::LiveTensor;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
 
 // ============================================================================
 // Batched Attention Parameters
@@ -244,16 +247,25 @@ pub trait BatchedAttentionLayer {
     /// Attention layer norm (ln1) as a producer epilogue (B1): returns the matmul-ready
     /// `DynamicActs` — q8a128 for an int8 `mode` (fused RMSNorm→quant in one kernel), `Float` for
     /// `Off`. Every layer fuses its own ln1.
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>>;
 
     /// FFN layer norm (ln2) as a producer epilogue (B3): q8a128 for an int8 `mode`, `Float` for
     /// `Off`.
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>>;
 
     /// FFN/MoE module consuming the producer-prepared `DynamicActs` (the fused `ffn_norm`): the
     /// router + expert gather take the q8a128 directly (no standalone quantize). `mlp_dtype` is the
     /// FP-stable accumulation dtype for the `Float` path.
-    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor>;
+    /// `'w` bounds the *result*, not the input: the FFN activations always come
+    /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
+    /// taken from the wave. A dense MLP hands its activations to a `Module` and
+    /// so could not accept a wave-scoped operand anyway.
+    fn ffn_forward<'w>(
+        &self,
+        acts: DynamicActs<'static>,
+        mlp_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>>;
 
     /// Project Q/K/V over the producer-prepared `DynamicActs` (the fused `attention_norm`), folding
     /// in any Q/K/V bias and q/k-norm. q/k/v share the single quantize (B1).
@@ -263,7 +275,7 @@ pub trait BatchedAttentionLayer {
     /// - Q shape: (batch, seq_len, n_head * head_dim)
     /// - K shape: (batch, seq_len, n_kv_head * head_dim)
     /// - V shape: (batch, seq_len, n_kv_head * head_dim)
-    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection>;
+    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection>;
 
     /// The output-projection weight (`attention_wo` / `self_attn.o_proj`). Backs the generalized
     /// `int8mode` + `output_projection` defaults so any KO-loaded model gets B2 + the mode for free
@@ -282,7 +294,10 @@ pub trait BatchedAttentionLayer {
     /// `forward_dynamic` off the o_proj weight: an `Int8` operand (decode) goes straight to the KO
     /// matmul; a `Float` operand is the FP path (or quantized at the matmul for a KO weight).
     /// Generic across all models.
-    fn output_projection(&self, attn: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+    /// Generic over `'w` so the decode context — which lives on the wave's
+    /// transient half — can be projected without being copied off it first.
+    /// The *result* is a fresh allocation and so is owned.
+    fn output_projection(&self, attn: DynamicActs<'_>, out_dtype: DType) -> Result<Tensor> {
         self.o_proj().forward_dynamic(attn.as_dynamic(), out_dtype)
     }
 }
@@ -396,16 +411,19 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
         _ => None,
     };
+    #[cfg(not(feature = "cuda"))]
+    let ffn_wave: Option<()> = None;
     let mut h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode())?;
-        layer.ffn_forward(acts, mlp_dtype)?
+        layer.ffn_forward(acts, mlp_dtype, ffn_wave.as_ref())?
     };
     h2.to_dtype_mut(orig_dtype)?;
     x.to_dtype_mut(orig_dtype)?;
     x.add_mut(&h2)?;
-    drop(h2);
-    #[cfg(feature = "cuda")]
-    drop(ffn_wave);
+    // No `drop(h2)` / `drop(ffn_wave)` here: `h2` borrows `ffn_wave`, so the
+    // compiler already refuses any order but this one. The guard falls out of
+    // scope at the end of the function, fencing the stream and rewinding the
+    // half — which is exactly where the hand-written drops used to put it.
     Ok(())
 }
 
@@ -583,9 +601,15 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
         _ => None,
     };
+    // No wave domain without CUDA, so there is no guard to name — but the
+    // kernel wrappers take one, and one call site for both configurations is
+    // worth more than saving this line.
+    #[cfg(not(feature = "cuda"))]
+    let layer_wave: Option<()> = None;
 
     let outputs = if use_paged && seq_len == 1 {
         paged_decode_attention(
+            layer_wave.as_ref(),
             caches,
             offsets,
             &q,
@@ -618,9 +642,9 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
         layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
     };
     profile_sync(attn_out.device());
-    // The context is consumed; release the half for the next layer.
-    #[cfg(feature = "cuda")]
-    drop(layer_wave);
+    // The half is released when `layer_wave` falls out of scope below. It is
+    // not dropped by hand any more: the attention context borrows it, so
+    // releasing it early is a compile error rather than a convention.
     pipeline_record("decode:out_proj", t_out_proj);
 
     TensorCat::from_tensors(0, std::iter::once(attn_out))
@@ -742,9 +766,15 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream())?),
         _ => None,
     };
+    // No wave domain without CUDA, so there is no guard to name — but the
+    // kernel wrappers take one, and one call site for both configurations is
+    // worth more than saving this line.
+    #[cfg(not(feature = "cuda"))]
+    let layer_wave: Option<()> = None;
 
     let out_packed = match glue_meta {
         Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
+            layer_wave.as_ref(),
             caches,
             offsets,
             &q,
@@ -771,6 +801,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         // Head dims outside {64, 128} and interleaved RoPE fail loudly in
         // paged_prefill_attn_varlen_chunks.
         _ => paged_prefill_batched(
+            layer_wave.as_ref(),
             caches,
             offsets,
             &q,
@@ -803,9 +834,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         layer.output_projection(DynamicActs::Float(reshaped_ctx), dt)?
     };
     profile_sync(output.device());
-    // The context is consumed; release the half for the next layer.
-    #[cfg(feature = "cuda")]
-    drop(layer_wave);
+    // As above: the guard's scope, not a hand-placed `drop`, bounds the half.
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;
@@ -936,7 +965,8 @@ fn standard_attention_prefill(
 /// Paged decode attention using chunked KV cache.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn paged_decode_attention(
+fn paged_decode_attention<'w>(
+    wave: Option<&'w WaveGeneration>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
     q: &Tensor,
@@ -952,7 +982,7 @@ fn paged_decode_attention(
     // B2: emit the attention context as q8a1024 (returns a flat U8 tensor) instead of an FP
     // context, so o_proj runs int8 with no standalone quantize. Head_dim 128 only.
     emit_q8: bool,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     let t_alloc = profile_now();
     KvCache::validate_chunked_decode_batch(caches, offsets)?;
     profile_sync(q.device());
@@ -1054,6 +1084,7 @@ fn paged_decode_attention(
         // bytes are the operand for o_proj's int8 matmul — never dtype-converted.
         let raw_out = if emit_q8 {
             paged_decode_attn_q8(
+                wave,
                 &q_kernel,
                 decode_headers_ptr,
                 arena_dtype,
@@ -1068,6 +1099,7 @@ fn paged_decode_attention(
             )?
         } else {
             paged_decode_attn(
+                wave,
                 &q_kernel,
                 decode_headers_ptr,
                 arena_dtype,

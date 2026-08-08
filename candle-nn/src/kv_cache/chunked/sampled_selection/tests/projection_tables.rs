@@ -29,14 +29,14 @@ use crate::kv_cache::chunked::tests::dump_reader::{load_dump, ChunkData};
 
 const K_MAGWEIGHT_THRESHOLDS: [f32; 11] = K_QREL_HIGH_THRESHOLDS;
 const V_COSINE_THRESHOLDS_PROPOSED: [f32; 11] = V_QREL_HIGH_THRESHOLDS;
-use crate::kv_cache::chunked::sampled_selection::{cpu_palette4_reduce, SampleFormat};
+use crate::kv_cache::arena_table::N_PALETTE;
 #[cfg(feature = "cuda")]
 use crate::kv_cache::chunked::sampled_selection::PagedSelectionGpuInputs;
+use crate::kv_cache::chunked::sampled_selection::{cpu_palette4_reduce, SampleFormat};
 use crate::kv_cache::chunked::CompressionPolicy;
 use crate::kv_cache::{KvFormat, QuantFormat};
 use half::f16;
 use std::time::{Duration, Instant};
-use crate::kv_cache::arena_table::N_PALETTE;
 
 #[cfg(feature = "cuda")]
 type GpuSelector = PagedSelectionGpuInputs;
@@ -781,10 +781,10 @@ impl BlockFormat {
             Self::Q3_1 => 3.0 + 32.0 / 32.0,  // 4.0 (16 bytes / 32 elem)
             Self::Q3_0 => 3.0 + 16.0 / 32.0,  // 3.5 (14 bytes / 32 elem)
             Self::Q2_1 => 2.0 + 32.0 / 32.0,  // 3.0 (12 bytes / 32 elem)
-            Self::Q2_A => 2.0 + 16.0 / 32.0, // 2.5 (10 bytes / 32 elem)
-            Self::Q2_S => 2.0 + 8.0 / 32.0, // 2.25 (9 bytes / 32 elem)
+            Self::Q2_A => 2.0 + 16.0 / 32.0,  // 2.5 (10 bytes / 32 elem)
+            Self::Q2_S => 2.0 + 8.0 / 32.0,   // 2.25 (9 bytes / 32 elem)
             Self::Q2_0 => 2.0 + 16.0 / 32.0,  // 2.5 (10 bytes / 32 elem)
-            Self::Q1_S => 1.0 + 8.0 / 32.0, // 1.25 (5 bytes / 32 elem)
+            Self::Q1_S => 1.0 + 8.0 / 32.0,   // 1.25 (5 bytes / 32 elem)
             Self::Q0 => 8.0 / 32.0,           // 0.25 (1 byte / 32 elem)
             Self::Q0_V => 16.0 / 32.0,        // 0.50 (2 byte / 32 elem)
             Self::Q1_A => 48.0 / 32.0,        // 1.50 (6 byte / 32 elem)
@@ -984,7 +984,11 @@ fn dump_path() -> Option<std::path::PathBuf> {
 /// Return the absolute path for a dump file given its crate-relative path, or None if absent.
 fn dump_path_for(rel: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -1673,10 +1677,12 @@ fn test_proposed_compression_curve() {
 
     println!("\n{sep}");
     println!("Proposed KV-Cache Compression Curve  (test-driven — CUDA kernel target)");
-    println!("  {} layers  {} chunks total  {} K-blocks  {} V-blocks",
+    println!(
+        "  {} layers  {} chunks total  {} K-blocks  {} V-blocks",
         header.num_layers,
         chunks.len(),
-        all[0][0].n, all[0][1].n,
+        all[0][0].n,
+        all[0][1].n,
     );
 
     // ── Table 1: Naive selection ──────────────────────────────────────────────
@@ -1821,28 +1827,28 @@ fn test_proposed_compression_curve() {
 #[cfg(feature = "cuda")]
 fn tag_to_block_format(tag: i32) -> BlockFormat {
     match tag {
-        1 => BlockFormat::F16,      // SELECT_FMT_F16
-        2 => BlockFormat::BF16,     // SELECT_FMT_BF16
-        7 => BlockFormat::Q8_0,     // SELECT_FMT_Q8_0
-        8 => BlockFormat::Q8_1,     // SELECT_FMT_Q8_1
-        10 => BlockFormat::Q8_KS,   // SELECT_FMT_Q8_KS
-        15 => BlockFormat::Q4_0,    // SELECT_FMT_Q4_0
-        16 => BlockFormat::Q4_1,    // SELECT_FMT_Q4_1
-        18 => BlockFormat::Q4_KS,   // SELECT_FMT_Q4_KS
-        19 => BlockFormat::Q3_0,    // SELECT_FMT_Q3_0
-        20 => BlockFormat::Q3_1,    // SELECT_FMT_Q3_1
-        22 => BlockFormat::Q2_0,    // SELECT_FMT_Q2_0
-        23 => BlockFormat::Q2_1,    // SELECT_FMT_Q2_1
-        25 => BlockFormat::Q2_S, // SELECT_FMT_Q2_S
-        26 => BlockFormat::Q2_A, // SELECT_FMT_Q2_A
-        27 => BlockFormat::Q1_S, // SELECT_FMT_Q1_S
-        28 => BlockFormat::Q0_V,    // SELECT_FMT_Q0_V
-        29 => BlockFormat::Q1_A,    // SELECT_FMT_Q1_A
-        30 => BlockFormat::Q0_X,    // SELECT_FMT_Q0_X
-        31 => BlockFormat::Q0_M2,   // SELECT_FMT_Q0_M2
-        32 => BlockFormat::Q0_M4,   // SELECT_FMT_Q0_M4
-        33 => BlockFormat::Q0,      // SELECT_FMT_Q0
-        _ => BlockFormat::F16,      // unknown
+        1 => BlockFormat::F16,    // SELECT_FMT_F16
+        2 => BlockFormat::BF16,   // SELECT_FMT_BF16
+        7 => BlockFormat::Q8_0,   // SELECT_FMT_Q8_0
+        8 => BlockFormat::Q8_1,   // SELECT_FMT_Q8_1
+        10 => BlockFormat::Q8_KS, // SELECT_FMT_Q8_KS
+        15 => BlockFormat::Q4_0,  // SELECT_FMT_Q4_0
+        16 => BlockFormat::Q4_1,  // SELECT_FMT_Q4_1
+        18 => BlockFormat::Q4_KS, // SELECT_FMT_Q4_KS
+        19 => BlockFormat::Q3_0,  // SELECT_FMT_Q3_0
+        20 => BlockFormat::Q3_1,  // SELECT_FMT_Q3_1
+        22 => BlockFormat::Q2_0,  // SELECT_FMT_Q2_0
+        23 => BlockFormat::Q2_1,  // SELECT_FMT_Q2_1
+        25 => BlockFormat::Q2_S,  // SELECT_FMT_Q2_S
+        26 => BlockFormat::Q2_A,  // SELECT_FMT_Q2_A
+        27 => BlockFormat::Q1_S,  // SELECT_FMT_Q1_S
+        28 => BlockFormat::Q0_V,  // SELECT_FMT_Q0_V
+        29 => BlockFormat::Q1_A,  // SELECT_FMT_Q1_A
+        30 => BlockFormat::Q0_X,  // SELECT_FMT_Q0_X
+        31 => BlockFormat::Q0_M2, // SELECT_FMT_Q0_M2
+        32 => BlockFormat::Q0_M4, // SELECT_FMT_Q0_M4
+        33 => BlockFormat::Q0,    // SELECT_FMT_Q0
+        _ => BlockFormat::F16,    // unknown
     }
 }
 
@@ -1899,6 +1905,11 @@ fn ladder_distance(a: BlockFormat, b: BlockFormat) -> usize {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_selection_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_batched_raw, GgmlDType};
 
     // Convert BlockFormat → GgmlDType for passing to CUDA kernel.
@@ -2075,8 +2086,8 @@ fn test_cuda_selection_matches_cpu() {
             ];
             sub.repeat(N_PALETTE)
         })
-            .flatten()
-            .collect();
+        .flatten()
+        .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
@@ -2514,6 +2525,11 @@ fn test_cuda_selection_matches_cpu() {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_per_head_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_per_head, GgmlDType};
 
     let bf_to_ggml = |bf: BlockFormat| -> GgmlDType {
@@ -2638,8 +2654,8 @@ fn test_cuda_per_head_matches_cpu() {
             ];
             sub.repeat(N_PALETTE)
         })
-            .flatten()
-            .collect();
+        .flatten()
+        .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
@@ -3109,6 +3125,11 @@ fn pack_f16(data: &[f32]) -> Vec<u8> {
 #[ignore]
 #[cfg(feature = "cuda")]
 fn test_cuda_r16_qproj_matches_cpu() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::quantized::{cuda::select_kv_format_paged_batched_raw, GgmlDType};
 
     let bf_to_ggml = |bf: BlockFormat| -> GgmlDType {
@@ -3263,8 +3284,8 @@ fn test_cuda_r16_qproj_matches_cpu() {
             ];
             sub.repeat(N_PALETTE)
         })
-            .flatten()
-            .collect();
+        .flatten()
+        .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
@@ -4767,6 +4788,11 @@ fn test_threshold_sweep() {
 #[test]
 #[ignore]
 fn test_candidate_list_compression_curve() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let total_start = Instant::now();
     let qwen3_path = dump_path_for(QWEN3_DUMP_REL_PATH);
     let llama_path = dump_path_for(LLAMA_DUMP_REL_PATH);
@@ -4781,7 +4807,11 @@ fn test_candidate_list_compression_curve() {
     } else {
         load_dump(llama_path.as_ref().unwrap()).expect("failed to load llama-kv-data.bin")
     };
-    let primary_name = if qwen3_path.is_some() { "qwen3-kv-data.bin" } else { "llama-kv-data.bin" };
+    let primary_name = if qwen3_path.is_some() {
+        "qwen3-kv-data.bin"
+    } else {
+        "llama-kv-data.bin"
+    };
     let mut data_sources = vec![primary_name.to_string()];
     if qwen3_path.is_some() {
         if let Some(p) = llama_path.as_ref() {
@@ -5116,10 +5146,16 @@ fn test_candidate_list_compression_curve() {
             let v_pal4_bpe = palette4_effective_bpe(&v_p4_fmts, blocks_per_head);
 
             // CPU mirror: same quota-slot algorithm on identical per-block inputs — must agree exactly (≤0.01 bpe).
-            let k_pal4_sample: Vec<SampleFormat> =
-                k_fmts.iter().copied().map(sample_format_from_block).collect();
-            let v_pal4_sample: Vec<SampleFormat> =
-                v_fmts.iter().copied().map(sample_format_from_block).collect();
+            let k_pal4_sample: Vec<SampleFormat> = k_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
+            let v_pal4_sample: Vec<SampleFormat> = v_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
             let (cpu_k_pal4_bpe, _) = cpu_palette4_reduce(&k_pal4_sample, blocks_per_head);
             let (cpu_v_pal4_bpe, _) = cpu_palette4_reduce(&v_pal4_sample, blocks_per_head);
             assert!(
@@ -5132,39 +5168,67 @@ fn test_candidate_list_compression_curve() {
                 );
             (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
         } else {
-            let k_sample: Vec<SampleFormat> =
-                k_fmts.iter().copied().map(sample_format_from_block).collect();
+            let k_sample: Vec<SampleFormat> = k_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
             let (k_pal4_bpe, k_p4_sample) = cpu_palette4_reduce(&k_sample, blocks_per_head);
-            let k_p4_fmts: Vec<BlockFormat> =
-                k_p4_sample.iter().copied().map(block_format_from_sample).collect();
-            let v_sample: Vec<SampleFormat> =
-                v_fmts.iter().copied().map(sample_format_from_block).collect();
+            let k_p4_fmts: Vec<BlockFormat> = k_p4_sample
+                .iter()
+                .copied()
+                .map(block_format_from_sample)
+                .collect();
+            let v_sample: Vec<SampleFormat> = v_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
             let (v_pal4_bpe, v_p4_sample) = cpu_palette4_reduce(&v_sample, blocks_per_head);
-            let v_p4_fmts: Vec<BlockFormat> =
-                v_p4_sample.iter().copied().map(block_format_from_sample).collect();
+            let v_p4_fmts: Vec<BlockFormat> = v_p4_sample
+                .iter()
+                .copied()
+                .map(block_format_from_sample)
+                .collect();
             (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
         };
 
         #[cfg(not(feature = "cuda"))]
         let (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts) = {
-            let k_sample: Vec<SampleFormat> =
-                k_fmts.iter().copied().map(sample_format_from_block).collect();
+            let k_sample: Vec<SampleFormat> = k_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
             let (k_pal4_bpe, k_p4_sample) = cpu_palette4_reduce(&k_sample, blocks_per_head);
-            let k_p4_fmts: Vec<BlockFormat> =
-                k_p4_sample.iter().copied().map(block_format_from_sample).collect();
-            let v_sample: Vec<SampleFormat> =
-                v_fmts.iter().copied().map(sample_format_from_block).collect();
+            let k_p4_fmts: Vec<BlockFormat> = k_p4_sample
+                .iter()
+                .copied()
+                .map(block_format_from_sample)
+                .collect();
+            let v_sample: Vec<SampleFormat> = v_fmts
+                .iter()
+                .copied()
+                .map(sample_format_from_block)
+                .collect();
             let (v_pal4_bpe, v_p4_sample) = cpu_palette4_reduce(&v_sample, blocks_per_head);
-            let v_p4_fmts: Vec<BlockFormat> =
-                v_p4_sample.iter().copied().map(block_format_from_sample).collect();
+            let v_p4_fmts: Vec<BlockFormat> = v_p4_sample
+                .iter()
+                .copied()
+                .map(block_format_from_sample)
+                .collect();
             (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
         };
         let timing_palette4 = palette4_start.elapsed();
 
         let mut k_pal4_dist = [0usize; 21];
         let mut v_pal4_dist = [0usize; 21];
-        for fmt in &k_p4_fmts { k_pal4_dist[fmt.table_index()] += 1; }
-        for fmt in &v_p4_fmts { v_pal4_dist[fmt.table_index()] += 1; }
+        for fmt in &k_p4_fmts {
+            k_pal4_dist[fmt.table_index()] += 1;
+        }
+        for fmt in &v_p4_fmts {
+            v_pal4_dist[fmt.table_index()] += 1;
+        }
         let k_total_pal4_blocks = k_p4_fmts.len();
         let v_total_pal4_blocks = v_p4_fmts.len();
 
@@ -5175,8 +5239,16 @@ fn test_candidate_list_compression_curve() {
             compute_quality_w1_p4(&chunks, blocks_per_chunk, &v_w1_fmts, &v_p4_fmts, false);
         let timing_quality = quality_start.elapsed();
 
-        let k_raw_bpe = if k_fmts.is_empty() { 16.0 } else { k_fmts.iter().map(|f| f.bits_per_elem() as f64).sum::<f64>() / k_fmts.len() as f64 };
-        let v_raw_bpe = if v_fmts.is_empty() { 16.0 } else { v_fmts.iter().map(|f| f.bits_per_elem() as f64).sum::<f64>() / v_fmts.len() as f64 };
+        let k_raw_bpe = if k_fmts.is_empty() {
+            16.0
+        } else {
+            k_fmts.iter().map(|f| f.bits_per_elem() as f64).sum::<f64>() / k_fmts.len() as f64
+        };
+        let v_raw_bpe = if v_fmts.is_empty() {
+            16.0
+        } else {
+            v_fmts.iter().map(|f| f.bits_per_elem() as f64).sum::<f64>() / v_fmts.len() as f64
+        };
         let cr = 16.0 / ((k_raw_bpe + v_raw_bpe) / 2.0);
         let k_bpe_p4 = k_pal4_bpe;
         let v_bpe_p4 = v_pal4_bpe;
@@ -5789,11 +5861,7 @@ fn test_candidate_list_compression_curve() {
         };
 
         // Build a tiny 2-chunk GPU object for the diagnostic comparison only.
-        let diag_chunks: Vec<ChunkData> = calibration_chunks
-            .iter()
-            .take(2)
-            .cloned()
-            .collect();
+        let diag_chunks: Vec<ChunkData> = calibration_chunks.iter().take(2).cloned().collect();
         let (_diag_generation, diag_gpu) = if !diag_chunks.is_empty() {
             let k_slices: Vec<&[f32]> = diag_chunks.iter().map(|c| c.k.as_slice()).collect();
             let v_slices: Vec<&[f32]> = diag_chunks.iter().map(|c| c.v.as_slice()).collect();
@@ -5802,10 +5870,15 @@ fn test_candidate_list_compression_curve() {
                     let stager = candle::quantized::pinned_staging::PinnedStager::new(&cuda_dev);
                     let generation = stager.begin_generation();
                     let g = PagedSelectionGpuInputs::from_f32_chunks(
-                        &k_slices, &v_slices,
-                        blocks_per_chunk, header.n_kv_head,
-                        DEFAULT_CALIBRATION_ARENA_CHUNKS, Some(&generation), &cuda_dev,
-                    ).ok();
+                        &k_slices,
+                        &v_slices,
+                        blocks_per_chunk,
+                        header.n_kv_head,
+                        DEFAULT_CALIBRATION_ARENA_CHUNKS,
+                        Some(&generation),
+                        &cuda_dev,
+                    )
+                    .ok();
                     (Some(generation), g)
                 }
                 _ => (None, None),
@@ -5815,7 +5888,10 @@ fn test_candidate_list_compression_curve() {
         };
 
         let diag_start = Instant::now();
-        println!("  GPU diagnostic check (3 levels, {} chunks)...", diag_chunks.len());
+        println!(
+            "  GPU diagnostic check (3 levels, {} chunks)...",
+            diag_chunks.len()
+        );
         let diag_levels = [0, 5, 9];
         for &level in &diag_levels {
             let (ref k_cands, ref v_cands) = candidates[level];
@@ -5836,11 +5912,25 @@ fn test_candidate_list_compression_curve() {
             let cpu_k_bpe = reduce_per_head(&k_fmts, blocks_per_chunk, blocks_per_head);
             let cpu_v_bpe = reduce_per_head(&v_fmts, blocks_per_chunk, blocks_per_head);
             let (gpu_k_bpe, gpu_v_bpe) = if let Some(dg) = diag_gpu.as_ref() {
-                let k_sc: Vec<SampleFormat> = k_cands.iter().copied().map(sample_format_from_block).collect();
-                let v_sc: Vec<SampleFormat> = v_cands.iter().copied().map(sample_format_from_block).collect();
-                let (ks, vs) = dg.select_block_formats(&k_sc, &v_sc,
-                    K_MAGWEIGHT_THRESHOLDS[level], K_MAGWEIGHT_THRESHOLDS[level],
-                    v_auto_thresholds[level], v_auto_thresholds[level])
+                let k_sc: Vec<SampleFormat> = k_cands
+                    .iter()
+                    .copied()
+                    .map(sample_format_from_block)
+                    .collect();
+                let v_sc: Vec<SampleFormat> = v_cands
+                    .iter()
+                    .copied()
+                    .map(sample_format_from_block)
+                    .collect();
+                let (ks, vs) = dg
+                    .select_block_formats(
+                        &k_sc,
+                        &v_sc,
+                        K_MAGWEIGHT_THRESHOLDS[level],
+                        K_MAGWEIGHT_THRESHOLDS[level],
+                        v_auto_thresholds[level],
+                        v_auto_thresholds[level],
+                    )
                     .expect("diag GPU select");
                 let kbf: Vec<BlockFormat> = ks.into_iter().map(block_format_from_sample).collect();
                 let vbf: Vec<BlockFormat> = vs.into_iter().map(block_format_from_sample).collect();
@@ -6060,8 +6150,6 @@ fn reduce_per_head(
     reduce_per_head_with_dist(block_fmts, blocks_per_chunk, blocks_per_head).0
 }
 
-
-
 /// Apply worst-case-per-head reduction and return the effective format for each block.
 fn apply_worst_case_reduction(
     block_fmts: &[BlockFormat],
@@ -6081,7 +6169,6 @@ fn apply_worst_case_reduction(
     }
     out
 }
-
 
 /// Compute quality metrics (SNR, NRMSE, cos_p95) for a given set of blocks
 /// using the specified effective formats (post-reduction).

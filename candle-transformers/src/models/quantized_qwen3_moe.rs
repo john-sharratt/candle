@@ -36,7 +36,10 @@ use candle::quantized::cuda::{
 #[cfg(feature = "cuda")]
 use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
+use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
@@ -250,7 +253,12 @@ impl SparseMoeBlock {
     /// Float for Off). The router consumes it via `forward_dynamic`; the experts byte-gather the
     /// q8a128 directly (no gather-then-quantize). CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic<'w>(
+        &self,
+        acts: DynamicActs<'static>,
+        out_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
             DynamicActs::Float(t) => t.dims3()?,
             DynamicActs::Int8(op) => match op.lead.as_slice() {
@@ -309,6 +317,7 @@ impl SparseMoeBlock {
                 })
             {
                 return self.forward_gpu_native(
+                    wave,
                     op,
                     &router_logits,
                     num_tokens,
@@ -364,9 +373,10 @@ impl SparseMoeBlock {
     /// crosses back to the host.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
-    fn forward_gpu_native(
+    fn forward_gpu_native<'w>(
         &self,
-        op: &Q8a128Operand,
+        wave: Option<&'w WaveGeneration>,
+        op: &Q8a128Operand<'_>,
         router_logits: &Tensor,
         num_tokens: usize,
         b_size: usize,
@@ -377,7 +387,7 @@ impl SparseMoeBlock {
         gd: &GpuDispatchTables,
         out_dtype: DType,
         t: ProfileMark,
-    ) -> Result<Tensor> {
+    ) -> Result<LiveTensor<'w>> {
         let device = router_logits.device().clone();
         let cuda_dev = match &device {
             Device::Cuda(d) => d.clone(),
@@ -457,7 +467,7 @@ impl SparseMoeBlock {
         // generation open around `ffn_forward` — which `forward_layer_batched_mixed`
         // does, spanning this call through the residual add that consumes the
         // result.
-        let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device)?;
+        let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device, wave)?;
         fused_deterministic_scatter(
             &ys,
             &down_out,
@@ -794,13 +804,13 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse ln1 → q8a128 (int8) or FP rms_norm (Off) in one kernel.
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
         self.ln1.forward_dynamic(x, mode)
     }
 
     /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
                 let (b, s, _) = t.dims3()?;
@@ -845,7 +855,7 @@ impl BatchedAttentionLayer for LayerWeights {
     /// B3: ln2 as a producer epilogue. Only the MoE path emits q8a128 (its router + expert gather
     /// consume it); a dense MLP layer stays FP (it has no int8 grouped path).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
         match &self.ffn {
             FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode),
             FeedForward::Mlp(_) => Ok(DynamicActs::Float(self.ln2.forward(x)?)),
@@ -855,7 +865,12 @@ impl BatchedAttentionLayer for LayerWeights {
     /// B3 consumer: the MoE/MLP over the producer-fused ln2 activation. MoE routes the q8a128 (or
     /// Float) through `forward_dynamic`; a dense MLP runs the FP path (with the stability cast).
     #[cfg(feature = "cuda")]
-    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor> {
+    fn ffn_forward<'w>(
+        &self,
+        acts: DynamicActs<'static>,
+        mlp_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
             FeedForward::MoE(m) => {
                 // FP acts get the F16→BF16 stability cast; q8a128 is range-safe (no cast).
@@ -863,7 +878,7 @@ impl BatchedAttentionLayer for LayerWeights {
                     DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(mlp_dtype)?),
                     int8 => int8,
                 };
-                m.forward_dynamic(acts, mlp_dtype)
+                m.forward_dynamic(acts, mlp_dtype, wave)
             }
             FeedForward::Mlp(m) => match acts {
                 DynamicActs::Float(t) => m.forward(&t.to_dtype(mlp_dtype)?),

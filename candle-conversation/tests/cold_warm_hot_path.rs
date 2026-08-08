@@ -2092,51 +2092,58 @@ fn assert_chunk_images_eq(left: &[Vec<ChunkImage>], right: &[Vec<ChunkImage>], w
 /// chosen format is non-palette — Q3_0, Q4_0, Q8_0 — the `k_pal` /
 /// `v_pal` / `k_scale` / `v_scale` slices are identity placeholders
 /// and don't carry per-(h, p) variance regardless of input.)
+///
+/// This function had drifted into asserting the *within*-side variation the
+/// paragraph above explicitly disclaims — `k_tags.len() >= 2`, plus the same
+/// for `v_tags`, both scale sets and both pal sets. That made a precondition
+/// on the round-trip into an assertion about the compression policy, and it
+/// broke when the policy was retuned: `Q1_S` joined the head of C6's V
+/// candidate list, and with C6's V low threshold at 0.171 the cheapest
+/// candidate clears the gate for every sub-band, so V comes back uniform
+/// (`v = [27; 16]`) while K splits `Q0_V`/`Q1_S`. No compression level
+/// satisfies the old assertions on both sides at once: C3–C5 collapse K,
+/// C6 collapses V, and C2 has no palette formats so `k_scale` is uniformly
+/// 1.0. Whether the selector *should* bottom out at one bit for dense
+/// zero-mean input is a live question about the (provisional) `PRODUCTION_*`
+/// thresholds, and not something this test can settle.
 fn assert_varied_formats(images: &[Vec<ChunkImage>], where_: &str) {
-    let mut k_tags: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    let mut v_tags: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    let mut k_scale_set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut v_scale_set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut k_pal_set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    let mut v_pal_set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    let mut chunks = 0usize;
+    // One counter per carrier. A K↔V swap can be confined to any single one of
+    // them, so each needs at least one chunk where the two sides actually
+    // differ — checking only `formats` would let a swap of the scale or palette
+    // slices alone round-trip undetected.
+    let (mut fmt_ne, mut scale_ne, mut pal_ne) = (0usize, 0usize, 0usize);
+    let mut all_k: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    let mut all_v: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
     for layer in images {
         for img in layer {
-            k_tags.extend(img.payload.k_formats.iter().copied());
-            v_tags.extend(img.payload.v_formats.iter().copied());
-            k_scale_set.extend(img.payload.k_scale.iter().map(|f| f.to_bits()));
-            v_scale_set.extend(img.payload.v_scale.iter().map(|f| f.to_bits()));
-            k_pal_set.extend(img.payload.k_pal.iter().copied());
-            v_pal_set.extend(img.payload.v_pal.iter().copied());
+            chunks += 1;
+            let p = &img.payload;
+            if p.k_formats != p.v_formats {
+                fmt_ne += 1;
+            }
+            let k_bits: Vec<u32> = p.k_scale.iter().map(|f| f.to_bits()).collect();
+            let v_bits: Vec<u32> = p.v_scale.iter().map(|f| f.to_bits()).collect();
+            if k_bits != v_bits {
+                scale_ne += 1;
+            }
+            if p.k_pal != p.v_pal {
+                pal_ne += 1;
+            }
+            all_k.extend(p.k_formats.iter().copied());
+            all_v.extend(p.v_formats.iter().copied());
         }
     }
-    assert!(
-        k_tags.len() >= 2,
-        "{where_}: within-K format-tag variation absent (set = {k_tags:?})"
-    );
-    assert!(
-        v_tags.len() >= 2,
-        "{where_}: within-V format-tag variation absent (set = {v_tags:?})"
-    );
-    assert!(
-        k_scale_set.len() >= 2,
-        "{where_}: k_scale uniform across (h, p) ({} distinct value)",
-        k_scale_set.len()
-    );
-    assert!(
-        v_scale_set.len() >= 2,
-        "{where_}: v_scale uniform across (h, p) ({} distinct value)",
-        v_scale_set.len()
-    );
-    assert!(
-        k_pal_set.len() >= 2,
-        "{where_}: k_pal bytes uniform across (h, p) ({} distinct byte)",
-        k_pal_set.len()
-    );
-    assert!(
-        v_pal_set.len() >= 2,
-        "{where_}: v_pal bytes uniform across (h, p) ({} distinct byte)",
-        v_pal_set.len()
-    );
+    assert!(chunks > 0, "{where_}: no chunk images to check");
+    for (carrier, differing) in [("formats", fmt_ne), ("scale", scale_ne), ("pal", pal_ne)] {
+        assert!(
+            differing > 0,
+            "{where_}: every chunk has k_{carrier} == v_{carrier}, so a K↔V swap \
+             confined to that carrier would round-trip cleanly and \
+             `assert_chunk_images_eq` would not see it. \
+             K tags = {all_k:?}, V tags = {all_v:?}"
+        );
+    }
 }
 
 /// Seed a turn with a K/V pattern explicitly designed to drive varied

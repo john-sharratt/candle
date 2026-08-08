@@ -1110,6 +1110,12 @@ impl ChunkedKvBacking {
                     } else {
                         source_k_fmt[band]
                     });
+                    // Taken off the source arena before the destination is
+                    // borrowed mutably below: `read_band_chunk` yields a lease
+                    // over `arenas`, and re-encoding writes through the same
+                    // map. The copy is what lets the two coexist, and it is the
+                    // reason this arm is the slow path — a same-class band
+                    // takes the verbatim byte copy above instead.
                     let floats = read_band_chunk(
                         arenas,
                         src_gid,
@@ -1117,7 +1123,8 @@ impl ChunkedKvBacking {
                         CHUNK_SIZE,
                         sub_head_dim,
                         &device,
-                    )?;
+                    )?
+                    .to_owned_tensor()?;
                     let dst_fmt = if is_v { active_v_fmt } else { active_k_fmt };
                     let dst = arenas.get_mut(&dst_gid.arena_idx()).ok_or_else(|| {
                         candle::Error::Msg(format!(

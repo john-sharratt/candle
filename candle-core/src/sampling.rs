@@ -1,4 +1,4 @@
-use crate::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor, WithDType};
+use crate::{CpuStorage, CustomOp1, DType, Layout, LiveTensor, Result, Shape, Tensor, WithDType};
 
 #[cfg(feature = "cuda")]
 use crate::CudaStorage;
@@ -561,7 +561,7 @@ impl CustomOp1 for BatchedSampling {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// Sample a token from logits using GPU-native multinomial sampling.
     ///
     /// This method performs sampling directly on the GPU device without transferring

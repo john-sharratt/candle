@@ -8,6 +8,11 @@ use candle::quantized::pinned_staging::GpuBuf;
 #[test]
 #[ignore]
 fn gpu_matches_cpu_real_data() {
+    // One lock per test, taken before the first device touch: the crate-wide
+    // guard is not reentrant, and several of these acquire a device more than
+    // once. See `crate::kv_cache::chunked::gpu_test_lock`.
+    #[cfg(feature = "cuda")]
+    let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::quantized::GgmlDType;
 

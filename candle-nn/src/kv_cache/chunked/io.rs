@@ -16,21 +16,21 @@ use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::KvFormat;
 use crate::CHUNK_SIZE;
 use candle::quantized::ggml_file::qtensor_from_ggml;
-use candle::{Device, Result, Tensor};
+use candle::{Device, LiveTensor, Result, Tensor};
 
 /// Read one band's whole chunk slot as floats, shaped `(chunk_size, sub_head_dim)`.
 ///
 /// The band's tag decides how: a float tag is a direct typed view of the slot,
 /// a quantized tag is dequantized from the slot's raw bytes. Only the chunk
 /// knows which — the arena is a run of untyped byte slots.
-pub(super) fn read_band_chunk(
-    arenas: &AHashMap<usize, Arena>,
+pub(super) fn read_band_chunk<'a>(
+    arenas: &'a AHashMap<usize, Arena>,
     gid: &ChunkGid,
     tag: ArenaFormatTag,
     chunk_size: usize,
     sub_head_dim: usize,
     device: &Device,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'a>> {
     let ai = gid.arena_idx();
     let arena = arenas
         .get(&ai)
@@ -210,17 +210,28 @@ impl ChunkedKvBacking {
                             v_pal_slices
                                 .push(v_data.narrow(0, in_blk, 1)?.unsqueeze(0)?.unsqueeze(0)?);
                         }
-                        k_head_slices.push(Tensor::cat(&k_pal_slices, 3)?);
-                        v_head_slices.push(Tensor::cat(&v_pal_slices, 3)?);
+                        k_head_slices.push(LiveTensor::cat(&k_pal_slices, 3)?);
+                        v_head_slices.push(LiveTensor::cat(&v_pal_slices, 3)?);
                     }
-                    k_slices.push(Tensor::cat(&k_head_slices, 1)?);
-                    v_slices.push(Tensor::cat(&v_head_slices, 1)?);
+                    k_slices.push(LiveTensor::cat(&k_head_slices, 1)?);
+                    v_slices.push(LiveTensor::cat(&v_head_slices, 1)?);
                 }
             }
 
-            // Concatenate along sequence dimension (dim 2)
-            let k_out = Tensor::cat(&k_slices, 2)?;
-            let v_out = Tensor::cat(&v_slices, 2)?;
+            // Concatenate along sequence dimension (dim 2), then take the
+            // result off the arena.
+            //
+            // Every tensor above is a *lease* over arena bytes, and the arena
+            // read-lock ends with this closure — after which another thread may
+            // evict the slot and hand its bytes to a new tenant. `cat` copies
+            // whenever it joins two or more pieces, but it short-circuits to
+            // `arg0.clone()` for a single one, so on a one-chunk single-head
+            // read the value that escapes here would be a lease over freed
+            // storage. `to_owned_tensor` makes the copy unconditional, which is
+            // what the `'static` in this function's return type has always
+            // claimed.
+            let k_out = LiveTensor::cat(&k_slices, 2)?.to_owned_tensor()?;
+            let v_out = LiveTensor::cat(&v_slices, 2)?.to_owned_tensor()?;
 
             Ok((k_out, v_out))
         })?

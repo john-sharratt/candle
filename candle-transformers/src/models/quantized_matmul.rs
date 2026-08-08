@@ -143,7 +143,7 @@ impl QMatMul {
         // Float activation → the ordinary path (handles Off gemx and any non-int8 weight). It tags
         // its own profile bucket, so don't double-record here.
         if let DynamicTensor::Float(t) = input {
-            return self.forward(t);
+            return self.forward_live(t);
         }
         // Int8 (pre-quantized) activation × KO weight → F32, cast back to the compute dtype.
         let t_mm = profile_now();
@@ -163,8 +163,11 @@ impl QMatMul {
     }
 }
 
-impl Module for QMatMul {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl QMatMul {
+    /// As [`candle::quantized::QMatMul::forward_live`]: accepts a wave-scoped
+    /// activation, because it only reads it and allocates its own output. The
+    /// `Module` impl below is this at `'static`.
+    pub fn forward_live(&self, xs: &candle::LiveTensor<'_>) -> Result<Tensor> {
         let _enter = self.span.enter();
         // Tag the profile entry with the format the matmul actually ran in (`_q8` int8 tensor-core,
         // `_f16`/`_f32` FP) so a perf-vs-off run shows at a glance whether int8 engaged.
@@ -214,7 +217,7 @@ impl Module for QMatMul {
             // Fall back to standard quantized matmul path for correctness.
             // Quantized CUDA kernels expect F32 inputs, so cast and restore dtype.
             let xs_f32 = xs2.to_dtype(DType::F32)?;
-            let out_f32 = self.inner.forward(&xs_f32)?;
+            let out_f32 = self.inner.forward_live(&xs_f32)?;
             pipeline_record("qmatmul_f32", t_mm);
             out_f32.to_dtype(in_dtype)?
         };
@@ -225,6 +228,12 @@ impl Module for QMatMul {
         } else {
             Ok(out2)
         }
+    }
+}
+
+impl Module for QMatMul {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_live(xs)
     }
 }
 

@@ -20,7 +20,10 @@ use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
+use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::{Arc, RwLock};
@@ -188,7 +191,7 @@ impl MlpWeights {
     /// B3 consumer: gate/up over a producer-prepared (fused ln2) activation, shared across both
     /// projections (no redundant ln2->q8a128). CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: &DynamicActs, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<Tensor> {
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
@@ -515,13 +518,13 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse ln1 -> q8a128 (int8) or FP rms_norm (Off) in one kernel.
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
         self.ln1.forward_dynamic(x, mode)
     }
 
     /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
                 let (b, s, _) = t.dims3()?;
@@ -559,13 +562,20 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 producer: fuse ln2 -> q8a128 (int8) or FP rms_norm (Off).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
         self.ln2.forward_dynamic(x, mode)
     }
 
     /// B3 consumer: dense MLP over the fused ln2 activation.
     #[cfg(feature = "cuda")]
-    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor> {
+    fn ffn_forward<'w>(
+        &self,
+        acts: DynamicActs<'static>,
+        mlp_dtype: DType,
+        // A dense MLP allocates its own output, so nothing here is
+        // wave-scoped; the parameter is the trait's, for the MoE case.
+        _wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         self.mlp.forward_dynamic(&acts, mlp_dtype)
     }
 }

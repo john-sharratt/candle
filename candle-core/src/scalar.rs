@@ -1,6 +1,6 @@
 //! TensorScalar Enum and Trait
 //!
-use crate::{DType, Result, Tensor, WithDType};
+use crate::{DType, LiveTensor, Result, Tensor, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16};
 
@@ -76,23 +76,29 @@ impl Scalar {
     }
 }
 
-pub enum TensorScalar {
-    Tensor(Tensor),
-    Scalar(Tensor),
+/// The right-hand side of a comparison, once normalised to a tensor.
+///
+/// `'w` is the operand's, so comparing against a leased tensor yields a result
+/// bounded by that lease rather than one claiming to live forever.
+pub enum TensorScalar<'w> {
+    Tensor(LiveTensor<'w>),
+    Scalar(LiveTensor<'w>),
 }
 
-pub trait TensorOrScalar {
-    fn to_tensor_scalar(self) -> Result<TensorScalar>;
+pub trait TensorOrScalar<'w> {
+    fn to_tensor_scalar(self) -> Result<TensorScalar<'w>>;
 }
 
-impl TensorOrScalar for &Tensor {
-    fn to_tensor_scalar(self) -> Result<TensorScalar> {
+impl<'w> TensorOrScalar<'w> for &LiveTensor<'w> {
+    fn to_tensor_scalar(self) -> Result<TensorScalar<'w>> {
         Ok(TensorScalar::Tensor(self.clone()))
     }
 }
 
-impl<T: WithDType> TensorOrScalar for T {
-    fn to_tensor_scalar(self) -> Result<TensorScalar> {
+/// A bare scalar allocates its own one-element tensor, which is owned and so
+/// fits any `'w` the call site needs.
+impl<'w, T: WithDType> TensorOrScalar<'w> for T {
+    fn to_tensor_scalar(self) -> Result<TensorScalar<'w>> {
         let scalar = Tensor::new(self, &crate::Device::Cpu)?;
         Ok(TensorScalar::Scalar(scalar))
     }

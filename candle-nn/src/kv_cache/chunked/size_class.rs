@@ -54,7 +54,20 @@ use super::types::{CHUNK_SIZE, TARGET_ARENA_BYTES};
 /// were the gate's only two configs below the pre-unification baseline, five
 /// runs of five, at the width where KV bandwidth dominates. Adding their rungs
 /// moved both above it. See `docs/archived/arena_unification_results.md`, step 6.
-pub const LADDER: [usize; 13] = [
+///
+/// # Head dims other than 128
+///
+/// The rungs above were sized for the production palette-4 geometry —
+/// `head_dim 128 / N_PALETTE 4 = 32`, so `CHUNK_SIZE(32) * 32 = 1024` elements
+/// a slot. A slot's payload scales with `head_dim`, so the supported dims
+/// {64, 96, 128, 256} need coverage up to `head_dim 256`, where `R16` and `F32`
+/// occupy 8192 B. Only that top rung is added: the intermediate payloads at
+/// those widths round up into existing rungs, which wastes bandwidth on a
+/// non-production geometry rather than adding classes that would strand regions
+/// on the production one. `every_kv_format_maps_to_a_class` pins coverage at
+/// *every* supported dim — it pinned only 128 before, which is how a chunk of
+/// `R16` at `head_dim 256` came to have nowhere to live.
+pub const LADDER: [usize; 14] = [
     320,  // catch-all: Q0, Q0_V, Q0_X, Q0_M2, Q0_M4, Q1_S, Q1_A, Q2_S, Q2_0
     384,  // Q2_1
     448,  // Q3_0
@@ -67,7 +80,8 @@ pub const LADDER: [usize; 13] = [
     1088, // Q8_0
     1152, // Q8_KS, Q8_1
     2048, // F16, BF16
-    4096, // R16, F32
+    4096, // R16, F32 — and F16/BF16 at head_dim 256
+    8192, // R16, F32 at head_dim 256
 ];
 
 /// Raw-gid stride: `raw = region_idx * GID_STRIDE + chunk_idx`.
@@ -243,17 +257,35 @@ mod tests {
         }
     }
 
-    /// Coverage: every format an arena can hold maps to a class at the
-    /// production geometry. A `None` here means a chunk of that format has
+    /// Every head dim the paged kernels accept. A slot's payload scales with
+    /// `head_dim / N_PALETTE`, so the ladder has to cover all of them, not just
+    /// the one the model in front of us happens to use.
+    ///
+    /// Kept in step with the `64 | 96 | 128 | 256` guards in
+    /// `paged_decode_attn` and `paged_prefill_attn_varlen_chunks`.
+    const SUPPORTED_HEAD_DIMS: [usize; 4] = [64, 96, 128, 256];
+
+    /// Coverage: every format an arena can hold maps to a class, at every head
+    /// dim the kernels accept. A `None` here means a chunk of that format has
     /// nowhere to live.
+    ///
+    /// This asserted `PROD_ELEMS` alone until a decode test at `head_dim 256`
+    /// died on `no size class covers Quantized(R16) at 2048 elems/chunk`: the
+    /// ladder stopped at 4096 B, and `R16`/`F32` need 8192 B at that width.
+    /// Pinning only the geometry we happen to ship is what let a supported one
+    /// go uncovered, so the loop runs over all of them.
     #[test]
     fn every_kv_format_maps_to_a_class() {
-        for fmt in all_kv_formats() {
-            let payload = payload_bytes(fmt, PROD_ELEMS);
-            assert!(
-                class_for_format(fmt, PROD_ELEMS).is_some(),
-                "{fmt:?} has payload {payload} B, past the top of the ladder {LADDER:?}"
-            );
+        for head_dim in SUPPORTED_HEAD_DIMS {
+            let elems = elems_per_chunk(head_dim / N_PALETTE);
+            for fmt in all_kv_formats() {
+                let payload = payload_bytes(fmt, elems);
+                assert!(
+                    class_for_format(fmt, elems).is_some(),
+                    "{fmt:?} at head_dim {head_dim} ({elems} elems/chunk) has payload \
+                     {payload} B, past the top of the ladder {LADDER:?}"
+                );
+            }
         }
     }
 

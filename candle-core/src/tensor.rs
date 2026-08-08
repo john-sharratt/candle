@@ -5,6 +5,7 @@ use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
+use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
 /// Unique identifier for tensors.
@@ -20,7 +21,20 @@ impl TensorId {
     }
 }
 
-pub struct Tensor_ {
+/// The shared body of a tensor: what `Tensor`'s `Arc` points at.
+///
+/// `'w` is how long this tensor's storage stays valid. It has to travel through
+/// `op`, which holds the tensors this one was derived from — a graph node must
+/// not outlive its operands' memory — but travelling is not the same as being
+/// grounded: `Op` -> `LiveTensor` -> `TensorInner` -> `BackpropOp` -> `Op` is a
+/// cycle, and `storage` carries no lifetime of its own, because a lease is a
+/// runtime `Backing` marker rather than a borrow. So the parameter bottoms out
+/// in the marker below, and variance is stated there rather than inferred.
+pub struct TensorInner<'w> {
+    /// Covariant in `'w`: an owned tensor is usable wherever a shorter-lived
+    /// one is expected, never the reverse. `&'w [u8]` and not `&'w mut [u8]`,
+    /// which would be invariant and would reject exactly that coercion.
+    lease: PhantomData<&'w [u8]>,
     id: TensorId,
     // As we provide inner mutability on the tensor content, the alternatives are:
     // - Using a mutex, this would have the highest cost when retrieving the storage but would
@@ -36,14 +50,14 @@ pub struct Tensor_ {
     // that's tricky to encode in the current setup.
     storage: Arc<RwLock<Storage>>,
     layout: Layout,
-    op: BackpropOp,
+    op: BackpropOp<'w>,
     is_variable: bool,
     dtype: DType,
     device: Device,
 }
 
-impl AsRef<Tensor> for Tensor {
-    fn as_ref(&self) -> &Tensor {
+impl<'w> AsRef<LiveTensor<'w>> for LiveTensor<'w> {
+    fn as_ref(&self) -> &LiveTensor<'w> {
         self
     }
 }
@@ -65,10 +79,42 @@ impl AsRef<Tensor> for Tensor {
 /// ```
 ///
 /// Tensors are reference counted with [`Arc`] so cloning them is cheap.
-pub struct Tensor(Arc<Tensor_>);
+///
+/// # Lifetime
+///
+/// `'w` is how long this tensor's storage stays valid. Anything allocated from
+/// the device pool owns its memory and so is [`Tensor`] — `LiveTensor<'static>`
+/// — which is what nearly all code means and writes. A tensor that *views*
+/// memory owned elsewhere carries that owner's lifetime instead: a KV arena
+/// slot, or a range of an in-flight inference wave's transient half, which is
+/// reclaimed the moment the wave's guard drops.
+///
+/// The parameter is covariant, so an owned tensor is accepted anywhere a
+/// shorter-lived one is expected and never the reverse:
+///
+/// ```
+/// use candle_core::{LiveTensor, Tensor};
+/// fn shorten<'a>(t: Tensor) -> LiveTensor<'a> { t }
+/// ```
+///
+/// ```compile_fail
+/// use candle_core::{LiveTensor, Tensor};
+/// fn lengthen<'a>(t: LiveTensor<'a>) -> Tensor { t }
+/// ```
+///
+/// That asymmetry is the whole point: it is what stops a wave buffer escaping
+/// the scope that will free it, without anyone having to order `drop` calls by
+/// hand. [`crate::Module`] and the `CustomOp` traits are deliberately left at
+/// `Tensor`, so a borrowed tensor cannot be handed to something that might
+/// store it.
+pub struct LiveTensor<'w>(Arc<TensorInner<'w>>);
 
-impl std::ops::Deref for Tensor {
-    type Target = Tensor_;
+/// The everyday tensor: it owns its storage, so that storage is live for as
+/// long as anything holds a reference to it.
+pub type Tensor = LiveTensor<'static>;
+
+impl<'w> std::ops::Deref for LiveTensor<'w> {
+    type Target = TensorInner<'w>;
 
     fn deref(&self) -> &Self::Target {
         self.0.as_ref()
@@ -111,7 +157,7 @@ macro_rules! binary_op {
 
 macro_rules! binary_op_scalar {
     ($fn_name:ident, $op_name:ident) => {
-        pub fn $fn_name<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+        pub fn $fn_name<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
             let rhs = match rhs.to_tensor_scalar()? {
                 crate::scalar::TensorScalar::Tensor(rhs) => rhs,
                 crate::scalar::TensorScalar::Scalar(rhs) => rhs
@@ -156,15 +202,20 @@ macro_rules! broadcast_binary_op {
 }
 
 /// Creates a fresh tensor structure based on a storage and a shape, this uses contiguous strides.
-pub(crate) fn from_storage<S: Into<Shape>>(
+///
+/// `'w` comes from `op`: the result must not outlive the operands recorded in
+/// it. A storage built from a pool allocation carries no constraint of its own,
+/// so an owned input yields `'static` and the caller sees a plain `Tensor`.
+pub(crate) fn from_storage<'w, S: Into<Shape>>(
     storage: Storage,
     shape: S,
-    op: BackpropOp,
+    op: BackpropOp<'w>,
     is_variable: bool,
-) -> Tensor {
+) -> LiveTensor<'w> {
     let dtype = storage.dtype();
     let device = storage.device();
-    let tensor_ = Tensor_ {
+    let tensor_ = TensorInner {
+        lease: PhantomData,
         id: TensorId::new(),
         storage: Arc::new(RwLock::new(storage)),
         layout: Layout::contiguous(shape),
@@ -173,10 +224,21 @@ pub(crate) fn from_storage<S: Into<Shape>>(
         dtype,
         device,
     };
-    Tensor(Arc::new(tensor_))
+    LiveTensor(Arc::new(tensor_))
 }
 
-impl Tensor {
+/// The tensor API, generic over how long the storage is valid.
+///
+/// Unlike [`crate::quantized::LiveQTensor`], this block is *not* split into
+/// `'static` constructors and `'w` accessors, because here the `-> Result<Self>`
+/// methods are overwhelmingly **views** — `reshape`, `narrow`, `t`,
+/// `broadcast_as` — and a view of a lease has to stay a lease. Returning `Self`
+/// is what makes that true by construction. The handful of methods that
+/// allocate leave `'w` free, which is sound because owned memory outlives every
+/// choice of `'w`; the discipline that matters is applied at the *lease*
+/// constructors instead, where `'w` is tied to a borrow of whatever owns the
+/// bytes.
+impl<'w> LiveTensor<'w> {
     /// Build a tensor that **views** device memory this process owns elsewhere,
     /// rather than memory allocated from the pool.
     ///
@@ -212,6 +274,33 @@ impl Tensor {
             BackpropOp::none(),
             false,
         ))
+    }
+
+    /// Wrap device storage a kernel has just written into a tensor.
+    ///
+    /// The door out of a hand-rolled CUDA kernel that does not go through
+    /// [`crate::CustomOp1`]. `CustomOp1::cuda_fwd` returns `(CudaStorage,
+    /// Shape)` with no lifetime parameter, so a kernel whose output lives on an
+    /// inference wave cannot say so through that trait — the lifetime is erased
+    /// at the boundary and the result comes back as an owned `Tensor`. Calling
+    /// the kernel directly and wrapping its storage here keeps `'w`.
+    ///
+    /// No backprop op is recorded: these are inference kernels, and a graph
+    /// edge would want a gradient definition none of them have.
+    ///
+    /// # Safety
+    /// `storage` must hold at least `shape.elem_count()` initialised elements
+    /// of its dtype, and `'w` must not outlive the memory behind it. When the
+    /// storage is [`crate::cuda_backend::Backing::Lease`] that memory belongs to
+    /// someone else — a wave's transient half, a KV arena — and picking `'w`
+    /// too long is exactly the mistake the parameter exists to prevent. Prefer
+    /// a caller whose own signature pins `'w` to a borrow of the owner.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_cuda_storage<S: Into<Shape>>(
+        storage: crate::CudaStorage,
+        shape: S,
+    ) -> LiveTensor<'w> {
+        from_storage(Storage::Cuda(storage), shape, BackpropOp::none(), false)
     }
 
     pub(crate) fn ones_impl<S: Into<Shape>>(
@@ -627,7 +716,9 @@ impl Tensor {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn add_mut(&mut self, rhs: &Self) -> Result<()> {
+    /// `rhs` carries its own lifetime: accumulating a wave-scoped result into
+    /// an owned buffer is the residual add, and it only reads `rhs`.
+    pub fn add_mut(&mut self, rhs: &LiveTensor<'_>) -> Result<()> {
         self.binary_inplace_op(rhs, crate::op::BinaryInplaceOp::Add)
     }
 
@@ -669,7 +760,11 @@ impl Tensor {
     }
 
     /// Internal helper for in-place binary operations.
-    fn binary_inplace_op(&mut self, rhs: &Self, op: crate::op::BinaryInplaceOp) -> Result<()> {
+    fn binary_inplace_op(
+        &mut self,
+        rhs: &LiveTensor<'_>,
+        op: crate::op::BinaryInplaceOp,
+    ) -> Result<()> {
         // Check shapes match
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
@@ -1467,7 +1562,7 @@ impl Tensor {
     }
 
     /// Repeat this tensor along the specified dimensions.
-    pub fn repeat<S: Into<Shape>>(&self, shape: S) -> Result<Tensor> {
+    pub fn repeat<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         // Similar to PyTorch, we extend the number of dimensions of self if needed.
         let repeats = shape.into();
         let repeats = repeats.dims();
@@ -1479,7 +1574,7 @@ impl Tensor {
         };
         for (idx, &repeat) in repeats.iter().enumerate() {
             if repeat > 1 {
-                inp = Tensor::cat(&vec![&inp; repeat], idx)?
+                inp = Self::cat(&vec![&inp; repeat], idx)?
             }
         }
         Ok(inp)
@@ -1521,7 +1616,7 @@ impl Tensor {
     ///
     /// * Will return `Err` if `args` contains less than 2 tensors.
     ///
-    pub fn meshgrid<A: AsRef<Tensor>>(args: &[A], xy_indexing: bool) -> Result<Vec<Self>> {
+    pub fn meshgrid<A: AsRef<LiveTensor<'w>>>(args: &[A], xy_indexing: bool) -> Result<Vec<Self>> {
         if args.len() <= 1 {
             Err(Error::OpRequiresAtLeastTwoTensors { op: "meshgrid" }.bt())?
         }
@@ -1683,7 +1778,8 @@ impl Tensor {
         } else {
             let op = BackpropOp::new1(self, |t| Op::Narrow(t, dim, start, len));
             let layout = self.layout().narrow(dim, start, len)?;
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout,
@@ -1692,7 +1788,7 @@ impl Tensor {
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
-            Ok(Tensor(Arc::new(tensor_)))
+            Ok(LiveTensor(Arc::new(tensor_)))
         }
     }
 
@@ -1780,7 +1876,7 @@ impl Tensor {
         } else {
             let a = self.narrow(dim, 0, dim_size - shift)?;
             let b = self.narrow(dim, dim_size - shift, shift)?;
-            Tensor::cat(&[&b, &a], dim)
+            Self::cat(&[&b, &a], dim)
         }
     }
 
@@ -1904,7 +2000,7 @@ impl Tensor {
     /// comparison operation is specified by the `op` argument.
     ///
     /// The returned tensor has the same shape as the original tensors and uses `u8` elements.
-    pub fn cmp<T: TensorOrScalar>(&self, rhs: T, op: CmpOp) -> Result<Self> {
+    pub fn cmp<T: TensorOrScalar<'w>>(&self, rhs: T, op: CmpOp) -> Result<Self> {
         let rhs = match rhs.to_tensor_scalar()? {
             crate::scalar::TensorScalar::Tensor(rhs) => rhs,
             crate::scalar::TensorScalar::Scalar(rhs) => rhs
@@ -1921,41 +2017,45 @@ impl Tensor {
     }
 
     /// Element-wise equality.
-    pub fn eq<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn eq<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Eq)
     }
 
     /// Element-wise non-equality.
-    pub fn ne<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn ne<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Ne)
     }
 
     /// Element-wise comparison with lower-than, the returned tensor uses value 1 where `self <
     /// rhs` and 0 otherwise.
-    pub fn lt<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn lt<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Lt)
     }
 
     /// Element-wise comparison with greater-than, the returned tensor uses value 1 where `self >
     /// rhs` and 0 otherwise.
-    pub fn gt<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn gt<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Gt)
     }
 
     /// Element-wise comparison with greater-equal, the returned tensor uses value 1 where `self >=
     /// rhs` and 0 otherwise.
-    pub fn ge<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn ge<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Ge)
     }
 
     /// Element-wise comparison with lower-equal, the returned tensor uses value 1 where `self <=
     /// rhs` and 0 otherwise.
-    pub fn le<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+    pub fn le<T: TensorOrScalar<'w>>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Le)
     }
 
     /// Clamp the tensor values to be between `min` and `max`.
-    pub fn clamp<T1: TensorOrScalar, T2: TensorOrScalar>(&self, min: T1, max: T2) -> Result<Self> {
+    pub fn clamp<T1: TensorOrScalar<'w>, T2: TensorOrScalar<'w>>(
+        &self,
+        min: T1,
+        max: T2,
+    ) -> Result<Self> {
         self.maximum(min)?.minimum(max)
     }
 
@@ -2751,7 +2851,12 @@ impl Tensor {
         self.is_variable
     }
 
-    pub(crate) fn op(&self) -> &Option<Op> {
+    /// The recorded graph edge, if this tensor tracks one.
+    ///
+    /// `Op<'w>` and not an elided `Op<'_>`: elision would tie the operands to
+    /// *this borrow* rather than to the tensor's own lifetime, which silently
+    /// constrains every caller that walks the graph.
+    pub(crate) fn op(&self) -> &Option<Op<'w>> {
         &self.op
     }
 
@@ -2765,7 +2870,7 @@ impl Tensor {
     /// assert_eq!(tensor.to_scalar::<f32>()?, 5.);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn max_all(&self) -> Result<Tensor> {
+    pub fn max_all(&self) -> Result<Self> {
         if self.rank() == 0 {
             Ok(self.clone())
         } else {
@@ -2783,7 +2888,7 @@ impl Tensor {
     /// assert_eq!(tensor.to_scalar::<f32>()?, 0.);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn min_all(&self) -> Result<Tensor> {
+    pub fn min_all(&self) -> Result<Self> {
         if self.rank() == 0 {
             Ok(self.clone())
         } else {
@@ -2801,12 +2906,12 @@ impl Tensor {
     /// assert_eq!(tensor.to_scalar::<f32>()?, 15.);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn sum_all(&self) -> Result<Tensor> {
+    pub fn sum_all(&self) -> Result<Self> {
         let dims: Vec<_> = (0..self.rank()).collect();
         self.sum(dims)
     }
 
-    pub fn mean_all(&self) -> Result<Tensor> {
+    pub fn mean_all(&self) -> Result<Self> {
         self.sum_all()? / self.elem_count() as f64
     }
 
@@ -2814,7 +2919,7 @@ impl Tensor {
         &self,
         start_dim: Option<D1>,
         end_dim: Option<D2>,
-    ) -> Result<Tensor> {
+    ) -> Result<Self> {
         if self.rank() == 0 {
             self.reshape(1)
         } else {
@@ -2842,18 +2947,18 @@ impl Tensor {
 
     /// Flattens the input tensor on the dimension indexes from `start_dim` to `end_dim` (both
     /// inclusive).
-    pub fn flatten<D1: Dim, D2: Dim>(&self, start_dim: D1, end_dim: D2) -> Result<Tensor> {
+    pub fn flatten<D1: Dim, D2: Dim>(&self, start_dim: D1, end_dim: D2) -> Result<Self> {
         self.flatten_(Some(start_dim), Some(end_dim))
     }
 
     /// Flattens the input tensor on the dimension indexes from `0` to `end_dim` (inclusive).
-    pub fn flatten_to<D: Dim>(&self, end_dim: D) -> Result<Tensor> {
+    pub fn flatten_to<D: Dim>(&self, end_dim: D) -> Result<Self> {
         self.flatten_(None::<usize>, Some(end_dim))
     }
 
     /// Flattens the input tensor on the dimension indexes from `start_dim` (inclusive) to the last
     /// dimension.
-    pub fn flatten_from<D: Dim>(&self, start_dim: D) -> Result<Tensor> {
+    pub fn flatten_from<D: Dim>(&self, start_dim: D) -> Result<Self> {
         self.flatten_(Some(start_dim), None::<usize>)
     }
 
@@ -2866,7 +2971,7 @@ impl Tensor {
     /// assert_eq!(tensor.to_vec1::<f32>()?, &[0., 1., 2., 3., 4., 5.]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn flatten_all(&self) -> Result<Tensor> {
+    pub fn flatten_all(&self) -> Result<Self> {
         self.flatten_(None::<usize>, None::<usize>)
     }
 
@@ -2881,7 +2986,7 @@ impl Tensor {
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn get(&self, i: usize) -> Result<Tensor> {
+    pub fn get(&self, i: usize) -> Result<Self> {
         let dims = self.dims();
         if dims.is_empty() {
             Ok(self.clone())
@@ -2903,7 +3008,7 @@ impl Tensor {
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn get_on_dim<D: Dim>(&self, dim: D, index: usize) -> Result<Tensor> {
+    pub fn get_on_dim<D: Dim>(&self, dim: D, index: usize) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "get_on_dim")?;
         self.narrow(dim, index, 1)?.squeeze(dim)
     }
@@ -2918,7 +3023,7 @@ impl Tensor {
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[0.0, 2.0, 4.0], [1.0, 3.0, 5.0]]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn t(&self) -> Result<Tensor> {
+    pub fn t(&self) -> Result<Self> {
         let rank = self.rank();
         if rank < 2 {
             Err(Error::UnexpectedNumberOfDims {
@@ -2933,14 +3038,15 @@ impl Tensor {
 
     /// Returns a tensor that is a transposed version of the input, the given dimensions are
     /// swapped.
-    pub fn transpose<D1: Dim, D2: Dim>(&self, dim1: D1, dim2: D2) -> Result<Tensor> {
+    pub fn transpose<D1: Dim, D2: Dim>(&self, dim1: D1, dim2: D2) -> Result<Self> {
         let dim1 = dim1.to_index(self.shape(), "transpose")?;
         let dim2 = dim2.to_index(self.shape(), "transpose")?;
         if dim1 == dim2 {
             return Ok(self.clone());
         }
         let op = BackpropOp::new1(self, |t| Op::Transpose(t, dim1, dim2));
-        let tensor_ = Tensor_ {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.transpose(dim1, dim2)?,
@@ -2949,7 +3055,7 @@ impl Tensor {
             dtype: self.dtype,
             device: self.device.clone(),
         };
-        Ok(Tensor(Arc::new(tensor_)))
+        Ok(LiveTensor(Arc::new(tensor_)))
     }
 
     /// Returns a tensor with the same data as the input where the dimensions have been permuted.
@@ -2963,7 +3069,7 @@ impl Tensor {
     /// assert_eq!(tensor.dims(), &[4, 5, 3, 2]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn permute<D: Dims>(&self, dims: D) -> Result<Tensor> {
+    pub fn permute<D: Dims>(&self, dims: D) -> Result<Self> {
         let dims = dims.to_indexes(self.shape(), "permute")?;
         // O(n^2) permutation check but these arrays are small.
         let is_permutation =
@@ -2976,7 +3082,8 @@ impl Tensor {
             )
         }
         let op = BackpropOp::new1(self, |t| Op::Permute(t, dims.clone()));
-        let tensor_ = Tensor_ {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.permute(&dims)?,
@@ -2985,7 +3092,7 @@ impl Tensor {
             dtype: self.dtype,
             device: self.device.clone(),
         };
-        Ok(Tensor(Arc::new(tensor_)))
+        Ok(LiveTensor(Arc::new(tensor_)))
     }
 
     /// Returns true if the data is stored in a C contiguous (aka row major) way.
@@ -3000,9 +3107,31 @@ impl Tensor {
 
     /// Compared to clone, this copies the actual storage but may fail because of running out of
     /// memory.
-    pub fn copy(&self) -> Result<Tensor> {
+    /// A `'static` deep copy of this tensor's contents.
+    ///
+    /// The sanctioned way to let wave- or arena-scoped data outlive its owner:
+    /// the storage is cloned onto a fresh allocation, so the result borrows
+    /// nothing. It really does allocate — that is the point, and it is why this
+    /// is not something [`Clone`] could do (it must return `Self`, and so would
+    /// inherit `'w` while quietly paying for a copy).
+    pub fn to_owned_tensor(&self) -> Result<Tensor> {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
+            id: TensorId::new(),
+            storage: Arc::new(RwLock::new(self.storage().try_clone(self.layout())?)),
+            layout: self.layout.clone(),
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(LiveTensor(Arc::new(tensor_)))
+    }
+
+    pub fn copy(&self) -> Result<Self> {
         let op = BackpropOp::new1(self, Op::Copy);
-        let tensor_ = Tensor_ {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
             id: TensorId::new(),
             storage: Arc::new(RwLock::new(self.storage().try_clone(self.layout())?)),
             layout: self.layout.clone(),
@@ -3011,18 +3140,19 @@ impl Tensor {
             dtype: self.dtype,
             device: self.device.clone(),
         };
-        Ok(Tensor(Arc::new(tensor_)))
+        Ok(LiveTensor(Arc::new(tensor_)))
     }
 
     /// Returns a new tensor detached from the current graph, gradient are not propagated through
     /// this new node. The storage of this tensor is shared with the initial tensor.
     ///
     /// If the tensor is already detached from the computation graph, the same tensor is returned.
-    pub fn detach(&self) -> Tensor {
+    pub fn detach(&self) -> Self {
         if self.op.is_none() && !self.is_variable {
             self.clone()
         } else {
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout: self.layout.clone(),
@@ -3031,12 +3161,12 @@ impl Tensor {
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
-            Tensor(Arc::new(tensor_))
+            LiveTensor(Arc::new(tensor_))
         }
     }
 
     /// If the target device is the same as the tensor device, only a shallow copy is performed.
-    pub fn to_device(&self, device: &Device) -> Result<Tensor> {
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
         if self.device().same_device(device) {
             Ok(self.clone())
         } else {
@@ -3065,7 +3195,8 @@ impl Tensor {
                 }
             };
             let op = BackpropOp::new1(self, Op::ToDevice);
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage: Arc::new(RwLock::new(storage)),
                 layout: self.layout.clone(),
@@ -3074,7 +3205,7 @@ impl Tensor {
                 dtype: self.dtype,
                 device: device.clone(),
             };
-            Ok(Tensor(Arc::new(tensor_)))
+            Ok(LiveTensor(Arc::new(tensor_)))
         }
     }
 
@@ -3095,7 +3226,8 @@ impl Tensor {
     /// any value, the dimension `t_a` must be equal to `i_a` if `i_a` is different from 1. If
     /// `i_a` is equal to 1, any value can be used.
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
-        let tensor_ = Tensor_ {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: self.layout.broadcast_as(shape)?,
@@ -3104,7 +3236,7 @@ impl Tensor {
             dtype: self.dtype,
             device: self.device.clone(),
         };
-        Ok(Tensor(Arc::new(tensor_)))
+        Ok(LiveTensor(Arc::new(tensor_)))
     }
 
     /// An alias for broadcast_as.
@@ -3181,7 +3313,8 @@ impl Tensor {
             let shape = self.shape().clone();
             let storage = self.storage.clone(); // Clone the Arc<RwLock<Storage>>
             let op = BackpropOp::new1(self, Op::ToDType);
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage,
                 layout: Layout::contiguous(&shape),
@@ -3190,7 +3323,7 @@ impl Tensor {
                 dtype,
                 device: self.device.clone(),
             };
-            *self = Tensor(Arc::new(tensor_));
+            *self = LiveTensor(Arc::new(tensor_));
         }
 
         Ok(())
@@ -3225,7 +3358,7 @@ impl Tensor {
 
     /// Returns a tensor that is in row major order. This is the same as the original tensor if it
     /// was already contiguous, otherwise a copy is triggered.
-    pub fn contiguous(&self) -> Result<Tensor> {
+    pub fn contiguous(&self) -> Result<Self> {
         if self.is_contiguous() {
             Ok(self.clone())
         } else {
@@ -3239,7 +3372,7 @@ impl Tensor {
     }
 
     /// Returns a tensor that is in row major order. This always makes a copy.
-    pub fn force_contiguous(&self) -> Result<Tensor> {
+    pub fn force_contiguous(&self) -> Result<Self> {
         let shape = self.shape();
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
@@ -3250,7 +3383,7 @@ impl Tensor {
 
     /// Create a variable based on the values currently stored in a tensor. The storage is always
     /// copied.
-    pub(crate) fn make_var(&self) -> Result<Tensor> {
+    pub(crate) fn make_var(&self) -> Result<Self> {
         let shape = self.shape().clone();
         let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
         self.storage()
@@ -3282,7 +3415,7 @@ impl Tensor {
     ///
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn reshape<S: ShapeWithOneHole>(&self, s: S) -> Result<Tensor> {
+    pub fn reshape<S: ShapeWithOneHole>(&self, s: S) -> Result<Self> {
         let shape = s.into_shape(self.elem_count())?;
         if shape.elem_count() != self.elem_count() {
             return Err(Error::ShapeMismatchBinaryOp {
@@ -3294,7 +3427,8 @@ impl Tensor {
         }
         let op = BackpropOp::new1(self, Op::Reshape);
         if self.is_contiguous() {
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
@@ -3303,7 +3437,7 @@ impl Tensor {
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
-            Ok(Tensor(Arc::new(tensor_)))
+            Ok(LiveTensor(Arc::new(tensor_)))
         } else {
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()
@@ -3335,7 +3469,8 @@ impl Tensor {
             let mut strides = self.stride().to_vec();
             dims.remove(dim);
             strides.remove(dim);
-            let tensor_ = Tensor_ {
+            let tensor_ = TensorInner {
+                lease: PhantomData,
                 id: TensorId::new(),
                 storage: self.storage.clone(),
                 layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
@@ -3344,7 +3479,7 @@ impl Tensor {
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
-            Ok(Tensor(Arc::new(tensor_)))
+            Ok(LiveTensor(Arc::new(tensor_)))
         } else {
             Ok(self.clone())
         }
@@ -3373,7 +3508,8 @@ impl Tensor {
         // C contiguous.
         let stride = if dim < strides.len() { strides[dim] } else { 1 };
         strides.insert(dim, stride);
-        let tensor_ = Tensor_ {
+        let tensor_ = TensorInner {
+            lease: PhantomData,
             id: TensorId::new(),
             storage: self.storage.clone(),
             layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
@@ -3382,7 +3518,7 @@ impl Tensor {
             dtype: self.dtype,
             device: self.device.clone(),
         };
-        Ok(Tensor(Arc::new(tensor_)))
+        Ok(LiveTensor(Arc::new(tensor_)))
     }
 
     /// Stacks two or more tensors along a particular dimension.
@@ -3401,7 +3537,7 @@ impl Tensor {
     /// assert_eq!(c.shape().dims(), &[2, 3, 2]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn stack<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
+    pub fn stack<A: AsRef<LiveTensor<'w>>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "stack" }.bt())?
         }
@@ -3423,13 +3559,13 @@ impl Tensor {
             let mut dims = self.dims().to_vec();
             dims[dim] = right;
             let right = Tensor::zeros(dims.as_slice(), self.dtype, self.device())?;
-            Tensor::cat(&[self, &right], dim)
+            Self::cat(&[self, &right], dim)
         } else if right == 0 {
             let dim = dim.to_index(self.shape(), "pad_with_zeros")?;
             let mut dims = self.dims().to_vec();
             dims[dim] = left;
             let left = Tensor::zeros(dims.as_slice(), self.dtype, self.device())?;
-            Tensor::cat(&[&left, self], dim)
+            Self::cat(&[&left, self], dim)
         } else {
             let dim = dim.to_index(self.shape(), "pad_with_zeros")?;
             let mut dims = self.dims().to_vec();
@@ -3437,7 +3573,7 @@ impl Tensor {
             let left = Tensor::zeros(dims.as_slice(), self.dtype, self.device())?;
             dims[dim] = right;
             let right = Tensor::zeros(dims.as_slice(), self.dtype, self.device())?;
-            Tensor::cat(&[&left, self, &right], dim)
+            Self::cat(&[&left, self, &right], dim)
         }
     }
 
@@ -3455,7 +3591,7 @@ impl Tensor {
             for _ in 0..right {
                 v.push(&r)
             }
-            Tensor::cat(&v, dim)
+            Self::cat(&v, dim)
         } else if right == 0 {
             let dim = dim.to_index(self.shape(), "pad_with_same")?;
             let l = self.narrow(dim, 0, 1)?;
@@ -3464,7 +3600,7 @@ impl Tensor {
                 v.push(&l)
             }
             v.push(self);
-            Tensor::cat(&v, dim)
+            Self::cat(&v, dim)
         } else {
             let dim = dim.to_index(self.shape(), "pad_with_same")?;
             let l = self.narrow(dim, 0, 1)?;
@@ -3477,18 +3613,8 @@ impl Tensor {
             for _ in 0..right {
                 v.push(&r)
             }
-            Tensor::cat(&v, dim)
+            Self::cat(&v, dim)
         }
-    }
-
-    /// Run the `forward` method of `m` on `self`.
-    pub fn apply<M: crate::Module>(&self, m: &M) -> Result<Self> {
-        m.forward(self)
-    }
-
-    /// Run the `forward` method of `m` on `self`.
-    pub fn apply_t<M: crate::ModuleT>(&self, m: &M, train: bool) -> Result<Self> {
-        m.forward_t(self, train)
     }
 
     pub(crate) fn storage(&self) -> std::sync::RwLockReadGuard<'_, Storage> {
@@ -3677,7 +3803,7 @@ impl Tensor {
     /// assert_eq!(t_flipped.to_vec2::<f64>()?, &[[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]]);
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn flip(&self, dims: &[usize]) -> Result<Tensor> {
+    pub fn flip(&self, dims: &[usize]) -> Result<Self> {
         let mut result = self.clone();
         for &dim in dims.iter() {
             let size = result.dim(dim)?;
@@ -3689,66 +3815,81 @@ impl Tensor {
     }
 }
 
+/// The arithmetic operator impls, generic over `'w` so that `a + b` on wave
+/// buffers yields a wave-scoped result instead of one claiming `'static`.
+///
+/// Both operands share a single `'w`. That is not a restriction in practice:
+/// `LiveTensor` is covariant, so mixing an owned tensor with a leased one
+/// simply resolves `'w` to the shorter of the two — which is exactly the
+/// lifetime the result is valid for.
 macro_rules! bin_trait {
     ($trait:ident, $fn1:ident, $mul:expr, $add:expr) => {
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<B> for Tensor {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<B> for LiveTensor<'w> {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: B) -> Self::Output {
-                Tensor::$fn1(&self, rhs.borrow())
+                LiveTensor::$fn1(&self, rhs.borrow())
             }
         }
 
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<B> for &Tensor {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<B> for &LiveTensor<'w> {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: B) -> Self::Output {
-                Tensor::$fn1(&self, rhs.borrow())
+                LiveTensor::$fn1(&self, rhs.borrow())
             }
         }
 
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<Tensor> for Result<B> {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<LiveTensor<'w>>
+            for Result<B>
+        {
+            type Output = Result<LiveTensor<'w>>;
 
-            fn $fn1(self, rhs: Tensor) -> Self::Output {
-                Tensor::$fn1(self?.borrow(), &rhs)
+            fn $fn1(self, rhs: LiveTensor<'w>) -> Self::Output {
+                LiveTensor::$fn1(self?.borrow(), &rhs)
             }
         }
 
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<&Tensor> for Result<B> {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<&LiveTensor<'w>>
+            for Result<B>
+        {
+            type Output = Result<LiveTensor<'w>>;
 
-            fn $fn1(self, rhs: &Tensor) -> Self::Output {
-                Tensor::$fn1(self?.borrow(), rhs)
+            fn $fn1(self, rhs: &LiveTensor<'w>) -> Self::Output {
+                LiveTensor::$fn1(self?.borrow(), rhs)
             }
         }
 
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<Result<B>> for Tensor {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<Result<B>>
+            for LiveTensor<'w>
+        {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: Result<B>) -> Self::Output {
-                Tensor::$fn1(&self, rhs?.borrow())
+                LiveTensor::$fn1(&self, rhs?.borrow())
             }
         }
 
-        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<Result<B>> for &Tensor {
-            type Output = Result<Tensor>;
+        impl<'w, B: std::borrow::Borrow<LiveTensor<'w>>> std::ops::$trait<Result<B>>
+            for &LiveTensor<'w>
+        {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: Result<B>) -> Self::Output {
-                Tensor::$fn1(&self, rhs?.borrow())
+                LiveTensor::$fn1(&self, rhs?.borrow())
             }
         }
 
-        impl std::ops::$trait<f64> for Tensor {
-            type Output = Result<Tensor>;
+        impl<'w> std::ops::$trait<f64> for LiveTensor<'w> {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: f64) -> Self::Output {
                 self.affine($mul(rhs), $add(rhs))
             }
         }
 
-        impl std::ops::$trait<f64> for &Tensor {
-            type Output = Result<Tensor>;
+        impl<'w> std::ops::$trait<f64> for &LiveTensor<'w> {
+            type Output = Result<LiveTensor<'w>>;
 
             fn $fn1(self, rhs: f64) -> Self::Output {
                 self.affine($mul(rhs), $add(rhs))
@@ -3757,73 +3898,94 @@ macro_rules! bin_trait {
     };
 }
 
+/// The methods that hand `self` to something which may outlive the call.
+///
+/// [`crate::Module`] and [`crate::ModuleT`] take `&Tensor`, so a module is free
+/// to keep what it is given — cache it, close over it, store it beside its
+/// weights. That is why they are not generic over `'w`, and why these two
+/// methods sit here rather than in the main block: running a module over a
+/// wave-scoped buffer is refused at compile time instead of producing a tensor
+/// that outlives the half it points into. Copy it off the wave first
+/// (`.contiguous()` onto owned storage) if that is really what you want.
+impl Tensor {
+    /// Run the `forward` method of `m` on `self`.
+    pub fn apply<M: crate::Module>(&self, m: &M) -> Result<Self> {
+        m.forward(self)
+    }
+
+    /// Run the `forward` method of `m` on `self`.
+    pub fn apply_t<M: crate::ModuleT>(&self, m: &M, train: bool) -> Result<Self> {
+        m.forward_t(self, train)
+    }
+}
+
 bin_trait!(Add, add, |_| 1., |v| v);
 bin_trait!(Sub, sub, |_| 1., |v: f64| -v);
 bin_trait!(Mul, mul, |v| v, |_| 0.);
 bin_trait!(Div, div, |v| 1. / v, |_| 0.);
 
-impl std::ops::Add<Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Add<LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn add(self, rhs: Tensor) -> Self::Output {
+    fn add(self, rhs: LiveTensor<'w>) -> Self::Output {
         rhs + self
     }
 }
 
-impl std::ops::Add<&Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Add<&LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn add(self, rhs: &Tensor) -> Self::Output {
+    fn add(self, rhs: &LiveTensor<'w>) -> Self::Output {
         rhs + self
     }
 }
 
-impl std::ops::Mul<Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Mul<LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn mul(self, rhs: Tensor) -> Self::Output {
+    fn mul(self, rhs: LiveTensor<'w>) -> Self::Output {
         rhs * self
     }
 }
 
-impl std::ops::Mul<&Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Mul<&LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn mul(self, rhs: &Tensor) -> Self::Output {
+    fn mul(self, rhs: &LiveTensor<'w>) -> Self::Output {
         rhs * self
     }
 }
 
-impl std::ops::Sub<Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Sub<LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn sub(self, rhs: Tensor) -> Self::Output {
+    fn sub(self, rhs: LiveTensor<'w>) -> Self::Output {
         rhs.affine(-1., self)
     }
 }
 
-impl std::ops::Sub<&Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Sub<&LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
-    fn sub(self, rhs: &Tensor) -> Self::Output {
+    fn sub(self, rhs: &LiveTensor<'w>) -> Self::Output {
         rhs.affine(-1., self)
     }
 }
 
-impl std::ops::Div<Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Div<LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
     #[allow(clippy::suspicious_arithmetic_impl)]
-    fn div(self, rhs: Tensor) -> Self::Output {
+    fn div(self, rhs: LiveTensor<'w>) -> Self::Output {
         rhs.recip()? * self
     }
 }
 
-impl std::ops::Div<&Tensor> for f64 {
-    type Output = Result<Tensor>;
+impl<'w> std::ops::Div<&LiveTensor<'w>> for f64 {
+    type Output = Result<LiveTensor<'w>>;
 
     #[allow(clippy::suspicious_arithmetic_impl)]
-    fn div(self, rhs: &Tensor) -> Self::Output {
+    fn div(self, rhs: &LiveTensor<'w>) -> Self::Output {
         rhs.recip()? * self
     }
 }

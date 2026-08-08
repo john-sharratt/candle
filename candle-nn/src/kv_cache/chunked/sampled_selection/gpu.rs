@@ -56,6 +56,7 @@ fn bump_generation(
 fn stage_bytes_as_gpu_buf(
     bytes: &[u8],
     generation: Option<&Generation>,
+    bump: Option<&super::super::bump_arena::Generation>,
     dev: &candle::CudaDevice,
 ) -> Result<GpuBuf> {
     if let Some(generation) = generation {
@@ -64,11 +65,24 @@ fn stage_bytes_as_gpu_buf(
         return generation.submit(pinned);
     }
     let stream = dev.cuda_stream();
-    let bump = super::super::bump_arena::persistence_domain(&stream)?;
+    let Some(bump) = bump else {
+        // No guard to bound a span range, so own the bytes outright rather than
+        // bump: an unguarded range is one another thread's last-generation drop
+        // can reset and re-hand-out under this kernel. Owned costs an
+        // allocation, which these tables can afford — they are small and
+        // uploaded once per selector.
+        let slice = stream
+            .memcpy_stod(bytes)
+            .map_err(|e| candle::Error::Msg(format!("selection table upload: {e}")))?;
+        return Ok(GpuBuf::from_raw_owned(slice, dev));
+    };
+    // Allocated *through* the guard, so the range provably belongs to a
+    // generation that is still open — `BumpRange<'_>` borrows `bump`.
     let range = bump.alloc(bytes.len(), 256)?;
-    // SAFETY: `range` is `bytes.len()` of the domain's span, kept live by the
-    // caller's `_bump_gen` guard; `bytes` is a host slice alive for this call;
-    // and the copy is enqueued on the same stream the kernel reads from.
+    // SAFETY: `range` is `bytes.len()` of the domain's span held by `bump`,
+    // which the caller keeps alive for as long as the returned `GpuBuf`;
+    // `bytes` is a host slice alive for this call; and the copy is enqueued on
+    // the same stream the kernel reads from.
     unsafe {
         candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
             range.ptr,
@@ -83,34 +97,37 @@ fn stage_bytes_as_gpu_buf(
 fn stage_i64_slice(
     values: &[i64],
     generation: Option<&Generation>,
+    bump: Option<&super::super::bump_arena::Generation>,
     dev: &candle::CudaDevice,
 ) -> Result<GpuBuf> {
     let bytes = unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
     };
-    stage_bytes_as_gpu_buf(bytes, generation, dev)
+    stage_bytes_as_gpu_buf(bytes, generation, bump, dev)
 }
 
 fn stage_i32_slice(
     values: &[i32],
     generation: Option<&Generation>,
+    bump: Option<&super::super::bump_arena::Generation>,
     dev: &candle::CudaDevice,
 ) -> Result<GpuBuf> {
     let bytes = unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
     };
-    stage_bytes_as_gpu_buf(bytes, generation, dev)
+    stage_bytes_as_gpu_buf(bytes, generation, bump, dev)
 }
 
 fn stage_f32_slice(
     values: &[f32],
     generation: Option<&Generation>,
+    bump: Option<&super::super::bump_arena::Generation>,
     dev: &candle::CudaDevice,
 ) -> Result<GpuBuf> {
     let bytes = unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
     };
-    stage_bytes_as_gpu_buf(bytes, generation, dev)
+    stage_bytes_as_gpu_buf(bytes, generation, bump, dev)
 }
 
 /// Upload a selection table to the device as an owned buffer.
@@ -124,11 +141,15 @@ fn stage_f32_slice(
 ///
 /// An empty job list still needs a non-null pointer for the launch, so it
 /// uploads one zeroed row.
-fn stage_table(table: &[i64], dev: &candle::CudaDevice) -> Result<GpuBuf> {
+fn stage_table(
+    table: &[i64],
+    bump: Option<&super::super::bump_arena::Generation>,
+    dev: &candle::CudaDevice,
+) -> Result<GpuBuf> {
     if table.is_empty() {
-        return stage_i64_slice(&vec![0i64; PerHeadEntry::COLS], None, dev);
+        return stage_i64_slice(&vec![0i64; PerHeadEntry::COLS], None, bump, dev);
     }
-    stage_i64_slice(table, None, dev)
+    stage_i64_slice(table, None, bump, dev)
 }
 
 pub enum SelectionBackend<'a> {
@@ -352,11 +373,13 @@ impl KvSamplerGpu {
             .iter()
             .map(|f| ggml_to_select_qtype(f.to_ggml_dtype()))
             .collect::<candle::Result<Vec<_>>>()?;
-        let candidates_buf = stage_i32_slice(&cand_codes, None, dev)?;
+        // No generation is open here — these are uploaded once when the
+        // selector is built — so they own their bytes rather than bumping.
+        let candidates_buf = stage_i32_slice(&cand_codes, None, None, dev)?;
         let bpe_vals: Vec<f32> = candidates.iter().map(|f| f.bits_per_elem()).collect();
-        let candidates_bpe_buf = stage_f32_slice(&bpe_vals, None, dev)?;
-        let k_thresholds_buf = stage_f32_slice(k_thresholds, None, dev)?;
-        let v_thresholds_buf = stage_f32_slice(v_thresholds, None, dev)?;
+        let candidates_bpe_buf = stage_f32_slice(&bpe_vals, None, None, dev)?;
+        let k_thresholds_buf = stage_f32_slice(k_thresholds, None, None, dev)?;
+        let v_thresholds_buf = stage_f32_slice(v_thresholds, None, None, dev)?;
 
         // Dedicated stream for DtoH transfers — separate from the compute stream.
         let dtoh_stream = dev
@@ -937,7 +960,12 @@ impl PagedSelectionGpuInputs {
         // current storage arenas — a named host error beats a silent GPU OOB.
         backing.validate_selection_gids(chunk_gids_keepalive, "single-layer")?;
         let per_head_table = backing.per_head_table_host(chunk_gids_keepalive)?;
-        let per_head_table_buf = stage_table(&per_head_table, dev)?;
+        // The guard opens *before* the uploads it bounds. Creating it in the
+        // struct literal below left the bumps briefly unguarded, so another
+        // thread's last-generation drop could reset the cursor between the
+        // upload and the guard.
+        let bump_gen = bump_generation(None, dev);
+        let per_head_table_buf = stage_table(&per_head_table, bump_gen.as_ref(), dev)?;
         let n_kv_head = backing.n_kv_head;
 
         let blocks_per_chunk = n_kv_head * backing.head_dim;
@@ -968,7 +996,7 @@ impl PagedSelectionGpuInputs {
         // clobbered-gids OOB). The table is tiny; the owned CudaSlice is held
         // by the GpuBuf and freed stream-ordered after the kernel — safe.
         let _ = generation;
-        let head_gids_buf = stage_i64_slice(&head_gids, None, dev)?;
+        let head_gids_buf = stage_i64_slice(&head_gids, None, bump_gen.as_ref(), dev)?;
 
         Ok(Self {
             chunk_gids_keepalive,
@@ -980,8 +1008,9 @@ impl PagedSelectionGpuInputs {
             n_kv_head,
             arena_chunks: GID_STRIDE,
             dev: dev.clone(),
-            // Staged with `None` above, so the buffers always borrow the span.
-            _bump_gen: bump_generation(None, dev),
+            // Staged through `bump_gen` above, so the buffers borrow the span
+            // it holds open.
+            _bump_gen: bump_gen,
         })
     }
 
@@ -1057,9 +1086,10 @@ impl PagedSelectionGpuInputs {
             bytes = unified_table.len() * std::mem::size_of::<i64>(),
             "fused selection table"
         );
-        let per_head_table_buf = stage_table(&unified_table, dev)?;
+        let bump_gen = bump_generation(generation, dev);
+        let per_head_table_buf = stage_table(&unified_table, bump_gen.as_ref(), dev)?;
         let _ = generation;
-        let head_gids_buf = stage_i64_slice(&unified_head_gids, None, dev)?;
+        let head_gids_buf = stage_i64_slice(&unified_head_gids, None, bump_gen.as_ref(), dev)?;
 
         Ok((
             Self {
@@ -1072,7 +1102,7 @@ impl PagedSelectionGpuInputs {
                 n_kv_head,
                 arena_chunks: GID_STRIDE,
                 dev: dev.clone(),
-                _bump_gen: bump_generation(generation, dev),
+                _bump_gen: bump_gen,
             },
             chunk_counts,
         ))
@@ -1103,12 +1133,14 @@ impl PagedSelectionGpuInputs {
             self.per_head_table[start_chunk * rows_per_chunk..end_chunk * rows_per_chunk].to_vec();
         // OWNED upload — same staging-lifetime hazard as `from_head_gids`.
         let _ = generation;
-        let head_gids_buf = stage_i64_slice(&head_gids, None, &self.dev)?;
-        let per_head_table_buf = stage_table(&per_head_table, &self.dev)?;
+        let bump_gen = bump_generation(None, &self.dev);
+        let head_gids_buf = stage_i64_slice(&head_gids, None, bump_gen.as_ref(), &self.dev)?;
+        let per_head_table_buf = stage_table(&per_head_table, bump_gen.as_ref(), &self.dev)?;
 
         Ok(Self {
-            // Re-uploaded with `None` above, so these borrow the span.
-            _bump_gen: bump_generation(None, &self.dev),
+            // Re-uploaded through `bump_gen` above, so these borrow the span
+            // it holds open.
+            _bump_gen: bump_gen,
             chunk_gids_keepalive,
             per_head_table,
             per_head_table_buf,
@@ -1315,8 +1347,8 @@ impl PagedSelectionGpuInputs {
             .copied()
             .map(SampleFormat::to_cuda_tag)
             .collect();
-        let k_buf = stage_i32_slice(&k_codes, generation, &self.dev)?;
-        let v_buf = stage_i32_slice(&v_codes, generation, &self.dev)?;
+        let k_buf = stage_i32_slice(&k_codes, generation, self._bump_gen.as_ref(), &self.dev)?;
+        let v_buf = stage_i32_slice(&v_codes, generation, self._bump_gen.as_ref(), &self.dev)?;
         let (k_head_gpu, v_head_gpu, k_eff_gpu, v_eff_gpu) = reduce_head_format_stats(
             k_buf.dev_ptr(),
             v_buf.dev_ptr(),

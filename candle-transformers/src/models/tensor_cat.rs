@@ -335,7 +335,11 @@ impl TensorCat {
     /// Add another tensor to this TensorCat in-place.
     ///
     /// The rhs tensor must be broadcastable to the shape of the concatenated tensor.
-    pub fn add_mut(&mut self, rhs: &Tensor) -> Result<()> {
+    /// Accumulate `rhs` into this buffer.
+    ///
+    /// `rhs` may be wave-scoped — the residual add is exactly where a leased
+    /// FFN or attention result is consumed — because this only *reads* it.
+    pub fn add_mut(&mut self, rhs: &candle::LiveTensor<'_>) -> Result<()> {
         self.tensor.add_mut(rhs)
     }
 

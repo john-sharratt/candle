@@ -214,7 +214,10 @@ impl Default for GovernorConfig {
         Self {
             kv_floor_abs: env_bytes_mb("CANDLE_VRAM_KV_FLOOR_MB", DEFAULT_KV_FLOOR_MB),
             kv_floor_pct: env_f64("CANDLE_VRAM_KV_FLOOR_PCT", DEFAULT_KV_FLOOR_PCT),
-            scratch_margin: env_bytes_mb("CANDLE_VRAM_SCRATCH_MARGIN_MB", DEFAULT_SCRATCH_MARGIN_MB),
+            scratch_margin: env_bytes_mb(
+                "CANDLE_VRAM_SCRATCH_MARGIN_MB",
+                DEFAULT_SCRATCH_MARGIN_MB,
+            ),
             balloon_target_frac: env_f64("CANDLE_VRAM_BALLOON_FRAC", DEFAULT_BALLOON_FRAC),
             balloon_headroom_abs: env_bytes_mb(
                 "CANDLE_VRAM_BALLOON_HEADROOM_MB",

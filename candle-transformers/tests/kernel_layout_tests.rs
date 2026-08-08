@@ -659,6 +659,7 @@ fn run_prefill(
     let generation = stager.begin_generation();
     let mut caches_arr: [&mut KvCache; 1] = [cache];
     let outs = paged_prefill_batched(
+        None,
         &mut caches_arr[..],
         &[offset],
         &qf,
@@ -796,6 +797,7 @@ fn decode_one_slot(
 
     let softmax_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
     let out = paged_decode_attn(
+        None,
         q,
         headers_ptr,
         DType::F16,
@@ -1481,6 +1483,7 @@ fn run_offset_window_glue_case(
 
     let gen_c = stager.begin_generation();
     let out_c = paged_glue_attn(
+        None,
         &mut [&mut cache_c],
         &[win_len],
         &qgf,
@@ -1502,6 +1505,7 @@ fn run_offset_window_glue_case(
     )?;
     let gen_b = stager.begin_generation();
     let out_b = paged_glue_attn(
+        None,
         &mut [&mut cache_b],
         &[win_len],
         &qgf,
@@ -1561,6 +1565,7 @@ fn glue_over(
     let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(GLUE_TOKENS, device)?;
     let gen = stager.begin_generation();
     let out = paged_glue_attn(
+        None,
         &mut [&mut cache],
         &[win_len],
         qgf,
@@ -1940,6 +1945,7 @@ fn run_glue_interspersed_case(
     let (gw_slice, gw_in_blk, fwd_ahead) = glue_descriptors(g, device)?;
     let gen = stager.begin_generation();
     let _ = paged_glue_attn(
+        None,
         &mut [&mut cache],
         &[la + lb],
         &qgf,

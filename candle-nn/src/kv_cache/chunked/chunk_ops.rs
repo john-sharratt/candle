@@ -1343,8 +1343,11 @@ impl ChunkedKvBacking {
         let lens: Vec<usize> = src_ptrs.iter().map(|(_, l)| *l as usize).collect();
         let mut group_start = 0usize;
         for (i, j, group_bytes) in staging_groups(&lens, MIGRATION_STAGING_CAP_BYTES) {
-            let _gen = bump.generation();
-            let staging = bump.alloc(group_bytes, 256)?;
+            // Allocated through the guard, so `staging` borrows it: the group's
+            // range cannot outlive the generation whose drop fences the copy
+            // stream and rewinds the cursor under it.
+            let group_gen = bump.generation();
+            let staging = group_gen.alloc(group_bytes, 256)?;
             let staging_base = staging.ptr as i64;
             let mut plan = MigrationPlan::new();
             let mut off = 0i64;
@@ -1607,7 +1610,14 @@ impl ChunkedKvBacking {
             // progress even when host RAM is fragmented or VRAM is tight, instead
             // of aborting. Only when a lone layer still won't fit do we propagate
             // the error (the turn stays hot-float + consistent, retried next pass).
-            let (_staging_gen, staging) = loop {
+            // The generation opens *before* the bisect, not on success inside
+            // it: the range allocated below borrows it, so the two cannot be
+            // produced as a pair. Retries need no fresh guard — a failed
+            // `alloc` bails before it advances the cursor — and a
+            // domain-creation failure is not memory pressure on this batch, so
+            // shrinking would not have helped it anyway.
+            let staging_gen = bump_arena::persistence_domain(copy_stream)?.generation();
+            let staging = loop {
                 let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
                 // Host scratch (fallible — see the per-layer variant's note).
                 let host_res = {
@@ -1626,12 +1636,9 @@ impl ChunkedKvBacking {
                 // bisect now shrinks against the domain's *declared* budget
                 // rather than against the driver refusing an allocation —
                 // same loop, a bound that is ours.
-                let alloc_res = host_res.and_then(|_| {
-                    bump_arena::persistence_domain(copy_stream)
-                        .and_then(|b| b.alloc(batch_bytes, 256).map(|r| (b, r)))
-                });
+                let alloc_res = host_res.and_then(|_| staging_gen.alloc(batch_bytes, 256));
                 match alloc_res {
-                    Ok((arena, range)) => break (arena.generation(), range),
+                    Ok(range) => break range,
                     Err(e) if lj > li + 1 => {
                         lj = li + ((lj - li) / 2).max(1);
                         tracing::warn!(
@@ -1669,8 +1676,10 @@ impl ChunkedKvBacking {
                     .as_mut()
                     .expect("pinned scratch allocated above");
                 let dst = &mut scratch.as_mut_slice()[..staging.len];
-                // SAFETY: as the hot->warm site — a range of this domain's span held by
-                // `_staging_gen`, copied into pinned host scratch, synced here.
+                // SAFETY: as the hot->warm site — a range of this domain's span
+                // held by `staging_gen`, which `staging` borrows, so it is
+                // still open here by construction; copied into pinned host
+                // scratch, synced here.
                 unsafe {
                     candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async(
                         dst,
@@ -1682,8 +1691,10 @@ impl ChunkedKvBacking {
                 copy_stream.synchronize().w()?;
             }
             // The generation drops at the end of this batch iteration, fencing
-            // the stream and rewinding the cursor for the next batch.
-            drop(_staging_gen);
+            // the stream and rewinding the cursor for the next batch. Dropping
+            // it earlier is no longer expressible: `staging` borrows it, and
+            // the last read of `staging` is the readback just above.
+            drop(staging_gen);
 
             // ── Per-layer scatter into fresh CPU arenas ─────────────────────
             for (k, backing) in backings[li..lj].iter().enumerate() {
@@ -2041,8 +2052,11 @@ impl ChunkedKvBacking {
         let lens: Vec<usize> = unique_raws.iter().map(|r| gid_byte_range[r].1).collect();
         for (i, j, group_bytes) in staging_groups(&lens, MIGRATION_STAGING_CAP_BYTES) {
             let group_start = gid_byte_range[&unique_raws[i]].0;
-            let _gen = bump.generation();
-            let staging = bump.alloc(group_bytes, 256)?;
+            // Allocated through the guard, so `staging` borrows it: the group's
+            // range cannot outlive the generation whose drop fences the copy
+            // stream and rewinds the cursor under it.
+            let group_gen = bump.generation();
+            let staging = group_gen.alloc(group_bytes, 256)?;
             let staging_base = staging.ptr as i64;
             let src_bytes = &scratch.as_slice()[group_start..group_start + group_bytes];
             // SAFETY: the range is `staging.len` of the domain's span, held by

@@ -48,7 +48,7 @@ pub use chunked::persistence_domain_stats;
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
 #[cfg(feature = "cuda")]
-pub use chunked::{begin_wave, wave_alloc, wave_domain_stats, BumpRange, WaveGeneration};
+pub use chunked::{begin_wave, wave_domain_stats, BumpRange, WaveGeneration};
 #[cfg(feature = "cuda")]
 pub use chunked::{region_stats, RegionStats, REGION_BYTES};
 

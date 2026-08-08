@@ -172,7 +172,6 @@ mod cuda_tests {
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
-    use std::sync::Mutex;
 
     /// Every test here builds real paged-KV arenas on the shared device, drawing
     /// from the process-global chunk pool and pinned stager — so they cannot run
@@ -183,11 +182,12 @@ mod cuda_tests {
     /// and under `--test-threads=1`, which is exactly what made an ordinary
     /// shared-state race read as GPU flakiness. Poison-tolerant so one failure
     /// does not cascade into the rest.
-    static GPU_LOCK: Mutex<()> = Mutex::new(());
-
-    fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
-        GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// Serialise against every GPU test in the crate, not just this module.
+    ///
+    /// A module-scoped lock let a `prefill_utils` test run concurrently with a
+    /// decode test over the same process-global region pool, which is what made
+    /// `correctness_decode_seal_gap` flaky. See [`crate::models::gpu_test_lock`].
+    use crate::models::gpu_test_lock::gpu_serial as gpu_guard;
 
     // ------------------------------------------------------------------
     // RoPE table helpers (same theta=10000 convention as prefill_utils)
@@ -380,6 +380,7 @@ mod cuda_tests {
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
 
         let result = paged_decode_attn(
+            None,
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -478,6 +479,7 @@ mod cuda_tests {
         let rope_cs = make_zero_rope_cs(head_dim, 16, device)?;
 
         let result = paged_decode_attn(
+            None,
             &q_c,
             headers_ptr,
             arena_dtype,

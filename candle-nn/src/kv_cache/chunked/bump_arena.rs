@@ -11,17 +11,24 @@
 //! # The reset is the only dangerous operation
 //!
 //! Resetting a cursor makes every buffer handed out since the last reset
-//! reusable, so it must not happen while a kernel is still reading one. Two
+//! reusable, so it must not happen while a kernel is still reading one. Three
 //! things guard it, and they are the whole safety argument:
 //!
+//! - **A borrow.** [`Generation::alloc`] returns a [`BumpRange<'w>`] that
+//!   borrows the guard, and every tensor built on that range carries the same
+//!   `'w`. A buffer therefore cannot be named after the guard that would free
+//!   it has dropped — the compiler rejects the program instead.
 //! - **A counted generation.** `reset` is refused while any [`Generation`] is
-//!   live. Refusal is loud — the count is checked, not assumed — because a
-//!   silent early reset is a data race that reproduces as garbage output far
-//!   from its cause (principle 7: safety by refusal, not by ceremony).
+//!   live. This is what covers the host-side cursor when several guards overlap;
+//!   the borrow bounds one guard's ranges, the count bounds the arena. Refusal
+//!   is loud — the count is checked, not assumed — because a silent early reset
+//!   is a data race that reproduces as garbage output far from its cause
+//!   (principle 7: safety by refusal, not by ceremony).
 //! - **A stream fence.** The last generation to drop synchronises the domain's
 //!   stream before the cursor moves, so the GPU has drained the ranges the
 //!   host is about to hand out again. This is `PinnedStager`'s sync-then-reset
-//!   discipline, applied to device memory.
+//!   discipline, applied to device memory. The borrow is a host-side statement
+//!   about names; only the fence orders the device.
 //!
 //! # Why domains are separate arenas
 //!
@@ -34,10 +41,12 @@
 //! Every domain is a disjoint sub-range of the device reservation's transient
 //! tier ([`super::region_pool::carve_transient`]), carved once and never
 //! returned. Addresses are therefore fixed for the process lifetime, which is
-//! what lets a `BumpRange` be a bare pointer with no lifetime.
+//! what lets a [`BumpRange`] be a bare pointer: `'w` bounds when the *range* may
+//! be reused, never whether the address is mapped.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
@@ -46,19 +55,23 @@ use candle::Result;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::region_pool::carve_transient;
 
-/// A range handed out by a [`BumpArena`].
+/// A range handed out by a [`Generation`].
 ///
 /// Deliberately **not** RAII: a bump range is freed by its generation's reset,
-/// never individually, so a `Drop` impl would be a lie. It carries no lifetime
-/// either — the compiler cannot express "valid until the generation resets",
-/// and pretending otherwise with a borrow would force every consumer to thread
-/// a lifetime that the counted generation already enforces at run time.
+/// never individually, so a `Drop` impl would be a lie. What bounds it instead
+/// is `'w` — a borrow of the [`Generation`] that handed it out. The cursor
+/// cannot rewind while that guard is alive, so "valid for `'w`" and "valid
+/// until the generation resets" are the same statement, and the borrow checker
+/// can hold the compiler to it.
 #[derive(Debug, Clone, Copy)]
-pub struct BumpRange {
+pub struct BumpRange<'w> {
     /// Device address of the range's first byte.
     pub ptr: u64,
     /// Bytes reserved.
     pub len: usize,
+    /// Covariant in `'w`: this range is valid for at most as long as the guard
+    /// it came from.
+    wave: PhantomData<&'w ()>,
 }
 
 /// How a domain makes a reset safe.
@@ -157,49 +170,6 @@ impl BumpArena {
         }
     }
 
-    /// Bump-allocate `len` bytes, aligned to `align`.
-    ///
-    /// Errors rather than growing: the span is the domain's budget, and §3.6's
-    /// fast gate is supposed to have sized the wave to fit *before* assembly
-    /// starts. An overflow here means the gate was wrong, which is worth a
-    /// loud failure rather than a silent allocation behind its back.
-    pub fn alloc(&self, len: usize, align: usize) -> Result<BumpRange> {
-        debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-        let mut inner = self.inner.lock().unwrap();
-        let start = (inner.cursor + align - 1) & !(align - 1);
-        let end = start.checked_add(len).ok_or_else(|| {
-            candle::Error::Msg(format!("{}: bump allocation overflowed usize", self.name))
-        })?;
-        if end > inner.capacity {
-            candle::bail!(
-                "{}: transient span exhausted — {len} B at offset {start} exceeds the \
-                 {} B budget. The wave should have been gated to fit before assembly.",
-                self.name,
-                inner.capacity,
-            );
-        }
-        inner.cursor = end;
-        inner.dirty = true;
-        if end > inner.peak {
-            inner.peak = end;
-            // Only on a new high-water mark, so this is quiet in steady state
-            // and self-terminating: a domain's watermark converges within the
-            // first few waves. This is the measurement the transient span is
-            // sized from, and it has to come from a real workload rather than
-            // the scheduler's own reporting path, which not every run exercises.
-            log::debug!(
-                "{}: transient peak {} B of {} B",
-                self.name,
-                end,
-                inner.capacity
-            );
-        }
-        Ok(BumpRange {
-            ptr: inner.base + start as u64,
-            len,
-        })
-    }
-
     /// Whether any [`Generation`] guard is currently open on this arena.
     pub(crate) fn is_live(&self) -> bool {
         self.inner.lock().unwrap().live > 0
@@ -213,6 +183,55 @@ impl BumpArena {
     }
 }
 
+/// Bump `len` bytes aligned to `align` from the arena behind `inner`.
+///
+/// The one allocation primitive, reached only through [`Generation::alloc`].
+/// There is deliberately no arena-level entry point: a range handed out by the
+/// arena would be bounded by the arena — which lives for the process — and so
+/// would reintroduce exactly the unbounded lease this module exists to remove.
+///
+/// Errors rather than growing: the span is the domain's budget, and §3.6's fast
+/// gate is supposed to have sized the wave to fit *before* assembly starts. An
+/// overflow here means the gate was wrong, which is worth a loud failure rather
+/// than a silent allocation behind its back.
+fn bump<'a>(
+    inner: &'a Mutex<Inner>,
+    name: &'static str,
+    len: usize,
+    align: usize,
+) -> Result<BumpRange<'a>> {
+    debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+    let mut inner = inner.lock().unwrap();
+    let start = (inner.cursor + align - 1) & !(align - 1);
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| candle::Error::Msg(format!("{name}: bump allocation overflowed usize")))?;
+    if end > inner.capacity {
+        candle::bail!(
+            "{}: transient span exhausted — {len} B at offset {start} exceeds the \
+             {} B budget. The wave should have been gated to fit before assembly.",
+            name,
+            inner.capacity,
+        );
+    }
+    inner.cursor = end;
+    inner.dirty = true;
+    if end > inner.peak {
+        inner.peak = end;
+        // Only on a new high-water mark, so this is quiet in steady state
+        // and self-terminating: a domain's watermark converges within the
+        // first few waves. This is the measurement the transient span is
+        // sized from, and it has to come from a real workload rather than
+        // the scheduler's own reporting path, which not every run exercises.
+        log::debug!("{}: transient peak {} B of {} B", name, end, inner.capacity);
+    }
+    Ok(BumpRange {
+        ptr: inner.base + start as u64,
+        len,
+        wave: PhantomData,
+    })
+}
+
 /// A live claim on a [`BumpArena`]'s current contents.
 ///
 /// While one exists the cursor cannot reset, so every range handed out since
@@ -221,6 +240,52 @@ impl BumpArena {
 pub struct Generation {
     inner: Arc<Mutex<Inner>>,
     name: &'static str,
+}
+
+impl Generation {
+    /// Bump `len` bytes, aligned to `align`, from the half this guard pins.
+    ///
+    /// The returned range borrows `self`, so it cannot outlive the guard whose
+    /// drop resets the cursor underneath it. That is the whole safety argument
+    /// for wave buffers, moved from a runtime count to the type system:
+    /// a caller who holds a `BumpRange<'w>` provably still holds the guard.
+    ///
+    /// Allocating *through the guard* also removes an ambiguity the arena
+    /// cannot resolve. A bump range has to come from a specific half, and with
+    /// two waves in flight there is no way to tell from the outside which half
+    /// a given call site belongs to — the older wave's late allocations would
+    /// land in the newer wave's half and be freed by its reset. Here the guard
+    /// names its own half, so the question never arises.
+    ///
+    /// A range cannot outlive the guard that reclaims it:
+    ///
+    /// ```compile_fail
+    /// # use candle_nn::kv_cache::{begin_wave, BumpRange};
+    /// # fn f(stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>)
+    /// #     -> candle::Result<()> {
+    /// let range = {
+    ///     let wave = begin_wave(stream)?;
+    ///     wave.alloc(1024, 256)?
+    /// };
+    /// println!("{}", range.ptr);
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// while using it inside the guard's scope is fine — the control that keeps
+    /// the case above from failing for an unrelated reason:
+    ///
+    /// ```no_run
+    /// # use candle_nn::kv_cache::begin_wave;
+    /// # fn f(stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>)
+    /// #     -> candle::Result<()> {
+    /// let wave = begin_wave(stream)?;
+    /// let range = wave.alloc(1024, 256)?;
+    /// println!("{}", range.ptr);
+    /// # Ok(()) }
+    /// ```
+    pub fn alloc(&self, len: usize, align: usize) -> Result<BumpRange<'_>> {
+        bump(&self.inner, self.name, len, align)
+    }
 }
 
 impl Drop for Generation {
@@ -332,12 +397,12 @@ fn with_wave_domain<R>(
 
 /// Open a wave: switch to the other half and return its generation guard.
 ///
-/// **The guard must be held for the whole wave.** This is §3.7's answer for
-/// wave intermediates: they are handed to candle ops as `Tensor`s and outlive
-/// the scope that allocated them, so they cannot pin the cursor themselves —
-/// the wave does. While the guard lives, [`wave_alloc`] hands out ranges from
-/// this half and the cursor cannot rewind; when it drops, the stream fences and
-/// the half is reusable.
+/// **The guard must be held for the whole wave**, and the borrow checker now
+/// holds callers to it: [`Generation::alloc`] hands out ranges that borrow this
+/// guard, and the tensors built on them carry the same lifetime, so a wave
+/// intermediate cannot be named after the guard drops. While the guard lives
+/// the cursor cannot rewind; when it drops, the stream fences and the half is
+/// reusable.
 ///
 /// Refuses when the half it would take is still live. Two waves in flight is
 /// the point of double buffering — N+1 assembles while N drains — but a third
@@ -366,48 +431,6 @@ pub fn begin_wave(stream: &Arc<CudaStream>) -> Result<Generation> {
         }
         domain.current = next;
         Ok(domain.halves[next].generation())
-    })
-}
-
-/// Bump `len` bytes from the in-flight wave's half, or `None` if no wave is in
-/// flight on this stream.
-///
-/// The absence is real, not a feature flag: the same kernel wrappers run inside
-/// the scheduler's wave loop and standalone in probes, replay harnesses, and
-/// kernel tests. Inside a wave there is a half whose generation guarantees the
-/// range outlives every kernel reading it; outside one there is nothing to
-/// bound the lifetime, and the caller must own its output instead.
-pub fn wave_alloc(stream: &Arc<CudaStream>, len: usize, align: usize) -> Result<Option<BumpRange>> {
-    with_wave_domain(stream, |domain| {
-        // **Both halves live is ambiguous, and ambiguity here is silent
-        // corruption.** This serves `domain.current`, the *most recently begun*
-        // half — not the half the caller's own `Generation` pins, which it has
-        // no way to name (the whole point of the ambient design is that kernel
-        // wrappers deep in the call graph allocate without threading a guard
-        // through). Those coincide only while exactly one generation is live.
-        //
-        // If a second wave opens while the first is still in flight, the first
-        // wave's later allocations land in the second's half and are freed by
-        // the second's reset — under kernels still reading them. `begin_wave`
-        // refuses a *third* wave; this refuses to guess between two.
-        //
-        // Today nothing nests (attention guards drop before the FFN guard
-        // opens), so this is unreachable — which is exactly when a wrong answer
-        // would go unnoticed longest.
-        if domain.halves[0].is_live() && domain.halves[1].is_live() {
-            candle::bail!(
-                "wave domain: both halves have live generations, so which one this \
-                 allocation belongs to is ambiguous. Serving the most recent would \
-                 hand the older wave memory the newer wave's reset frees. Close the \
-                 outer wave before opening another, or thread the `Generation` to \
-                 this call site."
-            )
-        }
-        let half = &domain.halves[domain.current];
-        if !half.is_live() {
-            return Ok(None);
-        }
-        half.alloc(len, align).map(Some)
     })
 }
 
@@ -487,13 +510,14 @@ mod tests {
 
 #[cfg(all(test, feature = "cuda"))]
 mod wave_tests {
-    use super::{begin_wave, wave_alloc, wave_domain_stats};
+    use super::{begin_wave, wave_domain_stats};
     use candle::{Device, Result};
 
     /// The wave domain is process-global and `cargo test` runs tests in
-    /// parallel, so these take turns. Without it, `no_wave_in_flight_means_no_range`
-    /// would see a half another test still had open.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// parallel, so these take turns. It is the *crate-wide* lock rather than a
+    /// local one: the KV selection tests build backings on the same device, and
+    /// a lock that only excludes this module would not exclude them.
+    use super::super::gpu_test_lock::gpu_serial as serial;
 
     fn stream() -> Option<std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>> {
         match Device::new_cuda(0) {
@@ -502,30 +526,19 @@ mod wave_tests {
         }
     }
 
-    /// Outside a wave there is nothing to bound a range's lifetime, so the
-    /// domain must say so rather than hand one out. This is what lets the same
-    /// kernel wrappers run in probes and replay harnesses.
-    #[test]
-    fn no_wave_in_flight_means_no_range() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(s) = stream() else { return Ok(()) };
-        assert!(wave_alloc(&s, 1024, 256)?.is_none());
-        Ok(())
-    }
-
     /// Inside a wave, ranges come from the half and do not overlap.
     #[test]
     fn ranges_within_a_wave_are_disjoint() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let guard = begin_wave(&s)?;
-        let a = wave_alloc(&s, 1000, 256)?.expect("wave in flight");
-        let b = wave_alloc(&s, 2000, 256)?.expect("wave in flight");
+        let a = guard.alloc(1000, 256)?;
+        let b = guard.alloc(2000, 256)?;
         assert!(a.ptr + a.len as u64 <= b.ptr, "ranges overlap");
         assert_eq!(b.ptr % 256, 0);
-        drop(guard);
-        // And the half is closed again once the wave ends.
-        assert!(wave_alloc(&s, 16, 256)?.is_none());
+        // Nothing to assert about life after `drop(guard)`: `a` and `b` borrow
+        // it, so a program that used them afterwards would not compile. That is
+        // the property this used to check at run time.
         Ok(())
     }
 
@@ -535,20 +548,20 @@ mod wave_tests {
     /// read.
     #[test]
     fn consecutive_waves_alternate_halves() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let g1 = begin_wave(&s)?;
-        let first = wave_alloc(&s, 4096, 256)?.expect("wave in flight").ptr;
+        let first = g1.alloc(4096, 256)?.ptr;
         drop(g1);
 
         let g2 = begin_wave(&s)?;
-        let second = wave_alloc(&s, 4096, 256)?.expect("wave in flight").ptr;
+        let second = g2.alloc(4096, 256)?.ptr;
         drop(g2);
 
         assert_ne!(first, second, "consecutive waves shared a half");
 
         let g3 = begin_wave(&s)?;
-        let third = wave_alloc(&s, 4096, 256)?.expect("wave in flight").ptr;
+        let third = g3.alloc(4096, 256)?.ptr;
         drop(g3);
         assert_eq!(third, first, "the third wave should be back on half A");
         Ok(())
@@ -558,7 +571,7 @@ mod wave_tests {
     /// given the half the first is still filling (principle 7).
     #[test]
     fn a_concurrent_wave_is_refused() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let _outer = begin_wave(&s)?;
         // The other half is free, so this one succeeds...
@@ -576,10 +589,10 @@ mod wave_tests {
     /// that clears the cursor.
     #[test]
     fn peak_outlives_the_reset() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let guard = begin_wave(&s)?;
-        wave_alloc(&s, 8192, 256)?.expect("wave in flight");
+        guard.alloc(8192, 256)?;
         drop(guard);
         let stats = wave_domain_stats(0).expect("domain exists");
         let peak = stats[0].1.max(stats[1].1);

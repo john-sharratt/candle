@@ -1,6 +1,6 @@
 // Efficient sampling that avoids hidden GPU→CPU transfers
 
-use crate::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor, WithDType};
+use crate::{CpuStorage, CustomOp1, DType, Layout, LiveTensor, Result, Shape, Tensor, WithDType};
 
 #[cfg(feature = "cuda")]
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     MetalStorage,
 };
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// GPU-efficient multinomial sampling that minimizes transfers
     ///
     /// Returns a tensor on the same device. For GPU tensors, this avoids

@@ -471,6 +471,7 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
 
     let mut cache_refs: Vec<&mut KvCache> = case.caches.iter_mut().collect();
     let out = paged_prefill_batched(
+        None,
         &mut cache_refs[..],
         &offsets,
         &q,

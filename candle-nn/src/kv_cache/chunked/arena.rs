@@ -9,6 +9,9 @@
 
 use crate::kv_cache::{arena_table::ArenaLocation, KvFormat, QuantFormat};
 use ahash::AHashMap;
+#[cfg(feature = "cuda")]
+use candle::quantized::LiveQTensor;
+use candle::LiveTensor;
 use candle::{DType, Result, Tensor};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
@@ -334,12 +337,12 @@ impl Arena {
     /// Errors if the requested view would run past the slot stride, so a wrong
     /// shape is a named host error rather than a read into the next tenant.
     #[cfg(feature = "cuda")]
-    pub(super) fn slot_view<S: Into<candle::Shape>>(
-        &self,
+    pub(super) fn slot_view<'a, S: Into<candle::Shape>>(
+        &'a self,
         chunk_idx: usize,
         dtype: DType,
         shape: S,
-    ) -> Result<Tensor> {
+    ) -> Result<LiveTensor<'a>> {
         let shape = shape.into();
         let want = shape.elem_count() * dtype.size_in_bytes();
         let stride = self.slot_stride();
@@ -358,10 +361,12 @@ impl Arena {
         let ptr = self.slot_ptr(chunk_idx).ok_or_else(|| {
             candle::Error::Msg("slot_view: arena is not GPU-resident".to_string())
         })?;
-        // SAFETY: `ptr` is slot `chunk_idx` of a live arena slab; the bounds
-        // check above keeps the view inside the slot, and zero-on-recycle
-        // (invariant 4) means the bytes are always a legal bit pattern.
-        unsafe { Tensor::from_leased_cuda_ptr(ptr, dtype, shape, self.data.device()) }
+        // SAFETY: the bounds check above keeps the view inside slot
+        // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
+        // always a legal bit pattern. That the slab outlives the view is no
+        // longer an obligation here: `'a` ties it to this borrow of the arena,
+        // exactly as for `qslot_view`.
+        unsafe { LiveTensor::from_leased_cuda_ptr(ptr, dtype, shape, self.data.device()) }
     }
 
     /// Byte offset of slot `chunk_idx`, bounds-checked against `len`.
@@ -424,12 +429,12 @@ impl Arena {
     /// write into the returned tensor lands in the arena. On a CPU arena the
     /// bytes are decoded on the host into a fresh tensor — a *copy*, so use
     /// [`Self::write_slot_typed`] rather than mutating the result.
-    pub(crate) fn read_slot_typed<S: Into<candle::Shape>>(
-        &self,
+    pub(crate) fn read_slot_typed<'a, S: Into<candle::Shape>>(
+        &'a self,
         chunk_idx: usize,
         dtype: DType,
         shape: S,
-    ) -> Result<Tensor> {
+    ) -> Result<LiveTensor<'a>> {
         let shape = shape.into();
         #[cfg(feature = "cuda")]
         if self.location == ArenaLocation::Gpu {
@@ -502,13 +507,17 @@ impl Arena {
     /// payload belong to no chunk. That also makes every offset into the
     /// returned tensor *slot-local*, which is what retires the arena-global
     /// `chunk_idx * elems_per_chunk + ...` arithmetic invariant 8 is about.
+    ///
+    /// The returned view borrows the arena, so it cannot outlive the slab it
+    /// addresses: `LiveQTensor<'a>` is not `QTensor`, and the difference is
+    /// what the borrow checker enforces here in place of a comment.
     #[cfg(feature = "cuda")]
-    pub(super) fn qslot_view(
-        &self,
+    pub(super) fn qslot_view<'a>(
+        &'a self,
         chunk_idx: usize,
         format: QuantFormat,
         elems: usize,
-    ) -> Result<candle::quantized::QTensor> {
+    ) -> Result<LiveQTensor<'a>> {
         let ggml = format.to_ggml_dtype();
         let payload = (elems / ggml.block_size()) * ggml.type_size();
         let off = self.slot_offset(chunk_idx, payload)?;
@@ -518,13 +527,12 @@ impl Arena {
         let candle::Device::Cuda(dev) = self.data.device() else {
             candle::bail!("qslot_view: arena slab is not on a CUDA device");
         };
-        // SAFETY: `base + off` is slot `chunk_idx` of a live arena slab, the
-        // bounds check in `slot_offset` keeps the view inside that slot, and
-        // zero-on-recycle (invariant 4) means the bytes are always a legal bit
-        // pattern for the format.
-        unsafe {
-            candle::quantized::QTensor::from_leased_cuda_ptr(base + off as u64, ggml, elems, dev)
-        }
+        // SAFETY: the bounds check in `slot_offset` keeps the view inside slot
+        // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
+        // always a legal bit pattern for the format. That the slab is still
+        // live is no longer an obligation here: `'a` ties the view to this
+        // borrow of the arena.
+        unsafe { LiveQTensor::from_leased_cuda_ptr(base + off as u64, ggml, elems, dev) }
     }
 
     /// Quantize `src` into slot `chunk_idx`, `elem_offset` elements in.

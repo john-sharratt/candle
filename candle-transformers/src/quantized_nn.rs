@@ -143,7 +143,7 @@ impl RmsNorm {
         &self,
         x: &Tensor,
         mode: candle::quantized::Int8Mode,
-    ) -> Result<candle::quantized::cuda::DynamicActs> {
+    ) -> Result<candle::quantized::cuda::DynamicActs<'static>> {
         use candle::quantized::cuda::DynamicActs;
         if !mode.is_int8() {
             return Ok(DynamicActs::Float(self.forward(x)?));

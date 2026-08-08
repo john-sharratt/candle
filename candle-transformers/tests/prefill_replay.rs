@@ -214,6 +214,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
         let mut refs: Vec<&mut KvCache> = caches.iter_mut().collect();
         let generation = stager.begin_generation();
         paged_prefill_batched(
+            None,
             &mut refs[..],
             &offsets,
             &q,

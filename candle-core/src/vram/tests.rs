@@ -55,7 +55,11 @@ fn reloading_the_model_does_not_collapse_the_kv_floor() {
     assert!(floor > gov.config().kv_floor_abs, "{floor}");
 
     gov.set_class(AllocClass::Weights, 8 * GIB);
-    assert_eq!(gov.kv_floor(), floor, "a second load must not move the floor");
+    assert_eq!(
+        gov.kv_floor(),
+        floor,
+        "a second load must not move the floor"
+    );
     assert_eq!(gov.class_reserved(AllocClass::Weights), 8 * GIB);
 }
 
@@ -205,7 +209,11 @@ fn balloon_stops_at_the_real_ceiling_when_the_cap_is_generous() -> Result<()> {
     let vram = FakeVram::new(total, total);
     let mut alloc = FakeBalloonAllocator::new(vram.clone(), 12 * GIB);
     let c = super::balloon::balloon_measure(&vram.probe(), &mut alloc, &cfg)?;
-    assert_eq!(c, 12 * GIB, "the driver's refusal is the ceiling, not the cap");
+    assert_eq!(
+        c,
+        12 * GIB,
+        "the driver's refusal is the ceiling, not the cap"
+    );
     Ok(())
 }
 
@@ -331,8 +339,7 @@ fn expert_budget_charges_our_own_spend_not_the_os_reserve() -> Result<()> {
         "only our own 500 MiB is spent; the 1375 MiB OS reserve is already in C"
     );
     // The discredited form would have charged `total - headroom` = 1875 MiB.
-    let double_booked =
-        13488 * MIB_U - 1875 * MIB_U - gov.kv_floor() - gov.scratch_margin();
+    let double_booked = 13488 * MIB_U - 1875 * MIB_U - gov.kv_floor() - gov.scratch_margin();
     assert!(
         budget > double_booked,
         "double-booking the reserve costs {} MiB",
@@ -766,5 +773,4 @@ mod real_cuda {
         );
         Ok(())
     }
-
 }

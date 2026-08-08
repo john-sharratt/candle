@@ -1993,6 +1993,7 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "offline curve-codebook sweep over real KV dumps, not a correctness test: 20+ min in a debug build. Run it with --ignored, and with --release as the comment above says."]
 fn test_q0_v_iterative_curve_selection() {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Device;

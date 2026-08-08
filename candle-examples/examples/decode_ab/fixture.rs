@@ -496,6 +496,7 @@ fn run_prefill(
     let generation = stager.begin_generation();
     let mut caches_arr: [&mut KvCache; 1] = [cache];
     let _ = paged_prefill_batched(
+        None,
         &mut caches_arr[..],
         &[offset],
         q,

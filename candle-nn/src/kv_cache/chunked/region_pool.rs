@@ -569,7 +569,8 @@ pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option
 ///
 /// Carved downward from the right end, once per domain and never returned, so
 /// every domain's address is fixed for the process lifetime — which is what
-/// lets a `BumpRange` be a bare pointer with no lifetime.
+/// lets a `BumpRange` be a bare pointer. Its `'w` bounds when the range may be
+/// handed out again, not whether the address is mapped.
 pub(crate) fn carve_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
     with_pool(stream, |pool| {
         let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
@@ -607,8 +608,10 @@ mod tests {
     use candle::cuda_backend::cudarc::driver::CudaStream;
 
     /// The pool is process-global and cargo runs tests in parallel, so region
-    /// counts are only stable while one test at a time is looking at them.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// counts are only stable while one test at a time is looking at them — and
+    /// that includes tests outside this module, which is why it is the
+    /// crate-wide lock and not a local `static`.
+    use super::super::gpu_test_lock::gpu_serial as serial;
 
     fn stream() -> Option<Arc<CudaStream>> {
         match Device::new_cuda(0) {
@@ -621,7 +624,7 @@ mod tests {
     /// region stride — the arithmetic every base pointer depends on.
     #[test]
     fn regions_are_disjoint_and_ascending() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let a = claim_region(&s)?.expect("a region");
         let b = claim_region(&s)?.expect("a second region");
@@ -637,7 +640,7 @@ mod tests {
     /// Dropping a handle returns its region, and the next claim takes the
     /// lowest free one back — the left-packing the evacuation order relies on.
     ///
-    /// Asserted as an ordering, not as two exact indices. `SERIAL` serialises
+    /// Asserted as an ordering, not as two exact indices. The lock serialises
     /// this module's tests against each other, but the pool is process-global
     /// and other modules' tests claim from it in parallel, so a specific region
     /// freed here can be taken by one of them before the re-claim. What must
@@ -646,7 +649,7 @@ mod tests {
     /// lowest is the one handed out.
     #[test]
     fn a_released_region_comes_back_lowest_first() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let low = claim_region(&s)?.expect("a region");
         let high = claim_region(&s)?.expect("a second region");
@@ -679,7 +682,7 @@ mod tests {
     /// A recycled region is handed over zeroed, whatever its last tenant left.
     #[test]
     fn a_recycled_region_is_zeroed() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let region = claim_region(&s)?.expect("a region");
         let base = region.base();
@@ -728,7 +731,7 @@ mod tests {
     /// takes the fast path is still handed over clean.
     #[test]
     fn one_quiesce_covers_a_whole_batch_of_releases() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
 
         let batch: Vec<_> = (0..4)
@@ -816,7 +819,7 @@ mod tests {
     /// Live + free accounts for every region: nothing leaks out of the span.
     #[test]
     fn every_region_is_either_live_or_free() -> Result<()> {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let held = claim_region(&s)?.expect("a region");
         let stats = region_stats(0).expect("a pool");
