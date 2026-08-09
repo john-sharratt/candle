@@ -155,24 +155,38 @@ pub trait CustomOp3 {
 impl<'w> LiveTensor<'w> {
     /// Applies a unary custom op without backward support.
     ///
-    /// Returns an owned `Tensor` even from a wave-scoped receiver: a custom op
-    /// allocates its own output storage, so the result borrows nothing from the
-    /// input. (Our own wave-writing kernels are the exception, and they are not
-    /// on this path precisely because it cannot express their lifetime.)
-    pub fn apply_op1_no_bwd<C: CustomOp1>(&self, c: &C) -> Result<Tensor> {
+    /// The result is bounded by the receiver's `'w`, not `'static`. A custom op
+    /// allocates its own output storage, but *where* that storage comes from is
+    /// decided by the operand: an op reading a wave-backed input writes its
+    /// output into the same arena, so the result is only live for as long as the
+    /// generation that owns it. Handing back a `Tensor` here would let that
+    /// result outlive the guard with nothing to catch it — every op reached
+    /// through this path (`softmax_last_dim`, `rms_norm`, `silu_mul`,
+    /// `layer_norm`, `sdpa`, the `rope` family, `QMatMul::forward_live`,
+    /// `argsort`, the sampling ops) would launder `'w` away silently.
+    ///
+    /// Callers holding an ordinary `Tensor` are unaffected: `'w` is `'static`
+    /// there, so `Self` *is* `Tensor`.
+    pub fn apply_op1_no_bwd<C: CustomOp1>(&self, c: &C) -> Result<Self> {
         let (storage, shape) = self.storage().apply_op1(self.layout(), c)?;
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
-    /// Applies a binary custom op without backward support
-    pub fn apply_op2_no_bwd<C: CustomOp2>(&self, rhs: &Self, c: &C) -> Result<Tensor> {
+    /// Applies a binary custom op without backward support.
+    ///
+    /// Bounded by `'w` for the reason given on [`Self::apply_op1_no_bwd`]. Both
+    /// operands share the one `'w`, so variance already unified them at the
+    /// shorter of the two before this is called.
+    pub fn apply_op2_no_bwd<C: CustomOp2>(&self, rhs: &Self, c: &C) -> Result<Self> {
         let (storage, shape) =
             self.storage()
                 .apply_op2(self.layout(), &rhs.storage(), rhs.layout(), c)?;
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
 
-    /// Applies a ternary custom op without backward support
-    pub fn apply_op3_no_bwd<C: CustomOp3>(&self, t2: &Self, t3: &Self, c: &C) -> Result<Tensor> {
+    /// Applies a ternary custom op without backward support.
+    ///
+    /// Bounded by `'w`; see [`Self::apply_op1_no_bwd`].
+    pub fn apply_op3_no_bwd<C: CustomOp3>(&self, t2: &Self, t3: &Self, c: &C) -> Result<Self> {
         let (storage, shape) = self.storage().apply_op3(
             self.layout(),
             &t2.storage(),

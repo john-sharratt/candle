@@ -66,7 +66,7 @@ fn write_band_chunk(
     tag: ArenaFormatTag,
     elems: usize,
     elem_offset: usize,
-    band: &Tensor,
+    band: &candle::LiveTensor<'_>,
 ) -> Result<()> {
     let ai = gid.arena_idx();
     let arena = arenas
@@ -247,8 +247,8 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
         offset: usize,
-        k: &Tensor,
-        v: &Tensor,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         let batch = self.batch_capacity();
         if batch_idx >= batch {
@@ -293,8 +293,8 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
         offset: usize,
-        k: &Tensor,
-        v: &Tensor,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         let (_, _, len, _) = k.dims4()?;
 

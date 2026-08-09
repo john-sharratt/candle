@@ -1,6 +1,6 @@
 //! Rotary Embeddings
 //!
-use candle::{CpuStorage, Layout, Result, Shape, Tensor, D};
+use candle::{CpuStorage, Layout, LiveTensor, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 /// Interleaved variant of rotary embeddings.
@@ -97,7 +97,7 @@ impl candle::CustomOp3 for RotaryEmbI {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -135,12 +135,29 @@ impl candle::CustomOp3 for RotaryEmbI {
             _ => candle::bail!("rope_i not supported for dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! rope_i_impl {
             ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(src_o1..src_o2);
                 let cos = $cos_slice.slice(cos_o1..cos_o2);
                 let sin = $sin_slice.slice(sin_o1..sin_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
@@ -201,7 +218,7 @@ impl candle::CustomOp3 for RotaryEmbI {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -277,7 +294,7 @@ fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
     }
 }
 
-pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+pub fn rope_i<'w>(xs: &LiveTensor<'w>, cos: &Tensor, sin: &Tensor) -> Result<LiveTensor<'w>> {
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
     let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
     let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
@@ -419,7 +436,7 @@ impl candle::CustomOp3 for RotaryEmb {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -458,12 +475,29 @@ impl candle::CustomOp3 for RotaryEmb {
             _ => candle::bail!("rope not supported for dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! rope_impl {
             ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(src_o1..src_o2);
                 let cos = $cos_slice.slice(cos_o1..cos_o2);
                 let sin = $sin_slice.slice(sin_o1..sin_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
@@ -525,7 +559,7 @@ impl candle::CustomOp3 for RotaryEmb {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -589,7 +623,7 @@ impl candle::CustomOp3 for RotaryEmb {
     }
 }
 
-pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+pub fn rope<'w>(xs: &LiveTensor<'w>, cos: &Tensor, sin: &Tensor) -> Result<LiveTensor<'w>> {
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
     let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
     let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
@@ -730,7 +764,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -766,12 +800,29 @@ impl candle::CustomOp3 for RotaryEmbThd {
             _ => candle::bail!("rope_thd not supported for dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! rope_thd_impl {
             ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(src_o1..src_o2);
                 let cos = $cos_slice.slice(cos_o1..cos_o2);
                 let sin = $sin_slice.slice(sin_o1..sin_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
@@ -834,7 +885,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -899,7 +950,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
     }
 }
 
-pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+pub fn rope_thd<'w>(xs: &LiveTensor<'w>, cos: &Tensor, sin: &Tensor) -> Result<LiveTensor<'w>> {
     let (b_sz, seq_len, _n_head, n_embd) = xs.dims4()?;
     let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
     let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;

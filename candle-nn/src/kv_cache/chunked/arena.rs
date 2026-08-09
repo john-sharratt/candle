@@ -9,6 +9,7 @@
 
 use crate::kv_cache::{arena_table::ArenaLocation, KvFormat, QuantFormat};
 use ahash::AHashMap;
+use candle::cuda_backend::wave_provenance::LeaseOrigin;
 #[cfg(feature = "cuda")]
 use candle::quantized::LiveQTensor;
 use candle::LiveTensor;
@@ -366,7 +367,15 @@ impl Arena {
         // always a legal bit pattern. That the slab outlives the view is no
         // longer an obligation here: `'a` ties it to this borrow of the arena,
         // exactly as for `qslot_view`.
-        unsafe { LiveTensor::from_leased_cuda_ptr(ptr, dtype, shape, self.data.device()) }
+        unsafe {
+            LiveTensor::from_leased_cuda_ptr(
+                ptr,
+                dtype,
+                shape,
+                self.data.device(),
+                LeaseOrigin::Foreign,
+            )
+        }
     }
 
     /// Byte offset of slot `chunk_idx`, bounds-checked against `len`.
@@ -452,11 +461,14 @@ impl Arena {
     /// encodes `src` to bytes on the host and splices them into the slot. Both
     /// keep the arena itself untyped — the caller's dtype comes from the band's
     /// tag, never from the arena.
+    /// `src` may live on an inference wave: the write copies its bytes into the
+    /// slot rather than retaining a view, so nothing in the arena outlives the
+    /// generation `src` came from.
     pub(crate) fn write_slot_typed(
         &mut self,
         chunk_idx: usize,
         elem_offset: usize,
-        src: &Tensor,
+        src: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         let dtype = src.dtype();
         #[cfg(feature = "cuda")]
@@ -532,7 +544,15 @@ impl Arena {
         // always a legal bit pattern for the format. That the slab is still
         // live is no longer an obligation here: `'a` ties the view to this
         // borrow of the arena.
-        unsafe { LiveQTensor::from_leased_cuda_ptr(base + off as u64, ggml, elems, dev) }
+        unsafe {
+            LiveQTensor::from_leased_cuda_ptr(
+                base + off as u64,
+                ggml,
+                elems,
+                dev,
+                LeaseOrigin::Foreign,
+            )
+        }
     }
 
     /// Quantize `src` into slot `chunk_idx`, `elem_offset` elements in.
@@ -547,7 +567,7 @@ impl Arena {
         format: QuantFormat,
         elems: usize,
         elem_offset: usize,
-        src: &Tensor,
+        src: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -657,7 +677,7 @@ fn decode_bytes(
 }
 
 /// The inverse of [`decode_bytes`]: a typed tensor's little-endian image.
-fn encode_bytes(src: &Tensor) -> Result<Vec<u8>> {
+fn encode_bytes(src: &candle::LiveTensor<'_>) -> Result<Vec<u8>> {
     fn flatten<T: Copy, const N: usize>(v: Vec<T>, le: impl Fn(T) -> [u8; N]) -> Vec<u8> {
         v.into_iter().flat_map(le).collect()
     }

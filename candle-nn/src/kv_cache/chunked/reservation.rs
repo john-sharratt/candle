@@ -349,9 +349,22 @@ mod tests {
     use super::Reservation;
     use candle::{Device, Result};
 
-    fn stream() -> Option<std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>> {
+    /// A CUDA stream **and** the crate-wide GPU serialisation guard.
+    ///
+    /// Returned together so the lock cannot be forgotten: these tests reserve
+    /// and map device address space, which is the same process-global resource
+    /// every `ChunkedKvBacking` draws on
+    /// (`crate::kv_cache::chunked::gpu_test_lock`). Running unserialised against
+    /// another GPU test surfaces as a failed mapping or an illegal access, and
+    /// the context stays poisoned for everything scheduled afterwards.
+    #[allow(clippy::type_complexity)]
+    fn stream() -> Option<(
+        std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        std::sync::MutexGuard<'static, ()>,
+    )> {
+        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         match Device::new_cuda(0) {
-            Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
+            Ok(Device::Cuda(d)) => Some((d.cuda_stream(), guard)),
             _ => None,
         }
     }
@@ -362,7 +375,9 @@ mod tests {
     /// cache of a benchmark run.
     #[test]
     fn the_device_supports_vmm() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         super::require_vmm(s.context().cu_device())
     }
 
@@ -371,7 +386,9 @@ mod tests {
     /// rests on: addresses are fixed up front, memory is claimed later.
     #[test]
     fn reserving_more_than_the_card_costs_nothing() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         let r = Reservation::reserve(&s, 64 * 1024 * 1024 * 1024)?;
         assert!(r.base() != 0);
         assert_eq!(r.mapped_bytes(), 0, "reserving must map nothing");
@@ -383,7 +400,9 @@ mod tests {
     /// granules — which is what lets region carving assume alignment.
     #[test]
     fn reservations_are_whole_granules() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         let r = Reservation::reserve(&s, 1)?;
         let g = r.granularity();
         assert!(g > 0 && g.is_power_of_two(), "odd granule size {g}");
@@ -395,7 +414,9 @@ mod tests {
     /// unmapping on drop returns it.
     #[test]
     fn mapped_memory_is_usable_at_the_reserved_address() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         let mut r = Reservation::reserve(&s, 8 * 1024 * 1024)?;
         assert!(
             r.map_range(0, 1024 * 1024)? >= 1024 * 1024,
@@ -436,7 +457,9 @@ mod tests {
     /// Mapping stops at the end of the span rather than running past it.
     #[test]
     fn mapping_stops_at_the_span_end() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         let mut r = Reservation::reserve(&s, 1)?;
         assert!(r.map_granule(0)?, "the single granule should map");
         assert!(!r.map_granule(1)?, "a second granule must not fit");
@@ -449,7 +472,9 @@ mod tests {
     /// region tier relies on for a freshly-claimed arena.
     #[test]
     fn mapping_leaves_the_granule_zeroed() -> Result<()> {
-        let Some(s) = stream() else { return Ok(()) };
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
         let mut r = Reservation::reserve(&s, 1)?;
         assert!(r.map_granule(0)?);
         let mut back = vec![0xFFu8; 4096];

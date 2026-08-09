@@ -48,6 +48,10 @@ ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]
 cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
+forbidden_allocations = [
+    "candle/forbidden_allocations",
+    "candle-nn/forbidden_allocations",
+]
 verbose = ["candle-nn/verbose"]
 cudnn = ["candle/cudnn", "candle-nn/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]

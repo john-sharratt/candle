@@ -28,8 +28,6 @@ pub struct TensorCat {
     cat_dim: usize,
     /// Size of each segment in the concatenation dimension (cached vector)
     segment_sizes: Vec<usize>,
-    /// Segment sizes as a tensor for efficient GPU operations
-    segment_sizes_tensor: Tensor,
 }
 
 /// Implement Deref to allow TensorCat to be used like a Tensor reference
@@ -176,19 +174,12 @@ impl TensorCat {
         // Derive inner shape (same as first tensor's shape)
         let inner_shape = tensors[0].shape().clone();
 
-        // Create segment_sizes_tensor from segment_sizes
-        // Convert usize values to u32 for tensor storage
-        let segment_sizes_u32: Vec<f32> = segment_sizes.iter().map(|&s| s as f32).collect();
-        let segment_sizes_tensor =
-            Tensor::new(segment_sizes_u32.as_slice(), &concatenated.device())?;
-
         Ok(Self {
             tensor: concatenated.contiguous()?,
             batch_size,
             inner_shape,
             cat_dim,
             segment_sizes,
-            segment_sizes_tensor: segment_sizes_tensor.contiguous()?,
         })
     }
 
@@ -214,52 +205,13 @@ impl TensorCat {
         let chunk_size = dims[0] / batch_size;
         let segment_sizes = vec![chunk_size; batch_size];
 
-        // Create segment_sizes_tensor
-        let segment_sizes_u32: Vec<f32> = segment_sizes.iter().map(|&s| s as f32).collect();
-        let segment_sizes_tensor = Tensor::new(segment_sizes_u32.as_slice(), tensor.device())?;
-
         Ok(Self {
             tensor: tensor.contiguous()?,
             batch_size,
             inner_shape,
             cat_dim,
             segment_sizes,
-            segment_sizes_tensor: segment_sizes_tensor.contiguous()?,
         })
-    }
-
-    /// Apply a transformation function to the underlying tensor
-    /// The first parameter is the concatenated tensor,
-    /// the second parameter is the segment sizes tensor.
-    ///
-    /// IMPORTANT: This preserves the original segment_sizes because transformations
-    /// like repeat_kv_internal() maintain the ragged structure - they don't change
-    /// the segment boundaries, only the content within each segment.
-    pub fn transform(&self, f: impl FnOnce(&Tensor, &Tensor) -> Result<Tensor>) -> Result<Self> {
-        let transformed_tensor = f(&self.tensor, &self.segment_sizes_tensor)?;
-
-        // Create new TensorCat with SAME segment_sizes (not recalculated!)
-        // The transformation preserves segment boundaries even if it modifies content
-        Ok(Self {
-            tensor: transformed_tensor.contiguous()?,
-            batch_size: self.batch_size,
-            inner_shape: self.inner_shape.clone(),
-            cat_dim: self.cat_dim,
-            segment_sizes: self.segment_sizes.clone(),
-            segment_sizes_tensor: self.segment_sizes_tensor.clone(),
-        })
-    }
-
-    /// Apply a transformation function to the underlying tensor
-    /// The first parameter is the concatenated tensor,
-    /// the second parameter is the segment sizes tensor.
-    pub fn transform_mut(
-        &mut self,
-        f: impl FnOnce(&Tensor, &Tensor) -> Result<Tensor>,
-    ) -> Result<()> {
-        let transformed_tensor = f(&self.tensor, &self.segment_sizes_tensor)?;
-        self.tensor = transformed_tensor.contiguous()?;
-        Ok(())
     }
 
     /// Get the batch size
@@ -290,11 +242,6 @@ impl TensorCat {
     /// Get a mutable reference to the underlying concatenated tensor
     pub fn as_cat_tensor_mut(&mut self) -> &mut Tensor {
         &mut self.tensor
-    }
-
-    /// Get the segment sizes as a tensor
-    pub fn segment_sizes_tensor(&self) -> &Tensor {
-        &self.segment_sizes_tensor
     }
 
     /// Get the segment sizes as a tensor (alias for deref compatibility)
@@ -1013,8 +960,10 @@ mod tests {
         Ok(())
     }
 
+    /// Ragged segments are tracked exactly, which is what every reader of a
+    /// `TensorCat` slices by.
     #[test]
-    fn test_segment_sizes_tensor_has_correct_values() -> Result<()> {
+    fn test_segment_sizes_have_correct_values() -> Result<()> {
         let device = Device::Cpu;
         let t1 = Tensor::new(&[1.0f32, 2.0], &device)?.reshape((1, 2))?;
         let t2 = Tensor::new(&[3.0f32, 4.0, 5.0], &device)?.reshape((1, 3))?;
@@ -1022,13 +971,7 @@ mod tests {
 
         let batch = TensorCat::from_tensors(1, vec![t1, t2, t3])?;
 
-        // Check segment_sizes Vec
         assert_eq!(batch.segment_sizes(), &vec![2, 3, 1]);
-
-        // Check segment_sizes_tensor
-        let sizes_tensor = batch.segment_sizes_tensor();
-        let sizes_values = sizes_tensor.to_vec1::<f32>()?;
-        assert_eq!(sizes_values, vec![2.0, 3.0, 1.0]);
 
         Ok(())
     }
@@ -1053,9 +996,6 @@ mod tests {
 
         // Test as_tensor
         let _ = batch.as_tensor();
-
-        // Test segment_sizes_tensor
-        let _ = batch.segment_sizes_tensor();
 
         Ok(())
     }

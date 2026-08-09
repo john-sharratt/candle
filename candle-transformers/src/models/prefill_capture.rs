@@ -121,7 +121,7 @@ fn dtype_tag(dt: DType) -> u8 {
 }
 
 #[cfg(feature = "cuda")]
-fn tensor_f32(t: &Tensor) -> Result<Vec<f32>> {
+fn tensor_f32(t: &candle::LiveTensor<'_>) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
@@ -133,9 +133,9 @@ fn tensor_f32(t: &Tensor) -> Result<Vec<f32>> {
 pub fn maybe_capture(
     caches: &[&mut KvCache],
     offsets: &[usize],
-    q_packed: &Tensor,
-    k_packed: &Tensor,
-    v_packed: &Tensor,
+    q_packed: &candle::LiveTensor<'_>,
+    k_packed: &candle::LiveTensor<'_>,
+    v_packed: &candle::LiveTensor<'_>,
     q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
@@ -205,9 +205,9 @@ fn build_and_write(
     path: &str,
     caches: &[&mut KvCache],
     offsets: &[usize],
-    q_packed: &Tensor,
-    k_packed: &Tensor,
-    v_packed: &Tensor,
+    q_packed: &candle::LiveTensor<'_>,
+    k_packed: &candle::LiveTensor<'_>,
+    v_packed: &candle::LiveTensor<'_>,
     q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,

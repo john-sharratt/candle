@@ -1704,8 +1704,10 @@ impl<'w> LiveQTensor<'w> {
         dtype: GgmlDType,
         elem_count: usize,
         device: &crate::CudaDevice,
+        origin: crate::cuda_backend::wave_provenance::LeaseOrigin,
     ) -> Result<Self> {
-        let storage = cuda::QCudaStorage::from_leased_device_ptr(ptr, elem_count, dtype, device)?;
+        let storage =
+            cuda::QCudaStorage::from_leased_device_ptr(ptr, elem_count, dtype, device, origin)?;
         Ok(Self {
             storage: QStorage::Cuda(storage),
             shape: Shape::from(elem_count),
@@ -1885,7 +1887,10 @@ impl<'w> LiveQTensor<'w> {
     /// arena.quantize_into(&float_data, 64)?;
     /// ```
     #[cfg(feature = "cuda")]
-    pub fn quantize_into(&mut self, src: &Tensor, elem_offset: usize) -> Result<()> {
+    /// `src` may live on an inference wave: this reads its bytes and quantizes
+    /// them into the slot, retaining nothing, so the slot does not outlive the
+    /// generation `src` came from.
+    pub fn quantize_into(&mut self, src: &LiveTensor<'_>, elem_offset: usize) -> Result<()> {
         // Validate device match
         if self.device().location() != src.device().location() {
             crate::bail!("quantize_into: device mismatch")
@@ -2309,7 +2314,7 @@ impl QMatMul {
     }
 
     #[allow(unused_variables)]
-    pub fn forward_via_gemx(&self, xs: &LiveTensor<'_>) -> Result<Tensor> {
+    pub fn forward_via_gemx<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
             Self::QTensor(t) => {
                 // For CUDA, we need to call the storage directly with compute_type
@@ -2372,9 +2377,14 @@ impl QMatMul {
     /// fused RMSNorm/SwiGLU/attention epilogue, so no standalone quantize launch), a `Float`
     /// operand is a plain FP tensor. Dispatches to [`cuda::dense_qmatmul`], which forks the int8
     /// KO tensor-core path vs the FP path and enforces the KO⇔int8 pairing against this weight.
-    /// Returns an F32 result of shape `[lead.., N]`; callers cast back to the compute dtype.
+    /// Returns a result of shape `[lead.., N]` stored at `out_dtype`: the int8 kernel converts its
+    /// F32 accumulator on the store, so there is no cast — and no second buffer — afterwards.
     #[cfg(feature = "cuda")]
-    pub fn forward_dynamic(&self, input: cuda::DynamicTensor<'_>) -> Result<Tensor> {
+    pub fn forward_dynamic<'w>(
+        &self,
+        input: cuda::DynamicTensor<'_, 'w>,
+        out_dtype: crate::DType,
+    ) -> Result<LiveTensor<'w>> {
         let t = match self {
             Self::QTensor(t) => t,
             _ => crate::bail!("forward_dynamic requires a QTensor weight"),
@@ -2389,7 +2399,7 @@ impl QMatMul {
         let wptr = cs.data_ptr();
         let wlen = cs.storage_size_in_bytes();
         let wdtype = t.dtype();
-        cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, &device)
+        cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, out_dtype, &device)
     }
 
     /// Fused q/k/v projection in ONE launch: the shared q8a128 activation `op` × the separate KO
@@ -2398,11 +2408,11 @@ impl QMatMul {
     /// [`forward_dynamic`] calls but with full GPU occupancy. Each weight must be a KO QTensor on
     /// CUDA (the int8 twin). See [`cuda::qkv_segmented_matmul`].
     #[cfg(feature = "cuda")]
-    pub fn qkv_segmented(
-        op: &cuda::Q8a128Operand,
+    pub fn qkv_segmented<'w>(
+        op: &cuda::Q8a128Operand<'w>,
         weights: &[&QMatMul],
         out_dtype: crate::DType,
-    ) -> Result<Tensor> {
+    ) -> Result<LiveTensor<'w>> {
         let mut segs = Vec::with_capacity(weights.len());
         let mut device = None;
         for w in weights {
@@ -2418,8 +2428,7 @@ impl QMatMul {
             segs.push((cs.data_ptr(), t.dtype(), t.shape().dims()[0]));
         }
         let device = device.ok_or_else(|| crate::Error::Msg("qkv_segmented: no weights".into()))?;
-        let out = cuda::qkv_segmented_matmul(op, &segs, &device)?;
-        out.to_dtype(out_dtype)
+        cuda::qkv_segmented_matmul(op, &segs, out_dtype, &device)
     }
 
     /// Int8 tensor-core matmul: q8a128 activations × KO weights. The weight must already be the
@@ -2428,8 +2437,14 @@ impl QMatMul {
     /// activation form (q8a128 for any non-`Off` mode). Quantizes the activation here (the
     /// **unfused** path, one standalone launch) then runs [`QMatMul::forward_dynamic`]; the fused
     /// producers bypass this by emitting q8a128 themselves and calling `forward_dynamic` directly.
+    /// The result comes back in `xs`'s dtype — quantizing the activation is not meant to change the
+    /// width the caller sees.
     #[cfg(feature = "cuda")]
-    pub fn forward_via_int8(&self, xs: &LiveTensor<'_>, mode: Int8Mode) -> Result<Tensor> {
+    pub fn forward_via_int8<'w>(
+        &self,
+        xs: &LiveTensor<'w>,
+        mode: Int8Mode,
+    ) -> Result<LiveTensor<'w>> {
         let device = match self {
             Self::QTensor(t) => match &t.storage {
                 QStorage::Cuda(cs) => cs.device().clone(),
@@ -2437,8 +2452,9 @@ impl QMatMul {
             },
             _ => crate::bail!("forward_via_int8 requires a KO QTensor weight"),
         };
+        let out_dtype = xs.dtype();
         let acts = cuda::to_dynamic(xs, mode, &device)?;
-        self.forward_dynamic(acts.as_dynamic())
+        self.forward_dynamic(acts.as_dynamic(), out_dtype)
     }
 }
 
@@ -2510,10 +2526,12 @@ impl QMatMul {
     ///
     /// [`crate::Module`] takes `&Tensor`, so it cannot accept a wave-scoped
     /// activation — and that restriction is deliberate everywhere else, because
-    /// a module may retain what it is given. This one provably does not: it
-    /// reads `xs` and allocates its own output. The `Module` impl below is this
-    /// method at `'static`.
-    pub fn forward_live(&self, xs: &LiveTensor<'_>) -> Result<Tensor> {
+    /// a module may retain what it is given. This one does not retain, but it
+    /// does *inherit*: the output is allocated from whichever arena `xs` came
+    /// from, so the result is bounded by `xs`'s generation rather than being
+    /// owned. The `Module` impl below is this method at `'static`, where the
+    /// distinction collapses and the result really is owned.
+    pub fn forward_live<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {

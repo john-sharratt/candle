@@ -41,6 +41,8 @@ use std::sync::RwLock;
 use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{begin_wave, LayerPhase, ModelGeometry, WavePlan, WAVE_FFN_BYTES};
 use candle_nn::Module;
 
 use super::batched_layer::{
@@ -54,8 +56,20 @@ use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 use candle_nn::Embedding;
+
+/// The forward-scoped generation a wave's head outputs were carved from.
+///
+/// Returned alongside the phase so the caller can keep the span open for as long
+/// as it holds the values sitting in it. There is no wave domain without CUDA,
+/// so off-CUDA this is a unit and every guard is `None`.
+#[cfg(feature = "cuda")]
+pub type WaveGuard = candle_nn::kv_cache::WaveGeneration;
+#[cfg(not(feature = "cuda"))]
+pub type WaveGuard = ();
 
 /// Outcome of a re-entrant [`BatchedInference::forward_batch_layers`] call.
 ///
@@ -87,6 +101,42 @@ pub(crate) fn driver_used_bytes(device: &Device) -> usize {
     }
 }
 
+/// The load-time shapes a wave's transient buffers are sized from.
+///
+/// Deliberately **width-free**: a wave's row count is an argument to the sizing
+/// functions, not a field here. Width is what admission is deciding, so baking
+/// an assumed width in would make the plan answer a question it is supposed to
+/// be asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveShapes {
+    /// Model hidden size.
+    pub hidden: usize,
+    /// FFN intermediate size. On a MoE model this is the *per-expert*
+    /// intermediate, not the dense equivalent.
+    pub intermediate: usize,
+    /// Experts each token routes to. `1` for a dense model, which collapses the
+    /// MoE terms to the dense FFN shapes rather than needing a second branch.
+    pub experts_per_tok: usize,
+}
+
+/// The dtype activations are carried in, for a KV cache stored as `cache_dtype`.
+///
+/// Activations follow the cache so the two never need a conversion between them
+/// — except for F8E4M3, which is a storage format with no compute kernels, so a
+/// cache in it computes in BF16.
+///
+/// One definition, because two would drift: the forward derives the activation
+/// dtype from the session's cache on every wave, and whoever configures the
+/// session has to materialise the norm weights in the *same* dtype or the
+/// forward refuses.
+pub fn activation_dtype(cache_dtype: DType) -> DType {
+    if cache_dtype == DType::F8E4M3 {
+        DType::BF16
+    } else {
+        cache_dtype
+    }
+}
+
 // ============================================================================
 // Core Model Trait (Simple Accessors Only)
 // ============================================================================
@@ -98,6 +148,54 @@ pub(crate) fn driver_used_bytes(device: &Device) -> usize {
 pub trait BatchedModelCore {
     /// Type of the layer that implements [`BatchedAttentionLayer`].
     type Layer: BatchedAttentionLayer;
+
+    /// Shapes the transient tier is sized from, captured at load.
+    ///
+    /// Read from the checkpoint's own config rather than derived from weight
+    /// dimensions: `hidden` is not `n_head * head_dim` on every model (Qwen3
+    /// carries 2048 against 32x128), so deriving it would be right for some
+    /// architectures and quietly wrong for others.
+    fn wave_shapes(&self) -> WaveShapes;
+
+    /// The geometry [`candle_nn::kv_cache::WavePlan`] prices a wave from.
+    ///
+    /// Pairs the load-time shapes with the session's activation dtype, which is
+    /// an inference-mode choice rather than a property of the weights. Head
+    /// geometry comes from layer 0 — every layer of a model shares it, and the
+    /// plan needs one layer's working set, not the whole stack's.
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
+        let shapes = self.wave_shapes();
+        ModelGeometry {
+            hidden: shapes.hidden,
+            intermediate: shapes.intermediate,
+            n_head: self.layer(0).n_head(),
+            n_kv_head: self.n_kv_head(),
+            head_dim: self.head_dim(),
+            experts_per_tok: shapes.experts_per_tok,
+            act_dtype,
+            // The int8 tensor-core kernels accumulate in BF16 before the cast back
+            // to `act_dtype`; both buffers are live at once, so the plan charges
+            // for both rather than for the wider of the two.
+            accum_dtype: DType::BF16,
+        }
+    }
+
+    /// Re-materialise every norm weight in the dtype activations will arrive in,
+    /// if it is not already.
+    ///
+    /// Called where a session is created — never inside a wave. A quantized
+    /// checkpoint dequantizes its norm weights to F32 while inference runs F16 or
+    /// BF16, so the norm kernels need them in the activation dtype. Converting on
+    /// demand inside the forward costs one device allocation and one launch per
+    /// norm, per layer, per token, and is invisible in a profile: it surfaces
+    /// only as a slightly slower forward. So the forward path *refuses* a dtype
+    /// it was not prepared for (`RmsNorm::weight_for`) and this is the only place
+    /// the conversion happens.
+    ///
+    /// The weight is reloaded from the retained quantized source rather than cast
+    /// from a resident copy, so switching dtypes costs a reload and never leaves
+    /// a second copy behind.
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()>;
 
     /// Number of transformer layers.
     fn num_layers(&self) -> usize;
@@ -358,7 +456,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         layer_start: usize,
         layer_end: usize,
         x_in: Option<TensorCat>,
-    ) -> Result<WavePhase> {
+    ) -> Result<(WavePhase, Option<WaveGuard>)> {
         if contexts.is_empty() {
             candle::bail!("forward_wave: empty batch");
         }
@@ -386,11 +484,31 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             .first()
             .map(|c| c.kv_caches.dtype())
             .unwrap_or(DType::F32);
-        let embed_dtype = if cache_dtype == DType::F8E4M3 {
-            DType::BF16
-        } else {
-            cache_dtype
-        };
+        let embed_dtype = activation_dtype(cache_dtype);
+
+        // Price this wave against the transient budget before assembling it.
+        //
+        // Reported, not enforced: `WavePlan` can size every per-layer buffer from
+        // the model geometry and the row count, but the spans are still fixed
+        // constants rather than derived from it, so a refusal here would reject
+        // waves the arenas can in fact hold. Admission is where the two meet.
+        #[cfg(feature = "cuda")]
+        {
+            let rows = n_decode + pre_rows + glue_rows;
+            if rows > 0 {
+                let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
+                if !plan.fits(rows, WAVE_FFN_BYTES) {
+                    // `describe` names the shape that overflowed rather than just
+                    // the number, which is the difference between a report you can
+                    // act on and one you can only notice.
+                    tracing::debug!(
+                        "wave of {rows} rows prices at {} B against a {WAVE_FFN_BYTES} B FFN span\n{}",
+                        plan.wave_bytes(rows),
+                        plan.describe(rows),
+                    );
+                }
+            }
+        }
 
         // Combined residual: embed every row flat `[1, total, hidden]`, or resume
         // a paused wave from its persisted stream.
@@ -411,7 +529,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     Some(he) => {
                         let flat = xt.flatten_all()?;
                         let n = flat.elem_count();
-                        let rows = he.embed(&flat, self.model.device())?;
+                        // A scope of its own for the gather's staging bytes. The
+                        // embedding runs before layer 0, so no phase span is open
+                        // and the attention arena is idle — its bytes are already
+                        // reserved, so the staging is free. The guard drops here,
+                        // before the layer loop opens the same span for real work.
+                        let staging = match self.model.device() {
+                            Device::Cuda(d) => {
+                                Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?)
+                            }
+                            _ => None,
+                        };
+                        let rows =
+                            he.embed(&flat, self.model.device(), wave_root(staging.as_ref()))?;
                         rows.reshape((1, n, he.layout().ncols))?
                     }
                     #[cfg(not(feature = "cuda"))]
@@ -550,7 +680,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         }
 
         if layer_end < num_layers {
-            return Ok(WavePhase::Residual(x));
+            return Ok((WavePhase::Residual(x), None));
         }
 
         // Head over the rows that need logits: every decode row (one token each,
@@ -573,20 +703,37 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // scatter already happened in the layer loop. Return the residual buffer;
         // the glue caller discards the `WaveStep` (it only needs the side effect).
         if idx.is_empty() {
-            return Ok(WavePhase::Residual(x));
+            return Ok((WavePhase::Residual(x), None));
         }
         let pre_norm = {
             let sel = Tensor::from_vec(idx, n_decode + n_prefill, x_flat.device())?;
             x_flat.index_select(&sel, 0)?.contiguous()?
         };
+        // The head's span. It runs after the last layer, so both phase spans are
+        // idle, and this one is reset per *forward* — the lifetime the norm and
+        // the logits actually have.
+        //
+        // Seeded from `wave_root`, which yields a `Backing` carrying a ticket
+        // rather than a borrow of the guard. That distinction is the whole
+        // mechanism: a borrow would bind `'w` to this scope and the logits could
+        // not be returned at all, while a ticket leaves them `'static`-typed and
+        // physically on the span. What makes that sound is handing the guard back
+        // with them, so the span cannot be reclaimed while the caller holds the
+        // values — see `WaveResult`.
+        #[cfg(feature = "cuda")]
+        let head_span = match self.model.device() {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+            _ => None,
+        };
         let logits = {
             #[cfg(feature = "cuda")]
             {
                 let proj = self.model.output_proj();
-                let acts = self
-                    .model
-                    .final_norm()
-                    .forward_dynamic(&pre_norm, proj.int8mode())?;
+                let acts = self.model.final_norm().forward_dynamic(
+                    &pre_norm,
+                    proj.int8mode(),
+                    wave_root(head_span.as_ref()),
+                )?;
                 proj.forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
             }
             #[cfg(not(feature = "cuda"))]
@@ -595,7 +742,12 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 self.model.output_proj().forward(&normed)?
             }
         };
-        Ok(WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?))
+        #[cfg(not(feature = "cuda"))]
+        let head_span: Option<WaveGuard> = None;
+        Ok((
+            WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),
+            head_span,
+        ))
     }
 
     /// Compute RoPE (cos, sin) for a batch of sequences.

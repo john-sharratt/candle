@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use candle::cuda_backend::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
 use super::arena::ArenaKey;
@@ -272,7 +273,13 @@ impl BackingInner {
         // memory that only this arena holds, and `arena_bytes` never exceeds a
         // region (asserted by the size-class ladder).
         let data = unsafe {
-            Tensor::from_leased_cuda_ptr(region.base(), DType::U8, arena_bytes, &self.device)?
+            Tensor::from_leased_cuda_ptr(
+                region.base(),
+                DType::U8,
+                arena_bytes,
+                &self.device,
+                LeaseOrigin::Foreign,
+            )?
         };
         Ok(Arena::new(data, key.class, key.location, index).in_region(region))
     }

@@ -10,10 +10,12 @@
 #[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
-use super::batched_model::BatchedModelCore;
+use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
+use crate::models::batched_layer::WaveRef;
+use crate::models::wave_buffers::wave_root;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::DynamicActs;
@@ -184,14 +186,18 @@ impl MlpWeights {
                 .ok_or_else(|| candle::Error::Msg("missing up_proj".into()))?;
             (gate_proj.forward(x)?, up_proj.forward(x)?)
         };
-        let gated = (&gate.apply(&self.act_fn)? * &up)?;
+        let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
         self.down_proj.forward(&gated)
     }
 
     /// B3 consumer: gate/up over a producer-prepared (fused ln2) activation, shared across both
     /// projections (no redundant ln2->q8a128). CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
@@ -224,8 +230,8 @@ impl MlpWeights {
         // no-ops except on the separate-weight Float path.
         gate.to_dtype_mut(out_dtype)?;
         up.to_dtype_mut(out_dtype)?;
-        let gated = (&gate.apply(&self.act_fn)? * &up)?;
-        let mut out = self.down_proj.forward(&gated)?;
+        let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
+        let mut out = self.down_proj.forward_live(&gated)?;
         out.to_dtype_mut(out_dtype)?;
         Ok(out)
     }
@@ -353,11 +359,11 @@ impl AttentionWeights {
 
     /// B1 consumer: q/k/v over a producer-prepared (fused ln1) activation.
     #[cfg(feature = "cuda")]
-    fn project_qkv(
+    fn project_qkv<'w>(
         &self,
-        acts: &DynamicActs,
+        acts: &DynamicActs<'w>,
         out_dtype: DType,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>)> {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         let q = &self.q_proj;
@@ -518,13 +524,22 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse ln1 -> q8a128 (int8) or FP rms_norm (Off) in one kernel.
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.ln1.forward_dynamic(x, mode)
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.ln1.forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
                 let (b, s, _) = t.dims3()?;
@@ -544,7 +559,7 @@ impl BatchedAttentionLayer for LayerWeights {
         let q = q
             .reshape((b_sz, seq_len, n_head, head_dim))?
             .transpose(1, 2)?;
-        let q_flat = self.self_attn.q_norm.forward(&q.flatten(0, 2)?)?;
+        let q_flat = self.self_attn.q_norm.forward_live(&q.flatten(0, 2)?)?;
         let q = q_flat
             .reshape((b_sz, n_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -552,7 +567,7 @@ impl BatchedAttentionLayer for LayerWeights {
         let k = k
             .reshape((b_sz, seq_len, n_kv_head, head_dim))?
             .transpose(1, 2)?;
-        let k_flat = self.self_attn.k_norm.forward(&k.flatten(0, 2)?)?;
+        let k_flat = self.self_attn.k_norm.forward_live(&k.flatten(0, 2)?)?;
         let k = k_flat
             .reshape((b_sz, n_kv_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -562,15 +577,20 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 producer: fuse ln2 -> q8a128 (int8) or FP rms_norm (Off).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.ln2.forward_dynamic(x, mode)
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.ln2.forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B3 consumer: dense MLP over the fused ln2 activation.
     #[cfg(feature = "cuda")]
     fn ffn_forward<'w>(
         &self,
-        acts: DynamicActs<'static>,
+        acts: DynamicActs<'w>,
         mlp_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
@@ -645,6 +665,29 @@ pub struct ModelWeights {
 #[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        for layer in &self.layers {
+            layer.ln1.maybe_change_dtype(dtype)?;
+            layer.ln2.maybe_change_dtype(dtype)?;
+            layer.self_attn.q_norm.maybe_change_dtype(dtype)?;
+            layer.self_attn.k_norm.maybe_change_dtype(dtype)?;
+        }
+        self.norm.maybe_change_dtype(dtype)
+    }
+
+    /// Recovered from the down-projection's own weight, whose shape is
+    /// `[hidden, intermediate]`. Reading the loaded weight rather than carrying
+    /// a copy of the config means the transient plan cannot drift from the
+    /// shapes the kernels actually see.
+    fn wave_shapes(&self) -> WaveShapes {
+        let dims = self.layers[0].mlp.down_proj.weight_dims();
+        WaveShapes {
+            hidden: dims[0],
+            intermediate: dims[1],
+            experts_per_tok: 1,
+        }
+    }
 
     fn num_layers(&self) -> usize {
         self.layers.len()

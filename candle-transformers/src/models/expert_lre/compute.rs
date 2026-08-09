@@ -15,6 +15,8 @@ use super::types::ExpertSlot;
 use super::types::MoeInput;
 #[cfg(feature = "cuda")]
 use crate::models::profile::{profile_now, ProfileAccumulator};
+use candle::cuda_backend::wave_provenance::{LeaseOrigin, WaveTicket};
+use candle::cuda_backend::Backing;
 use candle::{Result, Tensor};
 #[cfg(not(feature = "cuda"))]
 use candle_nn::Module;
@@ -105,12 +107,17 @@ pub(crate) fn extract_weight_info(
 /// Each expert has 1–N tokens from potentially different sessions.
 /// The `token_ids` index into `xs` and `ys`; `weight_ids` index into `weights_flat`.
 #[cfg(feature = "cuda")]
+/// `wave` seeds this phase's inheritance chain. The gather is the first
+/// allocation made inside the FFN generation, so it takes the ticket directly;
+/// the gate/up/SwiGLU/down GEMMs after it inherit from their operands and need
+/// no further mention of the wave.
 pub fn compute_experts_grouped(
     input: &MoeInput,
     ys: &mut Tensor,
     experts: &[(&ExpertSlot, &[u32], &[u32])],
     weights_flat: &Tensor,
     profile: &mut ProfileAccumulator,
+    wave: Option<WaveTicket>,
 ) -> Result<()> {
     if experts.is_empty() {
         return Ok(());
@@ -149,7 +156,11 @@ pub fn compute_experts_grouped(
     }
 
     // ── Upload token_ids once (shared by gather + scatter) ──
-    let tok_ids_dev = cuda_dev.memcpy_stod(&all_token_ids)?;
+    // Host-built tables have no device operand to inherit from, so they name
+    // the submitting layer's span directly — the same span the gather and
+    // scatter operands they index into were carved from.
+    let upload_root = Backing::from_ticket(wave);
+    let tok_ids_dev = cuda_dev.memcpy_stod_from(&all_token_ids, upload_root)?;
 
     // ── Extract weight pointers for each projection ──
     let mut gate_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
@@ -193,7 +204,13 @@ pub fn compute_experts_grouped(
                 fused_moe_gather_q8a128, grouped_qmatmul, silu_mul_q8a128, DynamicTensor,
             };
             let t = profile_now();
-            let stacked_q8 = fused_moe_gather_q8a128(op, &tok_ids_dev, total_batch, cuda_dev)?;
+            let stacked_q8 = fused_moe_gather_q8a128(
+                op,
+                &tok_ids_dev,
+                total_batch,
+                cuda_dev,
+                wave.map_or(Backing::Owned, |t| Backing::Lease(LeaseOrigin::Wave(t))),
+            )?;
             profile.record("gemm_gather", t);
             let t = profile_now();
             let gate_out = grouped_qmatmul(
@@ -203,6 +220,7 @@ pub fn compute_experts_grouped(
                 gate_nrows,
                 &expert_offsets,
                 cuda_dev,
+                stacked_q8.backing(),
             )?;
             profile.record("gemm_gate", t);
             let t = profile_now();
@@ -213,11 +231,13 @@ pub fn compute_experts_grouped(
                 gate_nrows,
                 &expert_offsets,
                 cuda_dev,
+                stacked_q8.backing(),
             )?;
             profile.record("gemm_up", t);
             // B4: fused SwiGLU → q8a128 (silu(gate)·up quantized in one kernel), feeds the down GEMM.
             let t = profile_now();
-            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, cuda_dev)?;
+            let inter_acts =
+                silu_mul_q8a128(&gate_out, &up_out, cuda_dev, gate_out.cuda_backing())?;
             profile.record("gemm_silu_mul", t);
             let t = profile_now();
             let down_out = grouped_qmatmul(
@@ -227,6 +247,7 @@ pub fn compute_experts_grouped(
                 down_nrows,
                 &expert_offsets,
                 cuda_dev,
+                inter_acts.backing(),
             )?;
             profile.record("gemm_down", t);
             // The int8 matmul emits F32; the fused scatter requires the compute dtype (= ys).
@@ -329,14 +350,14 @@ pub fn compute_experts_grouped(
     for i in 1..=num_tokens {
         token_starts[i] += token_starts[i - 1];
     }
-    let token_starts_dev = cuda_dev.memcpy_stod(&token_starts)?;
+    let token_starts_dev = cuda_dev.memcpy_stod_from(&token_starts, upload_root)?;
 
     // Reorder weight_ids to token-major using the same permutation.
     let reordered_weight_ids: Vec<u32> = perm.iter().map(|&i| all_weight_ids[i as usize]).collect();
-    let reordered_wt_ids_dev = cuda_dev.memcpy_stod(&reordered_weight_ids)?;
+    let reordered_wt_ids_dev = cuda_dev.memcpy_stod_from(&reordered_weight_ids, upload_root)?;
 
     // Upload perm so the kernel can gather from down_out directly — no index_select needed.
-    let perm_dev = cuda_dev.memcpy_stod(&perm)?;
+    let perm_dev = cuda_dev.memcpy_stod_from(&perm, upload_root)?;
 
     let t = profile_now();
     candle::quantized::cuda::fused_deterministic_scatter(

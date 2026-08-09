@@ -14,6 +14,7 @@
 use super::arena::ArenaStorageState;
 #[cfg(feature = "cuda")]
 use super::bump_arena;
+use super::bump_arena::NOT_A_WAVE;
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 use super::meta_pool::ChunkRecordSrc;
@@ -1346,7 +1347,9 @@ impl ChunkedKvBacking {
             // Allocated through the guard, so `staging` borrows it: the group's
             // range cannot outlive the generation whose drop fences the copy
             // stream and rewinds the cursor under it.
-            let group_gen = bump.generation();
+            // No planned layout on the persistence path: its staging is sized per batch
+            // rather than by the wave plan, so the whole span stays cursor-managed.
+            let group_gen = bump.generation(NOT_A_WAVE, NOT_A_WAVE)?;
             let staging = group_gen.alloc(group_bytes, 256)?;
             let staging_base = staging.ptr as i64;
             let mut plan = MigrationPlan::new();
@@ -1616,7 +1619,8 @@ impl ChunkedKvBacking {
             // `alloc` bails before it advances the cursor — and a
             // domain-creation failure is not memory pressure on this batch, so
             // shrinking would not have helped it anyway.
-            let staging_gen = bump_arena::persistence_domain(copy_stream)?.generation();
+            let staging_gen =
+                bump_arena::persistence_domain(copy_stream)?.generation(NOT_A_WAVE, NOT_A_WAVE)?;
             let staging = loop {
                 let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
                 // Host scratch (fallible — see the per-layer variant's note).
@@ -2055,7 +2059,7 @@ impl ChunkedKvBacking {
             // Allocated through the guard, so `staging` borrows it: the group's
             // range cannot outlive the generation whose drop fences the copy
             // stream and rewinds the cursor under it.
-            let group_gen = bump.generation();
+            let group_gen = bump.generation(NOT_A_WAVE, NOT_A_WAVE)?;
             let staging = group_gen.alloc(group_bytes, 256)?;
             let staging_base = staging.ptr as i64;
             let src_bytes = &scratch.as_slice()[group_start..group_start + group_bytes];
@@ -2504,10 +2508,23 @@ mod tests {
     // GPU, migrated to RAM, then back to VRAM, and the round-tripped
     // bytes must equal the original.
 
+    /// A CUDA device **and** the crate-wide GPU serialisation guard, or `None`
+    /// when there is no device.
+    ///
+    /// The guard is returned alongside the device rather than taken separately
+    /// so it cannot be forgotten. These tests build `ChunkedKvBacking`s, and a
+    /// backing is not an independent value: it draws on one process-global
+    /// region pool carved from a single reservation
+    /// (`crate::kv_cache::chunked::gpu_test_lock`). A test holding a device
+    /// without the lock races every other GPU test in the crate, and the way
+    /// that surfaces is `CUDA_ERROR_ILLEGAL_ADDRESS` from whichever one loses —
+    /// which then poisons the context for every test scheduled after it, so the
+    /// reported failure is rarely the guilty one.
     #[cfg(feature = "cuda")]
-    fn cuda_device_or_skip() -> Option<Device> {
+    fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
+        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         match Device::cuda_if_available(0) {
-            Ok(d @ Device::Cuda(_)) => Some(d),
+            Ok(d @ Device::Cuda(_)) => Some((d, guard)),
             _ => None,
         }
     }
@@ -2603,7 +2620,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -2648,7 +2665,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 2;
@@ -2700,7 +2717,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -2751,7 +2768,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -2813,7 +2830,7 @@ mod tests {
         use half::f16;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -2887,7 +2904,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 2;
@@ -2971,7 +2988,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let backing = cuda_backing(&device, 2, 16);

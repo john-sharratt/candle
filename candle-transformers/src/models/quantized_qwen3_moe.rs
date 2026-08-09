@@ -14,7 +14,7 @@
 #[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
-use super::batched_model::BatchedModelCore;
+use super::batched_model::{BatchedModelCore, WaveShapes};
 #[cfg(feature = "cuda")]
 use super::expert_lre::GpuDispatchTables;
 use super::expert_lre::{
@@ -24,9 +24,12 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
+use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
+use crate::models::wave_buffers::wave_root;
 use crate::models::wave_buffers::wave_zeros;
 use crate::quantized_nn::RmsNorm;
+use candle::cuda_backend::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
@@ -147,11 +150,11 @@ struct AttentionWeights {
 impl AttentionWeights {
     /// q/k/v projection over a producer-prepared [`DynamicActs`] (the fused `ln1` output).
     #[cfg(feature = "cuda")]
-    fn project_qkv(
+    fn project_qkv<'w>(
         &self,
-        acts: &DynamicActs,
+        acts: &DynamicActs<'w>,
         out_dtype: DType,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>)> {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         let q_proj = self
@@ -255,7 +258,7 @@ impl SparseMoeBlock {
     #[cfg(feature = "cuda")]
     fn forward_dynamic<'w>(
         &self,
-        acts: DynamicActs<'static>,
+        acts: DynamicActs<'w>,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
@@ -301,7 +304,7 @@ impl SparseMoeBlock {
             })
         }
         #[cfg(feature = "cuda")]
-        if let DynamicActs::Int8(op) = &acts {
+        if matches!(&acts, DynamicActs::Int8(_)) {
             // Every condition here degrades to the host path, never to an
             // error. The cache-owned safety chain (table coverage, router
             // width == table width, live pipeline thread) is
@@ -316,6 +319,12 @@ impl SparseMoeBlock {
                     k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced()
                 })
             {
+                // Moved, not borrowed: the gather is the activation's last
+                // reader, and a borrow here would be a borrow of a local that
+                // the `'w`-bounded result outlives.
+                let DynamicActs::Int8(op) = acts else {
+                    unreachable!("guarded by the `matches!` above")
+                };
                 return self.forward_gpu_native(
                     wave,
                     op,
@@ -334,14 +343,27 @@ impl SparseMoeBlock {
         }
 
         let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
-        let input = match acts {
-            DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
-            DynamicActs::Int8(op) => MoeInput::Q8(op),
+        // The expert-pipeline thread takes its work over a channel, so
+        // `MoeWorkRequest` cannot carry a lifetime and the operand must be
+        // `'static`. That is a statement about ownership, not about how long the
+        // bytes live: `submit_moe_work` sends and immediately blocks on the
+        // response, so `acts` — and the FFN span it sits in — is live for the
+        // whole of the worker's use. So these lease rather than copy; owning the
+        // bytes would mean a device copy of the entire ln2 activation per layer.
+        let Device::Cuda(lease_dev) = router_logits.device().clone() else {
+            candle::bail!("SparseMoeBlock::forward_dynamic: expected a CUDA device")
+        };
+        let input = match &acts {
+            DynamicActs::Float(t2) => MoeInput::Float(unsafe {
+                t2.as_foreign_lease()?.reshape((num_tokens, hidden_dim))?
+            }),
+            DynamicActs::Int8(op) => MoeInput::Q8(unsafe { op.as_foreign_lease(&lease_dev)? }),
         };
         self.forward_with_indices(
             input,
             out_dtype,
-            weights_flat,
+            // Same channel boundary, same reasoning, same lease.
+            unsafe { weights_flat.as_foreign_lease()? },
             idx_cpu,
             b_size,
             seq_len,
@@ -349,6 +371,7 @@ impl SparseMoeBlock {
             k,
             num_experts,
             t,
+            wave.map(|g| g.ticket()),
         )
     }
 
@@ -373,11 +396,15 @@ impl SparseMoeBlock {
     /// crosses back to the host.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
+    /// `'a` and `'w` are separate on purpose: `op` is consumed here, while the
+    /// returned combine target comes from `wave`. Unifying them would make the
+    /// result appear to borrow the activation and force the caller's operand to
+    /// outlive its own frame.
     fn forward_gpu_native<'w>(
         &self,
         wave: Option<&'w WaveGeneration>,
-        op: &Q8a128Operand<'_>,
-        router_logits: &Tensor,
+        op: Q8a128Operand<'w>,
+        router_logits: &LiveTensor<'_>,
         num_tokens: usize,
         b_size: usize,
         seq_len: usize,
@@ -416,7 +443,7 @@ impl SparseMoeBlock {
             .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
 
         // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
-        let stacked = fused_moe_gather_q8a128(op, &ws.tok_ids, a_ub, &cuda_dev)?;
+        let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &cuda_dev, wave_root(wave))?;
         let gate_out = grouped_qmatmul_dev_q8a128(
             &stacked,
             &gd.gate_ptrs,
@@ -443,7 +470,7 @@ impl SparseMoeBlock {
             launch_tiles,
             &cuda_dev,
         )?;
-        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev)?;
+        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
         let down_out = grouped_qmatmul_dev_q8a128(
             &inter_acts,
             &gd.down_ptrs,
@@ -484,13 +511,13 @@ impl SparseMoeBlock {
 
     /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
     /// Used by both the FP and q8a128 arms of `forward_dynamic` — operates only on the logits.
-    fn route_indices(
+    fn route_indices<'a>(
         &self,
-        router_logits: &Tensor,
+        router_logits: &LiveTensor<'a>,
         num_tokens: usize,
         k: usize,
         t: ProfileMark,
-    ) -> Result<(Tensor, Vec<Vec<u32>>)> {
+    ) -> Result<(LiveTensor<'a>, Vec<Vec<u32>>)> {
         // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
         #[cfg(not(feature = "cuda"))]
         let _ = num_tokens;
@@ -658,6 +685,7 @@ impl SparseMoeBlock {
         k: usize,
         num_experts: usize,
         _routing_start: ProfileMark,
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert via a counting sort ──
         // Each entry: (expert_id, token_idx, flat_weight_idx). Same-expert tokens
@@ -753,6 +781,7 @@ impl SparseMoeBlock {
             out_dtype,
             &weights_flat,
             assignments,
+            wave,
         )?;
 
         let result = ys.reshape((b_size, seq_len, hidden_dim))?;
@@ -804,13 +833,22 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse ln1 → q8a128 (int8) or FP rms_norm (Off) in one kernel.
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.ln1.forward_dynamic(x, mode)
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.ln1.forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
                 let (b, s, _) = t.dims3()?;
@@ -833,7 +871,7 @@ impl BatchedAttentionLayer for LayerWeights {
             .reshape((b_sz, seq_len, n_head, head_dim))?
             .transpose(1, 2)?;
         let q_flat = q.flatten(0, 2)?;
-        let q_flat = self.self_attn.q_norm.forward(&q_flat)?;
+        let q_flat = self.self_attn.q_norm.forward_live(&q_flat)?;
         let q = q_flat
             .reshape((b_sz, n_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -843,7 +881,7 @@ impl BatchedAttentionLayer for LayerWeights {
             .reshape((b_sz, seq_len, n_kv_head, head_dim))?
             .transpose(1, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        let k_flat = self.self_attn.k_norm.forward(&k_flat)?;
+        let k_flat = self.self_attn.k_norm.forward_live(&k_flat)?;
         let k = k_flat
             .reshape((b_sz, n_kv_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -855,9 +893,14 @@ impl BatchedAttentionLayer for LayerWeights {
     /// B3: ln2 as a producer epilogue. Only the MoE path emits q8a128 (its router + expert gather
     /// consume it); a dense MLP layer stays FP (it has no int8 grouped path).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
         match &self.ffn {
-            FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode),
+            FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode, wave_root(wave)),
             FeedForward::Mlp(_) => Ok(DynamicActs::Float(self.ln2.forward(x)?)),
         }
     }
@@ -867,7 +910,7 @@ impl BatchedAttentionLayer for LayerWeights {
     #[cfg(feature = "cuda")]
     fn ffn_forward<'w>(
         &self,
-        acts: DynamicActs<'static>,
+        acts: DynamicActs<'w>,
         mlp_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
@@ -881,7 +924,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 m.forward_dynamic(acts, mlp_dtype, wave)
             }
             FeedForward::Mlp(m) => match acts {
-                DynamicActs::Float(t) => m.forward(&t.to_dtype(mlp_dtype)?),
+                DynamicActs::Float(t) => m.forward(&t.to_owned_tensor()?.to_dtype(mlp_dtype)?),
                 DynamicActs::Int8(_) => candle::bail!(
                     "dense MLP: int8 activation unsupported (ffn_norm emits Float for Mlp)"
                 ),
@@ -925,11 +968,27 @@ pub struct ModelWeights {
     /// non-CUDA.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     base_weight_bytes: usize,
+    /// Shapes the transient tier is priced from, read from the checkpoint config.
+    wave_shapes: WaveShapes,
 }
 
 #[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        for layer in &self.layers {
+            layer.ln1.maybe_change_dtype(dtype)?;
+            layer.ln2.maybe_change_dtype(dtype)?;
+            layer.self_attn.q_norm.maybe_change_dtype(dtype)?;
+            layer.self_attn.k_norm.maybe_change_dtype(dtype)?;
+        }
+        self.norm.maybe_change_dtype(dtype)
+    }
+
+    fn wave_shapes(&self) -> WaveShapes {
+        self.wave_shapes
+    }
 
     fn num_layers(&self) -> usize {
         self.layers.len()
@@ -1246,6 +1305,10 @@ impl ModelWeights {
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
+        // Per-expert FFN width (moe_intermediate_size), which is what one expert
+        // GEMM produces and therefore what the transient plan prices against.
+        let expert_ffn_size =
+            md_opt_u32(&format!("{p}.expert_feed_forward_length")).unwrap_or(2048) as usize;
         // Qwen3-MoE always uses norm_topk_prob=true; GGUF often omits this key so default to 1.
         let norm_topk_prob = md_opt_u32(&format!("{p}.expert_weights_norm")).unwrap_or(1) == 1;
 
@@ -1435,6 +1498,11 @@ impl ModelWeights {
             _mmap: None,
             #[cfg(feature = "cuda")]
             _mmap_registration: None,
+            wave_shapes: WaveShapes {
+                hidden: hidden_size,
+                intermediate: expert_ffn_size,
+                experts_per_tok: n_expert_used,
+            },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
             // mmap (`from_gguf_by_path`) load path.
@@ -1573,7 +1641,7 @@ impl ModelWeights {
         tracing::debug!("GGUF arch: {p}  layers={num_layers} hidden={hidden_size} eps={rms_norm_eps:.2e} heads={num_attention_heads}Q/{num_kv_heads}KV head_dim={head_dim} ctx={max_position_embeddings} rope_base={rope_freq_base} experts={n_expert}/{n_expert_used} norm={norm_topk_prob}");
 
         // Expert FFN size (moe_intermediate_size)
-        let _expert_ffn_size =
+        let expert_ffn_size =
             md_opt_u32(&format!("{p}.expert_feed_forward_length")).unwrap_or(2048) as usize;
 
         let dtype_model = DType::F16;
@@ -2238,6 +2306,11 @@ impl ModelWeights {
             _mmap: Some(mmap),
             #[cfg(feature = "cuda")]
             _mmap_registration: _mmap_guard,
+            wave_shapes: WaveShapes {
+                hidden: hidden_size,
+                intermediate: expert_ffn_size,
+                experts_per_tok: n_expert_used,
+            },
             device: device.clone(),
             int8mode,
             base_weight_bytes,
@@ -2617,7 +2690,7 @@ mod tests {
         {
             use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{
-                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
+                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
             use crate::models::batched_model::BatchedInference;
 
@@ -2662,8 +2735,7 @@ mod tests {
              -> Result<Vec<Tensor>> {
                 Ok(model
                     .forward_wave(session, &[], &[], seqs, inputs, &[], &[], 0, n, None)?
-                    .logits
-                    .unwrap_or_default())
+                    .logits_owned()?)
             };
             // Layer-range reference through the wave entry (the retired
             // `forward_batched_layers`): prefill group, layers `[ls, le)`, residual.
@@ -2673,7 +2745,7 @@ mod tests {
                        ls: usize,
                        le: usize,
                        residual: Option<Tensor>|
-             -> Result<WaveStep> {
+             -> Result<WaveResult> {
                 model.forward_wave(session, &[], &[], seqs, inputs, &[], &[], ls, le, residual)
             };
             // Prefill an identical `ctx` context into `s`, leaving offset at ctx.len().
@@ -2714,8 +2786,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("full-range wave must produce logits");
+                .logits_owned()?;
             assert_eq!(wave.len(), 2, "wave logits = decode + prefill rows");
             let c_dec = cos(&sep_dec[0], &wave[0])?;
             let c_pre = cos(&sep_pre[0], &wave[1])?;
@@ -2728,16 +2799,12 @@ mod tests {
             let b = session.create_sequence()?;
             prep(&mut session, a, &ctx_p)?;
             prep(&mut session, b, &ctx_p)?;
-            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?
-                .logits
-                .expect("full sweep logits");
+            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?.logits_owned()?;
             let k = n / 2;
             let mid = fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
-                .residual
+                .into_residual()
                 .expect("paused sweep must return a residual");
-            let split = fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?
-                .logits
-                .expect("resumed sweep logits");
+            let split = fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?.logits_owned()?;
             let c_split = cos(&full[0], &split[0])?;
             println!("split sweep [0,{k})+[{k},{n}) vs full: cos={c_split:.5}");
             assert!(c_split > 0.999, "re-entrant sweep diverged (cos={c_split})");
@@ -2767,8 +2834,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("decode-only wave logits");
+                .logits_owned()?;
             assert_eq!(wave_d2.len(), 2, "decode-only wave = 2 decode rows");
             let c_d0 = cos(&sep_d2[0], &wave_d2[0])?;
             let c_d1 = cos(&sep_d2[1], &wave_d2[1])?;
@@ -2804,8 +2870,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("co-batch wave logits");
+                .logits_owned()?;
             assert_eq!(wave_1.len(), 2, "co-batch = decode + 1-token prefill");
             let c_1d = cos(&sep_dec1[0], &wave_1[0])?;
             let c_1p = cos(&sep_pre1[0], &wave_1[1])?;
@@ -2859,7 +2924,7 @@ mod tests {
                 kk,
                 None,
             )?
-            .residual
+            .into_residual()
             .expect("paused mixed cohort must return a residual");
             let mixed_split = fbl(
                 &mut session,
@@ -2869,8 +2934,7 @@ mod tests {
                 n,
                 Some(mixed_res),
             )?
-            .logits
-            .expect("resumed mixed cohort must produce logits");
+            .logits_owned()?;
             assert_eq!(mixed_split.len(), 2, "split cohort = one logit row per seq");
             let c_sm = cos(&ref_multi[0], &mixed_split[0])?;
             let c_ss = cos(&ref_one[0], &mixed_split[1])?;
@@ -2929,7 +2993,7 @@ mod tests {
                     kk2,
                     None,
                 )?
-                .residual
+                .into_residual()
                 .expect("paused co-batch must return a residual");
             // Split: 1 decode token, then the group's tokens (held whole).
             let gtok = pre_tok.len() + pre_tok.len() + one_tok.len();
@@ -2949,8 +3013,7 @@ mod tests {
                     n,
                     Some(dec_part),
                 )?
-                .logits
-                .expect("decode resume logits");
+                .logits_owned()?;
             // Resume the group alone to N (members re-passed in the SAME order).
             let grp_fin = model
                 .forward_wave(
@@ -2965,8 +3028,7 @@ mod tests {
                     n,
                     Some(grp_part),
                 )?
-                .logits
-                .expect("group resume logits");
+                .logits_owned()?;
             assert_eq!(dec_fin.len(), 1, "decode resume = one row");
             assert_eq!(grp_fin.len(), 3, "group resume = one row per member");
             let c_ed = cos(&sref_d[0], &dec_fin[0])?;
@@ -3025,7 +3087,7 @@ mod tests {
                     kk3,
                     None,
                 )?
-                .residual
+                .into_residual()
                 .expect("paused three-group co-batch must return a residual");
             let creep_tok3 = pre_tok.len() + one_tok.len();
             let glue_tok3 = pre_tok.len();
@@ -3046,8 +3108,7 @@ mod tests {
                     n,
                     Some(dec_part3),
                 )?
-                .logits
-                .expect("decode resume logits");
+                .logits_owned()?;
             let creep_fin3 = model
                 .forward_wave(
                     &mut session,
@@ -3061,8 +3122,7 @@ mod tests {
                     n,
                     Some(creep_part3),
                 )?
-                .logits
-                .expect("creep resume logits");
+                .logits_owned()?;
             let glue_fin3 = model
                 .forward_wave(
                     &mut session,
@@ -3076,8 +3136,7 @@ mod tests {
                     n,
                     Some(glue_part3),
                 )?
-                .logits
-                .expect("glue resume logits");
+                .logits_owned()?;
             let c_fd = cos(&href_d[0], &dec_fin3[0])?;
             let c_fca = cos(&href_ca[0], &creep_fin3[0])?;
             let c_fcb = cos(&href_cb[0], &creep_fin3[1])?;
@@ -3525,8 +3584,7 @@ mod tests {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
@@ -3556,8 +3614,7 @@ mod tests {
                         nl,
                         None,
                     )?
-                    .logits
-                    .unwrap_or_default();
+                    .logits_owned()?;
                 session.advance_sequence(seq_idx, 1)?;
                 last_logits = out
                     .into_iter()

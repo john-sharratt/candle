@@ -28,6 +28,7 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
@@ -550,6 +551,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: Vec<(u32, u32, u32)>,
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         match &self.mode {
             PipelineMode::Threaded { tx } => {
@@ -567,6 +569,7 @@ impl ExpertCache {
                     assignments,
                     // Captured right before `send` so the worker can split the inbound handoff
                     // (channel wakeup) out of the actual work.
+                    wave,
                     submitted_at: profile_now(),
                     response_tx: resp_tx,
                 };
@@ -600,6 +603,7 @@ impl ExpertCache {
                     out_dtype,
                     weights_flat,
                     &assignments,
+                    wave,
                 )
             }
         }
@@ -620,6 +624,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: &[(u32, u32, u32)],
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         let mut inner = mutex
             .lock()
@@ -674,6 +679,7 @@ impl ExpertCache {
                     &experts_vec,
                     weights_flat,
                     &mut _inline_prof,
+                    wave,
                 )?;
             }
         }

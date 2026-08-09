@@ -21,13 +21,15 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
-use super::batched_model::BatchedModelCore;
+use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::llama_rope::llama_inv_freq;
 use super::profile::{pipeline_record, profile_now, profile_sync};
 use super::rope_tables::CisPrecomputations;
 use super::{decode_utils, quantized_matmul::QMatMul};
+use crate::models::batched_layer::WaveRef;
 use crate::models::llama::{Llama3RopeConfig, Llama3RopeType};
+use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::DynamicActs;
@@ -212,7 +214,7 @@ impl Module for Mlp {
         pipeline_record(mul_name, t_mul);
 
         let t_w2 = profile_now();
-        let out = self.feed_forward_w2.forward(&intermediate)?;
+        let out = self.feed_forward_w2.forward_live(&intermediate)?;
         profile_sync(out.device());
         pipeline_record(w2_name, t_w2);
         Ok(out)
@@ -223,7 +225,11 @@ impl Mlp {
     /// B3 consumer: gate/up over a producer-prepared (fused ffn_norm) activation, shared across
     /// both projections; down-proj closes the block. CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
         let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
             // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
@@ -254,7 +260,7 @@ impl Mlp {
         w1.to_dtype_mut(out_dtype)?;
         w3.to_dtype_mut(out_dtype)?;
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward(&intermediate)?;
+        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
         out.to_dtype_mut(out_dtype)?;
         Ok(out)
     }
@@ -659,9 +665,14 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 producer: fuse ffn_norm -> q8a128 only for the dense MLP path; MoE stays FP.
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
         match &self.mlp_or_moe {
-            MlpOrMoe::Mlp(_) => self.ffn_norm.forward_dynamic(x, mode),
+            MlpOrMoe::Mlp(_) => self.ffn_norm.forward_dynamic(x, mode, wave_root(wave)),
             _ => Ok(DynamicActs::Float(self.ffn_norm.forward(x)?)),
         }
     }
@@ -670,7 +681,7 @@ impl BatchedAttentionLayer for LayerWeights {
     #[cfg(feature = "cuda")]
     fn ffn_forward<'w>(
         &self,
-        acts: DynamicActs<'static>,
+        acts: DynamicActs<'w>,
         mlp_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
@@ -679,7 +690,9 @@ impl BatchedAttentionLayer for LayerWeights {
         match &self.mlp_or_moe {
             MlpOrMoe::Mlp(m) => m.forward_dynamic(&acts, mlp_dtype),
             _ => match acts {
-                DynamicActs::Float(t) => self.mlp_or_moe.forward(&t.to_dtype(mlp_dtype)?),
+                DynamicActs::Float(t) => self
+                    .mlp_or_moe
+                    .forward(&t.to_owned_tensor()?.to_dtype(mlp_dtype)?),
                 DynamicActs::Int8(_) => {
                     candle::bail!("llama MoE ffn_forward received int8 acts")
                 }
@@ -689,13 +702,23 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.attention_norm.forward_dynamic(x, mode)
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.attention_norm
+            .forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B1 consumer: q/k/v over the fused activation (fused-qkv or separate).
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>> {
         let q_dim = self.n_head * self.head_dim;
         let kv_dim = self.n_kv_head * self.head_dim;
         let (q, k, v) = match acts {
@@ -754,6 +777,35 @@ pub struct ModelWeights {
 #[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        for layer in &self.layers {
+            layer.attention_norm.maybe_change_dtype(dtype)?;
+            layer.ffn_norm.maybe_change_dtype(dtype)?;
+        }
+        self.norm.maybe_change_dtype(dtype)
+    }
+
+    /// Recovered from the down-projection's own weight, whose shape is
+    /// `[hidden, intermediate]`. Llama layers may be dense or MoE, so the
+    /// routed case reads one expert's projection and its own `n_expert_used`
+    /// rather than assuming a dense FFN.
+    fn wave_shapes(&self) -> WaveShapes {
+        let (down, experts_per_tok) = match &self.layers[0].mlp_or_moe {
+            MlpOrMoe::Mlp(mlp) => (&mlp.feed_forward_w2, 1),
+            MlpOrMoe::MoE {
+                n_expert_used,
+                experts,
+                ..
+            } => (&experts[0].feed_forward_w2, *n_expert_used),
+        };
+        let dims = down.weight_dims();
+        WaveShapes {
+            hidden: dims[0],
+            intermediate: dims[1],
+            experts_per_tok,
+        }
+    }
 
     fn num_layers(&self) -> usize {
         self.layers.len()
@@ -2508,8 +2560,7 @@ mod tests {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
@@ -2540,8 +2591,7 @@ mod tests {
                         nl,
                         None,
                     )?
-                    .logits
-                    .unwrap_or_default();
+                    .logits_owned()?;
                 session.advance_sequence(seq_idx, 1)?;
                 last_logits = out
                     .into_iter()
@@ -2714,8 +2764,7 @@ mod tests {
                 nl,
                 None,
             )?
-            .logits
-            .unwrap_or_default();
+            .logits_owned()?;
         f16_session.advance_sequence(f16_seq, prefill_len)?;
 
         let r16_logits = model
@@ -2731,8 +2780,7 @@ mod tests {
                 nl,
                 None,
             )?
-            .logits
-            .unwrap_or_default();
+            .logits_owned()?;
         r16_session.advance_sequence(r16_seq, prefill_len)?;
 
         let f16_l = &f16_logits[0]; // [1, vocab]
@@ -2793,8 +2841,7 @@ mod tests {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             f16_session.advance_sequence(f16_seq, 1)?;
 
             let r16_out = model
@@ -2810,8 +2857,7 @@ mod tests {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             r16_session.advance_sequence(r16_seq, 1)?;
 
             let f16_l = &f16_out[0];

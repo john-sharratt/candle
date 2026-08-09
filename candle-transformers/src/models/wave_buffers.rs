@@ -55,6 +55,7 @@ use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::{
     CudaSlice, CudaStream, DevicePtr, DeviceRepr, SyncOnDrop,
 };
+use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin, WaveTicket};
 use candle::cuda_backend::CudaDType;
 use candle::{CudaDevice, CudaStorage, DType, Device, LiveTensor, Result, Shape, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
@@ -78,6 +79,9 @@ pub(crate) enum KernelOutput<'w, T> {
     Leased {
         ptr: u64,
         elems: usize,
+        /// The arena this came from, so an op reading the resulting tensor
+        /// allocates its own output from the same generation.
+        ticket: WaveTicket,
         wave: PhantomData<&'w ()>,
     },
     /// This op's own allocation, freed when the storage drops.
@@ -103,10 +107,12 @@ impl<'w, T: CudaDType + DeviceRepr> KernelOutput<'w, T> {
             return Ok(Self::Owned(unsafe { dev.alloc::<T>(elem_count)? }));
         };
         let bytes = elem_count * std::mem::size_of::<T>();
+        let ticket = wave.ticket();
         let range = wave.alloc(bytes, WAVE_ALIGN)?;
         Ok(Self::Leased {
             ptr: range.ptr,
             elems: elem_count,
+            ticket,
             wave: PhantomData,
         })
     }
@@ -137,8 +143,10 @@ impl<'w, T: CudaDType + DeviceRepr> KernelOutput<'w, T> {
             // SAFETY: `ptr` is `elems` elements of `T` in the half pinned by
             // the guard this borrows, so the range outlives the returned
             // storage by construction.
-            Self::Leased { ptr, elems, .. } => unsafe {
-                CudaStorage::wrap_leased_ptr::<T>(ptr, elems, dev)
+            Self::Leased {
+                ptr, elems, ticket, ..
+            } => unsafe {
+                CudaStorage::wrap_leased_ptr::<T>(ptr, elems, dev, LeaseOrigin::Wave(ticket))
             },
             Self::Owned(slice) => CudaStorage::wrap_cuda_slice(slice, dev),
         }
@@ -156,6 +164,23 @@ impl<'w, T: CudaDType + DeviceRepr> KernelOutput<'w, T> {
         // guard's own lifetime — carried on `Self` since `new`, so it cannot be
         // widened here.
         unsafe { LiveTensor::from_cuda_storage(storage, shape) }
+    }
+}
+
+/// The backing that **seeds** a phase's inheritance chain.
+///
+/// Every other buffer in a phase inherits its arena from an operand, but the
+/// first one cannot: its operand is the residual stream, which stays on the pool
+/// because it crosses layers. So the head of the chain names the generation
+/// directly, and everything downstream follows from it without a single further
+/// mention of the wave.
+///
+/// `Backing::Owned` without a guard, which is the correct answer rather than a
+/// fallback: outside a wave there is no arena to seed from.
+pub(crate) fn wave_root(wave: Option<&WaveGeneration>) -> candle::cuda_backend::Backing {
+    match wave {
+        Some(g) => candle::cuda_backend::Backing::Lease(LeaseOrigin::Wave(g.ticket())),
+        None => candle::cuda_backend::Backing::Owned,
     }
 }
 
@@ -178,6 +203,7 @@ pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
     };
     let stream = cuda.cuda_stream();
     let bytes = shape.elem_count() * dtype.size_in_bytes();
+    let ticket = wave.ticket();
     let range = wave.alloc(bytes, WAVE_ALIGN)?;
     // SAFETY: `range` is `bytes` of the half pinned by `wave`, and nothing else
     // addresses it within this generation.
@@ -185,5 +211,53 @@ pub(crate) fn wave_zeros<'w, S: Into<Shape>>(
         .map_err(|e| candle::Error::Msg(format!("zeroing a wave buffer: {e}")))?;
     // SAFETY: as above, and the returned tensor borrows `wave`, so it cannot be
     // named after the guard that reclaims the range has dropped.
-    unsafe { LiveTensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device) }
+    unsafe {
+        LiveTensor::from_leased_cuda_ptr(range.ptr, dtype, shape, device, LeaseOrigin::Wave(ticket))
+    }
+}
+
+/// [`wave_zeros`] for a holder of a [`WaveTicket`] rather than of the guard.
+///
+/// The expert-pipeline thread is the caller that needs this. It cannot borrow
+/// the generation — a `&WaveGeneration` does not cross a channel — but the
+/// ticket is a `Copy` coordinate and does, and the submitting thread blocks on
+/// the response for the whole request, so the generation is open throughout.
+///
+/// The result is a `Tensor`, i.e. `'static`, because it is handed back over the
+/// same channel. That is sound for the same reason the ticket is: the tensor
+/// **owns nothing** — it is a lease, so its drop frees nothing — and the wave's
+/// own reset reclaims the range. A ticket whose generation has already closed
+/// resolves to `None` and this allocates from the pool, which is a correct
+/// answer rather than a fallback.
+pub(crate) fn wave_zeros_ticketed<S: Into<Shape>>(
+    shape: S,
+    dtype: DType,
+    device: &Device,
+    ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
+    let shape = shape.into();
+    let bytes = shape.elem_count() * dtype.size_in_bytes();
+    let (Device::Cuda(cuda), Some(ticket)) = (device, ticket) else {
+        return Tensor::zeros(shape, dtype, device);
+    };
+    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
+        return Tensor::zeros(shape, dtype, device);
+    };
+    let stream = cuda.cuda_stream();
+    // `memset_d8_async` is a raw driver call, and the driver takes its context
+    // from the calling thread. [`wave_zeros`] gets away without this because it
+    // runs on the forward thread, where candle has already bound one; this runs
+    // on the expert-pipeline thread, which has not, and the call fails with
+    // `CUDA_ERROR_INVALID_CONTEXT`. Binding is idempotent.
+    stream
+        .context()
+        .bind_to_thread()
+        .map_err(|e| candle::Error::Msg(format!("binding the device context: {e}")))?;
+    // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
+    // arena, and no other claimant holds that range within this generation.
+    unsafe { memset_d8_async(ptr, 0, bytes, stream.cu_stream()) }
+        .map_err(|e| candle::Error::Msg(format!("zeroing a wave buffer: {e}")))?;
+    // SAFETY: as above. The lease frees nothing on drop, so the range's only
+    // reclaim is the generation's reset.
+    unsafe { Tensor::from_leased_cuda_ptr(ptr, dtype, shape, device, LeaseOrigin::Wave(ticket)) }
 }

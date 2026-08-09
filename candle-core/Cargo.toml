@@ -11,6 +11,10 @@ readme = "README.md"
 
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
+# Only for `forbidden_alloc`: unlike `std::backtrace`, it can capture frame
+# addresses without symbolising them, which is what keeps the detector cheap
+# enough to leave armed across a hot loop.
+backtrace = { version = "0.3", optional = true }
 byteorder = { workspace = true }
 candle-kernels = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
@@ -65,6 +69,11 @@ cuda = ["cudarc", "dep:candle-kernels", "dep:ug-cuda", "float8/cuda"]
 # Expose the VRAM Governor's scripted probe/allocator test doubles to other
 # crates' tests (candle-core's own tests get them via `cfg(test)`).
 vram-test-util = []
+# Report device allocations that reach the driver while the wave path is armed
+# (`forbidden_alloc`). Off by default: capturing a stack per allocation is far
+# too slow for a production run, and the counters are a measurement tool, not a
+# guard rail.
+forbidden_allocations = ["dep:backtrace"]
 cudnn = ["cuda", "cudarc/cudnn"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]

@@ -31,6 +31,10 @@ INSTANTIATE_KERNEL_GROUPED_INT8(
     QK5_K_K128, QI5_K_K128, block_c_q5_K, VDR_Q5_K_K128,
     float
 )
+INSTANTIATE_KERNEL_DENSE_INT8_ALL(
+    q5_k_int8,
+    QK5_K_K128, QI5_K_K128, block_c_q5_K, VDR_Q5_K_K128
+)
 
 // Q5_KO TC path — same INT8-MMA kernels reading the byte-permuted Q5_KO block.
 INSTANTIATE_KERNEL_GROUPED_INT8(
@@ -38,19 +42,14 @@ INSTANTIATE_KERNEL_GROUPED_INT8(
     QK5_K_K128, QI5_K_K128, block_c_q5_KO, VDR_Q5_K_K128,
     float
 )
-
-// Mode-2 dense variant (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill); selected when the
-// host passes force_mode2=1 (grid.x = ceil(total_batch/32)).
-extern "C" __global__ void LAUNCH_BOUNDS_TC16 q5_ko_int8_f32_dense_m2(
-    const void* __restrict__ weights,
-    const block_q8a128* __restrict__ vy, float* __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int total_batch,
-    const int y_stride, const int dst_stride) {
-    grouped_tc::quantized_matmul_dense_entry_int8<QK5_K_K128, QI5_K_K128, block_c_q5_KO,
-                                                  VDR_Q5_K_K128, float, 2>(
-        reinterpret_cast<const block_compact_t<block_c_q5_KO>*>(weights),
-        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride);
-}
+INSTANTIATE_KERNEL_DENSE_INT8_ALL(
+    q5_ko_int8,
+    QK5_K_K128, QI5_K_K128, block_c_q5_KO, VDR_Q5_K_K128
+)
+INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(
+    q5_ko_int8,
+    QK5_K_K128, QI5_K_K128, block_c_q5_KO, VDR_Q5_K_K128
+)
 
 // DISABLED: dequant_k64 not yet implemented for this quant type
 // MARLIN TENSOR CORE KERNEL

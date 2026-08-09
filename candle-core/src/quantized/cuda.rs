@@ -1,10 +1,14 @@
 use super::{GgmlDType, Int8Mode, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 
+use crate::cuda_backend::alloc_inheriting;
+use crate::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin};
 use crate::cuda_backend::Backing;
+use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
+use crate::LiveTensor;
 use crate::{CudaDevice, CudaStorage, Result, Shape};
-use half::f16;
+use half::{bf16, f16};
 
 use crate::cuda_backend::WrapErr;
 use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
@@ -30,7 +34,7 @@ use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
 // K/128 blocks have embedded scales, no external scale extraction needed.
 use candle_kernels::quantized::{
     dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
-    run_quantized_matmul, VxSegment, YType,
+    run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType,
 };
 
 // Import GEMX repacking dispatcher
@@ -262,14 +266,20 @@ impl Clone for QCudaStorage {
 
 impl Drop for QCudaStorage {
     fn drop(&mut self) {
-        if self.backing != Backing::Lease {
-            // Owned: dispose normally. `data` is `ManuallyDrop`, so without
-            // this the allocation is never freed.
-            // SAFETY: `self` is being destroyed; `data` is not read again and
-            // is dropped exactly once (this arm and the lease arm below are
-            // mutually exclusive and both return).
-            unsafe { std::mem::ManuallyDrop::drop(&mut self.data) };
-            return;
+        // Exhaustive rather than `!= Lease`, matching `CudaStorage::drop`: a
+        // future `Backing` variant must state which side it falls on here rather
+        // than silently inheriting the free path.
+        match self.backing {
+            Backing::Owned => {
+                // Dispose normally. `data` is `ManuallyDrop`, so without this the
+                // allocation is never freed.
+                // SAFETY: `self` is being destroyed; `data` is not read again and
+                // is dropped exactly once (this arm and the lease arm below are
+                // mutually exclusive and both return).
+                unsafe { std::mem::ManuallyDrop::drop(&mut self.data) };
+                return;
+            }
+            Backing::Lease(_) => {}
         }
         // Same discipline as `CudaStorage::drop`: calling `leak` rather than
         // merely suppressing the drop is load-bearing — it waits on the
@@ -312,6 +322,7 @@ impl QCudaStorage {
         elem_count: usize,
         dtype: GgmlDType,
         device: &CudaDevice,
+        origin: LeaseOrigin,
     ) -> Result<Self> {
         if elem_count % dtype.block_size() != 0 {
             crate::bail!(
@@ -331,7 +342,7 @@ impl QCudaStorage {
             }),
             device: device.clone(),
             dtype,
-            backing: Backing::Lease,
+            backing: Backing::Lease(origin),
         })
     }
 }
@@ -2393,7 +2404,6 @@ fn dequantize_bf16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
-    use half::bf16;
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
     {
@@ -2568,7 +2578,6 @@ fn dense_qmatmul_float(
     device: &CudaDevice,
 ) -> Result<(CudaStorage, crate::Shape)> {
     use crate::cuda_backend::CudaStorageSlice;
-    use half::bf16;
 
     let (batch_size, k) = match rhs_l.shape().dims() {
         [b, m, k] => (b * m, *k),
@@ -2632,8 +2641,8 @@ fn dense_qmatmul_float(
             batch_count: batch_size as i32,
         };
         macro_rules! run_matmul {
-            ($y_ptr:expr, $dst_ptr:expr) => {
-                unsafe {
+            ($y_ptr:expr, $dst_ptr:expr) => {{
+                let status = unsafe {
                     run_quantized_matmul(
                         &segment as *const VxSegment,
                         1,
@@ -2647,9 +2656,13 @@ fn dense_qmatmul_float(
                         ytype as i32,
                         weight_len,
                         0, // force_mode2: FP path ignores it
-                    );
-                }
-            };
+                        // out_dtype: the FP kernels store at the activation dtype, so this
+                        // only has to be a valid code — it is not consulted.
+                        OutDType::F32 as i32,
+                    )
+                };
+                check_matmul_status(status, "dense_qmatmul_float")?;
+            }};
         }
         match (&rhs_storage.slice, &dst_slice) {
             (CudaStorageSlice::F16(y_data), OutputSlice::F16(dst)) => {
@@ -2730,6 +2743,56 @@ impl QCudaStorage {
             device: device.clone(),
             dtype,
             backing: Backing::Owned,
+        })
+    }
+
+    /// Same as [`QCudaStorage::zeros`], but the bytes are left as they are.
+    ///
+    /// For storage a kernel fills immediately, where the zero-fill is a full
+    /// memset of the buffer discarded microseconds later by the write that
+    /// follows it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must write the whole `len`-byte data region before anything
+    /// reads it. The `MATRIX_ROW_PADDING` tail past `len` is uninitialised too,
+    /// so this is wrong for any storage handed to a q-matmul kernel — those
+    /// over-read into the padding by design, and [`QCudaStorage::zeros`] is
+    /// what makes that read a defined zero.
+    pub unsafe fn uninit(device: &CudaDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
+        unsafe { Self::uninit_from(device, el_count, dtype, Backing::Owned) }
+    }
+
+    /// [`Self::uninit`] with the storage taken from `origin`'s arena.
+    ///
+    /// For quantized staging that is written and consumed inside one scope — the
+    /// embedding gather, whose bytes are read once by the dequantize that
+    /// immediately follows. Carving that from the wave costs no VRAM at all: the
+    /// span is already reserved, so the bytes come out of a budget that has
+    /// been paid for whether or not anything uses it.
+    ///
+    /// # Safety
+    /// As [`Self::uninit`]: the storage is uninitialised, so every byte a reader
+    /// touches must be written first.
+    pub unsafe fn uninit_from(
+        device: &CudaDevice,
+        el_count: usize,
+        dtype: GgmlDType,
+        origin: Backing,
+    ) -> Result<Self> {
+        let size_in_bytes = ceil_div(el_count, dtype.block_size()) * dtype.type_size();
+        let padded_size_in_bytes =
+            ceil_div(el_count + MATRIX_ROW_PADDING, dtype.block_size()) * dtype.type_size();
+        let (inner, backing) =
+            unsafe { alloc_inheriting::<u8>(device, padded_size_in_bytes, origin)? };
+        Ok(QCudaStorage {
+            data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
+                inner,
+                len: size_in_bytes,
+            }),
+            device: device.clone(),
+            dtype,
+            backing,
         })
     }
 
@@ -2951,7 +3014,7 @@ impl QCudaStorage {
         // an owned buffer is freed.
         // SAFETY: the old value is moved out exactly once and not read again.
         let old = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
-        if self.backing == Backing::Lease {
+        if matches!(self.backing, Backing::Lease(_)) {
             old.inner.leak();
         } else {
             drop(old);
@@ -3419,7 +3482,7 @@ impl QCudaStorage {
         // chunk's bytes, or past the region at the last slot. The restriction is
         // documented on `from_leased_device_ptr` and `QTensor::from_leased_cuda_ptr`
         // but nothing enforced it, and `backing` is right here to check.
-        if self.backing == Backing::Lease {
+        if matches!(self.backing, Backing::Lease(_)) {
             crate::bail!(
                 "QMatMul on a leased quantized view: a lease is exactly its payload and \
                  carries no {MATRIX_ROW_PADDING}-element row padding, which both matmul \
@@ -3937,7 +4000,7 @@ pub fn repacked_size_bytes(nrows: usize, ncols: usize, dtype: GgmlDType) -> Resu
 ///
 /// # Returns
 /// A `Tensor` with shape `[total_batch, N]` on the same CUDA device.
-fn grouped_matmul_gemx_impl(
+fn grouped_matmul_gemx_impl<'w>(
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,
     nrows: usize,
@@ -3946,9 +4009,8 @@ fn grouped_matmul_gemx_impl(
     act_layout: &crate::Layout,
     expert_offsets: &[i32],
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+) -> Result<crate::LiveTensor<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
-    use half::bf16;
 
     let num_experts = weight_ptrs.len();
     if num_experts == 0 {
@@ -4012,21 +4074,13 @@ fn grouped_matmul_gemx_impl(
         ),
     };
 
-    // Allocate output
-    enum OutputSlice {
-        F16(CudaSlice<f16>),
-        BF16(CudaSlice<bf16>),
-        F32(CudaSlice<f32>),
-    }
-
-    let dst_slice = match ytype {
-        YType::F16 => OutputSlice::F16(unsafe { device.alloc::<f16>(nrows * total_batch)? }),
-        YType::BF16 => OutputSlice::BF16(unsafe { device.alloc::<bf16>(nrows * total_batch)? }),
-        YType::F32 => OutputSlice::F32(unsafe { device.alloc::<f32>(nrows * total_batch)? }),
-        YType::Q8A128 => crate::bail!(
-            "YType::Q8A128 is the int8 grouped matmul INPUT format, not an FP output dtype"
-        ),
-    };
+    // The output inherits the activations' arena and matches their dtype (the FP
+    // grouped kernels store at the activation width). Only the pool arm owns a
+    // slice; the wave arm stays a bare pointer until the wrap, so a `?` between
+    // here and there cannot drop a `CudaSlice` over arena memory.
+    let out_elems = nrows * total_batch;
+    let (dst_ptr, owned_out, out_backing) =
+        resolve_out(activations.dtype(), activations.backing, device, out_elems)?;
 
     // Grouped dispatch: split each expert's [offset..offset+cnt) batch range into
     // <=16-token MMA tiles, then run ALL experts in ONE kernel launch. The kernel
@@ -4074,7 +4128,11 @@ fn grouped_matmul_gemx_impl(
         for &x in &tile_b_cnt {
             packed.extend_from_slice(&x.to_le_bytes());
         }
-        let tables_dev = device.memcpy_stod(&packed)?;
+        // The tile tables are read by the same launch as the activation they
+        // dispatch over, so they belong on the same span. A host-built table has
+        // no device operand to inherit from, so it names the arena the caller
+        // already resolved for this call's output.
+        let tables_dev = device.memcpy_stod_from(&packed, activations.backing)?;
         let (base, _tg) = tables_dev.device_ptr(&stream);
         let wptr_ptr = base;
         let te_ptr = base + off_te as u64;
@@ -4082,7 +4140,7 @@ fn grouped_matmul_gemx_impl(
         let tbc_ptr = base + off_tbc as u64;
 
         macro_rules! dispatch_grouped {
-            ($y_data:expr, $dst:expr) => {{
+            ($y_data:expr) => {{
                 let y_view = match act_layout.contiguous_offsets() {
                     Some((o1, o2)) => $y_data.slice(o1..o2),
                     None => {
@@ -4093,7 +4151,6 @@ fn grouped_matmul_gemx_impl(
                     }
                 };
                 let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                let (dst_ptr, _dst_guard) = $dst.device_ptr(&stream);
                 unsafe {
                     run_grouped_quantized_matmul(
                         wptr_ptr as *const std::ffi::c_void,
@@ -4114,34 +4171,22 @@ fn grouped_matmul_gemx_impl(
             }};
         }
 
-        match (&activations.slice, &dst_slice) {
-            (CudaStorageSlice::F16(y_data), OutputSlice::F16(dst)) => {
-                dispatch_grouped!(y_data, dst);
+        match &activations.slice {
+            CudaStorageSlice::F16(y_data) => {
+                dispatch_grouped!(y_data);
             }
-            (CudaStorageSlice::BF16(y_data), OutputSlice::BF16(dst)) => {
-                dispatch_grouped!(y_data, dst);
+            CudaStorageSlice::BF16(y_data) => {
+                dispatch_grouped!(y_data);
             }
-            (CudaStorageSlice::F32(y_data), OutputSlice::F32(dst)) => {
-                dispatch_grouped!(y_data, dst);
+            CudaStorageSlice::F32(y_data) => {
+                dispatch_grouped!(y_data);
             }
             _ => unreachable!("ytype and activation slice should match"),
         }
     }
 
-    // Wrap output
-    let out_storage = match dst_slice {
-        OutputSlice::F16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
-        OutputSlice::BF16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
-        OutputSlice::F32(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
-    };
-
     let out_shape: Shape = vec![total_batch, nrows].into();
-    Ok(crate::tensor::from_storage(
-        crate::Storage::Cuda(out_storage),
-        out_shape,
-        crate::op::BackpropOp::none(),
-        false,
-    ))
+    tensor_from_owned_out(owned_out, dst_ptr, out_backing, out_shape, device)
 }
 
 /// Single-launch grouped MoE expert matmul over FP activations (F16/BF16/F32):
@@ -4190,6 +4235,211 @@ pub enum Q8a128Data<'w> {
     Tensor(crate::LiveTensor<'w>),
 }
 
+/// Where a kernel's output goes, and how the storage wrapping it must be marked.
+///
+/// Returned as a triple — `(ptr, owned, backing)` — rather than as separate
+/// decisions, because the pointer and the backing have to agree. A wave range
+/// marked `Owned` is a double free; a pool buffer marked `Lease` is a permanent
+/// leak. Resolving both in one place is what stops them drifting.
+///
+/// # Why the wave arm is a bare pointer
+///
+/// The pool arm owns a `CudaSlice`; the wave arm deliberately does not
+/// materialise one. A `CudaSlice` frees on drop, and between resolving an output
+/// and wrapping it the kernel launch can fail — every `?` in that window would
+/// otherwise put a `cuMemFreeAsync` on arena memory. Staying a raw `u64` until
+/// the caller wraps it removes the window entirely.
+type ResolvedOut<T> = (u64, Option<CudaSlice<T>>, Backing);
+
+/// Resolve a `u8` output from `origin`'s arena, or from the pool.
+///
+/// `origin` is the operand's backing: a wave-backed operand yields a wave-backed
+/// output (the inheritance rule), anything else allocates normally. A phase's
+/// *first* buffer has no arena to inherit — its operand is the residual stream,
+/// which must stay pooled because it crosses layers — so those call sites pass a
+/// synthesised `Backing::Lease(Wave(ticket))` to seed the chain instead.
+fn resolve_u8_out(origin: Backing, dev: &CudaDevice, bytes: usize) -> Result<ResolvedOut<u8>> {
+    if let Some(ticket) = origin.inherit_ticket() {
+        if let Some(ptr) = wave_alloc(ticket, bytes, INHERIT_ALIGN) {
+            return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
+        }
+    }
+    // SAFETY: the kernel the caller launches next fills this before anything
+    // reads it, exactly as when it allocated inline.
+    let slice = unsafe { dev.alloc::<u8>(bytes)? };
+    let ptr = {
+        let stream = dev.cuda_stream();
+        let (ptr, _guard) = slice.device_ptr(&stream);
+        ptr
+    };
+    Ok((ptr, Some(slice), Backing::Owned))
+}
+
+/// [`resolve_u8_out`] for a typed output.
+///
+/// Separate because the byte count is `elems * size_of::<T>()`, and getting that
+/// wrong is the one mistake this whole mechanism exists to make impossible.
+fn resolve_typed_out<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    origin: Backing,
+    dev: &CudaDevice,
+    elems: usize,
+) -> Result<ResolvedOut<T>> {
+    if let Some(ticket) = origin.inherit_ticket() {
+        let bytes = elems * std::mem::size_of::<T>();
+        if let Some(ptr) = wave_alloc(ticket, bytes, INHERIT_ALIGN) {
+            return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
+        }
+    }
+    // SAFETY: filled by the kernel the caller launches next.
+    let slice = unsafe { dev.alloc::<T>(elems)? };
+    let ptr = {
+        let stream = dev.cuda_stream();
+        let (ptr, _guard) = slice.device_ptr(&stream);
+        ptr
+    };
+    Ok((ptr, Some(slice), Backing::Owned))
+}
+
+/// A resolved matmul destination whose element type was picked at runtime.
+///
+/// The pool arm owns a typed `CudaSlice`, so the type has to be carried from the
+/// resolve to the wrap; the wave arm holds `None` and rides on the raw pointer.
+/// One enum for all three matmul entries — they make the same decision and would
+/// otherwise each grow their own copy of it.
+enum OwnedOut {
+    F16(Option<CudaSlice<f16>>),
+    BF16(Option<CudaSlice<bf16>>),
+    F32(Option<CudaSlice<f32>>),
+}
+
+/// [`resolve_typed_out`] with the element type chosen from a runtime [`DType`].
+fn resolve_out(
+    dtype: crate::DType,
+    origin: Backing,
+    dev: &CudaDevice,
+    elems: usize,
+) -> Result<(u64, OwnedOut, Backing)> {
+    match dtype {
+        crate::DType::F16 => {
+            let (p, o, b) = resolve_typed_out::<f16>(origin, dev, elems)?;
+            Ok((p, OwnedOut::F16(o), b))
+        }
+        crate::DType::BF16 => {
+            let (p, o, b) = resolve_typed_out::<bf16>(origin, dev, elems)?;
+            Ok((p, OwnedOut::BF16(o), b))
+        }
+        crate::DType::F32 => {
+            let (p, o, b) = resolve_typed_out::<f32>(origin, dev, elems)?;
+            Ok((p, OwnedOut::F32(o), b))
+        }
+        other => crate::bail!("quantized matmul: unsupported output dtype {other:?}"),
+    }
+}
+
+/// [`tensor_from_out`] for a destination resolved by [`resolve_out`].
+fn tensor_from_owned_out<'w>(
+    owned: OwnedOut,
+    ptr: u64,
+    backing: Backing,
+    shape: crate::Shape,
+    device: &CudaDevice,
+) -> Result<crate::LiveTensor<'w>> {
+    match owned {
+        OwnedOut::F16(o) => tensor_from_out::<f16>(o, ptr, backing, shape, device),
+        OwnedOut::BF16(o) => tensor_from_out::<bf16>(o, ptr, backing, shape, device),
+        OwnedOut::F32(o) => tensor_from_out::<f32>(o, ptr, backing, shape, device),
+    }
+}
+
+/// The dispatcher's store-width code for an output dtype.
+fn out_dtype_code(dtype: crate::DType) -> Result<i32> {
+    let code = match dtype {
+        crate::DType::F16 => OutDType::F16,
+        crate::DType::BF16 => OutDType::BF16,
+        crate::DType::F32 => OutDType::F32,
+        other => crate::bail!("quantized matmul: unsupported output dtype {other:?}"),
+    };
+    Ok(code as i32)
+}
+
+/// Turn a launcher status code into an error.
+///
+/// The launchers pick a kernel from a static table; a miss leaves the destination
+/// holding whatever the arena last put there. Checking the code is what makes that
+/// a failure instead of wrong numbers.
+fn check_matmul_status(code: i32, op: &str) -> Result<()> {
+    match MatmulStatus::from_code(code).failure() {
+        None => Ok(()),
+        Some(reason) => crate::bail!("{op}: kernel not launched ({reason}, status {code})"),
+    }
+}
+
+/// Build the q8a128 operand for whichever destination the kernel just wrote.
+///
+/// Kept next to [`resolve_u8_out`] because the two are halves of one decision:
+/// resolve picks where the bytes go, this wraps them without the caller having
+/// to re-derive which arm was taken.
+fn q8a128_from_out<'w>(
+    owned: Option<CudaSlice<u8>>,
+    ptr: u64,
+    backing: Backing,
+    bytes: usize,
+    rows: usize,
+    cols: usize,
+    device: &CudaDevice,
+) -> Result<Q8a128Operand<'w>> {
+    match owned {
+        Some(slice) => Ok(Q8a128Operand::new(slice, rows, cols)),
+        None => {
+            let dev = crate::Device::Cuda(device.clone());
+            let origin = match backing {
+                Backing::Lease(o) => o,
+                Backing::Owned => LeaseOrigin::Foreign,
+            };
+            // SAFETY: the kernel above filled `bytes` at `ptr`, and `'w` is the
+            // generation that range was carved from, so the operand cannot be
+            // named after the span is reset.
+            let backing_tensor = unsafe {
+                crate::LiveTensor::from_leased_cuda_ptr(ptr, crate::DType::U8, bytes, &dev, origin)?
+            };
+            Ok(Q8a128Operand::from_tensor(backing_tensor, rows, cols))
+        }
+    }
+}
+
+/// Wrap whichever destination a kernel wrote into as a tensor bounded by `'w`.
+///
+/// The leased arm is why these kernels carry a lifetime: an inherited output
+/// lives in a span the next layer resets, so returning `Tensor` (`'static`) over
+/// it would be a lie the borrow checker could not catch.
+fn tensor_from_out<
+    'w,
+    T: crate::WithDType + crate::cuda_backend::CudaDType + cudarc::driver::DeviceRepr,
+>(
+    owned: Option<CudaSlice<T>>,
+    ptr: u64,
+    backing: Backing,
+    shape: crate::Shape,
+    device: &CudaDevice,
+) -> Result<crate::LiveTensor<'w>> {
+    match owned {
+        Some(slice) => {
+            let storage = CudaStorage::wrap_cuda_slice(slice, device.clone());
+            // SAFETY: the kernel wrote `shape.elem_count()` elements of `T`.
+            Ok(unsafe { crate::LiveTensor::from_cuda_storage(storage, shape) })
+        }
+        None => {
+            let dev = crate::Device::Cuda(device.clone());
+            let origin = match backing {
+                Backing::Lease(o) => o,
+                Backing::Owned => LeaseOrigin::Foreign,
+            };
+            // SAFETY: as above, and `'w` bounds the carved range.
+            unsafe { crate::LiveTensor::from_leased_cuda_ptr(ptr, T::DTYPE, shape, &dev, origin) }
+        }
+    }
+}
+
 /// `'w` is the backing tensor's: the B2 decode context is written into an
 /// inference wave's transient half, so an operand wrapping it must not outlive
 /// that wave. The owned variant allocates and is free to pick any `'w`.
@@ -4201,6 +4451,41 @@ pub struct Q8a128Operand<'w> {
 }
 
 impl<'w> Q8a128Operand<'w> {
+    /// Copy off whatever arena this operand lives in, yielding one that owns its
+    /// bytes and so may be `'static`.
+    ///
+    /// The sanctioned escape from a wave, and the only one: it really copies
+    /// rather than laundering the lifetime. Needed where an operand crosses a
+    /// boundary the borrow checker cannot follow — the expert-pipeline thread
+    /// receives its work over a channel, so a `MoeWorkRequest` cannot carry a
+    /// lifetime and must own what it holds.
+    pub fn to_owned(&self) -> Result<Q8a128Operand<'static>> {
+        let data = match &self.data {
+            Q8a128Data::Owned(slice) => Q8a128Data::Owned(slice.try_clone().w()?),
+            Q8a128Data::Tensor(t) => Q8a128Data::Tensor(t.to_owned_tensor()?),
+        };
+        Ok(Q8a128Operand {
+            data,
+            rows: self.rows,
+            cols: self.cols,
+            lead: self.lead.clone(),
+        })
+    }
+
+    /// The arena this operand's bytes came from, for a kernel that wants to
+    /// allocate its output alongside them.
+    ///
+    /// The `Owned` arm holds a pool `CudaSlice` and so reports
+    /// [`Backing::Owned`]; the `Tensor` arm forwards whatever its storage
+    /// carries, which is how a wave-backed activation propagates through a
+    /// whole expert chain without any call site naming a generation.
+    pub fn backing(&self) -> Backing {
+        match &self.data {
+            Q8a128Data::Owned(_) => Backing::Owned,
+            Q8a128Data::Tensor(t) => t.cuda_backing(),
+        }
+    }
+
     /// Wrap owned q8a128 blocks of flattened logical shape `[rows × cols]`. `lead` defaults to
     /// `[rows]` (a 2D `[M, N]` output); use [`Self::with_lead`] to preserve higher activation
     /// ranks. The matmul mode (mode-1 vs mode-2 weight-reuse) is NOT stored here — it is a
@@ -4259,6 +4544,55 @@ impl<'w> Q8a128Operand<'w> {
         }
     }
 
+    /// Re-describe these bytes as a `'static` operand that **borrows** them.
+    ///
+    /// The counterpart to [`Self::to_owned`], and the one to prefer: `to_owned`
+    /// copies the whole activation off the arena, which on the MoE path is a
+    /// per-layer device copy of the entire ln2 output. This copies nothing — it
+    /// wraps the same address as a [`LeaseOrigin::Foreign`] lease, so dropping
+    /// the result frees nothing and the producer stays the owner.
+    ///
+    /// `'static` here is a statement about *ownership*, not lifetime: the result
+    /// owns no memory, so there is nothing for a lifetime to bound. That is what
+    /// lets it cross a channel — a `MoeWorkRequest` cannot carry a borrow — and
+    /// it is also exactly why the caller carries the obligation below.
+    ///
+    /// # Safety
+    /// `self` must outlive every use of the returned operand. On the expert
+    /// pipeline that is structural rather than hoped for: `submit_moe_work`
+    /// sends the request and immediately blocks on the response channel, so the
+    /// submitting frame — and the activation it holds — is live for the whole of
+    /// the worker's use, and both threads issue on the same stream.
+    pub unsafe fn as_foreign_lease(&self, device: &CudaDevice) -> Result<Q8a128Operand<'static>> {
+        let bytes = self.byte_len();
+        let dev = crate::Device::Cuda(device.clone());
+        let leased = self.with_device_ptr(device, |ptr| {
+            LiveTensor::from_leased_cuda_ptr(
+                ptr,
+                crate::DType::U8,
+                bytes,
+                &dev,
+                LeaseOrigin::Foreign,
+            )
+        })?;
+        Ok(Q8a128Operand {
+            data: Q8a128Data::Tensor(leased),
+            rows: self.rows,
+            cols: self.cols,
+            lead: self.lead.clone(),
+        })
+    }
+
+    /// Packed size of the q8a1024 blocks backing this operand.
+    ///
+    /// Delegates to [`q8a1024_byte_len`] rather than recomputing: this is the
+    /// size `as_foreign_lease` stamps on the lease it hands the expert pipeline,
+    /// and a figure that disagrees with what the quantizer actually allocated is
+    /// a lease that lies about its own extent.
+    pub fn byte_len(&self) -> usize {
+        q8a1024_byte_len(self.rows, self.cols)
+    }
+
     /// Run `f` with the raw device pointer to the q8a128 bytes, keeping the backing's
     /// storage/stream guards alive for the duration so the pointer stays valid. Unifies the
     /// owned-slice and tensor-backed variants for the kernel dispatch.
@@ -4292,9 +4626,30 @@ impl<'w> Q8a128Operand<'w> {
 /// path). Threading one type through the matmul hides whether it runs in float or int8
 /// mode: the int8 arm runs the q8a128 tensor-core path (mode-1/mode-2 chosen by the occupancy
 /// formula `q8a128_dense_use_mode2` at dispatch), the float arm derives it from the tensor's dtype.
-pub enum DynamicTensor<'a> {
-    Float(&'a crate::LiveTensor<'a>),
-    Int8(&'a Q8a128Operand<'a>),
+/// Two lifetimes, deliberately distinct: `'a` is how long this borrow of the
+/// operand lasts, `'w` is the generation the operand's memory belongs to.
+///
+/// Collapsing them (`Float(&'a LiveTensor<'a>)`) forces the result of a matmul
+/// to be bounded by the borrow of a *local variable* rather than by the arena
+/// the bytes came from — so a pool-backed activation held in a local could not
+/// produce a result that outlives the local, even though the result is owned.
+/// Keeping them apart lets `'w` stay `'static` for pool operands and contract
+/// to the guard only for wave-backed ones, which is the whole point.
+pub enum DynamicTensor<'a, 'w> {
+    Float(&'a crate::LiveTensor<'w>),
+    Int8(&'a Q8a128Operand<'w>),
+}
+
+impl DynamicTensor<'_, '_> {
+    /// The arena this activation came from, so a matmul over it can allocate its
+    /// output alongside. Forwarding this at every call site is the whole of the
+    /// inheritance rule on the consumer side.
+    pub fn backing(&self) -> Backing {
+        match self {
+            Self::Float(t) => t.cuda_backing(),
+            Self::Int8(op) => op.backing(),
+        }
+    }
 }
 
 /// Owned activation operand produced by [`to_dynamic`]: a float tensor ([`Int8Mode::Off`]) or
@@ -4307,7 +4662,7 @@ pub enum DynamicActs<'w> {
 
 impl<'w> DynamicActs<'w> {
     /// Borrow as the matmul-facing [`DynamicTensor`].
-    pub fn as_dynamic(&self) -> DynamicTensor<'_> {
+    pub fn as_dynamic(&self) -> DynamicTensor<'_, 'w> {
         match self {
             DynamicActs::Float(t) => DynamicTensor::Float(t),
             DynamicActs::Int8(op) => DynamicTensor::Int8(op),
@@ -4322,11 +4677,11 @@ impl<'w> DynamicActs<'w> {
 /// [`Int8Mode::Performance`] and [`Int8Mode::Precision`] — only the weight twin differs — so this
 /// branches solely on [`Int8Mode::is_int8`]. Paired with `QMatMul::repack_for_optimization` on the
 /// weight side; the matmul's KO⇔int8 guard keeps the two consistent.
-pub fn to_dynamic<'a>(
-    xs: &'a crate::LiveTensor<'a>,
+pub fn to_dynamic<'w>(
+    xs: &crate::LiveTensor<'w>,
     mode: Int8Mode,
     device: &CudaDevice,
-) -> Result<DynamicActs<'a>> {
+) -> Result<DynamicActs<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     if !mode.is_int8() {
         return Ok(DynamicActs::Float(xs.clone()));
@@ -4375,6 +4730,18 @@ pub fn to_dynamic<'a>(
     Ok(DynamicActs::Int8(op.with_lead(lead)))
 }
 
+/// Bytes a `[rows, cols]` activation occupies in the q8a1024 flat-grouped layout:
+/// 8 × 128-element tiles per 1152-byte super-block (see blocks.cuh).
+///
+/// The single definition of this size. `cols` is only required to be a multiple of
+/// 128, so the tile count is rounded up to whole super-blocks across the whole
+/// buffer — dividing `cols` by 1024 instead truncates for every K that is not a
+/// multiple of 1024, which includes the MoE intermediate widths (Qwen3-30B-A3B's
+/// is 768, where that form yields zero).
+pub(crate) fn q8a1024_byte_len(rows: usize, cols: usize) -> usize {
+    (rows * (cols / 128)).div_ceil(8) * 1152
+}
+
 /// Quantize activations `[rows, cols]` (dtype 0=F16,1=BF16,2=F32 at `act_ptr`) →
 /// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
 /// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
@@ -4386,9 +4753,7 @@ pub fn quantize_acts_q8a128(
     cols: usize,
     device: &CudaDevice,
 ) -> Result<Q8a128Operand<'static>> {
-    // q8a1024 flat-grouped: 8 × 128-tiles per 1152-byte super-block (see blocks.cuh).
-    let total_tiles = rows * (cols / 128);
-    let bytes = total_tiles.div_ceil(8) * 1152;
+    let bytes = q8a1024_byte_len(rows, cols);
     let mut out = unsafe { device.alloc::<u8>(bytes)? };
     {
         let stream = device.cuda_stream();
@@ -4414,12 +4779,13 @@ pub fn quantize_acts_q8a128(
 /// rounded through the input dtype before quantization, mirroring the FP store). `K` must be a
 /// multiple of 128 and ≤ 8192 (the row is cached in shared memory). Leading dims are preserved on
 /// the operand so the int8 matmul rebuilds the output rank like the float path.
-pub fn rms_norm_q8a128(
+pub fn rms_norm_q8a128<'w>(
     xs: &crate::Tensor,
     alpha: &crate::Tensor,
     eps: f32,
     device: &CudaDevice,
-) -> Result<Q8a128Operand<'static>> {
+    origin: Backing,
+) -> Result<Q8a128Operand<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     let (rows, cols) = match xs.dims() {
         &[m, k] => (m, k),
@@ -4453,9 +4819,9 @@ pub fn rms_norm_q8a128(
         d => crate::bail!("rms_norm_q8a128: unsupported dtype {d:?}"),
     };
 
-    let total_tiles = rows * (cols / 128);
-    let bytes = total_tiles.div_ceil(8) * 1152;
-    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+    let bytes = q8a1024_byte_len(rows, cols);
+    let out_bytes = bytes;
+    let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
 
     let (xs_storage, xs_layout) = xs.storage_and_layout();
     let (xo1, xo2) = xs_layout.contiguous_offsets().ok_or_else(|| {
@@ -4482,7 +4848,7 @@ pub fn rms_norm_q8a128(
 
     let stream = device.cuda_stream();
     {
-        let (out_ptr, _go) = out.device_ptr_mut(&stream);
+        let out_ptr = out_ptr_planned;
         // The src/alpha slices and their device-ptr guards must outlive the launch, so the kernel
         // call happens inside the match arm where all are still alive.
         macro_rules! launch {
@@ -4513,7 +4879,16 @@ pub fn rms_norm_q8a128(
     }
 
     let lead: Vec<usize> = xs.dims()[..xs.rank() - 1].to_vec();
-    Ok(Q8a128Operand::new(out, rows, cols).with_lead(lead))
+    q8a128_from_out(
+        owned,
+        out_ptr_planned,
+        out_backing,
+        bytes,
+        rows,
+        cols,
+        device,
+    )
+    .map(|o| o.with_lead(lead))
 }
 
 /// Fused SwiGLU → q8a128: compute `silu(gate) · up` element-wise and emit the q8a128 activation
@@ -4522,11 +4897,12 @@ pub fn rms_norm_q8a128(
 /// must share shape `[.. × K]` and dtype; `K` (and the total element count) must be a multiple of
 /// 128. Tracks the two-call path within float margin (silu uses the same fast-exp path, the
 /// result is rounded through the input dtype before quantization). Leading dims are preserved.
-pub fn silu_mul_q8a128(
+pub fn silu_mul_q8a128<'w>(
     gate: &crate::Tensor,
     up: &crate::Tensor,
     device: &CudaDevice,
-) -> Result<Q8a128Operand<'static>> {
+    origin: Backing,
+) -> Result<Q8a128Operand<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     if gate.dims() != up.dims() {
         crate::bail!(
@@ -4561,9 +4937,9 @@ pub fn silu_mul_q8a128(
         d => crate::bail!("silu_mul_q8a128: unsupported dtype {d:?}"),
     };
 
-    let total_tiles = rows * (cols / 128);
-    let bytes = total_tiles.div_ceil(8) * 1152;
-    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+    let bytes = q8a1024_byte_len(rows, cols);
+    let out_bytes = bytes;
+    let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
 
     let (g_storage, g_layout) = gate.storage_and_layout();
     let (go1, go2) = g_layout.contiguous_offsets().ok_or_else(|| {
@@ -4590,7 +4966,7 @@ pub fn silu_mul_q8a128(
 
     let stream = device.cuda_stream();
     {
-        let (out_ptr, _go) = out.device_ptr_mut(&stream);
+        let out_ptr = out_ptr_planned;
         macro_rules! launch {
             ($gsl:expr, $usl:expr) => {{
                 let gv = $gsl.slice(go1..go2);
@@ -4618,7 +4994,16 @@ pub fn silu_mul_q8a128(
     }
 
     let lead: Vec<usize> = gate.dims()[..gate.rank() - 1].to_vec();
-    Ok(Q8a128Operand::new(out, rows, cols).with_lead(lead))
+    q8a128_from_out(
+        owned,
+        out_ptr_planned,
+        out_backing,
+        bytes,
+        rows,
+        cols,
+        device,
+    )
+    .map(|o| o.with_lead(lead))
 }
 
 /// Quantize F32 weights `[nrows × ncols]` (row-major) → a GPU buffer in the lane-major KO
@@ -4735,7 +5120,7 @@ pub use candle_kernels::simple::moe_bucketize::{
     MAX_EXPERTS as MOE_MAX_EXPERTS, MAX_TOPK as MOE_MAX_TOPK,
 };
 
-fn grouped_matmul_gemx_q8a128(
+fn grouped_matmul_gemx_q8a128<'w>(
     act_ptr: u64,
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,
@@ -4744,7 +5129,8 @@ fn grouped_matmul_gemx_q8a128(
     total_batch: usize,
     expert_offsets: &[i32],
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+    origin: Backing,
+) -> Result<crate::LiveTensor<'w>> {
     let num_experts = weight_ptrs.len();
     if num_experts == 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
@@ -4780,7 +5166,8 @@ fn grouped_matmul_gemx_q8a128(
     }
     let num_tiles = tile_expert.len();
 
-    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+    let (dst_ptr, owned_dst, out_backing) =
+        resolve_typed_out::<f32>(origin, device, nrows * total_batch)?;
 
     {
         let stream = device.cuda_stream();
@@ -4801,13 +5188,16 @@ fn grouped_matmul_gemx_q8a128(
         for &x in &tile_b_cnt {
             packed.extend_from_slice(&x.to_le_bytes());
         }
-        let tables_dev = device.memcpy_stod(&packed)?;
+        // The tile tables are read by the same launch as the activation they
+        // dispatch over, so they belong on the same span. A host-built table has
+        // no device operand to inherit from, so it names the arena the caller
+        // already resolved for this call's output.
+        let tables_dev = device.memcpy_stod_from(&packed, origin)?;
         let (base, _tg) = tables_dev.device_ptr(&stream);
         let wptr_ptr = base;
         let te_ptr = base + off_te as u64;
         let tbs_ptr = base + off_tbs as u64;
         let tbc_ptr = base + off_tbc as u64;
-        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
         unsafe {
             run_grouped_quantized_matmul(
                 wptr_ptr as *const std::ffi::c_void,
@@ -4827,14 +5217,8 @@ fn grouped_matmul_gemx_q8a128(
         }
     }
 
-    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
     let out_shape: Shape = vec![total_batch, nrows].into();
-    Ok(crate::tensor::from_storage(
-        crate::Storage::Cuda(out_storage),
-        out_shape,
-        crate::op::BackpropOp::none(),
-        false,
-    ))
+    tensor_from_out::<f32>(owned_dst, dst_ptr, out_backing, out_shape, device)
 }
 
 /// Grouped (MoE) quantized matmul over a [`DynamicTensor`] activation, dispatched by
@@ -4862,14 +5246,15 @@ fn ensure_qmatmul_pairing(input: &DynamicTensor, weight_dtype: GgmlDType) -> Res
     Ok(())
 }
 
-pub fn grouped_qmatmul(
+pub fn grouped_qmatmul<'w>(
     input: DynamicTensor,
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,
     nrows: usize,
     expert_offsets: &[i32],
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+    origin: Backing,
+) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&input, weight_dtype)?;
     match input {
         DynamicTensor::Int8(op) => op.with_device_ptr(device, |act_ptr| {
@@ -4882,6 +5267,7 @@ pub fn grouped_qmatmul(
                 op.rows,
                 expert_offsets,
                 device,
+                origin,
             )
         }),
         DynamicTensor::Float(t) => {
@@ -4891,6 +5277,13 @@ pub fn grouped_qmatmul(
                 _ => crate::bail!("grouped_qmatmul: Float input must be a CUDA tensor"),
             };
             let ncols = *layout.shape().dims().last().unwrap();
+            // The FP grouped path writes through `&mut CudaSlice`, so it owns
+            // its output rather than taking a planned slot. An owned tensor
+            // coerces into any `'w` — it outlives every wave — so the caller
+            // sees the same type either way. This is the non-int8 path: the
+            // expert GEMMs of an F16/BF16 config still allocate, and the
+            // detector reports them as such.
+            let _ = origin;
             grouped_matmul_gemx_impl(
                 weight_ptrs,
                 weight_dtype,
@@ -4923,8 +5316,8 @@ pub fn grouped_qmatmul(
 /// to the host path for every valid row: same tables (proven by the bucketize
 /// tests), same ascending-expert tile order, same kernel.
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_qmatmul_dev_q8a128(
-    op: &Q8a128Operand<'_>,
+pub fn grouped_qmatmul_dev_q8a128<'w>(
+    op: &Q8a128Operand<'w>,
     weight_ptrs_dev: &CudaSlice<u64>,
     expert_base: usize,
     n_experts: usize,
@@ -4935,7 +5328,7 @@ pub fn grouped_qmatmul_dev_q8a128(
     tile_b_cnt: &CudaSlice<i32>,
     launch_tiles: usize,
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&DynamicTensor::Int8(op), weight_dtype)?;
     if nrows % 32 != 0 {
         crate::bail!("grouped_qmatmul_dev_q8a128: nrows={nrows} must be a multiple of 32");
@@ -4968,7 +5361,10 @@ pub fn grouped_qmatmul_dev_q8a128(
             weight_ptrs_dev.len()
         );
     }
-    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+    // Inherits the gathered activation's arena, so the whole expert chain —
+    // gate, up, SwiGLU, down — stays in the FFN generation the gather seeded.
+    let (dst_ptr, owned_dst, out_backing) =
+        resolve_typed_out::<f32>(op.backing(), device, nrows * total_batch)?;
     {
         let stream = device.cuda_stream();
         let (wp_base, _g0) = weight_ptrs_dev.device_ptr(&stream);
@@ -4977,7 +5373,6 @@ pub fn grouped_qmatmul_dev_q8a128(
         let (te, _g1) = tile_expert.device_ptr(&stream);
         let (tbs, _g2) = tile_b_start.device_ptr(&stream);
         let (tbc, _g3) = tile_b_cnt.device_ptr(&stream);
-        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
         op.with_device_ptr(device, |act_ptr| {
             unsafe {
                 run_grouped_quantized_matmul(
@@ -5000,14 +5395,8 @@ pub fn grouped_qmatmul_dev_q8a128(
         })?;
     }
 
-    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
     let out_shape: Shape = vec![total_batch, nrows].into();
-    Ok(crate::tensor::from_storage(
-        crate::Storage::Cuda(out_storage),
-        out_shape,
-        crate::op::BackpropOp::none(),
-        false,
-    ))
+    tensor_from_out::<f32>(owned_dst, dst_ptr, out_backing, out_shape, device)
 }
 
 /// Dense (non-MoE) quantized matmul over a [`DynamicTensor`] activation: a single weight
@@ -5033,17 +5422,18 @@ fn ko_fmt_code(dtype: GgmlDType) -> Result<i32> {
 
 /// Fused qkv int8 dense matmul: a SINGLE launch multiplies the shared q8a128 activation `op`
 /// (`[lead.., K]`) by up to three KO weights of possibly-different formats, writing the
-/// **concatenated** `[lead.., ΣN]` F32 output. Per thread-block the global N-tile resolves to one
+/// **concatenated** `[lead.., ΣN]` output at `out_dtype`. Per thread-block the global N-tile resolves to one
 /// segment (boundaries align to the 32-row tile → no divergence) and runs that segment's format on
 /// the shared activation. Float-identical to running the segments as separate `q8a128_dense_matmul`
 /// calls, but one launch with full GPU occupancy (the tiny k/v GEMVs no longer starve).
 ///
 /// `segments`: `(weight device ptr, KO dtype, N)` for each of q, k, v — N must be a multiple of 32.
-pub(crate) fn qkv_segmented_matmul(
-    op: &Q8a128Operand<'_>,
+pub(crate) fn qkv_segmented_matmul<'w>(
+    op: &Q8a128Operand<'w>,
     segments: &[(u64, GgmlDType, usize)],
+    out_dtype: crate::DType,
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+) -> Result<crate::LiveTensor<'w>> {
     if op.cols % 128 != 0 {
         crate::bail!(
             "qkv_segmented_matmul: K={} must be a multiple of 128",
@@ -5079,13 +5469,15 @@ pub(crate) fn qkv_segmented_matmul(
     let total_n_tiles = tile_start;
 
     let mode2 = q8a128_dense_use_mode2(m, n_total, k, cached_sm_count(device)) as i32;
-    let mut dst = unsafe { device.alloc::<f32>(m * n_total)? };
+    let out_code = out_dtype_code(out_dtype)?;
+    // Inherits the fused ln1 activation's arena, so q/k/v land in the attention
+    // generation alongside the norm that produced their operand.
+    let (dst_ptr, owned_dst, out_backing) =
+        resolve_out(out_dtype, op.backing(), device, m * n_total)?;
     op.with_device_ptr(device, |act_ptr| {
-        let stream = device.cuda_stream();
-        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
         // `bytes` is the HOST segment table (≤3 × 24B); the launcher copies it into by-value kernel
         // params, so there is no per-call device upload.
-        unsafe {
+        let status = unsafe {
             run_qkv_segmented_matmul(
                 bytes.as_ptr() as *const std::ffi::c_void,
                 segments.len() as i32,
@@ -5096,36 +5488,34 @@ pub(crate) fn qkv_segmented_matmul(
                 m as i32,
                 n_total as i32,
                 mode2,
-            );
-        }
-        Ok(())
+                out_code,
+            )
+        };
+        check_matmul_status(status, "qkv_segmented_matmul")
     })?;
 
-    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
     let mut out_dims = op.lead.clone();
     out_dims.push(n_total);
     let out_shape: Shape = out_dims.into();
-    Ok(crate::tensor::from_storage(
-        crate::Storage::Cuda(out_storage),
-        out_shape,
-        crate::op::BackpropOp::none(),
-        false,
-    ))
+    tensor_from_owned_out(owned_dst, dst_ptr, out_backing, out_shape, device)
 }
 
 /// The q8a128 int8 dense launch with an **explicit** tiling mode (`mode2`: false = mode-1 `Bm=16`,
 /// true = mode-2 `Bm=32` weight-reuse). Production reaches this from [`dense_qmatmul`] with the mode
 /// chosen by [`q8a128_dense_use_mode2`]; the crossover benchmark calls it directly to time each mode
-/// at a fixed `(M, N, K)`. Result is the F32 `[lead.., N]` output (rank rebuilt from `op.lead`).
-pub(crate) fn q8a128_dense_matmul(
-    op: &Q8a128Operand<'_>,
+/// at a fixed `(M, N, K)`. Result is the `[lead.., N]` output (rank rebuilt from `op.lead`) stored at
+/// `out_dtype` — the MMA accumulates in F32 registers and converts on the store, so a narrow
+/// `out_dtype` is bit-identical to the F32 kernel followed by a cast, minus the cast.
+pub(crate) fn q8a128_dense_matmul<'w>(
+    op: &Q8a128Operand<'w>,
     weight_ptr: u64,
     weight_dtype: GgmlDType,
     nrows: usize,
     weight_len: usize,
     mode2: bool,
+    out_dtype: crate::DType,
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+) -> Result<crate::LiveTensor<'w>> {
     if nrows % 32 != 0 {
         crate::bail!("q8a128_dense_matmul: nrows={nrows} must be a multiple of 32");
     }
@@ -5137,15 +5527,18 @@ pub(crate) fn q8a128_dense_matmul(
     }
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
     let (ncols, total_batch) = (op.cols, op.rows);
-    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+    let out_code = out_dtype_code(out_dtype)?;
+    // Inherits the activation's arena: on the decode path this is o_proj over a
+    // wave-backed attention context, so the projection lands in the same
+    // generation rather than in the pool.
+    let (dst_ptr, owned_dst, out_backing) =
+        resolve_out(out_dtype, op.backing(), device, nrows * total_batch)?;
     op.with_device_ptr(device, |act_ptr| {
-        let stream = device.cuda_stream();
-        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
         let segment = VxSegment {
             weights: weight_ptr as *const std::ffi::c_void,
             batch_count: total_batch as i32,
         };
-        unsafe {
+        let status = unsafe {
             run_quantized_matmul(
                 &segment as *const VxSegment,
                 1, // num_segments = 1 (non-MoE)
@@ -5159,32 +5552,32 @@ pub(crate) fn q8a128_dense_matmul(
                 YType::Q8A128 as i32, // int8 activation; tiling forced via `mode2`
                 weight_len,           // weight_bytes (FP path only; int8 ignores)
                 mode2 as i32,         // 0 = mode-1, 1 = mode-2 (weight-reuse)
-            );
-        }
-        Ok(())
+                out_code,             // store width
+            )
+        };
+        check_matmul_status(status, "q8a128_dense_matmul")
     })?;
-    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
     // Rebuild the output rank from the operand's leading dims ([lead.., N]) so the int8 arm matches
     // the float arm on 3D+ activations (data is row-major [M, N]).
     let mut out_dims = op.lead.clone();
     out_dims.push(nrows);
     let out_shape: Shape = out_dims.into();
-    Ok(crate::tensor::from_storage(
-        crate::Storage::Cuda(out_storage),
-        out_shape,
-        crate::op::BackpropOp::none(),
-        false,
-    ))
+    tensor_from_owned_out(owned_dst, dst_ptr, out_backing, out_shape, device)
 }
 
-pub fn dense_qmatmul(
-    input: DynamicTensor,
+/// `out_dtype` is the width the result is stored at. The int8 arm passes it to the
+/// kernel, which converts the F32 accumulator on the way out — the caller gets the
+/// dtype it asked for with no cast launch. The FP arm has no such choice: those
+/// kernels store at the activation dtype, so `out_dtype` must equal the input's.
+pub fn dense_qmatmul<'w>(
+    input: DynamicTensor<'_, 'w>,
     weight_ptr: u64,
     weight_dtype: GgmlDType,
     nrows: usize,
     weight_len: usize,
+    out_dtype: crate::DType,
     device: &CudaDevice,
-) -> Result<crate::Tensor> {
+) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&input, weight_dtype)?;
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
     match input {
@@ -5200,6 +5593,7 @@ pub fn dense_qmatmul(
                 nrows,
                 weight_len,
                 mode2,
+                out_dtype,
                 device,
             )
         }
@@ -5213,6 +5607,16 @@ pub fn dense_qmatmul(
             let (out_storage, out_shape) = dense_qmatmul_float(
                 weight_ptr, qtype, weight_len, nrows, ncols, cuda, layout, device,
             )?;
+            // Checked against what the path actually produced rather than re-deriving
+            // it from the activation: the FP kernels store at the activation dtype,
+            // but an exotic activation is promoted first, so the input dtype is not
+            // always the answer.
+            if out_storage.dtype() != out_dtype {
+                crate::bail!(
+                    "dense_qmatmul: the FP path produced {:?}, but {out_dtype:?} was requested",
+                    out_storage.dtype()
+                );
+            }
             Ok(crate::tensor::from_storage(
                 crate::Storage::Cuda(out_storage),
                 out_shape,
@@ -5317,11 +5721,11 @@ pub fn fused_moe_gather(
 /// expert ids in descending-logit order. With `norm_topk` the selected top-k softmax weights are
 /// renormalized (which cancels the global softmax denominator exactly, so the kernel never
 /// computes the 128-wide softmax); without it they are the plain full-softmax values.
-pub fn moe_route(
-    logits: &crate::Tensor,
+pub fn moe_route<'w>(
+    logits: &LiveTensor<'w>,
     k: usize,
     norm_topk: bool,
-) -> Result<(crate::Tensor, crate::Tensor)> {
+) -> Result<(LiveTensor<'w>, LiveTensor<'w>)> {
     use crate::cuda_backend::CudaStorageSlice;
 
     let (num_tokens, n_experts) = logits.dims2()?;
@@ -5351,8 +5755,12 @@ pub fn moe_route(
     };
 
     let stream = device.cuda_stream();
-    let out_idx: CudaSlice<u32> = unsafe { device.alloc::<u32>(num_tokens * k)? };
-    let out_w: CudaSlice<f32> = unsafe { device.alloc::<f32>(num_tokens * k)? };
+    // The routing pair is read by the bucketize kernel inside the same FFN
+    // scope as the logits it was derived from, so it belongs beside them.
+    let inherit = cuda.backing;
+    let (out_idx, idx_backing) =
+        unsafe { alloc_inheriting::<u32>(&device, num_tokens * k, inherit)? };
+    let (out_w, w_backing) = unsafe { alloc_inheriting::<f32>(&device, num_tokens * k, inherit)? };
 
     macro_rules! launch {
         ($s:expr) => {{
@@ -5383,13 +5791,21 @@ pub fn moe_route(
 
     let shape: Shape = vec![num_tokens, k].into();
     let weights = crate::tensor::from_storage(
-        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out_w, device.clone())),
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice_backed(
+            out_w,
+            device.clone(),
+            w_backing,
+        )),
         shape.clone(),
         crate::op::BackpropOp::none(),
         false,
     );
     let indices = crate::tensor::from_storage(
-        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out_idx, device.clone())),
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice_backed(
+            out_idx,
+            device.clone(),
+            idx_backing,
+        )),
         shape,
         crate::op::BackpropOp::none(),
         false,
@@ -5401,12 +5817,13 @@ pub fn moe_route(
 /// experts consume directly. The q8a1024 layout is token-contiguous (`hidden % 1024 == 0`), so
 /// this is a byte-row copy of each token's `hidden/1024 · 1152` bytes — no gather-then-quantize.
 /// Mirrors [`fused_moe_gather`] for the int8 path; pairs with [`rms_norm_q8a128`]-fused ln2.
-pub fn fused_moe_gather_q8a128(
+pub fn fused_moe_gather_q8a128<'w>(
     xs_q8: &Q8a128Operand<'_>,
     ids_dev: &CudaSlice<u32>,
     total_rows: usize,
     device: &CudaDevice,
-) -> Result<Q8a128Operand<'static>> {
+    origin: Backing,
+) -> Result<Q8a128Operand<'w>> {
     let hidden = xs_q8.cols;
     if hidden % 1024 != 0 {
         crate::bail!(
@@ -5415,10 +5832,11 @@ pub fn fused_moe_gather_q8a128(
         );
     }
     let row_bytes = (hidden / 1024) * 1152;
-    let mut out = unsafe { device.alloc::<u8>(total_rows * row_bytes)? };
+    let out_bytes = total_rows * row_bytes;
+    let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
     {
         let stream = device.cuda_stream();
-        let (out_ptr, _og) = out.device_ptr_mut(&stream);
+        let out_ptr = out_ptr_planned;
         let (ids_ptr, _ig) = ids_dev.device_ptr(&stream);
         xs_q8.with_device_ptr(device, |src_ptr| {
             unsafe {
@@ -5434,7 +5852,15 @@ pub fn fused_moe_gather_q8a128(
             Ok(())
         })?;
     }
-    Ok(Q8a128Operand::new(out, total_rows, hidden))
+    q8a128_from_out(
+        owned,
+        out_ptr_planned,
+        out_backing,
+        out_bytes,
+        total_rows,
+        hidden,
+        device,
+    )
 }
 
 /// Deterministic MoE scatter: sequential per-token reduce, no atomicAdd.
@@ -5448,10 +5874,10 @@ pub fn fused_moe_gather_q8a128(
 ///
 /// `ys` is ACCUMULATED into (+=); initialize to zero before the first call.
 pub fn fused_deterministic_scatter(
-    ys: &crate::LiveTensor<'_>,
-    down_out: &crate::Tensor,
+    ys: &LiveTensor<'_>,
+    down_out: &LiveTensor<'_>,
     perm: &CudaSlice<u32>,
-    weights_flat: &crate::Tensor,
+    weights_flat: &LiveTensor<'_>,
     reordered_weight_ids: &CudaSlice<u32>,
     token_starts: &CudaSlice<i32>,
     num_tokens: usize,
@@ -5614,7 +6040,7 @@ impl MoeBucketizeWorkspace {
 /// `≥ n_experts` is the router's empty-slot sentinel and is skipped. See
 /// `candle-kernels/src/simple/moe_bucketize.cu` for the padding contract.
 pub fn moe_bucketize(
-    indices: &crate::Tensor,
+    indices: &LiveTensor<'_>,
     n_experts: usize,
     tile_w: usize,
     ws: &mut MoeBucketizeWorkspace,

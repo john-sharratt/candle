@@ -56,7 +56,7 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
             };
             let (y_ptr, _gy) = y.device_ptr(&stream);
             let (dst_ptr, _gd) = dst.device_ptr(&stream);
-            unsafe {
+            let status = unsafe {
                 run_quantized_matmul(
                     &segment as *const VxSegment,
                     1,
@@ -70,8 +70,10 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
                     YType::F16 as i32,
                     xs_repacked.data.len,
                     0,
-                );
-            }
+                    OutDType::F16 as i32,
+                )
+            };
+            assert_eq!(status, 0, "matmul launcher rejected the call");
         }
         dev.synchronize()?;
         let res = dev.memcpy_dtov(&dst.slice(..))?;
@@ -506,7 +508,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
         let (y_ptr, _y_guard) = y.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
-        unsafe {
+        let status = unsafe {
             run_quantized_matmul(
                 &segment as *const VxSegment,
                 1,
@@ -520,8 +522,10 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 YType::F16 as i32,
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
-            );
-        }
+                OutDType::F16 as i32,
+            )
+        };
+        assert_eq!(status, 0, "matmul launcher rejected the call");
     }
 
     let result = dev.memcpy_dtov(&dst.slice(..))?;
@@ -606,7 +610,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
         let (y_ptr, _y_guard) = y.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
-        unsafe {
+        let status = unsafe {
             run_quantized_matmul(
                 &segment as *const VxSegment,
                 1,
@@ -620,8 +624,10 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 YType::F16 as i32,
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
-            );
-        }
+                OutDType::F16 as i32,
+            )
+        };
+        assert_eq!(status, 0, "matmul launcher rejected the call");
     }
 
     let result = dev.memcpy_dtov(&dst.slice(..))?;
@@ -761,7 +767,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
         let (y_ptr, _y_guard) = y.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
-        unsafe {
+        let status = unsafe {
             run_quantized_matmul(
                 &segment as *const VxSegment,
                 1,
@@ -775,8 +781,10 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 YType::F16 as i32,
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
-            );
-        }
+                OutDType::F16 as i32,
+            )
+        };
+        assert_eq!(status, 0, "matmul launcher rejected the call");
     }
 
     let result = dev.memcpy_dtov(&dst.slice(..))?;
@@ -1007,7 +1015,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
             let (y_ptr, _y_guard) = input.device_ptr(&stream);
             let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
-            unsafe {
+            let status = unsafe {
                 run_quantized_matmul(
                     &segment as *const VxSegment,
                     1,
@@ -1021,8 +1029,10 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     YType::BF16 as i32,
                     repacked.data.len,
                     0, // force_mode2 (tiling only; result-invariant)
-                );
-            }
+                    OutDType::BF16 as i32,
+                )
+            };
+            assert_eq!(status, 0, "matmul launcher rejected the call");
         }
 
         let result = dev.memcpy_dtov(&dst.slice(..))?;
@@ -1178,7 +1188,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
         let (y_ptr, _y_guard) = input.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
-        unsafe {
+        let status = unsafe {
             run_quantized_matmul(
                 &segment as *const VxSegment,
                 1,
@@ -1192,8 +1202,10 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 YType::BF16 as i32,
                 repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
-            );
-        }
+                OutDType::BF16 as i32,
+            )
+        };
+        assert_eq!(status, 0, "matmul launcher rejected the call");
     }
 
     let result = dev.memcpy_dtov(&dst.slice(..))?;
@@ -3292,6 +3304,179 @@ fn read_f32_tensor(dev: &CudaDevice, t: &crate::Tensor) -> Result<Vec<f32>> {
     Ok(dev.memcpy_dtov(&b.slice(..))?)
 }
 
+/// Read a narrow matmul output back as raw bit patterns.
+///
+/// Bits, not floats: the point of the narrowed dense kernels is that they are the
+/// F32 kernel plus the store-time conversion, so the gate compares the exact
+/// encoding rather than a tolerance. Widening to f32 first would hide a wrong
+/// rounding mode, and a tolerance would hide a whole wrong table row.
+#[cfg(test)]
+fn read_narrow_bits(dev: &CudaDevice, t: &crate::Tensor) -> Result<Vec<u16>> {
+    let s = t.storage_and_layout().0;
+    let c = match &*s {
+        crate::Storage::Cuda(s) => s,
+        _ => panic!("expected CUDA storage"),
+    };
+    match t.dtype() {
+        crate::DType::F16 => Ok(dev
+            .memcpy_dtov(&c.as_cuda_slice::<f16>()?.slice(..))?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()),
+        crate::DType::BF16 => Ok(dev
+            .memcpy_dtov(&c.as_cuda_slice::<bf16>()?.slice(..))?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()),
+        d => panic!("read_narrow_bits: expected a 16-bit float output, got {d:?}"),
+    }
+}
+
+/// The narrowed dense int8 kernels must be the F32 kernel with the store converted
+/// — bit for bit, for every KO format and both tiling modes.
+///
+/// This is the gate on the dispatch tables. `dense_kernels_int8` is indexed
+/// `[out_dtype][format]` and `dense_kernels_int8_m2` `[out_dtype][format - 14]`;
+/// a row transposed, shifted, or pointing at the wrong format produces plausible
+/// numbers from the wrong weights, which no tolerance test would catch. Comparing
+/// against `f16::from_f32` of the F32 kernel's own output pins both the table and
+/// the kernel's rounding (`__floats2half2_rn` / `__floats2bfloat162_rn`, both
+/// round-to-nearest-even, same as the host cast this replaced).
+#[test]
+fn dense_int8_narrow_output_matches_f32_bitwise() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let stream = dev.cuda_stream();
+    let ncols = 1024usize; // K
+    let nrows = 512usize; // N
+    let mut rng = rand::rng();
+
+    // Every KO format the dense table carries, with its requant parameters.
+    let formats: [(GgmlDType, (i32, usize, usize)); 3] = [
+        (GgmlDType::Q4_KO, (15, 0, 0)),
+        (GgmlDType::Q5_KO, (31, 0, 128)),
+        (GgmlDType::Q6_KO, (63, 256, 0)),
+    ];
+
+    // M=8 stays in mode-1 (Bm=16); M=512 crosses into mode-2 (Bm=32 weight-reuse),
+    // so both dispatch tables are exercised.
+    for &m in &[8usize, 512] {
+        let act: Vec<f32> = (0..m * ncols)
+            .map(|_| rng.random_range(-1.0f32..1.0))
+            .collect();
+        let op = quantize_acts_q8a128_test(&dev, &act, m, ncols)?;
+
+        for &(dtype, (maxq, crumb, hi)) in &formats {
+            let wf32: Vec<f32> = (0..nrows * ncols)
+                .map(|_| rng.random_range(-0.1f32..0.1))
+                .collect();
+            let ko = dev.memcpy_stod(&requant_ko_per128(&wf32, nrows, ncols, maxq, crumb, hi))?;
+            let (ptr, _g) = ko.device_ptr(&stream);
+
+            let wide = read_f32_tensor(
+                &dev,
+                &dense_qmatmul(
+                    DynamicTensor::Int8(&op),
+                    ptr,
+                    dtype,
+                    nrows,
+                    0,
+                    crate::DType::F32,
+                    &dev,
+                )?,
+            )?;
+
+            for out_dtype in [crate::DType::F16, crate::DType::BF16] {
+                let narrow = read_narrow_bits(
+                    &dev,
+                    &dense_qmatmul(
+                        DynamicTensor::Int8(&op),
+                        ptr,
+                        dtype,
+                        nrows,
+                        0,
+                        out_dtype,
+                        &dev,
+                    )?,
+                )?;
+                assert_eq!(narrow.len(), wide.len(), "M={m} {dtype:?} {out_dtype:?}");
+                for (i, (&got, &w)) in narrow.iter().zip(wide.iter()).enumerate() {
+                    let want = match out_dtype {
+                        crate::DType::F16 => f16::from_f32(w).to_bits(),
+                        _ => bf16::from_f32(w).to_bits(),
+                    };
+                    assert_eq!(
+                        got, want,
+                        "M={m} {dtype:?} {out_dtype:?} element {i}: kernel stored {got:#06x}, \
+                         casting the F32 kernel's {w} gives {want:#06x}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The same gate for the fused qkv launcher, whose tables are a dimension larger
+/// (`[out_dtype][format][mode]` for the uniform fast path, `[out_dtype][mode]` for
+/// the mixed one). Runs both: uniform q/k/v formats take the single-format kernel,
+/// mixed formats take the switch kernel, and they are separate table rows.
+#[test]
+fn qkv_segmented_narrow_output_matches_f32_bitwise() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let stream = dev.cuda_stream();
+    let k = 1024usize;
+    let mut rng = rand::rng();
+
+    let uniform: [(usize, GgmlDType, (i32, usize, usize)); 3] = [
+        (1024, GgmlDType::Q4_KO, (15, 0, 0)),
+        (256, GgmlDType::Q4_KO, (15, 0, 0)),
+        (256, GgmlDType::Q4_KO, (15, 0, 0)),
+    ];
+    let mixed: [(usize, GgmlDType, (i32, usize, usize)); 3] = [
+        (1024, GgmlDType::Q4_KO, (15, 0, 0)),
+        (256, GgmlDType::Q6_KO, (63, 256, 0)),
+        (256, GgmlDType::Q6_KO, (63, 256, 0)),
+    ];
+
+    for dims in [&uniform, &mixed] {
+        for &m in &[8usize, 512] {
+            let act: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let op = quantize_acts_q8a128_test(&dev, &act, m, k)?;
+
+            let mut slices = Vec::new();
+            let mut segs: Vec<(u64, GgmlDType, usize)> = Vec::new();
+            for &(n, dtype, (maxq, crumb, hi)) in dims {
+                let wf32: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
+                slices.push(dev.memcpy_stod(&requant_ko_per128(&wf32, n, k, maxq, crumb, hi))?);
+                let (ptr, _g) = slices.last().unwrap().device_ptr(&stream);
+                segs.push((ptr, dtype, n));
+            }
+
+            let wide = read_f32_tensor(
+                &dev,
+                &qkv_segmented_matmul(&op, &segs, crate::DType::F32, &dev)?,
+            )?;
+            for out_dtype in [crate::DType::F16, crate::DType::BF16] {
+                let narrow =
+                    read_narrow_bits(&dev, &qkv_segmented_matmul(&op, &segs, out_dtype, &dev)?)?;
+                assert_eq!(narrow.len(), wide.len());
+                for (i, (&got, &w)) in narrow.iter().zip(wide.iter()).enumerate() {
+                    let want = match out_dtype {
+                        crate::DType::F16 => f16::from_f32(w).to_bits(),
+                        _ => bf16::from_f32(w).to_bits(),
+                    };
+                    assert_eq!(
+                        got, want,
+                        "M={m} {out_dtype:?} element {i}: kernel stored {got:#06x}, \
+                         casting the F32 kernel's {w} gives {want:#06x}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Quantize f32 activations [total_batch, ncols] → `block_q8a128[total_batch][ncols/128]`
 /// (the pre-quantize feeding the INT8 grouped kernel). Synchronizes so the f32
 /// staging buffer is safe to drop.
@@ -3373,6 +3558,7 @@ fn grouped_int8_matches_legacy() -> Result<()> {
             nrows,
             &expert_offsets,
             &dev,
+            Backing::Owned,
         )?;
         let legacy = grouped_matmul_gemx(
             &weight_ptrs,
@@ -3446,8 +3632,17 @@ fn dense_int8_matches_grouped() -> Result<()> {
                 nrows,
                 &[0, total_batch as i32],
                 &dev,
+                Backing::Owned,
             )?;
-            let dense = dense_qmatmul(DynamicTensor::Int8(&q8a128), ko_ptr, kod, nrows, 0, &dev)?;
+            let dense = dense_qmatmul(
+                DynamicTensor::Int8(&q8a128),
+                ko_ptr,
+                kod,
+                nrows,
+                0,
+                crate::DType::F32,
+                &dev,
+            )?;
             let g = read_f32_tensor(&dev, &grouped)?;
             let d = read_f32_tensor(&dev, &dense)?;
             assert_eq!(g.len(), d.len());
@@ -3516,7 +3711,17 @@ fn qmatmul_int8mode_flag_end_to_end() -> Result<()> {
         };
         // Activation side: the same knob picks q8a128 (int8) or float.
         let acts = to_dynamic(&act_t, mode, &dev)?;
-        let out = dense_qmatmul(acts.as_dynamic(), wptr, wdtype, nrows, wlen, &dev)?;
+        let out = dense_qmatmul(
+            acts.as_dynamic(),
+            wptr,
+            wdtype,
+            nrows,
+            wlen,
+            // The float arm stores at the activation dtype, which is F32 here; the int8
+            // arm is free to pick, and F32 keeps both modes directly comparable.
+            crate::DType::F32,
+            &dev,
+        )?;
         let v = read_f32_tensor(&dev, &out)?;
         assert_eq!(v.len(), out_ref.len());
         let rel = rel_l2(&v, &out_ref);
@@ -3558,7 +3763,15 @@ fn qmatmul_int8mode_baseline_bit_check() -> Result<()> {
             _ => unreachable!(),
         };
         let acts = to_dynamic(&act_t, mode, &dev)?;
-        let out = dense_qmatmul(acts.as_dynamic(), wptr, q.dtype(), nrows, wlen, &dev)?;
+        let out = dense_qmatmul(
+            acts.as_dynamic(),
+            wptr,
+            q.dtype(),
+            nrows,
+            wlen,
+            act_t.dtype(),
+            &dev,
+        )?;
         read_f32_tensor(&dev, &out)
     };
 
@@ -3629,7 +3842,15 @@ fn dense_qmatmul_int8_preserves_3d_shape() -> Result<()> {
         .collect();
     let act_t = crate::Tensor::from_vec(act, (b, m, ncols), &device)?;
     let acts = to_dynamic(&act_t, Int8Mode::Performance, &dev)?;
-    let out = dense_qmatmul(acts.as_dynamic(), wptr, q.dtype(), nrows, wlen, &dev)?;
+    let out = dense_qmatmul(
+        acts.as_dynamic(),
+        wptr,
+        q.dtype(),
+        nrows,
+        wlen,
+        act_t.dtype(),
+        &dev,
+    )?;
     assert_eq!(
         out.dims(),
         &[b, m, nrows],
@@ -3648,6 +3869,7 @@ fn dense_qmatmul_int8_preserves_3d_shape() -> Result<()> {
         qf.dtype(),
         nrows,
         wlf,
+        act_t.dtype(),
         &dev,
     )?;
     assert_eq!(
@@ -3696,7 +3918,7 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev)?;
+        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev, Backing::Owned)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -3744,7 +3966,7 @@ fn silu_mul_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = silu_mul_q8a128(&gate, &up, &dev)?;
+        let fused_op = silu_mul_q8a128(&gate, &up, &dev, Backing::Owned)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -3795,6 +4017,7 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
         GgmlDType::Q4_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     dense_qmatmul(
@@ -3803,6 +4026,7 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
         GgmlDType::Q4_K,
         nrows,
         k_len,
+        act.dtype(),
         &dev,
     )?;
 
@@ -3814,6 +4038,7 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
             GgmlDType::Q4_K,
             nrows,
             0,
+            crate::DType::F32,
             &dev
         )
         .is_err(),
@@ -3826,6 +4051,7 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
             GgmlDType::Q4_KO,
             nrows,
             k_len,
+            act.dtype(),
             &dev
         )
         .is_err(),
@@ -3838,7 +4064,8 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
             GgmlDType::Q4_K,
             nrows,
             &[0, m as i32],
-            &dev
+            &dev,
+            Backing::Owned,
         )
         .is_err(),
         "grouped Int8 x non-KO weight must be rejected"
@@ -3850,7 +4077,8 @@ fn qmatmul_rejects_unpaired_weight_activation() -> Result<()> {
             GgmlDType::Q4_KO,
             nrows,
             &[0, m as i32],
-            &dev
+            &dev,
+            Backing::Owned,
         )
         .is_err(),
         "grouped Float x KO weight must be rejected"
@@ -3889,6 +4117,7 @@ fn dense_qmatmul_float_matches_grouped() -> Result<()> {
         wdtype,
         nrows,
         weight_len,
+        act.dtype(),
         &dev,
     )?;
     let grouped = grouped_qmatmul(
@@ -3898,6 +4127,7 @@ fn dense_qmatmul_float_matches_grouped() -> Result<()> {
         nrows,
         &[0, total_batch as i32],
         &dev,
+        Backing::Owned,
     )?;
     let d = read_f32_tensor(&dev, &dense.to_dtype(crate::DType::F32)?)?;
     let g = read_f32_tensor(&dev, &grouped.to_dtype(crate::DType::F32)?)?;
@@ -3977,6 +4207,7 @@ fn q4_ko_matches_q4_k_int8() -> Result<()> {
         GgmlDType::Q4_K,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let out_ko = dense_qmatmul(
@@ -3985,6 +4216,7 @@ fn q4_ko_matches_q4_k_int8() -> Result<()> {
         GgmlDType::Q4_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vk = read_f32_tensor(&dev, &out_k)?;
@@ -4038,6 +4270,7 @@ fn q4ko_submajor_dequant_correct() -> Result<()> {
         GgmlDType::Q4_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vgpu = read_f32_tensor(&dev, &out)?;
@@ -4126,6 +4359,7 @@ fn q8ko_submajor_dequant_correct() -> Result<()> {
         GgmlDType::Q8_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vgpu = read_f32_tensor(&dev, &out)?;
@@ -4198,6 +4432,7 @@ fn q8ko_per128_dequant_correct() -> Result<()> {
         GgmlDType::Q8_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vgpu = read_f32_tensor(&dev, &out)?;
@@ -4258,7 +4493,15 @@ fn q5q6_ko_per128_dequant_correct() -> Result<()> {
         let ko_slice = dev.memcpy_stod(&ob)?;
         let stream = dev.cuda_stream();
         let (ko_ptr, _g) = ko_slice.device_ptr(&stream);
-        let out = dense_qmatmul(DynamicTensor::Int8(&q8a128), ko_ptr, kod, nrows, 0, &dev)?;
+        let out = dense_qmatmul(
+            DynamicTensor::Int8(&q8a128),
+            ko_ptr,
+            kod,
+            nrows,
+            0,
+            crate::DType::F32,
+            &dev,
+        )?;
         let vgpu = read_f32_tensor(&dev, &out)?;
         let mut vref = vec![0f32; total_batch * nrows];
         for row in 0..nrows {
@@ -4331,6 +4574,7 @@ fn q6ko_submajor_dequant_correct() -> Result<()> {
         GgmlDType::Q6_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vgpu = read_f32_tensor(&dev, &out)?;
@@ -4428,6 +4672,7 @@ fn q5ko_submajor_dequant_correct() -> Result<()> {
         GgmlDType::Q5_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let vgpu = read_f32_tensor(&dev, &out)?;
@@ -5073,8 +5318,24 @@ fn q5q6q8_ko_match_k_int8() -> Result<()> {
         let stream = dev.cuda_stream();
         let (ko_ptr, _ko_guard) = ko_slice.device_ptr(&stream);
 
-        let out_k = dense_qmatmul(DynamicTensor::Int8(&q8a128), k_ptrs[0], kd, nrows, 0, &dev)?;
-        let out_ko = dense_qmatmul(DynamicTensor::Int8(&q8a128), ko_ptr, kod, nrows, 0, &dev)?;
+        let out_k = dense_qmatmul(
+            DynamicTensor::Int8(&q8a128),
+            k_ptrs[0],
+            kd,
+            nrows,
+            0,
+            crate::DType::F32,
+            &dev,
+        )?;
+        let out_ko = dense_qmatmul(
+            DynamicTensor::Int8(&q8a128),
+            ko_ptr,
+            kod,
+            nrows,
+            0,
+            crate::DType::F32,
+            &dev,
+        )?;
         let vk = read_f32_tensor(&dev, &out_k)?;
         let vko = read_f32_tensor(&dev, &out_ko)?;
         assert_eq!(vk.len(), vko.len());
@@ -5131,6 +5392,7 @@ fn q4_crossover_scan() -> Result<()> {
                     GgmlDType::Q4_KO,
                     nrows,
                     0,
+                    crate::DType::F32,
                     &dev,
                 )?;
             }
@@ -5145,6 +5407,7 @@ fn q4_crossover_scan() -> Result<()> {
                         GgmlDType::Q4_KO,
                         nrows,
                         0,
+                        crate::DType::F32,
                         &dev,
                     )?;
                 }
@@ -5221,14 +5484,30 @@ fn ko_vs_k_int8_bench() -> Result<()> {
 
             let time_i8 = |ptr: u64| -> Result<f64> {
                 for _ in 0..20 {
-                    let _ = dense_qmatmul(DynamicTensor::Int8(&q8), ptr, kod, nrows, 0, &dev)?;
+                    let _ = dense_qmatmul(
+                        DynamicTensor::Int8(&q8),
+                        ptr,
+                        kod,
+                        nrows,
+                        0,
+                        crate::DType::F32,
+                        &dev,
+                    )?;
                 }
                 dev.synchronize()?;
                 let mut best = f64::MAX;
                 for _ in 0..5 {
                     let t = Instant::now();
                     for _ in 0..100 {
-                        let _ = dense_qmatmul(DynamicTensor::Int8(&q8), ptr, kod, nrows, 0, &dev)?;
+                        let _ = dense_qmatmul(
+                            DynamicTensor::Int8(&q8),
+                            ptr,
+                            kod,
+                            nrows,
+                            0,
+                            crate::DType::F32,
+                            &dev,
+                        )?;
                     }
                     dev.synchronize()?;
                     best = best.min(t.elapsed().as_secs_f64() / 100.0);
@@ -5300,7 +5579,15 @@ fn ko_dense_ncu_probe() -> Result<()> {
         let stream = dev.cuda_stream();
         let (ko_ptr, _g) = ko_slice.device_ptr(&stream);
         for _ in 0..3 {
-            let _ = dense_qmatmul(DynamicTensor::Int8(&q8), ko_ptr, kod, nrows, 0, &dev)?;
+            let _ = dense_qmatmul(
+                DynamicTensor::Int8(&q8),
+                ko_ptr,
+                kod,
+                nrows,
+                0,
+                crate::DType::F32,
+                &dev,
+            )?;
         }
         dev.synchronize()?;
     }
@@ -5418,6 +5705,7 @@ fn grouped_moe_ko_vs_k_bench() -> Result<()> {
                         nrows,
                         &expert_offsets,
                         &dev,
+                        Backing::Owned,
                     )?;
                 }
                 dev.synchronize()?;
@@ -5432,6 +5720,7 @@ fn grouped_moe_ko_vs_k_bench() -> Result<()> {
                             nrows,
                             &expert_offsets,
                             &dev,
+                            Backing::Owned,
                         )?;
                     }
                     dev.synchronize()?;
@@ -5677,6 +5966,7 @@ fn q4k_grouped_stats_bench() -> Result<()> {
                 nrows,
                 &expert_offsets,
                 &dev,
+                Backing::Owned,
             )?;
             let vref = read_bf16_tensor(&dev, &ref_f16)?;
             let vko = read_f32_tensor(&dev, &ko_i8)?;
@@ -5705,6 +5995,7 @@ fn q4k_grouped_stats_bench() -> Result<()> {
                 nrows,
                 &expert_offsets,
                 &dev,
+                Backing::Owned,
             )?;
             let _ = grouped_qmatmul(
                 DynamicTensor::Int8(&q8a128),
@@ -5713,6 +6004,7 @@ fn q4k_grouped_stats_bench() -> Result<()> {
                 nrows,
                 &expert_offsets,
                 &dev,
+                Backing::Owned,
             )?;
         }
         dev.synchronize()?;
@@ -5746,6 +6038,7 @@ fn q4k_grouped_stats_bench() -> Result<()> {
                     nrows,
                     &expert_offsets,
                     &dev,
+                    Backing::Owned,
                 )?;
             }
             dev.synchronize()?;
@@ -5760,6 +6053,7 @@ fn q4k_grouped_stats_bench() -> Result<()> {
                     nrows,
                     &expert_offsets,
                     &dev,
+                    Backing::Owned,
                 )?;
             }
             dev.synchronize()?;
@@ -5935,6 +6229,7 @@ fn q5_ncu_probe() -> Result<()> {
             nrows,
             &expert_offsets,
             &dev,
+            Backing::Owned,
         )?;
     }
     dev.synchronize()?;
@@ -6016,6 +6311,7 @@ fn grouped_int8_outlier_stress() -> Result<()> {
         nrows,
         &expert_offsets,
         &dev,
+        Backing::Owned,
     )?;
     let legacy = grouped_matmul_gemx(
         &k_ptrs,
@@ -6122,6 +6418,7 @@ fn grouped_int8_vs_legacy_bench() -> Result<()> {
                             nrows,
                             &expert_offsets,
                             &dev,
+                            Backing::Owned,
                         )?;
                     }
                 }
@@ -6150,6 +6447,7 @@ fn grouped_int8_vs_legacy_bench() -> Result<()> {
                                 nrows,
                                 &expert_offsets,
                                 &dev,
+                                Backing::Owned,
                             )?;
                         }
                     }
@@ -6709,6 +7007,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 YType::BF16 as i32,
                 0, // weight_bytes=0 → L2-cached assumption (matches grouped_matmul_gemx)
                 0, // force_mode2 (tiling only; result-invariant)
+                OutDType::BF16 as i32,
             );
         };
 
@@ -7209,14 +7508,32 @@ fn q8a128_dense_mode_crossover() -> Result<()> {
                 let op = quantize_acts_q8a128_test(&dev, &act, m, k)?;
                 let time = |mode2: bool| -> Result<f64> {
                     for _ in 0..WARMUP {
-                        let _ = q8a128_dense_matmul(&op, ko_ptr, kod, n, wbytes, mode2, &dev)?;
+                        let _ = q8a128_dense_matmul(
+                            &op,
+                            ko_ptr,
+                            kod,
+                            n,
+                            wbytes,
+                            mode2,
+                            crate::DType::F32,
+                            &dev,
+                        )?;
                     }
                     dev.synchronize()?;
                     let mut v = Vec::with_capacity(ITERS);
                     for _ in 0..ITERS {
                         cuda_flush_l2(&flush_buf, &dev);
                         let t0 = Instant::now();
-                        let _ = q8a128_dense_matmul(&op, ko_ptr, kod, n, wbytes, mode2, &dev)?;
+                        let _ = q8a128_dense_matmul(
+                            &op,
+                            ko_ptr,
+                            kod,
+                            n,
+                            wbytes,
+                            mode2,
+                            crate::DType::F32,
+                            &dev,
+                        )?;
                         dev.synchronize()?;
                         v.push(t0.elapsed().as_secs_f64() * 1e6);
                     }
@@ -7325,12 +7642,20 @@ fn qkv_segmented_matches_separate() -> Result<()> {
             slices.push(ko);
             let (ptr, _g) = slices.last().unwrap().device_ptr(&stream);
             segs.push((ptr, dtype, n));
-            let r = dense_qmatmul(DynamicTensor::Int8(&op), ptr, dtype, n, 0, &dev)?;
+            let r = dense_qmatmul(
+                DynamicTensor::Int8(&op),
+                ptr,
+                dtype,
+                n,
+                0,
+                crate::DType::F32,
+                &dev,
+            )?;
             sep_refs.push(read_f32_tensor(&dev, &r)?);
         }
 
         // Fused.
-        let fused = qkv_segmented_matmul(&op, &segs, &dev)?;
+        let fused = qkv_segmented_matmul(&op, &segs, crate::DType::F32, &dev)?;
         let f = read_f32_tensor(&dev, &fused)?;
         assert_eq!(f.len(), m * n_total);
 
@@ -7369,12 +7694,20 @@ fn qkv_segmented_matches_separate() -> Result<()> {
             Ok(s[s.len() / 2])
         };
         let us_fused = time(&|| {
-            qkv_segmented_matmul(&op, &segs, &dev)?;
+            qkv_segmented_matmul(&op, &segs, crate::DType::F32, &dev)?;
             Ok(())
         })?;
         let us_sep = time(&|| {
             for &(ptr, dt, n) in &segs {
-                let _ = dense_qmatmul(DynamicTensor::Int8(&op), ptr, dt, n, 0, &dev)?;
+                let _ = dense_qmatmul(
+                    DynamicTensor::Int8(&op),
+                    ptr,
+                    dt,
+                    n,
+                    0,
+                    crate::DType::F32,
+                    &dev,
+                )?;
             }
             Ok(())
         })?;
@@ -7445,12 +7778,13 @@ fn qkv_segmented_vs_concat_same_format() -> Result<()> {
                 GgmlDType::Q4_KO,
                 n_total,
                 0,
+                crate::DType::F32,
                 &dev,
             )?;
             Ok(())
         })?;
         let us_seg = time(&|| {
-            qkv_segmented_matmul(&op, &segs, &dev)?;
+            qkv_segmented_matmul(&op, &segs, crate::DType::F32, &dev)?;
             Ok(())
         })?;
         println!(
@@ -7719,6 +8053,7 @@ fn cuda_grouped_qmatmul_dev_matches_host_tables() -> Result<()> {
             nrows,
             &host_offsets,
             &dev,
+            Backing::Owned,
         )?;
 
         // Device path: full table, raw ids, upper-bound launch.

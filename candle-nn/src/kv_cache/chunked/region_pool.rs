@@ -79,8 +79,10 @@ pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
 /// grow from the CUDA pool, where `scratch_margin` already covers them — so it
 /// was 4 regions of KV backing nothing. Reinstate it when something allocates
 /// from it, priced in regions like everything else here.
-const TRANSIENT_SPAN_BYTES: usize =
-    2 * super::bump_arena::WAVE_HALF_BYTES + MIGRATION_STAGING_CAP_BYTES;
+const TRANSIENT_SPAN_BYTES: usize = super::bump_arena::WAVE_ATTN_BYTES
+    + super::bump_arena::WAVE_FFN_BYTES
+    + super::bump_arena::WAVE_FORWARD_BYTES
+    + MIGRATION_STAGING_CAP_BYTES;
 
 const _: () = assert!(
     TRANSIENT_SPAN_BYTES % REGION_BYTES == 0,

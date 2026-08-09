@@ -5,6 +5,7 @@
 
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
@@ -250,6 +251,17 @@ pub struct MoeWorkRequest {
     /// Flat assignment array sorted by expert ID.
     /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
     pub assignments: Vec<(u32, u32, u32)>,
+    /// The wave generation the submitting layer has open, if any.
+    ///
+    /// A [`WaveTicket`] is a `Copy` coordinate rather than a borrow, which is
+    /// the whole reason it can be here: the expert chain runs on the pipeline
+    /// thread, and no `&WaveGeneration` could cross this channel. The forward
+    /// thread blocks on the response for the entire request (`submit_moe_work`
+    /// sends and immediately `recv`s), so the generation is open throughout, and
+    /// both threads issue on the same stream — so the arena's stream-ordered
+    /// reclaim still holds. A ticket from a closed generation resolves to
+    /// nothing, so the worst case is a pool allocation, never a stale range.
+    pub wave: Option<WaveTicket>,
     /// Timestamp captured by the forward thread just before `send` — lets the worker measure the
     /// inbound handoff latency (`submit_inbound` = pickup − submit). Zero-sized off-`profile`.
     pub submitted_at: ProfileMark,

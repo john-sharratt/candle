@@ -32,6 +32,24 @@ pub fn chunk_rope_positions_to_i32_tensor(
     Tensor::from_vec(as_u32, (batch_size, max_blocks), device)
 }
 
+/// Zero-row `(cos, sin)` shaped like a gather's result, allocating nothing.
+///
+/// A wave assembles decode, prefill and glue attention params on every step,
+/// but usually only one of the three groups is populated — so two empty
+/// gathers per token is the normal case, not an edge case. Gathering zero rows
+/// is *not* free: `index_select` uploads an index blob, allocates a
+/// zero-length output and launches a kernel, all to produce nothing.
+///
+/// A zero-row `narrow` is a view over the tables the caller already holds, so
+/// this touches the device not at all.
+pub fn empty_rope_cos_sin(cos_all: &Tensor, sin_all: &Tensor) -> Result<(Tensor, Tensor)> {
+    let rotary = cos_all.dim(1)?;
+    Ok((
+        cos_all.narrow(0, 0, 0)?.reshape((0, 1, rotary))?,
+        sin_all.narrow(0, 0, 0)?.reshape((0, 1, rotary))?,
+    ))
+}
+
 /// Gather per-batch RoPE (cos, sin) rows by `offsets_t` and reshape to (B, 1, D).
 ///
 /// Expects `cos_all` and `sin_all` shaped like (max_seq, D).
@@ -41,6 +59,9 @@ pub fn gather_rope_cos_sin(
     offsets_t: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     let b = offsets_t.dim(0)?;
+    if b == 0 {
+        return empty_rope_cos_sin(cos_all, sin_all);
+    }
 
     let mut cos = cos_all.index_select(offsets_t, 0)?;
     let mut sin = sin_all.index_select(offsets_t, 0)?;
@@ -188,6 +209,59 @@ mod cuda_tests {
     /// decode test over the same process-global region pool, which is what made
     /// `correctness_decode_seal_gap` flaky. See [`crate::models::gpu_test_lock`].
     use crate::models::gpu_test_lock::gpu_serial as gpu_guard;
+
+    /// A wave builds decode, prefill and glue params every step and usually
+    /// only one group is populated, so the empty gather runs twice per token.
+    /// It must not reach the driver at all.
+    ///
+    /// Needs `forbidden_allocations`: without it the detector reports every run
+    /// clean and both halves of this test would pass for the wrong reason.
+    #[cfg(feature = "forbidden_allocations")]
+    #[test]
+    fn empty_rope_gather_touches_no_device_memory() -> Result<()> {
+        let _gpu = gpu_guard();
+        let device = Device::new_cuda(0)?;
+        let cos_all = Tensor::randn(0f32, 1f32, (2048, 64), &device)?;
+        let sin_all = Tensor::randn(0f32, 1f32, (2048, 64), &device)?;
+        let populated = Tensor::new(&[3u32, 9, 17, 31], &device)?;
+        let empty = Tensor::from_vec(Vec::<u32>::new(), 0usize, &device)?;
+
+        // Build both index tensors and take the first-touch traffic (module
+        // load, kernel cache) before arming — it is unavoidable and would
+        // otherwise be attributed to the calls under test.
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &populated)?;
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &empty)?;
+        let _ = candle::forbidden_alloc::take_report();
+
+        let armed = candle::forbidden_alloc::armed();
+        let (cos, sin) = super::gather_rope_cos_sin(&cos_all, &sin_all, &empty)?;
+        drop(armed);
+        let empty_report = candle::forbidden_alloc::take_report();
+
+        // Positive control: the populated gather *does* allocate. Without it a
+        // disarmed detector, or one wired to the wrong build, would report the
+        // empty case clean no matter what it did.
+        let armed = candle::forbidden_alloc::armed();
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &populated)?;
+        drop(armed);
+        let populated_report = candle::forbidden_alloc::take_report();
+
+        assert_eq!(
+            cos.dims(),
+            &[0, 1, 64],
+            "shape must match the gathered form"
+        );
+        assert_eq!(sin.dims(), &[0, 1, 64]);
+        assert!(
+            !populated_report.is_clean(),
+            "control: a real gather must allocate, else the detector is not armed"
+        );
+        assert!(
+            empty_report.is_clean(),
+            "empty gather reached the driver: {empty_report}"
+        );
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // RoPE table helpers (same theta=10000 convention as prefill_utils)

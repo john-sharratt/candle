@@ -50,10 +50,12 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::Result;
 
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::region_pool::carve_transient;
+use super::wave_plan::LayerPhase;
 
 /// A range handed out by a [`Generation`].
 ///
@@ -109,6 +111,14 @@ struct Inner {
     dirty: bool,
     /// High-water mark of `cursor`, for the watermark that sizes the span.
     peak: usize,
+    /// Bumped every time the cursor rewinds.
+    ///
+    /// A [`WaveTicket`] carries the epoch it was minted in, so a ticket from a
+    /// closed generation resolves to nothing rather than carving from whatever
+    /// occupies the span now. `LiveTensor<'w>` already makes that unreachable at
+    /// compile time; this is the backstop for the `unsafe` constructors that
+    /// mint leases from raw pointers, where the compiler has nothing to check.
+    epoch: u64,
     stream: Arc<CudaStream>,
     reclaim: Reclaim,
 }
@@ -153,6 +163,7 @@ impl BumpArena {
                 live: 0,
                 dirty: false,
                 peak: 0,
+                epoch: 0,
                 stream: stream.clone(),
                 reclaim,
             })),
@@ -160,14 +171,26 @@ impl BumpArena {
         })
     }
 
-    /// Open a generation. The cursor cannot reset while the returned guard —
-    /// or any other — is alive.
-    pub(crate) fn generation(&self) -> Generation {
-        self.inner.lock().unwrap().live += 1;
-        Generation {
+    /// Open a generation reserving `planned_span` bytes at the base of the span
+    /// for layout slots.
+    ///
+    /// The cursor starts above the reserved region, so bumped ranges and planned
+    /// slots partition the span between them instead of competing for it.
+    /// Refuses a reservation larger than the arena, since every slot in it would
+    /// otherwise address memory the domain does not own.
+    pub(crate) fn generation(&self, domain: u32, arena: u32) -> Result<Generation> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.cursor > inner.peak {
+            inner.peak = inner.cursor;
+        }
+        inner.live += 1;
+        drop(inner);
+        Ok(Generation {
             inner: Arc::clone(&self.inner),
             name: self.name,
-        }
+            domain,
+            arena,
+        })
     }
 
     /// Whether any [`Generation`] guard is currently open on this arena.
@@ -232,6 +255,30 @@ fn bump<'a>(
     })
 }
 
+/// [`bump`] without the borrow, for the ticket resolver.
+///
+/// [`BumpRange`] ties its lifetime to the mutex guard, which is exactly right at
+/// a call site holding a [`Generation`] and useless here: the resolver is called
+/// from candle-core, which has no guard to borrow from and gets its bound from
+/// the `'w` already on the operand instead. Returning `None` on exhaustion
+/// rather than erroring, for the reason given on [`resolve_wave_alloc`].
+fn bump_raw(inner: &Mutex<Inner>, name: &'static str, len: usize, align: usize) -> Option<u64> {
+    debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+    let mut inner = inner.lock().ok()?;
+    let start = (inner.cursor + align - 1) & !(align - 1);
+    let end = start.checked_add(len)?;
+    if end > inner.capacity {
+        return None;
+    }
+    inner.cursor = end;
+    inner.dirty = true;
+    if end > inner.peak {
+        inner.peak = end;
+        log::debug!("{}: transient peak {} B of {} B", name, end, inner.capacity);
+    }
+    Some(inner.base + start as u64)
+}
+
 /// A live claim on a [`BumpArena`]'s current contents.
 ///
 /// While one exists the cursor cannot reset, so every range handed out since
@@ -240,9 +287,25 @@ fn bump<'a>(
 pub struct Generation {
     inner: Arc<Mutex<Inner>>,
     name: &'static str,
+    /// Coordinates of the arena this guard is open on, so the generation can
+    /// mint a [`WaveTicket`] for the storages allocated inside it.
+    domain: u32,
+    arena: u32,
 }
 
 impl Generation {
+    /// The coordinate an op allocating from this generation should carry.
+    ///
+    /// Stamped with the arena's current epoch, so the ticket stops resolving the
+    /// moment this generation's cursor rewinds.
+    pub fn ticket(&self) -> WaveTicket {
+        WaveTicket {
+            domain: self.domain,
+            arena: self.arena,
+            epoch: self.inner.lock().unwrap().epoch,
+        }
+    }
+
     /// Bump `len` bytes, aligned to `align`, from the half this guard pins.
     ///
     /// The returned range borrows `self`, so it cannot outlive the guard whose
@@ -260,11 +323,11 @@ impl Generation {
     /// A range cannot outlive the guard that reclaims it:
     ///
     /// ```compile_fail
-    /// # use candle_nn::kv_cache::{begin_wave, BumpRange};
+    /// # use candle_nn::kv_cache::{begin_wave, BumpRange, LayerPhase};
     /// # fn f(stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>)
     /// #     -> candle::Result<()> {
     /// let range = {
-    ///     let wave = begin_wave(stream)?;
+    ///     let wave = begin_wave(stream, LayerPhase::Attention)?;
     ///     wave.alloc(1024, 256)?
     /// };
     /// println!("{}", range.ptr);
@@ -275,10 +338,10 @@ impl Generation {
     /// the case above from failing for an unrelated reason:
     ///
     /// ```no_run
-    /// # use candle_nn::kv_cache::begin_wave;
+    /// # use candle_nn::kv_cache::{begin_wave, LayerPhase};
     /// # fn f(stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>)
     /// #     -> candle::Result<()> {
-    /// let wave = begin_wave(stream)?;
+    /// let wave = begin_wave(stream, LayerPhase::Attention)?;
     /// let range = wave.alloc(1024, 256)?;
     /// println!("{}", range.ptr);
     /// # Ok(()) }
@@ -320,6 +383,7 @@ impl Drop for Generation {
         let mut inner = self.inner.lock().unwrap();
         inner.cursor = 0;
         inner.dirty = false;
+        inner.epoch += 1;
     }
 }
 
@@ -337,37 +401,94 @@ pub fn persistence_domain_stats(ordinal: usize) -> Option<(usize, usize, usize)>
     domains().lock().unwrap().get(&ordinal).map(|a| a.stats())
 }
 
-/// Wave-domain half size.
+/// The attention phase's span.
 ///
-/// **Measured**, on Qwen3-30B-A3B at batch 64 (2026-08-07): both halves peak at
-/// 30.8 MiB, so 64 MiB is a little over 2x headroom. The peak is a wide-prefill
-/// attention output; decode-only layers sit at 3.8-6 MiB. Both halves converge
-/// on the same number, which is what per-layer alternation should produce.
+/// Sized from measurement, not symmetry. A generation's bump cursor never
+/// rewinds, so a phase needs the **sum** of everything it allocates, not its
+/// peak. On Qwen3-30B-A3B at ten concurrent contexts the attention phase sums to
+/// 297 MiB, which this rounds up to leave headroom for a wider wave.
 ///
-/// The headroom is deliberate rather than tight. The peak scales with the
-/// widest prefill a wave admits and with head count, so a larger model or a
-/// longer prefill window moves it, and exhausting a half fails the forward
-/// outright — which is the correct behaviour (it is how the O(depth)
-/// accumulation bug was caught) but a bad thing to run close to.
-///
-/// The reservation's transient tier is sized *from* this constant rather than
-/// the other way round ([`super::region_pool`]), so raising it moves the
-/// boundary and costs the KV side two regions per extra 16 MiB — which is the
-/// honest price and the reason to keep [`wave_domain_stats`] and the peak log
-/// pointed at it.
-pub(super) const WAVE_HALF_BYTES: usize = 64 * 1024 * 1024;
+/// Read that number against the one this constant used to hold. It was sized at
+/// 128 MiB from a measured 32 MiB peak — but that peak was the *paged-attention
+/// context buffer alone*, because `attention_norm` was accepting a wave and
+/// passing `Backing::Owned`, so the norm, the QKV projection, its cast and
+/// `o_proj` all inherited the pool instead. A span sized from a chain that is
+/// not running measures the chain that is not running, and it reads exactly like
+/// a comfortable fit: 24% utilisation, no error, no fallback warning. Seeding
+/// the chain moved the phase to 297 MiB in one step.
+pub const WAVE_ATTN_BYTES: usize = 384 * 1024 * 1024;
 
-/// The scheduler's wave domain: two halves, alternating.
+/// The FFN phase's span.
 ///
-/// Double-buffered so wave `N+1` can assemble while wave `N`'s kernels are
-/// still draining (§3.6). A half resets only when its own generation guard
-/// drops, which fences the stream first — so the half being filled and the half
-/// being drained are never the same memory.
+/// Four times the attention span because the expert chain is four buffers deep
+/// over `rows x experts_per_tok` rows — gather, gate, up, SwiGLU, down, cast —
+/// and none of them is reclaimed until the guard drops. This is the number that
+/// was clipping: the measured peak sat at 99.87% of a 64 MiB span, so the true
+/// demand was unknown until the cap was lifted off it.
+pub const WAVE_FFN_BYTES: usize = 512 * 1024 * 1024;
+
+/// The forward-scoped span.
+///
+/// Three orders of magnitude smaller than the layer phases, because it holds a
+/// different *kind* of thing. The phase spans carry activations, which scale
+/// with wave width times model width; this carries the metadata a forward builds
+/// once and every layer reads — ragged prefill offsets, RoPE tables, gathered
+/// position ids — which scale with the *sequence count*. A 64-sequence wave puts
+/// a few kilobytes here.
+///
+/// **One region**, which is also the floor: the transient tier is carved in
+/// [`super::region_pool::REGION_BYTES`] units and a compile-time assert requires
+/// the total to stay region-aligned, so a smaller span would not buy back any
+/// memory — it would round up to this anyway. The measured need is ~3 KB, so
+/// this is ~5000x headroom, and none of it is wasted: a span that cannot be
+/// subdivided cannot be spent on anything else.
+pub const WAVE_FORWARD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The scheduler's wave domain: one arena per layer phase.
+///
+/// A layer opens exactly two generations — attention, then the FFN — so with the
+/// arenas named by phase, attention reuses one span every layer and the FFN
+/// reuses the other. That is what the alternating pair already produced by
+/// parity; naming it removes the dependence on the count of `begin_wave` calls
+/// per layer staying even, and lets each span be sized from *its own* phase
+/// rather than both from the larger.
+///
+/// The sizing difference is not small: on Qwen3-30B-A3B at ten concurrent
+/// contexts the attention phase sums to 297 MiB and the FFN to at least 511 MiB,
+/// so two max-phase spans would reserve 1022 MiB where 808 MiB does.
+///
+/// # Why resetting a phase's span every layer is safe
+///
+/// Unchanged from the alternating pair, because the ordering argument was never
+/// about which half: a span is reset when its guard drops and handed out again
+/// one layer later, and between those two points sits the *other* phase's entire
+/// kernel sequence on the same stream. Same-stream launches complete in issue
+/// order, so the previous layer's reads have drained before the next layer's
+/// writes are issued ([`Reclaim::StreamOrdered`]).
 struct WaveDomain {
-    halves: [BumpArena; 2],
-    /// The half [`begin_wave`] handed out most recently: the one an in-flight
-    /// wave is allocating from.
-    current: usize,
+    /// Indexed by [`LayerPhase`] via [`phase_index`].
+    arenas: [BumpArena; 3],
+}
+
+/// Arena coordinate for a domain that is **not** a wave half.
+///
+/// The persistence domain stages on the copy stream and reclaims by fence, so a
+/// range from it must never be inherited by an op the way a wave range is: the
+/// two are not ordered against each other. A ticket carrying this resolves to
+/// nothing, so an op reading persistence-staged memory allocates from the pool —
+/// which is the correct answer, not a fallback.
+pub(crate) const NOT_A_WAVE: u32 = u32::MAX;
+
+/// Slot for a phase's arena.
+///
+/// A `match` rather than a cast so adding a phase is a compile error here
+/// instead of an out-of-bounds index at run time.
+fn phase_index(phase: LayerPhase) -> usize {
+    match phase {
+        LayerPhase::Attention => 0,
+        LayerPhase::Ffn => 1,
+        LayerPhase::Forward => 2,
+    }
 }
 
 fn wave_domains() -> &'static Mutex<HashMap<usize, WaveDomain>> {
@@ -384,65 +505,104 @@ fn with_wave_domain<R>(
     let domain = match map.entry(ordinal) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => v.insert(WaveDomain {
-            halves: [
-                BumpArena::new(stream, "wave-a", WAVE_HALF_BYTES, Reclaim::StreamOrdered)?,
-                BumpArena::new(stream, "wave-b", WAVE_HALF_BYTES, Reclaim::StreamOrdered)?,
+            arenas: [
+                BumpArena::new(stream, "wave-attn", WAVE_ATTN_BYTES, Reclaim::StreamOrdered)?,
+                BumpArena::new(stream, "wave-ffn", WAVE_FFN_BYTES, Reclaim::StreamOrdered)?,
+                BumpArena::new(
+                    stream,
+                    "wave-forward",
+                    WAVE_FORWARD_BYTES,
+                    Reclaim::StreamOrdered,
+                )?,
             ],
-            // So the first `begin_wave` lands on half A.
-            current: 1,
         }),
     };
     f(domain)
 }
 
-/// Open a wave: switch to the other half and return its generation guard.
+/// Open a generation on `phase`'s span.
 ///
-/// **The guard must be held for the whole wave**, and the borrow checker now
-/// holds callers to it: [`Generation::alloc`] hands out ranges that borrow this
-/// guard, and the tensors built on them carry the same lifetime, so a wave
-/// intermediate cannot be named after the guard drops. While the guard lives
-/// the cursor cannot rewind; when it drops, the stream fences and the half is
-/// reusable.
+/// **The guard must be held for the whole phase**, and the borrow checker holds
+/// callers to it: [`Generation::alloc`] hands out ranges that borrow this guard,
+/// and the tensors built on them carry the same lifetime, so a wave intermediate
+/// cannot be named after the guard drops. While the guard lives the cursor
+/// cannot rewind; when it drops, the span is reusable.
 ///
-/// Refuses when the half it would take is still live. Two waves in flight is
-/// the point of double buffering — N+1 assembles while N drains — but a third
-/// would have to share a span with one of them, and sharing means the first
-/// reset frees memory the other is still reading. Refuse rather than corrupt
-/// (principle 7).
-///
-/// # Alternation is not a safety property
-///
-/// A layer opens two generations — one for attention, one for the FFN — so with
-/// one attention group per layer the parity is even and a given call site keeps
-/// landing on the same half. That is fine and expected: what separates a half's
-/// last read from its next write is the same-stream work issued in between, and
-/// between two attention sections sits an entire FFN. Alternation is what makes
-/// that gap large, not what makes it correct.
-pub fn begin_wave(stream: &Arc<CudaStream>) -> Result<Generation> {
+/// Refuses when that phase's span is already live. A layer runs its two phases
+/// in sequence — attention's guard drops before the FFN's opens — so an overlap
+/// means a phase was entered twice without leaving it, and the inner drop would
+/// reset the span the outer one is still allocating from. Refuse rather than
+/// corrupt (principle 7).
+pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generation> {
+    // Idempotent, and done here rather than at load: this is the first moment a
+    // wave arena can exist, so it is the earliest point the resolver could be
+    // useful and the latest it could be needed.
+    candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
+    let ordinal = stream.context().ordinal() as u32;
+    let arena_idx = phase_index(phase) as u32;
     with_wave_domain(stream, |domain| {
-        let next = domain.current ^ 1;
-        if domain.halves[next].is_live() {
+        let arena = &domain.arenas[phase_index(phase)];
+        if arena.is_live() {
             candle::bail!(
-                "wave domain: half {next} still has a live generation — a third \
-                 wave started while two were in flight. Both halves are spoken \
-                 for, and sharing one would let the first reset free memory the \
-                 other is still reading."
+                "wave domain: the {phase:?} span already has a live generation. A \
+                 layer leaves one phase before entering the next, so this is a \
+                 phase re-entered while still open — the inner guard's drop would \
+                 reset the span the outer one is still handing out."
             )
         }
-        domain.current = next;
-        Ok(domain.halves[next].generation())
+        arena.generation(ordinal, arena_idx)
     })
 }
 
-/// `(cursor, peak, capacity)` for each wave half on `ordinal`.
+/// Carve `bytes` from the arena a [`WaveTicket`] names — the resolver candle-core
+/// calls when an op inherits its operand's arena.
 ///
-/// The `W_wave` term of the span equation `S = 2·W_wave + W_persist`.
-pub fn wave_domain_stats(ordinal: usize) -> Option<[(usize, usize, usize); 2]> {
-    wave_domains()
-        .lock()
-        .unwrap()
-        .get(&ordinal)
-        .map(|d| [d.halves[0].stats(), d.halves[1].stats()])
+/// `None` rather than an error for every miss, because each one has an
+/// unremarkable meaning and a pool allocation is always a correct answer:
+/// an unknown domain (no wave has run on that stream), a stale epoch (the
+/// generation rewound), or an exhausted span. Only the last is interesting, and
+/// it is already reported by the span-exhausted path the planned allocations
+/// take — turning it into a hard failure here would abort a forward that could
+/// have completed on pool memory.
+fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<u64> {
+    let map = wave_domains().lock().ok()?;
+    let domain = map.get(&(ticket.domain as usize))?;
+    let arena = domain.arenas.get(ticket.arena as usize)?;
+    let inner = Arc::clone(&arena.inner);
+    let name = arena.name;
+    // Drop the registry lock before touching the arena: the two are always taken
+    // in this order and never the reverse, which is what keeps this free of the
+    // deadlock an allocation path called from arbitrary op code could otherwise
+    // introduce.
+    drop(map);
+    {
+        let guard = inner.lock().ok()?;
+        if guard.epoch != ticket.epoch || guard.live == 0 {
+            return None;
+        }
+    }
+    bump_raw(&inner, name, bytes, align)
+}
+
+/// `(cursor, peak, capacity)` per wave arena on `ordinal`, ordered by
+/// [`phase_index`]: attention, FFN, forward.
+///
+/// The `W_wave` term of the span equation
+/// `S = W_attn + W_ffn + W_forward + W_persist`.
+///
+/// **`peak` is a process-lifetime high-water mark**, not a per-wave or
+/// per-request figure: it is raised when the cursor passes it and never lowered,
+/// because a span has to be sized for the worst moment it ever sees, not the
+/// most recent one. Reading it as "how full is the arena now" is wrong — that is
+/// `cursor`, and between waves it is zero.
+pub fn wave_domain_stats(ordinal: usize) -> Option<[(usize, usize, usize); 3]> {
+    wave_domains().lock().unwrap().get(&ordinal).map(|d| {
+        [
+            d.arenas[0].stats(),
+            d.arenas[1].stats(),
+            d.arenas[2].stats(),
+        ]
+    })
 }
 
 /// The persistence thread's transient domain: migration and quantize staging.
@@ -510,7 +670,7 @@ mod tests {
 
 #[cfg(all(test, feature = "cuda"))]
 mod wave_tests {
-    use super::{begin_wave, wave_domain_stats};
+    use super::{begin_wave, wave_domain_stats, LayerPhase};
     use candle::{Device, Result};
 
     /// The wave domain is process-global and `cargo test` runs tests in
@@ -531,7 +691,7 @@ mod wave_tests {
     fn ranges_within_a_wave_are_disjoint() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let guard = begin_wave(&s)?;
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
         let a = guard.alloc(1000, 256)?;
         let b = guard.alloc(2000, 256)?;
         assert!(a.ptr + a.len as u64 <= b.ptr, "ranges overlap");
@@ -542,46 +702,63 @@ mod wave_tests {
         Ok(())
     }
 
-    /// Consecutive waves land on different halves. This is the property that
-    /// lets wave N+1 assemble while wave N's kernels drain: if both waves used
-    /// the same span, the reset between them would free memory still being
-    /// read.
+    /// The two phases must not share a span. If they did, the FFN's reset would
+    /// free the attention output the residual add is still reading, and each
+    /// span would have to be sized for the larger of the two phases.
     #[test]
-    fn consecutive_waves_alternate_halves() -> Result<()> {
+    fn the_phases_have_separate_spans() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let g1 = begin_wave(&s)?;
-        let first = g1.alloc(4096, 256)?.ptr;
+        let g1 = begin_wave(&s, LayerPhase::Attention)?;
+        let attn = g1.alloc(4096, 256)?.ptr;
         drop(g1);
 
-        let g2 = begin_wave(&s)?;
-        let second = g2.alloc(4096, 256)?.ptr;
+        let g2 = begin_wave(&s, LayerPhase::Ffn)?;
+        let ffn = g2.alloc(4096, 256)?.ptr;
         drop(g2);
 
-        assert_ne!(first, second, "consecutive waves shared a half");
-
-        let g3 = begin_wave(&s)?;
-        let third = g3.alloc(4096, 256)?.ptr;
-        drop(g3);
-        assert_eq!(third, first, "the third wave should be back on half A");
+        assert_ne!(attn, ffn, "attention and FFN shared a span");
         Ok(())
     }
 
-    /// A second wave opened while the first is live is refused, not silently
-    /// given the half the first is still filling (principle 7).
+    /// The next layer reuses its phase's span rather than accumulating — the
+    /// whole point of resetting on guard drop. Without it a 48-layer wave would
+    /// hold 48 layers of transients instead of one layer's.
     #[test]
-    fn a_concurrent_wave_is_refused() -> Result<()> {
+    fn the_next_layer_reuses_the_same_phase_span() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let _outer = begin_wave(&s)?;
-        // The other half is free, so this one succeeds...
-        let inner = begin_wave(&s)?;
-        // ...but a third has nowhere to go while both are live.
+        let mut first = None;
+        for _layer in 0..3 {
+            let g = begin_wave(&s, LayerPhase::Attention)?;
+            let ptr = g.alloc(4096, 256)?.ptr;
+            drop(g);
+            match first {
+                None => first = Some(ptr),
+                Some(f) => assert_eq!(ptr, f, "a later layer moved off the span"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Both phases may be open at once — they are different spans — but
+    /// re-entering one while it is still open is refused (principle 7): the
+    /// inner guard's drop would reset the span the outer one is filling.
+    #[test]
+    fn re_entering_a_live_phase_is_refused() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let _attn = begin_wave(&s, LayerPhase::Attention)?;
+        let ffn = begin_wave(&s, LayerPhase::Ffn)?;
         assert!(
-            begin_wave(&s).is_err(),
-            "a third concurrent wave must be refused"
+            begin_wave(&s, LayerPhase::Attention).is_err(),
+            "re-entering the live attention span must be refused"
         );
-        drop(inner);
+        assert!(
+            begin_wave(&s, LayerPhase::Ffn).is_err(),
+            "re-entering the live FFN span must be refused"
+        );
+        drop(ffn);
         Ok(())
     }
 
@@ -591,13 +768,153 @@ mod wave_tests {
     fn peak_outlives_the_reset() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let guard = begin_wave(&s)?;
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
         guard.alloc(8192, 256)?;
         drop(guard);
         let stats = wave_domain_stats(0).expect("domain exists");
         let peak = stats[0].1.max(stats[1].1);
         assert!(peak >= 8192, "peak {peak} lost across the reset");
         assert_eq!(stats[0].0.min(stats[1].0), 0, "a cursor failed to rewind");
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod provenance_tests {
+    use super::super::gpu_test_lock::gpu_serial as serial;
+    use super::{begin_wave, LayerPhase};
+    use candle::cuda_backend::wave_provenance::LeaseOrigin;
+    use candle::{DType, Device, Result, Storage, Tensor};
+
+    fn cuda() -> Option<Device> {
+        match Device::cuda_if_available(0) {
+            Ok(d @ Device::Cuda(_)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The backing a tensor's storage carries.
+    fn backing_of(t: &Tensor) -> candle::cuda_backend::Backing {
+        let (storage, _) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cuda(c) => c.backing,
+            _ => panic!("expected CUDA storage"),
+        }
+    }
+
+    /// **The rule.** An op reading a wave-backed operand allocates its output
+    /// from the same generation — not from the pool.
+    ///
+    /// This is what makes the `'w` on the result true rather than merely
+    /// permitted, so it is worth pinning directly: the type system cannot check
+    /// that the *bytes* came from the arena, only that the lifetime is not
+    /// widened. Asserting on the cursor as well as the backing catches a ticket
+    /// that resolves to the right arena but never actually carves from it.
+    #[test]
+    fn an_op_inherits_its_operands_arena() -> Result<()> {
+        let _gpu = serial();
+        let Some(dev) = cuda() else { return Ok(()) };
+        let Device::Cuda(cd) = &dev else {
+            return Ok(());
+        };
+        let stream = cd.cuda_stream();
+
+        // A real allocation to point the lease at, so the cast reads live bytes.
+        let owner = Tensor::zeros((256,), DType::F32, &dev)?;
+
+        let wave = begin_wave(&stream, LayerPhase::Attention)?;
+        let before = {
+            let inner = wave.inner.lock().unwrap();
+            inner.cursor
+        };
+
+        let range = wave.alloc(256 * 4, 256)?;
+        let operand = unsafe {
+            Tensor::from_leased_cuda_ptr(
+                range.ptr,
+                DType::F32,
+                (256,),
+                &dev,
+                LeaseOrigin::Wave(wave.ticket()),
+            )?
+        };
+        let cursor_after_operand = {
+            let inner = wave.inner.lock().unwrap();
+            inner.cursor
+        };
+
+        let cast = operand.to_dtype(DType::BF16)?;
+
+        match backing_of(&cast) {
+            candle::cuda_backend::Backing::Lease(LeaseOrigin::Wave(t)) => {
+                assert_eq!(t, wave.ticket(), "inherited the wrong generation");
+            }
+            other => panic!("cast fell back to the pool: {other:?}"),
+        }
+        let cursor_after_cast = {
+            let inner = wave.inner.lock().unwrap();
+            inner.cursor
+        };
+        assert!(
+            cursor_after_cast > cursor_after_operand,
+            "the cast claimed no bytes from the arena ({cursor_after_operand} -> {cursor_after_cast})"
+        );
+        assert!(cursor_after_operand > before);
+
+        drop(cast);
+        drop(operand);
+        drop(wave);
+        // The owner must survive every one of those drops: a wave-backed result
+        // that reached `cuMemFreeAsync` would take the pool with it.
+        assert_eq!(owner.to_vec1::<f32>()?.len(), 256);
+        Ok(())
+    }
+
+    /// A pool-backed operand stays on the pool. The rule inherits an arena; it
+    /// does not invent one, so an ordinary tensor is untouched by any of this
+    /// even while a generation happens to be open.
+    #[test]
+    fn a_pool_operand_does_not_acquire_a_wave() -> Result<()> {
+        let _gpu = serial();
+        let Some(dev) = cuda() else { return Ok(()) };
+        let Device::Cuda(cd) = &dev else {
+            return Ok(());
+        };
+        let wave = begin_wave(&cd.cuda_stream(), LayerPhase::Ffn)?;
+        let ordinary = Tensor::zeros((128,), DType::F32, &dev)?;
+        let cast = ordinary.to_dtype(DType::BF16)?;
+        assert!(
+            matches!(backing_of(&cast), candle::cuda_backend::Backing::Owned),
+            "a pool operand must not pick up a wave it never came from"
+        );
+        drop(wave);
+        Ok(())
+    }
+
+    /// A ticket from a closed generation resolves to nothing, so an op holding
+    /// a stale lease allocates from the pool instead of carving from whatever
+    /// occupies that span now. `LiveTensor<'w>` makes this unreachable in safe
+    /// code; the backstop exists for the `unsafe` raw-pointer constructors.
+    #[test]
+    fn a_stale_ticket_does_not_resolve() -> Result<()> {
+        let _gpu = serial();
+        let Some(dev) = cuda() else { return Ok(()) };
+        let Device::Cuda(cd) = &dev else {
+            return Ok(());
+        };
+        let stream = cd.cuda_stream();
+
+        let stale = {
+            let wave = begin_wave(&stream, LayerPhase::Attention)?;
+            let t = wave.ticket();
+            let _r = wave.alloc(1024, 256)?;
+            t
+        };
+        assert!(
+            candle::cuda_backend::wave_provenance::wave_alloc(stale, 1024, 256).is_none(),
+            "a ticket outlived its generation and still carved from the span"
+        );
+        let _ = dev;
         Ok(())
     }
 }

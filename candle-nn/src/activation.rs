@@ -1,6 +1,6 @@
 //! Activation Functions
 //!
-use candle::{Result, Tensor};
+use candle::{LiveTensor, Result, Tensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -26,8 +26,13 @@ pub enum Activation {
     GeluPytorchTanh,
 }
 
-impl super::Module for Activation {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl Activation {
+    /// Apply to an activation that may live on an inference wave.
+    ///
+    /// Every arm allocates its output from the arena `xs` came from, so the
+    /// result is bounded by the same generation. [`super::Module::forward`] is
+    /// this at `'static`.
+    pub fn forward_live<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
             Self::Gelu => xs.gelu_erf(),
             // https://github.com/huggingface/transformers/blob/12f043eaeaabfef6f6efea411d98e6f6d3c094b7/src/transformers/activations.py#L49-L78
@@ -46,6 +51,12 @@ impl super::Module for Activation {
             &Self::LeakyRelu(negative_slope) => crate::ops::leaky_relu(xs, negative_slope),
             Self::GeluPytorchTanh => xs.gelu(),
         }
+    }
+}
+
+impl super::Module for Activation {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_live(xs)
     }
 }
 

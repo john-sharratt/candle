@@ -139,7 +139,10 @@ impl<'w> LiveTensor<'w> {
         }
         let shape = Shape::from(cat_dims);
         let op = crate::op::BackpropOp::new(args, |args| crate::op::Op::Cat(args, 0));
-        let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
+        // The concatenation lands in the arena its inputs came from — `arg0` is
+        // representative because every argument shares one `'w`, so they cannot
+        // come from different generations.
+        let mut storage = unsafe { device.alloc_uninit_from(&shape, dtype, arg0.wave_ticket())? };
         for (arg, &offset) in args.iter().zip(offsets.iter()) {
             let arg = arg.as_ref();
             arg.storage()
@@ -213,7 +216,10 @@ impl<'w> LiveTensor<'w> {
         let block_size: usize = cat_dims.iter().skip(1 + dim).product();
         let shape = Shape::from(cat_dims);
         let op = crate::op::BackpropOp::new(args, |args| crate::op::Op::Cat(args, dim));
-        let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
+        // The concatenation lands in the arena its inputs came from — `arg0` is
+        // representative because every argument shares one `'w`, so they cannot
+        // come from different generations.
+        let mut storage = unsafe { device.alloc_uninit_from(&shape, dtype, arg0.wave_ticket())? };
         let mut dst_o = 0;
         for arg in args.iter() {
             let arg = arg.as_ref();

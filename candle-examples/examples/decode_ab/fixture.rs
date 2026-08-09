@@ -282,6 +282,10 @@ impl Fixture {
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(ev_err)?;
         let out = paged_decode_attn(
+            // This is a kernel A/B harness, not the wave path: it times one
+            // decode in isolation, so there is no generation to carve from and
+            // the output is an ordinary pool allocation.
+            None,
             &self.q_dec,
             headers_ptr,
             self.arena_dtype,
@@ -511,7 +515,6 @@ fn run_prefill(
         rope_offsets,
         rope_cs,
         sc.rope_interleaved,
-        0,
         &generation,
         // No shared position-map cache in this one-shot fixture prefill.
         &std::cell::RefCell::new(None),

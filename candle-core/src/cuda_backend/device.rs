@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
-use crate::cuda_backend::Backing;
+use crate::cuda_backend::{alloc_inheriting, Backing};
+use crate::forbidden_alloc;
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +49,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
         self.stream.alloc::<T>(len).w()
     }
 
@@ -55,6 +57,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
         self.stream.alloc_zeros::<T>(len).w()
     }
 
@@ -96,7 +99,80 @@ impl CudaDevice {
         &self,
         src: &Src,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        // Allocates as well as copying: the destination slice is fresh device
+        // memory, so this is a driver allocation like the two above.
+        forbidden_alloc::record("CudaDevice::memcpy_stod", std::mem::size_of_val(src));
         self.stream.memcpy_stod(src).w()
+    }
+
+    /// [`Self::memcpy_stod`] with the destination taken from `origin`'s arena.
+    ///
+    /// Host uploads are the one wave-path allocation provenance cannot reach on
+    /// its own: a table built on the CPU has no device operand to inherit from,
+    /// so there is nothing for the rule to follow. What the call sites *do* have
+    /// is the arena the table is about to be read alongside — the tile and token
+    /// tables are consumed by the very kernels whose operands are already on the
+    /// span — so they pass that arena in explicitly.
+    ///
+    /// The copy itself is unchanged; only the destination moves.
+    pub fn memcpy_stod_from<
+        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+        Src: cudarc::driver::HostSlice<T> + ?Sized,
+    >(
+        &self,
+        src: &Src,
+        origin: Backing,
+    ) -> Result<Uploaded<T>> {
+        let (mut dst, backing) = unsafe { alloc_inheriting::<T>(self, src.len(), origin)? };
+        self.stream.memcpy_htod(src, &mut dst).w()?;
+        Ok(Uploaded {
+            slice: std::mem::ManuallyDrop::new(dst),
+            backing,
+        })
+    }
+}
+
+/// An uploaded table, freed only if this owns it.
+///
+/// [`CudaDevice::memcpy_stod_from`] can return a slice over either a pool
+/// allocation or a wave range, and a bare [`cudarc::driver::CudaSlice`] cannot
+/// tell the difference: its `Drop` frees unconditionally, which on arena memory
+/// is a `cuMemFreeAsync` against a span the pool never allocated. Carrying the
+/// backing alongside the slice is what makes the right disposal the only
+/// reachable one — the same job [`super::Backing`] does for [`super::CudaStorage`],
+/// at the one place that hands out a raw slice.
+pub struct Uploaded<T> {
+    slice: std::mem::ManuallyDrop<cudarc::driver::CudaSlice<T>>,
+    backing: Backing,
+}
+
+impl<T> std::ops::Deref for Uploaded<T> {
+    type Target = cudarc::driver::CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slice
+    }
+}
+
+impl<T> Drop for Uploaded<T> {
+    fn drop(&mut self) {
+        match self.backing {
+            // SAFETY: `slice` is live and dropped exactly once, here.
+            Backing::Owned => unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) },
+            // A view over a range the arena owns: the generation's reset reclaims
+            // the bytes, so the memory must not be freed here. `leak` — not a bare
+            // skip — is what does that correctly: it waits on the slice's
+            // read/write events, destroys them, and decrements the stream's `Arc`.
+            // Suppressing the drop instead would strand two `CudaEvent`s and a
+            // stream refcount per upload, which the MoE path issues several times
+            // per layer per token. Same obligation, and same reasoning, as
+            // `CudaStorageSlice::leak_view`.
+            //
+            // SAFETY: `slice` is taken and consumed exactly once, here.
+            Backing::Lease(_) => unsafe {
+                std::mem::ManuallyDrop::take(&mut self.slice).leak();
+            },
+        }
     }
 }
 
@@ -515,7 +591,8 @@ impl BackendDevice for CudaDevice {
             slice
         } else {
             let layout = Layout::contiguous(shape);
-            super::run_affine_ffi(&slice, self, &layout, up - lo, lo)?
+            // A freshly-created uniform tensor: nothing to inherit from.
+            super::run_affine_ffi(&slice, self, &layout, up - lo, lo, Backing::Owned)?
         };
         Ok(CudaStorage {
             slice,
@@ -737,5 +814,54 @@ impl BackendDevice for CudaDevice {
     fn synchronize(&self) -> Result<()> {
         self.stream.synchronize().map_err(crate::Error::wrap)?;
         Ok(())
+    }
+}
+
+impl CudaDevice {
+    /// Uninitialised storage taken from the arena `ticket` names, or from the
+    /// pool when there is none.
+    ///
+    /// The dtype dispatch goes through [`crate::cuda_backend::alloc_inheriting`]
+    /// so the buffer and the `Backing` stamped on it are resolved together —
+    /// naming them separately is what lets a wave range end up marked `Owned`.
+    ///
+    /// # Safety
+    ///
+    /// The returned storage is uninitialised; the caller must write it before
+    /// anything reads it, exactly as for `BackendDevice::alloc_uninit`.
+    pub(crate) unsafe fn alloc_uninit_from(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        ticket: Option<crate::wave_provenance::WaveTicket>,
+    ) -> Result<CudaStorage> {
+        use crate::cuda_backend::alloc_inheriting;
+        use crate::wave_provenance::LeaseOrigin;
+        let from = match ticket {
+            Some(t) => Backing::Lease(LeaseOrigin::Wave(t)),
+            None => Backing::Owned,
+        };
+        let elem_count = shape.elem_count();
+        macro_rules! arm {
+            ($ty:ty, $variant:ident) => {{
+                let (data, backing) = alloc_inheriting::<$ty>(self, elem_count, from)?;
+                (CudaStorageSlice::$variant(data), backing)
+            }};
+        }
+        let (slice, backing) = match dtype {
+            DType::U8 => arm!(u8, U8),
+            DType::U32 => arm!(u32, U32),
+            DType::I64 => arm!(i64, I64),
+            DType::BF16 => arm!(bf16, BF16),
+            DType::F16 => arm!(f16, F16),
+            DType::F32 => arm!(f32, F32),
+            DType::F64 => arm!(f64, F64),
+            DType::F8E4M3 => arm!(F8E4M3, F8E4M3),
+        };
+        Ok(CudaStorage {
+            slice,
+            device: self.clone(),
+            backing,
+        })
     }
 }

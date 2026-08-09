@@ -1,7 +1,7 @@
 //! Tensor ops.
 //!
 
-use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
+use candle::{CpuStorage, DType, Layout, LiveTensor, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
@@ -37,11 +37,11 @@ pub fn log_softmax<D: candle::shape::Dim>(xs: &Tensor, d: D) -> Result<Tensor> {
     Ok(log_sm)
 }
 
-pub fn silu(xs: &Tensor) -> Result<Tensor> {
+pub fn silu<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     xs.silu()
 }
 
-pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
+pub fn swiglu<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     let xs = xs.chunk(2, D::Minus1)?;
     &xs[0].silu()? * &xs[1]
 }
@@ -90,7 +90,7 @@ impl candle::CustomOp1 for Sigmoid {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = storage.device();
         let shape = layout.shape();
@@ -125,10 +125,20 @@ impl candle::CustomOp1 for Sigmoid {
         };
 
         // Macro to handle each dtype case with proper scoping for guards
+        // The operand's arena: this op's output is allocated beside its input,
+        // which is what makes the `'w` on the result true rather than merely
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+        // body resolves free identifiers at its definition site, not its call.
+        let inherit = storage.backing;
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+        let out_backing;
         macro_rules! sigmoid_impl {
             ($src_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(start_offset..);
-                let out = unsafe { dev.alloc::<$rust_type>(el_count)? };
+                let (out, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el_count, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (out_ptr, _out_guard) = out.device_ptr(&stream);
@@ -163,7 +173,7 @@ impl candle::CustomOp1 for Sigmoid {
         let dst = candle::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -269,20 +279,20 @@ impl candle::CustomOp1 for Sigmoid {
     }
 }
 
-pub fn sigmoid(xs: &Tensor) -> Result<Tensor> {
+pub fn sigmoid<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     xs.apply_op1(Sigmoid)
 }
 
-pub fn hard_sigmoid(xs: &Tensor) -> Result<Tensor> {
+pub fn hard_sigmoid<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     // TODO: Should we have a specialized op for this?
     ((xs + 3.0)? / 6.0)?.clamp(0f32, 1f32)
 }
 
-pub fn mish(xs: &Tensor) -> Result<Tensor> {
+pub fn mish<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     xs * (1.0 + xs.exp()?)?.log()?.tanh()
 }
 
-pub fn leaky_relu(xs: &Tensor, negative_slope: f64) -> Result<Tensor> {
+pub fn leaky_relu<'w>(xs: &LiveTensor<'w>, negative_slope: f64) -> Result<LiveTensor<'w>> {
     let zeros = xs.zeros_like()?;
     xs.maximum(&zeros)? + xs.minimum(&zeros)? * negative_slope
 }
@@ -392,7 +402,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = storage.device();
         let stream = dev.cuda_stream();
@@ -417,10 +427,27 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             _ => candle::bail!("softmax not supported for dtype {:?}", storage.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = storage.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! softmax_impl {
             ($src_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(o1..o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
@@ -452,7 +479,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -500,7 +527,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
     }
 }
 
-pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
+pub fn softmax_last_dim<'w>(xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
 
@@ -587,7 +614,7 @@ impl candle::CustomOp2 for RmsNorm {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -617,11 +644,28 @@ impl candle::CustomOp2 for RmsNorm {
             _ => candle::bail!("rmsnorm not supported for dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! rmsnorm_impl {
             ($src_slice:expr, $alpha_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(src_o1..src_o2);
                 let alpha = $alpha_slice.slice(alpha_o1..alpha_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
@@ -663,7 +707,7 @@ impl candle::CustomOp2 for RmsNorm {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -727,7 +771,7 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     x_normed.to_dtype(x_dtype)?.broadcast_mul(alpha)
 }
 
-pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
+pub fn rms_norm<'w>(xs: &LiveTensor<'w>, alpha: &Tensor, eps: f32) -> Result<LiveTensor<'w>> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
     if hidden_size_xs != hidden_size_alpha {
@@ -809,7 +853,7 @@ impl candle::CustomOp2 for SiluMul {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -849,11 +893,28 @@ impl candle::CustomOp2 for SiluMul {
             _ => candle::bail!("fused-silu-mul: unsupported dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! silu_mul_impl {
             ($gate_slice:expr, $up_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let gate = $gate_slice.slice(gate_o1..gate_o2);
                 let up = $up_slice.slice(up_o1..up_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (gate_ptr, _g_guard) = gate.device_ptr(&stream);
                     let (up_ptr, _u_guard) = up.device_ptr(&stream);
@@ -895,7 +956,7 @@ impl candle::CustomOp2 for SiluMul {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -907,7 +968,7 @@ impl candle::CustomOp2 for SiluMul {
 /// On CUDA, this runs as a single fused kernel instead of separate
 /// `silu()` + `mul()` calls, saving 1 kernel launch and 1 intermediate
 /// tensor allocation per invocation.
-pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+pub fn silu_mul<'w>(gate: &LiveTensor<'w>, up: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     gate.apply_op2_no_bwd(up, &SiluMul)
 }
 
@@ -1012,7 +1073,7 @@ impl candle::CustomOp3 for LayerNorm {
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::{kernels, Backing, CudaStorageSlice};
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = s1.device();
         let stream = dev.cuda_stream();
@@ -1046,12 +1107,29 @@ impl candle::CustomOp3 for LayerNorm {
             _ => candle::bail!("layernorm not supported for dtype {:?}", s1.dtype()),
         };
 
+        // The operand's arena: this op's output is allocated beside its input,
+
+        // which is what makes the `'w` on the result true rather than merely
+
+        // permitted. Declared before the dispatch macro because a `macro_rules!`
+
+        // body resolves free identifiers at its definition site, not its call.
+
+        let inherit = s1.backing;
+
+        // Assigned by the macro to whatever `alloc_inheriting` resolved.
+
+        let out_backing;
+
         macro_rules! layernorm_impl {
             ($src_slice:expr, $alpha_slice:expr, $beta_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
                 let src = $src_slice.slice(src_o1..src_o2);
                 let alpha = $alpha_slice.slice(alpha_o1..alpha_o2);
                 let beta = $beta_slice.slice(beta_o1..beta_o2);
-                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                let (dst, resolved_backing) = unsafe {
+                    candle::cuda_backend::alloc_inheriting::<$rust_type>(dev, el, inherit)?
+                };
+                out_backing = resolved_backing;
                 {
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);
                     let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
@@ -1103,7 +1181,7 @@ impl candle::CustomOp3 for LayerNorm {
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -1180,7 +1258,12 @@ pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> R
         .broadcast_add(beta)
 }
 
-pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
+pub fn layer_norm<'w>(
+    xs: &LiveTensor<'w>,
+    alpha: &Tensor,
+    beta: &Tensor,
+    eps: f32,
+) -> Result<LiveTensor<'w>> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
     let hidden_size_beta = beta.dims1()?;
@@ -1494,6 +1577,12 @@ impl candle::CustomOp3 for Sdpa {
 ///     - Use an alternate kernel
 ///     - Requires `seq` == `kv_seq`
 ///     - GQA is not supported (requires `qhead` == `kv_head`)
-pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, softcapping: f32) -> Result<Tensor> {
+pub fn sdpa<'w>(
+    q: &LiveTensor<'w>,
+    k: &LiveTensor<'w>,
+    v: &LiveTensor<'w>,
+    scale: f32,
+    softcapping: f32,
+) -> Result<LiveTensor<'w>> {
     q.apply_op3_no_bwd(k, v, &Sdpa { scale, softcapping })
 }

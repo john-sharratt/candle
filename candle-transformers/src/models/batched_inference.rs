@@ -34,7 +34,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    QuantFormat,
+    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1636,6 +1636,22 @@ impl BatchedInferenceSession {
         self.config.k_format.dtype().unwrap_or(DType::BF16)
     }
 
+    /// The dtype activations arrive in for this session — what a model's norm
+    /// weights must be materialised in before it runs a forward.
+    ///
+    /// Deliberately **not** [`Self::dtype`], and the difference is not cosmetic.
+    /// `dtype` describes *sealed storage* and falls back to BF16 for a quantized
+    /// format, which is right for the accounting it feeds. The forward instead
+    /// derives its activation dtype from the sequence's live caches, and
+    /// [`candle_nn::kv_cache::KvCache::dtype`] reports **F16** for a quantized
+    /// backing — that is the dtype the norms will actually see. Reading `dtype`
+    /// here yields BF16 weights for an F16 forward, which the norm refuses.
+    pub fn activation_dtype(&self) -> DType {
+        crate::models::batched_model::activation_dtype(
+            self.config.k_format.dtype().unwrap_or(DType::F16),
+        )
+    }
+
     /// Get the number of layers.
     pub fn num_layers(&self) -> usize {
         self.num_layers
@@ -2739,10 +2755,128 @@ pub struct WaveStep {
     pub logits: Option<Vec<Tensor>>,
 }
 
+/// A [`WaveStep`] together with what keeps it valid.
+///
+/// The head's outputs are carved from the forward-scoped span, which is
+/// reclaimed when its generation drops. Returning the step alone would hand the
+/// caller tensors whose memory is reusable the moment the callee returns — sound
+/// only by the convention that everyone samples before the next forward, which
+/// nothing checks.
+///
+/// So the guard travels **with** the result. The span cannot be reclaimed while
+/// this value is alive, and [`Deref`](std::ops::Deref) is what makes that
+/// checkable rather than merely true: reading through it borrows `self`, so a
+/// reference to the logits keeps the guard alive, while *moving* the logits out
+/// is rejected — you cannot move out of a `Deref`. Every site that only reads
+/// compiles unchanged; every site that would have taken the tensors away from
+/// their guard is a compile error, which is exactly the set worth looking at.
+pub struct WaveResult {
+    step: WaveStep,
+    /// Held, never read. `None` off-CUDA and for waves that never opened a
+    /// forward span.
+    #[cfg(feature = "cuda")]
+    _forward: Option<candle_nn::kv_cache::WaveGeneration>,
+}
+
+impl WaveResult {
+    /// Wrap a step whose outputs do not sit on a forward span.
+    pub fn owned(step: WaveStep) -> Self {
+        Self {
+            step,
+            #[cfg(feature = "cuda")]
+            _forward: None,
+        }
+    }
+
+    /// Wrap a step whose outputs were carved from `forward`'s span.
+    #[cfg(feature = "cuda")]
+    pub fn on_span(step: WaveStep, forward: Option<candle_nn::kv_cache::WaveGeneration>) -> Self {
+        Self {
+            step,
+            _forward: forward,
+        }
+    }
+
+    /// The logits, copied off the span so they outlive this result.
+    ///
+    /// The sanctioned escape, and it really copies. Prefer reading through
+    /// [`Deref`](std::ops::Deref) — `result.logits` — which costs nothing and
+    /// keeps the guard doing its job. This exists for callers that genuinely
+    /// need the values after the span is reclaimed: a caller that returns them
+    /// upward, or one that accumulates across several forwards.
+    ///
+    /// Empty when the wave paused before the head: a glue-only wave carries no
+    /// logits and that is not a failure. A *failed copy* is a different thing and
+    /// propagates — the two used to collapse into the same empty `Vec`, which the
+    /// scheduler reads as "this wave produced nothing" and turns into a silently
+    /// token-less turn.
+    pub fn logits_owned(&self) -> Result<Vec<Tensor>> {
+        match self.step.logits.as_ref() {
+            None => Ok(Vec::new()),
+            Some(ls) => ls.iter().map(|t| t.to_owned_tensor()).collect(),
+        }
+    }
+
+    /// Take the residual stream, which is pool-backed and outlives the span.
+    ///
+    /// Deliberately available by value where the logits are not: a paused wave's
+    /// residual is persisted and resumed on a *later* forward, so it cannot live
+    /// on a span that resets at the end of this one — and does not.
+    pub fn into_residual(mut self) -> Option<Tensor> {
+        self.step.residual.take()
+    }
+}
+
+impl std::ops::Deref for WaveResult {
+    type Target = WaveStep;
+
+    fn deref(&self) -> &WaveStep {
+        &self.step
+    }
+}
+
 /// **You don't need to implement this trait manually.** Any type that implements
 /// [`BatchedModel`] automatically gets a `ManagedBatchedModel` implementation
 /// via the blanket impl.
 pub trait ManagedBatchedModel {
+    /// The geometry [`candle_nn::kv_cache::WavePlan`] prices a wave from.
+    ///
+    /// Exposed here as well as on [`BatchedModelCore`] because the scheduler
+    /// holds the model behind this trait object, and admission has to price a
+    /// wave's transient buffers before it decides what to admit into it.
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry;
+
+    /// Widest prefill this model will run in one forward, in tokens.
+    ///
+    /// The smaller of two unrelated ceilings:
+    ///
+    /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider
+    ///   forward costs the same per token, so slicing is free.
+    /// * [`candle_nn::kv_cache::WavePlan::max_rows_within`] — how many rows the
+    ///   FFN span actually holds, computed from this model's geometry. On a MoE
+    ///   model the expert chain sees `rows × experts_per_tok`, so the same token
+    ///   count needs several times the span a dense model would.
+    ///
+    /// Taking the min is what stops a wave being sized by a constant that has
+    /// never seen the model. Falls back to the compute ceiling when the plan
+    /// cannot price a single row: a zero-width wave makes no progress, and
+    /// refusing here would abort a forward that can still run.
+    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
+        if fits == 0 {
+            return MAX_PREFILL_TOKENS;
+        }
+        fits.min(MAX_PREFILL_TOKENS)
+    }
+
+    /// Re-materialise every norm weight in the activation dtype — see
+    /// [`crate::models::batched_model::BatchedModelCore::maybe_change_dtype`].
+    ///
+    /// On this trait too because the scheduler holds the model behind it, and
+    /// the activation dtype is chosen where the KV cache is configured rather
+    /// than at load.
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()>;
+
     /// Number of transformer layers.
     fn num_layers(&self) -> usize;
     /// Number of KV heads per layer.
@@ -2816,7 +2950,7 @@ pub trait ManagedBatchedModel {
         layer_start: usize,
         layer_end: usize,
         residual_in: Option<Tensor>,
-    ) -> Result<WaveStep>;
+    ) -> Result<WaveResult>;
 
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
@@ -2826,13 +2960,21 @@ pub trait ManagedBatchedModel {
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
-        BatchedInferenceSession::new(
+        let session = BatchedInferenceSession::new(
             props.num_layers,
             props.n_kv_heads,
             props.head_dim,
             self.device(),
             config,
-        )
+        )?;
+        // Materialise the norm weights for this session's activation dtype, here
+        // rather than at each call site. A session is where the dtype is decided,
+        // it is created outside any wave, and the forward *refuses* a mismatch —
+        // so leaving the call to callers would mean every one of them has to
+        // remember, and the one that forgets fails at its first forward instead
+        // of at the line that was wrong.
+        self.maybe_change_dtype(session.activation_dtype())?;
+        Ok(session)
     }
 
     /// Create a sibling session that shares the KV arena pool with `source`.
@@ -2858,11 +3000,12 @@ pub trait ManagedBatchedModel {
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let backings = source.backings().iter().cloned().collect();
-        Ok(BatchedInferenceSession::new_with_backings(
-            backings,
-            config,
-            source.device(),
-        ))
+        let session = BatchedInferenceSession::new_with_backings(backings, config, source.device());
+        // The other way a session comes into being, and it decides an activation
+        // dtype just as `create_batched_session` does — so it materialises the
+        // norm weights the same way.
+        self.maybe_change_dtype(session.activation_dtype())?;
+        Ok(session)
     }
 
     /// Prunes excess memory usage.
@@ -2888,18 +3031,33 @@ pub trait ManagedBatchedModel {
     }
 }
 
-/// Maximum total tokens (batch_size × seq_len) for a single prefill forward pass.
-/// Larger prefills are automatically sliced into smaller batches to keep GPU memory
-/// bounded. GPU compute saturates around this point for typical models, so slicing
-/// costs virtually nothing in throughput. The value is a multiple of 32 for optimal
-/// CUDA kernel utilization.
-const MAX_PREFILL_TOKENS: usize = 4096;
+/// Compute-side ceiling on the tokens one prefill forward carries.
+///
+/// This is a *throughput* limit, not a memory one: beyond roughly this width the
+/// prefill kernels are compute-bound, so a wider forward costs the same per token
+/// and slicing above it is free. A multiple of 32, for kernel utilisation.
+///
+/// **It reserves nothing.** The transient tier is
+/// `WAVE_ATTN_BYTES + WAVE_FFN_BYTES + MIGRATION_STAGING_CAP_BYTES`, carved once
+/// at first use whatever this value is. Raising it does not cost VRAM; it permits
+/// a wider wave, and whether that wave *fits* is the separate question
+/// [`ManagedBatchedModel::prefill_width_cap`] asks the wave plan. The narrower of
+/// the two wins, so this can lead the span rather than having to trail it.
+const MAX_PREFILL_TOKENS: usize = 8192;
 
 /// Blanket implementation of `ManagedBatchedModel` for `BatchedInference<M>`.
 ///
 /// This allows models using the new `BatchedModelCore` + `BatchedInference` pattern
 /// to work with `BatchedInferenceSession` without implementing `BatchedModel`.
 impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
+        self.model().wave_geometry(act_dtype)
+    }
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        self.model().maybe_change_dtype(dtype)
+    }
+
     fn num_layers(&self) -> usize {
         self.model().num_layers()
     }
@@ -2965,7 +3123,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         layer_start: usize,
         layer_end: usize,
         residual_in: Option<Tensor>,
-    ) -> Result<WaveStep> {
+    ) -> Result<WaveResult> {
         if decode_inputs.len() != decode_seqs.len()
             || prefill_inputs.len() != prefill_seqs.len()
             || glue_inputs.len() != glue_seqs.len()
@@ -2992,12 +3150,22 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 .collect();
             let total: usize = lens.iter().sum();
             let max_len = lens.iter().copied().max().unwrap_or(1);
-            // Only slice ACROSS sequences: a single sequence over the budget can't
-            // be split (you can't slice within a sequence) and must run whole — as
-            // the old `forward_batched` did. Requiring `> 1` sequence also makes the
-            // recursion terminate: a one-sequence slice re-enters here, fails this
-            // guard, and runs whole instead of re-slicing itself forever.
-            if total > MAX_PREFILL_TOKENS && max_len > 1 && prefill_seqs.len() > 1 {
+            // Two ceilings, for unrelated reasons, so the narrower one wins.
+            //
+            // `MAX_PREFILL_TOKENS` is where the kernels stop caring: compute
+            // saturates around it, so a wider forward buys no throughput. The
+            // plan's bound is what the FFN span can physically hold, which is a
+            // correctness limit — exceed it and the expert chain spills to the
+            // pool, silently, one allocation at a time.
+            //
+            // They were previously decided apart, and the arena was the one that
+            // lost: it ran at ~100% of its span while the slicer sized waves
+            // against a constant that knows nothing about model geometry. A
+            // dense model and a MoE model at the same token count need wildly
+            // different spans — `expert_rows` multiplies by `experts_per_tok` —
+            // so only the plan can answer this.
+            let width_cap = self.prefill_width_cap(session.activation_dtype());
+            if total > width_cap && max_len > 1 && prefill_seqs.len() > 1 {
                 let mut all_logits: Vec<Tensor> = Vec::with_capacity(prefill_seqs.len());
                 let mut start = 0usize;
                 while start < prefill_seqs.len() {
@@ -3005,7 +3173,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                     let mut end = start;
                     while end < prefill_seqs.len() {
                         let l = lens[end];
-                        if end > start && toks + l > MAX_PREFILL_TOKENS {
+                        if end > start && toks + l > width_cap {
                             break;
                         }
                         toks += l;
@@ -3023,15 +3191,29 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                         num_layers,
                         None,
                     )?;
-                    all_logits.extend(step.logits.ok_or_else(|| {
+                    let lg = step.logits.as_ref().ok_or_else(|| {
                         candle::Error::Msg("forward_wave slice: no logits".into())
-                    })?);
+                    })?;
+                    // Copied off the span, not moved off it. Each slice is a
+                    // whole forward and reclaims its own forward span when
+                    // `step` drops at the end of this iteration — so a borrowed
+                    // logits row would be reading recycled bytes by the time the
+                    // next slice ran. (It could not even get that far: the span
+                    // refuses a second live generation, so slice two would fail
+                    // to open one while slice one still held it.)
+                    //
+                    // This is the sanctioned escape and it really copies. It is
+                    // confined to the slicing path, which is already paying for N
+                    // forwards, and it is why the value returned below is owned.
+                    for t in lg {
+                        all_logits.push(t.to_owned_tensor()?);
+                    }
                     start = end;
                 }
-                return Ok(WaveStep {
+                return Ok(WaveResult::owned(WaveStep {
                     residual: None,
                     logits: Some(all_logits),
-                });
+                }));
             }
         }
 
@@ -3290,7 +3472,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
             (None, _) => None,
         };
-        let phase = self.forward_wave_contexts(
+        let (phase, head_span) = self.forward_wave_contexts(
             &mut contexts,
             n_decode,
             n_prefill,
@@ -3315,7 +3497,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         //   A co-batched caller can then split the residual by contiguous group
         //   (decode | section | cohort | glue) to hold a creeping cohort whole while
         //   the full-sweep members continue.
-        Ok(match phase {
+        let step = match phase {
             WavePhase::Residual(x) => {
                 // Internal order → caller order. Tokens are dim 1.
                 let res = match token_perm.as_ref() {
@@ -3352,7 +3534,19 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                     logits: Some(out),
                 }
             }
-        })
+        };
+        // The head's outputs sit on the forward span, so the guard goes back with
+        // them: `WaveResult` is what stops the span being reclaimed while the
+        // caller still holds the logits.
+        #[cfg(feature = "cuda")]
+        {
+            Ok(WaveResult::on_span(step, head_span))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = head_span;
+            Ok(WaveResult::owned(step))
+        }
     }
 
     fn prune(&self) -> Result<()> {

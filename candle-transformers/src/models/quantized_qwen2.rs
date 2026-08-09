@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
-use super::batched_model::BatchedModelCore;
+use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::rope_tables::CisPrecomputations;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
@@ -33,6 +33,8 @@ use candle::{
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
 
 use super::quantized_matmul::QMatMul;
+use crate::models::batched_layer::WaveRef;
+use crate::models::wave_buffers::wave_root;
 use candle::LiveTensor;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
@@ -115,7 +117,7 @@ impl Mlp {
         w1.to_dtype_mut(xs.dtype())?;
         w3.to_dtype_mut(xs.dtype())?;
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward(&intermediate)?;
+        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
         out.to_dtype_mut(xs.dtype())?;
         Ok(out)
     }
@@ -125,7 +127,11 @@ impl Mlp {
     /// B3 consumer: gate/up over a producer-prepared (fused ffn_norm) activation, shared across
     /// both projections; Qwen2 down-proj closes the block. CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
         let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
             // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
@@ -153,7 +159,7 @@ impl Mlp {
         w1.to_dtype_mut(out_dtype)?;
         w3.to_dtype_mut(out_dtype)?;
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward(&intermediate)?;
+        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
         out.to_dtype_mut(out_dtype)?;
         Ok(out)
     }
@@ -187,7 +193,7 @@ impl Module for Mlp {
             w3 = w3.to_dtype(xs.dtype())?;
         }
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
-        let mut out = self.feed_forward_w2.forward(&intermediate)?;
+        let mut out = self.feed_forward_w2.forward_live(&intermediate)?;
         if out.dtype() != xs.dtype() {
             out = out.to_dtype(xs.dtype())?;
         }
@@ -413,15 +419,20 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 producer: fuse ffn_norm -> q8a128 (int8) or FP rms_norm (Off).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.ffn_norm.forward_dynamic(x, mode)
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.ffn_norm.forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B3 consumer: dense MLP over the fused ffn_norm activation.
     #[cfg(feature = "cuda")]
     fn ffn_forward<'w>(
         &self,
-        acts: DynamicActs<'static>,
+        acts: DynamicActs<'w>,
         mlp_dtype: DType,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
@@ -432,13 +443,23 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs<'static>> {
-        self.attention_norm.forward_dynamic(x, mode)
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.attention_norm
+            .forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B1 consumer: q/k/v over the fused activation, then Qwen2 QKV biases.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs<'_>, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>> {
         let q_dim = self.n_head * self.head_dim;
         let kv_dim = self.n_kv_head * self.head_dim;
         let wq = &self.attention_wq;
@@ -505,6 +526,27 @@ pub struct ModelWeights {
 #[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        for layer in &self.layers {
+            layer.attention_norm.maybe_change_dtype(dtype)?;
+            layer.ffn_norm.maybe_change_dtype(dtype)?;
+        }
+        self.norm.maybe_change_dtype(dtype)
+    }
+
+    /// Recovered from the down-projection's own weight, whose shape is
+    /// `[hidden, intermediate]`. Reading the loaded weight rather than carrying
+    /// a copy of the config means the transient plan cannot drift from the
+    /// shapes the kernels actually see.
+    fn wave_shapes(&self) -> WaveShapes {
+        let dims = self.layers[0].mlp.feed_forward_w2.weight_dims();
+        WaveShapes {
+            hidden: dims[0],
+            intermediate: dims[1],
+            experts_per_tok: 1,
+        }
+    }
 
     fn num_layers(&self) -> usize {
         self.layers.len()

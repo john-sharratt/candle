@@ -1,3 +1,5 @@
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::{alloc_inheriting, Backing, OutS};
 use crate::{LiveTensor, Result};
 use rayon::prelude::*;
 
@@ -90,13 +92,14 @@ mod cuda {
             dev: &CudaDevice,
             layout: &crate::Layout,
             _wrap: W,
-        ) -> Result<S> {
+            origin: Backing,
+        ) -> Result<OutS> {
             let slice = match layout.contiguous_offsets() {
                 None => crate::bail!("input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let elem_count = layout.shape().elem_count();
-            let dst = unsafe { dev.alloc::<u32>(elem_count)? };
+            let (dst, out_backing) = unsafe { alloc_inheriting::<u32>(dev, elem_count, origin)? };
             let ncols = self.last_dim;
             let nrows = elem_count / ncols;
             let ncols_pad = next_power_of_2(ncols);
@@ -136,7 +139,7 @@ mod cuda {
                     }
                 }
             }
-            Ok(S::U32(dst))
+            Ok((S::U32(dst), out_backing))
         }
     }
 }
@@ -172,13 +175,13 @@ impl crate::CustomOp1 for ArgSort {
         layout: &crate::Layout,
     ) -> Result<(crate::CudaStorage, crate::Shape)> {
         use crate::backend::BackendStorage;
-        use crate::cuda_backend::{Backing, Map1Any};
+        use crate::cuda_backend::Map1Any;
         let dev = storage.device();
-        let slice = self.map(&storage.slice, dev, layout)?;
+        let (slice, out_backing) = self.map(storage, dev, layout)?;
         let dst = crate::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
-            backing: Backing::Owned,
+            backing: out_backing,
         };
         Ok((dst, layout.shape().clone()))
     }

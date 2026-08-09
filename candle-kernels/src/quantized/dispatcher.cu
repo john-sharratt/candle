@@ -38,6 +38,7 @@
 // Dispatch table for deterministic kernel selection and reporting
 #include "block_compact.cuh"  // qtype_to_matmul_kernel_index + QTYPE_* constants
 #include "dispatch_table.cuh"
+#include "matmul_status.cuh"  // QMM_* launcher status codes
 
 // =============================================================================
 // L2 CACHE FLUSH UTILITY
@@ -832,66 +833,106 @@ typedef struct {
 
 // q8a128 INT8 DENSE kernels — the regular (non-MoE) QMatMul. Same INT8 m16n8k32
 // core as the grouped kernels, single weight, implicit tile schedule (blockIdx.x →
-// batch slice). Launched from run_quantized_matmul on ytype==3; F32 output. Row
-// ordering matches qtype_to_matmul_kernel_index (same as grouped_kernels_int8).
-extern "C" __global__ void q4_0_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q4_1_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q5_0_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q5_1_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q8_0_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q2_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q3_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q4_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q5_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q6_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q8_1_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q8_k_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q_awq_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q_awq_g64_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
+// batch slice). Launched from run_quantized_matmul on ytype==3. Row ordering
+// matches qtype_to_matmul_kernel_index (same as grouped_kernels_int8).
+//
+// Three output dtypes per format: the accumulator is F32 in registers either way,
+// so the tag only names the width of the final store. A dense projection is read
+// back at the model's activation dtype, and storing narrow there is what removes
+// the separate cast launch (and halves the bytes the result occupies on the wave
+// span). The grouped/MoE table stays F32-only — see grouped_kernels_int8.
+#define DECL_DENSE_INT8(name) \
+    extern "C" __global__ void name(const void*, const void*, void*, int, int, int, int, int);
+
+#define DECL_DENSE_INT8_ALL(base) \
+    DECL_DENSE_INT8(base##_f16_dense) \
+    DECL_DENSE_INT8(base##_bf16_dense) \
+    DECL_DENSE_INT8(base##_f32_dense)
+
+#define DECL_DENSE_INT8_M2_ALL(base) \
+    DECL_DENSE_INT8(base##_f16_dense_m2) \
+    DECL_DENSE_INT8(base##_bf16_dense_m2) \
+    DECL_DENSE_INT8(base##_f32_dense_m2)
+
+DECL_DENSE_INT8_ALL(q4_0_int8)
+DECL_DENSE_INT8_ALL(q4_1_int8)
+DECL_DENSE_INT8_ALL(q5_0_int8)
+DECL_DENSE_INT8_ALL(q5_1_int8)
+DECL_DENSE_INT8_ALL(q8_0_int8)
+DECL_DENSE_INT8_ALL(q2_k_int8)
+DECL_DENSE_INT8_ALL(q3_k_int8)
+DECL_DENSE_INT8_ALL(q4_k_int8)
+DECL_DENSE_INT8_ALL(q5_k_int8)
+DECL_DENSE_INT8_ALL(q6_k_int8)
+DECL_DENSE_INT8_ALL(q8_1_int8)
+DECL_DENSE_INT8_ALL(q8_k_int8)
+DECL_DENSE_INT8_ALL(q_awq_int8)
+DECL_DENSE_INT8_ALL(q_awq_g64_int8)
 // KO byte-permuted twins (rows 14-17).
-extern "C" __global__ void q4_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q5_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q6_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q8_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
+DECL_DENSE_INT8_ALL(q4_ko_int8)
+DECL_DENSE_INT8_ALL(q5_ko_int8)
+DECL_DENSE_INT8_ALL(q6_ko_int8)
+DECL_DENSE_INT8_ALL(q8_ko_int8)
+
 // q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is decided in Rust
 // (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
 // since the optimal point depends on weight bytes vs L2, not token count alone.
+// Mode-2 exists for the KO formats only — they are the ones a prefill wave runs.
+DECL_DENSE_INT8_M2_ALL(q4_ko_int8)
+DECL_DENSE_INT8_M2_ALL(q5_ko_int8)
+DECL_DENSE_INT8_M2_ALL(q6_ko_int8)
+DECL_DENSE_INT8_M2_ALL(q8_ko_int8)
 
-// Mode-2 KO dense (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill).
-extern "C" __global__ void q4_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q5_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q6_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
-extern "C" __global__ void q8_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
-// Indexed by (kernel_row - 14): Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17.
-static void* dense_kernels_int8_m2[4] = {
-    (void*)q4_ko_int8_f32_dense_m2,
-    (void*)q5_ko_int8_f32_dense_m2,
-    (void*)q6_ko_int8_f32_dense_m2,
-    (void*)q8_ko_int8_f32_dense_m2,
+#undef DECL_DENSE_INT8_M2_ALL
+#undef DECL_DENSE_INT8_ALL
+#undef DECL_DENSE_INT8
+
+// One row per output dtype, in OutDType order (0=F16, 1=BF16, 2=F32).
+#define DENSE_INT8_ROW(tag) { \
+    (void*)q4_0_int8_##tag##_dense,      /* 0   q4_0 */ \
+    (void*)q4_1_int8_##tag##_dense,      /* 1   q4_1 */ \
+    (void*)q5_0_int8_##tag##_dense,      /* 2   q5_0 */ \
+    (void*)q5_1_int8_##tag##_dense,      /* 3   q5_1 */ \
+    (void*)q8_0_int8_##tag##_dense,      /* 4   q8_0 */ \
+    (void*)q2_k_int8_##tag##_dense,      /* 5   q2_K */ \
+    (void*)q3_k_int8_##tag##_dense,      /* 6   q3_K */ \
+    (void*)q4_k_int8_##tag##_dense,      /* 7   q4_K */ \
+    (void*)q5_k_int8_##tag##_dense,      /* 8   q5_K */ \
+    (void*)q6_k_int8_##tag##_dense,      /* 9   q6_K */ \
+    (void*)q8_1_int8_##tag##_dense,      /* 10  q8_1 */ \
+    (void*)q8_k_int8_##tag##_dense,      /* 11  q8_K */ \
+    (void*)q_awq_int8_##tag##_dense,     /* 12  q_awq */ \
+    (void*)q_awq_g64_int8_##tag##_dense, /* 13  q_awq_g64 */ \
+    (void*)q4_ko_int8_##tag##_dense,     /* 14  q4_KO */ \
+    (void*)q5_ko_int8_##tag##_dense,     /* 15  q5_KO */ \
+    (void*)q6_ko_int8_##tag##_dense,     /* 16  q6_KO */ \
+    (void*)q8_ko_int8_##tag##_dense,     /* 17  q8_KO */ \
+}
+
+// Indexed by [out_dtype][kernel_row].
+static void* dense_kernels_int8[3][18] = {
+    DENSE_INT8_ROW(f16),
+    DENSE_INT8_ROW(bf16),
+    DENSE_INT8_ROW(f32),
 };
+#undef DENSE_INT8_ROW
 
-static void* dense_kernels_int8[18] = {
-    (void*)q4_0_int8_f32_dense,      // 0   q4_0
-    (void*)q4_1_int8_f32_dense,      // 1   q4_1
-    (void*)q5_0_int8_f32_dense,      // 2   q5_0
-    (void*)q5_1_int8_f32_dense,      // 3   q5_1
-    (void*)q8_0_int8_f32_dense,      // 4   q8_0
-    (void*)q2_k_int8_f32_dense,      // 5   q2_K
-    (void*)q3_k_int8_f32_dense,      // 6   q3_K
-    (void*)q4_k_int8_f32_dense,      // 7   q4_K
-    (void*)q5_k_int8_f32_dense,      // 8   q5_K
-    (void*)q6_k_int8_f32_dense,      // 9   q6_K
-    (void*)q8_1_int8_f32_dense,      // 10  q8_1
-    (void*)q8_k_int8_f32_dense,      // 11  q8_K
-    (void*)q_awq_int8_f32_dense,     // 12  q_awq
-    (void*)q_awq_g64_int8_f32_dense, // 13  q_awq_g64
-    (void*)q4_ko_int8_f32_dense,     // 14  q4_KO
-    (void*)q5_ko_int8_f32_dense,     // 15  q5_KO
-    (void*)q6_ko_int8_f32_dense,     // 16  q6_KO
-    (void*)q8_ko_int8_f32_dense,     // 17  q8_KO
+// Indexed by [out_dtype][kernel_row - 14]: Q4_KO=14, Q5_KO=15, Q6_KO=16, Q8_KO=17.
+#define DENSE_INT8_M2_ROW(tag) { \
+    (void*)q4_ko_int8_##tag##_dense_m2, \
+    (void*)q5_ko_int8_##tag##_dense_m2, \
+    (void*)q6_ko_int8_##tag##_dense_m2, \
+    (void*)q8_ko_int8_##tag##_dense_m2, \
+}
+
+static void* dense_kernels_int8_m2[3][4] = {
+    DENSE_INT8_M2_ROW(f16),
+    DENSE_INT8_M2_ROW(bf16),
+    DENSE_INT8_M2_ROW(f32),
 };
+#undef DENSE_INT8_M2_ROW
 
-extern "C" void run_quantized_matmul(
+extern "C" int run_quantized_matmul(
     const vx_segment_t* segments,
     int32_t num_segments,
     const void* vy,
@@ -903,7 +944,9 @@ extern "C" void run_quantized_matmul(
     int32_t qtype,
     int32_t ytype,
     size_t weight_bytes,  // Weight tensor size in bytes for L2 cache decision (FP path)
-    int32_t force_mode2   // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32 reuse). Rust decides.
+    int32_t force_mode2,  // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32 reuse). Rust decides.
+    int32_t out_dtype     // int8 dense store width: 0 = F16, 1 = BF16, 2 = F32. FP path ignores it
+                          // (there the output dtype is the activation dtype).
 ) {
     // Lookup table for kernel sets: [qtype][ytype][use_tc]
     // ytype: 0=F16, 1=BF16, 2=F32
@@ -972,32 +1015,38 @@ extern "C" void run_quantized_matmul(
     // -1 for any format that has no matmul kernel.
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
     if (kernel_row < 0) {
-        return;
+        return QMM_BAD_QTYPE;
     }
 
     // q8a128 INT8 path: `vy` is a block_q8a128 buffer, the single weight is
-    // segments[0].weights (non-MoE → one segment), output is F32. Same INT8 m16n8k32
-    // core as the grouped path. TC-only. nrows_y is the batch M; nrows_x is N.
-    // ytype 3 = Q8A128: the ONE int8 activation type. The mode (mode-1 Bm=16 vs mode-2 Bm=32
-    // weight-reuse) is a kernel/tiling property the dispatcher picks from the token count —
-    // the q8a1024 activation layout is mode-independent.
+    // segments[0].weights (non-MoE → one segment), the output stores at `out_dtype`.
+    // Same INT8 m16n8k32 core as the grouped path. TC-only. nrows_y is the batch M;
+    // nrows_x is N. ytype 3 = Q8A128: the ONE int8 activation type. The mode (mode-1
+    // Bm=16 vs mode-2 Bm=32 weight-reuse) is a kernel/tiling property the dispatcher
+    // picks from the token count — the q8a1024 activation layout is mode-independent.
     if (ytype == 3) {
         if (num_segments < 1) {
-            return;
+            return QMM_NO_SEGMENTS;
         }
-        void* kfn = dense_kernels_int8[kernel_row];
-        if (kfn == nullptr) {
-            return;
+        if (out_dtype < 0 || out_dtype > 2) {
+            return QMM_BAD_OUT_DTYPE;
         }
         const void* weights = segments[0].weights;
         const int total_batch = nrows_y;                  // M
         const int y_stride = ncols_x;                     // unused by the int8 kernel (ABI)
         const int dst_stride = nrows_x;                   // N
         const bool mode2 = (force_mode2 != 0);  // weight-reuse crossover decided in Rust
-        int batch_div = 16;                               // BATCH_TILE_I8 = 16 (mode-1)
+        void* kfn;
+        int batch_div;
         if (mode2 && kernel_row >= 14 && kernel_row <= 17) {
-            kfn = dense_kernels_int8_m2[kernel_row - 14];  // Bm=32 weight-reuse variant
+            kfn = dense_kernels_int8_m2[out_dtype][kernel_row - 14];  // Bm=32 weight-reuse variant
             batch_div = 32;                               // Bm = 32 (mode-2, N_SUB=2)
+        } else {
+            kfn = dense_kernels_int8[out_dtype][kernel_row];
+            batch_div = 16;                               // BATCH_TILE_I8 = 16 (mode-1)
+        }
+        if (kfn == nullptr) {
+            return QMM_NO_KERNEL;
         }
         const int batch_tiles = (total_batch + batch_div - 1) / batch_div;
         const int row_tiles = (nrows_x + 31) / 32;        // N_TILE = 32
@@ -1009,17 +1058,17 @@ extern "C" void run_quantized_matmul(
             (void*)&y_stride, (void*)&dst_stride,
         };
         cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
-        return;
+        return QMM_OK;
     }
 
     if (ytype < 0 || ytype > 2) {
-        return;
+        return QMM_BAD_YTYPE;
     }
     // KO byte-permuted formats (rows >= 14) have INT8 kernels only; the FP kernel
     // table `kernels` is sized to the 14 base formats. KO reaches here only on a
     // misrouted FP call — reject rather than index out of bounds.
     if (kernel_row >= 14) {
-        return;
+        return QMM_BAD_QTYPE;
     }
 
     // Cache device properties (queried once per device) via shared header
@@ -1043,9 +1092,8 @@ extern "C" void run_quantized_matmul(
     // Runtime validation: check that at least s1 kernel is linked (catches missing .cu files)
     // This is a one-time low-cost check that prevents silent NaN from unlinked kernels
     if (kset.s1 == nullptr) {
-        // Kernel not compiled - set CUDA error and return
-        // User will see "invalid device function" or similar from cudaGetLastError()
-        return;
+        // Kernel not compiled for this (format, activation dtype).
+        return QMM_NO_KERNEL;
     }
     
     // Calculate Y element size for pointer arithmetic
@@ -1169,6 +1217,7 @@ extern "C" void run_quantized_matmul(
         
         batch_offset += seg_batch;
     }
+    return QMM_OK;
 }
 
 // =============================================================================

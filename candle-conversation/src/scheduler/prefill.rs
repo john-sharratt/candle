@@ -1964,7 +1964,7 @@ impl Scheduler {
             if has_glue {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = out.logits.unwrap_or_default();
+            let logits = out.logits_owned()?;
             let d = n_dec.min(logits.len());
             let dec_logits = logits[..d].to_vec();
             if !sec_gidx.is_empty() {
@@ -2067,7 +2067,7 @@ impl Scheduler {
                     cursor,
                     None,
                 )?
-                .residual
+                .into_residual()
         } else {
             None
         };
@@ -2174,7 +2174,7 @@ impl Scheduler {
             if has_glue {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = seg2.logits.unwrap_or_default();
+            let logits = seg2.logits_owned()?;
             let d = n_dec.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
             let dec_logits = logits[..d].to_vec();
@@ -2186,7 +2186,7 @@ impl Scheduler {
         // Paused: split seg2's `[decode | creep | glue]` residual. Hold the creep
         // whole; continue the full-sweep members `[decode | glue]` into seg3.
         let res = seg2
-            .residual
+            .into_residual()
             .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
         let dec_part = if n_dec > 0 {
             Some(res.narrow(1, 0, n_dec)?)
@@ -2228,7 +2228,7 @@ impl Scheduler {
         if has_glue {
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        Ok(seg3.logits.unwrap_or_default())
+        seg3.logits_owned()
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
@@ -2674,7 +2674,7 @@ impl Scheduler {
                         nl,
                         None,
                     )
-                    .map(|s| s.logits.unwrap_or_default())
+                    .and_then(|s| s.logits_owned())
                     .map_err(ConversationError::Model)?;
                 self.session
                     .advance_sequence(sequence_id.0, chunk.len())
@@ -2704,7 +2704,7 @@ impl Scheduler {
                     self.model.num_layers().max(1),
                     None,
                 )
-                .map(|s| s.logits.unwrap_or_default())
+                .and_then(|s| s.logits_owned())
                 .map_err(ConversationError::Model)?;
 
             self.session

@@ -1,3 +1,4 @@
+use super::super::bump_arena::NOT_A_WAVE;
 use super::params::SELECT_BLOCK;
 use super::profile::sampled_profile_record_duration;
 use super::CompressionSummary;
@@ -48,9 +49,11 @@ fn bump_generation(
     if generation.is_some() {
         return None;
     }
+    // `0` planned span: this staging is sized per call rather than by the wave
+    // plan, so the whole domain stays cursor-managed.
     super::super::bump_arena::persistence_domain(&dev.cuda_stream())
+        .and_then(|b| b.generation(NOT_A_WAVE, NOT_A_WAVE))
         .ok()
-        .map(|b| b.generation())
 }
 
 fn stage_bytes_as_gpu_buf(

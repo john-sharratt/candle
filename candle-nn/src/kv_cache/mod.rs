@@ -47,8 +47,14 @@ pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, Gold
 pub use chunked::persistence_domain_stats;
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
+pub use chunked::wave_plan::{
+    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+};
 #[cfg(feature = "cuda")]
-pub use chunked::{begin_wave, wave_domain_stats, BumpRange, WaveGeneration};
+pub use chunked::{
+    begin_wave, wave_domain_stats, BumpRange, WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
+    WAVE_FORWARD_BYTES,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::{region_stats, RegionStats, REGION_BYTES};
 

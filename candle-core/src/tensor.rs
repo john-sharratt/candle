@@ -261,19 +261,89 @@ impl<'w> LiveTensor<'w> {
         dtype: DType,
         shape: S,
         device: &Device,
+        origin: crate::cuda_backend::wave_provenance::LeaseOrigin,
     ) -> Result<Self> {
         let Device::Cuda(cuda) = device else {
             crate::bail!("from_leased_cuda_ptr: expected a CUDA device, got {device:?}");
         };
         let shape = shape.into();
-        let storage =
-            crate::CudaStorage::from_leased_device_ptr(ptr, shape.elem_count(), dtype, cuda)?;
+        let storage = crate::CudaStorage::from_leased_device_ptr(
+            ptr,
+            shape.elem_count(),
+            dtype,
+            cuda,
+            origin,
+        )?;
         Ok(from_storage(
             Storage::Cuda(storage),
             shape,
             BackpropOp::none(),
             false,
         ))
+    }
+
+    /// Re-describe this tensor's bytes as a `'static` tensor that **borrows**
+    /// them, copying nothing.
+    ///
+    /// The alternative at a channel boundary is [`Self::to_owned_tensor`], which
+    /// really copies. `'static` here says the result owns no memory, not that
+    /// the memory is immortal — so the caller carries the obligation below.
+    ///
+    /// Requires a contiguous layout: a lease is an address plus a shape, and a
+    /// strided view is neither losslessly describable that way nor useful to the
+    /// kernels that consume one.
+    ///
+    /// # Safety
+    /// `self` must outlive every use of the returned tensor.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn as_foreign_lease(&self) -> Result<Tensor> {
+        let (storage, layout) = self.storage_and_layout();
+        if !layout.is_contiguous() {
+            crate::bail!("as_foreign_lease: requires a contiguous layout");
+        }
+        let Storage::Cuda(cuda) = &*storage else {
+            crate::bail!("as_foreign_lease: expected CUDA storage");
+        };
+        let dtype = self.dtype();
+        let base = cuda.slice.device_ptr(&cuda.device().cuda_stream());
+        let ptr = base + (layout.start_offset() * dtype.size_in_bytes()) as u64;
+        Tensor::from_leased_cuda_ptr(
+            ptr,
+            dtype,
+            self.shape().clone(),
+            self.device(),
+            crate::cuda_backend::wave_provenance::LeaseOrigin::Foreign,
+        )
+    }
+
+    /// The wave generation this tensor's storage was carved from, if any — what
+    /// an op passes along so its output is allocated beside its input.
+    ///
+    /// `None` off CUDA and for anything pool-backed, which is the right answer
+    /// rather than a fallback: there is no arena to inherit.
+    pub fn wave_ticket(&self) -> Option<crate::wave_provenance::WaveTicket> {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_backing().inherit_ticket()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// The arena this tensor's storage came from, for an op that wants to
+    /// allocate its output alongside it.
+    ///
+    /// [`crate::cuda_backend::Backing::Owned`] for anything not on CUDA, which
+    /// is the right answer rather than a fallback: there is no wave to inherit.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_backing(&self) -> crate::cuda_backend::Backing {
+        let (storage, _) = self.storage_and_layout();
+        match &*storage {
+            Storage::Cuda(c) => c.backing,
+            _ => crate::cuda_backend::Backing::Owned,
+        }
     }
 
     /// Wrap device storage a kernel has just written into a tensor.
@@ -2415,7 +2485,10 @@ impl<'w> LiveTensor<'w> {
         let dim = dim.to_index(self.shape(), "scatter")?;
         self.scatter_checks(indexes, source, dim)?;
         let shape = self.shape();
-        let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
+        let mut storage = unsafe {
+            self.device()
+                .alloc_uninit_from(shape, self.dtype(), self.wave_ticket())?
+        };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let layout = Layout::contiguous(shape);
@@ -2454,7 +2527,10 @@ impl<'w> LiveTensor<'w> {
         let dim = dim.to_index(self.shape(), "scatter-add")?;
         self.scatter_checks(indexes, source, dim)?;
         let shape = self.shape();
-        let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
+        let mut storage = unsafe {
+            self.device()
+                .alloc_uninit_from(shape, self.dtype(), self.wave_ticket())?
+        };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let layout = Layout::contiguous(shape);
@@ -2549,7 +2625,10 @@ impl<'w> LiveTensor<'w> {
             }
             .bt())?
         }
-        let mut storage = unsafe { self.device().alloc_uninit(self.shape(), self.dtype())? };
+        let mut storage = unsafe {
+            self.device()
+                .alloc_uninit_from(self.shape(), self.dtype(), self.wave_ticket())?
+        };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let offset = start * src.dims()[1..].iter().product::<usize>();
@@ -3363,7 +3442,10 @@ impl<'w> LiveTensor<'w> {
             Ok(self.clone())
         } else {
             let shape = self.shape();
-            let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
+            let mut storage = unsafe {
+                self.device()
+                    .alloc_uninit_from(shape, self.dtype(), self.wave_ticket())?
+            };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
             let op = BackpropOp::new1(self, Op::Copy);
@@ -3374,7 +3456,10 @@ impl<'w> LiveTensor<'w> {
     /// Returns a tensor that is in row major order. This always makes a copy.
     pub fn force_contiguous(&self) -> Result<Self> {
         let shape = self.shape();
-        let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
+        let mut storage = unsafe {
+            self.device()
+                .alloc_uninit_from(shape, self.dtype(), self.wave_ticket())?
+        };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let op = BackpropOp::new1(self, Op::Copy);
@@ -3385,7 +3470,10 @@ impl<'w> LiveTensor<'w> {
     /// copied.
     pub(crate) fn make_var(&self) -> Result<Self> {
         let shape = self.shape().clone();
-        let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
+        let mut storage = unsafe {
+            self.device()
+                .alloc_uninit_from(&shape, self.dtype(), self.wave_ticket())?
+        };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         Ok(from_storage(storage, shape, BackpropOp::none(), true))
@@ -3439,7 +3527,10 @@ impl<'w> LiveTensor<'w> {
             };
             Ok(LiveTensor(Arc::new(tensor_)))
         } else {
-            let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
+            let mut storage = unsafe {
+                self.device()
+                    .alloc_uninit_from(&shape, self.dtype(), self.wave_ticket())?
+            };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
             Ok(from_storage(storage, shape, op, false))

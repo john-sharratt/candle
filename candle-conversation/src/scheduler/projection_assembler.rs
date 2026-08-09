@@ -1327,7 +1327,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
                     nl,
                     None,
                 )
-                .map(|s| s.logits.unwrap_or_default())
+                .and_then(|s| s.logits_owned())
                 .map_err(ConversationError::Model)?;
         }
         ctx.session

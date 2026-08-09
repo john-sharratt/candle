@@ -52,6 +52,7 @@ mod size_class;
 #[cfg(feature = "cuda")]
 pub(crate) mod slot_state_arena;
 mod types;
+pub mod wave_plan;
 
 #[cfg(test)]
 mod tests;
@@ -100,7 +101,7 @@ pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
     begin_wave, persistence_domain_stats, wave_domain_stats, BumpRange,
-    Generation as WaveGeneration,
+    Generation as WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use region_pool::{region_stats, RegionStats, REGION_BYTES};

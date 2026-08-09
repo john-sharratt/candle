@@ -65,6 +65,7 @@ pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
 pub mod fletcher;
+pub mod forbidden_alloc;
 #[cfg(feature = "cuda")]
 pub mod gpu_keepalive;
 pub mod gpu_memory;
@@ -94,6 +95,7 @@ pub mod test_utils;
 pub mod utils;
 mod variable;
 pub mod vram;
+pub mod wave_provenance;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;

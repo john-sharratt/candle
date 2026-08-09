@@ -16,6 +16,7 @@
 #![cfg(feature = "cuda")]
 
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+use candle_core::cuda_backend::wave_provenance::LeaseOrigin;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -37,7 +38,15 @@ fn f32_ptr(t: &Tensor) -> u64 {
 fn lease_reads_the_owners_bytes() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     let owner = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (4,), &dev)?;
-    let leased = unsafe { Tensor::from_leased_cuda_ptr(f32_ptr(&owner), DType::F32, (4,), &dev)? };
+    let leased = unsafe {
+        Tensor::from_leased_cuda_ptr(
+            f32_ptr(&owner),
+            DType::F32,
+            (4,),
+            &dev,
+            LeaseOrigin::Foreign,
+        )?
+    };
     assert_eq!(leased.to_vec1::<f32>()?, vec![1.0, 2.0, 3.0, 4.0]);
     Ok(())
 }
@@ -48,7 +57,15 @@ fn lease_reads_the_owners_bytes() -> Result<()> {
 fn writes_through_a_lease_reach_the_owner() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     let owner = Tensor::zeros((4,), DType::F32, &dev)?;
-    let leased = unsafe { Tensor::from_leased_cuda_ptr(f32_ptr(&owner), DType::F32, (4,), &dev)? };
+    let leased = unsafe {
+        Tensor::from_leased_cuda_ptr(
+            f32_ptr(&owner),
+            DType::F32,
+            (4,),
+            &dev,
+            LeaseOrigin::Foreign,
+        )?
+    };
     let src = Tensor::from_vec(vec![7.0f32, 8.0], (2,), &dev)?;
     leased.slice_set(&src, 0, 1)?;
     assert_eq!(owner.to_vec1::<f32>()?, vec![0.0, 7.0, 8.0, 0.0]);
@@ -69,7 +86,9 @@ fn dropping_a_lease_leaves_the_owner_intact() -> Result<()> {
     // rather than as a merely-suspicious single case. Each iteration also
     // allocates, so a wrongly-freed slot would likely be handed straight back.
     for _ in 0..64 {
-        let leased = unsafe { Tensor::from_leased_cuda_ptr(ptr, DType::F32, (64,), &dev)? };
+        let leased = unsafe {
+            Tensor::from_leased_cuda_ptr(ptr, DType::F32, (64,), &dev, LeaseOrigin::Foreign)?
+        };
         assert_eq!(leased.to_vec1::<f32>()?[7], 7.0);
         drop(leased);
         let _scratch = Tensor::zeros((1024,), DType::F32, &dev)?;
@@ -91,7 +110,9 @@ fn lease_travels_with_views() -> Result<()> {
     let owner = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (12,), &dev)?;
     let ptr = f32_ptr(&owner);
     {
-        let leased = unsafe { Tensor::from_leased_cuda_ptr(ptr, DType::F32, (3, 4), &dev)? };
+        let leased = unsafe {
+            Tensor::from_leased_cuda_ptr(ptr, DType::F32, (3, 4), &dev, LeaseOrigin::Foreign)?
+        };
         let row = leased.narrow(0, 1, 1)?;
         assert_eq!(
             row.flatten_all()?.to_vec1::<f32>()?,
@@ -109,7 +130,9 @@ fn lease_travels_with_views() -> Result<()> {
 fn a_slot_can_be_viewed_as_bytes() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     let owner = Tensor::from_vec(vec![1.0f32], (1,), &dev)?;
-    let bytes = unsafe { Tensor::from_leased_cuda_ptr(f32_ptr(&owner), DType::U8, (4,), &dev)? };
+    let bytes = unsafe {
+        Tensor::from_leased_cuda_ptr(f32_ptr(&owner), DType::U8, (4,), &dev, LeaseOrigin::Foreign)?
+    };
     // 1.0f32 == 0x3F800000, little-endian.
     assert_eq!(bytes.to_vec1::<u8>()?, vec![0x00, 0x00, 0x80, 0x3F]);
     Ok(())
@@ -130,7 +153,9 @@ fn a_quantized_lease_addresses_the_owners_blocks() -> Result<()> {
     let owner = QTensor::quantize(&src, GgmlDType::Q8_0)?;
     let owner_ptr = owner.cuda_data_ptr().expect("owner is CUDA-resident");
 
-    let leased = unsafe { QTensor::from_leased_cuda_ptr(owner_ptr, GgmlDType::Q8_0, 64, cuda)? };
+    let leased = unsafe {
+        QTensor::from_leased_cuda_ptr(owner_ptr, GgmlDType::Q8_0, 64, cuda, LeaseOrigin::Foreign)?
+    };
     assert_eq!(
         leased.cuda_data_ptr(),
         Some(owner_ptr),
@@ -157,8 +182,15 @@ fn to_owned_qtensor_copies_off_the_lease() -> Result<()> {
     let owner_ptr = owner.cuda_data_ptr().expect("owner is CUDA-resident");
 
     let escaped = {
-        let leased =
-            unsafe { QTensor::from_leased_cuda_ptr(owner_ptr, GgmlDType::Q8_0, 64, cuda)? };
+        let leased = unsafe {
+            QTensor::from_leased_cuda_ptr(
+                owner_ptr,
+                GgmlDType::Q8_0,
+                64,
+                cuda,
+                LeaseOrigin::Foreign,
+            )?
+        };
         leased.to_owned_qtensor()
     };
     assert_ne!(
@@ -170,6 +202,91 @@ fn to_owned_qtensor_copies_off_the_lease() -> Result<()> {
         &*escaped.data()?,
         &*owner.data()?,
         "with the owner's bytes reproduced exactly"
+    );
+    Ok(())
+}
+
+/// `to_dtype_mut` on a leased tensor must not free the owner's *allocation*.
+///
+/// The cast itself writes through the lease, so the leased range's bytes are
+/// expected to change — that is what an in-place cast on a view means. What must
+/// not happen is the retype that follows releasing the owner's memory: it
+/// allocates a fresh pool buffer and copies, so the outgoing slice is a lease
+/// that has to be disposed of as a *view*. Assigning over it instead calls
+/// `cuMemFreeAsync` on the owner's block, and cudarc records that rejection
+/// silently rather than panicking — nothing announces the mistake where it
+/// happens.
+///
+/// So lease only the first half and assert on the second: the cast never touches
+/// the tail, but a freed-and-recycled allocation would.
+#[test]
+fn to_dtype_mut_on_a_lease_leaves_the_owner_intact() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let owner = Tensor::from_vec((0..64).map(|i| i as f32).collect::<Vec<_>>(), (64,), &dev)?;
+    let base = f32_ptr(&owner);
+
+    for _ in 0..32 {
+        let mut leased = unsafe {
+            Tensor::from_leased_cuda_ptr(base, DType::F32, (32,), &dev, LeaseOrigin::Foreign)?
+        };
+        // F32 -> BF16 narrows, so the buffer is big enough and the in-place path
+        // is taken rather than the allocating fallback.
+        leased.to_dtype_mut(DType::BF16)?;
+        assert_eq!(leased.dtype(), DType::BF16);
+        drop(leased);
+        // Allocate in between: if the drop returned the owner's block to the
+        // pool, this is what would claim it and overwrite the tail.
+        let _scratch = Tensor::zeros((4096,), DType::F32, &dev)?;
+    }
+
+    let tail = owner.narrow(0, 32, 32)?.to_vec1::<f32>()?;
+    for (i, v) in tail.iter().enumerate() {
+        let expected = (i + 32) as f32;
+        assert_eq!(
+            *v,
+            expected,
+            "owner float {} was corrupted — the lease drop freed the owner's block",
+            i + 32
+        );
+    }
+    Ok(())
+}
+
+/// After `to_dtype_mut` retypes a lease, the storage owns a fresh pool buffer —
+/// so its backing has to have followed the bytes. If it stayed `Lease`, drop
+/// would `leak_view` the pool allocation and never free it: a permanent leak of
+/// one buffer per cast, invisible to every other assertion here.
+#[test]
+fn to_dtype_mut_transfers_ownership_off_the_lease() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let owner = Tensor::from_vec(vec![1.0f32; 64], (64,), &dev)?;
+    let mut leased = unsafe {
+        Tensor::from_leased_cuda_ptr(
+            f32_ptr(&owner),
+            DType::F32,
+            (64,),
+            &dev,
+            LeaseOrigin::Foreign,
+        )?
+    };
+    leased.to_dtype_mut(DType::BF16)?;
+
+    // The retyped storage must no longer address the owner: a fresh buffer was
+    // allocated and copied into, so writing through it cannot reach `owner`.
+    let (storage, _) = leased.storage_and_layout();
+    let retyped_ptr = match &*storage {
+        candle_core::Storage::Cuda(c) => {
+            let slice = c.as_cuda_slice::<half::bf16>().expect("bf16 slice");
+            let stream = c.device.cuda_stream();
+            let (p, _g) = slice.device_ptr(&stream);
+            p
+        }
+        _ => panic!("expected CUDA storage"),
+    };
+    assert_ne!(
+        retyped_ptr,
+        f32_ptr(&owner),
+        "to_dtype_mut must move the storage off the leased pointer"
     );
     Ok(())
 }

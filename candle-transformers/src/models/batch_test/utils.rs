@@ -1,3 +1,4 @@
+use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use std::time::Duration;
@@ -571,6 +572,9 @@ impl TestParams {
             compression_level: config.mode.compression_level(),
             ..Default::default()
         };
+        // One loaded model serves every config in the sweep and the configs
+        // differ in KV dtype, so the norm weights are re-materialised per config.
+        // `create_batched_session` does that itself — see `maybe_change_dtype`.
         let mut session = model.create_batched_session(batch_config)?;
 
         // RAII diagnostic guard — MUST be declared AFTER `session`.
@@ -649,8 +653,7 @@ impl TestParams {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
 
             // Store logits and advance sequences
             for (&seq_idx, logits) in seq_idxs.iter().zip(logits_vec.into_iter()) {
@@ -769,8 +772,7 @@ impl TestParams {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
 
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
@@ -821,6 +823,16 @@ impl TestParams {
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
         let mut steps_run = 0usize;
+        // The steady-state decode loop is the hot loop the transient tier
+        // exists for, so it is the window worth measuring: every device
+        // allocation inside it is one the wave path should have taken from a
+        // bump range instead. The warmup step above is deliberately outside —
+        // its first-touch allocations are unavoidable and would drown the
+        // per-step traffic that matters.
+        //
+        // Arming is scoped to this block so an early `?` cannot leave the
+        // detector on for the sealing and reporting that follow.
+        let detector = forbidden_alloc::armed();
         if !stopped {
             for _step_num in 0..remaining_steps {
                 let toks =
@@ -832,6 +844,29 @@ impl TestParams {
             }
         }
         self.device.synchronize()?;
+        drop(detector);
+        let forbidden = forbidden_alloc::take_report();
+        if !forbidden.is_clean() {
+            eprintln!("[{:?}] {}", config.mode, forbidden);
+        }
+        // The other half of the picture: the detector says what did NOT come
+        // from an arena, this says how much did. A phase whose peak is zero has
+        // a chain that never started, which reads identically in the detector to
+        // a chain that started and was never converted.
+        #[cfg(feature = "cuda")]
+        if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+            if let Some([attn, ffn, fwd]) = candle_nn::kv_cache::wave_domain_stats(gpu_id) {
+                // `peak` is a process-lifetime high-water mark, so once one
+                // config saturates a span every later config reports the same
+                // number. Read it as "the worst this process ever saw", not as a
+                // per-config figure.
+                eprintln!(
+                    "[{:?}] wave arenas (peak is process-wide): attention {} B of {} B, \
+                     ffn {} B of {} B, forward {} B of {} B",
+                    config.mode, attn.1, attn.2, ffn.1, ffn.2, fwd.1, fwd.2
+                );
+            }
+        }
         pipeline_record("bench:decode_total", t_decode_total);
 
         let generate_duration = generate_start.elapsed();
@@ -1078,8 +1113,7 @@ impl TestParams {
                 nl,
                 None,
             )?
-            .logits
-            .unwrap_or_default();
+            .logits_owned()?;
         pipeline_record("bench:decode_forward_call", t_forward);
 
         for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {

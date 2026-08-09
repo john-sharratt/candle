@@ -117,6 +117,22 @@ impl QMatMul {
         })
     }
 
+    /// Dimensions of the underlying weight, `[out_features, in_features]`.
+    ///
+    /// Reads the shape off whichever representation the weight was loaded as,
+    /// so a projection's widths can be recovered from the model itself rather
+    /// than carried alongside it. That matters for the transient plan: sizing
+    /// from the loaded weights cannot drift from what the kernels actually see,
+    /// whereas a separately-stored copy of the same number can.
+    pub fn weight_dims(&self) -> Vec<usize> {
+        match &self.inner {
+            candle::quantized::QMatMul::QTensor(qt) => qt.shape().dims().to_vec(),
+            candle::quantized::QMatMul::Tensor(t) | candle::quantized::QMatMul::TensorF16(t) => {
+                t.dims().to_vec()
+            }
+        }
+    }
+
     pub fn inner(&self) -> &candle::quantized::QMatMul {
         &self.inner
     }
@@ -129,27 +145,27 @@ impl QMatMul {
 
     /// Matmul over an activation a producer already prepared as a [`DynamicTensor`]: an `Int8`
     /// operand is pre-quantized q8a128 (emitted by a fused RMSNorm/SwiGLU/attention epilogue) and
-    /// goes straight to the KO tensor-core matmul — no standalone quantize launch — then casts the
-    /// F32 result to `out_dtype`; a `Float` operand runs the standard `forward` path. This is the
-    /// consumer half of producer fusion: `quantize once per fan-out` (q/k/v share one ln1 operand).
-    /// CUDA only.
+    /// goes straight to the KO tensor-core matmul — no standalone quantize launch — which stores
+    /// its F32 accumulator directly at `out_dtype`; a `Float` operand runs the standard `forward`
+    /// path. This is the consumer half of producer fusion: `quantize once per fan-out` (q/k/v share
+    /// one ln1 operand). CUDA only.
     #[cfg(feature = "cuda")]
-    pub fn forward_dynamic(
+    pub fn forward_dynamic<'w>(
         &self,
-        input: candle::quantized::cuda::DynamicTensor,
+        input: candle::quantized::cuda::DynamicTensor<'_, 'w>,
         out_dtype: DType,
-    ) -> Result<Tensor> {
+    ) -> Result<candle::LiveTensor<'w>> {
         use candle::quantized::cuda::DynamicTensor;
         // Float activation → the ordinary path (handles Off gemx and any non-int8 weight). It tags
         // its own profile bucket, so don't double-record here.
         if let DynamicTensor::Float(t) = input {
             return self.forward_live(t);
         }
-        // Int8 (pre-quantized) activation × KO weight → F32, cast back to the compute dtype.
+        // Int8 (pre-quantized) activation × KO weight, stored at the compute dtype.
         let t_mm = profile_now();
-        let out_f32 = self.inner.forward_dynamic(input)?;
+        let out = self.inner.forward_dynamic(input, out_dtype)?;
         pipeline_record("qmatmul_q8", t_mm);
-        out_f32.to_dtype(out_dtype)
+        Ok(out)
     }
 
     /// Dequantize the underlying tensor.
@@ -165,9 +181,10 @@ impl QMatMul {
 
 impl QMatMul {
     /// As [`candle::quantized::QMatMul::forward_live`]: accepts a wave-scoped
-    /// activation, because it only reads it and allocates its own output. The
-    /// `Module` impl below is this at `'static`.
-    pub fn forward_live(&self, xs: &candle::LiveTensor<'_>) -> Result<Tensor> {
+    /// activation and returns a result bounded by the same generation, because
+    /// the output is allocated from whichever arena `xs` came from. The
+    /// `Module` impl below is this at `'static`, where the bound is vacuous.
+    pub fn forward_live<'w>(&self, xs: &candle::LiveTensor<'w>) -> Result<candle::LiveTensor<'w>> {
         let _enter = self.span.enter();
         // Tag the profile entry with the format the matmul actually ran in (`_q8` int8 tensor-core,
         // `_f16`/`_f32` FP) so a perf-vs-off run shows at a glance whether int8 engaged.
@@ -182,12 +199,11 @@ impl QMatMul {
             (xs.clone(), None, m)
         };
 
-        // int8 tensor-core path: q8a128 activations × the KO-twin weight, F32 result cast back
-        // to the input dtype. The weight twin was baked in at load by `from_*_with_mode`.
+        // int8 tensor-core path: q8a128 activations × the KO-twin weight, stored back at the input
+        // dtype. The weight twin was baked in at load by `from_*_with_mode`.
         #[cfg(feature = "cuda")]
         if self.int8mode.is_int8() {
-            let out_f32 = self.inner.forward_via_int8(&xs2, self.int8mode)?;
-            let out2 = out_f32.to_dtype(in_dtype)?;
+            let out2 = self.inner.forward_via_int8(&xs2, self.int8mode)?;
             pipeline_record("qmatmul_q8", t_mm);
             return if let Some((b, s)) = reshape_back {
                 let n = out2.dim(1)?;

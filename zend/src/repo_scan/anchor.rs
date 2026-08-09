@@ -382,7 +382,10 @@ mod tests {
         let a = pick(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (6, 8));
         assert!(a.body.starts_with("//! Turn-based conversation engine."));
-        assert!(!a.body.contains("Copyright"), "the licence is not the anchor");
+        assert!(
+            !a.body.contains("Copyright"),
+            "the licence is not the anchor"
+        );
     }
 
     /// A block comment opened and closed on one line is still a prelude line.

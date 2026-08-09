@@ -105,7 +105,12 @@ impl ChunkedCache {
 
     /// Write contiguous K/V data to the chunked backing.
     /// Expects tensors shaped (1, n_kv_head, len, head_dim).
-    pub(crate) fn write_contiguous(&self, offset: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+    pub(crate) fn write_contiguous(
+        &self,
+        offset: usize,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
+    ) -> Result<()> {
         self.backing.write_contiguous(self.batch_idx, offset, k, v)
     }
 
@@ -1024,7 +1029,15 @@ impl KvCache {
     ///
     /// Expects tensors shaped (1, n_kv_head, len, head_dim).
     /// For quantized storage, data is quantized on write.
-    pub fn chunked_write_kv(&self, offset: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+    /// `k`/`v` may live on an inference wave: this copies their bytes into the
+    /// arena rather than retaining a view, so nothing here outlives the
+    /// generation they came from.
+    pub fn chunked_write_kv(
+        &self,
+        offset: usize,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
+    ) -> Result<()> {
         match (&self.k.storage, &self.v.storage) {
             (CacheStorage::Chunked(k_c), CacheStorage::Chunked(_v_c)) => {
                 // Both K and V share the same backing

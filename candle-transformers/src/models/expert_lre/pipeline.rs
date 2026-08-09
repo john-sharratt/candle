@@ -84,6 +84,8 @@ use super::types::{
     PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator};
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_zeros_ticketed;
 #[cfg(not(feature = "cuda"))]
 use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
@@ -994,11 +996,19 @@ impl PipelineState {
         };
 
         let (num_tokens, hidden) = req.input.shape()?;
-        // Not a wave buffer, and cannot be one: this runs on the pipeline
-        // thread, and the tensor is handed back to the caller over a channel —
-        // so the scope that would have to hold it open belongs to a different
-        // thread than the one that allocated it. Restructuring who owns the
-        // combine target is what a transient domain here would need first.
+        // The combine target comes from the submitting layer's FFN span. This
+        // thread cannot borrow that generation, but the request carries its
+        // ticket, and the submitter blocks on the response for the whole
+        // request — so the span is open from here to the hand-back, and the
+        // returned tensor is a lease that frees nothing when the caller drops
+        // it.
+        // There is no wave domain without CUDA, so off-CUDA the target is an
+        // ordinary owned allocation — the same split the `MoeInput` match below
+        // makes, for the same reason.
+        #[cfg(feature = "cuda")]
+        let mut ys =
+            wave_zeros_ticketed((num_tokens, hidden), req.out_dtype, &self.device, req.wave)?;
+        #[cfg(not(feature = "cuda"))]
         let mut ys = Tensor::zeros((num_tokens, hidden), req.out_dtype, &self.device)?;
         // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
         #[cfg(not(feature = "cuda"))]
@@ -1029,6 +1039,7 @@ impl PipelineState {
                     &experts_vec,
                     &req.weights_flat,
                     &mut self.profile,
+                    req.wave,
                 )?;
             }
         }
@@ -1087,6 +1098,7 @@ impl PipelineState {
                     &experts_vec,
                     &req.weights_flat,
                     &mut self.profile,
+                    req.wave,
                 )?;
             }
         }

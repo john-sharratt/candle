@@ -7874,6 +7874,12 @@ mod tests {
     }
 
     impl ManagedBatchedModel for DummyModel {
+        /// No norms to materialise: this stub answers the scheduler's shape
+        /// questions and never runs a kernel.
+        fn maybe_change_dtype(&self, _dtype: DType) -> candle::Result<()> {
+            Ok(())
+        }
+
         fn num_layers(&self) -> usize {
             1
         }
@@ -7882,6 +7888,22 @@ mod tests {
         }
         fn head_dim(&self) -> usize {
             16
+        }
+
+        /// Matches the single-head, 16-wide shape the rest of this dummy
+        /// reports, so anything that prices a wave against it gets a coherent
+        /// (if tiny) answer rather than a placeholder.
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            candle_nn::kv_cache::ModelGeometry {
+                hidden: 16,
+                intermediate: 32,
+                n_head: 1,
+                n_kv_head: 1,
+                head_dim: 16,
+                experts_per_tok: 1,
+                act_dtype,
+                accum_dtype: DType::F32,
+            }
         }
         fn device(&self) -> &candle::Device {
             &self.device
@@ -7900,18 +7922,18 @@ mod tests {
             _layer_start: usize,
             layer_end: usize,
             _residual_in: Option<Tensor>,
-        ) -> candle::Result<candle_transformers::models::batched_inference::WaveStep> {
-            use candle_transformers::models::batched_inference::WaveStep;
+        ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult> {
+            use candle_transformers::models::batched_inference::{WaveResult, WaveStep};
             if layer_end >= self.num_layers() {
-                Ok(WaveStep {
+                Ok(WaveResult::owned(WaveStep {
                     residual: None,
                     logits: Some(self.dummy_logits(decode_seqs.len() + prefill_seqs.len())?),
-                })
+                }))
             } else {
-                Ok(WaveStep {
+                Ok(WaveResult::owned(WaveStep {
                     residual: Some(Tensor::zeros((1, 1, 1), DType::F32, &self.device)?),
                     logits: None,
-                })
+                }))
             }
         }
 

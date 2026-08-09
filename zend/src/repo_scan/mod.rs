@@ -1375,8 +1375,9 @@ mod tests {
         let per_conv = per_conversation_kv(KV, PRE_SCAN, 2);
         let held_by_fraction = CAPACITY - ((CAPACITY as f64) * 0.70) as u64;
         assert!(held_by_fraction > SCRATCH * 3, "{held_by_fraction}");
-        let by_fraction =
-            (((CAPACITY as f64) * 0.70) as u64).saturating_sub(POOL_USED - KV + PRE_SCAN) / per_conv;
+        let by_fraction = (((CAPACITY as f64) * 0.70) as u64)
+            .saturating_sub(POOL_USED - KV + PRE_SCAN)
+            / per_conv;
         let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
         assert_eq!(by_fraction, 0);
         assert_eq!(by_governor, 6);
