@@ -21,6 +21,7 @@ use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
 use crate::models::expert_lre::{ExpertCache, MmapExpertRef, MoeInput};
+use crate::models::profile::{pipeline_record, profile_now};
 
 use super::config::Config;
 use super::hyper::{HyperConnection, HyperParams};
@@ -64,7 +65,6 @@ pub struct Dsv4Engine {
     _mmap: Arc<memmap2::Mmap>,
     _reg: Option<MmapRegistration>,
     device: Device,
-    int8mode: Int8Mode,
 }
 
 impl Dsv4Engine {
@@ -342,7 +342,6 @@ impl Dsv4Engine {
             _mmap: mmap,
             _reg: reg,
             device: device.clone(),
-            int8mode,
         })
     }
 
@@ -380,6 +379,7 @@ impl Dsv4Engine {
         let dim = self.cfg.dim;
         let nt = token_ids.len();
         let x2 = x.reshape((nt, dim))?;
+        let t_route = profile_now();
         // Float-normalized input for routing + the shared expert.
         let normed = rms_norm(&x2, &layer.ffn_norm, self.cfg.norm_eps)?;
         let ids = Tensor::from_vec(token_ids.to_vec(), nt, &self.device)?;
@@ -397,12 +397,14 @@ impl Dsv4Engine {
             self.cfg.norm_eps as f32,
             &cuda_dev,
         )?;
+        pipeline_record("moe:route", t_route);
 
         // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),
         // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
         // The ONE intrinsic wave-path readback: the streaming expert cache
         // schedules pinned→VRAM uploads by expert id, so the routing indices
         // must be host-visible (amortized across every row of the wave).
+        let t_sort = profile_now();
         super::readback::note_readback();
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
         let weights_flat = weights.flatten_all()?; // [nt*k]
@@ -437,6 +439,8 @@ impl Dsv4Engine {
             }
         }
 
+        pipeline_record("moe:sort", t_sort);
+        let t_submit = profile_now();
         let routed = self.experts.submit_moe_work(
             layer.moe_layer_idx,
             expert_ids,
@@ -445,8 +449,12 @@ impl Dsv4Engine {
             &weights_flat,
             assignments,
         )?; // [nt, dim] F32
+        pipeline_record("moe:submit", t_submit);
+        let t_shared = profile_now();
         let shared = layer.shared.forward(&normed)?; // [nt, dim] F32
-        (routed + shared)?.reshape((1, nt, dim))
+        let out = (routed + shared)?.reshape((1, nt, dim));
+        pipeline_record("moe:shared", t_shared);
+        out
     }
 
     /// Open a decode session (per-layer streaming attention KV) over this resident model.
@@ -507,15 +515,12 @@ impl Dsv4Engine {
     pub(super) fn engine_layer(&self, l: usize) -> &EngineLayer {
         &self.layers[l]
     }
-    pub(super) fn moe_forward_row(
-        &self,
-        layer: &EngineLayer,
-        x: &Tensor,
-        token_id: u32,
-    ) -> Result<Tensor> {
-        self.moe_forward(layer, x, token_id)
+    /// The shared routed-expert cache — used to surface its pipeline telemetry
+    /// (hit rate, DMA/fence stalls) and worker-thread profile (upload-wait vs
+    /// GEMM) up through the `ManagedBatchedModel` profiling hooks.
+    pub(super) fn experts(&self) -> &ExpertCache {
+        &self.experts
     }
-
     /// The paged-kernel decode session: attention runs in the
     /// `paged-latent` kernel over a production chunked-arena slot
     /// (single-latent FP8 window) + `FloatGallery` corpus; the host keeps the

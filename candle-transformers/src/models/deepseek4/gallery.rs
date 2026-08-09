@@ -35,17 +35,17 @@ const HOT_ENTRY_CAP: usize = 8192;
 /// keeping the resident footprint bounded at unbounded depth (§L). Grows by
 /// doubling.
 pub struct FloatGallery {
-    attn: Tensor,  // [cap, head_dim] f32, pre-RoPE — CANONICAL, always CPU-archival
-    keys: Tensor,  // [cap, index_head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
+    attn: Tensor, // [cap, head_dim] f32, pre-RoPE — CANONICAL, always CPU-archival
+    keys: Tensor, // [cap, index_head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
     // The HOT retrieval artifact: the position-free two-region cache, built from
     // `attn` on append. The decode/prefill readers rotate the rope bands at read
     // time; the f32 `attn` is only needed to (re)build this. GPU while hot, CPU
     // when spilled (re-heated per query by `gather_corpus`).
-    nope_i8: Tensor,   // [cap, nope_dim] u8  (nope int8)
+    nope_i8: Tensor,    // [cap, nope_dim] u8  (nope int8)
     nope_scale: Tensor, // [cap, nope_bands] f32 (per-nope-band amax)
-    rope_bf: Tensor,   // [cap, rope_dim] bf16 (rope pre-rotation)
-    signs: Tensor, // [cap, sign_words] u32 — always GPU
-    pos: Tensor,   // [cap] u32 group-start positions — always GPU
+    rope_bf: Tensor,    // [cap, rope_dim] bf16 (rope pre-rotation)
+    signs: Tensor,      // [cap, sign_words] u32 — always GPU
+    pos: Tensor,        // [cap] u32 group-start positions — always GPU
     len: usize,
     cap: usize,
     head_dim: usize,
@@ -53,6 +53,12 @@ pub struct FloatGallery {
     device: Device,
     /// True once the two-region cache + `keys` have moved to CPU RAM (warm tier).
     spilled: bool,
+    /// Cached device base addresses of the four hot-cache regions
+    /// (`nope_i8`, `nope_scale`, `rope_bf`, `pos`) for the batched gather's
+    /// pointer table. Invalidated (`None`) whenever those tensors realloc
+    /// (`grow_to`) or move off the GPU (`maybe_spill`), so a stale address is
+    /// never handed to the kernel.
+    region_ptr_cache: std::cell::Cell<Option<[u64; 4]>>,
 }
 
 /// Latent geometry for the two-region cache (single-latent DeepSeek-V4).
@@ -98,6 +104,7 @@ impl FloatGallery {
             index_head_dim,
             device: device.clone(),
             spilled: false,
+            region_ptr_cache: std::cell::Cell::new(None),
         })
     }
 
@@ -181,6 +188,7 @@ impl FloatGallery {
         )?;
         self.pos = grow(&self.pos, 0, DType::U32, &self.device)?;
         self.cap = new_cap;
+        self.region_ptr_cache.set(None); // regions reallocated
         Ok(())
     }
 
@@ -198,6 +206,7 @@ impl FloatGallery {
         self.nope_scale = self.nope_scale.to_device(&Device::Cpu)?;
         self.rope_bf = self.rope_bf.to_device(&Device::Cpu)?;
         self.spilled = true;
+        self.region_ptr_cache.set(None); // regions moved to CPU
         Ok(())
     }
 
@@ -286,9 +295,9 @@ impl FloatGallery {
     #[cfg(feature = "cuda")]
     pub fn gather_selected(&self, gids: &Tensor) -> Result<(Tensor, Tensor)> {
         let pos = self.positions()?.index_select(gids, 0)?; // GPU
-        // `attn` is CPU-archival: read the k indices back (bounded), gather on
-        // CPU, upload the compacted rows. (The hot path is `gather_corpus`; this
-        // canonical-f32 gather is only for rebuild/reference callers.)
+                                                            // `attn` is CPU-archival: read the k indices back (bounded), gather on
+                                                            // CPU, upload the compacted rows. (The hot path is `gather_corpus`; this
+                                                            // canonical-f32 gather is only for rebuild/reference callers.)
         let gids_cpu = gids.to_device(&Device::Cpu)?;
         let attn = self
             .attn
@@ -307,7 +316,11 @@ impl FloatGallery {
     #[cfg(feature = "cuda")]
     pub fn gather_corpus(&self, gids: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let live = self.len.max(1);
-        let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?.contiguous()?;
+        let pos = self
+            .pos
+            .narrow(0, 0, live)?
+            .index_select(gids, 0)?
+            .contiguous()?;
         if self.spilled {
             let gids_cpu = gids.to_device(&Device::Cpu)?;
             let sel = |t: &Tensor| -> Result<Tensor> {
@@ -326,8 +339,141 @@ impl FloatGallery {
             let sel = |t: &Tensor| -> Result<Tensor> {
                 t.narrow(0, 0, live)?.index_select(gids, 0)?.contiguous()
             };
-            Ok((sel(&self.nope_i8)?, sel(&self.nope_scale)?, sel(&self.rope_bf)?, pos))
+            Ok((
+                sel(&self.nope_i8)?,
+                sel(&self.nope_scale)?,
+                sel(&self.rope_bf)?,
+                pos,
+            ))
         }
+    }
+
+    /// Gather this session's `k` selected hot-cache rows (`gids`) DIRECTLY into a
+    /// shared, pre-allocated output block at row `row_offset` — `out_nope`
+    /// `[total, NOPE_DIM]` u8, `out_scale` `[total, NOPE_BANDS]` f32, `out_rope`
+    /// `[total, ROPE_DIM]` bf16, `out_pos` `[total]` u32. One fused launch (all
+    /// four regions) replaces the four per-region `index_select`s; writing in
+    /// place replaces the cross-session `cat`. Tier-aware: the GPU kernel gathers
+    /// hot galleries; a spilled gallery re-heats its `k` rows from CPU RAM and
+    /// `slice_set`s them in (bounded transfer, as before).
+    #[cfg(feature = "cuda")]
+    pub fn gather_corpus_into(
+        &self,
+        gids: &Tensor,
+        out_nope: &Tensor,
+        out_scale: &Tensor,
+        out_rope: &Tensor,
+        out_pos: &Tensor,
+        row_offset: usize,
+    ) -> Result<()> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::Storage;
+        let k = gids.dim(0)?;
+        if k == 0 {
+            return Ok(());
+        }
+        let live = self.len.max(1);
+        if self.spilled {
+            // Warm tier: re-heat the k rows on CPU, upload, place at the offset.
+            let gids_cpu = gids.to_device(&Device::Cpu)?;
+            let sel = |t: &Tensor| -> Result<Tensor> {
+                t.narrow(0, 0, live)?
+                    .index_select(&gids_cpu, 0)?
+                    .to_device(&self.device)
+            };
+            out_nope.slice_set(&sel(&self.nope_i8)?, 0, row_offset)?;
+            out_scale.slice_set(&sel(&self.nope_scale)?, 0, row_offset)?;
+            out_rope.slice_set(&sel(&self.rope_bf)?, 0, row_offset)?;
+            let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?;
+            out_pos.slice_set(&pos, 0, row_offset)?;
+            return Ok(());
+        }
+        // Hot tier: one fused gather launch. The four source regions and the four
+        // outputs are all contiguous (dim-0 prefixes / fresh allocations), so
+        // their storage pointers address logical row 0; the kernel reinterprets
+        // each row as 32-bit words (all widths are 4-byte multiples).
+        let dev = match &self.device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("gather_corpus_into requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        let nope_src = self.nope_i8.narrow(0, 0, live)?;
+        let scale_src = self.nope_scale.narrow(0, 0, live)?;
+        let rope_src = self.rope_bf.narrow(0, 0, live)?;
+        let pos_src = self.pos.narrow(0, 0, live)?;
+        let gids = gids.contiguous()?;
+        macro_rules! ptr_u32 {
+            ($t:expr, $ty:ty) => {{
+                let (s, _) = $t.storage_and_layout();
+                match &*s {
+                    Storage::Cuda(c) => c.as_cuda_slice::<$ty>()?.device_ptr(&stream).0,
+                    _ => candle::bail!("gather_corpus_into: non-CUDA storage"),
+                }
+            }};
+        }
+        let np = ptr_u32!(nope_src, u8);
+        let sc = ptr_u32!(scale_src, f32);
+        let rp = ptr_u32!(rope_src, half::bf16);
+        let ps = ptr_u32!(pos_src, u32);
+        let gp = ptr_u32!(gids, u32);
+        let onp = ptr_u32!(out_nope, u8);
+        let osc = ptr_u32!(out_scale, f32);
+        let orp = ptr_u32!(out_rope, half::bf16);
+        let ops = ptr_u32!(out_pos, u32);
+        let code = unsafe {
+            candle_kernels::simple::corpus_gather::run_corpus_gather_rows(
+                np as *const u32,
+                sc as *const u32,
+                rp as *const u32,
+                ps as *const u32,
+                gp as *const u32,
+                onp as *mut u32,
+                osc as *mut u32,
+                orp as *mut u32,
+                ops as *mut u32,
+                k as i32,
+                row_offset as i32,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if code != 0 {
+            candle::bail!("corpus_gather_rows launch failed: cuda error {code}");
+        }
+        Ok(())
+    }
+
+    /// The four hot-cache region device base addresses (`nope_i8`, `nope_scale`,
+    /// `rope_bf`, `pos`), cached — the batched gather's per-session pointer table
+    /// entry. Addresses are the tensors' row-0 storage bases (valid while hot and
+    /// un-reallocated); the cache is invalidated on `grow_to`/`maybe_spill`.
+    #[cfg(feature = "cuda")]
+    fn hot_region_ptrs(&self) -> Result<[u64; 4]> {
+        if let Some(p) = self.region_ptr_cache.get() {
+            return Ok(p);
+        }
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::Storage;
+        let stream = match &self.device {
+            Device::Cuda(d) => d.cuda_stream(),
+            _ => candle::bail!("hot_region_ptrs requires CUDA"),
+        };
+        macro_rules! base {
+            ($t:expr, $ty:ty) => {{
+                let (s, _) = $t.storage_and_layout();
+                match &*s {
+                    Storage::Cuda(c) => c.as_cuda_slice::<$ty>()?.device_ptr(&stream).0,
+                    _ => candle::bail!("hot_region_ptrs requires CUDA"),
+                }
+            }};
+        }
+        let p = [
+            base!(self.nope_i8, u8),
+            base!(self.nope_scale, f32),
+            base!(self.rope_bf, half::bf16),
+            base!(self.pos, u32),
+        ];
+        self.region_ptr_cache.set(Some(p));
+        Ok(p)
     }
 
     /// Gather the scoring `keys` for `ids` (GPU u32) onto the GPU — from CPU
@@ -383,7 +529,10 @@ impl FloatGallery {
 
         // Stage 2 — precision: Indexer float score over the shortlist only.
         // The keys gather is tier-aware — from CPU RAM when spilled, in place
-        // otherwise — and touches only the bounded shortlist.
+        // otherwise — and touches only the bounded shortlist. The rescore stays
+        // a cuBLAS matmul + a parallel argsort: both use the whole GPU, so a
+        // single-block "fusion" of this stage is a net LOSS (measured -29%
+        // prefill) — the launches here are few and each is already efficient.
         let keys = self.gather_keys(&shortlist)?; // [m, ih]
         let scores = q_idx.matmul(&keys.t()?.contiguous()?)?; // [h, m]
         let scores = scores.relu()?;
@@ -395,9 +544,8 @@ impl FloatGallery {
             .squeeze(0)?;
         let picked = order.narrow(0, 0, k)?.contiguous()?; // shortlist-relative
         let gids = shortlist.index_select(&picked, 0)?; // absolute entry ids
-                                                        // Ascending entry order (the kernel walks the selection in group
-                                                        // order): entry ids are exact in f32 (< 2^24), so an f32 argsort
-                                                        // yields the ascending permutation on-device.
+                                                        // Ascending entry order: entry ids are exact in f32 (< 2^24), so an
+                                                        // f32 argsort yields the ascending permutation on-device.
         let asc = gids
             .to_dtype(DType::F32)?
             .unsqueeze(0)?
@@ -440,6 +588,233 @@ impl FloatGallery {
         let mut ids = order[..k].to_vec();
         ids.sort_unstable();
         Ok(ids)
+    }
+}
+
+/// A turn's compressed corpus in **native durable form** (Artifact C of
+/// docs/deepseek_turn_seal_persistence.md): the two-region attended cache
+/// (`nope_i8`/`nope_scale`/`rope_bf`) and the Indexer scoring `keys`, all
+/// host-resident and self-describing. This is what the seal persists (no
+/// re-quant — these already are the QAT storage precision) and what resume
+/// injects back into a [`FloatGallery`].
+///
+/// **No positions are stored.** Group-start positions are a pure function of
+/// entry order and the layer's compression ratio (`pos[i] = i · ratio`,
+/// turn-relative), so they are *reconstructed* at inject time against the
+/// position the turn lands at in the reconstructed context — exactly as the
+/// chunked KV cache derives positions from cumulative layout rather than
+/// persisting an absolute per token. Persisting the original absolute `pos`
+/// would be a stale second source of truth that provenance re-layout
+/// invalidates. The packed `signs` index is likewise rebuilt from `keys`
+/// (`sign_pack`), and the archival f32 `attn` is not stored (reference
+/// `gather_selected` only, never the resumed hot path).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorpusSnapshot {
+    pub index_head_dim: usize,
+    pub len: usize,
+    pub nope_i8: Vec<u8>,     // len * NOPE_DIM
+    pub nope_scale: Vec<f32>, // len * NOPE_BANDS
+    pub rope_bf: Vec<u16>,    // len * ROPE_DIM  (bf16 bit patterns)
+    pub keys: Vec<f32>,       // len * index_head_dim
+}
+
+impl CorpusSnapshot {
+    const MAGIC: &'static [u8; 4] = b"DSC2";
+
+    /// Serialize to a self-contained little-endian blob. Layout: magic(4) ·
+    /// index_head_dim/len/nope_dim/nope_bands/rope_dim (5×u32) · nope_i8 bytes ·
+    /// nope_scale f32 · rope_bf u16 · keys f32. Positions are NOT stored (they
+    /// are reconstructed at inject time — see the type docs).
+    pub fn encode(&self) -> Vec<u8> {
+        let ih = self.index_head_dim;
+        let len = self.len;
+        let mut out =
+            Vec::with_capacity(24 + len * (NOPE_DIM + NOPE_BANDS * 4 + ROPE_DIM * 2 + ih * 4));
+        out.extend_from_slice(Self::MAGIC);
+        for v in [
+            ih as u32,
+            len as u32,
+            NOPE_DIM as u32,
+            NOPE_BANDS as u32,
+            ROPE_DIM as u32,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&self.nope_i8);
+        for &v in &self.nope_scale {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.rope_bf {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.keys {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Inverse of [`Self::encode`]. Returns `None` on foreign magic, geometry
+    /// mismatch (a different single-latent shape), or a truncated payload.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 24 || &bytes[0..4] != Self::MAGIC {
+            return None;
+        }
+        let rd_u32 =
+            |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        let ih = rd_u32(4);
+        let len = rd_u32(8);
+        if rd_u32(12) != NOPE_DIM || rd_u32(16) != NOPE_BANDS || rd_u32(20) != ROPE_DIM {
+            return None;
+        }
+        let mut off = 24;
+        let take = |off: &mut usize, n: usize| -> Option<&[u8]> {
+            let s = bytes.get(*off..*off + n)?;
+            *off += n;
+            Some(s)
+        };
+        let nope_i8 = take(&mut off, len * NOPE_DIM)?.to_vec();
+        let nope_scale: Vec<f32> = take(&mut off, len * NOPE_BANDS * 4)?
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let rope_bf: Vec<u16> = take(&mut off, len * ROPE_DIM * 2)?
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let keys: Vec<f32> = take(&mut off, len * ih * 4)?
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Some(Self {
+            index_head_dim: ih,
+            len,
+            nope_i8,
+            nope_scale,
+            rope_bf,
+            keys,
+        })
+    }
+}
+
+impl FloatGallery {
+    /// Snapshot the live corpus into its native durable form
+    /// ([`CorpusSnapshot`]) — the seal artifact. Reads the `len` live rows of
+    /// the two-region cache + keys + pos back to host (tier-aware: the buffers
+    /// may be on CPU once spilled). The signs index and archival `attn` are
+    /// omitted (rebuilt / unused on restore).
+    #[cfg(feature = "cuda")]
+    pub fn snapshot(&self) -> Result<CorpusSnapshot> {
+        let len = self.len;
+        if len == 0 {
+            return Ok(CorpusSnapshot {
+                index_head_dim: self.index_head_dim,
+                len: 0,
+                nope_i8: Vec::new(),
+                nope_scale: Vec::new(),
+                rope_bf: Vec::new(),
+                keys: Vec::new(),
+            });
+        }
+        let nope_i8 = self
+            .nope_i8
+            .narrow(0, 0, len)?
+            .flatten_all()?
+            .to_vec1::<u8>()?;
+        let nope_scale = self
+            .nope_scale
+            .narrow(0, 0, len)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rope_bf: Vec<u16> = self
+            .rope_bf
+            .narrow(0, 0, len)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|b| b.to_bits())
+            .collect();
+        let keys = self
+            .keys
+            .narrow(0, 0, len)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(CorpusSnapshot {
+            index_head_dim: self.index_head_dim,
+            len,
+            nope_i8,
+            nope_scale,
+            rope_bf,
+            keys,
+        })
+    }
+
+    /// Rebuild a gallery from a [`CorpusSnapshot`] — the resume injection. The
+    /// two-region cache + keys are stamped directly (no re-quant); the sign
+    /// index is repacked from `keys` (bit-identical to the live append, which
+    /// packs the same keys); the archival `attn` is a CPU zero placeholder (the
+    /// reference `gather_selected` is not used on the resumed hot path).
+    ///
+    /// `positions` (length `snap.len`) are the RECONSTRUCTED group-start
+    /// positions the injected entries take in the resumed context — the caller
+    /// computes them from where the turn lands in the reconstruction and the
+    /// layer's compression ratio (`base + i·ratio`), NOT from any stored value.
+    /// Given identical positions, the restored gallery is byte-identical to the
+    /// live one on the durable set (`nope_i8`/`nope_scale`/`rope_bf`/`keys`/
+    /// `pos`/`signs`).
+    #[cfg(feature = "cuda")]
+    pub fn from_snapshot(
+        device: &Device,
+        snap: &CorpusSnapshot,
+        positions: &[u32],
+    ) -> Result<Self> {
+        let ih = snap.index_head_dim;
+        if snap.len == 0 {
+            return Self::new(device, NOPE_DIM + ROPE_DIM, ih, 1);
+        }
+        let len = snap.len;
+        if positions.len() != len {
+            candle::bail!(
+                "from_snapshot: {} positions for {} entries",
+                positions.len(),
+                len
+            );
+        }
+        let cap = len;
+        let nope_i8 = Tensor::from_vec(snap.nope_i8.clone(), (len, NOPE_DIM), device)?;
+        let nope_scale = Tensor::from_vec(snap.nope_scale.clone(), (len, NOPE_BANDS), device)?;
+        let rope_bf = Tensor::from_vec(
+            snap.rope_bf
+                .iter()
+                .map(|&b| half::bf16::from_bits(b))
+                .collect::<Vec<_>>(),
+            (len, ROPE_DIM),
+            device,
+        )?;
+        let keys = Tensor::from_vec(snap.keys.clone(), (len, ih), device)?;
+        let pos = Tensor::from_vec(positions.to_vec(), len, device)?;
+        // Signs are a deterministic function of the keys — repack on the GPU
+        // (identical to the live append's `sign_pack`).
+        let signs = sign_pack(&keys)?;
+        let mut g = Self {
+            attn: Tensor::zeros((cap, NOPE_DIM + ROPE_DIM), DType::F32, &Device::Cpu)?,
+            keys,
+            nope_i8,
+            nope_scale,
+            rope_bf,
+            signs,
+            pos,
+            len,
+            cap,
+            head_dim: NOPE_DIM + ROPE_DIM,
+            index_head_dim: ih,
+            device: device.clone(),
+            spilled: false,
+            region_ptr_cache: std::cell::Cell::new(None),
+        };
+        // Honor the hot/warm tier bound exactly as a live gallery would: past
+        // HOT_ENTRY_CAP the float pair lives in CPU RAM (signs/pos stay GPU).
+        g.maybe_spill(len)?;
+        Ok(g)
     }
 }
 
@@ -650,6 +1025,461 @@ pub fn bdp_recall(q_signs: &Tensor, signs: &Tensor, dim: usize) -> Result<Tensor
     Ok(counts)
 }
 
+/// Batched BDP recall across `n_sess` concurrent decode sessions in ONE launch.
+/// `q_signs` `[n_sess·n_heads, words]` are the sessions' packed query heads (row
+/// `s·n_heads + h`), `signs` `[total_g, words]` the concatenated per-session
+/// packed entries, `off`/`cnt` `[n_sess]` u32 each session's entry base/count in
+/// `signs`. Returns `counts` `[total_g]` — byte-identical per session to the
+/// per-session [`bdp_recall`]. `max_g` = the largest `cnt[s]`.
+#[cfg(feature = "cuda")]
+pub fn bdp_recall_batched(
+    q_signs: &Tensor,
+    signs: &Tensor,
+    off: &Tensor,
+    cnt: &Tensor,
+    n_sess: usize,
+    n_heads: usize,
+    max_g: usize,
+    dim: usize,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::Storage;
+    let words = sign_words(dim);
+    let total_g = signs.dim(0)?;
+    let dev = match signs.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle::bail!("bdp_recall_batched requires CUDA"),
+    };
+    let stream = dev.cuda_stream();
+    let counts = Tensor::zeros(total_g, DType::U32, signs.device())?;
+    {
+        let (sq, _) = q_signs.storage_and_layout();
+        let (ss, _) = signs.storage_and_layout();
+        let (soff, _) = off.storage_and_layout();
+        let (scnt, _) = cnt.storage_and_layout();
+        let (sc, _) = counts.storage_and_layout();
+        let ptr = |st: &Storage| -> Result<u64> {
+            match st {
+                Storage::Cuda(c) => Ok(c.as_cuda_slice::<u32>()?.device_ptr(&stream).0),
+                _ => unreachable!(),
+            }
+        };
+        let (qp, op, cp, np, outp) = (ptr(&sq)?, ptr(&ss)?, ptr(&soff)?, ptr(&scnt)?, ptr(&sc)?);
+        let code = unsafe {
+            candle_kernels::simple::bdp::run_bdp_recall_batched(
+                qp as *const u32,
+                op as *const u32,
+                cp as *const u32,
+                np as *const u32,
+                outp as *mut u32,
+                n_sess as i32,
+                n_heads as i32,
+                max_g as i32,
+                words as i32,
+                dim as i32,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if code != 0 {
+            candle::bail!("bdp_recall_batched launch failed: cuda error {code}");
+        }
+    }
+    Ok(counts)
+}
+
+/// Batched exact top-`max_m` (per session `min(max_m, cnt[s])`) over per-session
+/// count segments in ONE launch per stage. `counts` `[total_g]` concatenated,
+/// `off`/`cnt` `[n_sess]` u32. Returns `[n_sess, max_m]` u32 of SESSION-RELATIVE
+/// ids (`0..cnt[s]`); session `s`'s first `min(max_m, cnt[s])` columns are its
+/// shortlist (remaining columns undefined). Byte-identical per session to
+/// [`topm_select`]. `bins` = the agreement range (`n_heads·dim + 1`).
+#[cfg(feature = "cuda")]
+pub fn topm_select_batched(
+    counts: &Tensor,
+    off: &Tensor,
+    cnt: &Tensor,
+    n_sess: usize,
+    max_g: usize,
+    max_m: usize,
+    bins: usize,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::Storage;
+    let dev = match counts.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle::bail!("topm_select_batched requires CUDA"),
+    };
+    let stream = dev.cuda_stream();
+    let hist = Tensor::zeros(n_sess * bins, DType::U32, counts.device())?;
+    let meta = Tensor::zeros(n_sess * 4, DType::U32, counts.device())?;
+    let out = Tensor::zeros((n_sess, max_m), DType::U32, counts.device())?;
+    {
+        let (sc, _) = counts.storage_and_layout();
+        let (soff, _) = off.storage_and_layout();
+        let (scnt, _) = cnt.storage_and_layout();
+        let (sh, _) = hist.storage_and_layout();
+        let (sm, _) = meta.storage_and_layout();
+        let (so, _) = out.storage_and_layout();
+        let ptr = |st: &Storage| -> Result<u64> {
+            match st {
+                Storage::Cuda(c) => Ok(c.as_cuda_slice::<u32>()?.device_ptr(&stream).0),
+                _ => unreachable!(),
+            }
+        };
+        let (cp, offp, cntp, hp, mp, outp) = (
+            ptr(&sc)?,
+            ptr(&soff)?,
+            ptr(&scnt)?,
+            ptr(&sh)?,
+            ptr(&sm)?,
+            ptr(&so)?,
+        );
+        let code = unsafe {
+            candle_kernels::simple::bdp::run_topm_select_batched(
+                cp as *const u32,
+                offp as *const u32,
+                cntp as *const u32,
+                hp as *mut u32,
+                mp as *mut u32,
+                outp as *mut u32,
+                n_sess as i32,
+                max_g as i32,
+                max_m as i32,
+                bins as i32,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        };
+        if code != 0 {
+            candle::bail!("topm_select_batched launch failed: cuda error {code}");
+        }
+    }
+    Ok(out)
+}
+
+/// Batched two-stage selection across concurrent decode sessions. Runs Stage 1
+/// (BDP recall + top-M shortlist) for the WHOLE wave in one launch per kernel —
+/// the per-session loop's dominant cost (`topm_select` = a single-warp serial
+/// bin scan × sessions) collapses to a single grid — then does the bounded
+/// Stage-2 float rescore per session (a few-column cuBLAS matmul + argsort over
+/// ≤`top_m` keys). Each session's gallery is independent and, at decode, wholly
+/// causal, so this is byte-identical per session to calling
+/// [`FloatGallery::two_stage_select`] in a loop — the shortlist is the same
+/// M-superset and the float rescore picks the same top-k. Returns per session
+/// `(gids_ascending [k] u32, k)`; empty/degenerate sessions get `(zeros(1), 0)`.
+#[cfg(feature = "cuda")]
+pub fn two_stage_select_batched(
+    galleries: &[&FloatGallery],
+    queries: &[Tensor],
+    weights: &[Tensor],
+    top_m: usize,
+    top_k: usize,
+) -> Result<Vec<(Tensor, usize)>> {
+    let n_sess = galleries.len();
+    if n_sess == 0 {
+        return Ok(Vec::new());
+    }
+    let dev = galleries[0].device.clone();
+    let ihd = galleries[0].index_head_dim;
+    let n_heads = queries[0].dim(0)?;
+    let empty = || -> Result<(Tensor, usize)> { Ok((Tensor::zeros(1, DType::U32, &dev)?, 0)) };
+    let max_m = top_m.clamp(1, 1024);
+
+    // ── Partition: only DEEP sessions (`len > max_m`) need the recall stage.
+    // Shallow sessions (`0 < len ≤ max_m`) take the whole gallery as the
+    // shortlist — the per-session path's all-pass fast branch — so a batch of
+    // short conversations pays no Stage-1 cost at all (the batched recall win is
+    // realized exactly where it exists: unbounded-depth galleries). ──
+    let deep_idx: Vec<usize> = (0..n_sess).filter(|&s| galleries[s].len > max_m).collect();
+
+    // ── Stage 1 (batched) over the deep sessions only ──
+    // `shortlist_deep[d]` (row d = deep_idx[d]) holds session-relative top-M ids.
+    let shortlist_deep: Option<Tensor> = if deep_idx.is_empty() {
+        None
+    } else {
+        let nd = deep_idx.len();
+        let q_signs_cat = Tensor::cat(
+            &deep_idx
+                .iter()
+                .map(|&s| sign_pack(&queries[s]))
+                .collect::<Result<Vec<_>>>()?,
+            0,
+        )?; // [nd*h, words]
+        let mut sign_views: Vec<Tensor> = Vec::with_capacity(nd);
+        let mut off = Vec::with_capacity(nd);
+        let mut cnt = Vec::with_capacity(nd);
+        let mut running = 0u32;
+        let mut max_g = 0usize;
+        for &s in &deep_idx {
+            let len = galleries[s].len;
+            off.push(running);
+            cnt.push(len as u32);
+            sign_views.push(galleries[s].packed_signs()?);
+            running += len as u32;
+            max_g = max_g.max(len);
+        }
+        let signs_cat = if sign_views.len() == 1 {
+            sign_views[0].clone()
+        } else {
+            Tensor::cat(&sign_views, 0)?
+        };
+        let off_t = Tensor::from_vec(off, nd, &dev)?;
+        let cnt_t = Tensor::from_vec(cnt, nd, &dev)?;
+        let bins = n_heads * ihd + 1;
+        let counts = bdp_recall_batched(
+            &q_signs_cat,
+            &signs_cat,
+            &off_t,
+            &cnt_t,
+            nd,
+            n_heads,
+            max_g,
+            ihd,
+        )?;
+        Some(topm_select_batched(
+            &counts, &off_t, &cnt_t, nd, max_g, max_m, bins,
+        )?) // [nd, max_m]
+    };
+
+    // ── Stage 2 (batched): float rescore over the per-session shortlists ──
+    // Phase A gathers each session's ≤`max_m` shortlist keys (tier-aware — from
+    // CPU RAM when the gallery is spilled, in place otherwise). Phase B then
+    // rescores the WHOLE batch in one padded `bmm` + one batched argsort + one
+    // batched gather, replacing the per-session matmul/argsort launch loop. The
+    // padding columns (`j ≥ mₛ`) are masked to −∞ so they never enter a top-k.
+    // The selected gids are returned in descending-score order, not ascending:
+    // the decode reader gathers them into a dense `comp_idx` block and attends
+    // the SET (softmax is order-independent; each entry carries its own position
+    // for RoPE-at-read), so order is immaterial — and the byte-for-byte per
+    // session equivalence the tests hold is over the selected gid SET.
+    let mut out_slots: Vec<Option<(Tensor, usize)>> = (0..n_sess).map(|_| None).collect();
+    // Phase A — per-session shortlist + tier-aware key gather.
+    struct Active {
+        s: usize,
+        sl: Tensor,   // [m_s] session-relative shortlist ids
+        keys: Tensor, // [m_s, ihd] gathered scoring keys (GPU)
+        m_s: usize,
+        k: usize,
+    }
+    let mut active: Vec<Active> = Vec::new();
+    let mut deep_cursor = 0usize;
+    for (s, (g, _q)) in galleries.iter().zip(queries).enumerate() {
+        let len = g.len;
+        if len == 0 || top_k == 0 {
+            out_slots[s] = Some(empty()?);
+            continue;
+        }
+        let m_s = max_m.min(len);
+        let sl = if len > max_m {
+            let row = shortlist_deep
+                .as_ref()
+                .expect("deep sessions produced a shortlist")
+                .narrow(0, deep_cursor, 1)?
+                .reshape(max_m)?
+                .narrow(0, 0, m_s)?;
+            deep_cursor += 1;
+            row
+        } else {
+            Tensor::arange(0u32, len as u32, &dev)?
+        };
+        let keys = g.gather_keys(&sl)?; // [m_s, ihd]
+        active.push(Active {
+            s,
+            sl,
+            keys,
+            m_s,
+            k: top_k.min(m_s),
+        });
+    }
+    if active.is_empty() {
+        return Ok(out_slots.into_iter().map(|o| o.expect("filled")).collect());
+    }
+
+    // Phase B — pad to the batch's widest shortlist and rescore all at once.
+    let big = active.len();
+    let mm = active.iter().map(|a| a.m_s).max().unwrap();
+    let max_k = active.iter().map(|a| a.k).max().unwrap();
+    let keys_pad: Vec<Tensor> = active
+        .iter()
+        .map(|a| {
+            if a.m_s == mm {
+                Ok(a.keys.clone())
+            } else {
+                let pad = Tensor::zeros((mm - a.m_s, ihd), DType::F32, &dev)?;
+                Tensor::cat(&[&a.keys, &pad], 0)
+            }
+        })
+        .collect::<Result<_>>()?;
+    let keys_all = Tensor::stack(&keys_pad, 0)?; // [big, mm, ihd]
+    let q_all = Tensor::stack(
+        &active
+            .iter()
+            .map(|a| queries[a.s].clone())
+            .collect::<Vec<_>>(),
+        0,
+    )?; // [big, h, ihd]
+    let w_all = Tensor::stack(
+        &active
+            .iter()
+            .map(|a| weights[a.s].clone())
+            .collect::<Vec<_>>(),
+        0,
+    )?; // [big, h]
+        // scores[b,h,j] = q·k ; weighted[b,j] = Σ_h relu(scores)·w
+    let scores = q_all
+        .matmul(&keys_all.transpose(1, 2)?.contiguous()?)?
+        .relu()?; // [big,h,mm]
+    let weighted = scores.broadcast_mul(&w_all.unsqueeze(2)?)?.sum(1)?; // [big, mm]
+                                                                        // Mask padding columns to −∞ (padding keys score 0, which could outrank a
+                                                                        // genuinely negative-scoring real entry — the mask keeps padding out of top-k).
+    let mut validv = vec![0f32; big * mm];
+    for (i, a) in active.iter().enumerate() {
+        for j in 0..a.m_s {
+            validv[i * mm + j] = 1.0;
+        }
+    }
+    let neg = Tensor::from_vec(validv, (big, mm), &dev)?.affine(1e30, -1e30)?; // 0 valid, −1e30 pad
+    let weighted = weighted.broadcast_add(&neg)?;
+    // One batched argsort (descending) + one batched gather of the top-max_k
+    // shortlist-relative ids through each session's `sl` → absolute entry ids.
+    let order = weighted
+        .arg_sort_last_dim(false)?
+        .narrow(1, 0, max_k)?
+        .contiguous()?; // [big,max_k]
+    let sl_pad: Vec<Tensor> = active
+        .iter()
+        .map(|a| {
+            if a.m_s == mm {
+                Ok(a.sl.clone())
+            } else {
+                let pad = Tensor::zeros(mm - a.m_s, DType::U32, &dev)?;
+                Tensor::cat(&[&a.sl, &pad], 0)
+            }
+        })
+        .collect::<Result<_>>()?;
+    let sl_all = Tensor::stack(&sl_pad, 0)?; // [big, mm]
+    let gids_all = sl_all.gather(&order, 1)?; // [big, max_k] absolute ids, score order
+
+    // Phase C — hand back each session's first `k` (varies with shortlist size).
+    for (i, a) in active.iter().enumerate() {
+        let gids = gids_all
+            .narrow(0, i, 1)?
+            .reshape(max_k)?
+            .narrow(0, 0, a.k)?
+            .contiguous()?;
+        out_slots[a.s] = Some((gids, a.k));
+    }
+    Ok(out_slots.into_iter().map(|o| o.expect("filled")).collect())
+}
+
+/// Gather EVERY decode session's selected corpus rows into a shared pre-allocated
+/// block in ONE kernel launch (across all HOT galleries), instead of a launch per
+/// session. `gids[i]` are session `i`'s selected entry ids, placed at output row
+/// `row_offsets[i]`. Hot galleries batch through one launch via a device pointer
+/// table (each gallery's region base addresses); a spilled gallery re-heats its
+/// rows on CPU and `slice_set`s them in (the bounded warm-tier path). Byte-
+/// identical per row to [`FloatGallery::gather_corpus_into`].
+#[cfg(feature = "cuda")]
+pub fn gather_corpus_batched(
+    galleries: &[&FloatGallery],
+    gids: &[Tensor],
+    row_offsets: &[u32],
+    out_nope: &Tensor,
+    out_scale: &Tensor,
+    out_rope: &Tensor,
+    out_pos: &Tensor,
+) -> Result<()> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::Storage;
+    let n = galleries.len();
+    if n == 0 {
+        return Ok(());
+    }
+    // Spilled sessions take the per-session CPU path; collect the hot ones.
+    let mut hot: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if gids[i].dim(0)? == 0 {
+            continue;
+        }
+        let g = galleries[i];
+        if g.spilled {
+            g.gather_corpus_into(
+                &gids[i],
+                out_nope,
+                out_scale,
+                out_rope,
+                out_pos,
+                row_offsets[i] as usize,
+            )?;
+        } else {
+            hot.push(i);
+        }
+    }
+    if hot.is_empty() {
+        return Ok(());
+    }
+    let device = galleries[hot[0]].device.clone();
+    let dev = match &device {
+        Device::Cuda(d) => d.clone(),
+        _ => candle::bail!("gather_corpus_batched requires CUDA"),
+    };
+    let stream = dev.cuda_stream();
+    macro_rules! dp {
+        ($t:expr, $ty:ty) => {{
+            let (s, _) = $t.storage_and_layout();
+            match &*s {
+                Storage::Cuda(c) => c.as_cuda_slice::<$ty>()?.device_ptr(&stream).0,
+                _ => candle::bail!("gather_corpus_batched: non-CUDA storage"),
+            }
+        }};
+    }
+
+    // Packed metadata (exactly 2 small uploads): `ptrs` = the device pointer
+    // table [nope|scale|rope|pos|gids] (region addresses cached per gallery; the
+    // gid address is this step's selection tensor), `meta` = [out_off|cnt]. No
+    // per-session `narrow`/lock for regions, no gid `cat`, no per-array upload.
+    let n_hot = hot.len();
+    let mut ptrs = vec![0i64; 5 * n_hot];
+    let mut meta = vec![0u32; 2 * n_hot];
+    let mut max_k = 0usize;
+    // Keep the (possibly freshly-made-contiguous) gid tensors alive until the
+    // launch is enqueued — their addresses are in the pointer table.
+    let mut gid_keep: Vec<Tensor> = Vec::with_capacity(n_hot);
+    for (col, &i) in hot.iter().enumerate() {
+        let g = galleries[i];
+        let rp = g.hot_region_ptrs()?;
+        ptrs[col] = rp[0] as i64;
+        ptrs[n_hot + col] = rp[1] as i64;
+        ptrs[2 * n_hot + col] = rp[2] as i64;
+        ptrs[3 * n_hot + col] = rp[3] as i64;
+        let gk = gids[i].contiguous()?;
+        ptrs[4 * n_hot + col] = dp!(gk, u32) as i64;
+        meta[col] = row_offsets[i]; // out_off
+        meta[n_hot + col] = gk.dim(0)? as u32; // cnt
+        max_k = max_k.max(gk.dim(0)?);
+        gid_keep.push(gk);
+    }
+    let ptrs_t = Tensor::from_vec(ptrs, 5 * n_hot, &device)?;
+    let meta_t = Tensor::from_vec(meta, 2 * n_hot, &device)?;
+
+    let code = unsafe {
+        candle_kernels::simple::corpus_gather::run_corpus_gather_rows_batched(
+            dp!(ptrs_t, i64) as *const i64,
+            dp!(meta_t, u32) as *const u32,
+            dp!(out_nope, u8) as *mut u32,
+            dp!(out_scale, f32) as *mut u32,
+            dp!(out_rope, half::bf16) as *mut u32,
+            dp!(out_pos, u32) as *mut u32,
+            n_hot as i32,
+            max_k as i32,
+            stream.cu_stream() as *mut core::ffi::c_void,
+        )
+    };
+    if code != 0 {
+        candle::bail!("corpus_gather_rows_batched launch failed: cuda error {code}");
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -670,6 +1500,137 @@ mod tests {
 
     fn rows(n: usize, d: usize, seed: &mut u64) -> Vec<f32> {
         (0..n * d).map(|_| lcg(seed)).collect()
+    }
+
+    /// The fused `gather_corpus_into` (one kernel launch per session, writing
+    /// straight into a shared block at a row offset) must be BIT-IDENTICAL to the
+    /// per-region `index_select` path (`gather_corpus`), for every one of the
+    /// four hot-cache regions and at a non-zero destination offset.
+    #[test]
+    #[ignore]
+    fn gather_corpus_into_matches_reference() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut seed = 0xC0FFEEu64;
+        let n = 200usize;
+        let mut g = FloatGallery::new(&dev, HD, IH, 128)?;
+        let attn = Tensor::from_vec(rows(n, HD, &mut seed), (n, HD), &dev)?;
+        let keys = Tensor::from_vec(rows(n, IH, &mut seed), (n, IH), &dev)?;
+        let positions: Vec<u32> = (0..n as u32).map(|i| i * 4).collect();
+        g.append_batch(&attn, &keys, &positions)?;
+
+        let gid_v: Vec<u32> = vec![5, 17, 42, 3, 199, 0, 128, 63];
+        let k = gid_v.len();
+        let gids = Tensor::from_vec(gid_v, k, &dev)?;
+
+        // Reference: the per-region gather.
+        let (rn, rs, rr, rp) = g.gather_corpus(&gids)?;
+
+        // Fused: gather into a shared block at offset 2 (test the placement).
+        let off = 2usize;
+        let total = k + off + 1; // trailing untouched row
+        let on = Tensor::zeros((total, NOPE_DIM), DType::U8, &dev)?;
+        let os = Tensor::zeros((total, NOPE_BANDS), DType::F32, &dev)?;
+        let or_ = Tensor::zeros((total, ROPE_DIM), DType::BF16, &dev)?;
+        let op = Tensor::zeros(total, DType::U32, &dev)?;
+        g.gather_corpus_into(&gids, &on, &os, &or_, &op, off)?;
+
+        let got_n = on.narrow(0, off, k)?;
+        let got_s = os.narrow(0, off, k)?;
+        let got_r = or_.narrow(0, off, k)?;
+        let got_p = op.narrow(0, off, k)?;
+
+        let bits_u8 = |t: &Tensor| -> Result<Vec<u8>> { t.flatten_all()?.to_vec1::<u8>() };
+        let bits_u32 = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        assert_eq!(bits_u8(&got_n)?, bits_u8(&rn)?, "nope_i8 mismatch");
+        assert_eq!(bits_u32(&got_s)?, bits_u32(&rs)?, "nope_scale mismatch");
+        assert_eq!(bits_u32(&got_r)?, bits_u32(&rr)?, "rope_bf mismatch");
+        assert_eq!(
+            got_p.to_vec1::<u32>()?,
+            rp.to_vec1::<u32>()?,
+            "pos mismatch"
+        );
+        Ok(())
+    }
+
+    /// The single-launch `gather_corpus_batched` across several galleries must be
+    /// BIT-IDENTICAL, per session, to the per-session `gather_corpus` — the
+    /// device pointer table must address each gallery's rows correctly and each
+    /// session's block land at its own output offset.
+    #[test]
+    #[ignore]
+    fn gather_corpus_batched_matches_reference() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut seed = 0xBA7C4EDu64;
+        let ks = [7usize, 3, 12, 1, 9];
+        let mut galleries: Vec<FloatGallery> = Vec::new();
+        let mut gids: Vec<Tensor> = Vec::new();
+        let mut refs: Vec<(Tensor, Tensor, Tensor, Tensor)> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut cum = 0u32;
+        for (s, &k) in ks.iter().enumerate() {
+            let entries = 40 + s * 30;
+            let mut g = FloatGallery::new(&dev, HD, IH, 64)?;
+            let attn = Tensor::from_vec(rows(entries, HD, &mut seed), (entries, HD), &dev)?;
+            let keys = Tensor::from_vec(rows(entries, IH, &mut seed), (entries, IH), &dev)?;
+            let positions: Vec<u32> = (0..entries as u32).map(|i| i * 4).collect();
+            g.append_batch(&attn, &keys, &positions)?;
+            let gv: Vec<u32> = (0..k).map(|j| ((j * 3 + s) % entries) as u32).collect();
+            let gt = Tensor::from_vec(gv, k, &dev)?;
+            refs.push(g.gather_corpus(&gt)?);
+            gids.push(gt);
+            offsets.push(cum);
+            cum += k as u32;
+            galleries.push(g);
+        }
+        let total = cum as usize;
+        let on = Tensor::zeros((total, NOPE_DIM), DType::U8, &dev)?;
+        let os = Tensor::zeros((total, NOPE_BANDS), DType::F32, &dev)?;
+        let or_ = Tensor::zeros((total, ROPE_DIM), DType::BF16, &dev)?;
+        let op = Tensor::zeros(total, DType::U32, &dev)?;
+        let grefs: Vec<&FloatGallery> = galleries.iter().collect();
+        gather_corpus_batched(&grefs, &gids, &offsets, &on, &os, &or_, &op)?;
+
+        let bits_u8 = |t: &Tensor| -> Result<Vec<u8>> { t.flatten_all()?.to_vec1::<u8>() };
+        let bits_u32 = |t: &Tensor| -> Result<Vec<u32>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        for (s, &k) in ks.iter().enumerate() {
+            let o = offsets[s] as usize;
+            let (rn, rs, rr, rp) = &refs[s];
+            assert_eq!(
+                bits_u8(&on.narrow(0, o, k)?)?,
+                bits_u8(rn)?,
+                "sess {s} nope"
+            );
+            assert_eq!(
+                bits_u32(&os.narrow(0, o, k)?)?,
+                bits_u32(rs)?,
+                "sess {s} scale"
+            );
+            assert_eq!(
+                bits_u32(&or_.narrow(0, o, k)?)?,
+                bits_u32(rr)?,
+                "sess {s} rope"
+            );
+            assert_eq!(
+                op.narrow(0, o, k)?.to_vec1::<u32>()?,
+                rp.to_vec1::<u32>()?,
+                "sess {s} pos"
+            );
+        }
+        Ok(())
     }
 
     /// Diagnostic: candle CUDA argsort sanity across widths (stream + width
@@ -903,6 +1864,159 @@ mod tests {
             let got_pos = g.positions()?.to_vec1::<u32>()?;
             assert_eq!(&got_pos[before..before + n], &pos[..]);
         }
+        Ok(())
+    }
+
+    /// `CorpusSnapshot` byte codec: encode → decode is the identity, and the
+    /// header bytes are exactly the documented little-endian layout (magic +
+    /// 5×u32 geometry). Pure host logic — asserts raw bytes, not tolerances.
+    #[test]
+    fn corpus_snapshot_codec_round_trip() -> Result<()> {
+        let ih = IH; // 128
+        let len = 3usize;
+        let snap = CorpusSnapshot {
+            index_head_dim: ih,
+            len,
+            nope_i8: (0..len * NOPE_DIM).map(|i| (i % 251) as u8).collect(),
+            nope_scale: (0..len * NOPE_BANDS)
+                .map(|i| i as f32 * 0.5 - 3.0)
+                .collect(),
+            rope_bf: (0..len * ROPE_DIM).map(|i| (i * 7 + 1) as u16).collect(),
+            keys: (0..len * ih).map(|i| (i as f32).sin()).collect(),
+        };
+        let bytes = snap.encode();
+
+        // Exact header: "DSC2" · ih · len · NOPE_DIM · NOPE_BANDS · ROPE_DIM.
+        assert_eq!(&bytes[0..4], b"DSC2");
+        assert_eq!(&bytes[4..8], &(ih as u32).to_le_bytes());
+        assert_eq!(&bytes[8..12], &(len as u32).to_le_bytes());
+        assert_eq!(&bytes[12..16], &(NOPE_DIM as u32).to_le_bytes());
+        assert_eq!(&bytes[16..20], &(NOPE_BANDS as u32).to_le_bytes());
+        assert_eq!(&bytes[20..24], &(ROPE_DIM as u32).to_le_bytes());
+        // Total length: header + each region's exact byte count (NO positions).
+        let expect_len = 24 + len * (NOPE_DIM + NOPE_BANDS * 4 + ROPE_DIM * 2 + ih * 4);
+        assert_eq!(bytes.len(), expect_len);
+
+        let back = CorpusSnapshot::decode(&bytes).expect("decode");
+        assert_eq!(back, snap);
+
+        // Foreign magic / geometry mismatch → None.
+        assert!(CorpusSnapshot::decode(b"XXXX....................").is_none());
+        let mut bad = bytes.clone();
+        bad[12] ^= 0xff; // corrupt NOPE_DIM
+        assert!(CorpusSnapshot::decode(&bad).is_none());
+        // Truncated payload → None.
+        assert!(CorpusSnapshot::decode(&bytes[..bytes.len() - 1]).is_none());
+
+        // Empty corpus round-trips too.
+        let empty = CorpusSnapshot {
+            index_head_dim: ih,
+            len: 0,
+            nope_i8: Vec::new(),
+            nope_scale: Vec::new(),
+            rope_bf: Vec::new(),
+            keys: Vec::new(),
+        };
+        assert_eq!(CorpusSnapshot::decode(&empty.encode()).unwrap(), empty);
+        Ok(())
+    }
+
+    /// Gate (Artifact C): a live gallery snapshotted and restored is
+    /// byte-identical on the native durable set — the two-region cache, keys,
+    /// AND the repacked sign index — independent of positions, and the injected
+    /// positions are RECONSTRUCTED at a fresh base (`base + i·ratio`), NOT taken
+    /// from the snapshot (which stores none). Straddles a growth (4 → 16).
+    #[test]
+    #[ignore]
+    fn gallery_snapshot_restore_round_trip() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let ratio = 4u32; // CSA
+        let mut g = FloatGallery::new(&dev, HD, IH, 4)?;
+        let mut s = 77u64;
+        // Live append uses the true group-start positions i·ratio.
+        let mut appended = 0u32;
+        for n in [3usize, 9] {
+            let attn = rows(n, HD, &mut s);
+            let keys = rows(n, IH, &mut s);
+            let pos: Vec<u32> = (0..n as u32).map(|i| (appended + i) * ratio).collect();
+            appended += n as u32;
+            g.append_batch(
+                &Tensor::from_vec(attn, (n, HD), &dev)?,
+                &Tensor::from_vec(keys, (n, IH), &dev)?,
+                &pos,
+            )?;
+        }
+        let snap = g.snapshot()?;
+        assert_eq!(snap.len, g.len());
+
+        // Byte-exact codec on real data, then restore from the decoded blob at a
+        // NEW absolute base (the resume frame) — positions are reconstructed.
+        let blob = snap.encode();
+        let snap2 = CorpusSnapshot::decode(&blob).expect("decode");
+        assert_eq!(snap2, snap);
+        let new_base = 10_000u32;
+        let recon_pos: Vec<u32> = (0..snap2.len as u32)
+            .map(|i| new_base + i * ratio)
+            .collect();
+        let r = FloatGallery::from_snapshot(&dev, &snap2, &recon_pos)?;
+        assert_eq!(r.len(), g.len());
+
+        // Durable buffers must match bit-for-bit (independent of positions).
+        let cmp_u8 = |a: &Tensor, b: &Tensor, label: &str| -> Result<()> {
+            let av = a.flatten_all()?.to_vec1::<u8>()?;
+            let bv = b.flatten_all()?.to_vec1::<u8>()?;
+            assert_eq!(av, bv, "{label}");
+            Ok(())
+        };
+        let live = g.len();
+        cmp_u8(
+            &g.nope_i8.narrow(0, 0, live)?.to_device(&Device::Cpu)?,
+            &r.nope_i8.narrow(0, 0, live)?.to_device(&Device::Cpu)?,
+            "nope_i8",
+        )?;
+        let f_ns_g = g
+            .nope_scale
+            .narrow(0, 0, live)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let f_ns_r = r
+            .nope_scale
+            .narrow(0, 0, live)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (&a, &b)) in f_ns_g.iter().zip(&f_ns_r).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "nope_scale[{i}]");
+        }
+        let rope_g = g
+            .rope_bf
+            .narrow(0, 0, live)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        let rope_r = r
+            .rope_bf
+            .narrow(0, 0, live)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        for (i, (&a, &b)) in rope_g.iter().zip(&rope_r).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "rope_bf[{i}]");
+        }
+        let keys_g = g.scoring_keys()?.flatten_all()?.to_vec1::<f32>()?;
+        let keys_r = r.scoring_keys()?.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (&a, &b)) in keys_g.iter().zip(&keys_r).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "keys[{i}]");
+        }
+        // Positions are the reconstructed ones (shifted to the new base), NOT
+        // the originals.
+        assert_eq!(
+            r.positions()?.to_vec1::<u32>()?,
+            recon_pos,
+            "reconstructed pos"
+        );
+        assert_eq!(
+            g.packed_signs()?.flatten_all()?.to_vec1::<u32>()?,
+            r.packed_signs()?.flatten_all()?.to_vec1::<u32>()?,
+            "signs (repacked from keys)"
+        );
         Ok(())
     }
 

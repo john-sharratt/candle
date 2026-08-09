@@ -190,6 +190,21 @@ impl Compressor {
         Ok((kv, score))
     }
 
+    /// Batched [`Self::project_row`]: project a whole prefix `xs` (`[n, dim]` /
+    /// `[1, n, dim]`) into `(kv, score)`, each `[n, coff·d]` in F32, in ONE GEMM
+    /// per projection instead of `n` per-row GEMVs. The rows are the exact
+    /// per-token `project_row` outputs (`x·wkvᵀ` / `x·wgateᵀ`), so feeding row
+    /// `t` into [`IncrementalCompressor::push_projected`] is bit-identical to
+    /// `push_raw` on token `t` — this is the prefill fast path that hoists the
+    /// per-token projection out of the token loop.
+    pub fn project_rows(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n = xs.elem_count() / self.wkv.in_dim();
+        let xf = xs.reshape((n, self.wkv.in_dim()))?.to_dtype(DType::F32)?;
+        let kv = self.wkv.forward(&xf)?; // [n, cd]
+        let score = self.wgate.forward(&xf)?; // [n, cd]
+        Ok((kv, score))
+    }
+
     /// Build the incremental (decode) form of this compressor: a stateful streamer that
     /// accepts one token per `push` and emits ONE compressed entry every `ratio`-th token,
     /// bit-for-bit identical to the entry `forward`/`pool` produces for the same group over
@@ -218,12 +233,14 @@ impl Compressor {
 /// Per channel `c ∈ [0, head_dim)`:
 /// `m_c = max_t s_t[c]`, `l_c = Σ_t e^{s_t[c]−m_c}`, `acc_c = Σ_t e^{s_t[c]−m_c}·kv_t[c]`.
 #[derive(Clone)]
+#[allow(dead_code)] // LSE-merge persistence monoid (docs/deepseek_batched_paged_attention_plan.md); wired in a later phase
 pub struct GroupPartial {
     m: Tensor,   // [d] running per-channel max score
     l: Tensor,   // [d] running per-channel Σ exp
     acc: Tensor, // [d] running per-channel Σ exp·kv
 }
 
+#[allow(dead_code)]
 impl GroupPartial {
     /// The monoid identity `(−∞, 0, 0)` — the empty fold.
     pub fn identity(d: usize, device: &Device) -> Result<Self> {
@@ -275,6 +292,7 @@ impl GroupPartial {
 }
 
 /// Replace NaNs with `fill` (element-wise): `where(x == x, x, fill)`.
+#[allow(dead_code)]
 fn replace_nan(x: &Tensor, fill: f64) -> Result<Tensor> {
     let is_nan = x.ne(x)?; // NaN != NaN → 1
     let fill_t = Tensor::full(fill as f32, x.shape(), x.device())?;
@@ -311,8 +329,23 @@ impl IncrementalCompressor {
     /// `rope` must be the same `RotaryCache` the prefill path uses for this compressor.
     pub fn push(&mut self, x: &Tensor, rope: &RotaryCache) -> Result<Option<Tensor>> {
         let (kv, score) = self.c.project_row(x)?;
-        self.kv_rows.push(kv);
-        self.score_rows.push(score);
+        self.push_projected_roped(&kv, &score, rope)
+    }
+
+    /// As [`Self::push`] but the caller supplies the already-projected `kv`/`score`
+    /// rows (each `[1, coff·d]`, from [`Compressor::project_rows`]) instead of the
+    /// raw hidden `x` — buffering + roped emit only, no per-row projection GEMV.
+    /// Bit-identical to `push` on the same token (the projection is `push`'s only
+    /// difference). The prefill fast path batches the projection once and streams
+    /// the rows through here.
+    pub fn push_projected_roped(
+        &mut self,
+        kv: &Tensor,
+        score: &Tensor,
+        rope: &RotaryCache,
+    ) -> Result<Option<Tensor>> {
+        self.kv_rows.push(kv.clone());
+        self.score_rows.push(score.clone());
         if self.kv_rows.len() < self.c.ratio {
             return Ok(None);
         }
@@ -325,12 +358,29 @@ impl IncrementalCompressor {
     /// position-free).
     pub fn push_raw(&mut self, x: &Tensor) -> Result<Option<(Tensor, u32)>> {
         let (kv, score) = self.c.project_row(x)?;
-        self.kv_rows.push(kv);
-        self.score_rows.push(score);
+        self.push_projected(&kv, &score)
+    }
+
+    /// As [`Self::push_raw`] but the caller supplies the already-projected
+    /// `kv`/`score` rows (each `[1, coff·d]`, from [`Compressor::project_rows`])
+    /// instead of the raw hidden `x` — buffering + pre-RoPE emit only, no per-row
+    /// projection GEMV. Bit-identical to `push_raw` on the same token. Feeds the
+    /// batched-projection prefill fast path.
+    pub fn push_projected(&mut self, kv: &Tensor, score: &Tensor) -> Result<Option<(Tensor, u32)>> {
+        self.kv_rows.push(kv.clone());
+        self.score_rows.push(score.clone());
         if self.kv_rows.len() < self.c.ratio {
             return Ok(None);
         }
         Some(self.emit_group_raw()).transpose()
+    }
+
+    /// Batched projection over a whole prefix `xs` (`[n, dim]` / `[1, n, dim]`)
+    /// for this compressor's own weights — the source rows for
+    /// [`Self::push_projected`] / [`Self::push_projected_roped`]. One GEMM pair
+    /// instead of `n` per-row `project_row` GEMVs.
+    pub fn project_rows(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.c.project_rows(xs)
     }
 
     /// Pool → RMSNorm (NO RoPE): the position-free entry `[1, 1, d]` and its
@@ -382,6 +432,74 @@ impl IncrementalCompressor {
         let entry = entry.reshape((1, 1, d))?;
         let entry = self.rms_norm_entry(&entry)?;
         Ok((entry, (g * r) as u32))
+    }
+
+    /// Finalize the trailing partial group at a **turn seal**: pool the
+    /// `< ratio` currently-buffered rows into a corpus entry and return it
+    /// pre-RoPE (`[1, 1, d]`) alongside its group-start position, mirroring
+    /// [`Self::emit_group_raw`] but over fewer than `ratio` rows. Returns `None`
+    /// when nothing is buffered (the group boundary fell exactly on the seal).
+    ///
+    /// For the overlapping (`ratio == 4`) compressor the pool still includes the
+    /// **previous complete group's first-half rows** (the retained `prev_*`
+    /// halves) — the closed partial is a softmax-weighted latent exactly like a
+    /// full group, so the attention kernel merges it with no special case
+    /// (docs/deepseek_turn_seal_persistence.md Artifact B). `close` is terminal:
+    /// it clears the buffer and advances `group_idx`; the compressor must not be
+    /// pushed again after it.
+    pub fn close(&mut self) -> Result<Option<(Tensor, u32)>> {
+        let n = self.kv_rows.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let d = self.c.head_dim;
+        let r = self.c.ratio;
+        let dev = self.c.device().clone();
+
+        let kv_rows: Vec<&Tensor> = self.kv_rows.iter().collect();
+        let score_rows: Vec<&Tensor> = self.score_rows.iter().collect();
+        let kv_group = Tensor::cat(&kv_rows, 0)?; // [n, cd]
+                                                  // ape rows for the buffered within-group positions 0..n (added BEFORE
+                                                  // the overlap split, matching `pool` / `emit_group_raw`).
+        let ape = self
+            .c
+            .ape
+            .to_dtype(DType::F32)?
+            .reshape((r, self.c.cd()))?
+            .narrow(0, 0, n)?;
+        let score_group = (Tensor::cat(&score_rows, 0)? + ape)?; // [n, cd]
+
+        let entry = if self.c.overlap {
+            let curr_kv = kv_group.narrow(D::Minus1, d, d)?; // [n, d] second-half dims
+            let curr_score = score_group.narrow(D::Minus1, d, d)?;
+            let (prev_kv, prev_score) = match (&self.prev_kv_group, &self.prev_score_group) {
+                (Some(pk), Some(ps)) => (pk.narrow(D::Minus1, 0, d)?, ps.narrow(D::Minus1, 0, d)?),
+                // The partial group is itself group 0: no previous group, so the
+                // `-inf` prev-half is fully masked (pools only the buffered rows).
+                _ => (
+                    Tensor::zeros((r, d), DType::F32, &dev)?,
+                    Tensor::full(f32::NEG_INFINITY, (r, d), &dev)?,
+                ),
+            };
+            let kv_pool = Tensor::cat(&[&prev_kv, &curr_kv], 0)?; // [r+n, d]
+            let score_pool = Tensor::cat(&[&prev_score, &curr_score], 0)?;
+            let w = softmax(&score_pool, 0)?;
+            kv_pool.broadcast_mul(&w)?.sum(0)? // [d]
+        } else {
+            let w = softmax(&score_group, 0)?;
+            kv_group.broadcast_mul(&w)?.sum(0)? // cd == d
+        };
+
+        // Terminal: consume the buffer, but do NOT retain a new `prev_*` (nothing
+        // follows a seal-close in this compressor's lifetime).
+        self.kv_rows.clear();
+        self.score_rows.clear();
+
+        let g = self.group_idx;
+        self.group_idx += 1;
+        let entry = entry.reshape((1, 1, d))?;
+        let entry = self.rms_norm_entry(&entry)?;
+        Ok(Some((entry, (g * r) as u32)))
     }
 
     fn emit_group(&mut self, rope: &RotaryCache) -> Result<Tensor> {
@@ -639,6 +757,161 @@ mod tests {
     fn incremental_matches_prefill_nonoverlap() -> Result<()> {
         // ratio 3 (non-overlapping): 4 complete groups + 1 trailing token.
         incremental_matches_prefill_case(3, 5, 2, 13)
+    }
+
+    /// `close` finalizes a trailing partial group of `n < ratio` buffered rows
+    /// (non-overlapping compressor): the pooled entry is the softmax over
+    /// exactly those `n` rows of `(score + ape[:n])` per channel, then RMSNorm —
+    /// hand-computed scalar reference. Also checks that closing an empty buffer
+    /// (right after a group emitted) yields `None`.
+    #[test]
+    fn close_pools_trailing_partial_nonoverlap() -> Result<()> {
+        let dev = Device::Cpu;
+        let (dim, d, ratio, rd) = (6usize, 4usize, 3usize, 2usize);
+        let wkv = Tensor::randn(0f32, 1.0, (d, dim), &dev)?;
+        let wgate = Tensor::randn(0f32, 1.0, (d, dim), &dev)?;
+        let ape = Tensor::randn(0f32, 1.0, (ratio, d), &dev)?;
+        let norm = Tensor::randn(0f32, 1.0, d, &dev)?;
+        let c = Compressor::new(
+            wkv.clone(),
+            wgate.clone(),
+            ape.clone(),
+            norm.clone(),
+            ratio,
+            d,
+            rd,
+            1e-6,
+        );
+
+        // Exactly `ratio` rows: a group emits and the buffer empties, so a close
+        // immediately after must return None (boundary fell on the seal).
+        let x_full = Tensor::randn(0f32, 1.0, (1, ratio, dim), &dev)?;
+        let mut inc0 = c.incremental();
+        let mut emitted = 0;
+        for t in 0..ratio {
+            if inc0.push_raw(&x_full.i((0, t))?)?.is_some() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1);
+        assert!(inc0.close()?.is_none(), "empty buffer must close to None");
+
+        // Two buffered rows (< ratio=3): no group emitted, then close.
+        let n = 2usize;
+        let x = Tensor::randn(0f32, 1.0, (1, n, dim), &dev)?;
+        let mut inc = c.incremental();
+        for t in 0..n {
+            assert!(inc.push_raw(&x.i((0, t))?)?.is_none());
+        }
+        let (entry, pos) = inc.close()?.expect("partial rows must close to an entry");
+        assert_eq!(pos, 0, "first group starts at position 0");
+        let got = entry.reshape(d)?.to_vec1::<f32>()?;
+
+        // Scalar reference: per-channel softmax over the n rows of (score+ape[:n]),
+        // weighted sum of kv, then RMSNorm·norm_w.
+        let kv = lin(&x, &wkv)?.i(0)?.to_vec2::<f32>()?; // [n, d]
+        let sc = lin(&x, &wgate)?.i(0)?.to_vec2::<f32>()?;
+        let apev = ape.to_vec2::<f32>()?;
+        let normv = norm.to_vec1::<f32>()?;
+        let mut pooled = vec![0f32; d];
+        for (chan, p) in pooled.iter_mut().enumerate() {
+            let logits: Vec<f32> = (0..n).map(|t| sc[t][chan] + apev[t][chan]).collect();
+            let m = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|&v| (v - m).exp()).collect();
+            let z: f32 = exps.iter().sum();
+            *p = (0..n).map(|t| exps[t] / z * kv[t][chan]).sum();
+        }
+        let ms: f32 = pooled.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let inv = 1.0 / (ms + 1e-6).sqrt();
+        for (chan, &pv) in pooled.iter().enumerate() {
+            let expect = pv * inv * normv[chan];
+            assert!(
+                (got[chan] - expect).abs() < 1e-4,
+                "c{chan}: {} vs {expect}",
+                got[chan]
+            );
+        }
+        Ok(())
+    }
+
+    /// `close` on the overlapping (`ratio == 4`) compressor after one complete
+    /// group: the partial pool includes the previous group's first-half rows
+    /// (already `+ape`) alongside the buffered second-half rows — hand-computed
+    /// scalar reference, then RMSNorm.
+    #[test]
+    fn close_pools_trailing_partial_overlap() -> Result<()> {
+        let dev = Device::Cpu;
+        let (dim, d, ratio, rd) = (6usize, 4usize, 4usize, 2usize);
+        let wkv = Tensor::randn(0f32, 1.0, (2 * d, dim), &dev)?;
+        let wgate = Tensor::randn(0f32, 1.0, (2 * d, dim), &dev)?;
+        let ape = Tensor::randn(0f32, 1.0, (ratio, 2 * d), &dev)?;
+        let norm = Tensor::randn(0f32, 1.0, d, &dev)?;
+        let c = Compressor::new(
+            wkv.clone(),
+            wgate.clone(),
+            ape.clone(),
+            norm.clone(),
+            ratio,
+            d,
+            rd,
+            1e-6,
+        );
+
+        // One complete group (4 rows) then a partial (2 rows), then close.
+        let n = 2usize;
+        let total = ratio + n; // 6
+        let x = Tensor::randn(0f32, 1.0, (1, total, dim), &dev)?;
+        let mut inc = c.incremental();
+        let mut emitted = 0;
+        for t in 0..total {
+            if inc.push_raw(&x.i((0, t))?)?.is_some() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(
+            emitted, 1,
+            "group 0 emits, the trailing 2 rows stay buffered"
+        );
+        let (entry, pos) = inc.close()?.expect("partial closes to an entry");
+        assert_eq!(pos, ratio as u32, "group 1 starts at position ratio");
+        let got = entry.reshape(d)?.to_vec1::<f32>()?;
+
+        // Reference: pool = prev group-0 first-half rows (t=0..ratio, dims [0,d),
+        // score+ape[t]) ‖ curr partial rows (t=ratio..ratio+n, dims [d,2d),
+        // score+ape[within]). Softmax over the r+n rows per channel, then RMSNorm.
+        let kv = lin(&x, &wkv)?.i(0)?.to_vec2::<f32>()?; // [total, 2d]
+        let sc = lin(&x, &wgate)?.i(0)?.to_vec2::<f32>()?;
+        let apev = ape.to_vec2::<f32>()?;
+        let normv = norm.to_vec1::<f32>()?;
+        let mut pooled = vec![0f32; d];
+        for (chan, p) in pooled.iter_mut().enumerate() {
+            let mut logits: Vec<f32> = Vec::new();
+            let mut kvs: Vec<f32> = Vec::new();
+            for t in 0..ratio {
+                logits.push(sc[t][chan] + apev[t][chan]);
+                kvs.push(kv[t][chan]);
+            }
+            for j in 0..n {
+                let t = ratio + j;
+                logits.push(sc[t][d + chan] + apev[j][d + chan]);
+                kvs.push(kv[t][d + chan]);
+            }
+            let m = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|&v| (v - m).exp()).collect();
+            let z: f32 = exps.iter().sum();
+            *p = exps.iter().zip(&kvs).map(|(&e, &k)| e / z * k).sum();
+        }
+        let ms: f32 = pooled.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let inv = 1.0 / (ms + 1e-6).sqrt();
+        for (chan, &pv) in pooled.iter().enumerate() {
+            let expect = pv * inv * normv[chan];
+            assert!(
+                (got[chan] - expect).abs() < 1e-4,
+                "c{chan}: {} vs {expect}",
+                got[chan]
+            );
+        }
+        Ok(())
     }
 
     #[test]

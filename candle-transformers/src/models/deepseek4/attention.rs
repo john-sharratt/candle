@@ -452,10 +452,14 @@ impl IncrementalAttention<'_> {
 
 /// RMSNorm with a learned weight: `x * rsqrt(mean(x²)+eps) * w`.
 pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+    // Fused rmsnorm (one launch) instead of the ~6 eager ops (sqr/mean/add/sqrt/
+    // div/mul). `candle_nn::ops::rms_norm` is `x·rsqrt(mean(x²)+eps)·w`, exactly
+    // this function's math (`mean(x²) = Σx²/hidden`), computed in f32 for f32
+    // input — bit-equivalent within reduction-order tolerance. Called 3-4× per
+    // layer, so this removes hundreds of tiny launches per token.
     let x = x.to_dtype(DType::F32)?;
-    let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
-    let normed = x.broadcast_div(&(ms + eps)?.sqrt()?)?;
-    normed.broadcast_mul(&w.to_dtype(DType::F32)?)
+    let w = w.to_dtype(DType::F32)?;
+    candle_nn::ops::rms_norm(&x, &w, eps as f32)
 }
 
 /// Unweighted RMS scaling over the last dim: `x * rsqrt(mean(x²)+eps)`.

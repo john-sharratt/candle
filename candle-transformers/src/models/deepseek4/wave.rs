@@ -21,9 +21,33 @@ use crate::models::batched_inference::{
 
 use super::attention::{rms_norm, rms_scale};
 use super::engine::Dsv4Engine;
-use super::kernel_attention::{KernelLayerSeqState, KernelLayerStatic};
-use super::paged::HEAD_DIM;
-use crate::models::profile::{pipeline_record, profile_now};
+use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
+use super::kernel_attention::{
+    kernel_attn_decode_capture, shortlist_m, DecodeSel, KernelLayerSeqState, KernelLayerStatic,
+};
+use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
+use crate::models::expert_lre::PipelineStats;
+use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
+
+/// One layer's resident sliding-window ring, captured for turn-seal
+/// persistence (Artifact A of docs/deepseek_turn_seal_persistence.md).
+///
+/// **No absolute position is stored.** The window is always the contiguous tail
+/// of the turn, so on resume it is placed at `decode_pos − resident_len` — a
+/// function of where decode resumes in the reconstructed context, exactly as
+/// the chunked cache derives `rope_pos` from cumulative layout rather than a
+/// persisted per-token position.
+pub struct WindowRingLayer {
+    /// Number of resident tokens (the sliding-window tail, ≤ `window_size`).
+    pub resident_len: usize,
+    /// Dense resident-window latent `[1, 1, resident_len, HEAD_DIM]` f32 (K ≡ V).
+    pub kv: Tensor,
+}
+
+/// A sequence's full sliding-window ring across every layer (Artifact A).
+pub struct WindowRingSnapshot {
+    pub layers: Vec<WindowRingLayer>,
+}
 
 /// One sequence's per-layer corpus state plus the offset bookkeeping used to
 /// detect slot reuse.
@@ -70,6 +94,192 @@ impl DeepSeekBatched {
 
     pub fn engine(&self) -> &Dsv4Engine {
         &self.engine
+    }
+
+    /// Turn seal — **Artifact B** (docs/deepseek_turn_seal_persistence.md):
+    /// close every compression layer's trailing partial `comp`/`icomp` groups
+    /// into the gallery for `seq`. After this the live sliding-window tail is
+    /// fully represented in the compressed corpus, so the turn can be persisted
+    /// and resumed from the corpus alone. No-op for an unknown sequence.
+    pub fn seal_sequence(&self, seq: usize) -> Result<()> {
+        let mut map = self
+            .seq_state
+            .write()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        if let Some(e) = map.get_mut(&seq) {
+            for layer in e.layers.iter_mut() {
+                layer.seal_close()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **Artifact C** — snapshot `seq`'s sealed compressed corpus in native
+    /// durable form: one [`CorpusSnapshot`] per layer, `None` on SWA layers
+    /// (no gallery). Call AFTER [`Self::seal_sequence`] so the closed partials
+    /// are included. Errors if the sequence is unknown.
+    pub fn corpus_snapshot(
+        &self,
+        seq: usize,
+    ) -> Result<Vec<Option<super::gallery::CorpusSnapshot>>> {
+        let map = self
+            .seq_state
+            .read()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        let e = map.get(&seq).ok_or_else(|| {
+            candle::Error::Msg(format!("corpus_snapshot: unknown sequence {seq}"))
+        })?;
+        e.layers.iter().map(|l| l.snapshot_gallery()).collect()
+    }
+
+    /// Resume — **Artifact C**: rebuild `seq`'s per-layer corpus state fresh and
+    /// inject the persisted per-layer snapshots into the galleries at
+    /// RECONSTRUCTED positions. The streaming compressors restart empty (their
+    /// partials were closed at seal), so the first post-resume token opens a new
+    /// group at `absorbed`. `snaps` must have exactly `num_layers()` entries (as
+    /// produced by [`Self::corpus_snapshot`]).
+    ///
+    /// `corpus_base` is the absolute position the turn's tokens start at in the
+    /// reconstructed context; each layer's entry `i` is injected at
+    /// `corpus_base + i · ratio` (the layer's compression ratio from config) —
+    /// the position follows the layout, never the (unstored) original. `absorbed`
+    /// is the resume decode position (for slot-reuse detection).
+    pub fn corpus_restore(
+        &self,
+        seq: usize,
+        snaps: &[Option<super::gallery::CorpusSnapshot>],
+        corpus_base: usize,
+        absorbed: usize,
+    ) -> Result<()> {
+        if snaps.len() != self.num_layers() {
+            candle::bail!(
+                "corpus_restore: {} snapshots for {} layers",
+                snaps.len(),
+                self.num_layers()
+            );
+        }
+        let cfg = self.engine.cfg();
+        let dev = self.engine.engine_device();
+        let mut entry = self.fresh_seq_entry()?;
+        for (l, snap) in snaps.iter().enumerate() {
+            if let Some(s) = snap {
+                let ratio = cfg.compress_ratio(l) as u32;
+                let base = corpus_base as u32;
+                let positions: Vec<u32> = (0..s.len as u32).map(|i| base + i * ratio).collect();
+                entry.layers[l].restore_gallery(dev, s, &positions)?;
+            }
+        }
+        entry.absorbed = absorbed;
+        let mut map = self
+            .seq_state
+            .write()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        map.insert(seq, entry);
+        Ok(())
+    }
+
+    /// Resume a sequence's full decode state from its persisted artifacts at a
+    /// (possibly new) absolute frame — **the resume path**. `corpus_snaps`
+    /// (per-layer Artifact C) and `window` (Artifact A) are injected at
+    /// RECONSTRUCTED positions determined by the reconstruction layout, not read
+    /// from the artifacts:
+    /// - the compressed corpus at `base + i · ratio` (per-layer ratio);
+    /// - the raw sliding-window ring as the contiguous tail ending at the resume
+    ///   position `base + total_tokens` (so its `base_pos` is
+    ///   `decode_pos − resident_len`);
+    /// - the session's logical offset set to the resume position so the first
+    ///   decode continues there.
+    ///
+    /// `base` is where this conversation's frame starts in the reconstruction
+    /// (0 for a standalone reopen; > 0 when injected after a prefix), and
+    /// `total_tokens` is the conversation's token count. The compressors restart
+    /// empty (partials were closed at seal), so decode opens a fresh group at the
+    /// resume position. The `seq` slot must already exist (`create_sequence`).
+    pub fn resume_sequence(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        corpus_snaps: &[Option<super::gallery::CorpusSnapshot>],
+        window: &WindowRingSnapshot,
+        base: usize,
+        total_tokens: usize,
+    ) -> Result<()> {
+        let decode_pos = base + total_tokens;
+        self.corpus_restore(seq, corpus_snaps, base, decode_pos)?;
+        self.window_ring_restore(session, seq, window, decode_pos)?;
+        session.set_sequence_offset(seq, decode_pos)?;
+        Ok(())
+    }
+
+    /// **Artifact A** — snapshot `seq`'s resident sliding-window ring across all
+    /// layers: per layer the dense (dequantized) resident-window latent. This is
+    /// the transient tail that warm-starts the ring on resume (the durable
+    /// conversation state is the corpus, Artifact C). K≡V single latent, so one
+    /// tensor per layer; FP8/BF16 ⇄ F32 is lossless for the writer formats, so a
+    /// restore re-quantizes to byte-identical arena bytes. No absolute position
+    /// is captured — it is reconstructed from the resume frame (see
+    /// [`Self::window_ring_restore`]).
+    pub fn window_ring_snapshot(
+        &self,
+        session: &BatchedInferenceSession,
+        seq: usize,
+    ) -> Result<WindowRingSnapshot> {
+        let dev = self.engine.engine_device();
+        let mut layers = Vec::with_capacity(self.num_layers());
+        for backing in session.backings() {
+            let resident_len = backing.resident_len(seq)?;
+            let kv = if resident_len == 0 {
+                Tensor::zeros((1, 1, 0, HEAD_DIM), DType::F32, dev)?
+            } else {
+                let (k, _v) = backing.read_contiguous(seq, 0, resident_len)?;
+                k // K ≡ V single latent
+            };
+            layers.push(WindowRingLayer { resident_len, kv });
+        }
+        Ok(WindowRingSnapshot { layers })
+    }
+
+    /// Resume — **Artifact A**: rebuild `seq`'s sliding-window ring from a
+    /// snapshot so the first post-resume decode continues the sliding window at
+    /// the correct absolute frame. `decode_pos` is where decode resumes in the
+    /// reconstructed context (the tail of the layout); the window is the
+    /// contiguous tail ending there, so each layer is written at resident offset
+    /// 0 with `base_pos = decode_pos − resident_len` — the position is
+    /// RECONSTRUCTED from the resume frame, never read from the artifact. The
+    /// sequence slots must already exist in `session` (e.g. via
+    /// `create_sequence`); the caller sets the session offset to `decode_pos`
+    /// (or use [`Self::resume_sequence`]).
+    pub fn window_ring_restore(
+        &self,
+        session: &BatchedInferenceSession,
+        seq: usize,
+        snap: &WindowRingSnapshot,
+        decode_pos: usize,
+    ) -> Result<()> {
+        if snap.layers.len() != self.num_layers() {
+            candle::bail!(
+                "window_ring_restore: {} layers for {} model layers",
+                snap.layers.len(),
+                self.num_layers()
+            );
+        }
+        for (l, backing) in session.backings().iter().enumerate() {
+            let layer = &snap.layers[l];
+            backing.ensure_sequence_allocated(seq)?;
+            let base = decode_pos.checked_sub(layer.resident_len).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "window_ring_restore: decode_pos {decode_pos} < resident_len {}",
+                    layer.resident_len
+                ))
+            })? as u32;
+            if layer.resident_len > 0 {
+                backing.ensure_for_offset(seq, 0, layer.resident_len)?;
+                backing.write_contiguous(seq, 0, &layer.kv, &layer.kv)?;
+                backing.set_len(seq, layer.resident_len);
+            }
+            backing.set_window_base_pos(seq, base)?;
+        }
+        Ok(())
     }
 
     fn fresh_seq_entry(&self) -> Result<SeqEntry> {
@@ -191,6 +401,22 @@ impl ManagedBatchedModel for DeepSeekBatched {
             map.clear();
         }
         Ok(())
+    }
+
+    fn expert_stats(&self) -> Option<PipelineStats> {
+        Some(self.engine.experts().expert_stats())
+    }
+
+    fn reset_expert_stats(&self) {
+        self.engine.experts().reset_expert_stats();
+    }
+
+    fn snapshot_profiles(&self) -> ProfileSnapshot {
+        // Drain the expert-pipeline worker profile (upload-wait vs GEMM vs
+        // eviction) so the per-phase Bulk/Single profile tables surface the
+        // MoE-internal breakdown — the forward thread's coarse `moe:submit`
+        // span otherwise hides where the ~100ms/token of decode MoE goes.
+        self.engine.experts().snapshot_profiles()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -440,12 +666,25 @@ impl ManagedBatchedModel for DeepSeekBatched {
             }
             overrides.push((s, resident));
         }
+        // DECODE rows always serialize their slot state through the LIVE
+        // persistent gpu_chunks buffer (the cheap path Qwen/Llama use): a decode
+        // row's write chunk is pre-ensured, so it never reallocs during the layer
+        // loop, and the decode kernel commits its write-len on-device
+        // (`commit_write_len=true`) so the buffer advances for the next step. This
+        // skips the per-layer host snapshot COPY that dominated `wave_metadata`,
+        // for EVERY wave — pure-decode AND mixed. Only rows that mutate the arena
+        // mid-forward — PREFILL (absorbs across chunk boundaries in one launch)
+        // and GLUE (gap-chunk scatter) — still snapshot, so their `slices_ptr`
+        // survives the reallocation. Bit-exactness of the live vs snapshot decode
+        // path across chunk boundaries is gated by
+        // `decode_live_buffer_matches_snapshot_multistep`.
+        let snapshot_seqs: Vec<usize> = prefill_seqs.iter().chain(glue_seqs).copied().collect();
         let (pm, headers, stride) = session.build_decode_metadata_at(
             &all_seqs,
             &generation,
             &overrides,
             &non_writer,
-            true,
+            &snapshot_seqs,
         )?;
         let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
         let snaps = [(pm, headers, stride)];
@@ -465,11 +704,18 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let a = &layer.attn;
             let st = &self.layer_static[l];
             let rope = e.rope_for(l);
+            // Device handle for the sync-bracketed fine-span attribution below
+            // (cheap Arc clone; only the sync arms compile in under `profile`).
+            let dev = h.device().clone();
 
             // Attention sub-block.
             let t_attn_pre = profile_now();
+            let t_hcpre = profile_now();
             let (x, post, comb) = hc.pre(&h, &layer.hc_attn)?;
+            pipeline_record("attn:hc_pre", t_hcpre);
+            let t_anorm = profile_now();
             let x = rms_norm(&x, &layer.attn_norm, cfg.norm_eps)?;
+            pipeline_record("attn:norm", t_anorm);
             pipeline_record("deepseek:hc_pre_norm", t_attn_pre);
 
             // Phase A — glue scatter FIRST: every glue row's latent lands in
@@ -516,60 +762,189 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // stay isolated with no cross-bleed and no GID readback.
             let t_decode = profile_now();
             if !decode_seqs.is_empty() {
+                let t_dprep = profile_now();
                 let n_dec = decode_seqs.len();
-                let mut q_rows = Vec::with_capacity(n_dec);
-                let mut kv_rows = Vec::with_capacity(n_dec);
-                // Per-slot HOT two-region cache blocks, concatenated across slots
-                // into one launch (each slot's selection is a dense offset range).
-                let mut nope_blocks: Vec<Tensor> = Vec::new();
-                let mut scale_blocks: Vec<Tensor> = Vec::new();
-                let mut rope_blocks: Vec<Tensor> = Vec::new();
-                let mut pos_blocks: Vec<Tensor> = Vec::new();
-                let mut cnts: Vec<u32> = Vec::with_capacity(n_dec);
-                let mut offsets: Vec<u32> = Vec::with_capacity(n_dec);
-                let mut off = 0u32;
-                for (i, &seq) in decode_seqs.iter().enumerate() {
-                    let xi = x.narrow(1, i, 1)?;
-                    let entry = state.get_mut(&seq).expect("ensured above");
-                    let (q_bf, kv_bf, block, k) =
-                        super::kernel_attention::kernel_attn_decode_prepare(
-                            a,
-                            &mut entry.layers[l],
-                            &xi,
-                            rope,
-                            decode_pos[i],
-                        )?;
-                    q_rows.push(q_bf);
-                    kv_rows.push(kv_bf);
-                    if let Some((ni8, nsc, rbf, cpos)) = block {
-                        nope_blocks.push(ni8);
-                        scale_blocks.push(nsc);
-                        rope_blocks.push(rbf);
-                        pos_blocks.push(cpos);
+                let (h, hd) = (a.n_heads(), a.head_dim());
+
+                // Batched attention projections: ONE GEMM each over ALL decode
+                // rows (the decode rows are the first `n_dec` of `x`), replacing
+                // the per-session projection GEMVs. Bit-identical per row (matmul
+                // + last-dim norms are row-independent).
+                let t_proj = profile_now();
+                let xs_dec = x.narrow(1, 0, n_dec)?.to_dtype(DType::F32)?; // [1,n_dec,dim]
+                let qr_all = rms_norm(&a.wq_a().forward(&xs_dec)?, a.q_norm(), a.eps())?; // [1,n_dec,qa]
+                let q_all = a.wq_b().forward(&qr_all)?.reshape((1, n_dec, h, hd))?;
+                let q_all = rms_scale(&q_all, a.eps())?;
+                let q_bf_all = q_all.reshape((n_dec, h, hd))?.to_dtype(DType::BF16)?; // [n_dec,h,hd]
+                let kv_all = rms_norm(&a.wkv().forward(&xs_dec)?, a.kv_norm(), a.eps())?;
+                let kv_bf_all = kv_all.reshape((n_dec, hd))?.to_dtype(DType::BF16)?; // [n_dec,hd]
+                                                                                     // Batched compressor projections (shared layer weights) over all
+                                                                                     // decode rows — the stateless part of the corpus push; each
+                                                                                     // session's stateful pooling/emit then streams its pre-projected
+                                                                                     // row (bit-identical to the per-session `push_raw`/`push`).
+                let comp_proj = match a.compressor() {
+                    Some(c) => Some(c.project_rows(&xs_dec)?), // (kv[n_dec,cd], score[n_dec,cd])
+                    None => None,
+                };
+                let icomp_proj = match a.indexer() {
+                    Some(ix) => Some(ix.compressor().project_rows(&xs_dec)?),
+                    None => None,
+                };
+                // Batched indexer query projection (CSA layers have an indexer):
+                // one GEMM over all decode rows for `wq_b` + `weights_proj`; the
+                // position-dependent RoPE stays per session (each slot's decode
+                // position differs). Bit-identical per row to `query_space`.
+                let idx_query = match a.indexer() {
+                    Some(ix) => {
+                        let qr_2d = qr_all.reshape((n_dec, ()))?;
+                        let xs_2d = xs_dec.reshape((n_dec, ()))?;
+                        Some((ix, ix.query_gemm_batched(&xs_2d, &qr_2d)?))
                     }
-                    offsets.push(off);
-                    cnts.push(k as u32);
-                    off += k as u32;
+                    None => None,
+                };
+                pipeline_record("dprep:proj", t_proj);
+
+                // Pass 1: per-session corpus push (mutates the gallery) + capture
+                // the selection intent WITHOUT selecting — using the pre-projected
+                // query/compressor slices — so the selection batches across all
+                // sessions.
+                let mut sels: Vec<DecodeSel> = Vec::with_capacity(n_dec);
+                for (i, &seq) in decode_seqs.iter().enumerate() {
+                    let xi = xs_dec.narrow(1, i, 1)?; // [1,1,dim]
+                    let comp_row = match &comp_proj {
+                        Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
+                        None => None,
+                    };
+                    let icomp_row = match &icomp_proj {
+                        Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
+                        None => None,
+                    };
+                    // Per-session RoPE of this slot's batched indexer query.
+                    let (q_idx_i, w_i) = match &idx_query {
+                        Some((ix, (q_raw, weights))) => {
+                            let row = q_raw
+                                .narrow(0, i, 1)?
+                                .reshape((ix.n_heads(), ix.head_dim()))?;
+                            let qi = ix.rope_query(&row, rope, decode_pos[i])?;
+                            let wi = weights.narrow(0, i, 1)?.reshape(ix.n_heads())?;
+                            (Some(qi), Some(wi))
+                        }
+                        None => (None, None),
+                    };
+                    let entry = state.get_mut(&seq).expect("ensured above");
+                    let sel = kernel_attn_decode_capture(
+                        a,
+                        &mut entry.layers[l],
+                        &xi,
+                        comp_row.as_ref().map(|(k, s)| (k, s)),
+                        icomp_row.as_ref().map(|(k, s)| (k, s)),
+                        q_idx_i,
+                        w_i,
+                        rope,
+                    )?;
+                    sels.push(sel);
                     if l + 1 == n_layers {
                         entry.absorbed = decode_pos[i] + 1;
                     }
                 }
-                let q_all = Tensor::cat(&q_rows, 0)?; // [n_dec, H, hd]
-                let kv_all = Tensor::cat(&kv_rows, 0)?; // [n_dec, hd]
-                let dev = q_all.device();
-                let cache = if nope_blocks.is_empty() {
+                pipeline_record("decode:prep", t_dprep);
+
+                // Batched selection: ONE launch per Stage-1 kernel over EVERY CSA
+                // decode session's gallery, replacing the per-session two-stage
+                // selection loop (whose `topm_select` — a single-warp serial bin
+                // scan × sessions — dominated the decode selection cost). HCA
+                // sessions attend all causal entries; empty/SWA select nothing.
+                let t_dsel = profile_now();
+                let mut csa_idx: Vec<usize> = Vec::new();
+                let mut csa_gals: Vec<&FloatGallery> = Vec::new();
+                let mut csa_q: Vec<Tensor> = Vec::new();
+                let mut csa_w: Vec<Tensor> = Vec::new();
+                for (i, &seq) in decode_seqs.iter().enumerate() {
+                    if let DecodeSel::TwoStage { q_idx, weights } = &sels[i] {
+                        let g = state.get(&seq).expect("ensured").layers[l]
+                            .gallery
+                            .as_ref()
+                            .expect("CSA session has a gallery");
+                        csa_idx.push(i);
+                        csa_gals.push(g);
+                        csa_q.push(q_idx.clone());
+                        csa_w.push(weights.clone());
+                    }
+                }
+                let mut sel_gids: Vec<Option<Tensor>> = (0..n_dec).map(|_| None).collect();
+                let mut cnts: Vec<u32> = vec![0u32; n_dec];
+                if !csa_gals.is_empty() {
+                    let ix = a.indexer().expect("CSA layer has an indexer");
+                    let batched = two_stage_select_batched(
+                        &csa_gals,
+                        &csa_q,
+                        &csa_w,
+                        shortlist_m(ix.top_k()),
+                        ix.top_k(),
+                    )?;
+                    for (j, (gids, k)) in batched.into_iter().enumerate() {
+                        let i = csa_idx[j];
+                        cnts[i] = k as u32;
+                        if k > 0 {
+                            sel_gids[i] = Some(gids);
+                        }
+                    }
+                }
+                for (i, sel) in sels.iter().enumerate() {
+                    if let DecodeSel::AllEntries(n) = *sel {
+                        cnts[i] = n as u32;
+                        sel_gids[i] = Some(Tensor::arange(0u32, n as u32, &dev)?);
+                    }
+                }
+                pipeline_record("decode:select", t_dsel);
+
+                // Pass 2: gather EVERY session's selected HOT two-region rows into
+                // one pre-allocated block in a SINGLE batched launch (each slot's
+                // rows at its dense range `[offset, offset+k)`) — no per-region
+                // `index_select`, no cross-session `cat`, no per-session launch.
+                let t_dgather = profile_now();
+                let mut offsets: Vec<u32> = Vec::with_capacity(n_dec);
+                let mut off = 0u32;
+                for i in 0..n_dec {
+                    offsets.push(off);
+                    off += cnts[i];
+                }
+                let total_k = off as usize;
+                let cache = if total_k == 0 {
                     st.empty_corpus_cache()?
                 } else {
-                    let nope = Tensor::cat(&nope_blocks, 0)?;
-                    let clen = nope.dim(0)?;
+                    let out_nope = Tensor::zeros((total_k, NOPE_DIM), DType::U8, &dev)?;
+                    let out_scale = Tensor::zeros((total_k, NOPE_BANDS), DType::F32, &dev)?;
+                    let out_rope = Tensor::zeros((total_k, ROPE_DIM), DType::BF16, &dev)?;
+                    let out_pos = Tensor::zeros(total_k, DType::U32, &dev)?;
+                    let mut gg: Vec<&FloatGallery> = Vec::with_capacity(n_dec);
+                    let mut ggids: Vec<Tensor> = Vec::with_capacity(n_dec);
+                    let mut goff: Vec<u32> = Vec::with_capacity(n_dec);
+                    for (i, &seq) in decode_seqs.iter().enumerate() {
+                        if let Some(gids) = &sel_gids[i] {
+                            let g = state.get(&seq).expect("ensured").layers[l]
+                                .gallery
+                                .as_ref()
+                                .expect("selection implies a gallery");
+                            gg.push(g);
+                            ggids.push(gids.clone());
+                            goff.push(offsets[i]);
+                        }
+                    }
+                    gather_corpus_batched(
+                        &gg, &ggids, &goff, &out_nope, &out_scale, &out_rope, &out_pos,
+                    )?;
                     super::paged::CorpusCache::from_gathered(
-                        nope,
-                        Tensor::cat(&scale_blocks, 0)?,
-                        Tensor::cat(&rope_blocks, 0)?,
-                        Tensor::cat(&pos_blocks, 0)?,
-                        clen,
+                        out_nope, out_scale, out_rope, out_pos, total_k,
                     )?
                 };
+                pipeline_record("decode:gather", t_dgather);
+                let t_dcache = profile_now();
+                // The batched projections already produced these contiguous
+                // `[n_dec, …]` tensors; use them directly (the per-session
+                // narrow-then-cat that rebuilt them was a redundant device copy).
+                let q_all = q_bf_all; // [n_dec, H, hd]
+                let kv_all = kv_bf_all; // [n_dec, hd]
                 let max_sel = cnts.iter().map(|&c| c as usize).max().unwrap_or(0).max(1);
                 // Each slot's selection is the dense range [offset, offset+k) —
                 // strictly ascending, the compressed-index contract the kernel
@@ -581,18 +956,22 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         idx_flat[i * max_sel + k] = offsets[i] + k as u32;
                     }
                 }
-                let comp_idx = Tensor::from_vec(idx_flat, (n_dec, max_sel), dev)?;
-                let comp_cnt = Tensor::from_vec(cnts, n_dec, dev)?;
+                let comp_idx = Tensor::from_vec(idx_flat, (n_dec, max_sel), &dev)?;
+                let comp_cnt = Tensor::from_vec(cnts, n_dec, &dev)?;
                 // Explicit per-slot query position (the decode kernel no longer
                 // derives it from the writer slice, so the windowless slot works
                 // and the compressed causal guard has a reference).
                 let q_pos_dec = Tensor::from_vec(
-                    (0..n_dec).map(|i| decode_pos[i] as u32).collect::<Vec<u32>>(),
+                    (0..n_dec)
+                        .map(|i| decode_pos[i] as u32)
+                        .collect::<Vec<u32>>(),
                     n_dec,
-                    dev,
+                    &dev,
                 )?;
+                pipeline_record("decode:cache", t_dcache);
                 // `cache` is the gathered two-region hot cache (built above from
                 // the gallery's pre-built int8 — no per-wave rebuild).
+                let t_dkern = profile_now();
                 let out = super::paged::paged_latent_decode_raw(
                     &q_all,
                     hdr_of(l, 0),
@@ -606,19 +985,26 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     a.softmax_scale() as f32,
                     a.window_size(),
                     0,
-                    false,
+                    // Decode rows use the live persistent buffer, so always commit
+                    // the write-len on-device to advance it for the next step.
+                    true,
                     st.ws(),
                     None,
                 )?;
+                pipeline_record("decode:kernel", t_dkern);
+                // Batched output projection: ONE `output_proj` over all decode
+                // rows (`b = n_dec`) instead of a per-session call. `output_proj`
+                // is already batch-parametrized — its inner loop is over the 8
+                // o_lora groups, not sessions — so this is bit-identical per row
+                // (the group GEMMs are row-independent) and collapses `8·n_dec`
+                // group-GEMM launches to 8.
+                let t_doutp = profile_now();
+                let o = out.to_dtype(DType::F32)?.reshape((n_dec, h, 1, hd))?;
+                let proj = a.output_proj(&o, n_dec, 1)?; // [n_dec, 1, dim]
                 for i in 0..n_dec {
-                    let oi = out.narrow(0, i, 1)?.to_dtype(DType::F32)?.reshape((
-                        1,
-                        a.n_heads(),
-                        1,
-                        a.head_dim(),
-                    ))?;
-                    attn_rows.push(a.output_proj(&oi, 1, 1)?);
+                    attn_rows.push(proj.narrow(0, i, 1)?);
                 }
+                pipeline_record("decode:outproj", t_doutp);
                 pipeline_record("deepseek:decode_attn", t_decode);
             }
             // Prefill rows: each prompt is absorbed in ONE batched
@@ -636,25 +1022,21 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // then a single `paged_latent_prefill` reads the committed prefix
                 // `[0,base)` from the arena and the prompt `[base,base+s)` from the
                 // fresh bf16 latents (`kv_fresh`) — matching the per-token diagonal.
-                let mut q_rows = Vec::with_capacity(s_len);
-                let mut kv_rows = Vec::with_capacity(s_len);
-                let mut idx_rows: Vec<Vec<u32>> = Vec::with_capacity(s_len);
-                for t in 0..s_len {
-                    let xi = x.narrow(1, row_cursor + t, 1)?;
-                    let (q_bf, kv_bf, gids) = super::kernel_attention::kernel_attn_prefill_prepare(
+                // Whole-prompt batched prep: all stateless projections in a few
+                // GEMMs (was the per-token GEMV loop that dominated prefill).
+                let t_pprep = profile_now();
+                let xs = x.narrow(1, row_cursor, s_len)?;
+                let (q_all, kv_all, idx_rows) =
+                    super::kernel_attention::kernel_attn_prefill_prepare_batched(
                         a,
                         &mut entry.layers[l],
-                        &xi,
+                        &xs,
                         rope,
-                        base + t,
+                        base,
                     )?;
-                    q_rows.push(q_bf);
-                    kv_rows.push(kv_bf);
-                    idx_rows.push(gids);
-                }
-                let q_all = Tensor::cat(&q_rows, 0)?; // [s, H, hd]
-                let kv_all = Tensor::cat(&kv_rows, 0)?; // [s, hd]
+                pipeline_record("prefill:prep", t_pprep);
                 let dev = q_all.device();
+                let t_pgather = profile_now();
                 // Gather ONLY the union of selected entries onto the GPU (tier-
                 // aware — works when the gallery has spilled to CPU RAM past
                 // HOT_ENTRY_CAP), then remap each query's absolute GIDs to their
@@ -704,6 +1086,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     s_len,
                     dev,
                 )?;
+                pipeline_record("prefill:gather", t_pgather);
+                let t_pkern = profile_now();
                 let out = super::paged::paged_latent_prefill_raw(
                     &q_all,
                     hdr_of(l, decode_seqs.len() + pi),
@@ -720,21 +1104,26 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     session.backings()[l].k_format().to_tag(),
                     st.ws(),
                 )?;
+                pipeline_record("prefill:kernel", t_pkern);
                 // Write the prompt latents into the arena so FUTURE decode waves
                 // read them (this launch read the fresh bf16 diagonal, not the
                 // arena). K≡V single latent → k = v. The arena write lands at the
                 // RESIDENT offset (absolute `base` minus this seq's evicted front);
                 // the chunk it fills serialises its ABSOLUTE rope via `base_pos`.
+                let t_pwb = profile_now();
                 let base_resident = base - prefill_base_ev[pi] as usize;
                 let kv_4d = kv_all.reshape((1, 1, s_len, a.head_dim()))?;
                 session.backings()[l].write_contiguous(seq, base_resident, &kv_4d, &kv_4d)?;
                 session.backings()[l].set_len(seq, base_resident + s_len);
+                pipeline_record("prefill:writeback", t_pwb);
+                let t_poutp = profile_now();
                 let o = out
                     .to_dtype(DType::F32)?
                     .reshape((1, s_len, a.n_heads(), a.head_dim()))?
                     .transpose(1, 2)?
                     .contiguous()?;
                 attn_rows.push(a.output_proj(&o, 1, s_len)?);
+                pipeline_record("prefill:outproj", t_poutp);
                 if l + 1 == n_layers {
                     entry.absorbed = base + s_len;
                 }
@@ -800,13 +1189,17 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // host-visible to schedule the streaming cache's pinned→VRAM
             // uploads; it reaches zero only under full residency).
             let t_moe = profile_now();
+            let t_moe_hcpre = profile_now();
             let (x, post, comb) = hc.pre(&h1, &layer.hc_ffn)?;
             let mut flat_ids: Vec<u32> = decode_ids.clone();
             for ids in prefill_ids.iter().chain(&glue_ids) {
                 flat_ids.extend_from_slice(ids);
             }
+            pipeline_record("moe:hc_pre", t_moe_hcpre);
             let moe = e.moe_forward_batch(layer, &x, &flat_ids)?;
+            let t_moe_hcpost = profile_now();
             h = hc.post(&moe, &h1, &post, &comb)?;
+            pipeline_record("moe:hc_post", t_moe_hcpost);
             pipeline_record("deepseek:moe", t_moe);
         }
         drop(state);
@@ -820,6 +1213,20 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 residual: Some(flat),
                 logits: None,
             });
+        }
+
+        // A batched prefill wrote its tokens via `write_contiguous` (not the
+        // decode kernel's on-device write-len self-increment), so each prefill
+        // seq's cached decode slot buffer — built at the pre-prefill base offset
+        // during this wave's metadata build — carries a STALE writer-slice
+        // length. The live-buffer decode path reuses that buffer, so the first
+        // decode after a SHORT prefill (one that never crossed a chunk boundary —
+        // which would itself have dropped the buffer) would read a stale window.
+        // Re-serialize the writer slice to the prefilled length now (all layers
+        // are absorbed in this final segment; O(1) per seq per layer, one-time
+        // after each prefill — steady-state decode never pays it).
+        for &pseq in prefill_seqs {
+            session.refresh_decode_slot_state(pseq)?;
         }
 
         // Head: decode rows + each prefill sequence's LAST row.
@@ -851,6 +1258,17 @@ mod tests {
     use candle::quantized::Int8Mode;
     use candle::IndexOp;
 
+    /// Serialize the full-model integration tests. Each loads the 152 GB
+    /// DeepSeek-V4-Flash model with its multi-GB PINNED expert pool, so running
+    /// two concurrently exhausts host page-locked memory (`cuMemAllocHost`
+    /// OOM). Every such test takes this lock as its first line, so `cargo test`
+    /// runs them one at a time regardless of `--test-threads`. Poisoning is
+    /// tolerated — a panicking test still frees the model and releases the lock.
+    static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn model_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Multi-session concurrent batched forwarding — the throughput + coherence
     /// gate the wave architecture exists to serve, on the SAME shared
     /// `TestParams::run` / StoryRewrite harness the Qwen/Llama batched models
@@ -880,6 +1298,7 @@ mod tests {
         use crate::models::batched_inference::InferenceMode;
         use crate::models::dialect::Dialect;
 
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {
@@ -911,6 +1330,10 @@ mod tests {
             .with_suppress_thinking(true) // strip <think>…</think> before validation
             .with_stop_on_eos(vec![eos])
             .with_print_outputs(true)
+            // The comparison table's `int8` column must reflect the mode the model
+            // is actually loaded with (`load_model` uses `Int8Mode::Performance` —
+            // int8-KO expert/attention matmuls), not the harness default (`Off`).
+            .with_int8mode(Int8Mode::Performance)
             .with_timeout_secs(1800);
 
         let configs = [1usize, 4, 8]
@@ -939,6 +1362,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wave_paris() -> Result<()> {
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {
@@ -1076,6 +1500,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wave_paris_decode_only_prefill() -> Result<()> {
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {
@@ -1158,6 +1583,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wave_prefill_residual_divergence() -> Result<()> {
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {
@@ -1284,6 +1710,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wave_prefill_state_matches_decode_steps() -> Result<()> {
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {
@@ -1447,6 +1874,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wave_paris_conversation_prompt() -> Result<()> {
+        let _serial = model_test_guard();
         let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
             .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
         if !path.exists() {

@@ -319,7 +319,8 @@ pub struct TestResults {
     pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
     pub bulk_profile: ProfileSnapshot, // Profile data from prompt (bulk) phase
     pub single_profile: ProfileSnapshot, // Profile data from generate (single) phase
-    pub pipeline_profile: ProfileSnapshot, // Pipeline-level profiling (prefill/decode stages)
+    pub pipeline_bulk_profile: ProfileSnapshot, // Pipeline spans, prefill (bulk) phase only
+    pub pipeline_profile: ProfileSnapshot, // Pipeline spans, decode (single/generate) phase only
     /// Effective test mode used for this config (may override the global `TestParams::test_mode`).
     pub effective_test_mode: TestMode,
 }
@@ -789,6 +790,11 @@ impl TestParams {
 
         // Snapshot bulk profile at prompt→generate boundary
         let bulk_profile = model.snapshot_profiles();
+        // Capture + reset the pipeline spans here so the prefill (bulk) phase is
+        // attributed separately from decode — the final `pipeline_snapshot_and_reset`
+        // below then contains only the generate (decode) phase. Without this split
+        // the MoE / mHC spans (which run in both phases) are un-attributable.
+        let pipeline_bulk_profile = pipeline_snapshot_and_reset();
 
         // Quantize + seal the prefilled history, mirroring the substrate
         // scheduler's priming-projection boundary. `start_new_chunk = true` so
@@ -946,6 +952,7 @@ impl TestParams {
             expert_stats: None, // Filled by run() after collection
             bulk_profile,
             single_profile,
+            pipeline_bulk_profile,
             pipeline_profile: pipeline_snapshot_and_reset(),
             effective_test_mode: effective_mode,
         })
@@ -1505,7 +1512,12 @@ impl TestParams {
 
         self.print_profile_table(results, "Bulk (Prompt) Profile", |r| &r.bulk_profile);
         self.print_profile_table(results, "Single (Generate) Profile", |r| &r.single_profile);
-        self.print_profile_table(results, "Pipeline Profile", |r| &r.pipeline_profile);
+        self.print_profile_table(results, "Pipeline Profile — PREFILL (bulk)", |r| {
+            &r.pipeline_bulk_profile
+        });
+        self.print_profile_table(results, "Pipeline Profile — DECODE (single)", |r| {
+            &r.pipeline_profile
+        });
 
         if failed {
             Err(candle::Error::msg("Some tests failed"))

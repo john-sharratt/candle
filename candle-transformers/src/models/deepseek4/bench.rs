@@ -396,8 +396,8 @@ pub fn run_decode(dev: &Device, cfg: DecodeCfg) -> Result<Report> {
     let q_pos_t = Tensor::from_vec(vec![(base + WINDOW) as u32; cfg.slots], cfg.slots, dev)?;
     let launch = || -> Result<Tensor> {
         paged_latent_decode_raw(
-            &q, hdr_ptr, &kv_new, &cache, &comp_idx, &comp_cnt, &q_pos_t, &sinks, &rope_tab,
-            scale, WINDOW, cfg.splits, false, &ws, None,
+            &q, hdr_ptr, &kv_new, &cache, &comp_idx, &comp_cnt, &q_pos_t, &sinks, &rope_tab, scale,
+            WINDOW, cfg.splits, false, &ws, None,
         )
     };
 

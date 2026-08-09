@@ -12,10 +12,12 @@
 
 use candle::{DType, Result, Tensor};
 
+use crate::models::profile::{pipeline_record, profile_now};
+
 use super::attention::{rms_norm, rms_scale, Attention};
 use super::compressor::IncrementalCompressor;
 use super::config::LayerKind;
-use super::gallery::FloatGallery;
+use super::gallery::{CorpusSnapshot, FloatGallery};
 use std::sync::Arc;
 
 use super::paged::{
@@ -156,6 +158,63 @@ impl KernelLayerSeqState {
             gallery,
         })
     }
+
+    /// Turn-seal **close** (Artifact B → C): finalize this layer's trailing
+    /// partial compressor groups into corpus entries and append them to the
+    /// gallery. After this the live window tail is fully represented in the
+    /// compressed corpus, so the turn is persistable and resumable from the
+    /// corpus alone (docs/deepseek_turn_seal_persistence.md §2). The attention
+    /// and indexer compressors share group boundaries, so they close in lockstep
+    /// (`comp` yields the attended entry, `icomp` the scoring key; HCA layers
+    /// have no indexer and store a 1-wide placeholder key). A no-op on SWA
+    /// layers (no compressor/gallery) and when the buffers are already empty (the
+    /// group boundary fell exactly on the seal).
+    pub fn seal_close(&mut self) -> Result<()> {
+        let (Some(comp), Some(gallery)) = (self.comp.as_mut(), self.gallery.as_mut()) else {
+            return Ok(());
+        };
+        if let Some((entry, gpos)) = comp.close()? {
+            let (_, _, hd) = entry.dims3()?;
+            let key = match self.icomp.as_mut() {
+                Some(ic) => ic
+                    .close()?
+                    .expect("indexer compressor shares group boundaries")
+                    .0
+                    .reshape((1, ()))?,
+                None => Tensor::zeros((1, 1), DType::F32, entry.device())?,
+            };
+            gallery.append_batch(&entry.reshape((1, hd))?, &key, &[gpos])?;
+        } else if let Some(ic) = self.icomp.as_mut() {
+            let none = ic.close()?;
+            debug_assert!(none.is_none(), "compressor group boundaries diverged");
+        }
+        Ok(())
+    }
+
+    /// Snapshot this layer's compressed corpus in native durable form (Artifact
+    /// C). `None` on SWA layers (no gallery). Call after [`Self::seal_close`] so
+    /// the trailing partial is included.
+    pub fn snapshot_gallery(&self) -> Result<Option<CorpusSnapshot>> {
+        match &self.gallery {
+            Some(g) => Ok(Some(g.snapshot()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Inject a persisted corpus snapshot into this layer's gallery on resume
+    /// (Artifact C). Replaces the (fresh, empty) gallery with the restored one.
+    /// `positions` are the RECONSTRUCTED group-start positions (`base + i·ratio`)
+    /// the entries take in the resumed context — computed by the caller from the
+    /// reconstruction layout, not read from the snapshot (which stores none).
+    pub fn restore_gallery(
+        &mut self,
+        device: &candle::Device,
+        snap: &CorpusSnapshot,
+        positions: &[u32],
+    ) -> Result<()> {
+        self.gallery = Some(FloatGallery::from_snapshot(device, snap, positions)?);
+        Ok(())
+    }
 }
 
 impl KernelAttnLayer {
@@ -248,7 +307,11 @@ pub fn kernel_attn_decode_step(
     // Selection: SWA none; HCA all causal entries; CSA two-stage top-k.
     let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
     let (cache, comp_idx, comp_cnt) = if n_entries == 0 {
-        (st.empty_corpus_cache()?, st.empty_idx.clone(), st.empty_cnt.clone())
+        (
+            st.empty_corpus_cache()?,
+            st.empty_idx.clone(),
+            st.empty_cnt.clone(),
+        )
     } else {
         let gallery = seq.gallery.as_ref().unwrap();
         // Absolute entry ids the query attends: CSA two-stage top-k, HCA all.
@@ -265,7 +328,11 @@ pub fn kernel_attn_decode_step(
             LayerKind::SlidingWindow => (st.empty_idx.clone().reshape(1)?, 0),
         };
         if k == 0 {
-            (st.empty_corpus_cache()?, st.empty_idx.clone(), st.empty_cnt.clone())
+            (
+                st.empty_corpus_cache()?,
+                st.empty_idx.clone(),
+                st.empty_cnt.clone(),
+            )
         } else {
             // Gather the k selected entries' HOT two-region cache (tier-aware) and
             // walk them densely — `comp_idx = 0..k`. The gallery pre-built the
@@ -307,144 +374,180 @@ pub fn kernel_attn_decode_step(
     a.output_proj(&o, 1, 1)
 }
 
-/// Batched-prefill preparation for ONE prompt token: the SAME host projections
-/// and corpus-push + causal `two_stage_select` as [`kernel_attn_decode_step`],
-/// but it does NOT launch the attention — it returns the token's pre-RoPE bf16
-/// query `[1, n_heads, HEAD_DIM]`, its pre-RoPE bf16 latent `[1, HEAD_DIM]` (the
-/// batched `kv_fresh` diagonal source), and its absolute selected compressed
-/// GIDs. Looping this in token order builds the corpus causally, so token `t`
-/// selects only over entries completed by `t` — bit-identical selection to the
-/// per-token decode path, launched once for the whole prompt.
-pub fn kernel_attn_prefill_prepare(
+/// Whole-prompt batched prefill preparation. Every stateless projection is
+/// hoisted OUT of the token loop into one GEMM over the full prompt `xs`
+/// `[1, s, dim]`: the attention `wq_a`/`wq_b`/`wkv` (+ norms) and BOTH streaming
+/// compressors' `wkv`/`wgate`. The token loop then only does the cheap stateful
+/// work — buffering the pre-projected compressor rows, emitting a group when one
+/// completes (`push_projected*`), and the per-token causal selection — so token
+/// `t` still selects exactly over the entries completed by `t`. The projection
+/// is the only thing moved out of the loop; the pooling/emit/selection semantics
+/// (and their outputs) are unchanged. Returns the batched pre-RoPE bf16 query
+/// `[s, n_heads, HEAD_DIM]`, latent `[s, HEAD_DIM]`, and each token's absolute
+/// selected compressed GIDs.
+#[allow(clippy::type_complexity)]
+pub fn kernel_attn_prefill_prepare_batched(
     a: &Attention,
     seq: &mut KernelLayerSeqState,
-    x: &Tensor,
+    xs: &Tensor,
     rope: &RotaryCache,
-    pos: usize,
-) -> Result<(Tensor, Tensor, Vec<u32>)> {
+    base: usize,
+) -> Result<(Tensor, Tensor, Vec<Vec<u32>>)> {
     let (h, hd) = (a.n_heads(), a.head_dim());
-    let din = x.elem_count();
-    let x = x.reshape((1, 1, din))?.to_dtype(DType::F32)?;
+    let s = xs.dim(1)?;
+    let xs = xs.to_dtype(DType::F32)?;
 
-    let qr = rms_norm(&a.wq_a().forward(&x)?, a.q_norm(), a.eps())?;
-    let q = a.wq_b().forward(&qr)?.reshape((1, 1, h, hd))?;
-    let q = rms_scale(&q, a.eps())?;
-    let q_bf = q.reshape((1, h, hd))?.to_dtype(DType::BF16)?;
-    let kv = rms_norm(&a.wkv().forward(&x)?, a.kv_norm(), a.eps())?;
-    let kv_bf = kv.reshape((1, hd))?.to_dtype(DType::BF16)?;
+    // ── Batched attention projections: ONE GEMM each over all s tokens ──
+    let qr_all = rms_norm(&a.wq_a().forward(&xs)?, a.q_norm(), a.eps())?; // [1,s,qa]
+    let q_all = a.wq_b().forward(&qr_all)?.reshape((1, s, h, hd))?;
+    let q_all = rms_scale(&q_all, a.eps())?;
+    let q_bf_all = q_all.reshape((s, h, hd))?.to_dtype(DType::BF16)?; // [s,h,hd]
+    let kv_all = rms_norm(&a.wkv().forward(&xs)?, a.kv_norm(), a.eps())?; // [1,s,hd]
+    let kv_bf_all = kv_all.reshape((s, hd))?.to_dtype(DType::BF16)?; // [s,hd]
 
-    // Corpus maintenance — identical to the decode step.
-    if let (Some(comp), Some(gallery)) = (seq.comp.as_mut(), seq.gallery.as_mut()) {
-        if let Some((entry, gpos)) = comp.push_raw(&x)? {
-            let key = match seq.icomp.as_mut() {
-                Some(ic) => ic
-                    .push(&x, rope)?
-                    .expect("indexer compressor shares group boundaries")
-                    .reshape((1, ()))?,
-                None => Tensor::zeros((1, 1), DType::F32, x.device())?,
-            };
-            gallery.append_batch(&entry.reshape((1, hd))?, &key, &[gpos])?;
-        } else if let Some(ic) = seq.icomp.as_mut() {
-            let none = ic.push(&x, rope)?;
-            debug_assert!(none.is_none(), "compressor group boundaries diverged");
-        }
-    }
-
-    // Absolute selected GIDs (the per-query causal top-k), read to host so the
-    // wave can pack them into the `[s, max_sel]` selection the batched prefill
-    // launch expects (prefill is amortized — this is not the decode hot path).
-    let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
-    let gids: Vec<u32> = if n_entries == 0 {
-        Vec::new()
-    } else {
-        let gallery = seq.gallery.as_ref().unwrap();
-        match a.kind() {
-            LayerKind::Csa => {
-                let ix = a.indexer().expect("CSA layer has an indexer");
-                let (qi, w) = ix.query_space(&x, &qr, rope, pos)?;
-                let (g, k) =
-                    gallery.two_stage_select(&qi, &w, shortlist_m(ix.top_k()), ix.top_k())?;
-                if k == 0 {
-                    Vec::new()
-                } else {
-                    g.to_vec1::<u32>()?
-                }
-            }
-            LayerKind::Hca => (0..n_entries as u32).collect(),
-            LayerKind::SlidingWindow => Vec::new(),
-        }
+    // ── Batched compressor projections (attention-comp + indexer-comp) ──
+    let comp_proj = match seq.comp.as_ref() {
+        Some(c) => Some(c.project_rows(&xs)?), // (kv [s,cd], score [s,cd])
+        None => None,
     };
-    Ok((q_bf, kv_bf, gids))
+    let icomp_proj = match seq.icomp.as_ref() {
+        Some(ic) => Some(ic.project_rows(&xs)?),
+        None => None,
+    };
+
+    // ── Per-token stateful pass: buffer pre-projected rows, emit completed
+    // groups, and select causally — same corpus/selection semantics as the
+    // per-token decode step, just fed pre-projected rows. ──
+    let mut idx_rows: Vec<Vec<u32>> = Vec::with_capacity(s);
+    for t in 0..s {
+        let pos = base + t;
+        // Corpus maintenance from the pre-projected rows (no per-row GEMV) —
+        // disjoint field borrows of comp/gallery/icomp.
+        if let (Some(comp), Some(gallery), Some((ck, cs))) =
+            (seq.comp.as_mut(), seq.gallery.as_mut(), comp_proj.as_ref())
+        {
+            if let Some((entry, gpos)) =
+                comp.push_projected(&ck.narrow(0, t, 1)?, &cs.narrow(0, t, 1)?)?
+            {
+                let key = match (seq.icomp.as_mut(), icomp_proj.as_ref()) {
+                    (Some(ic), Some((ik, is))) => ic
+                        .push_projected_roped(&ik.narrow(0, t, 1)?, &is.narrow(0, t, 1)?, rope)?
+                        .expect("indexer compressor shares group boundaries")
+                        .reshape((1, ()))?,
+                    _ => Tensor::zeros((1, 1), DType::F32, xs.device())?,
+                };
+                gallery.append_batch(&entry.reshape((1, hd))?, &key, &[gpos])?;
+            } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_proj.as_ref()) {
+                let none =
+                    ic.push_projected_roped(&ik.narrow(0, t, 1)?, &is.narrow(0, t, 1)?, rope)?;
+                debug_assert!(none.is_none(), "compressor group boundaries diverged");
+            }
+        }
+
+        // Per-token causal selection over the corpus completed so far.
+        let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
+        let gids: Vec<u32> = if n_entries == 0 {
+            Vec::new()
+        } else {
+            let gallery = seq.gallery.as_ref().unwrap();
+            match a.kind() {
+                LayerKind::Csa => {
+                    let ix = a.indexer().expect("CSA layer has an indexer");
+                    let x_t = xs.narrow(1, t, 1)?;
+                    let qr_t = qr_all.narrow(1, t, 1)?;
+                    let (qi, w) = ix.query_space(&x_t, &qr_t, rope, pos)?;
+                    let (g, k) =
+                        gallery.two_stage_select(&qi, &w, shortlist_m(ix.top_k()), ix.top_k())?;
+                    if k == 0 {
+                        Vec::new()
+                    } else {
+                        g.to_vec1::<u32>()?
+                    }
+                }
+                LayerKind::Hca => (0..n_entries as u32).collect(),
+                LayerKind::SlidingWindow => Vec::new(),
+            }
+        };
+        idx_rows.push(gids);
+    }
+    Ok((q_bf_all, kv_bf_all, idx_rows))
 }
 
-/// Batched-decode preparation for ONE sequence's token: the SAME host
-/// projections + corpus-push + on-device select/gather as
-/// [`kernel_attn_decode_step`], but WITHOUT the attention launch. Returns the
-/// token's pre-RoPE bf16 query `[1, n_heads, HEAD_DIM]`, its pre-RoPE bf16
-/// latent `[1, HEAD_DIM]` (the fused-scatter source), and the ON-DEVICE gathered
-/// compressed block `[k, HEAD_DIM]` + positions `[k]` + count `k`. Selection and
-/// gather stay on-device (no GID readback), so the wave can concatenate these
-/// across sessions and attend ALL decode slots in ONE `paged_latent_decode`
-/// launch — the per-slot selection is offset into the concatenated block.
-#[allow(clippy::type_complexity)]
-pub fn kernel_attn_decode_prepare(
+/// What a decode session's corpus selection will be, captured BEFORE the select
+/// runs so the wave can batch the (per-session) two-stage selection across the
+/// whole decode set in one launch per Stage-1 kernel.
+pub enum DecodeSel {
+    /// CSA layer: two-stage BDP-recall → Indexer-precision top-k, using this
+    /// session's per-head Indexer query `[n_idx_heads, index_head_dim]` and gate
+    /// weights `[n_idx_heads]`. The gallery it selects over lives in the session
+    /// state the wave holds.
+    TwoStage { q_idx: Tensor, weights: Tensor },
+    /// HCA layer: attend ALL `n` causal compressed entries.
+    AllEntries(usize),
+    /// SWA layer or an empty corpus: no compressed selection.
+    None,
+}
+
+/// Corpus-push + selection-capture for ONE decode session's token, with the
+/// attention projections ALREADY batched across sessions by the caller — the
+/// counterpart to the batched prefill prep. `x` is the token's raw hidden
+/// `[1, 1, dim]` (f32) and `qr` its pre-projected, q-normed low-rank query
+/// `[1, 1, q_lora_rank]` (f32); the caller computed both in one GEMM over all
+/// decode rows and hands each session its slice. This runs only the STATEFUL
+/// per-session work: corpus maintenance (`push_raw`) and capturing the
+/// [`DecodeSel`] (the Indexer query space for a CSA layer). The two-stage
+/// selection itself is then batched over all sessions'
+/// galleries ([`super::gallery::two_stage_select_batched`]).
+#[allow(clippy::too_many_arguments)]
+pub fn kernel_attn_decode_capture(
     a: &Attention,
     seq: &mut KernelLayerSeqState,
     x: &Tensor,
+    comp_row: Option<(&Tensor, &Tensor)>,
+    icomp_row: Option<(&Tensor, &Tensor)>,
+    q_idx: Option<Tensor>,
+    weights: Option<Tensor>,
     rope: &RotaryCache,
-    pos: usize,
-) -> Result<(Tensor, Tensor, Option<(Tensor, Tensor, Tensor, Tensor)>, usize)> {
-    let (h, hd) = (a.n_heads(), a.head_dim());
-    let din = x.elem_count();
-    let x = x.reshape((1, 1, din))?.to_dtype(DType::F32)?;
-
-    let qr = rms_norm(&a.wq_a().forward(&x)?, a.q_norm(), a.eps())?;
-    let q = a.wq_b().forward(&qr)?.reshape((1, 1, h, hd))?;
-    let q = rms_scale(&q, a.eps())?;
-    let q_bf = q.reshape((1, h, hd))?.to_dtype(DType::BF16)?;
-    let kv = rms_norm(&a.wkv().forward(&x)?, a.kv_norm(), a.eps())?;
-    let kv_bf = kv.reshape((1, hd))?.to_dtype(DType::BF16)?;
-
-    // Corpus maintenance — identical to the decode step.
-    if let (Some(comp), Some(gallery)) = (seq.comp.as_mut(), seq.gallery.as_mut()) {
-        if let Some((entry, gpos)) = comp.push_raw(&x)? {
-            let key = match seq.icomp.as_mut() {
-                Some(ic) => ic
-                    .push(&x, rope)?
+) -> Result<DecodeSel> {
+    // Corpus maintenance — identical to the decode step, but fed the compressor
+    // rows already projected in a batched GEMM by the caller (bit-identical to
+    // `push_raw`/`push`, which differ only by the per-row projection).
+    let t_push = profile_now();
+    if let (Some(comp), Some(gallery), Some((ck, cs))) =
+        (seq.comp.as_mut(), seq.gallery.as_mut(), comp_row)
+    {
+        if let Some((entry, gpos)) = comp.push_projected(ck, cs)? {
+            let key = match (seq.icomp.as_mut(), icomp_row) {
+                (Some(ic), Some((ik, is))) => ic
+                    .push_projected_roped(ik, is, rope)?
                     .expect("indexer compressor shares group boundaries")
                     .reshape((1, ()))?,
-                None => Tensor::zeros((1, 1), DType::F32, x.device())?,
+                _ => Tensor::zeros((1, 1), DType::F32, x.device())?,
             };
-            gallery.append_batch(&entry.reshape((1, hd))?, &key, &[gpos])?;
-        } else if let Some(ic) = seq.icomp.as_mut() {
-            let none = ic.push(&x, rope)?;
+            gallery.append_batch(&entry.reshape((1, a.head_dim()))?, &key, &[gpos])?;
+        } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_row) {
+            let none = ic.push_projected_roped(ik, is, rope)?;
             debug_assert!(none.is_none(), "compressor group boundaries diverged");
         }
     }
+    pipeline_record("dprep:push", t_push);
 
-    // Selection → on-device gather (compacted block); no host readback.
+    // Capture the selection intent (no gallery read here — the select is
+    // batched). The CSA query/weights were projected in a batched GEMM by the
+    // caller (`Indexer::query_gemm_batched` + per-session `rope_query`); this
+    // just tags the intent with the gallery's live size.
     let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
-    if n_entries == 0 {
-        return Ok((q_bf, kv_bf, None, 0));
-    }
-    let gallery = seq.gallery.as_ref().unwrap();
-    let (gids, k) = match a.kind() {
-        LayerKind::Csa => {
-            let ix = a.indexer().expect("CSA layer has an indexer");
-            let (qi, w) = ix.query_space(&x, &qr, rope, pos)?;
-            gallery.two_stage_select(&qi, &w, shortlist_m(ix.top_k()), ix.top_k())?
+    let sel = if n_entries == 0 {
+        DecodeSel::None
+    } else {
+        match a.kind() {
+            LayerKind::Csa => DecodeSel::TwoStage {
+                q_idx: q_idx.expect("CSA layer supplies a batched query"),
+                weights: weights.expect("CSA layer supplies batched gate weights"),
+            },
+            LayerKind::Hca => DecodeSel::AllEntries(n_entries),
+            LayerKind::SlidingWindow => DecodeSel::None,
         }
-        LayerKind::Hca => (
-            Tensor::arange(0u32, n_entries as u32, x.device())?,
-            n_entries,
-        ),
-        LayerKind::SlidingWindow => return Ok((q_bf, kv_bf, None, 0)),
     };
-    if k == 0 {
-        return Ok((q_bf, kv_bf, None, 0));
-    }
-    // The HOT two-region cache for the selection (gallery pre-built on append);
-    // the wave concatenates these across sessions into one launch.
-    let (ni8, nsc, rbf, cpos) = gallery.gather_corpus(&gids)?;
-    Ok((q_bf, kv_bf, Some((ni8, nsc, rbf, cpos)), k))
+    Ok(sel)
 }

@@ -736,9 +736,12 @@ impl ChunkedKvBacking {
                 // sees v_ptr == k_ptr.
                 let nope_bands = crate::kv_cache::arena_table::LATENT_NOPE_BANDS.min(np);
                 let rope_bands = np - nope_bands;
-                let nope_run = self.inner.alloc_chunk_run_for_key(k_key.clone(), nope_bands)?;
+                let nope_run = self
+                    .inner
+                    .alloc_chunk_run_for_key(k_key.clone(), nope_bands)?;
                 let rope_run = if rope_bands > 0 {
-                    self.inner.alloc_chunk_run_for_key(rope_key.clone(), rope_bands)?
+                    self.inner
+                        .alloc_chunk_run_for_key(rope_key.clone(), rope_bands)?
                 } else {
                     Vec::new()
                 };

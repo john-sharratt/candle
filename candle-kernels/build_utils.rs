@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 // (`src/simple/quantized_dispatcher.cu` — the seal-time quantize/select
 // kernels — compiles in its own group under the bit-exact mirror contract
 // flags; see the `quantize_dispatch` group below.)
-const SIMPLE_KERNELS: [&str; 43] = [
+const SIMPLE_KERNELS: [&str; 45] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
+    "src/simple/corpus_gather.cu",
     // Kernel implementations
     "src/simple/add_at_indices.cu",
     "src/simple/arena_compact.cu",
@@ -34,6 +35,7 @@ const SIMPLE_KERNELS: [&str; 43] = [
     "src/simple/fletcher32.cu",
     "src/simple/moe_bucketize.cu",
     "src/simple/sinkhorn.cu",
+    "src/simple/hyper_mhc.cu",
     "src/simple/bdp.cu",
     "src/simple/moe_scatter.cu",
     "src/simple/affine.cu",

@@ -792,7 +792,7 @@ impl BatchedInferenceSession {
         seq_indices: &[usize],
         generation: &Generation,
     ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
-        self.build_decode_metadata_at(seq_indices, generation, &[], &[], false)
+        self.build_decode_metadata_at(seq_indices, generation, &[], &[], &[])
     }
 
     /// [`Self::build_decode_metadata`] with explicit per-sequence offset
@@ -809,18 +809,32 @@ impl BatchedInferenceSession {
     /// permanently inflates the slot's block count — the turn-seal range
     /// `[turn_start_parent_blocks, block_count)` then misses the turn's real
     /// blocks and the turn silently never persists.
+    ///
+    /// `snapshot_seqs` names the sequences whose slot state must be captured as
+    /// an IMMUTABLE snapshot copy into `generation` (their `slices_ptr` survives
+    /// a later chunk-boundary reallocation) — i.e. any sequence that mutates the
+    /// arena during this forward: a prefill absorbing across chunk boundaries, a
+    /// glue gap-scatter. Every OTHER sequence (a plain decode row, whose write
+    /// chunk is pre-ensured so it never reallocs) keeps the zero-copy LIVE
+    /// pointer + on-device write-len commit — the cheap decode path. Passing
+    /// `&[]` makes every row live.
     pub fn build_decode_metadata_at(
         &self,
         seq_indices: &[usize],
         generation: &Generation,
         offset_overrides: &[(usize, usize)],
         non_writer: &[usize],
-        snapshot_slices: bool,
+        snapshot_seqs: &[usize],
     ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
         let n_active = seq_indices.len();
         if n_active == 0 {
             return Ok((None, None, 0));
         }
+        // Per-row snapshot decision (layer-invariant), aligned with `seq_indices`.
+        let snapshot_mask: Vec<bool> = seq_indices
+            .iter()
+            .map(|s| snapshot_seqs.contains(s))
+            .collect();
 
         // 24-byte SlotHeader: n_slices, write_slice, slices_ptr, position_map_ptr.
         let header_stride = n_active * 24;
@@ -942,15 +956,15 @@ impl BatchedInferenceSession {
             // that survives later chunk-boundary reallocations of the live
             // buffer. Live decode (one metadata build per step, used immediately)
             // keeps the zero-copy live pointer + on-device write-len commit.
-            let (seq_ptrs, sync_stats) = if snapshot_slices {
-                self.backings[layer_idx].sync_decode_gpu_chunks_snapshot(
-                    &seq_offsets,
-                    &arena_info,
-                    generation,
-                )?
-            } else {
-                self.backings[layer_idx].sync_decode_gpu_chunks(&seq_offsets, &arena_info)?
-            };
+            // Per-row live-or-snapshot: only the rows in `snapshot_seqs` pay the
+            // immutable copy; decode rows keep the live pointer (mask all-false ⇒
+            // the whole wave is the cheap live path).
+            let (seq_ptrs, sync_stats) = self.backings[layer_idx].sync_decode_gpu_chunks_snapshot(
+                &seq_offsets,
+                &arena_info,
+                generation,
+                &snapshot_mask,
+            )?;
             slot_reuse_time += sync_stats.reuse_time;
             slot_rebuild_time += sync_stats.rebuild_time;
             saw_slot_reuse |= sync_stats.reuses > 0;

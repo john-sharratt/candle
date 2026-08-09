@@ -448,7 +448,11 @@ impl MetaPool {
     /// `set_single_latent`, which runs before its first chunk allocation.
     pub fn set_record_bytes(&self, record_bytes: usize) {
         debug_assert!(
-            self.slabs.lock().expect("meta pool lock poisoned").refs.is_empty(),
+            self.slabs
+                .lock()
+                .expect("meta pool lock poisoned")
+                .refs
+                .is_empty(),
             "set_record_bytes must run before any record is allocated"
         );
         self.record_bytes

@@ -185,7 +185,10 @@ impl BackingInner {
     /// allocation, arena sub-band sizing, and record serialization goes through
     /// this so the single-latent path can carry 8 bands while GQA stays at 4.
     pub(crate) fn n_palette(&self) -> usize {
-        if self.single_latent.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .single_latent
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             crate::kv_cache::arena_table::LATENT_N_BANDS
         } else {
             crate::kv_cache::arena_table::N_PALETTE
@@ -1417,6 +1420,7 @@ impl ChunkedKvBacking {
         batch_entries: &[(usize, usize)],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
         generation: &candle::quantized::pinned_staging::Generation,
+        snapshot_mask: &[bool],
     ) -> candle::Result<(Vec<(u64, u32, u32)>, DecodeGpuChunkSyncStats)> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
@@ -1428,14 +1432,25 @@ impl ChunkedKvBacking {
 
         let mut results = Vec::with_capacity(batch_entries.len());
         let mut stats = DecodeGpuChunkSyncStats::default();
-        for &(seq_idx, seq_offset) in batch_entries {
+        for (i, &(seq_idx, seq_offset)) in batch_entries.iter().enumerate() {
             let t_sync = std::time::Instant::now();
+            // Per-entry: a sequence that mutates the arena during this forward
+            // (a prefill absorbing across chunk boundaries, a glue gap-scatter)
+            // needs an IMMUTABLE snapshot copy so its `slices_ptr` survives the
+            // reallocation; a plain decode row never reallocs (its write chunk is
+            // pre-ensured), so it keeps the zero-copy LIVE pointer + on-device
+            // write-len commit — the cheap Qwen/Llama decode path.
+            let want_snapshot = snapshot_mask.get(i).copied().unwrap_or(true);
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
-                let ((_live_ptr, n_slices, write_slice), kind) =
+                let ((live_ptr, n_slices, write_slice), kind) =
                     seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
-                let snap_ptr = seq.snapshot_gpu_chunks_into(generation, seq_offset)?;
-                ((snap_ptr, n_slices, write_slice), kind)
+                let ptr = if want_snapshot {
+                    seq.snapshot_gpu_chunks_into(generation, seq_offset)?
+                } else {
+                    live_ptr
+                };
+                ((ptr, n_slices, write_slice), kind)
             } else {
                 ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
             };

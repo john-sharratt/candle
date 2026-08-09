@@ -445,7 +445,13 @@ pub fn paged_latent_decode_raw(
             stream.cu_stream() as *mut core::ffi::c_void,
         );
     }
-    q.device().synchronize()?;
+    // No device sync here: the kernel and every downstream consumer of `out`
+    // (output projection, mHC, the eventual logits readback) run on the same
+    // stream, so stream ordering already guarantees `out` is complete before it
+    // is read. A per-call `synchronize()` drained the GPU and blocked the host
+    // 43× per decode token (once per layer) — the dominant decode cost — for no
+    // correctness benefit. The workspace (`ws.acc`/`ws.ml`) is likewise reused
+    // stream-ordered across layers, so it needs no barrier either.
     Ok(out)
 }
 
@@ -666,7 +672,8 @@ pub fn paged_latent_prefill_raw(
         }
         base += len;
     }
-    q.device().synchronize()?;
+    // No device sync (see `paged_latent_decode_raw`): stream ordering makes `out`
+    // valid for the same-stream consumers without draining the GPU per call.
     Ok(out)
 }
 
@@ -1849,6 +1856,7 @@ impl SyntheticSlots {
 /// to that asm, so the replica is bit-exact. (The archive also compiles with
 /// `-fmad=false`, so *implicit* contraction never appears anywhere else in the
 /// kernel — plain mul/add mirrors plain mul/add.)
+#[allow(dead_code)] // CPU mirror-oracle for the decode-kernel tests
 pub fn ds_exp_mirror(x: f32) -> f32 {
     let log2_e = f32::from_bits(0x3FB8_AA3B);
     let c3 = f32::from_bits(0x3D9D_9653);
@@ -1871,6 +1879,7 @@ pub fn ds_exp_mirror(x: f32) -> f32 {
 /// kernels run under `--use_fast_math`, so the division is written as the
 /// explicit round-to-nearest intrinsic — zero→1, then the requant divides
 /// by `s` via `__frcp_rn(s)` = `1.0/s`, round-nearest-even, clamp ±127).
+#[allow(dead_code)] // reference two-region quantizer for the mirror tests
 pub fn quant_bands(v: &[f32; HEAD_DIM]) -> ([i8; HEAD_DIM], [f32; N_BANDS]) {
     let mut q = [0i8; HEAD_DIM];
     let mut scales = [1.0f32; N_BANDS];
@@ -1901,9 +1910,14 @@ pub fn quant_bands(v: &[f32; HEAD_DIM]) -> ([i8; HEAD_DIM], [f32; N_BANDS]) {
 /// sides, and the nope int8 is the same `mx/127`, RNE, clamp path as
 /// [`quant_bands`]'s nope arm.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // reference two-region cache builder for the mirror tests
 pub fn build_corpus_cache(
     v: &[f32; HEAD_DIM],
-) -> ([i8; NOPE_DIM], [f32; NOPE_DIM / SUB_DIM], [half::bf16; ROPE_DIM]) {
+) -> (
+    [i8; NOPE_DIM],
+    [f32; NOPE_DIM / SUB_DIM],
+    [half::bf16; ROPE_DIM],
+) {
     const NOPE_BANDS: usize = NOPE_DIM / SUB_DIM;
     let mut nope = [0i8; NOPE_DIM];
     let mut scale = [1.0f32; NOPE_BANDS];
@@ -1930,6 +1944,7 @@ pub fn build_corpus_cache(
 
 /// One key's contribution to the logit: Σ_band (int32 dot) · sQ · sK, summed
 /// in ascending band order — the kernel's per-band float accumulation chain.
+#[allow(dead_code)] // CPU logit mirror-oracle for the decode-kernel tests
 pub fn mirror_logit(
     q_i8: &[i8; HEAD_DIM],
     q_s: &[f32; N_BANDS],
@@ -2232,7 +2247,9 @@ mod tests {
             .collect();
         let mut s = 0x1234_5678u64;
         let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
         let l0: [f32; HEAD_DIM] = std::array::from_fn(|_| next());
@@ -2302,7 +2319,9 @@ mod tests {
         let g = 48usize;
         let mut s = 0x51ED_2701u64;
         let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
         let mut entries: Vec<[f32; HEAD_DIM]> =
@@ -3414,7 +3433,11 @@ mod tests {
                 got_k[i]
             );
             // K≡V: the V read aliases the K bytes.
-            assert_eq!(got_v[i].to_bits(), expect.to_bits(), "V[{i}] alias (dim {d})");
+            assert_eq!(
+                got_v[i].to_bits(),
+                expect.to_bits(),
+                "V[{i}] alias (dim {d})"
+            );
         }
         Ok(())
     }
@@ -3526,6 +3549,162 @@ mod tests {
             synth.len(),
             max_abs_diff(&synth, &arena_out)
         );
+        Ok(())
+    }
+
+    /// Correctness gate for the decode-metadata optimization: a PURE-DECODE
+    /// wave may serialize its slot state through the cheap LIVE persistent buffer
+    /// (`build_decode_metadata_at` `snapshot_slices=false` + on-device
+    /// `commit_write_len=true`) — the path Qwen/Llama already use — instead of
+    /// the per-step host SNAPSHOT copy (`snapshot_slices=true` + host-patched
+    /// write-len). This runs two independent sessions through IDENTICAL decode
+    /// steps, one on each path, and asserts their per-step outputs are
+    /// BIT-IDENTICAL across ≥3 chunk boundaries (positions 32/64/96). The live
+    /// buffer's on-device write-len self-increment must track the snapshot's
+    /// offset-derived write-len exactly, step after step, or the window walk
+    /// diverges after a boundary.
+    #[test]
+    #[ignore]
+    fn decode_live_buffer_matches_snapshot_multistep() -> Result<()> {
+        use crate::models::batched_inference::{BatchedConfig, BatchedInferenceSession};
+        use candle_nn::kv_cache::{ChunkedKvBacking, KvCache, KvFormat};
+
+        let dev = Device::new_cuda(0)?;
+        let n_win = 30usize; // window starts inside chunk 0
+        let steps = 72usize; // new tokens land at 30..101 → crosses 32, 64, 96
+        let window_size = 128usize;
+        let softmax_scale = (HEAD_DIM as f64).powf(-0.5) as f32;
+        let mut s = 7u64;
+
+        // Deterministic tokens (FP8-exact, the window store format) + queries.
+        let toks: Vec<[f32; HEAD_DIM]> = (0..n_win + steps)
+            .map(|_| std::array::from_fn(|_| fp8_exact(&mut s)))
+            .collect();
+        let qs: Vec<[f32; HEAD_DIM]> = (0..steps * H)
+            .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
+            .collect();
+        let sinks = Tensor::from_vec((0..H).map(|_| bf16_exact(&mut s) * 0.5).collect(), H, &dev)?;
+        let freqs_v: Vec<f32> =
+            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+                .into_iter()
+                .map(|f| f as f32)
+                .collect();
+        let rope_tab = build_rope_table(&Tensor::from_vec(freqs_v, ROPE_DIM / 2, &dev)?)?;
+        let ws = LatentWorkspace::build(&dev)?;
+
+        // Two independent sessions, each with the initial `n_win` window written.
+        let mk = || -> Result<(BatchedInferenceSession, usize)> {
+            let backing = ChunkedKvBacking::new_with_format_adaptive(
+                1,
+                1,
+                HEAD_DIM,
+                KvFormat::Float(DType::F8E4M3),
+                KvFormat::Float(DType::F8E4M3),
+                &dev,
+                256,
+                None,
+            )?;
+            backing.set_single_latent(true);
+            let cfg = BatchedConfig {
+                k_format: KvFormat::Float(DType::F8E4M3),
+                v_format: KvFormat::Float(DType::F8E4M3),
+                initial_seq_len: 256,
+                ..Default::default()
+            };
+            let mut session =
+                BatchedInferenceSession::new_with_backings(vec![backing.clone()], cfg, &dev);
+            let seq = session.create_sequence()?;
+            let flat: Vec<f32> = toks[..n_win]
+                .iter()
+                .flat_map(|w| w.iter().copied())
+                .collect();
+            let latent = Tensor::from_vec(flat, (1, 1, n_win, HEAD_DIM), &dev)?;
+            let mut cache = KvCache::new(2, 256);
+            cache.set_chunked_backing(&backing, seq, None)?;
+            cache.chunked_write_kv(0, &latent, &latent)?;
+            cache.set_current_seq_len(n_win)?;
+            session.set_sequence_offset(seq, n_win)?;
+            Ok((session, seq))
+        };
+        let (mut sess_live, seq_l) = mk()?;
+        let (mut sess_snap, seq_s) = mk()?;
+
+        // Window-only decode (empty corpus) isolates the slot-buffer path.
+        let comp = Tensor::zeros((1, HEAD_DIM), DType::F32, &dev)?;
+        let comp_pos = Tensor::zeros(1, DType::U32, &dev)?;
+        let comp_idx = Tensor::full(u32::MAX, (1, 1), &dev)?;
+        let comp_cnt = Tensor::zeros(1, DType::U32, &dev)?;
+
+        // One decode step on a session at `pos`, over the given snapshot/commit
+        // mode; returns the flattened output bits.
+        let step = |session: &mut BatchedInferenceSession,
+                    seq: usize,
+                    pos: usize,
+                    t: usize,
+                    snapshot: bool|
+         -> Result<Vec<f32>> {
+            session.set_sequence_offset(seq, pos)?;
+            // Commit the host chunk usage to the pre-write prefix (the wave's
+            // per-step `set_len`), so the metadata's write chunk/len is derived
+            // from a consistent slot state (no eviction here → resident == pos).
+            for backing in session.backings() {
+                backing.set_len(seq, pos);
+            }
+            let kv_new =
+                Tensor::from_vec(toks[pos].to_vec(), (1, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+            let qf: Vec<f32> = qs[t * H..(t + 1) * H]
+                .iter()
+                .flat_map(|h| h.iter().copied())
+                .collect();
+            let q = Tensor::from_vec(qf, (1, H, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
+            let q_pos = Tensor::from_vec(vec![pos as u32], 1, &dev)?;
+            let generation = session.begin_stager_generation();
+            let snap_seqs: &[usize] = if snapshot {
+                std::slice::from_ref(&seq)
+            } else {
+                &[]
+            };
+            let (_pm, headers, _stride) =
+                session.build_decode_metadata_at(&[seq], &generation, &[], &[], snap_seqs)?;
+            let headers = headers.expect("decode metadata headers");
+            let out = paged_latent_decode_raw(
+                &q,
+                headers.dev_ptr(),
+                &kv_new,
+                &CorpusCache::build(&comp, &comp_pos)?,
+                &comp_idx,
+                &comp_cnt,
+                &q_pos,
+                &sinks,
+                &rope_tab,
+                softmax_scale,
+                window_size,
+                1,
+                !snapshot, // live buffer commits on-device; snapshot patches host-side
+                &ws,
+                None,
+            )?;
+            drop(generation);
+            out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+        };
+
+        for t in 0..steps {
+            let pos = n_win + t;
+            let live = step(&mut sess_live, seq_l, pos, t, false)?;
+            let snap = step(&mut sess_snap, seq_s, pos, t, true)?;
+            let mism = live
+                .iter()
+                .zip(&snap)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                mism,
+                0,
+                "step {t} (pos {pos}): {mism}/{} bit mismatches live-vs-snapshot (max |Δ| {})",
+                live.len(),
+                max_abs_diff(&live, &snap)
+            );
+        }
         Ok(())
     }
 
@@ -3941,8 +4120,26 @@ mod tests {
         let q4 = |outer| BandSpec { fmt: 15, outer };
         let t8 = |a: [BandSpec; 8]| -> [BandSpec; N_BANDS] { std::array::from_fn(|i| a[i % 8]) };
         let fmts = vec![
-            t8([q8(1.5), q4(1.0), BandSpec::default(), q8(1.0), q8(1.5), q4(1.0), BandSpec::default(), q8(1.0)]),
-            t8([q4(2.0), q8(1.0), q8(0.5), q4(1.0), q4(2.0), q8(1.0), q8(0.5), q4(1.0)]),
+            t8([
+                q8(1.5),
+                q4(1.0),
+                BandSpec::default(),
+                q8(1.0),
+                q8(1.5),
+                q4(1.0),
+                BandSpec::default(),
+                q8(1.0),
+            ]),
+            t8([
+                q4(2.0),
+                q8(1.0),
+                q8(0.5),
+                q4(1.0),
+                q4(2.0),
+                q8(1.0),
+                q8(0.5),
+                q4(1.0),
+            ]),
             [BandSpec::default(); N_BANDS],
         ];
         let softmax_scale = (HEAD_DIM as f64).powf(-0.5) as f32;
@@ -4057,13 +4254,76 @@ mod tests {
         // Tile an 8-format pattern across the 16 bands (bands 8-15 repeat 0-7).
         let t8 = |a: [BandSpec; 8]| -> [BandSpec; N_BANDS] { std::array::from_fn(|i| a[i % 8]) };
         let fmts = vec![
-            t8([b(8, 1.0), b(18, 1.0), b(19, 1.0), b(20, 1.0), b(8, 1.0), b(18, 1.0), b(19, 1.0), b(20, 1.0)]),
-            t8([b(25, 0.25), b(26, 0.25), b(27, 0.25), b(29, 0.25), b(25, 0.25), b(26, 0.25), b(27, 0.25), b(29, 0.25)]),
-            t8([b(28, 0.25), b(30, 0.25), b(31, 0.25), b(32, 0.25), b(28, 0.25), b(30, 0.25), b(31, 0.25), b(32, 0.25)]),
-            t8([b(33, 0.25), b(25, 0.5), b(27, 0.5), b(32, 0.5), b(28, 0.3), b(26, 0.3), b(30, 0.5), b(31, 0.5)]),
-            t8([b(10, 1.5), b(16, 1.0), b(15, 2.0), b(7, 0.5), b(19, 0.5), b(20, 1.5), b(18, 2.0), b(8, 1.5)]),
-            t8([b(19, 0.5), b(20, 1.5), b(18, 2.0), b(8, 1.5), b(10, 1.5), b(16, 1.0), b(15, 2.0), b(7, 0.5)]),
-            t8([b(28, 0.3), b(26, 0.3), b(30, 0.5), b(31, 0.5), b(33, 0.25), b(25, 0.5), b(27, 0.5), b(32, 0.5)]),
+            t8([
+                b(8, 1.0),
+                b(18, 1.0),
+                b(19, 1.0),
+                b(20, 1.0),
+                b(8, 1.0),
+                b(18, 1.0),
+                b(19, 1.0),
+                b(20, 1.0),
+            ]),
+            t8([
+                b(25, 0.25),
+                b(26, 0.25),
+                b(27, 0.25),
+                b(29, 0.25),
+                b(25, 0.25),
+                b(26, 0.25),
+                b(27, 0.25),
+                b(29, 0.25),
+            ]),
+            t8([
+                b(28, 0.25),
+                b(30, 0.25),
+                b(31, 0.25),
+                b(32, 0.25),
+                b(28, 0.25),
+                b(30, 0.25),
+                b(31, 0.25),
+                b(32, 0.25),
+            ]),
+            t8([
+                b(33, 0.25),
+                b(25, 0.5),
+                b(27, 0.5),
+                b(32, 0.5),
+                b(28, 0.3),
+                b(26, 0.3),
+                b(30, 0.5),
+                b(31, 0.5),
+            ]),
+            t8([
+                b(10, 1.5),
+                b(16, 1.0),
+                b(15, 2.0),
+                b(7, 0.5),
+                b(19, 0.5),
+                b(20, 1.5),
+                b(18, 2.0),
+                b(8, 1.5),
+            ]),
+            t8([
+                b(19, 0.5),
+                b(20, 1.5),
+                b(18, 2.0),
+                b(8, 1.5),
+                b(10, 1.5),
+                b(16, 1.0),
+                b(15, 2.0),
+                b(7, 0.5),
+            ]),
+            t8([
+                b(28, 0.3),
+                b(26, 0.3),
+                b(30, 0.5),
+                b(31, 0.5),
+                b(33, 0.25),
+                b(25, 0.5),
+                b(27, 0.5),
+                b(32, 0.5),
+            ]),
             [BandSpec::default(); N_BANDS],
         ];
         let inp = gen_inputs(&case, 0xBEEF);
@@ -4376,8 +4636,26 @@ mod tests {
         let q4 = |outer| BandSpec { fmt: 15, outer };
         let t8 = |a: [BandSpec; 8]| -> [BandSpec; N_BANDS] { std::array::from_fn(|i| a[i % 8]) };
         let sealed = [
-            t8([q8(1.5), q4(1.0), BandSpec::default(), q8(1.0), q8(1.5), q4(1.0), BandSpec::default(), q8(1.0)]),
-            t8([q4(2.0), q8(1.0), q8(0.5), q4(1.0), q4(2.0), q8(1.0), q8(0.5), q4(1.0)]),
+            t8([
+                q8(1.5),
+                q4(1.0),
+                BandSpec::default(),
+                q8(1.0),
+                q8(1.5),
+                q4(1.0),
+                BandSpec::default(),
+                q8(1.0),
+            ]),
+            t8([
+                q4(2.0),
+                q8(1.0),
+                q8(0.5),
+                q4(1.0),
+                q4(2.0),
+                q8(1.0),
+                q8(0.5),
+                q4(1.0),
+            ]),
         ];
         let specs = vec![sealed[0], sealed[1], [BandSpec::default(); N_BANDS]];
 

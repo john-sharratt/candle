@@ -56,10 +56,26 @@ impl HyperConnection {
 
     /// `hc_pre`: reduce `[b, s, hc, d]` to a block input `[b, s, d]` and return the
     /// `post`/`comb` mixing tensors needed by [`Self::post`].
+    ///
+    /// On CUDA the rms-rsqrt, the sigmoid gate split, and the weighted residual
+    /// reduction fuse into two launches (+ the `fn_w` matmul + the sinkhorn
+    /// launch) — `hc_pre_gates`/`hc_pre_reduce`, bit-exact to the eager path
+    /// below which is the CPU reference. This kills ~25 tiny per-call launches
+    /// that pure launch-overhead dominated at decode.
     pub fn pre(&self, x: &Tensor, p: &HyperParams) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, hc, d) = x.dims4()?;
         let x = x.to_dtype(candle::DType::F32)?;
         let xf = x.reshape((b, s, hc * d))?;
+
+        #[cfg(feature = "cuda")]
+        if matches!(x.device(), candle::Device::Cuda(_)) {
+            let mixes_raw = p.fn_w.forward(&xf)?; // [b,s,mix_hc] (rsqrt folded in the kernel)
+            let (pre, post, comb_raw) = cuda_fused::pre_gates(&xf, &mixes_raw, p, hc, d, self.eps)?;
+            let comb = self.sinkhorn(&comb_raw)?;
+            let y = cuda_fused::pre_reduce(&x, &pre, hc, d)?;
+            return Ok((y, post, comb));
+        }
+
         let rsqrt = self.rms_rsqrt(&xf)?; // [b,s,1]
         let mixes = p.fn_w.forward(&xf)?.broadcast_mul(&rsqrt)?; // [b,s,mix_hc]
 
@@ -80,6 +96,14 @@ impl HyperConnection {
     ) -> Result<Tensor> {
         let block_out = block_out.to_dtype(candle::DType::F32)?;
         let residual = residual.to_dtype(candle::DType::F32)?;
+
+        #[cfg(feature = "cuda")]
+        if matches!(block_out.device(), candle::Device::Cuda(_)) {
+            // Fused: `new[j,k] = post[j]·out[k] + Σ_i comb[i,j]·res[i,k]` in one
+            // launch (was ~10 eager broadcast/sum ops). Bit-exact to the path below.
+            return cuda_fused::post(&block_out, &residual, post, comb);
+        }
+
         // post term: post[...,hc,1] * out[...,1,d] -> [b,s,hc,d]
         let post_term = post
             .unsqueeze(D::Minus1)?
@@ -305,6 +329,155 @@ impl candle::CustomOp1 for SinkhornOp {
     }
 }
 
+/// Raw-FFI launchers for the fused mHC kernels (`simple/hyper_mhc.cu`). One
+/// launch each replaces the tiny eager op chains in `pre`/`post`; the eager
+/// paths in [`HyperConnection`] remain the CPU reference and the bit-exact
+/// oracle for `fused_pre_post_matches_eager`.
+#[cfg(feature = "cuda")]
+mod cuda_fused {
+    use super::HyperParams;
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::{DType, Device, Result, Storage, Tensor};
+    use candle_kernels::simple::hyper_mhc::{run_mhc_post, run_mhc_pre_gates, run_mhc_pre_reduce};
+
+    /// Device pointer of a contiguous f32 CUDA tensor (extracted inline so the
+    /// storage-guard and pointer-guard both live to the launch — matching the
+    /// `gallery::sign_pack` pattern). `$p` binds the `u64` device address.
+    macro_rules! cuda_f32_ptr {
+        ($t:expr, $stream:expr, $s:ident, $p:ident, $g:ident) => {
+            let ($s, _) = $t.storage_and_layout();
+            let ($p, $g) = match &*$s {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr($stream),
+                _ => candle::bail!("mhc fused kernels require CUDA f32 storage"),
+            };
+        };
+    }
+
+    /// `hc_pre` stage 1 (rms-rsqrt · gate split): `(pre, post, comb_raw)`.
+    pub(super) fn pre_gates(
+        xf: &Tensor,
+        mixes_raw: &Tensor,
+        p: &HyperParams,
+        hc: usize,
+        d: usize,
+        eps: f64,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, s, _) = xf.dims3()?;
+        let n = (b * s) as i32;
+        let dev = match xf.device() {
+            Device::Cuda(dd) => dd.clone(),
+            _ => candle::bail!("mhc pre_gates requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        let xf = xf.contiguous()?;
+        let mixes_raw = mixes_raw.contiguous()?;
+        let base = p.base.to_dtype(DType::F32)?.contiguous()?;
+        let scale = p.scale.to_dtype(DType::F32)?.contiguous()?;
+        let pre = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
+        let post = Tensor::zeros((b, s, hc), DType::F32, xf.device())?;
+        let comb_raw = Tensor::zeros((b, s, hc, hc), DType::F32, xf.device())?;
+        {
+            cuda_f32_ptr!(xf, &stream, s_xf, p_xf, _g0);
+            cuda_f32_ptr!(mixes_raw, &stream, s_mx, p_mx, _g1);
+            cuda_f32_ptr!(base, &stream, s_ba, p_ba, _g2);
+            cuda_f32_ptr!(scale, &stream, s_sc, p_sc, _g3);
+            cuda_f32_ptr!(pre, &stream, s_pr, p_pr, _g4);
+            cuda_f32_ptr!(post, &stream, s_po, p_po, _g5);
+            cuda_f32_ptr!(comb_raw, &stream, s_cr, p_cr, _g6);
+            unsafe {
+                run_mhc_pre_gates(
+                    p_xf as *const f32,
+                    p_mx as *const f32,
+                    p_ba as *const f32,
+                    p_sc as *const f32,
+                    p_pr as *mut f32,
+                    p_po as *mut f32,
+                    p_cr as *mut f32,
+                    n,
+                    hc as i32,
+                    d as i32,
+                    eps as f32,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                );
+            }
+        }
+        Ok((pre, post, comb_raw))
+    }
+
+    /// `hc_pre` stage 2 (weighted residual reduction): `y [b,s,d]`.
+    pub(super) fn pre_reduce(x: &Tensor, pre: &Tensor, hc: usize, d: usize) -> Result<Tensor> {
+        let (b, s, _, _) = x.dims4()?;
+        let n = (b * s) as i32;
+        let dev = match x.device() {
+            Device::Cuda(dd) => dd.clone(),
+            _ => candle::bail!("mhc pre_reduce requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        let x = x.contiguous()?;
+        let pre = pre.contiguous()?;
+        let y = Tensor::zeros((b, s, d), DType::F32, x.device())?;
+        {
+            cuda_f32_ptr!(x, &stream, s_x, p_x, _g0);
+            cuda_f32_ptr!(pre, &stream, s_p, p_p, _g1);
+            cuda_f32_ptr!(y, &stream, s_y, p_y, _g2);
+            unsafe {
+                run_mhc_pre_reduce(
+                    p_x as *const f32,
+                    p_p as *const f32,
+                    p_y as *mut f32,
+                    n,
+                    hc as i32,
+                    d as i32,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                );
+            }
+        }
+        Ok(y)
+    }
+
+    /// `hc_post` recombination: `new [b,s,hc,d]`.
+    pub(super) fn post(
+        block_out: &Tensor,
+        residual: &Tensor,
+        post: &Tensor,
+        comb: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, s, hc, d) = residual.dims4()?;
+        let n = (b * s) as i32;
+        let dev = match residual.device() {
+            Device::Cuda(dd) => dd.clone(),
+            _ => candle::bail!("mhc post requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        let block_out = block_out.contiguous()?;
+        let residual = residual.contiguous()?;
+        let post = post.contiguous()?;
+        let comb = comb.contiguous()?;
+        let out = Tensor::zeros((b, s, hc, d), DType::F32, residual.device())?;
+        {
+            cuda_f32_ptr!(block_out, &stream, s_bo, p_bo, _g0);
+            cuda_f32_ptr!(residual, &stream, s_re, p_re, _g1);
+            cuda_f32_ptr!(post, &stream, s_po, p_po, _g2);
+            cuda_f32_ptr!(comb, &stream, s_cb, p_cb, _g3);
+            cuda_f32_ptr!(out, &stream, s_ou, p_ou, _g4);
+            unsafe {
+                run_mhc_post(
+                    p_bo as *const f32,
+                    p_re as *const f32,
+                    p_po as *const f32,
+                    p_cb as *const f32,
+                    p_ou as *mut f32,
+                    n,
+                    hc as i32,
+                    d as i32,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +563,56 @@ mod tests {
         let c0 = expanded.i((.., .., 0, ..))?;
         let diff = (c0 - &x)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-6);
+        Ok(())
+    }
+
+    /// The fused CUDA `hc_pre`/`hc_post` kernels reproduce the eager (CPU)
+    /// reference within reduction-order tolerance — the correctness oracle for
+    /// the launch-collapsing fusion in `cuda_fused`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fused_pre_post_matches_eager() -> Result<()> {
+        let cpu = Device::Cpu;
+        let cuda = Device::new_cuda(0)?;
+        let (hc, d, b, s) = (4usize, 48usize, 1usize, 3usize);
+        let mix_hc = (2 + hc) * hc;
+        let hcx = HyperConnection::new(hc, 20, 1e-6);
+
+        // Deterministic pseudo-random fixtures (host, then mirrored to device).
+        let fn_w = Tensor::randn(0f32, 1.0, (mix_hc, hc * d), &cpu)?;
+        let base = Tensor::randn(0f32, 0.5, mix_hc, &cpu)?;
+        let scale = Tensor::from_vec(vec![0.7f32, 1.1, 0.9], 3, &cpu)?;
+        let x = Tensor::randn(0f32, 1.0, (b, s, hc, d), &cpu)?;
+        let block_out = Tensor::randn(0f32, 1.0, (b, s, d), &cpu)?;
+
+        let p_cpu = HyperParams {
+            fn_w: fn_w.clone().into(),
+            base: base.clone(),
+            scale: scale.clone(),
+        };
+        let p_cuda = HyperParams {
+            fn_w: fn_w.to_device(&cuda)?.into(),
+            base: base.to_device(&cuda)?,
+            scale: scale.to_device(&cuda)?,
+        };
+        let x_cuda = x.to_device(&cuda)?;
+
+        // pre: eager (CPU) vs fused (CUDA).
+        let (y_r, post_r, comb_r) = hcx.pre(&x, &p_cpu)?;
+        let (y_c, post_c, comb_c) = hcx.pre(&x_cuda, &p_cuda)?;
+        let maxdiff = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            let a = a.to_device(&cpu)?.flatten_all()?;
+            let b = b.to_device(&cpu)?.flatten_all()?;
+            (a - b)?.abs()?.max(0)?.to_scalar::<f32>()
+        };
+        assert!(maxdiff(&post_r, &post_c)? < 1e-4, "post gate mismatch");
+        assert!(maxdiff(&comb_r, &comb_c)? < 1e-4, "comb mismatch");
+        assert!(maxdiff(&y_r, &y_c)? < 1e-3, "pre reduce mismatch");
+
+        // post: eager (CPU) vs fused (CUDA), fed each path's own pre outputs.
+        let new_r = hcx.post(&block_out, &x, &post_r, &comb_r)?;
+        let new_c = hcx.post(&block_out.to_device(&cuda)?, &x_cuda, &post_c, &comb_c)?;
+        assert!(maxdiff(&new_r, &new_c)? < 2e-3, "post recombine mismatch");
         Ok(())
     }
 }

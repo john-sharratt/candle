@@ -88,10 +88,82 @@ impl Indexer {
         Ok((q, weights))
     }
 
+    /// Batched form of [`Self::query_space`]'s two GEMMs across `n` concurrent
+    /// decode sessions: `xs` `[n, dim]` (raw hiddens) and `qr_all` `[n,
+    /// q_lora_rank]` (the shared q-normed low-rank) → the PRE-RoPE per-head query
+    /// `q_raw` `[n, n_heads, head_dim]` and the gate weights `[n, n_heads]`. Both
+    /// projections are row-independent, so this is bit-identical per row to
+    /// `query_space`; the position-dependent RoPE stays per session in
+    /// [`Self::rope_query`] (cheap elementwise, applied at each session's own
+    /// decode position).
+    pub fn query_gemm_batched(&self, xs: &Tensor, qr_all: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (h, hd) = (self.n_heads, self.head_dim);
+        let n = qr_all.dim(0)?;
+        let q_raw = self
+            .wq_b
+            .forward(&qr_all.to_dtype(DType::F32)?)?
+            .reshape((n, h, hd))?;
+        let scale = self.softmax_scale * (h as f64).powf(-0.5);
+        let weights =
+            (self.weights_proj.forward(&xs.to_dtype(DType::F32)?)? * scale)?.reshape((n, h))?;
+        Ok((q_raw, weights))
+    }
+
+    /// Per-session RoPE for one row of [`Self::query_gemm_batched`]'s `q_raw`
+    /// (`q_raw_row` `[n_heads, head_dim]`) at token position `pos` — the exact
+    /// rotation `query_space` applies (transpose to `[1,h,1,hd]` so RoPE's seq
+    /// axis is length 1, rotate the trailing `rope_head_dim`), returning the
+    /// roped per-head query `[n_heads, head_dim]`.
+    pub fn rope_query(&self, q_raw_row: &Tensor, rope: &RotaryCache, pos: usize) -> Result<Tensor> {
+        let (h, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        let q = q_raw_row
+            .reshape((1, 1, h, hd))?
+            .transpose(1, 2)?
+            .contiguous()?; // [1,h,1,hd]
+        let q_nope = q.narrow(D::Minus1, 0, hd - rd)?;
+        let q_rope = rope.apply(&q.narrow(D::Minus1, hd - rd, rd)?, pos, false)?;
+        Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?.reshape((h, hd))
+    }
+
     /// A streaming compressor over the Indexer's own key space — the kernel
     /// path drives this directly (`push_raw`) to feed the `FloatGallery`.
     pub fn incremental_compressor(&self) -> super::compressor::IncrementalCompressor {
         self.compressor.incremental()
+    }
+
+    /// The Indexer's key-space compressor (shared layer weights) — used to batch
+    /// its projection across concurrent decode sessions before the per-session
+    /// stateful push.
+    pub fn compressor(&self) -> &Compressor {
+        &self.compressor
+    }
+
+    /// The Indexer's roped per-head query for the token at `pos`, flattened to a
+    /// single band `[n_heads * head_dim]` in `(head, dim)` order — the exact
+    /// input to `WideQSig::from_band` (Artifact D of
+    /// docs/deepseek_turn_seal_persistence.md). The provenance wide-Q for a
+    /// DeepSeek turn is `sign` of this band per Indexer head: the model's
+    /// LEARNED significance space, read straight from the Indexer, rather than
+    /// the R16 cross-layer sign-fold every other model uses. The head ordering
+    /// matches `from_band`'s `(head × head_dim + dim)` bit layout, so the packed
+    /// signature plugs into the unchanged selection scan.
+    pub fn query_band(
+        &self,
+        x: &Tensor,
+        qr: &Tensor,
+        rope: &RotaryCache,
+        pos: usize,
+    ) -> Result<Vec<f32>> {
+        let (q, _w) = self.query_space(x, qr, rope, pos)?;
+        q.flatten_all()?.to_vec1::<f32>()
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn n_heads(&self) -> usize {
+        self.n_heads
     }
 
     pub fn top_k(&self) -> usize {
@@ -237,6 +309,62 @@ impl IncrementalIndexer<'_> {
 mod tests {
     use super::*;
     use candle::{Device, IndexOp};
+
+    /// `query_band` (Artifact D wide-Q source) returns the roped per-head
+    /// Indexer query flattened in `(head, dim)` order — exactly the band
+    /// `WideQSig::from_band` signs and packs. Locks length + ordering against
+    /// `query_space`'s q, and demonstrates the `from_band` sign-pack rule over
+    /// that ordering.
+    #[test]
+    fn query_band_matches_query_space_pack_order() -> Result<()> {
+        let dev = Device::Cpu;
+        let (dim, qlr, h, hd, rd, ratio) = (8usize, 6usize, 3usize, 8usize, 4usize, 4usize);
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let comp = Compressor::new(
+            Tensor::randn(0f32, 1.0, (2 * hd, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (2 * hd, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (ratio, 2 * hd), &dev)?,
+            Tensor::ones(hd, DType::F32, &dev)?,
+            ratio,
+            hd,
+            rd,
+            1e-6,
+        );
+        let wq_b = Tensor::randn(0f32, 1.0, (h * hd, qlr), &dev)?;
+        let wproj = Tensor::randn(0f32, 1.0, (h, dim), &dev)?;
+        let idx = Indexer::new(QLinear::from_weight(wq_b), wproj, comp, h, hd, rd, 4);
+
+        let pos = 5usize;
+        let x = Tensor::randn(0f32, 1.0, (dim,), &dev)?;
+        let qr = Tensor::randn(0f32, 1.0, (qlr,), &dev)?;
+        let band = idx.query_band(&x, &qr, &rope, pos)?;
+        assert_eq!(band.len(), h * hd, "band is n_heads × head_dim");
+
+        // The band IS query_space's q flattened in (head, dim) row order.
+        let (q_space, _w) = idx.query_space(&x, &qr, &rope, pos)?;
+        let q_flat = q_space.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (&a, &b)) in band.iter().zip(&q_flat).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "band[{i}] != query_space q[{i}]");
+        }
+
+        // `from_band`'s pack rule (bit i of head hh set iff band[hh*hd+i] >= 0)
+        // over that ordering is well-defined and deterministic.
+        let wph = hd.div_ceil(64);
+        let mut words = vec![0u64; h * wph];
+        for hh in 0..h {
+            for i in 0..hd {
+                if band[hh * hd + i] >= 0.0 {
+                    words[hh * wph + i / 64] |= 1u64 << (i % 64);
+                }
+            }
+        }
+        // Head 0's low word reflects head 0's dims only (ordering isolation).
+        let expect_h0: u64 = (0..hd)
+            .filter(|&i| band[i] >= 0.0)
+            .fold(0u64, |w, i| w | (1u64 << (i % 64)));
+        assert_eq!(words[0], expect_h0);
+        Ok(())
+    }
 
     /// Index scores equal a scalar transcription `Σ_h relu(q_h·k_g)·w_h`, with the gate
     /// `w = (x·Wᵀ)·(hd^-0.5·h^-0.5)`. The reference rebuilds `q` and the compressed cache

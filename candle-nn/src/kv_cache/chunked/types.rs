@@ -524,6 +524,22 @@ impl SequenceState {
         self.chunks.iter().map(|c| c.usage as usize).sum()
     }
 
+    /// The sliding-window ring's evicted-front count — the absolute position of
+    /// the first resident token. Zero until the ring first slides.
+    #[inline]
+    pub(super) fn base_pos(&self) -> u32 {
+        self.base_pos
+    }
+
+    /// Seed the evicted-front count directly (turn-seal ring restore): the
+    /// remaining resident chunks then serialise ABSOLUTE `rope_base` positions
+    /// from this base (`rope_pos = base_pos + Σ preceding usage`), so a resumed
+    /// window continues the original absolute frame.
+    #[inline]
+    pub(super) fn set_base_pos(&mut self, v: u32) {
+        self.base_pos = v;
+    }
+
     /// Get the `ChunkWindow` for block `blk`.
     #[inline]
     pub(super) fn chunk_at(&self, blk: usize) -> Option<&ChunkWindow> {
@@ -575,7 +591,13 @@ impl SequenceState {
     #[inline]
     pub(super) fn rope_pos(&self, blk: usize) -> i32 {
         let count = blk.min(self.chunks.len());
-        self.base_pos as i32 + self.chunks.iter().take(count).map(|c| c.usage as i32).sum::<i32>()
+        self.base_pos as i32
+            + self
+                .chunks
+                .iter()
+                .take(count)
+                .map(|c| c.usage as i32)
+                .sum::<i32>()
     }
 
     /// Slide the sliding-window ring: drop every FRONT chunk that has fully
@@ -1008,9 +1030,9 @@ impl SequenceState {
             ref mut gpu_chunks,
             ..
         } = *self;
-        gpu_chunks
-            .as_mut()
-            .rebuild_decode(chunks, n_kv_head, head_dim, arena_info, write_len, wi, base_pos)?;
+        gpu_chunks.as_mut().rebuild_decode(
+            chunks, n_kv_head, head_dim, arena_info, write_len, wi, base_pos,
+        )?;
 
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((ptr, n as u32, wi as u32))

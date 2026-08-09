@@ -60,4 +60,9 @@ pub mod fletcher32;
 // Fused Sinkhorn (doubly-stochastic) normalization of the mHC combine matrix:
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
 pub mod bdp;
+pub mod hyper_mhc;
 pub mod sinkhorn;
+
+// Fused compressed-corpus hot-cache gather: assembles a decode wave's selected
+// gallery rows into one contiguous block, replacing per-region index_select+cat
+pub mod corpus_gather;

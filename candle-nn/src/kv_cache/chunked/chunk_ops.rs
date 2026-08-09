@@ -2943,6 +2943,92 @@ mod tests {
         backing.record_turn(slot).unwrap()
     }
 
+    /// Turn-seal window-ring snapshot → restore (Artifact A of
+    /// docs/deepseek_turn_seal_persistence.md): after the sliding-window ring
+    /// evicts its front chunk, the resident window + `base_pos` — captured via
+    /// the snapshot primitives (`window_base_pos` / `resident_len` /
+    /// `read_contiguous`) — restore bit-exactly into a fresh backing
+    /// (`ensure_for_offset` / `write_contiguous` / `set_len` /
+    /// `set_window_base_pos`), preserving both the window content AND the
+    /// absolute-position frame (each restored row still equals its absolute
+    /// position `base_pos + i`).
+    #[test]
+    fn window_ring_snapshot_restore_round_trip() {
+        let (n_kv_head, head_dim) = (1usize, 32usize);
+        let backing = cpu_backing(n_kv_head, head_dim);
+        let slot = backing.alloc_sequence().unwrap();
+        let n = 80usize;
+        backing.ensure_for_offset(slot, 0, n).unwrap();
+        // Token t's whole row is the scalar t (bf16-exact for t < 256), so a
+        // restored row can be checked against its ABSOLUTE position.
+        let vals: Vec<f32> = (0..n)
+            .flat_map(|t| std::iter::repeat(t as f32).take(head_dim))
+            .collect();
+        let k = Tensor::from_vec(vals, (1, n_kv_head, n, head_dim), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, n);
+        // Eviction only slides SEALED front chunks (below `writer_start_idx`);
+        // seal chunks 0 and 1 so the front is evictable (in the live model the
+        // writer advances past chunks whose tokens are folded into the corpus).
+        backing.test_set_writer_start(slot, 2).unwrap();
+
+        // Slide the ring: window 32, query at 79 → front chunk [0,32) fully
+        // exits (lowest in-window abs = 79 − 32 + 1 = 48 ≥ 32).
+        let base_pos = backing.evict_window_front(slot, 32, n - 1).unwrap();
+        assert_eq!(base_pos, 32, "front chunk [0,32) must evict");
+        let resident_len = backing.resident_len(slot).unwrap();
+        assert_eq!(resident_len, n - 32, "48 resident tokens (abs 32..79)");
+        assert_eq!(backing.window_base_pos(slot).unwrap(), 32);
+
+        // Snapshot the resident window.
+        let (snap_k, snap_v) = backing.read_contiguous(slot, 0, resident_len).unwrap();
+
+        // Restore into a fresh backing.
+        let restored = cpu_backing(n_kv_head, head_dim);
+        let rslot = restored.alloc_sequence().unwrap();
+        restored.ensure_for_offset(rslot, 0, resident_len).unwrap();
+        restored
+            .write_contiguous(rslot, 0, &snap_k, &snap_v)
+            .unwrap();
+        restored.set_len(rslot, resident_len);
+        restored.set_window_base_pos(rslot, base_pos).unwrap();
+
+        assert_eq!(restored.window_base_pos(rslot).unwrap(), base_pos);
+        assert_eq!(restored.resident_len(rslot).unwrap(), resident_len);
+
+        // Content bit-exact (integers → exact in F32), and each row equals its
+        // absolute position base_pos + i.
+        let (rk, rv) = restored.read_contiguous(rslot, 0, resident_len).unwrap();
+        let f32v = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(f32v(&snap_k), f32v(&rk), "restored window K bit-exact");
+        assert_eq!(f32v(&snap_v), f32v(&rv), "restored window V bit-exact");
+        let rows = rk
+            .reshape((resident_len, head_dim))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            let want = (base_pos as usize + i) as f32;
+            assert!(
+                row.iter().all(|&x| (x - want).abs() < 1e-3),
+                "restored row {i} must equal absolute pos {want}"
+            );
+        }
+    }
+
     /// `migrate_sealed_to_cpu` on a CPU-backed sequence copies chunks into new
     /// CPU arena slots.  Structural invariants (token count, chunk count, location)
     /// must be preserved.

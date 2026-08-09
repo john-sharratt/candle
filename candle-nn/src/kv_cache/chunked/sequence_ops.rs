@@ -226,14 +226,65 @@ impl ChunkedKvBacking {
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        let Some(seq) = state
-            .sequences
-            .get_mut(batch_idx)
-            .and_then(|s| s.as_mut())
-        else {
+        let Some(seq) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) else {
             return Ok(0);
         };
         Ok(seq.evict_front_window(window_size, abs_pos))
+    }
+
+    /// The sliding-window ring's evicted-front count for `batch_idx` — the
+    /// absolute position of the first resident token (`base_pos`). Zero until
+    /// the ring first slides; `Ok(0)` for an unallocated slot.
+    pub fn window_base_pos(&self, batch_idx: usize) -> Result<u32> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        Ok(state
+            .sequences
+            .get(batch_idx)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.base_pos())
+            .unwrap_or(0))
+    }
+
+    /// The resident token count for `batch_idx` — the number of tokens currently
+    /// held in the arena (the sliding-window tail after eviction). `Ok(0)` for
+    /// an unallocated slot.
+    pub fn resident_len(&self, batch_idx: usize) -> Result<usize> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        Ok(state
+            .sequences
+            .get(batch_idx)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.seq_len())
+            .unwrap_or(0))
+    }
+
+    /// Seed the sliding-window ring's evicted-front count directly (turn-seal
+    /// ring restore, Artifact A): after the resident window KV is written at
+    /// resident offset 0, this stamps `base_pos` so the remaining chunks
+    /// serialise ABSOLUTE `rope_base` positions and the resumed window continues
+    /// the original absolute frame. Errors if the slot is not allocated.
+    pub fn set_window_base_pos(&self, batch_idx: usize, base_pos: u32) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let seq = state
+            .sequences
+            .get_mut(batch_idx)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "set_window_base_pos: slot {batch_idx} not allocated"
+                ))
+            })?;
+        seq.set_base_pos(base_pos);
+        Ok(())
     }
 
     /// Set one block's window geometry — its skip `offset` and valid token

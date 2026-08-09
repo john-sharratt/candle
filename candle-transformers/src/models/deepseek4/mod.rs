@@ -40,6 +40,8 @@ mod moe;
 mod paged;
 pub mod readback;
 mod rope;
+#[cfg(feature = "cuda")]
+pub mod select_bench;
 mod streaming;
 mod transformer;
 #[cfg(feature = "cuda")]
@@ -52,9 +54,9 @@ pub use footprint::{
     deepseek_kv_footprint, fp16_linear_baseline_bytes, ratio_vs_fp16_linear, KvFootprint,
     CORPUS_DTYPE, WINDOW_KV_DTYPE,
 };
-pub use gallery::FloatGallery;
 #[cfg(feature = "cuda")]
 pub use gallery::{bdp_recall, sign_pack};
+pub use gallery::{CorpusSnapshot, FloatGallery};
 pub use hyper::{HyperConnection, HyperParams};
 pub use indexer::Indexer;
 pub use linear::QLinear;
@@ -67,4 +69,4 @@ pub use rope::RotaryCache;
 pub use streaming::StreamingModel;
 pub use transformer::{Block, Transformer};
 #[cfg(feature = "cuda")]
-pub use wave::DeepSeekBatched;
+pub use wave::{DeepSeekBatched, WindowRingLayer, WindowRingSnapshot};
