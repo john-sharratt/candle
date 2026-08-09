@@ -167,11 +167,11 @@ extern "C" int32_t run_topm_select(
 // Batched BDP recall: one thread per (session, entry). The session's query
 // heads are staged in shared memory once per block (n_heads·words u32 ≤ 1 KB).
 extern "C" __global__ void bdp_recall_batched_kernel(
-    const uint32_t* __restrict__ q_signs, // [n_sess*n_heads, words]
-    const uint32_t* __restrict__ signs,   // [total_g, words]
-    const uint32_t* __restrict__ off,     // [n_sess] entry base per session
-    const uint32_t* __restrict__ cnt,     // [n_sess] entry count per session
-    uint32_t* __restrict__ counts,        // [total_g]
+    const uint32_t* __restrict__ q_signs,  // [n_sess*n_heads, words]
+    const uint64_t* __restrict__ sign_ptrs, // [n_sess] base ptr to session s's [cnt[s], words]
+    const uint32_t* __restrict__ off,      // [n_sess] OUTPUT base per session (into counts)
+    const uint32_t* __restrict__ cnt,      // [n_sess] entry count per session
+    uint32_t* __restrict__ counts,         // [total_g]
     int n_heads,
     int words,
     int dim
@@ -179,7 +179,11 @@ extern "C" __global__ void bdp_recall_batched_kernel(
     extern __shared__ uint32_t qh_shared[]; // [n_heads*words], 16B-aligned (dyn smem)
     int s = blockIdx.y;
     int g = (int)cnt[s];
-    int base = (int)off[s];
+    int base = (int)off[s]; // output offset into the concatenated `counts`
+    // Each session's packed signs are read IN PLACE from its own resident buffer
+    // (no O(Σlen·words) concatenation that grows with context depth); the entry index
+    // is session-relative (`e`), while `counts` stays concatenated at `base + e`.
+    const uint32_t* signs = (const uint32_t*)sign_ptrs[s];
     const uint32_t* qbase = q_signs + (int64_t)s * n_heads * words;
     // Stage this session's query heads once (coalesced over the block).
     for (int i = threadIdx.x; i < n_heads * words; i += blockDim.x) {
@@ -199,7 +203,7 @@ extern "C" __global__ void bdp_recall_batched_kernel(
         const uint4* sg4 = reinterpret_cast<const uint4*>(signs);
         for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < g;
              e += gridDim.x * blockDim.x) {
-            uint4 sg = sg4[base + e];
+            uint4 sg = sg4[e];
             uint32_t total = 0;
             for (int h = 0; h < n_heads; ++h) {
                 uint4 q = qh4[h];
@@ -215,7 +219,7 @@ extern "C" __global__ void bdp_recall_batched_kernel(
     // removing the redundant per-head re-reads of the same row.
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < g;
          e += gridDim.x * blockDim.x) {
-        const uint32_t* sg = signs + (int64_t)(base + e) * words;
+        const uint32_t* sg = signs + (int64_t)e * words;
         uint32_t sgr[32];
         for (int w = 0; w < words && w < 32; ++w) {
             sgr[w] = sg[w];
@@ -362,7 +366,7 @@ extern "C" __global__ void topm_compact_batched_kernel(
 
 extern "C" int32_t run_bdp_recall_batched(
     const uint32_t* q_signs,
-    const uint32_t* signs,
+    const uint64_t* sign_ptrs,
     const uint32_t* off,
     const uint32_t* cnt,
     uint32_t* counts,
@@ -381,7 +385,7 @@ extern "C" int32_t run_bdp_recall_batched(
     dim3 blocks(bx, n_sess);
     size_t smem = (size_t)n_heads * words * sizeof(uint32_t);
     bdp_recall_batched_kernel<<<blocks, threads, smem, stream>>>(
-        q_signs, signs, off, cnt, counts, n_heads, words, dim);
+        q_signs, sign_ptrs, off, cnt, counts, n_heads, words, dim);
     return (int32_t)cudaGetLastError();
 }
 

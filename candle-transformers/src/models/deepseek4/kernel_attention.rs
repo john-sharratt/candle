@@ -14,10 +14,11 @@ use candle::{DType, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
 
-use super::attention::{rms_norm, rms_scale, Attention};
+use super::attention::{rms_norm, Attention};
 use super::compressor::IncrementalCompressor;
 use super::config::LayerKind;
 use super::gallery::{CorpusSnapshot, FloatGallery};
+use super::linear::shared_int8_pair;
 use std::sync::Arc;
 
 use super::paged::{
@@ -281,7 +282,7 @@ pub fn kernel_attn_decode_step(
     // kernel rotates at the position it derives from the slot state.
     let qr = rms_norm(&a.wq_a().forward(&x)?, a.q_norm(), a.eps())?;
     let q = a.wq_b().forward(&qr)?.reshape((1, 1, h, hd))?;
-    let q = rms_scale(&q, a.eps())?;
+    let q = a.rms_scale(&q)?;
     let q_bf = q.reshape((1, h, hd))?.to_dtype(DType::BF16)?;
     let kv = rms_norm(&a.wkv().forward(&x)?, a.kv_norm(), a.eps())?;
     let kv_bf = kv.reshape((1, hd))?.to_dtype(DType::BF16)?;
@@ -401,11 +402,13 @@ pub fn kernel_attn_prefill_prepare_batched(
     // (`pprep:proj` — the stateless GEMMs, the prefill counterpart of decode's
     // `dprep:proj`.)
     let t_proj = profile_now();
-    let qr_all = rms_norm(&a.wq_a().forward(&xs)?, a.q_norm(), a.eps())?; // [1,s,qa]
+    // wq_a and wkv both project `xs`; quantize the activation once and share it.
+    let (qa_raw, kv_raw) = shared_int8_pair(&xs, a.wq_a(), a.wkv())?;
+    let qr_all = rms_norm(&qa_raw, a.q_norm(), a.eps())?; // [1,s,qa]
     let q_all = a.wq_b().forward(&qr_all)?.reshape((1, s, h, hd))?;
-    let q_all = rms_scale(&q_all, a.eps())?;
+    let q_all = a.rms_scale(&q_all)?;
     let q_bf_all = q_all.reshape((s, h, hd))?.to_dtype(DType::BF16)?; // [s,h,hd]
-    let kv_all = rms_norm(&a.wkv().forward(&xs)?, a.kv_norm(), a.eps())?; // [1,s,hd]
+    let kv_all = rms_norm(&kv_raw, a.kv_norm(), a.eps())?; // [1,s,hd]
     let kv_bf_all = kv_all.reshape((s, hd))?.to_dtype(DType::BF16)?; // [s,hd]
 
     // ── Batched compressor projections (attention-comp + indexer-comp) ──

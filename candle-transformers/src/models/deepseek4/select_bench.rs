@@ -245,7 +245,6 @@ pub fn validate_kernels(dev: &Device, cfg: SelectCfg) -> Result<(bool, f32)> {
         .iter()
         .map(|g| g.packed_signs())
         .collect::<Result<_>>()?;
-    let signs_cat = Tensor::cat(&g_signs, 0)?;
     let off: Vec<u32> = (0..n).map(|s| (s * cfg.entries) as u32).collect();
     let cnt: Vec<u32> = vec![cfg.entries as u32; n];
     let off_t = Tensor::from_vec(off, n, dev)?;
@@ -253,7 +252,7 @@ pub fn validate_kernels(dev: &Device, cfg: SelectCfg) -> Result<(bool, f32)> {
 
     let counts_b = bdp_recall_batched(
         &q_signs,
-        &signs_cat,
+        &g_signs,
         &off_t,
         &cnt_t,
         n,
@@ -551,7 +550,6 @@ pub fn run_select_kernels(dev: &Device, cfg: SelectCfg, iters: usize) -> Result<
         .iter()
         .map(|g| g.packed_signs())
         .collect::<Result<_>>()?;
-    let signs = Tensor::cat(&g_signs, 0)?;
     let off = Tensor::from_vec(
         (0..n).map(|s| (s * cfg.entries) as u32).collect::<Vec<_>>(),
         n,
@@ -561,7 +559,7 @@ pub fn run_select_kernels(dev: &Device, cfg: SelectCfg, iters: usize) -> Result<
     let one = |_: usize| -> Result<()> {
         let counts = bdp_recall_batched(
             &q_signs,
-            &signs,
+            &g_signs,
             &off,
             &cnt,
             n,

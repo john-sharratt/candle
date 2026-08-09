@@ -388,7 +388,7 @@ mod tests {
             compressor,
             indexer,
         };
-        Ok(Attention::new(cfg, layer, p))
+        Attention::new(cfg, layer, p)
     }
 
     fn build_model(cfg: &Config, dev: &Device) -> Result<Transformer> {

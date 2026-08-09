@@ -175,7 +175,11 @@ latent_decode_kernel(
     __shared__ alignas(128) int8_t sQ[HEADS_TILE][HEAD_DIM];       // 8 KB
     __shared__ alignas(16) float scaleQ[HEADS_TILE][NPAL];
     __shared__ alignas(128) T kv_f[KEYS_TILE][HEAD_DIM];           // 8 KB (bf16)
-    __shared__ alignas(128) int8_t sK[KEYS_TILE][HEAD_DIM];        // 4 KB
+    // sK padded to a stride that is a multiple of 16 but not 128 so the QK B-operand's
+    // 8 ldmatrix rows land in distinct banks (the unpadded HEAD_DIM stride collapsed
+    // them onto {0,1,2,3} → 8-way conflict every tile). QK-only consumer, so padding is
+    // safe; the store/dump index through the array type and never touch the pad tail.
+    __shared__ alignas(128) int8_t sK[KEYS_TILE][HEAD_DIM + 16];   // 4.125 KB
     __shared__ alignas(16) float scaleK[KEYS_TILE][NPAL];
     __shared__ alignas(16) float scores_p[NPAL][HEADS_TILE][KEYS_TILE]; // 2 KB
     __shared__ int key_valid[KEYS_TILE];
@@ -440,7 +444,8 @@ latent_decode_kernel(
                 uint32_t a_frag[4];
                 uint32_t b_frag[2];
                 fused_attn::load_a_frag_m16k32(a_frag, &sQ[0][p * SUB + ks * 32], HEAD_DIM, lane);
-                fused_attn::load_b_frag_n8k32(b_frag, &sK[0][p * SUB + ks * 32], HEAD_DIM, lane);
+                fused_attn::load_b_frag_n8k32_ldmatrix(b_frag, &sK[0][p * SUB + ks * 32],
+                                                       HEAD_DIM + 16, lane);
                 fused_attn::mma_int8_m16n8k32(c, a_frag, b_frag, c);
             }
             // C layout: lane holds rows {lane>>2, (lane>>2)+8}, cols

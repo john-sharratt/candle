@@ -13,13 +13,13 @@
 //! RoPE dims are de-rotated (inverse rotation) before the grouped low-rank output
 //! projection.
 
-use candle::{DType, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::ops::softmax;
 
 use super::compressor::Compressor;
 use super::config::{Config, LayerKind};
 use super::indexer::Indexer;
-use super::linear::QLinear;
+use super::linear::{shared_int8_pair, QLinear};
 use super::rope::RotaryCache;
 
 const NEG_BIG: f64 = -1e30;
@@ -49,6 +49,10 @@ pub struct Attention {
     kind: LayerKind,
     eps: f64,
     softmax_scale: f64,
+    // Unit weight `[head_dim]` for the per-head unweighted RMS scale, built once so
+    // `rms_scale` is a single fused `rms_norm` launch instead of the eager sqr/mean/add/
+    // sqrt/div chain (see `Self::rms_scale`).
+    ones_hd: Tensor,
 }
 
 pub struct AttentionParams {
@@ -65,8 +69,9 @@ pub struct AttentionParams {
 }
 
 impl Attention {
-    pub fn new(cfg: &Config, layer: usize, p: AttentionParams) -> Self {
-        Self {
+    pub fn new(cfg: &Config, layer: usize, p: AttentionParams) -> Result<Self> {
+        let ones_hd = Tensor::ones(cfg.head_dim, DType::F32, p.q_norm.device())?;
+        Ok(Self {
             wq_a: p.wq_a,
             q_norm: p.q_norm,
             wq_b: p.wq_b,
@@ -87,7 +92,16 @@ impl Attention {
             kind: cfg.layer_kind(layer),
             eps: cfg.norm_eps,
             softmax_scale: (cfg.head_dim as f64).powf(-0.5),
-        }
+            ones_hd,
+        })
+    }
+
+    /// Per-head unweighted RMS scale over the last dim: `x * rsqrt(mean(x²)+eps)`.
+    /// A single fused `rms_norm` launch against a cached unit weight, instead of the
+    /// eager sqr/mean/add/sqrt/div chain — identical math to the sibling `rms_norm`
+    /// with weight ≡ 1.
+    pub(crate) fn rms_scale(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(&x.to_dtype(DType::F32)?, &self.ones_hd, self.eps as f32)
     }
 
     /// Prefill forward over the full prefix `x` `[b, s, dim]`. Returns `[b, s, dim]`.
@@ -96,10 +110,14 @@ impl Attention {
         let (h, hd) = (self.n_heads, self.head_dim);
         let x = x.to_dtype(DType::F32)?;
 
+        // wq_a and wkv both project the same `x`; quantize the activation once and share it
+        // (bit-identical to two independent `forward`s — see `shared_int8_forward`).
+        let (qa_raw, kv_raw) = shared_int8_pair(&x, &self.wq_a, &self.wkv)?;
+
         // --- query ---
-        let qr = rms_norm(&self.wq_a.forward(&x)?, &self.q_norm, self.eps)?; // [b,s,q_lora]
+        let qr = rms_norm(&qa_raw, &self.q_norm, self.eps)?; // [b,s,q_lora]
         let q = self.wq_b.forward(&qr)?.reshape((b, s, h, hd))?;
-        let q = rms_scale(&q, self.eps)?; // per-head unweighted RMS, q is [b,s,h,hd]
+        let q = self.rms_scale(&q)?; // per-head unweighted RMS, q is [b,s,h,hd]
 
         // RoPE the query by TOKEN POSITION. `model.py`'s `apply_rotary_emb` indexes `freqs_cis` by
         // the sequence axis and broadcasts over heads (`view(1, seq, 1, rd)` for the 4D `q`), so
@@ -110,7 +128,7 @@ impl Attention {
         let q = self.rope_last(&q, rope, 0, false)?; // rope by token position (Minus2 = s)
 
         // --- raw window KV (K == V) ---
-        let kv = rms_norm(&self.wkv.forward(&x)?, &self.kv_norm, self.eps)?; // [b,s,hd]
+        let kv = rms_norm(&kv_raw, &self.kv_norm, self.eps)?; // [b,s,hd]
         let kv = self.rope_last(&kv, rope, 0, false)?;
 
         // --- compressed KV ---
@@ -253,19 +271,94 @@ impl Attention {
             .contiguous()?
             .reshape((b, s, ng, per_group))?;
         // Per group g: o[:,:,g,:] `[b*s, per_group]` @ wo_a[g]ᵀ -> `[b*s, olr]`, run as an int8-KO
-        // linear. Concatenated over groups on the head axis → `[b, s, ng·olr]` (same layout the
-        // old dequant+grouped-matmul produced).
-        let mut groups = Vec::with_capacity(ng);
-        for (g, wo_a_g) in self.wo_a.iter().enumerate() {
-            let og = o
-                .narrow(2, g, 1)?
-                .contiguous()?
-                .reshape((b * s, per_group))?;
-            let proj_g = wo_a_g.forward(&og)?; // [b*s, olr]
-            groups.push(proj_g.reshape((b, s, 1, olr))?);
-        }
-        let proj = Tensor::cat(&groups, 2)?.reshape((b, s, ng * olr))?;
+        // linear. Concatenated over groups on the head axis → `[b, s, ng·olr]`. When every
+        // `wo_a` is int8-KO the whole set runs in ONE grouped launch (see `grouped_output_proj`);
+        // otherwise (Dense/Quant fixtures) the per-group loop below.
+        let proj = match self.grouped_output_proj(&o, b, s)? {
+            Some(p) => p,
+            None => {
+                let mut groups = Vec::with_capacity(ng);
+                for (g, wo_a_g) in self.wo_a.iter().enumerate() {
+                    let og = o
+                        .narrow(2, g, 1)?
+                        .contiguous()?
+                        .reshape((b * s, per_group))?;
+                    let proj_g = wo_a_g.forward(&og)?; // [b*s, olr]
+                    groups.push(proj_g.reshape((b, s, 1, olr))?);
+                }
+                Tensor::cat(&groups, 2)?.reshape((b, s, ng * olr))?
+            }
+        };
         self.wo_b.forward(&proj)
+    }
+
+    /// One grouped int8-KO matmul over all `ng` output-projection groups instead of `ng`
+    /// separate quantize+matmul launches: the groups become contiguous row-blocks of a single
+    /// operand `[ng·b·s, per_group]`, each block multiplied by its own `wo_a[g]`
+    /// (`grouped_qmatmul` with block offsets). Returns `None` unless every `wo_a` is int8-KO on
+    /// CUDA and the shapes meet the kernel's alignment (`per_group % 128`, `o_lora_rank % 32`),
+    /// so the caller falls back to the per-group loop. Bit-identical to that loop: q8a128
+    /// quantizes per row (independent of grouping) and the grouped kernel equals the per-weight
+    /// dense matmul on each block.
+    #[cfg(feature = "cuda")]
+    fn grouped_output_proj(&self, o: &Tensor, b: usize, s: usize) -> Result<Option<Tensor>> {
+        use candle::quantized::cuda::{grouped_qmatmul, to_dynamic};
+        use candle::quantized::Int8Mode;
+        // Decode signature only (`s == 1`): each group sees few rows (`b` = the concurrent
+        // decode count), so the launch-bound path wins by collapsing `ng` launches into one.
+        // Prefill (`s > 1`) feeds each group many rows — those large per-group GEMMs run
+        // faster as separate dense matmuls than through the MoE grouped `gemx` kernel — so it
+        // keeps the per-group loop.
+        if s != 1 {
+            return Ok(None);
+        }
+        let (ng, olr) = (self.n_groups, self.o_lora_rank);
+        let per_group = (self.n_heads / ng) * self.head_dim;
+        if per_group % 128 != 0 || olr % 32 != 0 {
+            return Ok(None);
+        }
+        let dev = match o.device() {
+            Device::Cuda(d) => d.clone(),
+            _ => return Ok(None),
+        };
+        let mut ptrs = Vec::with_capacity(ng);
+        let mut wdtype = None;
+        for w in &self.wo_a {
+            match w.ko_weight() {
+                Some((p, dt)) => {
+                    ptrs.push(p);
+                    wdtype = Some(dt);
+                }
+                None => return Ok(None),
+            }
+        }
+        let wdtype = match wdtype {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let bs = b * s;
+        // [b,s,ng,per_group] -> group-major [ng,b,s,per_group] -> [ng*b*s, per_group]
+        let o_g = o
+            .permute((2, 0, 1, 3))?
+            .contiguous()?
+            .reshape((ng * bs, per_group))?
+            .to_dtype(DType::F32)?;
+        let op = to_dynamic(&o_g, Int8Mode::Performance, &dev)?;
+        let offsets: Vec<i32> = (0..=ng).map(|g| (g * bs) as i32).collect();
+        let out = grouped_qmatmul(op.as_dynamic(), &ptrs, wdtype, olr, &offsets, &dev)?; // [ng*bs, olr] f32
+                                                                                         // [ng*bs, olr] -> [ng, bs, olr] -> [bs, ng, olr] -> [b, s, ng*olr]
+        let proj = out
+            .reshape((ng, bs, olr))?
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((b, s, ng * olr))?;
+        Ok(Some(proj))
+    }
+
+    /// No grouped int8 path without CUDA — the caller runs the per-group loop.
+    #[cfg(not(feature = "cuda"))]
+    fn grouped_output_proj(&self, _o: &Tensor, _b: usize, _s: usize) -> Result<Option<Tensor>> {
+        Ok(None)
     }
 }
 
@@ -385,17 +478,20 @@ impl IncrementalAttention<'_> {
         let din = x.elem_count();
         let x = x.reshape((1, 1, din))?.to_dtype(DType::F32)?;
 
+        // wq_a and wkv both project the same token `x`; quantize the activation once and share it.
+        let (qa_raw, kv_raw) = shared_int8_pair(&x, &a.wq_a, &a.wkv)?;
+
         // --- query: shared low-rank qr → wq_b → per-head RMS scale → RoPE at `pos` ---
-        let qr = rms_norm(&a.wq_a.forward(&x)?, &a.q_norm, a.eps)?; // [1,1,q_lora]
+        let qr = rms_norm(&qa_raw, &a.q_norm, a.eps)?; // [1,1,q_lora]
         let q = a.wq_b.forward(&qr)?.reshape((1, 1, h, hd))?;
-        let q = rms_scale(&q, a.eps)?;
+        let q = a.rms_scale(&q)?;
         // RoPE the query by TOKEN POSITION `pos` (matches the fixed prefill / `model.py`: q roped
         // by seq position, broadcast over heads). Transpose to `[1,h,1,hd]` so seq is at Minus2.
         let q = q.transpose(1, 2)?.contiguous()?; // [1,h,1,hd]
         let q = a.rope_last(&q, rope, pos, false)?; // rope by token position `pos`
 
         // --- raw window KV (K == V): RoPE at `pos`, append to the ring ---
-        let kv = rms_norm(&a.wkv.forward(&x)?, &a.kv_norm, a.eps)?; // [1,1,hd]
+        let kv = rms_norm(&kv_raw, &a.kv_norm, a.eps)?; // [1,1,hd]
         let kv = a.rope_last(&kv, rope, pos, false)?;
         self.window.push(kv.reshape((hd,))?);
         if self.window.len() > a.window_size {
@@ -462,16 +558,114 @@ pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     candle_nn::ops::rms_norm(&x, &w, eps as f32)
 }
 
-/// Unweighted RMS scaling over the last dim: `x * rsqrt(mean(x²)+eps)`.
-pub(crate) fn rms_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
-    x.broadcast_div(&(ms + eps)?.sqrt()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle::{Device, IndexOp};
+
+    /// The fused unit-weight `rms_norm` used by `Attention::rms_scale` reproduces the eager
+    /// `x·rsqrt(mean(x²)+eps)` it replaces (within f32 reduction-order tolerance).
+    #[test]
+    fn rms_scale_fused_matches_eager() -> Result<()> {
+        let dev = Device::Cpu;
+        let hd = 512usize;
+        let eps = 1e-6f64;
+        let x = Tensor::randn(0f32, 2.0, (2, 3, 8, hd), &dev)?;
+        let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let eager = x.broadcast_div(&(ms + eps)?.sqrt()?)?;
+        let ones = Tensor::ones(hd, DType::F32, &dev)?;
+        let fused = candle_nn::ops::rms_norm(&x, &ones, eps as f32)?;
+        let diff = (eager - fused)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "rms_scale fused vs eager max abs diff {diff}");
+        Ok(())
+    }
+
+    /// The fused weighted `rms_norm` used by the compressor's `rms_norm`/`rms_norm_entry`
+    /// reproduces the eager `x·rsqrt(mean(x²)+eps)·w` it replaces.
+    #[test]
+    fn rms_norm_weighted_fused_matches_eager() -> Result<()> {
+        let dev = Device::Cpu;
+        let hd = 512usize;
+        let eps = 1e-6f64;
+        let x = Tensor::randn(0f32, 2.0, (5, hd), &dev)?;
+        let w = Tensor::randn(1f32, 0.3, hd, &dev)?;
+        let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let eager = x.broadcast_div(&(ms + eps)?.sqrt()?)?.broadcast_mul(&w)?;
+        let fused = candle_nn::ops::rms_norm(&x, &w, eps as f32)?;
+        let diff = (eager - fused)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "weighted rms_norm fused vs eager max abs diff {diff}"
+        );
+        Ok(())
+    }
+
+    /// The grouped int8-KO output projection (`grouped_output_proj`, decode `s == 1`)
+    /// reproduces the per-group loop it replaces: same permute/reshape/offset layout, and
+    /// `grouped_qmatmul` equals the per-weight dense matmul on each block. Guards the
+    /// reshape/offset logic that the full-model gate would otherwise be the only cover for.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn grouped_output_proj_matches_per_group() -> Result<()> {
+        use candle::quantized::{GgmlDType, Int8Mode, QMatMul, QTensor};
+        let dev = Device::new_cuda(0)?;
+        let (h, hd, ng, olr) = (8usize, 128usize, 2usize, 64usize);
+        let per_group = (h / ng) * hd; // 512 (% 128 == 0)
+        let dim = 256usize; // width of the dummy non-wo_a projections; unused by output_proj
+
+        let mut cfg = Config::tiny();
+        cfg.n_heads = h;
+        cfg.head_dim = hd;
+        cfg.o_groups = ng;
+        cfg.o_lora_rank = olr;
+        cfg.dim = dim;
+
+        // int8-KO `wo_a[g]` = `[olr, per_group]` (the twin the engine path loads).
+        let mk_ko = || -> Result<QLinear> {
+            let w = Tensor::randn(0f32, 0.3, (olr, per_group), &dev)?;
+            let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+            let ko = QMatMul::from_qtensor(qt)?.repack_for_optimization(Int8Mode::Performance)?;
+            Ok(QLinear::from_int8(ko))
+        };
+        let wo_a: Vec<QLinear> = (0..ng).map(|_| mk_ko()).collect::<Result<_>>()?;
+
+        let p = AttentionParams {
+            wq_a: dense(cfg.q_lora_rank, dim, &dev)?,
+            q_norm: Tensor::ones(cfg.q_lora_rank, DType::F32, &dev)?,
+            wq_b: dense(h * hd, cfg.q_lora_rank, &dev)?,
+            wkv: dense(hd, dim, &dev)?,
+            kv_norm: Tensor::ones(hd, DType::F32, &dev)?,
+            wo_a,
+            wo_b: dense(dim, ng * olr, &dev)?,
+            attn_sink: Tensor::randn(0f32, 1.0, h, &dev)?,
+            compressor: None,
+            indexer: None,
+        };
+        let att = Attention::new(&cfg, 0, p)?;
+
+        // `grouped_output_proj` takes the reshaped `o` `[b, s, ng, per_group]` (s == 1 decode).
+        let b = 3usize;
+        let o = Tensor::randn(0f32, 1.0, (b, 1, ng, per_group), &dev)?;
+        let grouped = att
+            .grouped_output_proj(&o, b, 1)?
+            .expect("int8-KO wo_a + aligned shapes → grouped path");
+
+        // Per-group reference (the loop the grouped path replaces).
+        let mut groups = Vec::with_capacity(ng);
+        for (g, wo_a_g) in att.wo_a.iter().enumerate() {
+            let og = o.narrow(2, g, 1)?.contiguous()?.reshape((b, per_group))?;
+            groups.push(wo_a_g.forward(&og)?.reshape((b, 1, olr))?);
+        }
+        let reference = Tensor::cat(&groups, 2)?.reshape((b, 1, ng * olr))?;
+
+        let diff = (grouped - reference)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-3, "grouped vs per-group max abs diff {diff}");
+        Ok(())
+    }
 
     /// Sink softmax: with a very negative sink the result approaches plain softmax; with a
     /// very positive sink the output magnitude shrinks (mass leaks to the zero-value key).
@@ -647,7 +841,7 @@ mod tests {
             compressor,
             indexer,
         };
-        Ok(Attention::new(cfg, layer, p))
+        Attention::new(cfg, layer, p)
     }
 
     fn build_compress(

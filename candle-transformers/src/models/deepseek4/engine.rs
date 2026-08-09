@@ -16,6 +16,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::{get_vram_info, gguf_file, GgmlDType, Int8Mode, MmapRegistration};
 use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
@@ -385,18 +386,21 @@ impl Dsv4Engine {
         let ids = Tensor::from_vec(token_ids.to_vec(), nt, &self.device)?;
         let (weights, indices) = layer.gate.route(&normed, &ids)?; // [nt,k], [nt,k] u32
 
-        // q8a128 activation for the int8-KO grouped expert GEMM (fused RMSNorm→quant, same
-        // normalization as `normed` — quantization noise only, within the QAT tolerance).
+        // q8a128 activation for the int8-KO grouped expert GEMM: quantize the SAME
+        // `normed` the router already saw (a quantize-only launch), rather than
+        // re-normalizing `x2` a second time. One RMSNorm reduction over [nt, dim] per
+        // layer instead of two, and the expert input is now exactly the routed
+        // normalization (a single source of truth); quantization noise only, within QAT.
         let cuda_dev = match &self.device {
             Device::Cuda(d) => d.clone(),
             _ => candle::bail!("Dsv4Engine::moe_forward requires a CUDA device"),
         };
-        let q8 = candle::quantized::cuda::rms_norm_q8a128(
-            &x2,
-            &layer.ffn_norm,
-            self.cfg.norm_eps as f32,
-            &cuda_dev,
-        )?;
+        let q8 = match to_dynamic(&normed, Int8Mode::Performance, &cuda_dev)? {
+            DynamicActs::Int8(op) => op,
+            DynamicActs::Float(_) => {
+                candle::bail!("q8a128 activation quantize returned a non-int8 operand")
+            }
+        };
         pipeline_record("moe:route", t_route);
 
         // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),

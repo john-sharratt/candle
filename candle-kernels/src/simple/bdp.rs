@@ -59,7 +59,7 @@ extern "C" {
     #[allow(clippy::too_many_arguments)]
     pub fn run_bdp_recall_batched(
         q_signs: *const u32,
-        signs: *const u32,
+        sign_ptrs: *const u64,
         off: *const u32,
         cnt: *const u32,
         counts: *mut u32,

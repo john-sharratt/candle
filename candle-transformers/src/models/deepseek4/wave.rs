@@ -19,12 +19,13 @@ use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
 };
 
-use super::attention::{rms_norm, rms_scale};
+use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
 use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
 use super::kernel_attention::{
     kernel_attn_decode_capture, shortlist_m, DecodeSel, KernelLayerSeqState, KernelLayerStatic,
 };
+use super::linear::shared_int8_pair;
 use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
 use crate::models::expert_lre::PipelineStats;
 use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
@@ -699,6 +700,40 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .write()
             .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
 
+        // Wave-invariant decode query positions: built ONCE here instead of rebuilding
+        // the `[n_dec]` u32 upload inside every layer (the positions are fixed for the
+        // whole wave). `None` when the wave carries no decode rows.
+        let q_pos_dec_t = if decode_seqs.is_empty() {
+            None
+        } else {
+            Some(Tensor::from_vec(
+                decode_pos.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
+                decode_seqs.len(),
+                h.device(),
+            )?)
+        };
+        // Wave-invariant prefill query positions (`base..base+s_len` per prefill seq):
+        // hoisted for the same reason — each is rebuilt in every layer otherwise.
+        let prefill_q_pos: Vec<Tensor> = prefill_seqs
+            .iter()
+            .enumerate()
+            .map(|(pi, _)| {
+                let s_len = prefill_lens[pi];
+                let base = prefill_base[pi];
+                Tensor::from_vec(
+                    (base as u32..(base + s_len) as u32).collect::<Vec<u32>>(),
+                    s_len,
+                    h.device(),
+                )
+            })
+            .collect::<Result<_>>()?;
+        // The MoE token-id list is identical across layers; assemble it once.
+        let flat_ids: Vec<u32> = decode_ids
+            .iter()
+            .copied()
+            .chain(prefill_ids.iter().chain(&glue_ids).flatten().copied())
+            .collect();
+
         for l in layer_start..layer_end {
             let layer = e.engine_layer(l);
             let a = &layer.attn;
@@ -772,11 +807,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // + last-dim norms are row-independent).
                 let t_proj = profile_now();
                 let xs_dec = x.narrow(1, 0, n_dec)?.to_dtype(DType::F32)?; // [1,n_dec,dim]
-                let qr_all = rms_norm(&a.wq_a().forward(&xs_dec)?, a.q_norm(), a.eps())?; // [1,n_dec,qa]
+                                                                           // wq_a and wkv share `xs_dec`; quantize the activation once for both.
+                let (qa_raw, kv_raw) = shared_int8_pair(&xs_dec, a.wq_a(), a.wkv())?;
+                let qr_all = rms_norm(&qa_raw, a.q_norm(), a.eps())?; // [1,n_dec,qa]
                 let q_all = a.wq_b().forward(&qr_all)?.reshape((1, n_dec, h, hd))?;
-                let q_all = rms_scale(&q_all, a.eps())?;
+                let q_all = a.rms_scale(&q_all)?;
                 let q_bf_all = q_all.reshape((n_dec, h, hd))?.to_dtype(DType::BF16)?; // [n_dec,h,hd]
-                let kv_all = rms_norm(&a.wkv().forward(&xs_dec)?, a.kv_norm(), a.eps())?;
+                let kv_all = rms_norm(&kv_raw, a.kv_norm(), a.eps())?;
                 let kv_bf_all = kv_all.reshape((n_dec, hd))?.to_dtype(DType::BF16)?; // [n_dec,hd]
                                                                                      // Batched compressor projections (shared layer weights) over all
                                                                                      // decode rows — the stateless part of the corpus push; each
@@ -958,16 +995,12 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
                 let comp_idx = Tensor::from_vec(idx_flat, (n_dec, max_sel), &dev)?;
                 let comp_cnt = Tensor::from_vec(cnts, n_dec, &dev)?;
-                // Explicit per-slot query position (the decode kernel no longer
-                // derives it from the writer slice, so the windowless slot works
-                // and the compressed causal guard has a reference).
-                let q_pos_dec = Tensor::from_vec(
-                    (0..n_dec)
-                        .map(|i| decode_pos[i] as u32)
-                        .collect::<Vec<u32>>(),
-                    n_dec,
-                    &dev,
-                )?;
+                // Explicit per-slot query position (the decode kernel no longer derives it
+                // from the writer slice, so the windowless slot works and the compressed
+                // causal guard has a reference). Hoisted above the layer loop — wave-fixed.
+                let q_pos_dec = q_pos_dec_t
+                    .as_ref()
+                    .expect("decode branch runs only when the wave has decode rows");
                 pipeline_record("decode:cache", t_dcache);
                 // `cache` is the gathered two-region hot cache (built above from
                 // the gallery's pre-built int8 — no per-wave rebuild).
@@ -979,7 +1012,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     &cache,
                     &comp_idx,
                     &comp_cnt,
-                    &q_pos_dec,
+                    q_pos_dec,
                     st.sinks(),
                     st.rope_tab(),
                     a.softmax_scale() as f32,
@@ -1001,9 +1034,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let t_doutp = profile_now();
                 let o = out.to_dtype(DType::F32)?.reshape((n_dec, h, 1, hd))?;
                 let proj = a.output_proj(&o, n_dec, 1)?; // [n_dec, 1, dim]
-                for i in 0..n_dec {
-                    attn_rows.push(proj.narrow(0, i, 1)?);
-                }
+                                                         // One reshaped view instead of `n_dec` narrow slices — the rows are
+                                                         // concatenated along axis 1 below exactly as the prefill/glue rows are,
+                                                         // so `[1, n_dec, dim]` is bit-identical and skips the narrow round-trip.
+                attn_rows.push(proj.reshape((1, n_dec, ()))?);
                 pipeline_record("decode:outproj", t_doutp);
                 pipeline_record("deepseek:decode_attn", t_decode);
             }
@@ -1090,18 +1124,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 }
                 let comp_idx = Tensor::from_vec(idx_flat, (s_len, max_sel), dev)?;
                 let comp_cnt = Tensor::from_vec(cnt_v, s_len, dev)?;
-                let q_pos = Tensor::from_vec(
-                    (base as u32..(base + s_len) as u32).collect::<Vec<_>>(),
-                    s_len,
-                    dev,
-                )?;
+                let q_pos = &prefill_q_pos[pi]; // wave-invariant, hoisted above the layer loop
                 pipeline_record("pgather:remap", t_pg_remap);
                 pipeline_record("prefill:gather", t_pgather);
                 let t_pkern = profile_now();
                 let out = super::paged::paged_latent_prefill_raw(
                     &q_all,
                     hdr_of(l, decode_seqs.len() + pi),
-                    &q_pos,
+                    q_pos,
                     Some((&kv_all, base)),
                     &cache,
                     &comp_idx,
@@ -1155,7 +1185,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     .wq_b()
                     .forward(qr)?
                     .reshape((1, g_len, a.n_heads(), a.head_dim()))?;
-                let q = rms_scale(&q, a.eps())?;
+                let q = a.rms_scale(&q)?;
                 let q_bf = q
                     .reshape((g_len, a.n_heads(), a.head_dim()))?
                     .to_dtype(DType::BF16)?;
@@ -1201,10 +1231,6 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let t_moe = profile_now();
             let t_moe_hcpre = profile_now();
             let (x, post, comb) = hc.pre(&h1, &layer.hc_ffn)?;
-            let mut flat_ids: Vec<u32> = decode_ids.clone();
-            for ids in prefill_ids.iter().chain(&glue_ids) {
-                flat_ids.extend_from_slice(ids);
-            }
             pipeline_record("moe:hc_pre", t_moe_hcpre);
             let moe = e.moe_forward_batch(layer, &x, &flat_ids)?;
             let t_moe_hcpost = profile_now();

@@ -1,6 +1,39 @@
 # DeepSeek-V4-Flash — hot-path optimization findings (next round)
 
-**Date:** 2026-08-09. **Branch:** `deepseek-flash`. **Status:** static-analysis findings, none implemented yet.
+**Date:** 2026-08-09 (Tier 1–3 measured 2026-08-10). **Branch:** `deepseek-flash`.
+**Status:** Tiers 1–3 implemented + measured (see per-item **OUTCOME** notes).
+
+## Tier-2/3 measured outcomes (2026-08-10)
+Landed (all 100% correct at [1,4,8] StoryRewrite, uncommitted): **T2.1** (`signs_cat` → per-gallery device
+pointer table in `bdp_recall_batched` — kernel+FFI+wrapper; bit-exact vs the concatenated path per
+`select_harness_smoke` at entries 256/2048/8192, all 100% match; removes the one O(depth) selection copy),
+**T2.3** (hoisted `q_pos_dec`/prefill `q_pos`/`flat_ids` out of the layer loop), **T2.4** (validity mask
+built on-device, host double-loop removed), **T2.5** (MoE double-RMSNorm removed — q8 derived from the
+routed `normed` via a quantize-only launch instead of re-normalizing), **Tier-3 decode narrow-then-cat**
+(one `reshape((1,n_dec,dim))` view instead of `n_dec` narrow slices). Model-level t/s flat in the shallow
+[1,4,8] dev regime (all are launch-count/compute reductions masked by the WDDM floor + MoE bound; T2.1's
+win is depth-scaling and not visible until production depth).
+**Not landed:** **T2.2** (dead zero-inits) — needs a new public candle-core uninit API AND risks
+uninit-memory garbage if any kernel doesn't write every lane, for a `cuMemset`-removal win unmeasurable
+at the model level; net-negative EV, skipped. **Tier-3 dead-kernel deletion** — the non-batched
+`bdp_recall`/`topm_select`/`two_stage_select` are NOT dead (live on the single-session engine decode path
+`kernel_attention.rs:323`, the out-of-regime prefill fallback `:504`, and the streaming reference
+`engine.rs:948`) — genuine alternate paths, not dual-path shims; doc premise was wrong. **Tier-3
+`norm_w` cast** — already a no-op (`dequant_f32` loads it F32). Remaining Tier-3 (single-session
+micro-uploads, ascending re-sort, Phase-B pad+cat+stack, HCA arange) are low-value / non-product-path /
+conditional — assessed, not landed.
+
+## Tier-1 measured outcomes (2026-08-10)
+Landed: **T1.1** (shared q8a128 activation, bit-identical), **T1.3** (fused `rms_scale`/`rms_norm_entry`),
+**T1.2d** (padded `sK` + ldmatrix B-load, +0.6% isolated decode-kernel, bit-exact). Reverted as measured
+non-wins on the `latent_decode_bench` (200k-depth, 640 keys/query, baseline 0.833 ms/call): **T1.2a** int4
+packs (0.837, within noise), **T1.2b** PV single-read (**0.911, −10%** — `beta[2][8]` registers cost
+occupancy on the `__launch_bounds__(256,4)` kernel), **T1.2c** A-frag hoist (0.843, −1%, +8 regs occupancy).
+Lesson confirmed by the kernel's own top comment: this decode kernel is occupancy/latency-bound with load
+latency already hidden by the 640 independent blocks, so **memory-traffic and store-width cuts buy nothing
+and register/smem additions actively hurt**. Only T1.2d (which removes an MMA *bank conflict*, not traffic)
+helped. Full model [1,4,8] gate stayed 100% correct (StoryRewrite); model-level t/s flat (decode is
+WDDM-launch-floor + MoE bound, so the sub-percent kernel win is invisible end-to-end).
 **Model:** 284B / 13B-active MoE, single-latent K≡V attention (HEAD_DIM=512, NOPE_DIM=448, ROPE_DIM=64),
 streaming MXFP4 experts, 43 layers. RTX PRO 5000 Blackwell 72 GB (sm_120), WDDM.
 
@@ -59,11 +92,21 @@ real levers; pure parallel-compute cuts are hidden under the launch floor at dec
   relocation. **This is the reframed "x-proj concat" — the earlier int8-KO-weight-surgery worry was
   unfounded; `qkv_segmented` does the multi-weight-single-launch already.**
 - **Hotness:** MAXIMAL (per projection × 43 × every token).
+- **OUTCOME (LANDED):** `shared_int8_forward(x, &[&QLinear])` in `linear.rs` (the "minimal"
+  `forward_dynamic` shared-operand path, not `qkv_segmented`). Provably bit-identical: `forward_via_int8`
+  *is* `to_dynamic + forward_dynamic`, so sharing the operand only elides the duplicate deterministic
+  quantize. Wired into wq_a+wkv (prefill/decode/kernel_attention/wave) and wkv+wgate (compressor
+  pool/project_row/project_rows). 100% correct at [1,4,8].
 
 ### T1.2 — Port the prefill attention kernel's vectorization to the decode kernel
 The decode kernel (`candle-kernels/src/paged-latent/latent_decode_kernel.cuh`) is the hottest kernel and
 memory-bound, but does scalar/strided memory where `latent_prefill_kernel.cuh` already went wide. All
 bit-exact with a tested prefill precedent.
+
+> **OUTCOME:** only **T1.2d LANDED** (+0.6%, bit-exact). **T1.2a/b/c REVERTED** as measured non-wins —
+> this kernel is occupancy-bound with load latency already hidden by its 640 independent blocks, so the
+> traffic/store cuts (a/b) buy nothing and the register-adding hoists (b/c) drop below 4 blocks/SM. See
+> the Tier-1 measured-outcomes block at the top. Do not re-chase T1.2a/b/c without new hardware.
 
 - **T1.2a — Pack int8 stores into `int4`.** `sQ`/`sK` int8 stores are 16–32 scalar `STS.S8`
   (`latent_decode_kernel.cuh:225-229` `sQ`, `:398-402` `sK`); prefill packs them
@@ -104,8 +147,12 @@ bit-exact with a tested prefill precedent.
   `rms_norm_entry` → `candle_nn::ops::rms_norm(x, &norm_w_f32, eps)` with `norm_w_f32` cached at
   construction (also kills the per-call weight cast).
 - **Confidence:** HIGH (`rms_scale`, per-token × 43) / MEDIUM (`rms_norm_entry`, per-group × 43). Pure
-  launch reduction, no sync to relocate. Callers of `rms_scale`: `attention.rs:102/284/391`,
-  `kernel_attention.rs:406`.
+  launch reduction, no sync to relocate. Callers of `rms_scale`: `attention.rs:102/391`,
+  `kernel_attention.rs:284/406`, `wave.rs:777/1158` (more sites than first listed).
+- **OUTCOME (LANDED):** `rms_scale` is now an `Attention` method over a cached unit-weight `ones_hd`;
+  compressor `rms_norm`/`rms_norm_entry` fused too. CPU equivalence tests (fused vs eager, <1e-5) added.
+  100% correct at [1,4,8]. (Kept even though model-level t/s is flat — fewer launches is a real
+  work reduction that will surface once the WDDM launch floor lifts.)
 
 ---
 
@@ -120,8 +167,11 @@ bit-exact with a tested prefill precedent.
   `O(Σ len_s · words)` D2D copy that **grows without bound with context depth** (~8 MB/layer at 64×8192,
   ~350 MB/token). The one selection cost that scales with unbounded context.
 - **Fix:** give `bdp_recall_batched` a per-gallery **device pointer table** reading each gallery's
-  `packed_signs()` in place — the exact pattern `gather_corpus_batched` /
-  `run_corpus_gather_rows_batched` already use (`gallery.rs:1530-1564`). Needs a kernel-signature change.
+  `packed_signs()` in place — the same pointer-table shape `gather_corpus_batched` /
+  `run_corpus_gather_rows_batched` already use (`gallery.rs:~1530-1564`, though that one builds the table
+  from `hot_region_ptrs()`, not `packed_signs()`). Needs a kernel-signature change.
+- **Note:** gallery.rs line numbers in this doc are ~15 low vs the current file (the file drifted); the
+  cited regions are otherwise accurate. wave/paged/hyper/engine/attention/compressor refs are exact.
 - **Confidence:** HIGH for the unbounded-context product regime; pure copy, not a drain relocation.
 - **Hotness:** very high (per CSA layer × token × wave).
 
@@ -153,12 +203,13 @@ bit-exact with a tested prefill precedent.
 - **Confidence:** HIGH (q_pos_dec) → LOW; all genuine upload/alloc removals, none drain relocations.
 
 ### T2.4 — Build selection masks on-device instead of host-uploading them
-- **Category:** 1 + 4. **Where:** `gallery.rs:1423-1430` (`two_stage_select_batched` validity mask) and
-  `gallery.rs:622-628` (`batched_causal_select` causal mask).
-- **Issue:** both build an `O(rows·cols)` mask on the host in a double loop and H2D-upload it every call.
-  The mask is a pure function of a small per-row count: `col_index < count[row]`.
-- **Fix:** upload only the `[rows]` count vector, form the mask on-device via
-  `arange(cols).broadcast_lt(&count.unsqueeze(1))?.affine(...)`. Removes the host loop + large H2D.
+- **Category:** 1 + 4. **Where (remaining):** `two_stage_select_batched` validity mask (~`gallery.rs:1438-1444`,
+  host double loop `validv` then `affine`). The `batched_causal_select` mask (`gallery.rs:629-643`) is
+  **already on-device** (`arange`/`broadcast_lt`/`affine`, landed in commit 5d3928aa) — do NOT redo it.
+- **Issue:** the validity mask builds an `O(big·mm)` mask on the host in a double loop and H2D-uploads it
+  every call. It is a pure function of a small per-row count: `col_index < a.m_s`.
+- **Fix:** upload only the `[big]` count vector, form the mask on-device via
+  `arange(mm).broadcast_lt(&count.unsqueeze(1))?.affine(...)`. Removes the host loop + large H2D.
 - **Confidence:** MEDIUM (per CSA layer × token for the batched select). Genuine host-work + copy removal.
 
 ### T2.5 — Remove the double RMSNorm in `moe_forward_batch`
@@ -234,16 +285,21 @@ bit-exact with a tested prefill precedent.
 
 ## Recommended implementation order
 
-1. **T1.3 (fuse `rms_scale`)** — trivial, clean, per-token launch cut, exactly mirrors an already-blessed
-   fusion. Warm-up win.
-2. **T1.1 (shared q8a128 activation)** — biggest single lever, now low-risk (API + MoE precedent exist).
-   Gate bit-exact (q8a128 quant of a shared operand is identical to quantizing per call).
-3. **T1.2a → T1.2b → T1.2c → T1.2d (decode-kernel vectorization)** — biggest wins on the hottest kernel;
-   all bit-exact with a `latent_prefill_kernel.cuh` template. Do in that order (risk ascending); measure
-   occupancy after 2c/2d.
-4. **T2.2 (dead zero-inits)**, **T2.3 (hoist uploads)**, **T2.1 (`signs_cat` pointer table)** — the
-   `signs_cat` fix matters most at production depth (unbounded context).
-5. **T2.4 / T2.5 / Tier 3** as time allows; confirm-and-delete the dead non-batched selection kernels.
+**Tier 1 — DONE (2026-08-10):** T1.3 ✅, T1.1 ✅, T1.2d ✅ landed; T1.2a/b/c reverted (measured non-wins).
+
+Remaining (Tier 2):
+1. **T2.1 (`signs_cat` pointer table)** — matters most at production depth (the one selection cost that
+   scales unbounded with context). HIGH confidence.
+2. **T2.3 (hoist per-layer uploads)** — `q_pos_dec` HIGH (decode launch-bound); rest LOW-MED.
+3. **T2.2 (dead zero-inits)** — driver-memset + pool-churn cut; confirm each kernel fully overwrites.
+4. **T2.4 (validity mask on-device)** — only the `two_stage_select_batched` half remains.
+5. **T2.5 (MoE double-RMSNorm)** / **Tier 3** as time allows; confirm-and-delete the dead non-batched
+   selection kernels.
+
+**Validation discipline (reinforced by the Tier-1 results):** measure every kernel change on
+`latent_decode_bench` / `latent_prefill_bench` (isolated, seconds) AND the [1,4,8] model gate before
+keeping it — static "obvious win" reasoning failed for 3 of 4 T1.2 items because the decode kernel is
+occupancy-bound. Revert anything that improves a span but not the wall clock.
 
 **Validation discipline (from the last round):** each change must show a real **wall-clock** t/s
 improvement at `[1,4,8]` (full path filter `models::deepseek4::wave::tests::test_parallel_batched_forwarding`

@@ -21,7 +21,7 @@
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::ops::softmax;
 
-use super::linear::QLinear;
+use super::linear::{shared_int8_pair, QLinear};
 use super::rope::RotaryCache;
 
 /// One compressor instance (attention-side or indexer-side). `head_dim` is the width of
@@ -87,8 +87,8 @@ impl Compressor {
         let cutoff = groups * r;
 
         let x = x.to_dtype(DType::F32)?;
-        let kv = self.wkv.forward(&x)?; // [b,s,cd]
-        let score = self.wgate.forward(&x)?;
+        // wkv and wgate share the activation `x`; quantize it once for both projections.
+        let (kv, score) = shared_int8_pair(&x, &self.wkv, &self.wgate)?;
 
         let kv = kv.narrow(1, 0, cutoff)?.reshape((b, groups, r, cd))?;
         let ape = self.ape.to_dtype(DType::F32)?.reshape((1, 1, r, cd))?;
@@ -158,9 +158,12 @@ impl Compressor {
     }
 
     fn rms_norm(&self, x: &Tensor) -> Result<Tensor> {
-        let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x.broadcast_div(&(ms + self.eps)?.sqrt()?)?;
-        normed.broadcast_mul(&self.norm_w.to_dtype(DType::F32)?)
+        // Single fused `rms_norm` launch (`x·rsqrt(mean(x²)+eps)·w`) instead of the
+        // eager sqr/mean/add/sqrt/div/mul chain. `to_dtype(F32)` on an already-F32
+        // `norm_w` is a no-op.
+        let x = x.to_dtype(DType::F32)?;
+        let w = self.norm_w.to_dtype(DType::F32)?;
+        candle_nn::ops::rms_norm(&x, &w, self.eps as f32)
     }
 
     /// The number of compressed entries produced for a prefix of length `seq`.
@@ -185,8 +188,7 @@ impl Compressor {
     /// per-token `x·wkvᵀ` / `x·wgateᵀ` that `pool` computes for the whole prefix at once.
     fn project_row(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let x = x.reshape((1, self.wkv.in_dim()))?.to_dtype(DType::F32)?;
-        let kv = self.wkv.forward(&x)?; // [1, cd]
-        let score = self.wgate.forward(&x)?; // [1, cd]
+        let (kv, score) = shared_int8_pair(&x, &self.wkv, &self.wgate)?;
         Ok((kv, score))
     }
 
@@ -200,8 +202,7 @@ impl Compressor {
     pub fn project_rows(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
         let n = xs.elem_count() / self.wkv.in_dim();
         let xf = xs.reshape((n, self.wkv.in_dim()))?.to_dtype(DType::F32)?;
-        let kv = self.wkv.forward(&xf)?; // [n, cd]
-        let score = self.wgate.forward(&xf)?; // [n, cd]
+        let (kv, score) = shared_int8_pair(&xf, &self.wkv, &self.wgate)?;
         Ok((kv, score))
     }
 
@@ -668,9 +669,11 @@ impl IncrementalCompressor {
     }
 
     fn rms_norm_entry(&self, x: &Tensor) -> Result<Tensor> {
-        let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x.broadcast_div(&(ms + self.c.eps)?.sqrt()?)?;
-        normed.broadcast_mul(&self.c.norm_w.to_dtype(DType::F32)?)
+        // Single fused `rms_norm` launch, mirroring `Compressor::rms_norm`. `to_dtype(F32)`
+        // on an already-F32 `norm_w` is a no-op.
+        let x = x.to_dtype(DType::F32)?;
+        let w = self.c.norm_w.to_dtype(DType::F32)?;
+        candle_nn::ops::rms_norm(&x, &w, self.c.eps as f32)
     }
 }
 

@@ -1131,14 +1131,16 @@ pub fn bdp_recall(q_signs: &Tensor, signs: &Tensor, dim: usize) -> Result<Tensor
 
 /// Batched BDP recall across `n_sess` concurrent decode sessions in ONE launch.
 /// `q_signs` `[n_sess·n_heads, words]` are the sessions' packed query heads (row
-/// `s·n_heads + h`), `signs` `[total_g, words]` the concatenated per-session
-/// packed entries, `off`/`cnt` `[n_sess]` u32 each session's entry base/count in
-/// `signs`. Returns `counts` `[total_g]` — byte-identical per session to the
+/// `s·n_heads + h`); `sign_tensors[s]` `[cnt[s], words]` is session `s`'s own
+/// resident packed-sign index, **read in place** via a device pointer table (no
+/// concatenation — that copy grew `O(Σlen·words)` with context depth). `off`/`cnt`
+/// `[n_sess]` u32 give each session's base/count in the concatenated `counts`
+/// output. Returns `counts` `[total_g]` — byte-identical per session to the
 /// per-session [`bdp_recall`]. `max_g` = the largest `cnt[s]`.
 #[cfg(feature = "cuda")]
 pub fn bdp_recall_batched(
     q_signs: &Tensor,
-    signs: &Tensor,
+    sign_tensors: &[Tensor],
     off: &Tensor,
     cnt: &Tensor,
     n_sess: usize,
@@ -1149,32 +1151,61 @@ pub fn bdp_recall_batched(
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::Storage;
     let words = sign_words(dim);
-    let total_g = signs.dim(0)?;
-    let dev = match signs.device() {
+    let total_g: usize = sign_tensors
+        .iter()
+        .map(|t| t.dim(0))
+        .sum::<Result<usize>>()?;
+    let dev = match q_signs.device() {
         Device::Cuda(d) => d.clone(),
         _ => candle::bail!("bdp_recall_batched requires CUDA"),
     };
     let stream = dev.cuda_stream();
-    let counts = Tensor::zeros(total_g, DType::U32, signs.device())?;
+    let counts = Tensor::zeros(total_g.max(1), DType::U32, q_signs.device())?;
+    // Per-session base pointer table: each session's signs are read in place (the
+    // sign index is always GPU-resident), so no depth-scaling `cat`.
+    let mut sign_ptrs: Vec<i64> = Vec::with_capacity(n_sess);
+    for t in sign_tensors {
+        let (st, layout) = t.storage_and_layout();
+        let p = match &*st {
+            Storage::Cuda(c) => {
+                c.as_cuda_slice::<u32>()?
+                    .slice(layout.start_offset()..)
+                    .device_ptr(&stream)
+                    .0
+            }
+            _ => candle::bail!("bdp_recall_batched requires CUDA sign storage"),
+        };
+        sign_ptrs.push(p as i64);
+    }
+    let sign_ptrs_t = Tensor::from_vec(sign_ptrs, n_sess, q_signs.device())?;
     {
         let (sq, _) = q_signs.storage_and_layout();
-        let (ss, _) = signs.storage_and_layout();
         let (soff, _) = off.storage_and_layout();
         let (scnt, _) = cnt.storage_and_layout();
         let (sc, _) = counts.storage_and_layout();
-        let ptr = |st: &Storage| -> Result<u64> {
+        let (sp, _) = sign_ptrs_t.storage_and_layout();
+        let ptr_u32 = |st: &Storage| -> Result<u64> {
             match st {
                 Storage::Cuda(c) => Ok(c.as_cuda_slice::<u32>()?.device_ptr(&stream).0),
                 _ => unreachable!(),
             }
         };
-        let (qp, op, cp, np, outp) = (ptr(&sq)?, ptr(&ss)?, ptr(&soff)?, ptr(&scnt)?, ptr(&sc)?);
+        let table = match &*sp {
+            Storage::Cuda(c) => c.as_cuda_slice::<i64>()?.device_ptr(&stream).0,
+            _ => unreachable!(),
+        };
+        let (qp, op, cp, outp) = (
+            ptr_u32(&sq)?,
+            ptr_u32(&soff)?,
+            ptr_u32(&scnt)?,
+            ptr_u32(&sc)?,
+        );
         let code = unsafe {
             candle_kernels::simple::bdp::run_bdp_recall_batched(
                 qp as *const u32,
+                table as *const u64,
                 op as *const u32,
                 cp as *const u32,
-                np as *const u32,
                 outp as *mut u32,
                 n_sess as i32,
                 n_heads as i32,
@@ -1308,7 +1339,10 @@ pub fn two_stage_select_batched(
                 .collect::<Result<Vec<_>>>()?,
             0,
         )?; // [nd*h, words]
-        let mut sign_views: Vec<Tensor> = Vec::with_capacity(nd);
+            // Per-session resident sign indices, read in place via a device pointer table
+            // inside `bdp_recall_batched` — no depth-scaling concatenation. The gallery owns
+            // each `signs` buffer (never spilled), so these views stay valid for the launch.
+        let mut sign_tensors: Vec<Tensor> = Vec::with_capacity(nd);
         let mut off = Vec::with_capacity(nd);
         let mut cnt = Vec::with_capacity(nd);
         let mut running = 0u32;
@@ -1317,21 +1351,16 @@ pub fn two_stage_select_batched(
             let len = galleries[s].len;
             off.push(running);
             cnt.push(len as u32);
-            sign_views.push(galleries[s].packed_signs()?);
+            sign_tensors.push(galleries[s].packed_signs()?);
             running += len as u32;
             max_g = max_g.max(len);
         }
-        let signs_cat = if sign_views.len() == 1 {
-            sign_views[0].clone()
-        } else {
-            Tensor::cat(&sign_views, 0)?
-        };
         let off_t = Tensor::from_vec(off, nd, &dev)?;
         let cnt_t = Tensor::from_vec(cnt, nd, &dev)?;
         let bins = n_heads * ihd + 1;
         let counts = bdp_recall_batched(
             &q_signs_cat,
-            &signs_cat,
+            &sign_tensors,
             &off_t,
             &cnt_t,
             nd,
@@ -1435,13 +1464,16 @@ pub fn two_stage_select_batched(
     let weighted = scores.broadcast_mul(&w_all.unsqueeze(2)?)?.sum(1)?; // [big, mm]
                                                                         // Mask padding columns to −∞ (padding keys score 0, which could outrank a
                                                                         // genuinely negative-scoring real entry — the mask keeps padding out of top-k).
-    let mut validv = vec![0f32; big * mm];
-    for (i, a) in active.iter().enumerate() {
-        for j in 0..a.m_s {
-            validv[i * mm + j] = 1.0;
-        }
-    }
-    let neg = Tensor::from_vec(validv, (big, mm), &dev)?.affine(1e30, -1e30)?; // 0 valid, −1e30 pad
+                                                                        // Padding mask formed ON DEVICE: column j is valid for row i iff j < m_s[i].
+                                                                        // `col < count` → {1,0}; `affine(1e30, −1e30)` → {0, −1e30} exactly (1·1e30 − 1e30 = 0).
+                                                                        // Only the tiny [big] count vector is uploaded, not the full [big·mm] host-built mask.
+    let counts: Vec<u32> = active.iter().map(|a| a.m_s as u32).collect();
+    let counts = Tensor::from_vec(counts, (big, 1), &dev)?;
+    let col = Tensor::arange(0u32, mm as u32, &dev)?.reshape((1, mm))?;
+    let neg = col
+        .broadcast_lt(&counts)?
+        .to_dtype(DType::F32)?
+        .affine(1e30, -1e30)?; // valid → 0, pad → −1e30
     let weighted = weighted.broadcast_add(&neg)?;
     // One batched argsort (descending) + one batched gather of the top-max_k
     // shortlist-relative ids through each session's `sl` → absolute entry ids.

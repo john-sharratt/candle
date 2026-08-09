@@ -366,7 +366,7 @@ pub fn load_attention(
         compressor,
         indexer,
     };
-    Ok(Attention::new(cfg, layer, p))
+    Attention::new(cfg, layer, p)
 }
 
 /// Slice a 3D expert tensor `[n_experts, out, inn]` into per-expert `QMatMul`s. Each
