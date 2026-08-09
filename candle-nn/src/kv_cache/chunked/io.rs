@@ -316,7 +316,14 @@ impl ChunkedKvBacking {
                     })?;
 
                 let k_seg = k.narrow(2, src_pos, seg)?.contiguous()?;
-                let v_seg = v.narrow(2, src_pos, seg)?.contiguous()?;
+                // The single latent aliases V to K (the V bands are never stored,
+                // see the `single_latent` skip below), so slicing/copying `v` here
+                // is pure dead work — build the V segment only when it is written.
+                let v_seg = if single_latent {
+                    None
+                } else {
+                    Some(v.narrow(2, src_pos, seg)?.contiguous()?)
+                };
 
                 // Band path: each head has `n_palette` K/V sub-chunks of width
                 // head_dim / n_palette (4 for GQA, LATENT_N_BANDS for the
@@ -328,15 +335,16 @@ impl ChunkedKvBacking {
                     let sub_head_dim = (self.inner.head_dim / np).max(1);
                     for h in 0..n_kv_head {
                         let k_head = k_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
-                        let v_head = v_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
+                        let v_head = match &v_seg {
+                            Some(vs) => Some(vs.narrow(1, h, 1)?.squeeze(1)?), // (1, seg, head_dim)
+                            None => None,
+                        };
 
                         for p in 0..np {
                             let d_start = p * sub_head_dim;
                             let k_band = k_head.narrow(2, d_start, sub_head_dim)?.contiguous()?;
-                            let v_band = v_head.narrow(2, d_start, sub_head_dim)?.contiguous()?;
 
                             let k_gid = cw.gids.k_gid_pal(h, p);
-                            let v_gid = cw.gids.v_gid_pal(h, p);
 
                             let k_ai = k_gid.arena_idx();
                             let k_ci = k_gid.chunk_idx();
@@ -377,6 +385,14 @@ impl ChunkedKvBacking {
                                 continue;
                             }
 
+                            // Reached only for real K/V backings (GQA); build the
+                            // V band here so the single-latent path never pays it.
+                            let v_band = v_head
+                                .as_ref()
+                                .expect("v_head present for a real K/V backing")
+                                .narrow(2, d_start, sub_head_dim)?
+                                .contiguous()?;
+                            let v_gid = cw.gids.v_gid_pal(h, p);
                             let v_ai = v_gid.arena_idx();
                             let v_ci = v_gid.chunk_idx();
                             let v_arena = arenas.get(&v_ai).ok_or_else(|| {

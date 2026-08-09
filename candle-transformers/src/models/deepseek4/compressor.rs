@@ -383,6 +383,161 @@ impl IncrementalCompressor {
         self.c.project_rows(xs)
     }
 
+    /// Number of rows currently buffered in the incomplete group (`0..ratio`).
+    /// The causal-visibility bound for a batched prefill: after consuming `t+1`
+    /// rows this call, `(buffered_len() + t + 1) / ratio` groups are complete.
+    pub fn buffered_len(&self) -> usize {
+        self.kv_rows.len()
+    }
+
+    /// This compressor's group size (`ratio`).
+    pub fn ratio(&self) -> usize {
+        self.c.ratio
+    }
+
+    /// Batched, carried-state-aware group emission: consume `n` pre-projected
+    /// rows (`kv`/`score` each `[n, cd]`, from [`Compressor::project_rows`]) and
+    /// emit EVERY complete group they form in one batched pool — bit-identical to
+    /// streaming the same rows one at a time through [`Self::push_projected`]
+    /// (`rope = None`, pre-RoPE attn entries; matches `emit_group_raw`) or
+    /// [`Self::push_projected_roped`] (`rope = Some`, roped indexer keys; matches
+    /// `emit_group`). The carried partial-group buffer and the overlap prev-group
+    /// seed the first emitted group, so a prefill that resumes mid-group
+    /// (`base > 0`, non-empty buffer) is handled exactly. Returns
+    /// `(entries [G, head_dim], group-start positions [G])`, or `None` when the
+    /// rows complete no group (all buffered for the next call).
+    pub fn emit_groups_projected(
+        &mut self,
+        kv: &Tensor,
+        score: &Tensor,
+        rope: Option<&RotaryCache>,
+    ) -> Result<Option<(Tensor, Vec<u32>)>> {
+        let r = self.c.ratio;
+        let d = self.c.head_dim;
+        let cd = self.c.cd();
+        let dev = self.c.device().clone();
+        let n = kv.dim(0)?;
+
+        // Combined stream = carried partial-group rows ++ the new rows, so a
+        // resume mid-group starts exactly where the per-token buffer left off.
+        let l0 = self.kv_rows.len();
+        let (kv_comb, score_comb) = if l0 == 0 {
+            (kv.clone(), score.clone())
+        } else {
+            let ck = Tensor::cat(&self.kv_rows.iter().collect::<Vec<_>>(), 0)?;
+            let cs = Tensor::cat(&self.score_rows.iter().collect::<Vec<_>>(), 0)?;
+            (Tensor::cat(&[&ck, kv], 0)?, Tensor::cat(&[&cs, score], 0)?)
+        };
+        let n_tot = l0 + n;
+        let groups = n_tot / r;
+        if groups == 0 {
+            // No group completes: buffer every combined row for the next call.
+            // `force_contiguous` (not `contiguous`, a no-op on these already-
+            // contiguous views) copies each row into its own storage so the
+            // combined-stream buffer is not pinned across calls.
+            self.kv_rows = (0..n_tot)
+                .map(|i| kv_comb.narrow(0, i, 1)?.force_contiguous())
+                .collect::<Result<_>>()?;
+            self.score_rows = (0..n_tot)
+                .map(|i| score_comb.narrow(0, i, 1)?.force_contiguous())
+                .collect::<Result<_>>()?;
+            return Ok(None);
+        }
+        let cutoff = groups * r;
+
+        // [groups, r, cd] group rows; `ape` is added to the score BEFORE the
+        // overlap split (matches `pool` / `emit_group_raw`).
+        let kv_g = kv_comb.narrow(0, 0, cutoff)?.reshape((groups, r, cd))?;
+        let ape = self.c.ape.to_dtype(DType::F32)?.reshape((1, r, cd))?;
+        let score_g = score_comb
+            .narrow(0, 0, cutoff)?
+            .reshape((groups, r, cd))?
+            .broadcast_add(&ape)?;
+
+        let entry = if self.c.overlap {
+            let curr_kv = kv_g.narrow(D::Minus1, d, d)?; // [groups, r, d]
+            let curr_score = score_g.narrow(D::Minus1, d, d)?;
+            let prev_src_kv = kv_g.narrow(D::Minus1, 0, d)?; // [groups, r, d]
+            let prev_src_score = score_g.narrow(D::Minus1, 0, d)?;
+            // prev[0] = carried prev group's first-half (pad kv=0 / score=−inf for
+            // a true group 0), prev[j>0] = group j−1's first-half — the batch-wise
+            // form of `overlap_transform`'s `prev[g] = prev_src[g−1]` shift.
+            let (p0_kv, p0_score) = match (&self.prev_kv_group, &self.prev_score_group) {
+                (Some(pk), Some(ps)) => (
+                    pk.narrow(D::Minus1, 0, d)?.reshape((1, r, d))?,
+                    ps.narrow(D::Minus1, 0, d)?.reshape((1, r, d))?,
+                ),
+                _ => (
+                    Tensor::zeros((1, r, d), DType::F32, &dev)?,
+                    Tensor::full(f32::NEG_INFINITY, (1, r, d), &dev)?,
+                ),
+            };
+            let prev_kv = if groups > 1 {
+                Tensor::cat(&[&p0_kv, &prev_src_kv.narrow(0, 0, groups - 1)?], 0)?
+            } else {
+                p0_kv
+            };
+            let prev_score = if groups > 1 {
+                Tensor::cat(&[&p0_score, &prev_src_score.narrow(0, 0, groups - 1)?], 0)?
+            } else {
+                p0_score
+            };
+            let kv_pool = Tensor::cat(&[&prev_kv, &curr_kv], 1)?; // [groups, 2r, d]
+            let score_pool = Tensor::cat(&[&prev_score, &curr_score], 1)?;
+            let w = softmax(&score_pool, 1)?;
+            kv_pool.broadcast_mul(&w)?.sum(1)? // [groups, d]
+        } else {
+            let w = softmax(&score_g, 1)?;
+            kv_g.broadcast_mul(&w)?.sum(1)? // cd == d
+        };
+
+        // RMSNorm (batched over groups) then, for the indexer, RoPE at each
+        // group-start position — mirroring `emit_group_raw` / `emit_group`.
+        let entry = self.rms_norm_entry(&entry.reshape((1, groups, d))?)?; // [1, groups, d]
+        let positions: Vec<u32> = (0..groups)
+            .map(|j| ((self.group_idx + j) * r) as u32)
+            .collect();
+        let entry = match rope {
+            Some(rope) => {
+                let rd = self.c.rope_head_dim;
+                let nope = entry.narrow(D::Minus1, 0, d - rd)?;
+                let rope_part = entry.narrow(D::Minus1, d - rd, rd)?;
+                let rope_part = rope.apply_positions(&rope_part, &positions, false)?;
+                Tensor::cat(&[&nope, &rope_part], D::Minus1)?
+            }
+            None => entry,
+        };
+        let entry = entry.reshape((groups, d))?;
+
+        // Retain state: the last complete group as the next overlap prev, the
+        // trailing rows as the next partial buffer, and advance the group index.
+        // `force_contiguous` copies the small retained slices into their own
+        // storage (plain `contiguous` is a no-op on these contiguous views) so
+        // the combined-stream buffer is freed — matching the per-token path,
+        // whose prev group is a fresh `cat`, not a view into a large buffer.
+        self.prev_kv_group = Some(
+            kv_g.narrow(0, groups - 1, 1)?
+                .reshape((r, cd))?
+                .force_contiguous()?,
+        );
+        self.prev_score_group = Some(
+            score_g
+                .narrow(0, groups - 1, 1)?
+                .reshape((r, cd))?
+                .force_contiguous()?,
+        );
+        let rem = n_tot - cutoff;
+        self.kv_rows = (0..rem)
+            .map(|i| kv_comb.narrow(0, cutoff + i, 1)?.force_contiguous())
+            .collect::<Result<_>>()?;
+        self.score_rows = (0..rem)
+            .map(|i| score_comb.narrow(0, cutoff + i, 1)?.force_contiguous())
+            .collect::<Result<_>>()?;
+        self.group_idx += groups;
+
+        Ok(Some((entry, positions)))
+    }
+
     /// Pool → RMSNorm (NO RoPE): the position-free entry `[1, 1, d]` and its
     /// group-start position.
     fn emit_group_raw(&mut self) -> Result<(Tensor, u32)> {
@@ -757,6 +912,104 @@ mod tests {
     fn incremental_matches_prefill_nonoverlap() -> Result<()> {
         // ratio 3 (non-overlapping): 4 complete groups + 1 trailing token.
         incremental_matches_prefill_case(3, 5, 2, 13)
+    }
+
+    /// [`IncrementalCompressor::emit_groups_projected`] (batched, carried-state
+    /// aware) must be bit-identical to streaming the same pre-projected rows one
+    /// at a time through `push_projected` (raw) / `push_projected_roped` (roped) —
+    /// including across a call boundary that splits a group (the resume-mid-group
+    /// case a prefill at `base > 0` hits), for both the overlapping and
+    /// non-overlapping compressors.
+    fn emit_groups_batched_matches_streamed_case(
+        ratio: usize,
+        d: usize,
+        rd: usize,
+        s: usize,
+        split: usize,
+    ) -> Result<()> {
+        let dev = Device::Cpu;
+        let dim = 8usize;
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let c = Compressor::new(
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (ratio, coff * d), &dev)?,
+            Tensor::randn(0f32, 1.0, d, &dev)?,
+            ratio,
+            d,
+            rd,
+            1e-6,
+        );
+        let x = Tensor::randn(0f32, 1.0, (s, dim), &dev)?; // [s, dim]
+        let (kv_all, score_all) = c.project_rows(&x)?; // [s, cd]
+
+        let chunks = [(0usize, split), (split, s - split)];
+
+        // Streamed vs batched, over both the raw (pre-RoPE) and roped forms.
+        for roped in [false, true] {
+            let mut inc_s = c.incremental();
+            let mut ent_s: Vec<Tensor> = Vec::new();
+            let mut pos_s: Vec<u32> = Vec::new();
+            for t in 0..s {
+                let kv = kv_all.narrow(0, t, 1)?;
+                let sc = score_all.narrow(0, t, 1)?;
+                if roped {
+                    if let Some(e) = inc_s.push_projected_roped(&kv, &sc, &rope)? {
+                        ent_s.push(e.reshape((1, d))?);
+                    }
+                } else if let Some((e, p)) = inc_s.push_projected(&kv, &sc)? {
+                    ent_s.push(e.reshape((1, d))?);
+                    pos_s.push(p);
+                }
+            }
+
+            let mut inc_b = c.incremental();
+            let mut ent_b: Vec<Tensor> = Vec::new();
+            let mut pos_b: Vec<u32> = Vec::new();
+            for &(a, len) in &chunks {
+                if len == 0 {
+                    continue;
+                }
+                let kv = kv_all.narrow(0, a, len)?;
+                let sc = score_all.narrow(0, a, len)?;
+                let rope_arg = if roped { Some(&rope) } else { None };
+                if let Some((e, p)) = inc_b.emit_groups_projected(&kv, &sc, rope_arg)? {
+                    ent_b.push(e);
+                    pos_b.extend(p);
+                }
+            }
+
+            if !roped {
+                assert_eq!(pos_s, pos_b, "positions (ratio={ratio}, split={split})");
+            }
+            let a = Tensor::cat(&ent_s, 0)?.flatten_all()?.to_vec1::<f32>()?;
+            let b = Tensor::cat(&ent_b, 0)?.flatten_all()?.to_vec1::<f32>()?;
+            let max_abs = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_abs < 1e-6,
+                "batched vs streamed diverge (ratio={ratio}, split={split}, roped={roped}): max|Δ| = {max_abs}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn emit_groups_batched_matches_streamed() -> Result<()> {
+        // Overlapping (ratio 4): single-shot, split mid-group, split off-boundary,
+        // and a first chunk that completes NO group (all buffered → None).
+        emit_groups_batched_matches_streamed_case(4, 6, 4, 14, 14)?;
+        emit_groups_batched_matches_streamed_case(4, 6, 4, 14, 6)?;
+        emit_groups_batched_matches_streamed_case(4, 6, 4, 23, 7)?;
+        emit_groups_batched_matches_streamed_case(4, 6, 4, 14, 2)?;
+        // Non-overlapping (ratio 3).
+        emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 13)?;
+        emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 5)?;
+        Ok(())
     }
 
     /// `close` finalizes a trailing partial group of `n < ratio` buffered rows

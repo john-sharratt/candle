@@ -509,21 +509,42 @@ impl FloatGallery {
         top_m: usize,
         top_k: usize,
     ) -> Result<(Tensor, usize)> {
-        if self.len == 0 || top_k == 0 {
+        self.two_stage_select_causal(q_idx, weights, top_m, top_k, self.len)
+    }
+
+    /// As [`Self::two_stage_select`] but restricted to the first `n_causal`
+    /// entries — the causal-visibility bound a batched prefill needs when the
+    /// whole prompt's corpus is appended up front: a query at prompt position `p`
+    /// sees only the groups completed by `p`. Selecting over `[0, n_causal)` is
+    /// bit-identical to running against a gallery that held exactly that many
+    /// entries (each entry's sign-pack / key / score is independent of the ones
+    /// after it), so it reproduces the per-token incremental path exactly.
+    #[cfg(feature = "cuda")]
+    pub fn two_stage_select_causal(
+        &self,
+        q_idx: &Tensor,
+        weights: &Tensor,
+        top_m: usize,
+        top_k: usize,
+        n_causal: usize,
+    ) -> Result<(Tensor, usize)> {
+        let n = n_causal.min(self.len);
+        if n == 0 || top_k == 0 {
             return Ok((Tensor::zeros(1, DType::U32, &self.device)?, 0));
         }
         // The bitonic argsort caps at 1024 columns, which bounds the rescore
         // width — the recall shortlist itself is selected by the exact
         // histogram top-M (any corpus size).
-        let m = top_m.clamp(1, 1024).min(self.len);
+        let m = top_m.clamp(1, 1024).min(n);
 
-        // Stage 1 — recall: shortlist by packed-sign agreement.
-        let shortlist: Tensor = if m >= self.len {
-            Tensor::arange(0u32, self.len as u32, &self.device)?
+        // Stage 1 — recall: shortlist by packed-sign agreement over `[0, n)`.
+        let shortlist: Tensor = if m >= n {
+            Tensor::arange(0u32, n as u32, &self.device)?
         } else {
             let n_heads = q_idx.dim(0)?;
             let q_signs = sign_pack(q_idx)?;
-            let counts = bdp_recall(&q_signs, &self.packed_signs()?, self.index_head_dim)?;
+            let signs = self.signs.narrow(0, 0, n)?;
+            let counts = bdp_recall(&q_signs, &signs, self.index_head_dim)?;
             topm_select(&counts, m, n_heads * self.index_head_dim + 1)?
         };
 
@@ -554,6 +575,89 @@ impl FloatGallery {
             .contiguous()?;
         let gids_sorted = gids.index_select(&asc, 0)?;
         Ok((gids_sorted.contiguous()?, k))
+    }
+
+    /// Whole-prompt batched causal select: score every prompt token's roped
+    /// query against the corpus at once and take each token's causal top-k in a
+    /// few launches, replacing the per-token [`Self::two_stage_select_causal`]
+    /// loop. `q_idx` `[s, n_idx_heads, index_head_dim]` are the roped per-token
+    /// queries, `weights` `[s, n_idx_heads]` the gate weights, and `n_visible[t]`
+    /// the number of causally-visible entries for token `t` (`≤ len`).
+    ///
+    /// **Regime:** valid ONLY when the widest causal window fits the shortlist
+    /// width (`max(n_visible) ≤ top_m` at the call site, which the caller checks).
+    /// There the recall shortlist covers everything, so two-stage selection
+    /// degenerates to the exact full Indexer top-k — this computes exactly that,
+    /// bit-identical to `two_stage_select_causal(.., n_visible[t])` per token (a
+    /// unit gate proves it). For deeper prompts the caller keeps the per-token
+    /// recall path (whose shortlist approximation the batched exact top-k would
+    /// diverge from). The device argsort caps at 1024 columns, matched by the
+    /// same window bound. Returns each token's selected absolute entry ids,
+    /// ascending.
+    #[cfg(feature = "cuda")]
+    pub fn batched_causal_select(
+        &self,
+        q_idx: &Tensor,
+        weights: &Tensor,
+        n_visible: &[usize],
+        top_k: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        // Hot-only: reads `scoring_keys()` in place (not the tier-aware
+        // `gather_keys`), so the gallery must be GPU-resident or the rescore
+        // matmul mixes devices. The caller's regime gate (max n_visible ≤
+        // shortlist width ≤ 1024) keeps the corpus far below HOT_ENTRY_CAP, so an
+        // in-regime gallery is never spilled.
+        debug_assert!(
+            !self.spilled,
+            "batched_causal_select is hot-only (regime-gated below HOT_ENTRY_CAP)"
+        );
+        let s = q_idx.dim(0)?;
+        let h = q_idx.dim(1)?;
+        let ih = self.index_head_dim;
+        let n_corpus = n_visible.iter().copied().max().unwrap_or(0).min(self.len);
+        if n_corpus == 0 || top_k == 0 {
+            return Ok(vec![Vec::new(); s]);
+        }
+        // scores[t,h,g] = relu(q_th · k_g); weighted[t,g] = Σ_h scores · w_th.
+        let keys = self.scoring_keys()?.narrow(0, 0, n_corpus)?; // [n_corpus, ih]
+        let scores = q_idx
+            .reshape((s * h, ih))?
+            .matmul(&keys.t()?.contiguous()?)? // [s*h, n_corpus]
+            .reshape((s, h, n_corpus))?
+            .relu()?;
+        let weighted = scores.broadcast_mul(&weights.reshape((s, h, 1))?)?.sum(1)?; // [s, n_corpus]
+                                                                                    // Causal mask formed ON DEVICE: column g is invalid for token t once
+                                                                                    // g ≥ n_visible[t]. `col < count` → {1,0}; `affine(1e30, −1e30)` →
+                                                                                    // {0, −1e30} exactly (1·1e30 − 1e30 = 0), added so masked entries
+                                                                                    // never enter any top-k. Bit-identical to a host mask, without the
+                                                                                    // per-call H2D of an s×n_corpus buffer.
+        let counts: Vec<u32> = n_visible
+            .iter()
+            .map(|&nv| nv.min(n_corpus) as u32)
+            .collect();
+        let counts = Tensor::from_vec(counts, (s, 1), &self.device)?;
+        let col = Tensor::arange(0u32, n_corpus as u32, &self.device)?.reshape((1, n_corpus))?;
+        let mask = col
+            .broadcast_lt(&counts)?
+            .to_dtype(DType::F32)?
+            .affine(1e30, -1e30)?; // valid → 0, masked → −1e30
+        let weighted = weighted.broadcast_add(&mask)?;
+        // One batched descending argsort; the column index IS the absolute entry
+        // id (keys are `[0, n_corpus)` in order).
+        let kmax = top_k.min(n_corpus);
+        let order = weighted
+            .arg_sort_last_dim(false)?
+            .narrow(1, 0, kmax)?
+            .contiguous()?; // [s, kmax] u32
+        let order_v = order.to_vec2::<u32>()?;
+        let mut out = Vec::with_capacity(s);
+        for (t, &nv) in n_visible.iter().enumerate() {
+            let k_t = top_k.min(nv.min(n_corpus));
+            let mut ids: Vec<u32> = order_v[t][..k_t].to_vec();
+            ids.sort_unstable();
+            out.push(ids);
+        }
+        Ok(out)
     }
 
     /// Reference selector: the full Indexer top-k over ALL entries (no recall
@@ -2126,6 +2230,137 @@ mod tests {
             full,
             "M=64 on structured corpus must recover the full top-k"
         );
+        Ok(())
+    }
+
+    /// `two_stage_select_causal(.., n_causal = K)` over an N-entry gallery must be
+    /// bit-identical to `two_stage_select` over a gallery holding only the first
+    /// K of the same entries — the causal-prefix bound the batched prefill relies
+    /// on (each entry's sign-pack / key is independent of the ones after it).
+    #[test]
+    #[ignore]
+    fn two_stage_select_causal_matches_prefix_gallery() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut s = 17u64;
+        let n_full = 300usize;
+        let k_causal = 173usize; // arbitrary non-boundary prefix
+        let n_heads = 4usize;
+        let top_k = 8usize;
+
+        // Shared-direction query with per-head jitter (as in two_stage_equals_full).
+        let shared: Vec<f32> = (0..IH).map(|_| lcg(&mut s)).collect();
+        let q_vals: Vec<f32> = (0..n_heads)
+            .flat_map(|_| {
+                shared
+                    .iter()
+                    .map(|&v| v + lcg(&mut s) * 0.3)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let q = Tensor::from_vec(q_vals, (n_heads, IH), &dev)?;
+        let weights = Tensor::from_vec(vec![1.0f32; n_heads], n_heads, &dev)?;
+
+        // Plant a few relevant entries INSIDE the causal prefix so the shortlist
+        // is non-trivial and exact.
+        let mut keys = rows(n_full, IH, &mut s);
+        for (j, &e) in [3usize, 40, 88, 150, 170].iter().enumerate() {
+            for d in 0..IH {
+                keys[e * IH + d] = shared[d] * (2.0 + j as f32 * 0.1) + lcg(&mut s) * 0.1;
+            }
+        }
+        let attn = rows(n_full, HD, &mut s);
+        let pos: Vec<u32> = (0..n_full as u32).map(|i| i * 4).collect();
+
+        let mut gal_full = FloatGallery::new(&dev, HD, IH, 8)?;
+        gal_full.append_batch(
+            &Tensor::from_vec(attn.clone(), (n_full, HD), &dev)?,
+            &Tensor::from_vec(keys.clone(), (n_full, IH), &dev)?,
+            &pos,
+        )?;
+
+        // Prefix gallery: only the first K entries (identical bytes).
+        let mut gal_prefix = FloatGallery::new(&dev, HD, IH, 8)?;
+        gal_prefix.append_batch(
+            &Tensor::from_vec(attn[..k_causal * HD].to_vec(), (k_causal, HD), &dev)?,
+            &Tensor::from_vec(keys[..k_causal * IH].to_vec(), (k_causal, IH), &dev)?,
+            &pos[..k_causal],
+        )?;
+
+        for &m in &[64usize, 1024] {
+            let (a_t, ak) = gal_full.two_stage_select_causal(&q, &weights, m, top_k, k_causal)?;
+            let (b_t, bk) = gal_prefix.two_stage_select(&q, &weights, m, top_k)?;
+            assert_eq!(ak, bk, "k mismatch (m={m})");
+            assert_eq!(
+                a_t.to_vec1::<u32>()?,
+                b_t.to_vec1::<u32>()?,
+                "causal(K) over N-gallery must equal full over K-gallery (m={m})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whole-prompt [`FloatGallery::batched_causal_select`] must be bit-identical
+    /// to the per-token [`FloatGallery::two_stage_select_causal`] loop it replaces
+    /// in the in-regime case (widest window ≤ shortlist, so two-stage == full
+    /// top-k), across per-token causal bounds that grow with position.
+    #[test]
+    #[ignore]
+    fn batched_causal_select_matches_per_token() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut s = 23u64;
+        let n_corpus = 200usize; // ≤ 1024 → in-regime (exact) path
+        let n_tok = 40usize;
+        let n_heads = 4usize;
+        let top_k = 8usize;
+
+        // Corpus keys, a few planted along a shared direction so top-k is
+        // non-trivial; per-token queries share that direction with jitter.
+        let shared: Vec<f32> = (0..IH).map(|_| lcg(&mut s)).collect();
+        let mut keys = rows(n_corpus, IH, &mut s);
+        for (j, &e) in [3usize, 30, 77, 120, 160].iter().enumerate() {
+            for d in 0..IH {
+                keys[e * IH + d] = shared[d] * (2.0 + j as f32 * 0.1) + lcg(&mut s) * 0.1;
+            }
+        }
+        let attn = rows(n_corpus, HD, &mut s);
+        let pos: Vec<u32> = (0..n_corpus as u32).map(|i| i * 4).collect();
+        let mut gal = FloatGallery::new(&dev, HD, IH, 8)?;
+        gal.append_batch(
+            &Tensor::from_vec(attn, (n_corpus, HD), &dev)?,
+            &Tensor::from_vec(keys, (n_corpus, IH), &dev)?,
+            &pos,
+        )?;
+
+        let mut qv = Vec::with_capacity(n_tok * n_heads * IH);
+        for _ in 0..n_tok {
+            for _ in 0..n_heads {
+                for d in 0..IH {
+                    qv.push(shared[d] + lcg(&mut s) * 0.5);
+                }
+            }
+        }
+        let q_idx = Tensor::from_vec(qv, (n_tok, n_heads, IH), &dev)?;
+        let wv: Vec<f32> = (0..n_tok * n_heads).map(|_| 0.5 + lcg(&mut s)).collect();
+        let weights = Tensor::from_vec(wv, (n_tok, n_heads), &dev)?;
+
+        // Causal bound grows with position (groups completing), capped at n_corpus.
+        let n_visible: Vec<usize> = (0..n_tok).map(|t| ((t + 1) * 5).min(n_corpus)).collect();
+
+        let batched = gal.batched_causal_select(&q_idx, &weights, &n_visible, top_k)?;
+
+        for t in 0..n_tok {
+            let qt = q_idx.narrow(0, t, 1)?.reshape((n_heads, IH))?;
+            let wt = weights.narrow(0, t, 1)?.reshape(n_heads)?;
+            // top_m = n_corpus ≥ n_visible[t] → the m≥n (full top-k) branch.
+            let (gids_t, k) =
+                gal.two_stage_select_causal(&qt, &wt, n_corpus, top_k, n_visible[t])?;
+            let expect: Vec<u32> = if k == 0 {
+                Vec::new()
+            } else {
+                gids_t.to_vec1::<u32>()?
+            };
+            assert_eq!(batched[t], expect, "token {t} (n_visible={})", n_visible[t]);
+        }
         Ok(())
     }
 

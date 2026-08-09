@@ -1046,6 +1046,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let mut union: Vec<u32> = idx_rows.iter().flatten().copied().collect();
                 union.sort_unstable();
                 union.dedup();
+                // `pgather:corpus` — GPU gather of the selected-entry union into a
+                // contiguous corpus cache (decode's `decode:gather`/`decode:cache`).
+                let t_pg_corpus = profile_now();
                 let cache = match entry.layers[l].gallery.as_ref() {
                     Some(g) if !union.is_empty() => {
                         let ids = Tensor::from_vec(union.clone(), union.len(), dev)?;
@@ -1054,6 +1057,12 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     }
                     _ => st.empty_corpus_cache()?,
                 };
+                pipeline_record("pgather:corpus", t_pg_corpus);
+                // `pgather:remap` — HOST per-token remap of each query's absolute
+                // GIDs to their dense index in the compacted union, and the
+                // `comp_idx`/`comp_cnt`/`q_pos` uploads. O(s·max_sel) host work with
+                // no decode analogue (decode selects one row).
+                let t_pg_remap = profile_now();
                 let remap: HashMap<u32, u32> = union
                     .iter()
                     .enumerate()
@@ -1086,6 +1095,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     s_len,
                     dev,
                 )?;
+                pipeline_record("pgather:remap", t_pg_remap);
                 pipeline_record("prefill:gather", t_pgather);
                 let t_pkern = profile_now();
                 let out = super::paged::paged_latent_prefill_raw(

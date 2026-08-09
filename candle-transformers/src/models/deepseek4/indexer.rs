@@ -125,6 +125,31 @@ impl Indexer {
         Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?.reshape((h, hd))
     }
 
+    /// Batched RoPE over a whole prompt's [`Self::query_gemm_batched`] output:
+    /// `q_raw` `[s, n_heads, head_dim]` roped at contiguous token positions
+    /// `base .. base+s` (RoPE applied along the seq axis, matching `Indexer::scores`),
+    /// returning the roped per-head queries `[s, n_heads, head_dim]`. Row `t` is
+    /// bit-identical to [`Self::rope_query`] at `pos = base + t`.
+    pub fn rope_query_batched(
+        &self,
+        q_raw: &Tensor,
+        rope: &RotaryCache,
+        base: usize,
+    ) -> Result<Tensor> {
+        let (h, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        let s = q_raw.dim(0)?;
+        let q = q_raw
+            .reshape((1, s, h, hd))?
+            .transpose(1, 2)?
+            .contiguous()?; // [1,h,s,hd]
+        let q_nope = q.narrow(D::Minus1, 0, hd - rd)?;
+        let q_rope = rope.apply(&q.narrow(D::Minus1, hd - rd, rd)?, base, false)?; // positions base..base+s
+        Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((s, h, hd))
+    }
+
     /// A streaming compressor over the Indexer's own key space — the kernel
     /// path drives this directly (`push_raw`) to feed the `FloatGallery`.
     pub fn incremental_compressor(&self) -> super::compressor::IncrementalCompressor {

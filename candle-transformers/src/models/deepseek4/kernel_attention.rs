@@ -398,6 +398,9 @@ pub fn kernel_attn_prefill_prepare_batched(
     let xs = xs.to_dtype(DType::F32)?;
 
     // ── Batched attention projections: ONE GEMM each over all s tokens ──
+    // (`pprep:proj` — the stateless GEMMs, the prefill counterpart of decode's
+    // `dprep:proj`.)
+    let t_proj = profile_now();
     let qr_all = rms_norm(&a.wq_a().forward(&xs)?, a.q_norm(), a.eps())?; // [1,s,qa]
     let q_all = a.wq_b().forward(&qr_all)?.reshape((1, s, h, hd))?;
     let q_all = rms_scale(&q_all, a.eps())?;
@@ -414,62 +417,100 @@ pub fn kernel_attn_prefill_prepare_batched(
         Some(ic) => Some(ic.project_rows(&xs)?),
         None => None,
     };
+    pipeline_record("pprep:proj", t_proj);
 
-    // ── Per-token stateful pass: buffer pre-projected rows, emit completed
-    // groups, and select causally — same corpus/selection semantics as the
-    // per-token decode step, just fed pre-projected rows. ──
-    let mut idx_rows: Vec<Vec<u32>> = Vec::with_capacity(s);
-    for t in 0..s {
-        let pos = base + t;
-        // Corpus maintenance from the pre-projected rows (no per-row GEMV) —
-        // disjoint field borrows of comp/gallery/icomp.
-        if let (Some(comp), Some(gallery), Some((ck, cs))) =
-            (seq.comp.as_mut(), seq.gallery.as_mut(), comp_proj.as_ref())
-        {
-            if let Some((entry, gpos)) =
-                comp.push_projected(&ck.narrow(0, t, 1)?, &cs.narrow(0, t, 1)?)?
-            {
-                let key = match (seq.icomp.as_mut(), icomp_proj.as_ref()) {
-                    (Some(ic), Some((ik, is))) => ic
-                        .push_projected_roped(&ik.narrow(0, t, 1)?, &is.narrow(0, t, 1)?, rope)?
-                        .expect("indexer compressor shares group boundaries")
-                        .reshape((1, ()))?,
-                    _ => Tensor::zeros((1, 1), DType::F32, xs.device())?,
-                };
-                gallery.append_batch(&entry.reshape((1, hd))?, &key, &[gpos])?;
-            } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_proj.as_ref()) {
-                let none =
-                    ic.push_projected_roped(&ik.narrow(0, t, 1)?, &is.narrow(0, t, 1)?, rope)?;
-                debug_assert!(none.is_none(), "compressor group boundaries diverged");
-            }
+    // ── pprep:push — build the WHOLE prompt's compressed corpus in ONE batched
+    // emit + ONE append, the carried-state-aware batch form of the per-token
+    // push loop (bit-identical by `emit_groups_batched_matches_streamed`),
+    // instead of `s` per-token pool/append launches. The per-token select below
+    // reads a causal PREFIX of it. `comp`/`icomp` share group boundaries, so one
+    // emit drives the attn entries (pre-RoPE) and the indexer keys (roped). ──
+    let t_push = profile_now();
+    let ratio_comp = seq.comp.as_ref().map_or(1, |c| c.ratio());
+    let l0 = seq.comp.as_ref().map_or(0, |c| c.buffered_len()); // carried partial group
+    let base_entries = seq.gallery.as_ref().map_or(0, |g| g.len()); // corpus before this prefill
+    let mut g_total = 0usize;
+    if let (Some(comp), Some(gallery), Some((ck, cs))) =
+        (seq.comp.as_mut(), seq.gallery.as_mut(), comp_proj.as_ref())
+    {
+        if let Some((attn_entries, positions)) = comp.emit_groups_projected(ck, cs, None)? {
+            g_total = positions.len();
+            let key_entries = match (seq.icomp.as_mut(), icomp_proj.as_ref()) {
+                (Some(ic), Some((ik, is))) => {
+                    let (keys, kpos) = ic
+                        .emit_groups_projected(ik, is, Some(rope))?
+                        .expect("indexer compressor shares group boundaries");
+                    debug_assert_eq!(kpos, positions, "comp/icomp group boundaries diverged");
+                    keys // [g_total, index_head_dim]
+                }
+                _ => Tensor::zeros((g_total, 1), DType::F32, xs.device())?,
+            };
+            gallery.append_batch(&attn_entries, &key_entries, &positions)?;
+        } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_proj.as_ref()) {
+            let none = ic.emit_groups_projected(ik, is, Some(rope))?;
+            debug_assert!(none.is_none(), "compressor group boundaries diverged");
         }
+    }
+    pipeline_record("pprep:push", t_push);
 
-        // Per-token causal selection over the corpus completed so far.
-        let n_entries = seq.gallery.as_ref().map_or(0, |g| g.len());
-        let gids: Vec<u32> = if n_entries == 0 {
-            Vec::new()
-        } else {
-            let gallery = seq.gallery.as_ref().unwrap();
-            match a.kind() {
-                LayerKind::Csa => {
-                    let ix = a.indexer().expect("CSA layer has an indexer");
-                    let x_t = xs.narrow(1, t, 1)?;
-                    let qr_t = qr_all.narrow(1, t, 1)?;
-                    let (qi, w) = ix.query_space(&x_t, &qr_t, rope, pos)?;
-                    let (g, k) =
-                        gallery.two_stage_select(&qi, &w, shortlist_m(ix.top_k()), ix.top_k())?;
-                    if k == 0 {
+    // ── pprep:select — causal select over the up-front corpus. Each token sees
+    // the entries present before this prefill plus the groups completed through
+    // it (`(l0 + t + 1) / ratio`); bounding the select to that prefix reproduces
+    // the per-token incremental gallery exactly. ──
+    let t_sel = profile_now();
+    let n_visible: Vec<usize> = (0..s)
+        .map(|t| base_entries + ((l0 + t + 1) / ratio_comp).min(g_total))
+        .collect();
+    let idx_rows: Vec<Vec<u32>> = match a.kind() {
+        LayerKind::Csa => {
+            let ix = a.indexer().expect("CSA layer has an indexer");
+            let m = shortlist_m(ix.top_k());
+            let max_nv = base_entries + g_total; // widest window (the last token)
+            if max_nv == 0 {
+                vec![Vec::new(); s]
+            } else if max_nv <= m.min(1024) {
+                // In-regime: the shortlist covers every token's window, so
+                // two-stage recall degenerates to the exact full Indexer top-k —
+                // do the whole prompt in one batched query GEMM + one rescore +
+                // one argsort (bit-identical to the per-token loop by
+                // `batched_causal_select_matches_per_token`). Kills the per-token
+                // select launches that dominated `pprep:select`.
+                let (q_raw, weights) =
+                    ix.query_gemm_batched(&xs.reshape((s, ()))?, &qr_all.reshape((s, ()))?)?;
+                let q_idx = ix.rope_query_batched(&q_raw, rope, base)?; // [s,h,ih]
+                let gallery = seq.gallery.as_ref().unwrap();
+                gallery.batched_causal_select(&q_idx, &weights, &n_visible, ix.top_k())?
+            } else {
+                // Out-of-regime (corpus wider than the shortlist): the exact
+                // batched top-k would diverge from the per-token recall
+                // approximation the decode path uses, so keep the per-token
+                // recall select to preserve prefill≡decode parity on deep prompts.
+                let gallery = seq.gallery.as_ref().unwrap();
+                let mut rows = Vec::with_capacity(s);
+                for (t, &n_vis) in n_visible.iter().enumerate() {
+                    let gids = if n_vis == 0 {
                         Vec::new()
                     } else {
-                        g.to_vec1::<u32>()?
-                    }
+                        let x_t = xs.narrow(1, t, 1)?;
+                        let qr_t = qr_all.narrow(1, t, 1)?;
+                        let (qi, w) = ix.query_space(&x_t, &qr_t, rope, base + t)?;
+                        let (g, k) =
+                            gallery.two_stage_select_causal(&qi, &w, m, ix.top_k(), n_vis)?;
+                        if k == 0 {
+                            Vec::new()
+                        } else {
+                            g.to_vec1::<u32>()?
+                        }
+                    };
+                    rows.push(gids);
                 }
-                LayerKind::Hca => (0..n_entries as u32).collect(),
-                LayerKind::SlidingWindow => Vec::new(),
+                rows
             }
-        };
-        idx_rows.push(gids);
-    }
+        }
+        LayerKind::Hca => n_visible.iter().map(|&n| (0..n as u32).collect()).collect(),
+        LayerKind::SlidingWindow => vec![Vec::new(); s],
+    };
+    pipeline_record("pprep:select", t_sel);
     Ok((q_bf_all, kv_bf_all, idx_rows))
 }
 
