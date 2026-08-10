@@ -68,7 +68,9 @@ fn pool_prefill_across_seqs(
     let mut off = 0usize;
     for (i, g) in &some {
         let n = g.positions.len();
-        out[*i] = Some(pooled.narrow(0, off, n)?.contiguous()?);
+        // Dim-0 slice of the contiguous pooled block — a bare view (its
+        // `contiguous()` was a runtime no-op); `append_batch` reads it directly.
+        out[*i] = Some(pooled.narrow(0, off, n)?);
         off += n;
     }
     Ok(out)
@@ -1000,10 +1002,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let cache = if total_k == 0 {
                     st.empty_corpus_cache()?
                 } else {
-                    let out_nope = Tensor::zeros((total_k, NOPE_DIM), DType::U8, &dev)?;
-                    let out_scale = Tensor::zeros((total_k, NOPE_BANDS), DType::F32, &dev)?;
-                    let out_rope = Tensor::zeros((total_k, ROPE_DIM), DType::BF16, &dev)?;
-                    let out_pos = Tensor::zeros(total_k, DType::U32, &dev)?;
+                    // Gather-kernel output block (total_k>0 here — the ==0 case
+                    // took empty_corpus_cache above): every row written by the
+                    // gather, so allocate uninit and skip the memset.
+                    let out_nope = Tensor::empty((total_k, NOPE_DIM), DType::U8, &dev)?;
+                    let out_scale = Tensor::empty((total_k, NOPE_BANDS), DType::F32, &dev)?;
+                    let out_rope = Tensor::empty((total_k, ROPE_DIM), DType::BF16, &dev)?;
+                    let out_pos = Tensor::empty(total_k, DType::U32, &dev)?;
                     let mut gg: Vec<&FloatGallery> = Vec::with_capacity(n_dec);
                     let mut ggids: Vec<Tensor> = Vec::with_capacity(n_dec);
                     let mut goff: Vec<u32> = Vec::with_capacity(n_dec);
@@ -1035,16 +1040,17 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let max_sel = cnts.iter().map(|&c| c as usize).max().unwrap_or(0).max(1);
                 // Each slot's selection is the dense range [offset, offset+k) —
                 // strictly ascending, the compressed-index contract the kernel
-                // documents (attention is order-independent, but the contract
-                // holds by construction here).
-                let mut idx_flat = vec![u32::MAX; n_dec * max_sel];
-                for i in 0..n_dec {
-                    for k in 0..cnts[i] as usize {
-                        idx_flat[i * max_sel + k] = offsets[i] + k as u32;
-                    }
-                }
-                let comp_idx = Tensor::from_vec(idx_flat, (n_dec, max_sel), &dev)?;
-                let comp_cnt = Tensor::from_vec(cnts, n_dec, &dev)?;
+                // documents. Built ON-DEVICE by broadcast: comp_idx[i,k] =
+                // offsets[i]+k for k<cnt[i], else u32::MAX. Only the tiny per-slot
+                // `offsets`/`cnts` metadata (n_dec entries) is uploaded — no host
+                // O(n_dec·max_sel) idx_flat loop.
+                let offsets_t = Tensor::from_vec(offsets, n_dec, &dev)?; // [n_dec]
+                let comp_cnt = Tensor::from_vec(cnts, n_dec, &dev)?; // [n_dec]
+                let colk = Tensor::arange(0u32, max_sel as u32, &dev)?.reshape((1, max_sel))?;
+                let base = offsets_t.reshape((n_dec, 1))?.broadcast_add(&colk)?; // [n_dec,max_sel]
+                let keep = colk.broadcast_lt(&comp_cnt.reshape((n_dec, 1))?)?; // [n_dec,max_sel]
+                let maxpad = Tensor::full(u32::MAX, (n_dec, max_sel), &dev)?;
+                let comp_idx = keep.where_cond(&base, &maxpad)?; // [n_dec,max_sel] u32
                 // Explicit per-slot query position (the decode kernel no longer derives it
                 // from the writer slice, so the windowless slot works and the compressed
                 // causal guard has a reference). Hoisted above the layer loop — wave-fixed.
@@ -1154,7 +1160,6 @@ impl ManagedBatchedModel for DeepSeekBatched {
 
             // ── Prefill pass 2: per seq — append pooled entries, select, gather,
             // attend, write back, project out ──
-            let mut row_cursor = decode_seqs.len();
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
@@ -1337,7 +1342,6 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 if l + 1 == n_layers {
                     entry.absorbed = base + s_len;
                 }
-                row_cursor += s_len;
             }
             if !prefill_seqs.is_empty() {
                 pipeline_record("deepseek:prefill_attn", t_prefill);
@@ -1438,16 +1442,23 @@ impl ManagedBatchedModel for DeepSeekBatched {
         let t_head = profile_now();
         let reduced = hc.head_reduce(&h, e.hc_head())?; // [1, rows, dim]
         let normed = rms_norm(&reduced, e.output_norm(), cfg.norm_eps)?;
-        let mut logits_rows: Vec<Tensor> = Vec::with_capacity(all_seqs.len());
-        for i in 0..decode_seqs.len() {
-            let row = normed.narrow(1, i, 1)?;
-            logits_rows.push(e.lm_head().forward(&row)?.reshape((1, cfg.vocab_size))?);
-        }
+        // Rows to score: every decode row (the [0,n_dec) prefix) + each prefill
+        // sequence's LAST row. Gather them into one [1, R, dim] block and run
+        // lm_head in a SINGLE batched GEMM (was R per-row GEMV launches);
+        // bit-identical since each row's logits are independent.
+        let hdev = normed.device().clone();
+        let mut sel_rows: Vec<u32> = (0..decode_seqs.len() as u32).collect();
         let mut cursor = decode_seqs.len();
         for &s_len in &prefill_lens {
-            let row = normed.narrow(1, cursor + s_len - 1, 1)?;
-            logits_rows.push(e.lm_head().forward(&row)?.reshape((1, cfg.vocab_size))?);
+            sel_rows.push((cursor + s_len - 1) as u32);
             cursor += s_len;
+        }
+        let r_total = sel_rows.len();
+        let idx = Tensor::from_vec(sel_rows, r_total, &hdev)?;
+        let logits_all = e.lm_head().forward(&normed.index_select(&idx, 1)?)?; // [1,R,vocab]
+        let mut logits_rows: Vec<Tensor> = Vec::with_capacity(r_total);
+        for r in 0..r_total {
+            logits_rows.push(logits_all.narrow(1, r, 1)?.reshape((1, cfg.vocab_size))?);
         }
         pipeline_record("deepseek:head_lm", t_head);
         Ok(WaveStep {

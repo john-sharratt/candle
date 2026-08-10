@@ -270,6 +270,23 @@ impl Tensor {
         Tensor::zeros(self.shape(), self.dtype(), self.device())
     }
 
+    /// Allocates a tensor WITHOUT initialising its storage — the bytes are
+    /// whatever the allocator returned. This skips the full-width `memset` that
+    /// [`Tensor::zeros`] pays, so it is the correct constructor for a buffer that
+    /// a kernel (or other op) fully overwrites before anything reads it.
+    ///
+    /// SAFETY / CONTRACT: every element MUST be written before it is read.
+    /// Reading an unwritten element yields an arbitrary value (and, for the
+    /// float dtypes, possibly a NaN/Inf bit pattern). Use [`Tensor::zeros`] for
+    /// any buffer whose zero value is read before being written — accumulators
+    /// (`atomicAdd`/`atomicMax` targets), scatter bases, and ragged padding.
+    pub fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        // Uninitialised storage: the caller's write is the initialisation.
+        let storage = unsafe { device.alloc_uninit(&shape, dtype)? };
+        Ok(from_storage(storage, shape, BackpropOp::none(), false))
+    }
+
     pub(crate) fn rand_impl<S: Into<Shape>, T: crate::FloatDType>(
         lo: T,
         up: T,

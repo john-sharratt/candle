@@ -372,7 +372,9 @@ pub fn paged_latent_decode_raw(
     };
     let stream = dev.cuda_stream();
 
-    let out = Tensor::zeros((num_slots, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
+    // Pure kernel output (final store, not accumulation — the acc/ml workspace
+    // holds the running softmax): allocate uninit, the kernel writes every element.
+    let out = Tensor::empty((num_slots, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
     let num_splits = decode_num_splits(num_slots, n_q_head, num_splits_override);
     if num_slots * n_q_head * num_splits > WORKSPACE_CAP {
         candle::bail!(
@@ -559,7 +561,8 @@ pub fn paged_latent_prefill_raw(
         _ => candle::bail!("paged_latent_prefill requires CUDA tensors"),
     };
     let stream = dev.cuda_stream();
-    let out = Tensor::zeros((total_q, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
+    // Pure kernel output (final store): allocate uninit, the kernel writes all.
+    let out = Tensor::empty((total_q, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
     // The prefill's split factor is 1 unless pinned by the override.
     let num_splits = num_splits_override.clamp(1, 32);
     // Queries are mutually independent (per-query position, selection, and
@@ -616,12 +619,13 @@ pub fn paged_latent_prefill_raw(
     // the attention kernel reads the baked int8 (QK) + gathers the pre-quantized
     // V bytes (PV), skipping the per-query RoPE.
     let g_total = cache.nope_i8.dim(0)?;
-    let comp_i8 = Tensor::zeros((g_total, HEAD_DIM), DType::U8, q.device())?;
-    let comp_scale = Tensor::zeros((g_total, N_BANDS), DType::F32, q.device())?;
+    // Pure pre-pass outputs (every row written when g_total>0, empty-shaped when 0).
+    let comp_i8 = Tensor::empty((g_total, HEAD_DIM), DType::U8, q.device())?;
+    let comp_scale = Tensor::empty((g_total, N_BANDS), DType::F32, q.device())?;
     // Pre-quantized PV operand: comp_v8 holds the corpus V bytes at the
-    // per-dim-global scale comp_vmax (zeros-alloc doubles as the zero init the
-    // pre-pass's atomicMax accumulation requires).
-    let comp_v8 = Tensor::zeros((g_total, HEAD_DIM), DType::U8, q.device())?;
+    // per-dim-global scale comp_vmax.
+    let comp_v8 = Tensor::empty((g_total, HEAD_DIM), DType::U8, q.device())?;
+    // comp_vmax is the pre-pass's atomicMax accumulator — MUST start zeroed.
     let comp_vmax = Tensor::zeros(HEAD_DIM, DType::F32, q.device())?;
     let ci8_p = cuda_ptr!(&comp_i8, u8);
     let cscl_p = cuda_ptr!(&comp_scale, f32);

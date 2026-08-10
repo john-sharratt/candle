@@ -505,14 +505,18 @@ impl IncrementalCompressor {
         let groups = n_tot / r;
         if groups == 0 {
             // No group completes: buffer every combined row for the next call.
-            // `force_contiguous` (not `contiguous`, a no-op on these already-
-            // contiguous views) copies each row into its own storage so the
-            // combined-stream buffer is not pinned across calls.
+            // ONE forced copy of the whole (tiny, < ratio rows) combined buffer
+            // breaks the pin on the batched-projection input `kv` (a dim-0 narrow,
+            // which plain `contiguous` would NOT copy); the per-row entries are
+            // then free views into that small owned buffer. Replaces the former
+            // per-row `force_contiguous` storm (2·n_tot copies → 2).
+            let kv_buf = kv_comb.force_contiguous()?;
+            let sc_buf = score_comb.force_contiguous()?;
             self.kv_rows = (0..n_tot)
-                .map(|i| kv_comb.narrow(0, i, 1)?.force_contiguous())
+                .map(|i| kv_buf.narrow(0, i, 1))
                 .collect::<Result<_>>()?;
             self.score_rows = (0..n_tot)
-                .map(|i| score_comb.narrow(0, i, 1)?.force_contiguous())
+                .map(|i| sc_buf.narrow(0, i, 1))
                 .collect::<Result<_>>()?;
             return Ok(None);
         }
@@ -569,12 +573,14 @@ impl IncrementalCompressor {
 
         // Retain state: the last complete group as the next overlap prev, the
         // trailing rows as the next partial buffer, and advance the group index.
-        // `force_contiguous` copies the small retained slices into their own
-        // storage (plain `contiguous` is a no-op on these contiguous views) so
-        // the combined-stream buffer is freed — matching the per-token path,
-        // whose prev group is a fresh `cat`, not a view into a large buffer.
-        // Reads only the RAW group rows — pooling-independent, so the pool can be
-        // deferred + batched across sequences.
+        // Each retained tensor is materialised with a SINGLE forced copy out of
+        // the combined-stream buffer (a dim-0 narrow that plain `contiguous`
+        // would not copy — leaving the big batched-projection buffer pinned), so
+        // the stream buffer frees while the retained state stays bounded to ≤2·r
+        // rows. The `rem` trailing rows are held as free views into one small
+        // owned tail buffer, replacing the former per-row `force_contiguous`
+        // storm (2·rem copies → 2). Reads only the RAW group rows —
+        // pooling-independent, so the pool can be deferred + batched across seqs.
         self.prev_kv_group = Some(
             kv_g.narrow(0, groups - 1, 1)?
                 .reshape((r, cd))?
@@ -587,11 +593,13 @@ impl IncrementalCompressor {
                 .force_contiguous()?,
         );
         let rem = n_tot - cutoff;
+        let kv_tail = kv_comb.narrow(0, cutoff, rem)?.force_contiguous()?;
+        let sc_tail = score_comb.narrow(0, cutoff, rem)?.force_contiguous()?;
         self.kv_rows = (0..rem)
-            .map(|i| kv_comb.narrow(0, cutoff + i, 1)?.force_contiguous())
+            .map(|i| kv_tail.narrow(0, i, 1))
             .collect::<Result<_>>()?;
         self.score_rows = (0..rem)
-            .map(|i| score_comb.narrow(0, cutoff + i, 1)?.force_contiguous())
+            .map(|i| sc_tail.narrow(0, i, 1))
             .collect::<Result<_>>()?;
         self.group_idx += groups;
 

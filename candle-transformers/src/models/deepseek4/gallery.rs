@@ -246,9 +246,11 @@ impl FloatGallery {
         // so build into GPU scratch and copy the int8/bf16 rows down to RAM.
         let attn_gpu = attn_rows.to_device(&self.device)?;
         if self.spilled {
-            let nope_tmp = Tensor::zeros((n, NOPE_DIM), DType::U8, &self.device)?;
-            let scale_tmp = Tensor::zeros((n, NOPE_BANDS), DType::F32, &self.device)?;
-            let rope_tmp = Tensor::zeros((n, ROPE_DIM), DType::BF16, &self.device)?;
+            // build_corpus_cache_into writes all n rows (n≥1 — append bails on 0):
+            // uninit scratch, the seal kernel is the initialisation.
+            let nope_tmp = Tensor::empty((n, NOPE_DIM), DType::U8, &self.device)?;
+            let scale_tmp = Tensor::empty((n, NOPE_BANDS), DType::F32, &self.device)?;
+            let rope_tmp = Tensor::empty((n, ROPE_DIM), DType::BF16, &self.device)?;
             build_corpus_cache_into(&attn_gpu, &nope_tmp, &scale_tmp, &rope_tmp, 0, n)?;
             self.nope_i8
                 .slice_set(&nope_tmp.to_device(&Device::Cpu)?, 0, self.len)?;
@@ -345,18 +347,15 @@ impl FloatGallery {
     #[cfg(feature = "cuda")]
     pub fn gather_corpus(&self, gids: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let live = self.len.max(1);
-        let pos = self
-            .pos
-            .narrow(0, 0, live)?
-            .index_select(gids, 0)?
-            .contiguous()?;
+        // `index_select` / `to_device` already produce fresh contiguous buffers,
+        // so no trailing `contiguous()` copy is needed (it was a runtime no-op).
+        let pos = self.pos.narrow(0, 0, live)?.index_select(gids, 0)?;
         if self.spilled {
             let gids_cpu = gids.to_device(&Device::Cpu)?;
             let sel = |t: &Tensor| -> Result<Tensor> {
                 t.narrow(0, 0, live)?
                     .index_select(&gids_cpu, 0)?
-                    .to_device(&self.device)?
-                    .contiguous()
+                    .to_device(&self.device)
             };
             Ok((
                 sel(&self.nope_i8)?,
@@ -365,9 +364,8 @@ impl FloatGallery {
                 pos,
             ))
         } else {
-            let sel = |t: &Tensor| -> Result<Tensor> {
-                t.narrow(0, 0, live)?.index_select(gids, 0)?.contiguous()
-            };
+            let sel =
+                |t: &Tensor| -> Result<Tensor> { t.narrow(0, 0, live)?.index_select(gids, 0) };
             Ok((
                 sel(&self.nope_i8)?,
                 sel(&self.nope_scale)?,
