@@ -545,6 +545,7 @@ impl BatchedModelCore for ModelWeights {
             hidden: dims[0],
             intermediate: dims[1],
             experts_per_tok: 1,
+            n_experts: 1,
         }
     }
 

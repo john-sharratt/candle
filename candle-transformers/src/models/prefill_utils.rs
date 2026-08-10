@@ -469,13 +469,9 @@ fn paged_prefill_batched_impl<'w>(
         );
     }
 
-    // Reset caches where offset == 0.
-    for (cache, &off) in caches.iter_mut().zip(offsets.iter()) {
-        if off == 0 {
-            cache.reset();
-        }
-    }
-
+    // No reset and no truncation here: `wave_admit` did both for every layer
+    // before the forward began, and repeating them would discard the chunks that
+    // pass claimed.
     let mut use_chunks = caches
         .first()
         .and_then(|c| c.k_cache().chunked_arena_chunks())
@@ -540,24 +536,12 @@ fn paged_prefill_batched_impl<'w>(
         candle::bail!("chunked backing unavailable");
     }
 
-    // Ensure chunks for EXACTLY each sequence's own q_len — never over-allocate
-    // to max(q_lens). Extra trailing chunks on a shorter sequence desync the
-    // decode writer slice (the kernel's "one free slot per chunk" contract),
-    // tripping the `ws_offset + ws_len < CHUNK_SIZE` assert on its next decode.
-    // Per-cache calls use each cache's real batch_idx, so a single-element slice
-    // targets the correct slot.
     // Entry drain: attributes GPU work still in flight when the prefill
     // call begins (enqueued by the caller) separately from this call's own
     // spans — without it the first sync'd span absorbs the caller's tail.
     let t_entry = profile_now();
     profile_sync(q.device());
     pipeline_record("prefill:entry", t_entry);
-    let t_alloc = profile_now();
-    for (i, &add) in q_lens.iter().enumerate() {
-        KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
-    }
-    profile_sync(q.device());
-    pipeline_record("prefill:alloc", t_alloc);
 
     let t_meta = profile_now();
     let (compute_dtype, _chunk_size) = {
@@ -2025,6 +2009,7 @@ impl<'k> PagedDecode<'k> {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::paged_prefill_batched as paged_prefill_flat;
+    use candle_nn::kv_cache::ChunkedKvBacking;
 
     /// Serialize the GPU tests: the split-KV launcher's grow-on-demand
     /// partial pool is a function-local static sized for the production
@@ -2338,10 +2323,25 @@ mod tests {
         offset: usize,
         dtype: DType,
     ) -> Result<Tensor> {
+        // Stand in for the scheduler and for `wave_admit`: the prefill entry
+        // neither creates a backing nor claims chunks of its own any more, so a
+        // test driving the kernel directly has to arrive with both, exactly as
+        // the real caller does.
+        let backing = ChunkedKvBacking::new(
+            b_sz,
+            n_kv_head,
+            head_dim,
+            dtype,
+            q.device(),
+            offset + seq_len,
+        )?;
         let mut cache0 = KvCache::new(2, 4096);
         cache0.force_dtype(dtype);
+        cache0.set_chunked_backing(&backing, 0, None)?;
+        cache0.set_current_seq_len(offset)?;
         let offsets = [offset];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
+        KvCache::ensure_chunked_capacity_batch(&mut caches, &offsets, seq_len)?;
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, q.device())?;
         let generation = PinnedStager::new(q.device().as_cuda_device()?).begin_generation();
 
@@ -3025,6 +3025,9 @@ mod tests {
 
         let offsets = [0usize];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
+        // Stand in for `wave_admit`: the prefill entry no longer claims its own
+        // chunks, so the caller must have made the write region before it runs.
+        KvCache::ensure_chunked_capacity_batch(&mut caches, &offsets, seq_len)?;
         let generation = backing.begin_stager_generation_required();
 
         let out = paged_prefill_uniform(

@@ -7901,6 +7901,7 @@ mod tests {
                 n_kv_head: 1,
                 head_dim: 16,
                 experts_per_tok: 1,
+                n_experts: 1,
                 act_dtype,
                 accum_dtype: DType::F32,
             }

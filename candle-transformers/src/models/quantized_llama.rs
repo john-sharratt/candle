@@ -791,19 +791,20 @@ impl BatchedModelCore for ModelWeights {
     /// routed case reads one expert's projection and its own `n_expert_used`
     /// rather than assuming a dense FFN.
     fn wave_shapes(&self) -> WaveShapes {
-        let (down, experts_per_tok) = match &self.layers[0].mlp_or_moe {
-            MlpOrMoe::Mlp(mlp) => (&mlp.feed_forward_w2, 1),
+        let (down, experts_per_tok, n_experts) = match &self.layers[0].mlp_or_moe {
+            MlpOrMoe::Mlp(mlp) => (&mlp.feed_forward_w2, 1, 1),
             MlpOrMoe::MoE {
                 n_expert_used,
                 experts,
                 ..
-            } => (&experts[0].feed_forward_w2, *n_expert_used),
+            } => (&experts[0].feed_forward_w2, *n_expert_used, experts.len()),
         };
         let dims = down.weight_dims();
         WaveShapes {
             hidden: dims[0],
             intermediate: dims[1],
             experts_per_tok,
+            n_experts,
         }
     }
 

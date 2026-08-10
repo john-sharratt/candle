@@ -389,6 +389,25 @@ impl Scheduler {
     /// sealed), so admission cleared batches whose real KV was several GiB and
     /// the allocator then refused them one arena at a time. See
     /// [`candle_nn::kv_cache::active_kv_formats`].
+    ///
+    /// # The seal's second copy is *not* charged here, and that was tried
+    ///
+    /// `docs/elastic_vram_partition.md` §7 phase 1 asks admit to account for
+    /// "persistence's quantize destinations", and the obvious reading — a block
+    /// occupies its active slot *and* its sealed destination while the
+    /// compressor copies between them, so charge both — was built and reverted.
+    ///
+    /// It is the wrong shape. The overlap lasts one copy; the charge lasts the
+    /// block's whole life. Applying it here doubles the price of **every** block
+    /// in every admission decision, in-flight accounting and decode reserve, so
+    /// admission clears roughly half the work it should. On a live rebuild that
+    /// showed as `(no forwards)` against a `64MiB` budget with a 14k-token
+    /// backlog: nothing admitted, so nothing completed, so nothing freed, so the
+    /// budget never recovered.
+    ///
+    /// A transient double-occupancy is a *reserve* — a fixed pool the compressor
+    /// draws on — not a per-block tariff. That is what §7 means and it is still
+    /// unbuilt.
     fn per_block_kv_bytes(&self) -> u64 {
         let (k, v) = self.session.active_kv_formats();
         per_block_kv_bytes(

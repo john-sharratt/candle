@@ -1,8 +1,15 @@
 //! The capacity arithmetic the startup partition is sized from.
 //!
-//! Both permanent claims a model load makes — the expert cache and the KV
-//! reservation — come from [`VramGovernor::usable`], so the accounting lives
-//! once and the two cannot disagree about how much of `C` is left.
+//! There is one claim now, not two. [`VramGovernor::usable`] is what the device
+//! reservation is sized from, and the reservation holds the KV side, the
+//! transient tier and the expert cache between them — so there is no second
+//! budget to keep in step with the first.
+//!
+//! `expert_budget()` was that second budget: `usable − kv_floor −
+//! scratch_margin`, divided by `max_expert_size` to pick a resident-expert
+//! count. It went with `kv_floor`. The count is now the weight zone's capacity,
+//! `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, computed once against a span
+//! whose extent is a fact (`docs/elastic_vram_partition.md` §6).
 //!
 //! This file also held the managed-allocation path: `reserve` for permanent
 //! class-tagged allocations, and `allocate`, which retried an out-of-memory
@@ -27,45 +34,6 @@ pub fn is_oom(err: &Error) -> bool {
 }
 
 impl VramGovernor {
-    /// The bytes available to hold MoE experts resident, computed *now* from the
-    /// live measurement (mandatory weights already loaded), leaving the KV floor
-    /// and the scratch cushion free. The expert loader divides this by
-    /// `max_expert_size` to pick how many slots to keep resident (§11).
-    ///
-    /// Bounded by [`Self::usable`] — the balloon-measured capacity `C`, not live
-    /// headroom alone. Sizing against headroom overshoots: measured on a 16 GiB
-    /// card, `C` was 13488 MiB while headroom at expert load was ~15000 MiB, so
-    /// the cache took 8888 MiB (3065 slots) where the capacity allowed 6493
-    /// (2187), and every later allocation ran into a pool whose `used` sat above
-    /// `C` with the driver still reporting free memory. Startup never finished:
-    /// section prefill and calibration together need ~4.4 GiB of KV, and the
-    /// overshoot left them under 1 GiB. The expert cache is permanent — nothing
-    /// reclaims it, no relief rung can shed a slot — so an overshoot here is not
-    /// transient pressure, it is a card that never fits its own workload again.
-    pub fn expert_budget(&self) -> Result<u64> {
-        let usable = self.usable()?;
-        let budget = usable
-            .saturating_sub(self.kv_floor())
-            .saturating_sub(self.scratch_margin());
-        // A zero budget is not a small budget: the loader keeps no expert
-        // resident and every forward streams all of them over PCIe. That is a
-        // configuration failure (floor + cushion exceed what is left of `C`),
-        // and it is otherwise indistinguishable from a card that is merely
-        // tight, so say it rather than let the model come up silently crippled.
-        if budget == 0 {
-            tracing::warn!(
-                target: "candle_core::vram",
-                usable_mib = usable / (1024 * 1024),
-                kv_floor_mib = self.kv_floor() / (1024 * 1024),
-                scratch_margin_mib = self.scratch_margin() / (1024 * 1024),
-                capacity_mib = self.capacity() / (1024 * 1024),
-                "expert budget is zero — no experts will stay resident and every \
-                 forward will stream them over PCIe"
-            );
-        }
-        Ok(budget)
-    }
-
     /// What is left of the measured capacity `C` right now: live headroom,
     /// bounded by `C` less what we have already spent of it.
     ///

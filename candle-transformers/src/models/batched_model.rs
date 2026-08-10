@@ -42,7 +42,10 @@ use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{begin_wave, LayerPhase, ModelGeometry, WavePlan, WAVE_FFN_BYTES};
+use candle_nn::kv_cache::{
+    begin_wave, plan_wave_transient, set_claim_reserve, LayerPhase, ModelGeometry, WavePlan,
+    REGION_BYTES, WAVE_FORWARD_BYTES,
+};
 use candle_nn::Module;
 
 use super::batched_layer::{
@@ -56,6 +59,7 @@ use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
+use super::wave_admit::admit_wave_kv;
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
@@ -117,6 +121,9 @@ pub struct WaveShapes {
     /// Experts each token routes to. `1` for a dense model, which collapses the
     /// MoE terms to the dense FFN shapes rather than needing a second branch.
     pub experts_per_tok: usize,
+    /// Experts the router scores over — the width of the per-token logits the
+    /// FFN phase carries. `1` on a dense model, which has no router.
+    pub n_experts: usize,
 }
 
 /// The dtype activations are carried in, for a KV cache stored as `cache_dtype`.
@@ -172,11 +179,18 @@ pub trait BatchedModelCore {
             n_kv_head: self.n_kv_head(),
             head_dim: self.head_dim(),
             experts_per_tok: shapes.experts_per_tok,
+            n_experts: shapes.n_experts,
             act_dtype,
-            // The int8 tensor-core kernels accumulate in BF16 before the cast back
-            // to `act_dtype`; both buffers are live at once, so the plan charges
-            // for both rather than for the wider of the two.
-            accum_dtype: DType::BF16,
+            // The int8 tensor-core kernels emit **F32** and the cast back to
+            // `act_dtype` is a second buffer, so the plan charges for both
+            // rather than for the wider of the two.
+            //
+            // This said BF16 until the census measured it: the expert GEMM
+            // outputs came back at four bytes an element, not two, so every
+            // accumulate-dtype term in the FFN phase — gate, up and down, the
+            // three largest buffers a MoE layer allocates — was priced at half
+            // its size.
+            accum_dtype: DType::F32,
         }
     }
 
@@ -486,26 +500,68 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             .unwrap_or(DType::F32);
         let embed_dtype = activation_dtype(cache_dtype);
 
-        // Price this wave against the transient budget before assembling it.
+        // **Phase 1: admit.** Claim every KV slot this wave will write, for
+        // every layer in the range, before a single byte of it computes — so the
+        // arena frontier is final when the transient tier is reserved against it
+        // (`docs/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
+        // were made by the caller when it built the position map; this covers
+        // the multi-token rows.
+        admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
+
+        // **Phase 2: price and reserve this wave's transient tier.**
         //
-        // Reported, not enforced: `WavePlan` can size every per-layer buffer from
-        // the model geometry and the row count, but the spans are still fixed
-        // constants rather than derived from it, so a refusal here would reject
-        // waves the arenas can in fact hold. Admission is where the two meet.
+        // After admit, so the partition it measures against is the one the whole
+        // forward will run on. The tier is sized to *this* wave rather than to
+        // the widest one the engine can run: a twenty-session decode prices at a
+        // few megabytes where the old fixed constants reserved 912 MiB, and the
+        // difference is ground the weight side gets to hold — which is the entire
+        // point of the tier sitting between the arenas and the weights (§2).
+        //
+        // Reserved **once**, for the forward. `begin_wave` lays the three spans
+        // out inside the reservation on every phase but never chooses its
+        // address, which is what keeps layer *N*'s extents and layer *N+1*'s at
+        // the same offsets (§13b).
         #[cfg(feature = "cuda")]
         {
             let rows = n_decode + pre_rows + glue_rows;
             if rows > 0 {
-                let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
-                if !plan.fits(rows, WAVE_FFN_BYTES) {
-                    // `describe` names the shape that overflowed rather than just
-                    // the number, which is the difference between a report you can
-                    // act on and one you can only notice.
-                    tracing::debug!(
-                        "wave of {rows} rows prices at {} B against a {WAVE_FFN_BYTES} B FFN span\n{}",
-                        plan.wave_bytes(rows),
-                        plan.describe(rows),
-                    );
+                if let Device::Cuda(d) = self.model.device() {
+                    let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
+                    // One region of slack per layer phase. The plan enumerates
+                    // every declared buffer, but a phase pays one alignment per
+                    // range and the count is not in the plan, so this covers the
+                    // rounding rather than an unknown.
+                    let pad = |b: usize| b + REGION_BYTES;
+                    let per_phase = [
+                        pad(plan.phase_bytes(LayerPhase::Attention, rows)),
+                        pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
+                        // The forward phase carries per-*sequence* metadata —
+                        // ragged offsets, RoPE tables — which the plan prices as
+                        // zero because it sizes what scales with width. One
+                        // region is the floor the tier is carved in anyway.
+                        WAVE_FORWARD_BYTES,
+                    ];
+                    // **Phase 1's third term, reaching the placement.** Admit
+                    // claimed this wave's KV; the compressor allocates its
+                    // quantize destinations while the forward runs, and those
+                    // are size classes that may have no arena yet. Reserve room
+                    // for them so they land below the tier rather than moving
+                    // it (§7 phase 1, `set_claim_reserve`).
+                    //
+                    // Bounded by what this wave *writes*: a sealed copy is never
+                    // larger than the active block it compresses, so the active
+                    // volume is an upper bound on the destinations this wave's
+                    // work will eventually need. Steady state is what makes that
+                    // the right shape — everything written must be sealed, so
+                    // the sealing rate tracks the writing rate — and the
+                    // observed per-forward peak corrects it when a backlog makes
+                    // the compressor run ahead of this wave.
+                    let kv_bytes = rows
+                        .saturating_mul(self.model.num_layers())
+                        .saturating_mul(2 * self.model.n_kv_head() * self.model.head_dim())
+                        .saturating_mul(embed_dtype.size_in_bytes());
+                    set_claim_reserve(&d.cuda_stream(), kv_bytes.div_ceil(REGION_BYTES))?;
+                    plan_wave_transient(&d.cuda_stream(), per_phase)?;
                 }
             }
         }

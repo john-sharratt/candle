@@ -30,11 +30,49 @@ use super::types::{
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+// ============================================================================
+// Pinned pool sizing
+// ============================================================================
+
+/// Layers' worth of experts the pinned pool keeps free for the swap pipeline.
+///
+/// A swap is evict-then-load: moving an expert VRAM→pinned **consumes** a free
+/// pinned slot, and the matching pinned→VRAM load gives one back. Net zero, but
+/// the pool needs slack for the turnover — at zero free slots there is no way to
+/// evict to make room to load, nor to load to make room to evict.
+///
+/// One layer is the batch bound: `evict_for_prefetch_batch` is asked for as many
+/// experts as a layer is short, and a layer has `experts_per_layer` of them. Two
+/// covers the prefetch running a layer ahead
+/// ([`super::cache::PREFETCH_EVICT_WINDOW`] looks back that far for candidates).
+///
+/// This is reserved *from the boundary*, not shared with it — the two competing
+/// for one pool is what made a retraction able to stall the pipeline.
+pub(crate) const CHURN_RESERVE_LAYERS: usize = 2;
+
+/// The smallest number of experts VRAM may hold, as a fraction of the model.
+///
+/// This is the **design input** the pinned pool is sized from, and therefore the
+/// real answer to "how far can the boundary move". A quarter of the model leaves
+/// the weight side able to give up three quarters of its residency to the KV
+/// side for a wide prefill, and take it back for decode.
+///
+/// It is a choice, not a measurement, and it is bounded by host RAM: every slot
+/// of shrink range costs one pinned slot, so lowering it trades host RAM for
+/// VRAM roughly one for one. That is the trade the two-tier design exists to
+/// make — host RAM is the plentiful side — but it is not free, and
+/// `cuMemAllocHost` refusing at load is how a machine says the fraction is too
+/// low for it.
+fn min_vram_expert_slots(total_experts: usize) -> usize {
+    total_experts / 4
+}
 
 // ============================================================================
 // Pipeline mode
@@ -168,10 +206,15 @@ impl ExpertCache {
     ///
     /// **Non-CUDA path:** fills VRAM from mmap (legacy GGML path).
     #[allow(clippy::too_many_arguments)]
+    /// `zone` is the weight side of the device reservation, already sized: its
+    /// capacity **is** the resident-expert count. There is no budget arithmetic
+    /// left at this level — `VramGovernor::expert_budget` used to divide bytes by
+    /// `max_expert_size` here, and the zone's capacity is that same quotient
+    /// taken once, against a span whose extent is a fact rather than a forecast.
     pub fn new(
         mmap: Arc<memmap2::Mmap>,
         host_refs: Vec<Vec<MmapExpertRef>>,
-        num_slots: usize,
+        zone: WeightZone,
         device: &Device,
         experts_per_layer: usize,
         _gguf_path: Option<&std::path::Path>,
@@ -179,7 +222,8 @@ impl ExpertCache {
         int8mode: candle::quantized::Int8Mode,
     ) -> Result<Self> {
         let num_moe_layers = host_refs.len();
-        let mut inner = ExpertCacheInner::new(num_slots, num_moe_layers, experts_per_layer);
+        let num_slots = zone.capacity();
+        let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
 
         // ── CUDA copy stream (pipeline thread) ──
         #[cfg(feature = "cuda")]
@@ -248,65 +292,48 @@ impl ExpertCache {
         #[cfg(feature = "cuda")]
         let (pinned_pool, expert_locations, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
-                // Build per-layer geometry. The pinned pool caches the *target* format: for Off
-                // that is the gemx K/128 repack of the source dtype; for int8 it is the KO twin
-                // (repacked once per expert, then DMA-reloaded on a miss — no per-miss re-quant).
-                let mut geoms: Vec<LayerGeometry> = Vec::with_capacity(num_moe_layers);
-                for moe_idx in 0..num_moe_layers {
-                    let r = &host_refs[moe_idx][0];
-                    let tko = |d: candle::quantized::GgmlDType| {
-                        if int8mode.is_int8() {
-                            d.to_ko(int8mode)
-                        } else {
-                            Ok(d)
-                        }
-                    };
-                    let gate_dtype = tko(r.gate_dtype)?;
-                    let up_dtype = tko(r.up_dtype)?;
-                    let down_dtype = tko(r.down_dtype)?;
-                    let gate_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.gate_shape[0],
-                        r.gate_shape[1],
-                        gate_dtype,
-                    )?;
-                    let up_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.up_shape[0],
-                        r.up_shape[1],
-                        up_dtype,
-                    )?;
-                    let down_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.down_shape[0],
-                        r.down_shape[1],
-                        down_dtype,
-                    )?;
-                    geoms.push(LayerGeometry {
-                        gate_shape: r.gate_shape.clone(),
-                        gate_dtype,
-                        gate_repacked_size,
-                        up_shape: r.up_shape.clone(),
-                        up_dtype,
-                        up_repacked_size,
-                        down_shape: r.down_shape.clone(),
-                        down_dtype,
-                        down_repacked_size,
-                        total_repacked_size: gate_repacked_size
-                            + up_repacked_size
-                            + down_repacked_size,
-                    });
-                }
+                let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
 
-                // Compute pinned pool size: total experts minus VRAM slots,
-                // plus 10% headroom for runtime evictions (drip + end-of-pass
-                // move VRAM experts to pinned — need free pinned slots for that).
-                // When all experts fit in VRAM, skip the pinned pool entirely —
-                // no eviction is needed and pinned RAM would be wasted.
+                // **Size the pinned pool for the smallest VRAM residency the
+                // boundary may ever reach, not for the one it happens to open
+                // at.**
+                //
+                // An expert is in VRAM or pinned and nowhere else, so
+                // `pinned_occupied = total_experts − vram_slots` at all times.
+                // Shrink VRAM and pinned occupancy grows one for one — but the
+                // pool is a single `cuMemAllocHost` that never grows, so
+                // whatever slack it opens with is the *entire* budget for the
+                // boundary to move.
+                //
+                // Sizing it from `num_slots` (the opening position) made that
+                // budget accidental: it came out as 10% of wherever the boundary
+                // started, and that 10% is also the swap pipeline's in-flight
+                // depth — `evict_for_prefetch_batch` takes up to a layer's worth
+                // at a time, with prefetch running a layer or two ahead. The two
+                // uses shared one pool, so on a live rebuild the retraction asked
+                // for thousands of regions, found the churn slack was all there
+                // was, and delivered nothing.
+                //
+                // Sizing it from the *floor* instead makes the dependency run one
+                // way: pick how small the weight side may get, and the pool is
+                // whatever guarantees every expert has somewhere to be at that
+                // extreme, plus churn depth on top. Above the floor the pool
+                // simply carries empty slots, which is exactly what headroom
+                // looks like.
+                //
+                // The allocation is the feasibility test. There is no need to ask
+                // the OS what is available — `cuMemAllocHost` either succeeds or
+                // it does not, and pinned pages are non-pageable, so a refusal is
+                // a real answer and not a hint. Failure propagates and the
+                // process stops at load with the numbers in the message.
                 let total_experts = num_moe_layers * experts_per_layer;
                 let all_resident = num_slots >= total_experts;
                 let num_pinned = if all_resident {
                     0
                 } else {
-                    let eviction_headroom = num_slots / 10; // 10% of VRAM slots
-                    total_experts.saturating_sub(num_slots) + eviction_headroom
+                    let floor = min_vram_expert_slots(total_experts);
+                    let churn = CHURN_RESERVE_LAYERS * experts_per_layer;
+                    total_experts.saturating_sub(floor) + churn
                 };
                 let slot_size = geoms
                     .iter()
@@ -368,7 +395,7 @@ impl ExpertCache {
         // before they move into `PipelineState` below.
         #[cfg(feature = "cuda")]
         {
-            let occupied = inner.slots.len() - inner.free_slots.len();
+            let occupied = inner.num_slots() - inner.free_len();
             let slot_bytes = layer_geometries
                 .iter()
                 .map(|g| g.total_repacked_size)
@@ -377,8 +404,8 @@ impl ExpertCache {
             let seeded = occupied * slot_bytes;
             tracing::info!(
                 target: "candle_transformers::expert_lre",
-                num_slots = inner.slots.len(),
-                free_slots = inner.free_slots.len(),
+                num_slots = inner.num_slots(),
+                free_slots = inner.free_len(),
                 occupied,
                 slot_bytes,
                 resident_gib = seeded as f64 / 1e9,
@@ -471,9 +498,16 @@ impl ExpertCache {
         slot_to_key: Vec<Option<(usize, usize)>>,
         device: &Device,
     ) -> Self {
+        // Every slot is occupied and none ever moves, so the zone exists only to
+        // answer "which index is where" — the addresses are the pre-built
+        // storages' own, not the zone's, and nothing here allocates from it.
+        let mut zone = WeightZone::new(0, 0, slots.len(), slots.len());
+        for _ in 0..slots.len() {
+            zone.alloc();
+        }
         let inner = ExpertCacheInner {
             slots,
-            free_slots: vec![],
+            zone,
             key_to_slot,
             last_used,
             generation,

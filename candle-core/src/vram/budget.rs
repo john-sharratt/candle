@@ -17,25 +17,6 @@ use super::{AllocClass, VramGovernor};
 /// and per-card-class tuning.
 #[derive(Clone, Debug)]
 pub struct GovernorConfig {
-    /// KV floor absolute term (default 3 GiB).
-    ///
-    /// Sized for the *cold-start* peak, not steady state: section prefill plus
-    /// calibration hold ~4.4 GiB of KV at once, while a warm daemon sits at
-    /// ~1 GiB reserved / 0.66 GiB live. Every byte here is a byte the expert
-    /// cache cannot have.
-    ///
-    /// 2.5 GiB was tried on the 16 GiB card and backed out. It did move 512 MiB
-    /// into the expert budget (2509 → 2684 resident experts), and cold start did
-    /// complete — but calibration raised **five** `budget exceeded` wave
-    /// failures where the conservative setting raised none, so it operates in the
-    /// region where wave steps fail and retry. The apparent calibration speedup
-    /// that accompanied it (1654 s → 1077 s) is not attributable: model load in
-    /// the same run improved 39 %, which this term cannot influence, so the two
-    /// runs differed in machine state. Re-deriving it needs a back-to-back A/B on
-    /// an otherwise idle machine.
-    pub kv_floor_abs: u64,
-    /// KV floor fraction of `(C − Weights)` (default 0.15).
-    pub kv_floor_pct: f64,
     /// Cushion left outside the KV reservation, for the allocations that still
     /// come from the CUDA pool: the gallery arena's slabs, the grow-only
     /// sampler / provenance / MoE-routing scratches, and the threaded expert
@@ -68,126 +49,88 @@ pub struct GovernorConfig {
     /// where the driver refused the balloon, which is what makes `capacity_c`
     /// 14,592 rather than 16,376.)
     pub scratch_margin: u64,
-    /// Fraction of total VRAM the balloon tries to claim (default 0.95).
-    pub balloon_target_frac: f64,
-    /// Absolute headroom (bytes) the balloon always leaves below `total`,
-    /// combined with [`Self::balloon_target_frac`] as
-    /// `C = min(frac × total, total − headroom_abs)` (default 1 GiB).
+    /// **The one number the card holds back**, in bytes (default 512 MiB).
     ///
-    /// This is a cap on what the balloon may *try*, not a reserve for the
-    /// running engine. The balloon claims and touches real pages, so it stops on
-    /// its own when the driver refuses — that refusal is the honest ceiling, and
-    /// it is the whole point of ballooning: touching forces residency, which
-    /// evicts other tenants' cold allocations on WDDM. A generous cap costs
-    /// nothing when the card is smaller than it; a tight one stops the balloon
-    /// before it ever reaches the ceiling, and the difference is simply never
-    /// used by anybody.
+    /// `C = min(headroom, total − this)`, on the balloon's growth loop and on
+    /// the fast path that skips it alike ([`super::balloon::capacity_target`]).
+    /// Everything the engine owns is sized from `C`, so this is the working
+    /// margin left to the display driver and the OS — and it is left
+    /// permanently, not just during the measurement.
     ///
-    /// It was 2.5 GiB, on the reasoning that a forward's transient scratch peak
-    /// must live above the resident set. That is true, and it is already
-    /// reserved — [`Self::scratch_margin`] is subtracted in `expert_budget` and
-    /// sits below every relief rung. Reserving it here as well booked the same
-    /// bytes twice. Measured on the 16 GiB card: the cap bound at 13815 MiB and
-    /// `C` came out 13488, while the real ceiling the balloon finds when allowed
-    /// to look is **14592** — 1104 MiB that no allocator was permitted to touch,
-    /// on a card where startup was failing for want of ~1 GiB.
+    /// It replaces three terms that were trying to be this one:
     ///
-    /// Note what now bounds the claim: with the cap out of the way the balloon
-    /// grows until [`Self::balloon_floor`] (512 MiB) or the driver refuses,
-    /// where the old 2.5 GiB cap stopped it with ~2.5 GiB still free. On a
-    /// machine whose display is driven by this GPU, the measurement window is
-    /// correspondingly tighter. That window is brief and the balloon frees
-    /// everything it claimed, but `balloon_floor` — not this term — is the knob
-    /// that governs it.
-    pub balloon_headroom_abs: u64,
-    /// Headroom floor at which the balloon stops growing (default 512 MiB).
-    pub balloon_floor: u64,
+    /// - `balloon_target_frac` (0.95). A fraction of the card is not a fact
+    ///   about anything — "leave 5%" is 818 MiB on a 16 GiB card and 4.9 GiB on
+    ///   a 96 GiB one, for no reason that scales with what the OS actually
+    ///   needs. It was also applied *only* as the fast path's threshold, never
+    ///   as a cap, so on an uncontended card no reserve was applied at all.
+    /// - `balloon_headroom_abs` (512 MiB). The same quantity as this, but
+    ///   documented as "a cap on what the balloon may try, not a reserve for the
+    ///   running engine" — which is exactly the distinction that let the fast
+    ///   path ignore it.
+    /// - `balloon_floor` (512 MiB). A headroom floor for the growth loop. Two
+    ///   numbers cannot both be "the amount we leave"; and stopping on live
+    ///   headroom defeats the purpose of ballooning, which is to drive headroom
+    ///   down so WDDM evicts other tenants' cold pages. The refusal is the
+    ///   honest ceiling, and the balloon frees everything it claimed within
+    ///   milliseconds.
+    pub capacity_reserve: u64,
     /// Balloon growth granularity in bytes (default 256 MiB).
     pub balloon_chunk: u64,
+    /// Smallest chunk the balloon refines down to on refusal (default 2 MiB).
+    ///
+    /// The reservation's granule size: below it a claim cannot be expressed in
+    /// the allocator `C` is being measured *for*, so refining further would
+    /// measure memory that could never be mapped. Refining from
+    /// [`Self::balloon_chunk`] to here costs at most three extra failed
+    /// allocations and removes an up-to-256 MiB under-measurement that would
+    /// otherwise be permanent.
+    pub balloon_min_chunk: u64,
 }
 
 /// The shipped defaults, in the units their `CANDLE_VRAM_*` overrides use, so
 /// [`GovernorConfig::default`] and [`GovernorConfig::defaults_ignoring_env`]
 /// cannot drift apart.
-/// Sized against the **cold-ingest high-water mark**, not the steady state.
 ///
-/// Measured on the 16 GiB card against the real `mind` corpus: a cold boot
-/// climbs to **284 live regions (4,544 MiB)** while the system prompt's
-/// collections prefill, then falls to **69 regions (1,104 MiB)** and stays
-/// there. Steady state needs a sixth of what the boot transient does, and it is
-/// the transient that decides whether the daemon comes up at all — at
-/// `3 GiB + 15 %` the span is 218 regions and boot wedges with every region
-/// occupied, relief freeing nothing because the content is pinned and not yet
-/// warm-backed.
+/// **`kv_floor_abs` and `kv_floor_pct` are gone.** They were the static
+/// partition: `4352 MiB + 15% × (C − weights)` reserved for KV, with the expert
+/// cache taking what was left. The measurement that justified them is worth
+/// keeping, because it is also the argument for replacing them — this is what a
+/// megabyte of the term cost, cold-booting the `mind` corpus on the 16 GiB card
+/// with decode probed at matched context depth:
 ///
-/// Measured span against this term, cold-booting the same `mind` corpus, with
-/// decode probed at matched context depth (kv/fwd 550–736):
+/// | `kv_floor_abs` | KV span | expert slots | decode | boot |
+/// |---|---|---|---|---|
+/// | 3 GiB | 218 regions | 2618 | — | dies: retry storm, no forwards |
+/// | 4 GiB | 274 regions | 2267 | — | ready |
+/// | 5 GiB | 328 regions | 1917 | 67 ms/fwd | clean |
+/// | 6 GiB | 384 regions | 1566 | 80 ms/fwd | clean, 100 regions unused |
 ///
-/// | `kv_floor_abs` | KV span | expert slots | residency | decode | boot |
-/// |---|---|---|---|---|---|
-/// | 3 GiB | 218 regions | 2618 | 42.6 % | — | dies: retry storm, no forwards |
-/// | 4 GiB | 274 regions | 2267 | 36.9 % | — | ready |
-/// | 5 GiB | 328 regions | 1917 | 31.2 % | 67 ms/fwd | clean |
-/// | 6 GiB | 384 regions | 1566 | 25.5 % | 80 ms/fwd | clean, 100 regions unused |
+/// 1024 MiB bought 56 KV regions and cost 351 expert slots. The term had to
+/// clear the **cold-boot transient** — 284 live regions (4,544 MiB) while the
+/// system prompt's collections prefill — and the daemon then spent its life at
+/// **70 regions (1,120 MiB)**. So roughly 3.4 GiB sat reserved for a peak that
+/// happened once, on the card where the expert cache is what pays for decode.
 ///
-/// **Every MiB here is a MiB the expert cache does not get, and the expert
-/// cache is what pays for decode**: 1024 MiB of this term buys 56 KV regions and
-/// costs 351 expert slots, worth ~16 % of decode throughput per step of the
-/// table. So this is sized to what KV *needs*, never to what is spare.
-///
-/// Steady-state KV is **70 regions (1,120 MiB)**. What forces the term above
-/// that is the cold-boot transient: the system prompt's collections must stay
-/// resident until the last section that prefills over them is built, so the hot
-/// set peaks at **284 regions** and only then collapses. That peak is structural
-/// — see `docs/archived/arena_unification_results.md` for why it cannot be offloaded away
-/// — and it is what this term has to clear.
-///
-/// The transient tier gave back 512 MiB (a shelf backing no allocator, and a
-/// 512 MiB migration staging span against a 29,696 B peak), so this term buys
-/// 32 more regions than it used to for the same expert budget.
-///
-/// **This term moved with `scratch_margin`, not against the expert cache.**
-/// `expert_budget` is `usable − kv_floor − scratch_margin`, so raising this by
-/// exactly what `scratch_margin` gave up (512 MiB) leaves the expert budget
-/// identical while the KV span — `usable − scratch_margin − transient` — gains
-/// the whole amount. 32 regions for nothing, which is what pays for clearing
-/// the 284-region cold-boot peak.
-///
-/// Spending it there rather than on more experts is what the decode curve says
-/// to do:
-///
-/// | expert slots | 1566 | 1917 | 2267 | 2355 | 2443 |
-/// |---|---|---|---|---|---|
-/// | decode median | 80 ms | 67 ms | 57 ms | 63 ms | 57 ms |
-///
-/// The first three are a real trend. The last three are **one flat band inside
-/// run-to-run noise** — 2355 measuring slower than 2267 is what says so, since
-/// residency cannot make decode worse. So the expert cache stops paying
-/// somewhere near 2,300 slots on this model and slots past that are free to
-/// spend, while a span clearing the 284-region peak removes a reproducible
-/// first-boot casualty (the post-priming quantize drain, which needs a slot to
-/// compress a section into before it can release the native one).
-///
-/// The percentage term tracks the card; the absolute term tracks the corpus,
-/// and only the card is knowable here. A workspace with one very large
-/// collection needs `CANDLE_VRAM_KV_FLOOR_MB` raised — the failure names the
-/// exhausted reservation, so the symptom points at this knob.
-const DEFAULT_KV_FLOOR_MB: u64 = 4352;
-const DEFAULT_KV_FLOOR_PCT: f64 = 0.15;
+/// A single number cannot be right for both moments, which is the whole reason
+/// the boundary moves now (`docs/elastic_vram_partition.md` §1).
 const DEFAULT_SCRATCH_MARGIN_MB: u64 = 512;
-const DEFAULT_BALLOON_FRAC: f64 = 0.95;
-/// Tracks [`DEFAULT_SCRATCH_MARGIN_MB`], which is the invariant
-/// `the_balloon_reserve_does_not_double_book_the_scratch_cushion` pins: this is
-/// a cap on what the balloon may *try*, not a second reserve, so anything above
-/// the cushion books the same bytes twice.
+/// The working margin left to the display driver and the OS, permanently.
 ///
-/// It does not bind on this card in any case — `C = min(frac × total, total −
-/// this)` targets 15,864 MiB of the 16,376 MiB card, while the balloon actually
-/// stops at 14,592 MiB where the driver refuses. The refusal is the honest
-/// ceiling; this only stops the balloon reaching for something absurd.
-const DEFAULT_BALLOON_HEADROOM_MB: u64 = 512;
-const DEFAULT_BALLOON_FLOOR_MB: u64 = 512;
+/// Distinct from [`DEFAULT_SCRATCH_MARGIN_MB`], which is memory *we* keep
+/// outside the reservation for our own CUDA pool. This one is memory we never
+/// claim at all. They are the same size by coincidence, not by derivation, and
+/// the invariant that used to tie them together
+/// (`the_balloon_reserve_does_not_double_book_the_scratch_cushion`) was pinning
+/// a relationship that only existed because the old term was documented as "a
+/// cap on what the balloon may try" rather than as a reserve.
+const DEFAULT_CAPACITY_RESERVE_MB: u64 = 512;
 const DEFAULT_BALLOON_CHUNK_MB: u64 = 256;
+/// One VMM allocation granule on every device this runs on. `Reservation`
+/// queries the real value at run time; the balloon cannot, because it runs
+/// before any reservation exists, and 2 MiB is small enough that being wrong
+/// about it costs at most 2 MiB of measurement precision.
+const DEFAULT_BALLOON_MIN_CHUNK_MB: u64 = 2;
 
 impl GovernorConfig {
     /// The shipped defaults with **no** `CANDLE_VRAM_*` override applied.
@@ -198,13 +141,10 @@ impl GovernorConfig {
     /// for a reason unrelated to the code under test.
     pub fn defaults_ignoring_env() -> Self {
         Self {
-            kv_floor_abs: DEFAULT_KV_FLOOR_MB * 1024 * 1024,
-            kv_floor_pct: DEFAULT_KV_FLOOR_PCT,
             scratch_margin: DEFAULT_SCRATCH_MARGIN_MB * 1024 * 1024,
-            balloon_target_frac: DEFAULT_BALLOON_FRAC,
-            balloon_headroom_abs: DEFAULT_BALLOON_HEADROOM_MB * 1024 * 1024,
-            balloon_floor: DEFAULT_BALLOON_FLOOR_MB * 1024 * 1024,
+            capacity_reserve: DEFAULT_CAPACITY_RESERVE_MB * 1024 * 1024,
             balloon_chunk: DEFAULT_BALLOON_CHUNK_MB * 1024 * 1024,
+            balloon_min_chunk: DEFAULT_BALLOON_MIN_CHUNK_MB * 1024 * 1024,
         }
     }
 }
@@ -212,19 +152,19 @@ impl GovernorConfig {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            kv_floor_abs: env_bytes_mb("CANDLE_VRAM_KV_FLOOR_MB", DEFAULT_KV_FLOOR_MB),
-            kv_floor_pct: env_f64("CANDLE_VRAM_KV_FLOOR_PCT", DEFAULT_KV_FLOOR_PCT),
             scratch_margin: env_bytes_mb(
                 "CANDLE_VRAM_SCRATCH_MARGIN_MB",
                 DEFAULT_SCRATCH_MARGIN_MB,
             ),
-            balloon_target_frac: env_f64("CANDLE_VRAM_BALLOON_FRAC", DEFAULT_BALLOON_FRAC),
-            balloon_headroom_abs: env_bytes_mb(
-                "CANDLE_VRAM_BALLOON_HEADROOM_MB",
-                DEFAULT_BALLOON_HEADROOM_MB,
+            capacity_reserve: env_bytes_mb(
+                "CANDLE_VRAM_CAPACITY_RESERVE_MB",
+                DEFAULT_CAPACITY_RESERVE_MB,
             ),
-            balloon_floor: env_bytes_mb("CANDLE_VRAM_BALLOON_FLOOR_MB", DEFAULT_BALLOON_FLOOR_MB),
             balloon_chunk: env_bytes_mb("CANDLE_VRAM_BALLOON_CHUNK_MB", DEFAULT_BALLOON_CHUNK_MB),
+            balloon_min_chunk: env_bytes_mb(
+                "CANDLE_VRAM_BALLOON_MIN_CHUNK_MB",
+                DEFAULT_BALLOON_MIN_CHUNK_MB,
+            ),
         }
     }
 }
@@ -235,14 +175,6 @@ fn env_bytes_mb(key: &str, default_mb: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(default_mb)
         .saturating_mul(1024 * 1024)
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(default)
 }
 
 impl VramGovernor {
@@ -259,8 +191,9 @@ impl VramGovernor {
     }
 
     /// Record `bytes` reserved under `class` (an allocation that already
-    /// happened elsewhere, e.g. model weights or expert slots). Reporting +
-    /// `kv_floor` base only — the availability gate is always the live measurement.
+    /// happened elsewhere, e.g. model weights or expert slots). **Reporting
+    /// only** — no partition is derived from it, and the availability gate is
+    /// always the live measurement.
     pub fn credit_class(&self, class: AllocClass, bytes: u64) {
         self.class_reserved[class.idx()].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
@@ -271,11 +204,13 @@ impl VramGovernor {
     /// model load.
     ///
     /// `credit_class` is wrong for those. It adds, so loading a second model
-    /// into the same process tallies both — and for `Weights` that is not just
-    /// a cosmetic over-count: `kv_floor` is `abs + pct × (C − weights)`, so a
-    /// doubled tally drives `C − weights` to zero and collapses the floor to
-    /// `kv_floor_abs`, silently removing the KV reserve on the card where it
-    /// matters most.
+    /// into the same process tallies both, and every report of the card's
+    /// decomposition is then wrong by a whole model.
+    ///
+    /// The tally no longer *sizes* anything — `kv_floor` was the last reader and
+    /// it is gone. In particular the span is **not** `usable − Weights`: the
+    /// weights are already inside `usable`, and subtracting the tally on top
+    /// would book them twice (`region_pool::span_from`).
     pub fn set_class(&self, class: AllocClass, bytes: u64) {
         self.class_reserved[class.idx()].store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
@@ -300,29 +235,12 @@ impl VramGovernor {
         }
     }
 
-    /// **The VRAM the KV subsystem owns**, transient tier included, and so the
-    /// reserve the expert budget must leave free: `3 GiB + 15% × (C − Weights)`.
+    /// The cushion left **outside** the reservation, for the CUDA pool.
     ///
-    /// The expert loader takes `usable − kv_floor − scratch_margin`, so what
-    /// survives to the first KV cache is `kv_floor + scratch_margin`; the
-    /// reservation then claims exactly `kv_floor` across its two sides and
-    /// leaves the cushion on the pool. `region_pool`'s
-    /// `the_reservation_claims_exactly_the_kv_floor` pins that identity.
-    ///
-    /// It is no longer a *floor* in the evict-no-further sense — nothing evicts
-    /// against a watermark any more (`docs/archived/arena_unification.md` §5). It is the
-    /// partition knob, and step 7 tunes it.
-    pub fn kv_floor(&self) -> u64 {
-        let c = self.capacity();
-        let weights = self.class_reserved(AllocClass::Weights);
-        let base = c.saturating_sub(weights);
-        self.config
-            .kv_floor_abs
-            .saturating_add((self.config.kv_floor_pct * base as f64) as u64)
-    }
-
-    /// The scratch cushion held above the floor when sizing experts (§11).
-    pub fn scratch_margin(&self) -> u64 {
+    /// The reservation takes `usable − this`. It is not held back from anything
+    /// else — the KV side, the transient tier and the expert cache are all
+    /// inside the span, and the boundary between them moves.
+    pub fn pool_cushion(&self) -> u64 {
         self.config.scratch_margin
     }
 

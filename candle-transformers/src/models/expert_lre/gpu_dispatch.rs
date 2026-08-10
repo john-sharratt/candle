@@ -253,7 +253,7 @@ mod tests {
         let n = slots.len();
         ExpertCacheInner {
             slots,
-            free_slots: vec![],
+            zone: full_zone(n),
             key_to_slot,
             last_used: vec![0; n],
             generation: 0,
@@ -262,6 +262,18 @@ mod tests {
             num_moe_layers: 0,
             experts_per_layer: 0,
         }
+    }
+
+    /// A zone of `n` slots with every one occupied — what these fixtures mean by
+    /// "the cache is full". Drained through the real API rather than
+    /// constructed full, so the fixture cannot disagree with the allocator about
+    /// what occupancy looks like.
+    fn full_zone(n: usize) -> candle_nn::kv_cache::WeightZone {
+        let mut zone = candle_nn::kv_cache::WeightZone::new(1 << 30, 4096, n, n);
+        for _ in 0..n {
+            zone.alloc().expect("a fresh zone has every slot free");
+        }
+        zone
     }
 
     #[test]
@@ -323,7 +335,7 @@ mod tests {
         key_to_slot.insert((0usize, 0usize), 0usize);
         let inner = ExpertCacheInner {
             slots: vec![Some(slot)],
-            free_slots: vec![],
+            zone: full_zone(1),
             key_to_slot,
             last_used: vec![0],
             generation: 0,

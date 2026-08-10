@@ -855,7 +855,7 @@ function renderMemory(d){
       hdr('vram governor');
       row('honest headroom', fmtB(g.headroom_bytes));
       row('capacity C', fmtB(g.capacity_bytes));
-      row('kv floor / scratch margin', fmtB(g.kv_floor_bytes)+' '+dim('/ '+fmtB(g.scratch_margin_bytes)));
+      row('pool cushion '+dim('(outside the span)'), fmtB(g.pool_cushion_bytes));
       row('reserved w\u00b7e\u00b7s\u00b7k',
         fmtB(g.reserved_weights_bytes)+' '+dim('\u00b7')+' '+fmtB(g.reserved_expert_bytes)+' '
         +dim('\u00b7')+' '+fmtB(g.reserved_scratch_bytes)+' '+dim('\u00b7')+' '+fmtB(g.reserved_kv_bytes));

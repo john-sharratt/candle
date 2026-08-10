@@ -108,7 +108,7 @@ fn max_live_conversations() -> Option<usize> {
     }
     Some(scan_width(
         governor.capacity_bytes,
-        governor.scratch_margin_bytes,
+        governor.pool_cushion_bytes,
         vram.pool_used_bytes,
         kv,
         SCAN_KV_BASELINE.load(Ordering::Relaxed),

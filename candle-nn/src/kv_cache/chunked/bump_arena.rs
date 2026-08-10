@@ -54,7 +54,8 @@ use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::Result;
 
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
-use super::region_pool::carve_transient;
+use super::region_pool::{carve_persist, place_transient, release_transient};
+use super::wave_census::{self, Carve};
 use super::wave_plan::LayerPhase;
 
 /// A range handed out by a [`Generation`].
@@ -111,6 +112,23 @@ struct Inner {
     dirty: bool,
     /// High-water mark of `cursor`, for the watermark that sizes the span.
     peak: usize,
+    /// The largest generation the census has already itemised, **per carve
+    /// count**.
+    ///
+    /// Kept apart from `peak` because the two answer different questions: `peak`
+    /// is what the span must hold, this is what has already been reported.
+    ///
+    /// Keyed by carve count rather than held as one number because an arena
+    /// serves more than one chain, and the widest is not the only one worth
+    /// seeing. The attention span carries a twelve-carve prefill chain and a
+    /// narrower decode chain that reaches `o_proj` through a different operand;
+    /// a single high-water mark would only ever print the first, and the plan
+    /// has to upper-bound both. The count is what distinguishes them, and it
+    /// takes a handful of distinct values, so this stays small.
+    reported_peak: HashMap<usize, usize>,
+    /// Ranges carved in the current generation, when
+    /// [`super::wave_census::enabled`]. Empty in every ordinary run.
+    census: Vec<Carve>,
     /// Bumped every time the cursor rewinds.
     ///
     /// A [`WaveTicket`] carries the epoch it was minted in, so a ticket from a
@@ -143,18 +161,29 @@ impl std::fmt::Debug for BumpArena {
 }
 
 impl BumpArena {
-    /// Reserve `capacity` bytes for the domain called `name`.
+    /// Reserve `capacity` bytes for the domain called `name`, out of the fixed
+    /// persistence block.
+    ///
+    /// The **only** fixed-carve domain. The persistence thread stages on its own
+    /// copy stream, on a schedule that has nothing to do with a wave's, so its
+    /// ranges can be live at any moment a forward begins — which is exactly when
+    /// the wave tier moves. It therefore lives at the far left of the span,
+    /// where neither boundary can reach it, and it is the one domain whose
+    /// address is fixed for the process lifetime.
+    ///
+    /// The wave domains are the opposite: [`BumpArena::detached`], placed per
+    /// forward, gone in between.
     pub(crate) fn new(
         stream: &Arc<CudaStream>,
         name: &'static str,
         capacity: usize,
         reclaim: Reclaim,
     ) -> Result<Self> {
-        // A disjoint sub-range of the device's transient reservation. The
-        // span is untyped storage; every range is written by its claimant
-        // before any kernel reads it, and the cursor guarantees ranges handed
-        // out within one generation are disjoint.
-        let base = carve_transient(stream, capacity)?;
+        // A disjoint sub-range of the device's reservation. The span is untyped
+        // storage; every range is written by its claimant before any kernel
+        // reads it, and the cursor guarantees ranges handed out within one
+        // generation are disjoint.
+        let base = carve_persist(stream, capacity)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 base,
@@ -163,6 +192,8 @@ impl BumpArena {
                 live: 0,
                 dirty: false,
                 peak: 0,
+                reported_peak: HashMap::new(),
+                census: Vec::new(),
                 epoch: 0,
                 stream: stream.clone(),
                 reclaim,
@@ -191,6 +222,64 @@ impl BumpArena {
             domain,
             arena,
         })
+    }
+
+    /// A domain with no backing yet, to be positioned by [`Self::rebase`].
+    ///
+    /// The wave domains are built this way because the tier they live in does
+    /// not exist between forwards. A zero capacity is not a degenerate case to
+    /// guard against — it is the correct state of a wave span when no wave is
+    /// running, and any allocation against it fails loudly on the ordinary
+    /// exhausted-span path.
+    pub(crate) fn detached(stream: &Arc<CudaStream>, name: &'static str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                base: 0,
+                capacity: 0,
+                cursor: 0,
+                live: 0,
+                dirty: false,
+                peak: 0,
+                reported_peak: HashMap::new(),
+                census: Vec::new(),
+                epoch: 0,
+                stream: stream.clone(),
+                reclaim: Reclaim::StreamOrdered,
+            })),
+            name,
+        }
+    }
+
+    /// Move this domain to `base` with `capacity` bytes, for the wave about to
+    /// start.
+    ///
+    /// **Only legal while no generation is open**, which is exactly when the
+    /// domain holds nothing: the transient tier vanishes between forwards, so
+    /// there is no live range whose address this could invalidate. That is what
+    /// lets the tier be the one variable-size, movable block in the span — and
+    /// it is why it can sit between the arenas and the weights, absorbing both
+    /// sides' movement without a hole and without relocating anything.
+    ///
+    /// A `BumpRange` is still a bare pointer. `'w` bounds it to its generation,
+    /// and a generation never spans a rebase.
+    pub(crate) fn rebase(&self, base: u64, capacity: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.live > 0 {
+            candle::bail!(
+                "{}: refusing to move a domain with {} live generation(s) — its \
+                 ranges are named by pointers that would silently move",
+                self.name,
+                inner.live,
+            )
+        }
+        inner.base = base;
+        inner.capacity = capacity;
+        inner.cursor = 0;
+        inner.dirty = false;
+        inner.census.clear();
+        // The epoch is what invalidates a `WaveTicket` minted before the move.
+        inner.epoch += 1;
+        Ok(())
     }
 
     /// Whether any [`Generation`] guard is currently open on this arena.
@@ -239,6 +328,15 @@ fn bump<'a>(
     }
     inner.cursor = end;
     inner.dirty = true;
+    if wave_census::enabled() {
+        // The carve is recorded whether or not a frame could be named: a census
+        // that dropped the unattributable ones would under-count the phase,
+        // which is the one thing it exists to get right.
+        inner.census.push(Carve {
+            len,
+            label: wave_census::label(),
+        });
+    }
     if end > inner.peak {
         inner.peak = end;
         // Only on a new high-water mark, so this is quiet in steady state
@@ -272,6 +370,15 @@ fn bump_raw(inner: &Mutex<Inner>, name: &'static str, len: usize, align: usize) 
     }
     inner.cursor = end;
     inner.dirty = true;
+    if wave_census::enabled() {
+        // The carve is recorded whether or not a frame could be named: a census
+        // that dropped the unattributable ones would under-count the phase,
+        // which is the one thing it exists to get right.
+        inner.census.push(Carve {
+            len,
+            label: wave_census::label(),
+        });
+    }
     if end > inner.peak {
         inner.peak = end;
         log::debug!("{}: transient peak {} B of {} B", name, end, inner.capacity);
@@ -362,7 +469,15 @@ impl Drop for Generation {
                 inner.reclaim,
             )
         };
+        // The tier's reference count moves on **every** drop, not only the ones
+        // that reset a cursor: a clean generation still held the tier open.
+        let release = |g: &Generation| {
+            if g.domain != NOT_A_WAVE {
+                release_if_last(g.domain as usize);
+            }
+        };
         if !should_reset {
+            release(self);
             return;
         }
         // Fence before the cursor moves: the ranges about to become reusable
@@ -377,13 +492,28 @@ impl Drop for Generation {
                     "{}: transient reset skipped — stream fence failed: {e:?}",
                     self.name
                 );
+                release(self);
                 return;
             }
         }
         let mut inner = self.inner.lock().unwrap();
+        // The generation is closing, so its cursor is this layer phase's whole
+        // cost. Itemise it if it is the worst yet for its chain — see
+        // `wave_census`.
+        if wave_census::enabled() {
+            let (cursor, carves, capacity) = (inner.cursor, inner.census.len(), inner.capacity);
+            let seen = inner.reported_peak.entry(carves).or_insert(0);
+            if cursor > *seen {
+                *seen = cursor;
+                wave_census::report(self.name, cursor, capacity, &inner.census);
+            }
+        }
+        inner.census.clear();
         inner.cursor = 0;
         inner.dirty = false;
         inner.epoch += 1;
+        drop(inner);
+        release(self);
     }
 }
 
@@ -468,6 +598,44 @@ pub const WAVE_FORWARD_BYTES: usize = 16 * 1024 * 1024;
 struct WaveDomain {
     /// Indexed by [`LayerPhase`] via [`phase_index`].
     arenas: [BumpArena; 3],
+    /// Generations open across **all three** arenas.
+    ///
+    /// The per-arena `live` count bounds one span's cursor; this bounds the
+    /// tier's *existence*. It goes 0 → 1 when a forward opens its first phase
+    /// and 1 → 0 when the last guard drops, and those two moments are exactly
+    /// where the tier is placed and where it vanishes.
+    live_generations: usize,
+    /// What the next placement should reserve per phase, set by the forward
+    /// before it opens anything ([`plan_wave_transient`]).
+    ///
+    /// `None` until a forward has priced itself, which is the case for every
+    /// path that opens a wave without going through the batched forward — tests,
+    /// the migration helpers — and those get [`fallback_plan`].
+    planned: Option<[usize; 3]>,
+    /// Where the tier currently sits, while it exists.
+    placed_at: Option<u64>,
+    /// Whether that placement belongs to a **forward** or to a lone guard.
+    ///
+    /// [`plan_wave_transient`] reserves for the forward, so the reservation has
+    /// to outlive the phase boundaries inside it and is released by the *next*
+    /// forward. A caller that opens a guard without ever pricing itself — a
+    /// test, a migration helper, anything at load — has no forward to hand it
+    /// back, so its reservation is scoped to the guard and
+    /// [`release_if_last`] returns it.
+    ///
+    /// Without the distinction a single unplanned `begin_wave` at load pins the
+    /// tier at whatever the frontier was then, for the life of the process.
+    reserved_by_forward: bool,
+}
+
+/// What to reserve per phase when a wave opens without having priced itself.
+///
+/// The old fixed constants. A caller that goes through the batched forward
+/// always sets a real plan; this covers the paths that do not, and it is
+/// deliberately the worst case rather than a guess — an under-sized fallback
+/// would exhaust a span rather than merely waste one.
+fn fallback_plan() -> [usize; 3] {
+    [WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES]
 }
 
 /// Arena coordinate for a domain that is **not** a wave half.
@@ -505,19 +673,74 @@ fn with_wave_domain<R>(
     let domain = match map.entry(ordinal) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => v.insert(WaveDomain {
+            // Created with no backing at all: the tier does not exist between
+            // forwards, so there is nothing to carve until one opens.
             arenas: [
-                BumpArena::new(stream, "wave-attn", WAVE_ATTN_BYTES, Reclaim::StreamOrdered)?,
-                BumpArena::new(stream, "wave-ffn", WAVE_FFN_BYTES, Reclaim::StreamOrdered)?,
-                BumpArena::new(
-                    stream,
-                    "wave-forward",
-                    WAVE_FORWARD_BYTES,
-                    Reclaim::StreamOrdered,
-                )?,
+                BumpArena::detached(stream, "wave-attn"),
+                BumpArena::detached(stream, "wave-ffn"),
+                BumpArena::detached(stream, "wave-forward"),
             ],
+            live_generations: 0,
+            planned: None,
+            placed_at: None,
+            reserved_by_forward: false,
         }),
     };
     f(domain)
+}
+
+/// Price **and reserve** the transient tier for the forward about to run.
+///
+/// Called once per forward, after its KV is admitted and before it opens its
+/// first phase. The three figures come from `WavePlan::phase_bytes` at the
+/// admitted row count, so the tier is sized to **this** wave rather than to the
+/// widest one the engine can run — a twenty-session decode needs a few megabytes
+/// where the fixed constants reserved 912 MiB, and the difference is what the
+/// weight side gets to hold.
+///
+/// # The reservation is per forward, and that is the whole point
+///
+/// This used to only record a size, with [`begin_wave`] deciding the address on
+/// each phase and [`release_if_last`] giving the ground back when that phase's
+/// last guard dropped. A forward opens and closes its phases many times, so the
+/// tier's ground was released and re-taken between every one of them — and in
+/// each of those gaps the region ceiling lifted, another thread could claim a
+/// fresh region, and the next phase's tier landed one region further along.
+///
+/// A tier that walks forward mid-sweep puts layer *N*'s FFN extent and layer
+/// *N+1*'s attention extent at **different** offsets, which is not the situation
+/// [`Reclaim::StreamOrdered`] argues about: that argument is a phase reusing
+/// *its own* span with a whole other phase's same-stream work in between. Two
+/// different extents, on two streams, have nothing ordering them. It cost
+/// `Q8_0 x20` every session's output while the region pool looked untouched
+/// (`docs/elastic_vram_partition.md` §13b).
+///
+/// So the address is decided **here**, once, and held for the forward: the
+/// ceiling stands across the inter-phase gaps, `begin_wave` rebases onto an
+/// address it does not choose, and `release_if_last` returns the arenas to
+/// nothing without returning the ground.
+///
+/// A forward that begins while a guard from the previous one is still live keeps
+/// that reservation rather than moving it — the tier cannot move under a live
+/// generation, and refusing here would fail a forward for a bookkeeping reason.
+pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+    let stream = stream.clone();
+    with_wave_domain(&stream, |domain| {
+        domain.planned = Some(per_phase);
+        if domain.live_generations > 0 {
+            return Ok(());
+        }
+        // The previous forward's ground goes back before this one's frontier is
+        // measured, so the reservation is taken against a partition that already
+        // reflects everything admit claimed.
+        if domain.placed_at.take().is_some() {
+            release_transient(&stream);
+        }
+        let total: usize = per_phase.iter().sum();
+        domain.placed_at = Some(place_transient(&stream, total)?);
+        domain.reserved_by_forward = true;
+        Ok(())
+    })
 }
 
 /// Open a generation on `phase`'s span.
@@ -540,7 +763,8 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
     candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
     let ordinal = stream.context().ordinal() as u32;
     let arena_idx = phase_index(phase) as u32;
-    with_wave_domain(stream, |domain| {
+    let stream = stream.clone();
+    with_wave_domain(&stream, |domain| {
         let arena = &domain.arenas[phase_index(phase)];
         if arena.is_live() {
             candle::bail!(
@@ -550,8 +774,102 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                  reset the span the outer one is still handing out."
             )
         }
-        arena.generation(ordinal, arena_idx)
+        // **The arenas come into existence here; the ground they sit on does
+        // not.** [`plan_wave_transient`] reserved that once for the whole
+        // forward, so this only lays the three spans out inside it — at an
+        // address this function does not choose and cannot change. That is what
+        // keeps every phase of a sweep at the same offsets.
+        //
+        // **The plan is the size.** `WavePlan` prices this wave's buffers from
+        // the model's geometry, and every variant in it was read off
+        // `super::wave_census` on a real run rather than inferred, so a
+        // twenty-session decode reserves the few megabytes it needs where the
+        // fixed constants reserved 912 MiB — and a wide prefill reserves more
+        // than 912 MiB rather than silently spilling the tail of its expert
+        // chain onto the pool, which is what the constants were doing.
+        //
+        // The fallback covers callers that never priced themselves — tests, the
+        // migration helpers — and it is deliberately the old worst case rather
+        // than a guess. Those callers never reached `plan_wave_transient`
+        // either, so this is also where their reservation is taken.
+        if domain.live_generations == 0 {
+            let plan = domain.planned.unwrap_or_else(fallback_plan);
+            let base = match domain.placed_at {
+                Some(base) => base,
+                None => {
+                    // No forward priced this one, so nothing will hand the
+                    // ground back for it — the reservation is the guard's and
+                    // drops with it.
+                    let total: usize = plan.iter().sum();
+                    let base = place_transient(&stream, total)?;
+                    domain.placed_at = Some(base);
+                    domain.reserved_by_forward = false;
+                    base
+                }
+            };
+            let mut at = base;
+            for (i, arena) in domain.arenas.iter().enumerate() {
+                arena.rebase(at, plan[i])?;
+                at += plan[i] as u64;
+            }
+        }
+        // Count only once the guard exists. The count is what `release_if_last`
+        // decrements on drop, so incrementing before a fallible call would strand
+        // the tier permanently if that call ever failed — there would be no guard
+        // to drop and nothing to bring the count back down.
+        let generation = arena.generation(ordinal, arena_idx)?;
+        domain.live_generations += 1;
+        Ok(generation)
     })
+}
+
+/// Release the tier if `ordinal`'s last wave generation has just dropped.
+///
+/// Called from [`Generation::drop`]. Reference-counted rather than scoped
+/// because a forward's head span is *returned to its caller* — the tier's
+/// lifetime is the union of the guards, not any one function's body.
+fn release_if_last(ordinal: usize) {
+    let mut map = match wave_domains().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    let Some(domain) = map.get_mut(&ordinal) else {
+        return;
+    };
+    domain.live_generations = domain.live_generations.saturating_sub(1);
+    if domain.live_generations > 0 {
+        return;
+    }
+    // Nothing is live in any of the three spans, so detach them — a cursor that
+    // still names an address it no longer owns is the one thing a bump allocator
+    // must not have.
+    //
+    // **A forward's ground stays reserved.** This runs at every phase boundary,
+    // not only at the end of a forward: a layer's attention guard drops before
+    // its FFN guard opens, and the head span opens after the last layer's has
+    // gone. Returning the reservation there would lift the region ceiling in
+    // each of those gaps, let another thread claim into it, and move the next
+    // phase's tier — which is exactly the failure §13b records. The reservation
+    // belongs to the forward, and [`plan_wave_transient`] is what returns it.
+    //
+    // **A lone guard's ground does not.** A caller that never priced itself has
+    // no forward to hand it back, so leaving the reservation standing pins the
+    // tier for the life of the process — at whatever the frontier happened to be
+    // when some helper opened a span at load.
+    for arena in &domain.arenas {
+        let _ = arena.rebase(0, 0);
+    }
+    if !domain.reserved_by_forward && domain.placed_at.take().is_some() {
+        release_transient(&stream_of(domain));
+    }
+}
+
+/// The stream a wave domain was built against.
+///
+/// Every arena in a domain is created from the same stream, so any of them
+/// answers — arena 0 by convention.
+fn stream_of(domain: &WaveDomain) -> Arc<CudaStream> {
+    domain.arenas[0].inner.lock().unwrap().stream.clone()
 }
 
 /// Carve `bytes` from the arena a [`WaveTicket`] names — the resolver candle-core
@@ -584,6 +902,25 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
     bump_raw(&inner, name, bytes, align)
 }
 
+/// Whether any wave generation is open on `ordinal`.
+///
+/// **The one thing the moving boundary must never do is move mid-wave.** A
+/// retraction evicts experts and relocates others, and a wave in flight may be
+/// reading either; the design's answer is that the boundary moves only at the
+/// expert pipeline's end-of-pass, where no GEMM for the pass is still being
+/// issued. That is a structural property of where `renegotiate_boundary` is
+/// called from, and this is what lets `set_weight_floor` check it rather than
+/// trust it (principle 7: refuse rather than corrupt).
+pub fn wave_is_live(ordinal: usize) -> bool {
+    wave_domains()
+        .lock()
+        .map(|map| {
+            map.get(&ordinal)
+                .is_some_and(|d| d.arenas.iter().any(|a| a.is_live()))
+        })
+        .unwrap_or(false)
+}
+
 /// `(cursor, peak, capacity)` per wave arena on `ordinal`, ordered by
 /// [`phase_index`]: attention, FFN, forward.
 ///
@@ -612,8 +949,10 @@ pub fn wave_domain_stats(ordinal: usize) -> Option<[(usize, usize, usize); 3]> {
 /// callers were written to respect, now enforced by the allocator instead of
 /// by the driver refusing.
 ///
-/// Separate from the wave domain so the persistence thread can never reset a
-/// buffer the scheduler is still reading, and vice versa (§3.6).
+/// Separate from the wave domains so the persistence thread can never reset a
+/// buffer the scheduler is still reading, and vice versa — and carved from the
+/// **fixed** left block rather than the floating wave tier, because its ranges
+/// live on a copy stream whose schedule has nothing to do with a wave's.
 pub(crate) fn persistence_domain(stream: &Arc<CudaStream>) -> Result<BumpArena> {
     let mut map = domains().lock().unwrap();
     let ordinal = stream.context().ordinal();

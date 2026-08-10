@@ -3859,6 +3859,72 @@ pub fn load_repacked_on_stream(
     }))
 }
 
+/// Upload `repacked_data` to `dst_ptr` — device memory owned by somebody else —
+/// and wrap it as a storage that will not free those bytes.
+///
+/// The weight-zone counterpart of [`load_repacked_on_stream`]. An expert slot is
+/// a fixed-size range of the device reservation, handed out by
+/// `candle_nn::kv_cache::WeightZone`, so the bytes outlive any one `QTensor`
+/// built over them: a miss overwrites the slot in place and an eviction returns
+/// it to the zone's free list. Dropping the storage must therefore release the
+/// *view* and nothing else, which is exactly what [`Backing::Lease`] means here.
+///
+/// No `MATRIX_ROW_PADDING` tail, matching what the pool path allocated: the
+/// expert kernels read the repacked layout exactly and never over-read it.
+///
+/// # Safety
+///
+/// `dst_ptr` must point to at least `repacked_data.len()` bytes of device memory
+/// that stays live, and un-aliased for writes, for the storage's lifetime.
+pub unsafe fn load_repacked_into(
+    device: &CudaDevice,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    dst_ptr: u64,
+    repacked_data: &[u8],
+    dtype: GgmlDType,
+) -> Result<super::QStorage> {
+    let len = repacked_data.len();
+    // Upgraded once and moved into the storage: a second upgrade would need its
+    // own `leak` on every path out of here, and forgetting one strands a pair of
+    // `CudaEvent`s per expert load.
+    let mut inner = stream.upgrade_device_ptr::<u8>(dst_ptr, len);
+    stream
+        .memcpy_htod(repacked_data, &mut inner.slice_mut(..len))
+        .map_err(crate::Error::wrap)?;
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len }),
+        device: device.clone(),
+        dtype,
+        backing: Backing::Lease(LeaseOrigin::Foreign),
+    }))
+}
+
+/// Wrap `bytes` of already-populated device memory at `ptr` as a storage that
+/// will not free it — [`load_repacked_into`] without the upload.
+///
+/// For a slot that has been **relocated**: the bytes were copied device-to-device
+/// and are already correct, but the three `QMatMul`s hold device pointers, so
+/// their storages have to be rebuilt over the new address.
+///
+/// # Safety
+///
+/// `ptr` must point to at least `bytes` of live device memory holding a valid
+/// `dtype` payload, un-aliased for writes for the storage's lifetime.
+pub unsafe fn view_repacked(
+    device: &CudaDevice,
+    ptr: u64,
+    bytes: usize,
+    dtype: GgmlDType,
+) -> Result<super::QStorage> {
+    let inner = device.cuda_stream().upgrade_device_ptr::<u8>(ptr, bytes);
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len: bytes }),
+        device: device.clone(),
+        dtype,
+        backing: Backing::Lease(LeaseOrigin::Foreign),
+    }))
+}
+
 /// Like [`load_repacked_on_stream`], but uses the device's default stream.
 pub fn load_repacked(
     device: &CudaDevice,

@@ -633,14 +633,18 @@ impl Scheduler {
         // partition came to binding, which is what step 7 tunes.
         if let Some(r) = candle_nn::kv_cache::region_stats(0) {
             tracing::debug!(
-                "kv-regions: live={} peak={} free={} of {} ({}MiB) | transient carved={}MiB of {}MiB",
+                "kv-regions: live={} peak={} free={} of {} ({}MiB) | tier={}MiB \
+                 (ceiling {} regions) | weights={}MiB | late-claims={} refusals={}",
                 r.live,
                 r.peak_live,
                 r.free,
                 r.total,
                 mib(r.total * candle_nn::kv_cache::REGION_BYTES),
-                mib(r.transient_carved),
                 mib(r.transient_bytes),
+                r.transient_ceiling,
+                mib(r.weight_bytes),
+                r.fresh_claims_during_wave,
+                r.refusals_during_wave,
             );
         }
         // Per-domain transient peaks, the terms the transient tier is sized

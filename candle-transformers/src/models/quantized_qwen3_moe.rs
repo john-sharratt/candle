@@ -17,6 +17,8 @@ use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 use super::batched_model::{BatchedModelCore, WaveShapes};
 #[cfg(feature = "cuda")]
 use super::expert_lre::GpuDispatchTables;
+#[cfg(feature = "cuda")]
+use super::expert_lre::{layer_geometries, slot_bytes_for};
 use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
@@ -43,6 +45,11 @@ use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
+use candle_nn::kv_cache::WeightZone;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{
+    initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
+};
 use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
@@ -798,6 +805,69 @@ enum FeedForward {
     MoE(SparseMoeBlock),
 }
 
+/// A layer's FFN before the expert cache exists.
+///
+/// The load order is dense-weights-then-span-then-experts (see
+/// `docs/elastic_vram_partition.md` §4): the reservation is sized from a live
+/// measurement taken once every dense tensor is resident, and the expert cache
+/// is filled into the span that measurement produced. A MoE layer's
+/// `SparseMoeBlock` holds an `Arc<ExpertCache>`, so it cannot be built during
+/// the dense loop — this is what the loop produces instead, and the cache is
+/// grafted on afterwards.
+///
+/// Only the expert half is deferred. The router gate is a dense tensor and is
+/// loaded in the loop with the rest of them.
+enum PendingFfn {
+    Mlp(MlpWeights),
+    MoE { gate: QMatMul, moe_layer_idx: usize },
+}
+
+/// A layer with everything except its expert cache.
+struct PendingLayer {
+    self_attn: AttentionWeights,
+    ffn: PendingFfn,
+    ln1: RmsNorm,
+    ln2: RmsNorm,
+}
+
+impl PendingLayer {
+    /// Graft the expert cache on. `cache` is `None` only for a model with no MoE
+    /// layers, where no `PendingFfn::MoE` can exist either.
+    fn resolve(
+        self,
+        cache: Option<&Arc<ExpertCache>>,
+        n_expert_used: usize,
+        norm_topk_prob: bool,
+    ) -> Result<LayerWeights> {
+        let ffn = match self.ffn {
+            PendingFfn::Mlp(mlp) => FeedForward::Mlp(mlp),
+            PendingFfn::MoE {
+                gate,
+                moe_layer_idx,
+            } => {
+                let cache = cache.ok_or_else(|| {
+                    candle::Error::Msg(
+                        "a MoE layer was loaded but no expert cache was built".into(),
+                    )
+                })?;
+                FeedForward::MoE(SparseMoeBlock {
+                    gate,
+                    cache: cache.clone(),
+                    moe_layer_idx,
+                    num_experts_per_tok: n_expert_used,
+                    norm_topk_prob,
+                })
+            }
+        };
+        Ok(LayerWeights {
+            self_attn: self.self_attn,
+            ffn,
+            ln1: self.ln1,
+            ln2: self.ln2,
+        })
+    }
+}
+
 // ============================================================================
 // Layer Weights
 // ============================================================================
@@ -1159,31 +1229,6 @@ pub fn read_hf_config(model_dir: &std::path::Path) -> HFModelConfig {
 ///
 /// Tries `qwen3moe`, `qwen2moe`, then falls back to whatever
 /// `general.architecture` says. Returns the prefix string (e.g. "qwen2moe").
-/// Is `name` an MoE expert weight, in **either** GGUF layout?
-///
-/// The loader accepts two: the 3D merged form, where a layer's experts are one
-/// `blk.{i}.ffn_{gate,up,down}_exps.weight`, and the 2D per-expert fallback,
-/// where each expert is its own `blk.{i}.ffn_{gate,up,down}.{j}.weight`. Only
-/// the first has a distinguishing suffix, so matching on `_exps.weight` alone
-/// silently classifies every tensor of a 2D checkpoint as dense.
-///
-/// The numeric segment is what separates an expert from a *dense* layer's
-/// `blk.{i}.ffn_gate.weight`, which must stay counted as dense.
-fn is_expert_tensor(name: &str) -> bool {
-    if name.ends_with("_exps.weight") {
-        return true;
-    }
-    let Some(rest) = name.strip_suffix(".weight") else {
-        return false;
-    };
-    let Some((head, idx)) = rest.rsplit_once('.') else {
-        return false;
-    };
-    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    head.ends_with(".ffn_gate") || head.ends_with(".ffn_up") || head.ends_with(".ffn_down")
-}
 
 fn detect_arch_prefix(metadata: &HashMap<String, gguf_file::Value>) -> String {
     // Check general.architecture first
@@ -1502,6 +1547,7 @@ impl ModelWeights {
                 hidden: hidden_size,
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
+                n_experts: n_expert,
             },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
@@ -1937,170 +1983,35 @@ impl ModelWeights {
         }
 
         // Combined progress denominator for the `from_gguf_by_path`
-        // outer callback: expert cache uploads (`num_moe_layers ×
-        // n_expert`) followed by the per-layer attention loop
-        // (`num_layers`). The bar then advances continuously through
-        // both phases, instead of sitting at 0% until the cache
-        // finishes.
+        // outer callback: the per-layer dense loop (`num_layers`) followed by
+        // the expert cache uploads (`num_moe_layers × n_expert`). The bar then
+        // advances continuously through both phases.
+        //
+        // The two phases swapped order. The dense weights must be **resident**
+        // before the span is reserved, because the span is sized from
+        // `usable()` — a live measurement — and that is what subtracts them
+        // exactly once. Sizing the expert cache first meant forecasting the
+        // dense footprint from the GGUF tensor table and hoping the forecast
+        // matched (`pending_dense_bytes`, now deleted).
         let total_expert_ticks = num_moe_layers * n_expert;
         let total_units = total_expert_ticks + num_layers;
 
-        // ── Build Expert Cache ──
-        let expert_cache = if !all_host_refs.is_empty() && n_expert > 0 {
-            // Determine per-expert shapes from the first layer's first expert
-            // Use max expert size across all layers for budget calculation
-            let max_expert_size = all_host_refs
-                .iter()
-                .flat_map(|layer| layer.iter())
-                .map(|r| r.gate_len + r.up_len + r.down_len)
-                .max()
-                .unwrap_or(0);
-            let total_experts = num_moe_layers * n_expert;
-            let total_expert_bytes = total_experts * max_expert_size;
-
-            // ── Declare the dense weights BEFORE sizing the expert cache ──
-            //
-            // `expert_budget()` reserves `kv_floor + scratch_margin` out of what
-            // is free *at this instant*, so everything that loads after this
-            // point is spent from that reserve. The per-layer dense tensors are
-            // ~1 GiB of it and they have not loaded yet: the loader reaches them
-            // below, and the post-load `set_class(Weights, ...)` that records
-            // them runs ~260 lines further on. Until that was accounted here,
-            // the KV side paid for the model's own weights — measured at
-            // 2,912 MiB where the partition intends ~4,439
-            // (`docs/archived/arena_unification_results.md`, step 7b).
-            //
-            // Summed from the GGUF tensor table rather than measured, for the
-            // same reason the post-load tally is summed: a driver delta cannot
-            // see through the caching allocator. Experts are excluded — they are
-            // what this budget is *for* — and so is the embedding, whose VRAM
-            // contribution `dense_bytes` already carries, because the
-            // host-vs-device decision for it was made above.
-            //
-            // The later `set_class` is not redundant: it replaces this estimate
-            // with the true summed total once every tensor is resident. This one
-            // exists to inform the decision; that one to be correct afterwards.
-            #[cfg(feature = "cuda")]
-            let pending_dense_bytes: usize = if matches!(device, Device::Cuda(_)) {
-                let planned: usize = ct
-                    .tensor_infos
-                    .iter()
-                    .filter(|(name, _)| {
-                        !is_expert_tensor(name) && name.as_str() != "token_embd.weight"
-                    })
-                    .map(|(_, info)| {
-                        let blocks = info.shape.elem_count() / info.ggml_dtype.block_size();
-                        blocks * info.ggml_dtype.type_size()
-                    })
-                    .sum();
-                tracing::info!(
-                    target: "candle_transformers::quantized_qwen3_moe",
-                    loaded_mib = dense_bytes.get() >> 20,
-                    still_to_load_mib = planned >> 20,
-                    "declaring dense weights before the expert budget"
-                );
-                if let Some(g) = candle::vram::get(gpu_id) {
-                    g.set_class(
-                        candle::vram::AllocClass::Weights,
-                        (dense_bytes.get() + planned) as u64,
-                    );
-                }
-                planned
-            } else {
-                0
-            };
-            #[cfg(not(feature = "cuda"))]
-            let pending_dense_bytes: usize = 0;
-
-            // ── VRAM budget for expert LRU cache ──
-            // Preferred: the VRAM Governor computes it from the live measurement
-            // at this instant, with the dense weights declared just above, so the
-            // KV floor + scratch cushion it leaves free are computed against the
-            // whole model rather than the part of it that happens to be resident
-            // (`docs/vram_governor_design.md` §11). Fallback (no governor): the
-            // legacy `min(max(free−5GB, free×50%), total_expert_bytes)`.
-            //
-            // The pending dense bytes come off the budget, not out of the floor.
-            // Declaring them above makes `kv_floor` honest for every later
-            // reader, but the floor is `abs + pct x (C - weights)` — declaring
-            // weights *lowers* it, which hands the experts more, and the weights
-            // still load from the remainder afterwards. Measured: the
-            // declaration alone moved KV 182 -> 176 regions, the wrong way. What
-            // `expert_budget()` cannot know is that `usable` includes memory
-            // already promised to tensors the loader has not reached yet.
-            #[cfg(feature = "cuda")]
-            let gov_budget = candle::vram::get(gpu_id)
-                .and_then(|g| g.expert_budget().ok())
-                .map(|b| b.saturating_sub(pending_dense_bytes as u64));
-            #[cfg(not(feature = "cuda"))]
-            let gov_budget: Option<u64> = None;
-            let expert_budget = match gov_budget {
-                Some(b) => (b as usize).min(total_expert_bytes),
-                None => {
-                    const RESERVE_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GB
-                    let generous = free_vram.saturating_sub(RESERVE_BYTES).max(free_vram / 2);
-                    generous.min(total_expert_bytes)
-                }
-            };
-
-            let num_slots = if max_expert_size > 0 {
-                let base = expert_budget / max_expert_size;
-                // Round up: if leftover VRAM can fit ≥50% of another expert,
-                // take it — avoids DMA churn when the model *almost* fits.
-                let remainder = expert_budget % max_expert_size;
-                let rounded = if remainder >= max_expert_size / 2 {
-                    base + 1
-                } else {
-                    base
-                };
-                rounded.min(total_experts)
-            } else {
-                0
-            };
-
-            tracing::debug!(
-                "Expert cache: {} slots / {} total (budget {:.1} GB / {:.1} GB model, max expert {:.1} KB)",
-                num_slots,
-                total_experts,
-                expert_budget as f64 / 1e9,
-                total_expert_bytes as f64 / 1e9,
-                max_expert_size as f64 / 1e3,
-            );
-
-            // Wrap the outer callback so the cache's per-expert
-            // `(done, total_experts)` ticks land on the combined
-            // denominator computed above.
-            let cache_wrapper =
-                progress.map(|cb| move |done: usize, _total: usize| cb(done, total_units));
-            let cache_progress: Option<&dyn Fn(usize, usize)> =
-                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
-            let cache = ExpertCache::new(
-                mmap.clone(),
-                all_host_refs,
-                num_slots,
-                device,
-                n_expert,
-                Some(file_path),
-                cache_progress,
-                int8mode,
-            )?;
-            // Record the resident expert footprint with the governor (tally +
-            // kv_floor base; the availability gate stays the live measurement).
-            #[cfg(feature = "cuda")]
-            if let Some(g) = candle::vram::get(gpu_id) {
-                g.set_class(
-                    candle::vram::AllocClass::Expert,
-                    (num_slots * max_expert_size) as u64,
-                );
-            }
-            Some(Arc::new(cache))
-        } else {
-            // No MoE layers — warm the entire mmap the simple way.
+        // The expert cache is built **after** the dense weights, further down.
+        // Only the "is there one at all" question is answered here, because a
+        // model without MoE layers warms its whole mmap now and never comes
+        // back to this.
+        let has_experts = !all_host_refs.is_empty() && n_expert > 0;
+        if !has_experts {
             warm_mmap(&mmap);
-            None
-        };
-        // ── Load layers ──
-        let mut layers = Vec::with_capacity(num_layers);
+        }
+
+        // ── Load layers (dense) ──
+        //
+        // Everything except the experts. The FFN half of a MoE layer needs the
+        // expert cache, which needs the span, which is sized from a measurement
+        // taken once these are resident — so the loop yields a [`PendingLayer`]
+        // and the cache is grafted on below.
+        let mut pending: Vec<PendingLayer> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let prefix = format!("blk.{i}");
 
@@ -2162,22 +2073,12 @@ impl ModelWeights {
                     load_tensor(&format!("{prefix}.ffn_gate_inp.weight"))?.into(),
                     int8mode,
                 )?;
-
-                let cache_ref = expert_cache
-                    .as_ref()
-                    .ok_or_else(|| candle::Error::Msg("expert_cache is None for MoE layer".into()))?
-                    .clone();
-
                 let moe_layer_idx = moe_count;
                 moe_count += 1;
-
-                FeedForward::MoE(SparseMoeBlock {
+                PendingFfn::MoE {
                     gate,
-                    cache: cache_ref,
                     moe_layer_idx,
-                    num_experts_per_tok: n_expert_used,
-                    norm_topk_prob,
-                })
+                }
             } else {
                 // Dense MLP
                 let gate_w = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
@@ -2215,7 +2116,7 @@ impl ModelWeights {
                         Some(QMatMul::from_weights_with_mode(up_w.into(), int8mode)?),
                     )
                 };
-                FeedForward::Mlp(MlpWeights {
+                PendingFfn::Mlp(MlpWeights {
                     gate_up_proj,
                     gate_proj,
                     up_proj,
@@ -2225,7 +2126,7 @@ impl ModelWeights {
                 })
             };
 
-            layers.push(LayerWeights {
+            pending.push(PendingLayer {
                 self_attn,
                 ffn,
                 ln1,
@@ -2235,22 +2136,145 @@ impl ModelWeights {
             if (i + 1) % 8 == 0 || i == num_layers - 1 {
                 tracing::debug!("Layer {}/{} loaded", i + 1, num_layers);
             }
-            // Continue the bar from where the expert cache left off, on
-            // the same combined denominator (`total_units`). Each layer
-            // is one tick — the layers run far faster than experts but
-            // they're a small fraction of the total either way.
+            // The dense loop runs first now, so it holds the first `num_layers`
+            // ticks of the combined denominator and the expert fill continues
+            // from there.
             if let Some(cb) = progress {
-                cb(total_expert_ticks + i + 1, total_units);
+                cb(i + 1, total_units);
             }
         }
 
-        // Load final norm and output projection
+        // Load final norm and output projection — the last of the dense weights.
         let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let lm_head_tensor = match load_tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
+
+        // ── Reserve the span, then build the expert cache into it ──
+        //
+        // This is the moment §4 describes: every dense tensor is resident, so
+        // `usable()` reports what is genuinely left, and the reservation takes
+        // it. Nothing after this point allocates weights outside the span.
+        #[cfg(feature = "cuda")]
+        if let Some(g) = candle::vram::get(gpu_id) {
+            g.set_class(candle::vram::AllocClass::Weights, dense_bytes.get() as u64);
+        }
+
+        let expert_cache = if has_experts {
+            let total_experts = num_moe_layers * n_expert;
+            //
+            // There used to be one — `pending_dense_bytes`, summed from the GGUF
+            // tensor table — because the expert budget was computed while ~1 GiB
+            // of dense tensors had not loaded yet, so the KV side paid for the
+            // model's own weights (measured at 2,912 MiB where the partition
+            // intended ~4,439). The forecast existed only because the ordering
+            // was wrong.
+            //
+            // Under the current order every dense tensor is resident before this
+            // point, so `usable()` — the drop in headroom since `C` was measured
+            // — has already netted them out, exactly once. Re-declaring them
+            // would book the same bytes twice.
+            //
+            // ── The span decides the slot count ──
+            //
+            // `VramGovernor::expert_budget()` used to compute a byte budget here
+            // and divide it by `max_expert_size`. Both are gone. The weight zone
+            // is a region of the reservation, its capacity is
+            // `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, and that quotient
+            // **is** the resident-expert count — there is no second arithmetic
+            // deriving one from the other, and no forecast of anything.
+            //
+            // `slot_bytes` comes from the *repacked* geometry rather than the
+            // raw GGML lengths the old budget used. A slot holds one expert's
+            // three projections at aligned offsets, and it is what the zone is
+            // carved into, so it has to be the exact figure the upload writes.
+            #[cfg(feature = "cuda")]
+            let zone = if let Device::Cuda(cuda_dev) = device {
+                let stream = cuda_dev.cuda_stream();
+                let geoms = layer_geometries(&all_host_refs, int8mode)?;
+                let slot_bytes = slot_bytes_for(&geoms);
+                // Two different numbers: where the boundary starts, and how far
+                // it may ever go. The zone opens at `initial` — sized to leave
+                // the KV side its measured cold-boot peak — and its `limit` is
+                // the hard floor it may grow to once the KV side has shown what
+                // it actually uses.
+                let limit_bytes = weight_capacity_bytes(&stream)?;
+                let initial_bytes = initial_weight_bytes(&stream)?;
+                let slots_in = |bytes: usize| {
+                    if slot_bytes > 0 {
+                        (bytes / slot_bytes).min(total_experts)
+                    } else {
+                        0
+                    }
+                };
+                let capacity = slots_in(initial_bytes);
+                let limit = slots_in(limit_bytes);
+                let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit);
+                // Place the boundary. Everything left of it belongs to the KV
+                // side, and the region count is re-derived from it here rather
+                // than assumed anywhere.
+                let regions = set_weight_floor(&stream, zone.frontier_for_capacity())?;
+                tracing::info!(
+                    target: "candle_transformers::quantized_qwen3_moe",
+                    slots = capacity,
+                    max_slots = limit,
+                    total_experts,
+                    slot_bytes,
+                    weight_gib = (capacity * slot_bytes) as f64 / 1e9,
+                    model_gib = (total_experts * slot_bytes) as f64 / 1e9,
+                    kv_regions = regions,
+                    "expert cache opened against the span"
+                );
+                zone
+            } else {
+                // No device reservation on a non-CUDA device: the legacy prewarm
+                // path allocates each expert from the host allocator, so the zone
+                // exists only to count slots and hand out indices.
+                WeightZone::new(0, 0, total_experts, total_experts)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let zone = WeightZone::new(0, 0, total_experts, total_experts);
+            let capacity = zone.capacity();
+            let slot_bytes = zone.slot_bytes();
+
+            // Wrap the outer callback so the cache's per-expert
+            // `(done, total_experts)` ticks land on the combined denominator,
+            // after the `num_layers` ticks the dense loop already spent.
+            let cache_wrapper = progress
+                .map(|cb| move |done: usize, _total: usize| cb(num_layers + done, total_units));
+            let cache_progress: Option<&dyn Fn(usize, usize)> =
+                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
+            let cache = ExpertCache::new(
+                mmap.clone(),
+                all_host_refs,
+                zone,
+                device,
+                n_expert,
+                Some(file_path),
+                cache_progress,
+                int8mode,
+            )?;
+            // Record the resident expert footprint with the governor. Reporting
+            // only — nothing sizes itself from this any more.
+            #[cfg(feature = "cuda")]
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.set_class(
+                    candle::vram::AllocClass::Expert,
+                    (capacity * slot_bytes) as u64,
+                );
+            }
+            Some(Arc::new(cache))
+        } else {
+            None
+        };
+
+        // ── Graft the cache onto the layers ──
+        let layers = pending
+            .into_iter()
+            .map(|p| p.resolve(expert_cache.as_ref(), n_expert_used, norm_topk_prob))
+            .collect::<Result<Vec<_>>>()?;
 
         tracing::debug!(
             "Model loaded: {} layers ({} MoE), int8mode={:?}",
@@ -2310,6 +2334,7 @@ impl ModelWeights {
                 hidden: hidden_size,
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
+                n_experts: n_expert,
             },
             device: device.clone(),
             int8mode,
@@ -2348,35 +2373,6 @@ mod tests {
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
-
-    /// Expert tensors must be recognised in **both** GGUF layouts, because the
-    /// pre-load weight declaration subtracts everything it does *not* classify
-    /// as an expert from the expert budget. Matching only the 3D `_exps.weight`
-    /// suffix counted a 2D checkpoint's whole expert set as dense, which
-    /// saturates `expert_budget` to zero and builds the LRU cache with no GPU
-    /// slots at all — a silently crippled load, not a crash.
-    #[test]
-    fn expert_tensors_are_recognised_in_both_gguf_layouts() {
-        // 3D merged: one tensor per (layer, projection).
-        assert!(is_expert_tensor("blk.0.ffn_gate_exps.weight"));
-        assert!(is_expert_tensor("blk.47.ffn_down_exps.weight"));
-
-        // 2D per-expert fallback: one tensor per (layer, projection, expert).
-        assert!(is_expert_tensor("blk.0.ffn_gate.0.weight"));
-        assert!(is_expert_tensor("blk.12.ffn_up.127.weight"));
-        assert!(is_expert_tensor("blk.47.ffn_down.63.weight"));
-
-        // A dense layer's FFN has no expert index and must stay dense.
-        assert!(!is_expert_tensor("blk.0.ffn_gate.weight"));
-        assert!(!is_expert_tensor("blk.0.ffn_up.weight"));
-        assert!(!is_expert_tensor("blk.0.ffn_down.weight"));
-
-        // Everything else is dense.
-        assert!(!is_expert_tensor("blk.0.attn_q.weight"));
-        assert!(!is_expert_tensor("token_embd.weight"));
-        assert!(!is_expert_tensor("output_norm.weight"));
-        assert!(!is_expert_tensor("blk.0.ffn_gate.0.bias"));
-    }
 
     #[test]
     #[ignore] // Run with: cargo test --release --features cuda --lib --package candle-transformers quantized_qwen3_moe::tests::test_parallel_batched_forwarding -- --ignored --nocapture
@@ -2804,7 +2800,8 @@ mod tests {
             let mid = fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
                 .into_residual()
                 .expect("paused sweep must return a residual");
-            let split = fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?.logits_owned()?;
+            let split =
+                fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?.logits_owned()?;
             let c_split = cos(&full[0], &split[0])?;
             println!("split sweep [0,{k})+[{k},{n}) vs full: cos={c_split:.5}");
             assert!(c_split > 0.999, "re-entrant sweep diverged (cos={c_split})");

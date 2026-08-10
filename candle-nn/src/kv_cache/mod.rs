@@ -52,11 +52,22 @@ pub use chunked::wave_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    begin_wave, wave_domain_stats, BumpRange, WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
-    WAVE_FORWARD_BYTES,
+    begin_wave, plan_wave_transient, wave_domain_stats, BumpRange, WaveGeneration, WAVE_ATTN_BYTES,
+    WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
+};
+/// The span's geometry, for the model loader that installs a weight side into it.
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    initial_weight_bytes, set_claim_reserve, set_weight_floor, span_end, take_kv_demand,
+    weight_capacity_bytes, weight_floor_after,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{region_stats, RegionStats, REGION_BYTES};
+/// The weight side of the reservation. Pure arithmetic, so it is available
+/// whether or not the crate was built with a GPU backend.
+pub use chunked::{
+    RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;

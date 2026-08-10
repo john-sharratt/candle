@@ -1,7 +1,7 @@
-//! The balloon-and-measure bootstrap: claim ~90% of VRAM (touching it to force
-//! residency, which evicts other processes' cold allocations on WDDM), record
-//! the resident high-water as the capacity `C`, then free it. See
-//! `docs/vram_governor_design.md` §5.
+//! The balloon-and-measure bootstrap: claim everything except a fixed reserve
+//! (touching it to force residency, which evicts other processes' cold
+//! allocations on WDDM), record the resident high-water as the capacity `C`,
+//! then free it. See `docs/elastic_vram_partition.md` §5.
 
 use super::budget::GovernorConfig;
 use super::reading::VramProbe;
@@ -18,38 +18,75 @@ pub trait BalloonAllocator {
     fn free_all(&mut self);
 }
 
-/// Grow the balloon until it reaches the capacity target `C`, the probe's
-/// headroom hits `balloon_floor`, or an allocation fails — whichever comes first.
-/// Returns the resident high-water we claimed (`C`), having freed the balloon.
+/// The capacity target: everything on the card except a fixed absolute reserve.
 ///
-/// The target combines a fractional and an absolute reserve as
-/// `C = min(balloon_target_frac × total, total − balloon_headroom_abs)`: the
-/// fraction governs large cards and the absolute headroom protects small ones
-/// (see [`GovernorConfig::balloon_headroom_abs`]). `balloon_floor` remains a
-/// separate, deeper safety net for the growth loop itself.
+/// One expression, used by the growth loop **and** by the fast path that skips
+/// the balloon entirely, so the two cannot disagree about what "as much as
+/// possible" means. It was two — a fraction of total for the growth loop and
+/// nothing at all on the fast path — and the fast path is the one that runs on
+/// an uncontended card, so in practice the reserve was not being applied.
+///
+/// A fraction of the card is not a fact about anything: it says "leave 5%",
+/// which on a 16 GiB card means 818 MiB and on a 96 GiB card means 4.9 GiB, for
+/// no reason that scales. What has to be left is a fixed working margin for the
+/// display driver and the OS, and that is an absolute quantity.
+pub fn capacity_target(total: u64, reserve: u64) -> u64 {
+    total.saturating_sub(reserve)
+}
+
+/// Grow the balloon until it reaches [`capacity_target`], or until the driver
+/// refuses a chunk smaller than [`GovernorConfig::balloon_min_chunk`] — whichever
+/// comes first. Returns the resident high-water we claimed (`C`), having freed
+/// the balloon.
+///
+/// # Refusal refines the chunk instead of ending the claim
+///
+/// The loop grows in `balloon_chunk` steps (256 MiB). A refusal at that size
+/// says nothing about 128 MiB, so ending there leaves up to a whole chunk of
+/// claimable memory unmeasured — and `C` is what every later partition is sized
+/// from, so an under-measurement is permanent. Halving on refusal and continuing
+/// walks the claim down to within `balloon_min_chunk` of the true ceiling, at a
+/// cost of at most `log2(chunk / min_chunk)` extra failed allocations (three, at
+/// the shipped values).
+///
+/// The floor is the reservation's granule size: below it a claim cannot be
+/// expressed in the allocator the capacity is being measured *for*, so refining
+/// further would measure memory that could never be mapped.
+///
+/// The chunk only ever shrinks, so the loop provably terminates and pays at most
+/// `log2(chunk / min_chunk)` failed allocations near the ceiling. A refusal far
+/// from the ceiling — a transient squatter rather than the limit — leaves the
+/// rest of the claim to be made in `min_chunk` steps, bounded at
+/// `target / min_chunk` iterations. Restoring the chunk on success would avoid
+/// that, at the cost of re-failing at every doubling once the ceiling is close;
+/// the bound is a fraction of a second and the failure path is the one that
+/// matters, so it stays monotone.
 pub fn balloon_measure(
     probe: &dyn VramProbe,
     alloc: &mut dyn BalloonAllocator,
     config: &GovernorConfig,
 ) -> Result<u64> {
     let total = probe.read()?.total;
-    let frac_target = (config.balloon_target_frac * total as f64) as u64;
-    let abs_target = total.saturating_sub(config.balloon_headroom_abs);
-    let target = frac_target.min(abs_target);
-    let chunk = config.balloon_chunk.max(1);
+    let target = capacity_target(total, config.capacity_reserve);
+    let min_chunk = config.balloon_min_chunk.max(1);
+    let mut chunk = config.balloon_chunk.max(min_chunk);
     let mut reserved = 0u64;
     while reserved < target {
-        let headroom = probe.read()?.headroom;
-        if headroom <= config.balloon_floor {
-            break;
-        }
         let want = chunk.min(target - reserved);
         if want == 0 {
             break;
         }
         match alloc.alloc_and_touch(want) {
             Ok(()) => reserved = reserved.saturating_add(want),
-            Err(_) => break, // hard ceiling reached
+            Err(_) => {
+                // Not the ceiling — the ceiling *for this chunk size*. Halve and
+                // ask again; stop only when even the smallest useful claim is
+                // refused.
+                if chunk <= min_chunk {
+                    break;
+                }
+                chunk = (chunk / 2).max(min_chunk);
+            }
         }
     }
     alloc.free_all();

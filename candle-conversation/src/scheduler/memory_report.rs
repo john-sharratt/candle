@@ -102,9 +102,14 @@ pub struct GovernorSection {
     pub capacity_bytes: u64,
     /// Live measured headroom (honest, excludes the pool reuse gap).
     pub headroom_bytes: u64,
-    /// KV floor the startup partition leaves for the KV reservation.
-    pub kv_floor_bytes: u64,
-    pub scratch_margin_bytes: u64,
+    /// Cushion left outside the reservation for the CUDA pool.
+    ///
+    /// Replaces `kv_floor_bytes`, which reported the static KV reserve. There is
+    /// no static reserve now — the span holds KV, transients and experts, and
+    /// the boundary between the last two moves — so the weight side's own extent
+    /// is what says where the partition currently sits, and that is reported
+    /// with the arena occupancy rather than here.
+    pub pool_cushion_bytes: u64,
     /// Loose per-class reserved tallies (reporting, not availability gates).
     pub reserved_weights_bytes: u64,
     pub reserved_expert_bytes: u64,
@@ -275,8 +280,7 @@ impl Scheduler {
             let governor = self.session.vram_governor().map(|gov| GovernorSection {
                 capacity_bytes: gov.capacity(),
                 headroom_bytes: gov.measure().map(|r| r.headroom).unwrap_or(0),
-                kv_floor_bytes: gov.kv_floor(),
-                scratch_margin_bytes: gov.scratch_margin(),
+                pool_cushion_bytes: gov.pool_cushion(),
                 reserved_weights_bytes: gov.class_reserved(AllocClass::Weights),
                 reserved_expert_bytes: gov.class_reserved(AllocClass::Expert),
                 reserved_scratch_bytes: gov.class_reserved(AllocClass::Scratch),
@@ -436,8 +440,7 @@ mod tests {
                 governor: Some(GovernorSection {
                     capacity_bytes: 6,
                     headroom_bytes: 7,
-                    kv_floor_bytes: 8,
-                    scratch_margin_bytes: 9,
+                    pool_cushion_bytes: 8,
                     reserved_weights_bytes: 11,
                     reserved_expert_bytes: 12,
                     reserved_scratch_bytes: 13,

@@ -52,7 +52,12 @@ mod size_class;
 #[cfg(feature = "cuda")]
 pub(crate) mod slot_state_arena;
 mod types;
+mod wave_census;
 pub mod wave_plan;
+/// Unconditional: the zone is pure arithmetic over addresses and slot indices,
+/// so its invariants — the ones a mis-set boundary would violate — are provable
+/// on a machine with no GPU.
+pub mod weight_zone;
 
 #[cfg(test)]
 mod tests;
@@ -84,6 +89,9 @@ pub use size_class::{
 };
 pub use types::{ChunkMeta, CHUNK_SIZE};
 pub use types::{LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
+pub use weight_zone::{
+    RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+};
 
 // Re-export for use within submodules and tests
 pub use arena::ArenaKey;
@@ -100,8 +108,13 @@ pub use super::arena_table::ArenaLocation;
 pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
-    begin_wave, persistence_domain_stats, wave_domain_stats, BumpRange,
+    begin_wave, persistence_domain_stats, plan_wave_transient, wave_domain_stats, BumpRange,
     Generation as WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
+};
+#[cfg(feature = "cuda")]
+pub use region_pool::{
+    initial_weight_bytes, set_claim_reserve, set_weight_floor, span_end, take_kv_demand,
+    weight_capacity_bytes, weight_floor_after,
 };
 #[cfg(feature = "cuda")]
 pub use region_pool::{region_stats, RegionStats, REGION_BYTES};

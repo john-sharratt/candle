@@ -66,6 +66,56 @@ pub(crate) struct LayerGeometry {
     pub total_repacked_size: usize,
 }
 
+/// Per-layer geometry for every MoE layer, from the GGUF references.
+///
+/// The pinned pool caches the *target* format: for `Off` that is the gemx K/128
+/// repack of the source dtype; for int8 it is the KO twin (repacked once per
+/// expert, then DMA-reloaded on a miss — no per-miss re-quant).
+///
+/// A free function rather than a step inside `ExpertCache::new` because the
+/// model loader needs the answer **before** the cache exists: the weight zone's
+/// slot size comes from these repacked byte counts, and the zone has to be sized
+/// and its floor installed before a single expert is uploaded into it.
+#[cfg(feature = "cuda")]
+pub(crate) fn layer_geometries(
+    host_refs: &[Vec<super::types::MmapExpertRef>],
+    int8mode: candle::quantized::Int8Mode,
+) -> Result<Vec<LayerGeometry>> {
+    let mut geoms: Vec<LayerGeometry> = Vec::with_capacity(host_refs.len());
+    for layer in host_refs {
+        let Some(r) = layer.first() else { continue };
+        let tko = |d: candle::quantized::GgmlDType| {
+            if int8mode.is_int8() {
+                d.to_ko(int8mode)
+            } else {
+                Ok(d)
+            }
+        };
+        let gate_dtype = tko(r.gate_dtype)?;
+        let up_dtype = tko(r.up_dtype)?;
+        let down_dtype = tko(r.down_dtype)?;
+        let gate_repacked_size =
+            candle::quantized::repacked_size_bytes(r.gate_shape[0], r.gate_shape[1], gate_dtype)?;
+        let up_repacked_size =
+            candle::quantized::repacked_size_bytes(r.up_shape[0], r.up_shape[1], up_dtype)?;
+        let down_repacked_size =
+            candle::quantized::repacked_size_bytes(r.down_shape[0], r.down_shape[1], down_dtype)?;
+        geoms.push(LayerGeometry {
+            gate_shape: r.gate_shape.clone(),
+            gate_dtype,
+            gate_repacked_size,
+            up_shape: r.up_shape.clone(),
+            up_dtype,
+            up_repacked_size,
+            down_shape: r.down_shape.clone(),
+            down_dtype,
+            down_repacked_size,
+            total_repacked_size: gate_repacked_size + up_repacked_size + down_repacked_size,
+        });
+    }
+    Ok(geoms)
+}
+
 /// Physical location of an expert in the two-tier cache.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

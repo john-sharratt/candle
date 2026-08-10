@@ -154,6 +154,7 @@ pub mod trocr;
 pub mod vgg;
 pub mod vit;
 pub mod voxtral;
+mod wave_admit;
 #[cfg(feature = "cuda")]
 pub mod wave_buffers;
 pub mod whisper;

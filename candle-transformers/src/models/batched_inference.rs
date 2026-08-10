@@ -1284,7 +1284,7 @@ impl BatchedInferenceSession {
                 self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
             }
             // Uncompressed (F16/BF16) modes keep their float chunks in place — the
-            // prefill's `truncate_caches_to_offset` already collapses phantom
+            // wave's admit phase (`wave_admit`) already collapses phantom
             // chunks from repeated re-prefill, so the record_turn/truncate/re-inject
             // round-trip is unnecessary (and re-injecting Arc-shared chunks under a
             // lone sequence corrupted the decode read). Just open a fresh writer.
@@ -2848,7 +2848,9 @@ pub trait ManagedBatchedModel {
 
     /// Widest prefill this model will run in one forward, in tokens.
     ///
-    /// The smaller of two unrelated ceilings:
+    /// The smallest of three unrelated ceilings
+    /// (`docs/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
+    /// KV-fits)`):
     ///
     /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider
     ///   forward costs the same per token, so slicing is free.
@@ -2856,17 +2858,57 @@ pub trait ManagedBatchedModel {
     ///   FFN span actually holds, computed from this model's geometry. On a MoE
     ///   model the expert chain sees `rows × experts_per_tok`, so the same token
     ///   count needs several times the span a dense model would.
+    /// * **What the KV side can still hold.** The admit phase claims every chunk
+    ///   the wave will write before it computes anything, so a wave admitted
+    ///   wider than the free regions can back is one that fails partway through
+    ///   claiming — with some layers extended and some not. Capping here turns
+    ///   that into a narrower wave, which is the outcome the whole partition is
+    ///   for: under pressure the engine slows down instead of failing.
     ///
     /// Taking the min is what stops a wave being sized by a constant that has
-    /// never seen the model. Falls back to the compute ceiling when the plan
-    /// cannot price a single row: a zero-width wave makes no progress, and
-    /// refusing here would abort a forward that can still run.
+    /// never seen the model. Each term falls back to permissive when it cannot
+    /// answer — no reservation yet, or a plan that cannot price a single row —
+    /// because a zero-width wave makes no progress, and refusing here would abort
+    /// a forward that can still run.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        let mut cap = MAX_PREFILL_TOKENS;
         let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
-        if fits == 0 {
-            return MAX_PREFILL_TOKENS;
+        if fits > 0 {
+            cap = cap.min(fits);
         }
-        fits.min(MAX_PREFILL_TOKENS)
+        if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
+            cap = cap.min(kv_fits);
+        }
+        cap
+    }
+
+    /// Rows the KV side has room to admit, or `None` when it cannot say.
+    ///
+    /// Every token writes one K and one V element per KV head per layer, so the
+    /// per-row cost is fixed by geometry and the only variable is how many free
+    /// regions remain. Deliberately measured against `free` rather than against
+    /// the elastic floor: the boundary moves at the expert pipeline's end of
+    /// pass, so ground the weight side is currently holding is not available to
+    /// *this* wave however willing it might be to give it up later.
+    ///
+    /// One region of margin, because a sequence's chunks do not pack a region
+    /// exactly and the last one is partly wasted.
+    fn kv_width_cap(&self, act_dtype: DType) -> Option<usize> {
+        let stats = candle_nn::kv_cache::region_stats(0)?;
+        let free = stats.free.saturating_sub(1);
+        let per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
+        let per_row_all_layers = per_row.checked_mul(self.num_layers())?;
+        if per_row_all_layers == 0 {
+            return None;
+        }
+        let rows = free.saturating_mul(candle_nn::kv_cache::REGION_BYTES) / per_row_all_layers;
+        // **Never zero.** A width cap of nought is not a narrow wave, it is no
+        // wave — and once the KV side is full it would be permanent: no forward
+        // runs, so nothing completes, so nothing is freed, so the cap stays at
+        // nought. The partition's answer to genuine exhaustion is a refused
+        // claim and the relief pass behind it, both of which need a forward to
+        // have been attempted.
+        Some(rows.max(1))
     }
 
     /// Re-materialise every norm weight in the activation dtype — see

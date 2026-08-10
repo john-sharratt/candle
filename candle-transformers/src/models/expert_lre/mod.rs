@@ -163,6 +163,15 @@ pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
 pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
+/// What the weight zone must be carved into to hold one expert.
+///
+/// The model loader needs this **before** the cache exists: the zone's slot size
+/// decides its capacity, its capacity decides where the weight boundary sits,
+/// and the boundary has to be placed before a single expert is uploaded into it.
+#[cfg(feature = "cuda")]
+pub(crate) use pinned::layer_geometries;
+#[cfg(feature = "cuda")]
+pub(crate) use pipeline::slot_bytes_for;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
 };

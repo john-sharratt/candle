@@ -20,29 +20,33 @@
 //! Deriving the width from the budget makes the plan an upper bound *by
 //! construction*: the scheduler cannot admit a wave it has not already priced.
 //!
-//! # One source of truth, or none
+//! # One source of truth, and how it is held to that
 //!
 //! The failure mode this module is shaped to avoid is a plan that quietly
-//! disagrees with what the code allocates. If the sizing lived here and the
-//! allocation lived at the call site, the two would be independent transcripts
-//! of the same shape, and they would drift the first time a kernel's output
-//! changed — silently, because the only symptom is a span that exhausts under
-//! a workload nobody ran.
+//! disagrees with what the code allocates. A buffer is named **once**, as a
+//! [`WaveBuffer`] variant, and that variant answers two questions: which phase
+//! it belongs to, and what shape it is at a given row count. The byte
+//! arithmetic appears in exactly one function ([`BufferShape::bytes`]). Nothing
+//! is kept in a parallel list — [`WaveBuffer::iter`] derives the inventory, so
+//! the plan, the totals, the admission bound and the tests all pick up a new
+//! variant with no edit.
 //!
-//! So a buffer is named **once**, as a [`WaveBuffer`] variant, and that variant
-//! answers two questions: which phase it belongs to, and what shape it is at a
-//! given row count. The byte arithmetic appears in exactly one function
-//! ([`BufferShape::bytes`]). Call sites size their allocation by asking the
-//! plan for the same variant, so a buffer that grows grows in both places or in
-//! neither.
+//! What the compiler cannot check is whether the list is *complete*, and that
+//! is not a theoretical gap — it was wrong by a factor of 1.8 on the attention
+//! phase and by 2 on the accumulate dtype, and every test stayed green. Under
+//! operand provenance an op reading a wave-backed operand carves its output from
+//! the same generation, so an undeclared buffer never reaches the driver and
+//! never appears in a `candle::forbidden_alloc` report. It just costs the span.
 //!
-//! Adding a buffer is adding an enum variant, and the compiler's exhaustiveness
-//! check refuses that without a phase and a shape. Nothing is kept in a
-//! parallel list — [`WaveBuffer::iter`] derives the inventory, so the plan, the
-//! totals, the admission bound and the tests all pick up a new variant with no
-//! edit.
+//! The check is therefore external and empirical:
+//! [`super::wave_census`] itemises the layer that set each span's high-water
+//! mark, in carve order, with the caller that asked for it. Every variant below
+//! was read off that census on Qwen3-30B-A3B rather than inferred from the
+//! source, and the totals in the tests are pinned against it. **A change to the
+//! attention or FFN chain is a change to this list**, and `KV_WAVE_CENSUS=1`
+//! over the gate is how to find out what it should say.
 //!
-//! # A phase at a time, and its peak rather than its total
+//! # A phase at a time, and the union of the chains that can run in it
 //!
 //! A layer opens two generations — one spanning attention → `o_proj`, one
 //! spanning the FFN — and each drops before the next opens, resetting its span.
@@ -50,12 +54,20 @@
 //! its own arena ([`super::bump_arena`]) sized from its own peak rather than
 //! both from the larger.
 //!
-//! Within a phase, most buffers die long before it ends: the gate and up
-//! projections are consumed by the fused SwiGLU, the SwiGLU output by the down
-//! GEMM. [`WavePlan::phase_bytes`] therefore charges the **peak concurrent**
-//! bytes, and [`WavePlan::layout`] realises that peak by assigning offsets so
-//! buffers with disjoint lifetimes share bytes. Charging the total instead would
-//! price a MoE layer at 1.75x its real high-water mark.
+//! Within a phase more than one chain can run, and the plan charges their
+//! **union** rather than their maximum. That is not conservatism, it is the
+//! shape of a mixed wave: `forward_layer_batched_mixed` opens **one** attention
+//! generation and runs every group inside it, so a wave carrying both a decode
+//! group and a prefill group allocates the decode chain's buffers *and* the
+//! prefill chain's, into the same span, before either guard drops. The prefill
+//! chain is the wider of the two per row, so a wave that is entirely prefill
+//! pays for the decode chain's two extra buffers it never allocates — about 15%
+//! of the attention phase, which is the price of the plan being given a total
+//! row count rather than a per-group split.
+//!
+//! The same holds for the FFN's two expert-dispatch paths, except that the
+//! GPU-native path's buffers are a subset of the pipeline path's, so the union
+//! costs nothing there.
 
 use candle::DType;
 use strum::IntoEnumIterator;
@@ -157,6 +169,11 @@ pub struct ModelGeometry {
     /// Experts each token routes to. `1` for a dense model, which collapses the
     /// MoE terms to the dense FFN shapes rather than needing a second branch.
     pub experts_per_tok: usize,
+    /// Experts the router scores over — the width of its logits, which is a
+    /// per-token buffer the FFN phase carries. `1` on a dense model, where the
+    /// term degenerates to a column the router never allocates and costs two
+    /// bytes a row.
+    pub n_experts: usize,
     /// The compute dtype activations are carried in.
     pub act_dtype: DType,
     /// What the int8 tensor-core kernels emit before the cast back to
@@ -181,36 +198,98 @@ impl ModelGeometry {
     pub const fn attn_cols(&self) -> usize {
         self.n_head * self.head_dim
     }
+
+    /// Columns of one of K or V, as the QKV narrow produces them.
+    pub const fn kv_cols(&self) -> usize {
+        self.n_kv_head * self.head_dim
+    }
 }
+
+/// How many u32 of routing metadata the expert pipeline uploads per assignment.
+///
+/// The one term here that is a **bound rather than a transcript**, and it is
+/// labelled as such because the alternative is worse. The threaded expert
+/// pipeline splits a wave's assignments into expert batches and, per batch,
+/// uploads three assignment-indexed tables, three tile-indexed tables (a tile
+/// covers at least one assignment, so these are bounded by the same count) and
+/// one token-indexed table. Batches partition the assignments, so however many
+/// there are the assignment-indexed uploads sum to the same total — but the
+/// tile and token tables do not decompose that cleanly, and pinning them exactly
+/// would tie this file to the pipeline's batching policy.
+///
+/// The census measured 3.5 u32 per assignment at the widest wave the gate runs.
+/// Eight is that doubled, and it costs 0.19% of the FFN phase — a margin worth
+/// paying on the plan's least structured term, where being short fails a forward
+/// and being generous is invisible.
+const ROUTING_U32_PER_ASSIGNMENT: usize = 8;
 
 /// Every buffer a layer allocates from the transient tier.
 ///
-/// One variant per allocation site. A site that is not a variant here is a site
-/// still reaching the driver — which is what `candle::forbidden_alloc` reports,
-/// so the two are meant to be read against each other.
+/// One variant per allocation site, and the list is the **union** over the
+/// chains a phase can run — see the module header for why a union rather than a
+/// maximum. Every one of these was read off [`super::wave_census`] on
+/// Qwen3-30B-A3B; the comment on each says which chain allocates it, so a
+/// reader can check the list against the code that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum WaveBuffer {
-    /// Attention RMSNorm, quantized for the int8 QKV matmul.
+    /// Attention RMSNorm, quantized for the int8 QKV matmul. Both chains.
     AttnNorm,
-    /// Fused Q/K/V projection output.
+    /// Fused Q/K/V projection output — one segmented launch over the three KO
+    /// weights, narrowed into q/k/v afterwards. Both chains.
     QkvProjection,
-    /// Attention output, consumed by `o_proj`.
+    /// Q, copied out of the fused QKV buffer.
     ///
-    /// Declared in its **dense** form, which is what prefill and glue write. The
-    /// int8 decode path instead has its kernel emit the context already packed
-    /// as q8a128 (`PagedDecode::q8_byte_size`), so o_proj needs no standalone
-    /// quantize — and that form is strictly smaller: at `cols = 4096` a row costs
-    /// 4608 B packed against 8192 B dense in F16. Declaring the dense form
-    /// therefore upper-bounds both, and prefill — the wide case that actually
-    /// decides the budget — is the dense one anyway. A second variant for the
-    /// packed form would only ever lower a bound that is never the binding one.
+    /// The narrow is a strided view over a `qkv_cols`-wide row, so reshaping it
+    /// to `[batch, seq, heads, dim]` cannot alias and copies. Both chains.
+    QSplit,
+    /// Q flattened to `[batch · heads · seq, dim]` for the head-wise RMSNorm.
+    ///
+    /// Free on the decode chain, where `seq == 1` leaves the transposed view
+    /// contiguous; a real copy on prefill.
+    QNormIn,
+    /// Q RMSNorm output. Both chains.
+    QNormOut,
+    /// Q returned to `[batch, seq, heads · dim]` after the norm — a transpose
+    /// then a reshape, so again a copy on prefill and free on decode.
+    QHeadsPacked,
+    /// K, copied out of the fused QKV buffer. Both chains.
+    KSplit,
+    /// K flattened for the head-wise RMSNorm. Prefill only, as [`Self::QNormIn`].
+    KNormIn,
+    /// K RMSNorm output. Both chains.
+    KNormOut,
+    /// K returned to `[batch, seq, kv_heads · dim]`. Prefill only.
+    KHeadsPacked,
+    /// V, made contiguous out of the fused QKV buffer for the cache write.
+    VContiguous,
+    /// The attention context in its **dense** form, which prefill and glue write.
     AttnOutput,
-    /// `o_proj` int8 result, before the cast back to the compute dtype.
-    OProjAccum,
-    /// `o_proj` cast to the compute dtype.
-    OProjCast,
-    /// FFN RMSNorm, quantized for the expert GEMMs.
+    /// The attention context in its **packed** form.
+    ///
+    /// The int8 decode kernel emits q8a1024 directly (`PagedDecode::q8_byte_size`)
+    /// so `o_proj` needs no standalone quantize. Declared separately from
+    /// [`Self::AttnOutput`] rather than folded into it because a mixed wave
+    /// allocates both — the decode group's packed context and the prefill
+    /// group's dense one — into the same generation.
+    DecodeContext,
+    /// `o_proj`'s result, in the compute dtype.
+    ///
+    /// Decode only. On the prefill chain `o_proj` takes a `Float` context and the
+    /// int8 override quantizes it at the matmul, and that quantize breaks the
+    /// provenance chain — so prefill's `o_proj` output lands on the pool instead
+    /// of the span, and the census sees nothing here.
+    OProjOutput,
+    /// FFN RMSNorm, quantized for the expert GEMMs. Both dispatch paths.
     FfnNorm,
+    /// The router's per-token logits over every expert. Both paths.
+    RouterLogits,
+    /// Top-k routing weights, in F32. Both paths.
+    RouteWeights,
+    /// Top-k expert ids, as u32. Both paths.
+    RouteIndices,
+    /// The routing tables the expert pipeline uploads per batch — see
+    /// [`ROUTING_U32_PER_ASSIGNMENT`]. Threaded pipeline only.
+    RoutingTables,
     /// Tokens gathered into expert-major order for the grouped GEMMs.
     MoeGather,
     /// Gate projection over the gathered tokens.
@@ -220,11 +299,22 @@ pub enum WaveBuffer {
     /// Fused SwiGLU output, requantized to feed the down GEMM.
     SwigluAct,
     /// Down projection, in the accumulate dtype.
+    ///
+    /// Threaded pipeline only: the GPU-native path's grouped down GEMM feeds
+    /// `fused_deterministic_scatter` without materialising a span-backed result.
     DownGemm,
-    /// Down projection cast to the compute dtype for the scatter.
+    /// Down projection cast to the compute dtype for the scatter. Pipeline only.
     DownCast,
-    /// The MoE combine target the scatter accumulates into.
+    /// The MoE combine target the scatter accumulates into. Both paths.
     MoeCombine,
+    /// The FFN result cast to the residual's dtype before the second residual
+    /// add.
+    ///
+    /// A no-op when the two already agree, which is every BF16 configuration —
+    /// but an F16 session carries its residual in F16 and its MoE in BF16, and
+    /// then this is a full `rows × hidden` buffer at the very end of the phase,
+    /// when the span is at its fullest.
+    FfnResidualCast,
 }
 
 impl WaveBuffer {
@@ -233,17 +323,31 @@ impl WaveBuffer {
         match self {
             Self::AttnNorm
             | Self::QkvProjection
+            | Self::QSplit
+            | Self::QNormIn
+            | Self::QNormOut
+            | Self::QHeadsPacked
+            | Self::KSplit
+            | Self::KNormIn
+            | Self::KNormOut
+            | Self::KHeadsPacked
+            | Self::VContiguous
             | Self::AttnOutput
-            | Self::OProjAccum
-            | Self::OProjCast => LayerPhase::Attention,
+            | Self::DecodeContext
+            | Self::OProjOutput => LayerPhase::Attention,
             Self::FfnNorm
+            | Self::RouterLogits
+            | Self::RouteWeights
+            | Self::RouteIndices
+            | Self::RoutingTables
             | Self::MoeGather
             | Self::GateGemm
             | Self::UpGemm
             | Self::SwigluAct
             | Self::DownGemm
             | Self::DownCast
-            | Self::MoeCombine => LayerPhase::Ffn,
+            | Self::MoeCombine
+            | Self::FfnResidualCast => LayerPhase::Ffn,
         }
     }
 
@@ -268,10 +372,22 @@ impl WaveBuffer {
         match self {
             Self::AttnNorm => q8(rows, g.hidden),
             Self::QkvProjection => dense(rows, g.qkv_cols(), g.act_dtype),
+            Self::QSplit | Self::QNormIn | Self::QNormOut | Self::QHeadsPacked => {
+                dense(rows, g.attn_cols(), g.act_dtype)
+            }
+            Self::KSplit
+            | Self::KNormIn
+            | Self::KNormOut
+            | Self::KHeadsPacked
+            | Self::VContiguous => dense(rows, g.kv_cols(), g.act_dtype),
             Self::AttnOutput => dense(rows, g.attn_cols(), g.act_dtype),
-            Self::OProjAccum => dense(rows, g.hidden, g.accum_dtype),
-            Self::OProjCast => dense(rows, g.hidden, g.act_dtype),
+            Self::DecodeContext => q8(rows, g.attn_cols()),
+            Self::OProjOutput => dense(rows, g.hidden, g.act_dtype),
             Self::FfnNorm => q8(rows, g.hidden),
+            Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
+            Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
+            Self::RouteIndices => dense(rows, g.experts_per_tok, DType::U32),
+            Self::RoutingTables => dense(er, ROUTING_U32_PER_ASSIGNMENT, DType::U32),
             Self::MoeGather => q8(er, g.hidden),
             Self::GateGemm => dense(er, g.intermediate, g.accum_dtype),
             Self::UpGemm => dense(er, g.intermediate, g.accum_dtype),
@@ -279,6 +395,7 @@ impl WaveBuffer {
             Self::DownGemm => dense(er, g.hidden, g.accum_dtype),
             Self::DownCast => dense(er, g.hidden, g.act_dtype),
             Self::MoeCombine => dense(rows, g.hidden, g.act_dtype),
+            Self::FfnResidualCast => dense(rows, g.hidden, g.act_dtype),
         }
     }
 
@@ -441,6 +558,7 @@ mod tests {
             n_kv_head: 4,
             head_dim: 128,
             experts_per_tok: 8,
+            n_experts: 128,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
         }
@@ -454,6 +572,7 @@ mod tests {
             n_kv_head: 8,
             head_dim: 128,
             experts_per_tok: 1,
+            n_experts: 1,
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
         }
@@ -516,6 +635,111 @@ mod tests {
             .map(|p| WaveBuffer::iter().filter(|b| b.phase() == p).count())
             .sum();
         assert_eq!(counted, WaveBuffer::iter().count());
+    }
+
+    /// Per-row cost of the attention chain a **prefill** group runs, as
+    /// `KV_WAVE_CENSUS=1` measured it on Qwen3-30B-A3B: twelve carves, and every
+    /// one of them a whole number of bytes per row.
+    ///
+    /// ```text
+    /// [ 0]    2304  AttnNorm       q8a128 over hidden
+    /// [ 1]   10240  QkvProjection  the fused segmented launch
+    /// [ 2]    8192  QSplit         narrow out of the fused buffer
+    /// [ 3]    8192  QNormIn        flatten for the head-wise norm
+    /// [ 4]    8192  QNormOut       the norm itself
+    /// [ 5]    8192  QHeadsPacked   transpose back
+    /// [ 6]    1024  KSplit
+    /// [ 7]    1024  KNormIn
+    /// [ 8]    1024  KNormOut
+    /// [ 9]    1024  KHeadsPacked
+    /// [10]    1024  VContiguous
+    /// [11]    8192  AttnOutput     the paged prefill kernel's context
+    /// ```
+    const MEASURED_ATTN_PREFILL_PER_ROW: usize = 58624;
+
+    /// The same for a **decode** group: nine carves, and a different set — the
+    /// `seq == 1` reshapes are free, and the context comes back already packed,
+    /// so `o_proj` runs off it and lands on the span.
+    ///
+    /// ```text
+    /// [0]  2304  AttnNorm
+    /// [1] 10240  QkvProjection
+    /// [2]  8192  QSplit
+    /// [3]  8192  QNormOut
+    /// [4]  1024  KSplit
+    /// [5]  1024  KNormOut
+    /// [6]  1024  VContiguous
+    /// [7]  4608  DecodeContext   q8a1024, emitted by the decode kernel
+    /// [8]  4096  OProjOutput
+    /// ```
+    const MEASURED_ATTN_DECODE_PER_ROW: usize = 40704;
+
+    /// The FFN chain on the **threaded expert pipeline**, which is the wider of
+    /// the two dispatch paths — the GPU-native path scatters straight out of the
+    /// down GEMM and never materialises [`WaveBuffer::DownGemm`] or
+    /// [`WaveBuffer::DownCast`] on the span.
+    ///
+    /// Excludes the routing tables, which are bounded rather than measured
+    /// (see [`ROUTING_U32_PER_ASSIGNMENT`]) — they came to 3.5 u32 per
+    /// assignment against the 8 charged here.
+    const MEASURED_FFN_PIPELINE_PER_ROW: usize = 183616;
+
+    /// The plan must cover every chain that can run in its phase, because a
+    /// mixed wave runs more than one of them inside a single generation.
+    ///
+    /// This is the assertion the whole module exists to make true, and it was
+    /// false by 1.8x on attention and by 2x on the accumulate dtype until the
+    /// census measured it. Stated against constants read off a real run rather
+    /// than against the plan's own arithmetic — a test that recomputed the
+    /// declaration would have passed throughout.
+    #[test]
+    fn the_plan_covers_every_measured_chain() {
+        let plan = WavePlan::new(moe());
+        for rows in [1usize, 20, 124, 744, 3936] {
+            let attn = plan.phase_bytes(LayerPhase::Attention, rows);
+            for (name, rate) in [
+                ("prefill", MEASURED_ATTN_PREFILL_PER_ROW),
+                ("decode", MEASURED_ATTN_DECODE_PER_ROW),
+            ] {
+                assert!(
+                    attn >= rate * rows,
+                    "attention at {rows} rows prices {attn} B but the measured \
+                     {name} chain takes {} B\n{}",
+                    rate * rows,
+                    plan.describe(rows)
+                );
+            }
+            let ffn = plan.phase_bytes(LayerPhase::Ffn, rows);
+            assert!(
+                ffn >= MEASURED_FFN_PIPELINE_PER_ROW * rows,
+                "FFN at {rows} rows prices {ffn} B but the measured pipeline \
+                 chain takes {} B\n{}",
+                MEASURED_FFN_PIPELINE_PER_ROW * rows,
+                plan.describe(rows)
+            );
+        }
+    }
+
+    /// What the union costs over the widest single chain, recorded so the
+    /// over-bound is a number someone chose rather than one nobody noticed.
+    ///
+    /// A pure-prefill wave pays for `DecodeContext` and `OProjOutput` it never
+    /// allocates; a pure-decode wave pays for four reshape copies that `seq == 1`
+    /// makes free. Both are the price of the plan being handed a total row count
+    /// instead of a per-group split, and closing it means passing the split.
+    #[test]
+    fn the_attention_union_costs_a_recorded_margin() {
+        let plan = WavePlan::new(moe());
+        let rows = 1000;
+        let priced = plan.phase_bytes(LayerPhase::Attention, rows);
+        let widest = MEASURED_ATTN_PREFILL_PER_ROW * rows;
+        let margin = (priced as f64 / widest as f64 - 1.0) * 100.0;
+        println!("attention union over the prefill chain: {margin:.1}%");
+        assert!(
+            (14.0..16.0).contains(&margin),
+            "the union's margin over the widest chain moved to {margin:.1}% — \
+             either a buffer was added to one chain only, or the shapes changed"
+        );
     }
 
     #[test]

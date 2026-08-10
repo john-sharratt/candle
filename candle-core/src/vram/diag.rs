@@ -25,8 +25,13 @@ pub struct BudgetTable {
     pub source: super::ProbeKind,
     /// Loose per-class reserved tallies.
     pub rows: [BudgetRow; AllocClass::COUNT],
-    /// KV floor (`3 GiB + 15% × (C − Weights)`).
-    pub kv_floor: u64,
+    /// Cushion left outside the reservation for the CUDA pool.
+    ///
+    /// This was `kv_floor` — the static KV reserve the expert budget had to
+    /// leave. There is no such reserve now: the KV side, the transient tier and
+    /// the expert cache share one span and negotiate the boundary between them,
+    /// so what is worth reporting here is the only quantity still held *back*.
+    pub pool_cushion: u64,
 }
 
 impl BudgetTable {
@@ -68,7 +73,7 @@ impl VramGovernor {
             headroom: reading.headroom,
             source: reading.source,
             rows,
-            kv_floor: self.kv_floor(),
+            pool_cushion: self.pool_cushion(),
         }
     }
 
@@ -77,12 +82,13 @@ impl VramGovernor {
         let t = self.budget_table();
         let mut s = String::new();
         s.push_str(&format!(
-            "vram budget [{whence}] source={:?} C={}MiB total={}MiB headroom={}MiB kv_floor={}MiB\n",
+            "vram budget [{whence}] source={:?} C={}MiB total={}MiB headroom={}MiB \
+             pool_cushion={}MiB\n",
             t.source,
             mib(t.capacity_c),
             mib(t.total),
             mib(t.headroom),
-            mib(t.kv_floor),
+            mib(t.pool_cushion),
         ));
         for row in &t.rows {
             s.push_str(&format!(

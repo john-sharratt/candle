@@ -204,16 +204,21 @@ impl VramGovernor {
     /// and return it. Applies the circuit-breaker fallback if the claim is
     /// implausibly small.
     ///
-    /// Fast path: if the measurement already reports headroom at/above the balloon
-    /// target, the card is already ours — there are no squatters to evict, so the
-    /// live measurement *is* the capacity and the expensive touch-balloon is
-    /// skipped. This is the normal startup case (empty card before model load);
-    /// the touch only runs when VRAM is genuinely contended.
+    /// Fast path: if the measurement already reports headroom at/above the
+    /// capacity target, the card is already ours — there are no squatters to
+    /// evict, so the live measurement *is* the capacity and the expensive
+    /// touch-balloon is skipped. This is the normal startup case (empty card
+    /// before model load); the touch only runs when VRAM is genuinely contended.
+    ///
+    /// **The reserve is applied here too.** It was not: this path used the
+    /// fraction as a *threshold* and then took `headroom.min(total)`, so on the
+    /// path that actually runs in production the card kept nothing back at all.
+    /// Both paths now clamp to the same [`balloon::capacity_target`].
     pub fn run_balloon(&self, alloc: &mut dyn BalloonAllocator) -> Result<u64> {
         let reading = self.probe.read()?;
-        let target = (self.config.balloon_target_frac * reading.total as f64) as u64;
+        let target = balloon::capacity_target(reading.total, self.config.capacity_reserve);
         if reading.headroom >= target {
-            let c = reading.headroom.min(reading.total);
+            let c = reading.headroom.min(target);
             self.record_capacity(c);
             tracing::info!(
                 target: "candle_core::vram",
@@ -232,7 +237,10 @@ impl VramGovernor {
     pub fn run_full_balloon(&self, alloc: &mut dyn BalloonAllocator) -> Result<u64> {
         let claimed = balloon::balloon_measure(self.probe.as_ref(), alloc, &self.config)?;
         let total = self.probe.read()?.total;
-        let sane_floor = (self.config.balloon_target_frac * 0.5 * total as f64) as u64;
+        // Half the card. A claim below this is not a tight card, it is a broken
+        // measurement — the circuit breaker exists for a probe that reports
+        // nonsense, not for a card that is merely busy.
+        let sane_floor = total / 2;
         let c = if claimed >= sane_floor {
             claimed
         } else {

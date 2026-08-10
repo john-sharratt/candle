@@ -1,47 +1,72 @@
-//! The device reservation and its two sides.
+//! The device reservation and the four things that live in it.
 //!
-//! One VA span per device, claimed once and never given back
-//! (`docs/archived/arena_unification.md` §3.1). It is divided at a fixed,
-//! region-aligned boundary:
+//! One VA span per device, claimed once and never given back, covering
+//! **everything the engine owns except the dense weights**
+//! (`docs/elastic_vram_partition.md` §2):
 //!
 //! ```text
-//! [ region 0 | region 1 | ... | region k-1 ]  [ transient tier ]
-//!   KV side, 16 MiB each, lowest-first         bump domains
+//!            while a forward runs:                between forwards:
+//!  span_base            T        W    span_end     span_base       W    span_end
+//!      ├────────┬───────┼────────┼────────┤            ├────────┬──────┼────────┤
+//!      │persist │regions│transnt │ expert │            │persist │regions│ expert │
+//!      │ fixed  │  ───► │        │ ◄───   │            │ fixed  │  ───► │ ◄───   │
+//!      └────────┴───────┴────────┴────────┘            └────────┴──────┴────────┘
 //! ```
 //!
-//! **The KV side** hands out whole regions. `create_arena` takes one,
-//! `release_arena` gives it back, and neither touches the CUDA allocator: a
-//! region is an address, and the memory behind it was claimed at startup. That
-//! is what makes an arena base pointer permanently valid — the property the
-//! arena-topology guard used to defend with a process-global lock.
+//! **The persistence staging block** is the one span with a fixed address. The
+//! persistence thread stages on its own copy stream, on a schedule that has
+//! nothing to do with a wave's, so its ranges can be live at any moment a
+//! forward begins — it therefore sits at the far left, where nothing reaches it.
 //!
-//! **The transient tier** is carved into the per-domain bump spans of
-//! [`super::bump_arena`]. It sits at the right end because that is the edge a
-//! moving boundary would grow into; the boundary is fixed in this step, so the
-//! layout is what carries the segregation (§9 S6).
+//! **The KV side** hands out whole regions, lowest-index-first, so live arenas
+//! stay left-packed and `W` can move. `create_arena` takes one, `release_arena`
+//! gives it back, and neither touches the CUDA allocator: a region is an
+//! address, and the memory behind it was claimed at startup.
+//!
+//! **The wave transient tier vanishes between forwards.** It is placed by
+//! [`place_transient`] at the width *this* wave prices, immediately left of `W`,
+//! and released when the last generation drops. That is what makes it the only
+//! variable-size block in the span: at the moment its extent changes it holds
+//! nothing, so a resize leaves no hole and moves no data. A block at a fixed
+//! address could not do this — making it variable there would either strand a
+//! gap between it and the arenas, or move the arena base and relocate every
+//! region. It has to be the block adjacent to the moving boundary.
+//!
+//! **The weight side** is expert slots, filled right-to-left
+//! ([`super::weight_zone`]). It is owned by the expert cache; this module knows
+//! only `W`, its leftmost edge, which [`set_weight_floor`] places at load and
+//! moves between waves.
+//!
+//! **`W` is the only boundary that moves**, and it moves in one place, at one
+//! time: the expert pipeline thread's end-of-pass, where no expert GEMM for the
+//! pass is still being issued. The KV side never moves it directly — it records
+//! what it could not get ([`take_kv_demand`]) and the weight side acts on that
+//! at its own safe point.
 //!
 //! # Sizing
 //!
-//! The whole reservation — both sides — is `kv_floor`, the governor's partition
-//! knob, and the KV side is what is left of it once the transient tier is taken
-//! out. The cushion the governor also holds back (`scratch_margin`) stays
-//! *outside* the reservation, for the allocations still served by the CUDA pool:
-//! the gallery arena, the grow-only scratches, the threaded expert pipeline's
-//! combine target.
+//! The span is everything `usable()` reports at the moment it is claimed, less
+//! the cushion left to the CUDA pool. Nothing is subtracted for the dense
+//! weights, and that is not an oversight: they are already resident when this
+//! runs, so `usable()` — which counts the *drop in headroom since `C` was
+//! measured* — has already netted them out. Subtracting them again would be the
+//! same bytes booked twice, which this codebase has done twice before
+//! (`balloon_headroom_abs` against `expert_budget`; `scratch_margin` against the
+//! transient tier, "same bytes, two places, opposite signs").
 //!
 //! The claim is then made granule by granule with a write to each one, so the
 //! reservation ends wherever the driver actually refuses rather than wherever a
-//! subtraction predicted it would. Measuring and claiming stay one act — and
-//! because the ask is now honest, a refusal *means* something: it says the
-//! governor's `usable()` over-read the card, which is a fact worth logging
-//! rather than the expected outcome of asking for more than exists.
+//! subtraction predicted it would. A short claim costs **regions**, not the
+//! transient tier or the weight side: everything except the region count is
+//! positioned relative to the span's right edge, so shrinking the span squeezes
+//! the KV count and leaves a forward able to run.
 
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_sync;
 use candle::cuda_backend::cudarc::driver::CudaStream;
@@ -51,45 +76,43 @@ use candle::Result;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::reservation::Reservation;
 use super::types::TARGET_ARENA_BYTES;
+use super::weight_zone::{INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 
 /// One region of the KV side. Every size class carves its arenas at this size.
 pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
 
-/// The transient tier's share of the span: `S = 2·W_wave + W_persist` (§3.6),
-/// built from each domain's own budget so the two cannot drift apart.
+/// The widest the wave transient tier can ever be — the old fixed reservation,
+/// kept only as the worst case the elastic middle must be able to *reach*.
 ///
-/// **Every byte here is a byte the KV side does not get**, and on a 16 GiB card
-/// the KV side is what the expert cache competes with, so this is sized to what
-/// the domains need and never to what looks safe. Both terms are held against a
-/// measurement (Qwen3-30B-A3B, batch 64):
-///
-/// | term | reserved | measured peak |
-/// |---|---|---|
-/// | `2·W_wave` | 128 MiB | 61.6 MiB — 30.8 MiB per half |
-/// | `W_persist` | 64 MiB | 29,696 B, but bounded by the batch cap it spans |
-///
-/// The wave halves keep ~2x headroom deliberately: the peak scales with the
-/// widest prefill a wave admits, and exhausting a half fails the forward. The
-/// persistence term is a declared budget rather than a watermark — a batch
-/// bisects itself to fit it, so the span buys DtoH syncs on the hot→warm path,
-/// not correctness.
-///
-/// There is no shelf term. It reserved 64 MiB for a static-shelf allocator that
-/// was never built — the sampler, provenance and MoE routing scratches still
-/// grow from the CUDA pool, where `scratch_margin` already covers them — so it
-/// was 4 regions of KV backing nothing. Reinstate it when something allocates
-/// from it, priced in regions like everything else here.
-const TRANSIENT_SPAN_BYTES: usize = super::bump_arena::WAVE_ATTN_BYTES
+/// Nothing reserves this any more. The tier is placed per forward at the width
+/// that forward actually needs (`WavePlan::phase_bytes`), which for a
+/// twenty-session decode is a few megabytes against the 912 MiB here. This
+/// constant survives so [`MIN_ELASTIC_RESERVE`] can be checked against it: the
+/// floor has to leave room for the widest wave, even though no wave but the
+/// widest will use it.
+const MAX_WAVE_TRANSIENT_BYTES: usize = super::bump_arena::WAVE_ATTN_BYTES
     + super::bump_arena::WAVE_FFN_BYTES
-    + super::bump_arena::WAVE_FORWARD_BYTES
-    + MIGRATION_STAGING_CAP_BYTES;
+    + super::bump_arena::WAVE_FORWARD_BYTES;
+
+/// The persistence thread's staging block, at the far **left** of the span.
+///
+/// Fixed for the process lifetime and out of both frontiers' way. It is 4
+/// regions' worth; putting it left rather than letting it float is what lets the
+/// weight boundary move without ever having to reason about a copy stream that
+/// is not synchronised to the wave.
+const PERSIST_SPAN_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
 
 const _: () = assert!(
-    TRANSIENT_SPAN_BYTES % REGION_BYTES == 0,
-    "the boundary between the two sides must be region-aligned"
+    MAX_WAVE_TRANSIENT_BYTES % REGION_BYTES == 0 && PERSIST_SPAN_BYTES % REGION_BYTES == 0,
+    "every fixed block must be region-aligned so region carving stays exact"
 );
 
-/// The KV side when no governor has measured the card.
+const _: () = assert!(
+    MIN_ELASTIC_RESERVE > MAX_WAVE_TRANSIENT_BYTES + PERSIST_SPAN_BYTES,
+    "the floor must leave room for the widest wave's tier, or a forward cannot run"
+);
+
+/// The span when no governor has measured the card.
 ///
 /// A fixed number rather than a fraction of what the driver reports free. The
 /// fraction was tried and is wrong here: the only processes that get this far
@@ -98,7 +121,8 @@ const _: () = assert!(
 /// flight when the first KV cache is built — and a run that lost the race
 /// claimed nothing at all. This is large enough for the suite's peak arena
 /// working set and small enough to leave the card to the tests themselves.
-const TEST_KV_SPAN_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const TEST_SPAN_BYTES: usize =
+    2 * 1024 * 1024 * 1024 + MAX_WAVE_TRANSIENT_BYTES + PERSIST_SPAN_BYTES;
 
 /// A claimed region, released back to the free list when dropped.
 ///
@@ -158,14 +182,48 @@ pub struct RegionStats {
     pub free: usize,
     /// Most regions ever live at once — how close the partition came to full.
     pub peak_live: usize,
-    /// Bytes of transient span, and of it, bytes carved into bump domains.
+    /// Bytes the wave transient tier occupies **right now**, and the ceiling it
+    /// imposes on the region count while it does.
+    ///
+    /// Both are zero between forwards: the tier does not exist then, and the
+    /// whole span below the weight floor is the KV side's. A non-zero reading is
+    /// a snapshot taken mid-wave, not a reservation.
     pub transient_bytes: usize,
-    pub transient_carved: usize,
+    pub transient_ceiling: usize,
+    /// Fresh regions claimed since boot while a tier was placed — claims that
+    /// arrived after the wave's admit phase. Zero is the precondition for
+    /// anchoring the tier at the arena frontier.
+    pub fresh_claims_during_wave: usize,
+    /// Claims refused because the tier's base was the ceiling — room existed,
+    /// the tier's position hid it. A non-zero reading says the admit phase let a
+    /// claim through to the wave.
+    pub refusals_during_wave: usize,
+    /// Bytes of the span the weight side is permitted to hold.
+    pub weight_bytes: usize,
+    /// Bytes of the span nothing has been able to use — the tail left over when
+    /// the region count rounds down.
+    pub slack_bytes: usize,
+    /// Bytes of address space reserved, and the driver's mapping granule. The
+    /// two together say whether a shortfall is the driver refusing or the
+    /// layout rounding.
+    pub reserved_bytes: usize,
+    pub granularity: usize,
 }
 
 struct RegionPool {
     reservation: Reservation,
-    /// Regions the claim actually backed: the KV side is `[0, total)`.
+    /// First byte of the span.
+    span_base: u64,
+    /// Bytes of the span actually backed by physical memory. May be less than
+    /// what was reserved, when the driver refused part-way.
+    span_bytes: usize,
+    /// First byte available to regions — past both fixed blocks.
+    region_base: u64,
+    /// The leftmost byte the weight side occupies: **the moving boundary**.
+    /// `span_end` until an expert cache installs a zone.
+    weight_floor: u64,
+    /// Regions that fit between [`Self::region_base`] and the transient tier:
+    /// the KV side is `[0, total)`.
     total: usize,
     /// Lowest region index never yet handed out.
     next: usize,
@@ -185,74 +243,256 @@ struct RegionPool {
     /// wait only while this still equals [`Self::quiesce_epoch`] — otherwise a
     /// quiesce has happened since, and the region's readers are long gone.
     released_epoch: Vec<u64>,
-    /// One past the last byte of the transient tier.
-    transient_end: u64,
+    /// Where the wave transient tier sits **while a forward is running**, and
+    /// how big it is. `None` between forwards, when it occupies nothing.
+    ///
+    /// This is the one variable-size block in the span, and it is variable
+    /// precisely because it vanishes: nothing is live in it at the moment its
+    /// position or extent changes, so a resize leaves no hole and moves no data.
+    /// That is why it sits *between* the arenas and the weights — the only place
+    /// a block that changes size can absorb both sides' movement without one.
+    transient_base: Option<u64>,
     transient_bytes: usize,
-    /// Transient bytes already carved into domains. Never returned.
-    transient_carved: usize,
+    /// Bytes below the weight floor withheld from the KV side **even while no
+    /// tier stands** — the width of the last tier placed.
+    ///
+    /// The ceiling has to survive the gap between forwards, because a region is
+    /// not preemptible. Lifting it to `total` the moment a tier is released
+    /// lets the persistence thread — which claims size-class arenas on its own
+    /// schedule, all through and between forwards — take the very ground the
+    /// next tier is about to be placed on. It cannot be asked for it back: an
+    /// arena holds its region for as long as it lives, so the next
+    /// [`place_transient`] would find live data where the tier belongs and has
+    /// no choice but to refuse the forward.
+    ///
+    /// Holding the last tier's width keeps that from happening in the steady
+    /// state, where consecutive waves are the same shape. It is not a
+    /// guarantee — a decode wave followed by a wide prefill widens the tier
+    /// against a reserve sized for the narrow one — which is why
+    /// [`place_transient`] still checks, and refuses rather than overlaps.
+    tier_reserve: usize,
+    /// Persistence-staging bytes carved from the fixed left block.
+    persist_carved: usize,
+    /// Regions the KV side asked for and could not get since this was last
+    /// drained — **the signal that the boundary should move**.
+    ///
+    /// A counter rather than a callback: `claim_region` runs on whichever thread
+    /// needed an arena, while the weight side is owned by the expert pipeline
+    /// thread and its slots may be under read by kernels still in flight.
+    /// Evicting from here would be a cross-thread call into a cache that is
+    /// mid-wave. So the KV side records what it wanted and the weight side reads
+    /// it at its own safe point (end of pass), which costs one wave of latency
+    /// and buys an eviction that cannot race a kernel.
+    kv_pressure: usize,
+    /// Fresh regions claimed while a wave's transient tier was placed.
+    ///
+    /// The measurement that decides whether the tier can sit at the arena
+    /// frontier. Every one of these is a claim that arrived *after* the admit
+    /// phase, so with the tier anchored at the frontier it would be refused
+    /// rather than served. Cumulative for the process; a run that ends with zero
+    /// is a run in which admit really was exhaustive.
+    fresh_claims_during_wave: usize,
+    /// Region claims refused because the tier's base was the ceiling.
+    ///
+    /// Distinct from [`Self::kv_pressure`], which counts claims the *partition*
+    /// could not satisfy. These are claims the partition had room for and the
+    /// tier's position blocked, and the fix for them is admitting earlier rather
+    /// than moving the boundary.
+    refusals_during_wave: usize,
+    /// Fresh regions wanted since the current forward reserved its tier, and the
+    /// largest that count has ever reached.
+    ///
+    /// **The number that refuted anchoring the tier at the arena frontier.** For
+    /// that placement to work, everything claimed after a forward begins has to
+    /// fit in a gap left above the frontier — and on the quantized path this
+    /// peaks in the hundreds, because the compressor creates size-class arenas
+    /// as it chooses formats. Kept because it is the standing evidence for where
+    /// the tier sits, and because a workload that drove it to zero would be one
+    /// where the frontier anchor became possible again.
+    fresh_this_forward: usize,
+    fresh_per_forward_peak: usize,
+    /// Regions to leave free below the tier for claims that arrive *after* it is
+    /// reserved — the seed for the frontier anchor's gap.
+    ///
+    /// Set per forward by whoever knows the workload
+    /// ([`set_claim_reserve`]); `fresh_per_forward_peak` corrects it upward from
+    /// observation. A seed is required rather than merely helpful: learned alone,
+    /// the gap starts at zero, the first claim after the reservation is refused,
+    /// and the forward dies before the measurement that would widen it.
+    claim_reserve: usize,
+    /// Highest demand seen in the window that is closing, and in the one before
+    /// it. The mark the weight side measures "spare" against is the larger of
+    /// the two — see [`RegionPool::spare_regions`].
+    kv_peak_window: usize,
+    kv_peak_prev_window: usize,
+    /// When the current window opened.
+    kv_peak_window_opened: Instant,
+    /// When the KV side was last refused a region.
+    ///
+    /// The one signal that is neither history nor occupancy: a refusal is the KV
+    /// side *saying* it wanted more. Neither of the other two catches an ingest,
+    /// where demand only ever grows — at any instant there is room, and a moment
+    /// later there is not.
+    last_pressure_at: Option<Instant>,
 }
+
+/// How far back the KV side's high-water mark looks.
+///
+/// The mark is a **sliding-window maximum**, not a decaying estimate: the
+/// largest demand seen in the window now closing or the one before it. It rises
+/// the instant demand does, and falls exactly one window after the peak that set
+/// it stops being current. **Fast to concede, deliberate to take** — being short
+/// of KV throttles admission, being short of experts is a slowdown, and the two
+/// are not worth trading symmetrically.
+///
+/// Two earlier shapes and what they cost:
+///
+/// - **Per-pass decay** (×0.9) let the weight side take 224 of 291 regions
+///   during the gate's single-context configs and the twenty-context config that
+///   followed failed outright. Passes are not time; a benchmark answers "has KV
+///   been idle for a few forwards?" yes constantly.
+/// - **Exponential decay on a five-minute clock** was safe and nearly inert. It
+///   converges by halving, so a cold-start mark of 332 regions needs three
+///   intervals — a quarter of an hour — to reach a steady state the daemon
+///   reaches in seconds. Measured on a live rebuild: 19 live regions of 332,
+///   5008 MiB idle, and the boundary had not moved.
+///
+/// A window maximum has neither fault. Convergence is one window, exactly, and
+/// there is no rate constant to pick — only how long a quiet period must last
+/// before it counts as quiet, which is a question about the workload and has an
+/// answer.
+///
+/// **Sixty seconds** is that answer for an interactive daemon: long enough that
+/// the gap between two turns of a conversation does not read as idle, short
+/// enough that a batch of small prefills hands the weight side its ground while
+/// the batch is still running. The safety net underneath is admission — the
+/// scheduler's ceiling is `(free regions − setpoint) × region_bytes`, read live,
+/// so ground given to the weights narrows what admission accepts rather than
+/// failing anything.
+const KV_PEAK_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most regions the weight side may take in one pass.
+///
+/// Growth is a step, not a jump, because each region it takes may have to be
+/// given back — and giving back costs an eviction or a relocation, while not
+/// taking costs only the residency it would have bought for one more pass.
+const KV_GROW_STEP: usize = 8;
 
 fn pools() -> &'static Mutex<HashMap<usize, RegionPool>> {
     static POOLS: OnceLock<Mutex<HashMap<usize, RegionPool>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The KV side's target size.
+/// The span's target size: everything left, less the cushion the CUDA pool keeps.
 ///
-/// With a governor — every production load installs one — this is everything
-/// left: `usable` is what remains of the balloon-measured capacity after the
-/// weights and the expert cache, less the cushion the forward's own activations
-/// need. Claiming the remainder is the point of consuming the memory at startup
-/// rather than competing for it later.
+/// With a governor — every production load installs one — `usable` is what
+/// remains of the balloon-measured capacity `C` right now. The dense weights are
+/// already resident when this runs, so they are already inside `usable`'s
+/// accounting and **nothing further is subtracted for them** (see
+/// [`span_from`]).
 ///
-/// Without one, [`TEST_KV_SPAN_BYTES`].
+/// Without a governor, [`TEST_SPAN_BYTES`].
 ///
 /// **A governor that fails to answer is an error, not a fallback.** These two
 /// cases used to share one `_` arm, so a transient `usable()` failure on a
-/// production card sized the whole KV side at the 2 GiB test constant and said
+/// production card sized the whole span at the 2 GiB test constant and said
 /// nothing — the reservation would come up a quarter of its intended size and
 /// every downstream number would be quietly wrong. Absence of a governor is a
 /// test binary; a governor that errors is a fault.
-fn kv_span_target(ordinal: usize) -> Result<usize> {
+fn span_target(ordinal: usize) -> Result<usize> {
     let Some(gov) = candle::vram::get(ordinal) else {
-        return Ok(TEST_KV_SPAN_BYTES);
+        return Ok(TEST_SPAN_BYTES);
     };
     let usable = gov.usable().map_err(|e| {
         candle::Error::Msg(format!(
             "reservation: the VRAM governor could not report usable bytes ({e}). \
-             Refusing to size the KV side from the {TEST_KV_SPAN_BYTES} B test \
-             constant on a card that has a governor — that would silently claim a \
-             fraction of the intended reservation."
+             Refusing to size the span from the {TEST_SPAN_BYTES} B test constant \
+             on a card that has a governor — that would silently claim a fraction \
+             of the intended reservation."
         ))
     })?;
-    Ok(kv_span_from(usable as usize, gov.scratch_margin() as usize))
+    Ok(span_from(usable as usize, gov.pool_cushion() as usize))
 }
 
-/// The KV side, given what is left of `C` and the cushion to leave on the pool.
+/// The span, given what is left of `C` and the cushion to leave on the pool.
 ///
-/// Split out from [`kv_span_target`] so the identity below can be asserted
-/// without a governor.
+/// **The dense weights are subtracted exactly once, and not here.** `usable()`
+/// is `headroom.min(C − spent_by_us)` where `spent_by_us` is the drop in
+/// headroom since `C` was measured — and the dense weights are resident by the
+/// time this is called, so they are already inside that drop. Subtracting
+/// `class_reserved(Weights)` on top would book the same bytes twice.
 ///
-/// **The transient tier comes out of this budget.** The reservation claims
-/// `kv_span + TRANSIENT_SPAN_BYTES` in one act, so the transient side is part
-/// of the same claim rather than something added on top of it.
+/// That is not a hypothetical. The load order now makes the weights both
+/// resident *and* tallied at this moment, so the second subtraction looks like
+/// prudence; it is the exact mistake this codebase has already made twice.
+/// `balloon_headroom_abs` reserved the transient peak that `expert_budget` was
+/// also reserving — 1,104 MiB no allocator was permitted to touch — and this
+/// function's predecessor subtracted `scratch_margin` against a transient tier
+/// that was then added back on top, "same bytes, two places, opposite signs".
 ///
-/// It used to be added on top, and the result over-asked by the whole transient
-/// span. `scratch_margin` was subtracted here as "the cushion the first
-/// forward's scratch lands in" — but the forward's scratch *is* the transient
-/// tier now, which is what §3.6 moved it to, so the same memory was reserved
-/// twice by two places that did not know about each other. The reservation then
-/// asked for `usable − margin + 704 MiB`, the granule touch refused the excess,
-/// and the KV side came out at whatever the driver happened to leave. The
-/// partition was being decided by the refusal point instead of by policy.
+/// Split out so the identity can be asserted without a governor.
+fn span_from(usable: usize, pool_reserve: usize) -> usize {
+    usable.saturating_sub(pool_reserve)
+}
+
+/// How the span divides, once its true backed size is known.
 ///
-/// The same mistake, one layer up, is recorded against `balloon_headroom_abs`:
-/// reserving the transient peak in the balloon cap as well as in
-/// `expert_budget` "booked the same bytes twice".
-fn kv_span_from(usable: usize, pool_reserve: usize) -> usize {
-    usable
-        .saturating_sub(pool_reserve)
-        .saturating_sub(TRANSIENT_SPAN_BYTES)
+/// **This is the layout at rest**, between forwards. Only the persistence block
+/// is here; the wave transient tier occupies nothing until a forward places it
+/// ([`place_transient`]), so the regions run straight to the weight floor:
+///
+/// ```text
+/// | persist 64 MiB | regions … | ← W → weight slots |
+/// ```
+///
+/// The tier is deliberately absent. It is the one **variable-size** block in the
+/// span — priced per wave rather than at the widest wave — and it is safe to be
+/// variable precisely because it vanishes here: at the moment its extent changes
+/// it holds nothing, so a resize leaves no hole and moves no data.
+///
+/// That is also why it belongs between the regions and the weights rather than
+/// at a fixed address beside the persistence block. A variable-size block at a
+/// fixed address is a choice between two failures: leave the region base fixed
+/// and every resize strands a hole (fragmentation), or pack the regions after it
+/// and every resize relocates every region (thrashing). Only the position
+/// adjacent to the moving boundary disturbs nothing.
+///
+/// A span that came up short costs **regions** and never the persistence block:
+/// it is positioned from the left and the region count is what absorbs the
+/// difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    region_base: u64,
+    total: usize,
+    transient_end: u64,
+    /// The weight floor as clamped into the span — what the caller asked for,
+    /// corrected. Returned rather than recomputed so nothing downstream has to
+    /// repeat the clamp and risk disagreeing about it.
+    weight_floor: u64,
+    slack: usize,
+}
+
+/// Divide a span of `span_bytes` at `span_base` with the weight side occupying
+/// `[weight_floor, span_end)`.
+fn layout_span(span_base: u64, span_bytes: usize, weight_floor: u64) -> Layout {
+    let region_base = span_base + PERSIST_SPAN_BYTES as u64;
+    let transient_end = region_base;
+    let span_end = span_base + span_bytes as u64;
+    // Clamp rather than trust: the floor arrives from arithmetic done a crate
+    // away, and a wrapped subtraction here would produce an address that looks
+    // plausible. `.min(span_end)` keeps the lower bound meaningful on a span too
+    // small to hold the fixed blocks; `RegionPool::create` refuses that span
+    // outright, so this only has to stay arithmetically sane.
+    let weight_floor = weight_floor.clamp(region_base.min(span_end), span_end);
+    let usable_for_regions = weight_floor.saturating_sub(region_base) as usize;
+    let total = usable_for_regions / REGION_BYTES;
+    Layout {
+        region_base,
+        total,
+        transient_end,
+        weight_floor,
+        slack: usable_for_regions - total * REGION_BYTES,
+    }
 }
 
 impl RegionPool {
@@ -263,115 +503,98 @@ impl RegionPool {
         let usable_before = candle::vram::get(ordinal)
             .and_then(|g| g.usable().ok())
             .unwrap_or(0) as usize;
-        let want_regions = kv_span_target(ordinal)? / REGION_BYTES;
-        let kv_span = want_regions * REGION_BYTES;
-        let mut reservation = Reservation::reserve(stream, kv_span + TRANSIENT_SPAN_BYTES)?;
+        let want = (span_target(ordinal)? / REGION_BYTES) * REGION_BYTES;
+        let mut reservation = Reservation::reserve(stream, want)?;
 
-        // The transient tier is claimed first even though it sits to the right.
-        // A forward that cannot allocate its intermediates cannot run at all,
-        // while a KV side that comes up short merely holds fewer sequences — so
-        // if the card can only satisfy one of them, it must be this one.
-        let transient = reservation.map_range(kv_span, TRANSIENT_SPAN_BYTES)?;
-        if transient < TRANSIENT_SPAN_BYTES {
+        // Claim left to right across the whole span. A refusal part-way ends the
+        // span there, and because every other block is positioned relative to
+        // the right edge, the shortfall lands on the region count — the one
+        // tenant that degrades gracefully.
+        let claimed = reservation.map_range(0, want)?;
+        let span_bytes = (claimed / REGION_BYTES) * REGION_BYTES;
+        let span_base = reservation.base();
+        let span_end = span_base + span_bytes as u64;
+        let minimum = PERSIST_SPAN_BYTES + MAX_WAVE_TRANSIENT_BYTES;
+        if span_bytes < minimum {
             candle::bail!(
-                "reservation: the card refused the {TRANSIENT_SPAN_BYTES} B transient tier \
-                 after {transient} B — there is not enough VRAM left to run a forward"
+                "reservation: the card backed only {span_bytes} B of the {want} B asked \
+                 for, below the {minimum} B of fixed staging and transient span a \
+                 forward needs — there is not enough VRAM left to run one"
             )
         }
-        let claimed = reservation.map_range(0, kv_span)?;
-        let total = claimed / REGION_BYTES;
+
+        // No weight side yet: an expert cache installs one at load
+        // (`set_weight_floor`), and a process without experts leaves the whole
+        // span to KV.
+        let layout = layout_span(span_base, span_bytes, span_end);
+        let total = layout.total;
         // The partition, on the one channel that survives a test binary (which
         // installs no tracing subscriber, so the log lines below are invisible
-        // there). Step 7 tunes these numbers, and it needs them from the gate as
-        // well as from the daemon.
-        // What the governor meant KV to own, against what it actually got. The
-        // two differ whenever `kv_floor` exceeds what survived the weights and
-        // the expert cache, and nothing else reports it: `shortfall` measures
-        // only the granule touch refusing, so a floor that was never achievable
-        // reads as a clean reservation. The floor is the partition knob, so a
-        // silent gap between asking and getting makes it un-tunable.
+        // there).
+        //
+        // `residual` is `capacity − weights − usable` — CUDA pool growth, the
+        // gallery arena, per-class overhead — and is the term to chase when the
+        // span comes out smaller than the card suggests it should. `weights` is
+        // reported next to it precisely so that anyone reading this can confirm
+        // it was subtracted **once**: it is inside `usable`, not applied on top
+        // of it.
         let gov = candle::vram::get(ordinal);
-        let intended = gov.as_ref().map_or(0, |g| g.kv_floor() as usize);
-        let floor_deficit = intended.saturating_sub(claimed + TRANSIENT_SPAN_BYTES);
-        // The class tallies go out alongside so `floor_deficit` is
-        // *attributable*, not merely visible. `kv_floor` names the reserve the
-        // expert budget must LEAVE, not what KV ends up owning; the two differ
-        // by everything that allocated in between. Without the breakdown the gap
-        // reads as an unexplained ~1 GiB, and the first thing anyone tuning from
-        // first principles does is mistrust the knob. `residual` is
-        // `capacity - weights - experts - usable` — pool growth, the gallery,
-        // per-class overhead — and is the term to chase if the deficit moves.
         let weights = gov
             .as_ref()
             .map_or(0, |g| g.class_reserved(AllocClass::Weights) as usize);
-        let experts = gov
-            .as_ref()
-            .map_or(0, |g| g.class_reserved(AllocClass::Expert) as usize);
         let capacity = gov.as_ref().map_or(0, |g| g.capacity() as usize);
         let residual = capacity
             .saturating_sub(weights)
-            .saturating_sub(experts)
             .saturating_sub(usable_before);
         if super::alloc::arena_stats_enabled() {
             let mib = |b: usize| b / (1024 * 1024);
             eprintln!(
-                "[reservation] capacity_c={}MiB usable={}MiB kv_floor={}MiB \
-                 scratch_margin={}MiB | asked={}MiB claimed={}MiB ({total} regions) \
-                 transient={}MiB | shortfall={}MiB floor_deficit={}MiB \
-                 | weights={}MiB experts={}MiB residual={}MiB",
+                "[reservation] capacity_c={}MiB usable={}MiB pool_cushion={}MiB \
+                 weights={}MiB residual={}MiB | asked={}MiB span={}MiB \
+                 (shortfall {}MiB) = persist {}MiB + {total} regions ({}MiB) \
+                 + transient {}MiB + weights-side {}MiB, slack {}B",
                 mib(capacity),
                 mib(usable_before),
-                mib(intended),
-                gov.as_ref().map_or(0, |g| mib(g.scratch_margin() as usize)),
-                mib(kv_span),
-                mib(claimed),
-                mib(TRANSIENT_SPAN_BYTES),
-                mib(kv_span.saturating_sub(claimed)),
-                mib(floor_deficit),
+                gov.as_ref().map_or(0, |g| mib(g.pool_cushion() as usize)),
                 mib(weights),
-                mib(experts),
                 mib(residual),
+                mib(want),
+                mib(span_bytes),
+                mib(want.saturating_sub(span_bytes)),
+                mib(PERSIST_SPAN_BYTES),
+                mib(total * REGION_BYTES),
+                mib(MAX_WAVE_TRANSIENT_BYTES),
+                mib((span_end - layout.weight_floor) as usize),
+                layout.slack,
             );
         }
-        if floor_deficit > 0 {
+        if span_bytes < want {
             log::warn!(
-                "reservation: KV owns {} MiB of the {} MiB `kv_floor` reserves, \
-                 short by {} MiB. `kv_floor` is the reserve the expert budget \
-                 must LEAVE, not what KV receives — the gap is whatever \
-                 allocated between `expert_budget()` and this claim: weights \
-                 {} MiB, experts {} MiB, residual {} MiB (pool growth, gallery, \
-                 per-class overhead). Raising CANDLE_VRAM_KV_FLOOR_MB shrinks \
-                 the expert budget by the same amount, which is the trade this \
-                 knob makes.",
-                (claimed + TRANSIENT_SPAN_BYTES) / (1024 * 1024),
-                intended / (1024 * 1024),
-                floor_deficit / (1024 * 1024),
-                weights / (1024 * 1024),
-                experts / (1024 * 1024),
-                residual / (1024 * 1024),
-            );
-        }
-        if claimed < kv_span {
-            log::warn!(
-                "reservation: KV side claimed {} MiB of the {} MiB asked for — \
-                 {total} regions",
-                claimed / (1024 * 1024),
-                kv_span / (1024 * 1024),
+                "reservation: the card backed {} MiB of the {} MiB span asked for. \
+                 The shortfall lands on the KV side ({total} regions) — the fixed \
+                 staging, the transient tier and the weight side are positioned \
+                 from the span's right edge and are unaffected.",
+                span_bytes / (1024 * 1024),
+                want / (1024 * 1024),
             );
         } else {
             log::info!(
-                "reservation: {total} regions ({} MiB) KV + {} MiB transient, \
-                 {} MiB of address space in {} KiB granules",
-                claimed / (1024 * 1024),
-                TRANSIENT_SPAN_BYTES / (1024 * 1024),
-                reservation.reserved_bytes() / (1024 * 1024),
+                "reservation: {} MiB span = {} MiB persist + {total} regions \
+                 ({} MiB), transient placed per forward (≤{} MiB), in {} KiB granules",
+                span_bytes / (1024 * 1024),
+                PERSIST_SPAN_BYTES / (1024 * 1024),
+                (total * REGION_BYTES) / (1024 * 1024),
+                MAX_WAVE_TRANSIENT_BYTES / (1024 * 1024),
                 reservation.granularity() / 1024,
             );
         }
 
-        let transient_end = reservation.base() + (kv_span + TRANSIENT_SPAN_BYTES) as u64;
         Ok(Self {
             reservation,
+            span_base,
+            span_bytes,
+            region_base: layout.region_base,
+            weight_floor: span_end,
             total,
             next: 0,
             free: BinaryHeap::new(),
@@ -382,18 +605,243 @@ impl RegionPool {
             // overwrites it, so the initial value is never load-bearing.
             quiesce_epoch: 0,
             released_epoch: vec![0; total],
-            transient_end,
-            transient_bytes: TRANSIENT_SPAN_BYTES,
-            transient_carved: 0,
+            transient_base: None,
+            transient_bytes: 0,
+            // Nothing has been placed, so nothing is owed a reserve. The KV
+            // side is empty at this point in any case.
+            tier_reserve: 0,
+            persist_carved: 0,
+            kv_pressure: 0,
+            fresh_claims_during_wave: 0,
+            refusals_during_wave: 0,
+            fresh_this_forward: 0,
+            fresh_per_forward_peak: 0,
+            claim_reserve: 0,
+            // Opens at the top: the weight side must watch the KV side stay
+            // small before it may take anything, never assume it will.
+            // Both windows open at the top: the weight side must watch the KV
+            // side stay small before it may take anything, never assume it will.
+            kv_peak_window: total,
+            kv_peak_prev_window: total,
+            kv_peak_window_opened: Instant::now(),
+            last_pressure_at: None,
         })
     }
 
+    fn span_end(&self) -> u64 {
+        self.span_base + self.span_bytes as u64
+    }
+
+    /// Note that a fresh region was wanted during the current forward.
+    ///
+    /// Raises the per-forward peak the tier's gap is sized from. Called on the
+    /// satisfied path *and* on the refused one — see the refusal branch for why
+    /// counting only the satisfied ones deadlocks the headroom.
+    fn note_fresh_demand(&mut self) {
+        self.fresh_this_forward += 1;
+        if self.fresh_this_forward > self.fresh_per_forward_peak {
+            self.fresh_per_forward_peak = self.fresh_this_forward;
+        }
+    }
+
+    /// The lowest address the wave transient tier may not reach below: one past
+    /// the last byte any live arena holds.
+    ///
+    /// A region is not preemptible — an arena keeps its address for as long as
+    /// it lives — so this is a hard floor for the tier, not a preference.
+    fn live_end(&self) -> u64 {
+        self.region_base + (self.live_watermark() * REGION_BYTES) as u64
+    }
+
+    /// Regions the KV side may hand out **right now**.
+    ///
+    /// `total` is what fits below the weight floor. While a forward is running,
+    /// the transient tier sits on top of the live arenas, so the ceiling drops to
+    /// where it starts — a region stamped past that would be inside the tier.
+    ///
+    /// Between forwards the tier is gone but the ceiling **does not** return to
+    /// `total`: [`Self::tier_reserve`] holds the last tier's width back, because
+    /// a region claimed into that ground cannot be given up again in time for
+    /// the next placement.
+    fn region_ceiling(&self) -> usize {
+        let top = match self.transient_base {
+            Some(base) => base,
+            None => self
+                .weight_floor
+                .saturating_sub(self.tier_reserve as u64)
+                .max(self.region_base),
+        };
+        let usable = top.saturating_sub(self.region_base) as usize;
+        (usable / REGION_BYTES).min(self.total)
+    }
+
     fn region_base(&self, index: usize) -> u64 {
-        self.reservation.base() + (index * REGION_BYTES) as u64
+        self.region_base + (index * REGION_BYTES) as u64
     }
 
     fn free_count(&self) -> usize {
         self.free.len() + (self.total - self.next)
+    }
+
+    /// One past the highest region currently held by an arena.
+    ///
+    /// The KV side cannot shrink below this, and it is meaningfully smaller than
+    /// `next` because the free list is lowest-first: live arenas stay
+    /// left-packed, which is the property that makes the boundary movable at all.
+    fn live_watermark(&self) -> usize {
+        let free: std::collections::HashSet<usize> =
+            self.free.iter().map(|Reverse(i)| *i).collect();
+        (0..self.next)
+            .rev()
+            .find(|i| !free.contains(i))
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Move the weight side's left edge and re-derive the region count.
+    ///
+    /// Runs at model load to place the boundary, and between waves to move it.
+    /// Refuses rather than corrupts (principle 7): a floor past
+    /// [`MIN_ELASTIC_RESERVE`], past the span end, or one that would strand a
+    /// live region is an error, not a clamp.
+    ///
+    /// The fixed blocks do not move with it — the transient tier is a constant
+    /// size at a constant address (see [`layout_span`]) — so this changes exactly
+    /// two things: how many regions exist, and where the weight side starts.
+    fn set_weight_floor(&mut self, floor: u64) -> Result<usize> {
+        let span_end = self.span_end();
+        let min_floor = self.span_base + MIN_ELASTIC_RESERVE as u64;
+        if floor < min_floor {
+            candle::bail!(
+                "weight floor {floor:#x} would leave the elastic middle below the \
+                 {} MiB reserve (floor must be at least {min_floor:#x})",
+                MIN_ELASTIC_RESERVE / (1024 * 1024),
+            )
+        }
+        if floor > span_end {
+            candle::bail!("weight floor {floor:#x} is past the span end {span_end:#x}")
+        }
+        let layout = layout_span(self.span_base, self.span_bytes, floor);
+        let watermark = self.live_watermark();
+        if layout.total < watermark {
+            candle::bail!(
+                "weight floor would cut the KV side to {} regions, but region {} is \
+                 live. The weight side may only take regions the KV side is not \
+                 using; ask it to release them first.",
+                layout.total,
+                watermark - 1,
+            )
+        }
+        self.weight_floor = floor;
+        self.total = layout.total;
+        self.released_epoch.resize(layout.total, 0);
+        // Regions past the new total no longer exist: drop them from the free
+        // list and pull `next` back so the fresh-region path cannot hand one out.
+        self.free.retain(|Reverse(i)| *i < layout.total);
+        self.next = self.next.min(layout.total);
+        Ok(layout.total)
+    }
+
+    /// Regions the weight side may take, against the KV side's **recent**
+    /// high-water mark rather than its free count right now.
+    ///
+    /// Free-right-now is the wrong signal and taking it was measured to be
+    /// catastrophic: the gate's first configs run one context, so nearly the
+    /// whole KV side reads as free, the weight side takes it, and the 20-context
+    /// config that follows exhausts the 67 regions left. Free means "not in use
+    /// this instant", and the weight side needs "not in use lately".
+    ///
+    /// So the mark is a sliding-window maximum over [`KV_PEAK_WINDOW`]: it
+    /// tracks demand up the instant it rises, and falls exactly one window after
+    /// the peak that set it stops being current — ageing a boot transient out
+    /// without ever forgetting a demand the KV side is still making.
+    ///
+    /// # Why this is still an estimate, and why that is not a failure of nerve
+    ///
+    /// `docs/elastic_vram_partition.md` §7 claims the phase-locked forward
+    /// "recomputes the partition exactly and needs no decay at all". That is
+    /// half true, and the half it gets wrong is the half that matters here.
+    ///
+    /// What a forward can compute exactly is *its own* demand: admit makes the
+    /// KV claims, `WavePlan` prices the tier, and both are known before a byte
+    /// computes. The boundary is not set against this forward's demand. It is
+    /// set against the **next** one's — the weight side is being asked to take
+    /// ground on the promise that nothing will want it back — and no exactness
+    /// about the present makes the future knowable.
+    ///
+    /// That was established by building the exact version and running it. A
+    /// monotone watermark has no seed that works: started at zero it offers the
+    /// whole span on the first negotiation and every config of the gate fails;
+    /// started at `total` it never falls, so the weight side never gains a
+    /// region and the mechanism is inert. Anything in between is a decay wearing
+    /// a different name.
+    ///
+    /// So the estimate stays, and what the exact figures buy is the *other*
+    /// direction: the tier term below is this wave's real price rather than the
+    /// old fixed 912 MiB, so the mark it is added to is no longer inflated by a
+    /// reservation nobody uses.
+    fn spare_regions(&mut self, slack: usize) -> usize {
+        // Demand is arenas **plus the tier standing on top of them** — this runs
+        // at the pipeline's end of pass, while the tier is still reserved, so
+        // both are visible. Measuring against `live` alone would let the weight
+        // side grow into ground the very next wave's transient needs, and a wave
+        // that cannot reserve its tier fails outright.
+        // `tier_reserve` rather than `transient_bytes` alone: the two are equal
+        // while a tier stands, which is when this normally runs, but the reserve
+        // outlives the placement and is what the KV side is actually being kept
+        // off. Taking the larger means a call from between forwards cannot read
+        // the tier's ground as spare.
+        let demand = self.live
+            + self
+                .transient_bytes
+                .max(self.tier_reserve)
+                .div_ceil(REGION_BYTES);
+        // Rises the instant demand does; falls exactly one window after the peak
+        // that set it passes out of view.
+        self.kv_peak_window = self.kv_peak_window.max(demand);
+        if self.kv_peak_window_opened.elapsed() >= KV_PEAK_WINDOW {
+            self.kv_peak_prev_window = self.kv_peak_window;
+            self.kv_peak_window = demand;
+            self.kv_peak_window_opened = Instant::now();
+        }
+        // **Two independent permissions, and the weight side needs both.**
+        //
+        // The window peak guards against demand the KV side made *recently* and
+        // will plausibly make again. It says nothing about right now — a peak
+        // that has aged out leaves the mark low even while every region is
+        // occupied, because the mark measures history and occupancy measures the
+        // present.
+        //
+        // A live rebuild showed exactly that: sixty seconds in, the KV side was
+        // climbing toward saturation, the window had not yet caught up, and the
+        // weight side took four regions out from under it. Small in itself, and
+        // precisely the wrong direction — those were regions the KV side was
+        // about to need and could only get back by evicting experts, which the
+        // pinned pool had no room for.
+        //
+        // So ground must be free in *both* senses: unused across the window, and
+        // unused this instant.
+        //
+        // And neither is enough on its own during an **ingest**, where demand
+        // climbs monotonically: the window has not caught up, this instant has
+        // room, and a moment later every region is taken. Measured — with both
+        // guards in place the weight side still took eight regions ninety
+        // seconds into a rebuild that then saturated.
+        //
+        // The third guard is the KV side's own voice. A refusal is it asking for
+        // more and being told no, and a side that has been refused inside the
+        // last window has no spare ground by definition, whatever the other two
+        // say.
+        if self
+            .last_pressure_at
+            .is_some_and(|t| t.elapsed() < KV_PEAK_WINDOW)
+        {
+            return 0;
+        }
+        let by_history = self
+            .total
+            .saturating_sub(self.kv_peak_window.max(self.kv_peak_prev_window));
+        let by_occupancy = self.free_count();
+        by_history.min(by_occupancy).saturating_sub(slack)
     }
 }
 
@@ -472,13 +920,67 @@ pub(crate) fn ensure(stream: &std::sync::Arc<CudaStream>) -> Result<()> {
 /// never reads the last one's data (invariant 4).
 pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option<RegionHandle>> {
     with_pool(stream, |pool| {
-        let (index, recycled) = match pool.free.pop() {
-            Some(Reverse(idx)) => (idx, true),
-            None if pool.next < pool.total => {
-                pool.next += 1;
-                (pool.next - 1, false)
+        // **The ceiling binds the free list too.** A region freed while the tier
+        // was small — or absent, between forwards — keeps its index, and the
+        // next wave's tier may be placed below it. Handing it out then would put
+        // KV writes inside the wave's own intermediates.
+        //
+        // One comparison suffices: the heap is ordered lowest-index-first, so if
+        // the lowest free region is above the ceiling then every free region is.
+        let ceiling = pool.region_ceiling();
+        let lowest_free_usable = pool.free.peek().is_some_and(|Reverse(i)| *i < ceiling);
+        let (index, recycled) = if lowest_free_usable {
+            let Reverse(idx) = pool.free.pop().expect("peeked");
+            (idx, true)
+        } else if pool.next < ceiling {
+            // **A fresh region claimed while the tier is placed is a claim the
+            // admit phase did not make.** Counted rather than refused: the tier
+            // sits at the weight floor today, so there is room above the
+            // frontier for these; placing it *at* the frontier
+            // (`docs/elastic_vram_partition.md` §7 phase 2) is what turns each
+            // of these into a refusal, and this is the measurement that says how
+            // many there would be.
+            if pool.transient_base.is_some() {
+                pool.fresh_claims_during_wave += 1;
             }
-            None => return Ok(None),
+            pool.note_fresh_demand();
+            pool.next += 1;
+            (pool.next - 1, false)
+        } else {
+            // Exhausted. Record what the KV side wanted so the weight side
+            // can give it up at its next safe point, and let the caller take
+            // its usual pressure path for this attempt.
+            pool.kv_pressure += 1;
+            // Stamped as well as counted: the count is drained by the weight
+            // side's next negotiation, the stamp is what keeps it from taking
+            // ground for a full window afterwards.
+            pool.last_pressure_at = Some(Instant::now());
+            // **A refusal is demand too, and the gap must hear about it.**
+            // Counting only satisfied claims would let the headroom deadlock:
+            // too small a gap refuses the claim, the refusal never raises the
+            // peak, and the next forward reserves the same too-small gap for
+            // ever. So the demand is noted whether or not it was met.
+            pool.note_fresh_demand();
+            // **A refusal while the tier is placed is the tier's fault, not the
+            // partition's.** The ceiling sits at the tier's base, so a claim
+            // arriving after the wave began is refused however much ground is
+            // free above it. Counted apart from `kv_pressure` because the two
+            // call for opposite responses: real pressure wants the boundary
+            // moved, this wants a wider gap.
+            if pool.transient_base.is_some() {
+                pool.refusals_during_wave += 1;
+                if super::alloc::arena_stats_enabled() {
+                    eprintln!(
+                        "[tier-refusal] region claim refused with the tier placed \
+                         at {:#x} (ceiling {ceiling}, next {}, total {}) — count {}",
+                        pool.transient_base.unwrap_or(0),
+                        pool.next,
+                        pool.total,
+                        pool.refusals_during_wave,
+                    );
+                }
+            }
+            return Ok(None);
         };
         let base = pool.region_base(index);
         if recycled {
@@ -567,24 +1069,356 @@ pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option
     })
 }
 
-/// Carve a bump domain's span out of the transient tier.
+/// Whether `[base, base + len)` is ground the tier may stand on, or the bytes
+/// by which it is not.
 ///
-/// Carved downward from the right end, once per domain and never returned, so
-/// every domain's address is fixed for the process lifetime — which is what
-/// lets a `BumpRange` be a bare pointer. Its `'w` bounds when the range may be
-/// handed out again, not whether the address is mapped.
-pub(crate) fn carve_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
+/// **The tier may only stand on ground no arena is using.** Bounding it below by
+/// the start of the KV side is not enough, and that was the defect: a region
+/// already handed out keeps its address for the life of its arena, so a tier
+/// measured down from `W` lands on top of the *highest* live regions long before
+/// it reaches region zero. [`RegionPool::region_ceiling`] stops later claims from
+/// entering the tier but cannot revoke a claim already made, so the placement is
+/// where the two have to be reconciled — and the only sound answer is to refuse
+/// (principle 7: refuse rather than corrupt). [`RegionPool::set_weight_floor`]
+/// guards the same invariant from the other side, for the same reason.
+///
+/// Split out from [`place_transient`] so the rule is arithmetic that tests
+/// without a device.
+fn tier_fits(base: u64, len: usize, live_end: u64, floor: u64) -> std::result::Result<(), u64> {
+    let top = base.saturating_add(len as u64);
+    // Both directions are reported, because either can be the binding one: the
+    // frontier anchor computes a base upward from the arenas and overshoots
+    // `floor`, while the default placement measures down from `floor` and
+    // undershoots `live_end`. Taking the larger keeps the pressure figure honest
+    // whichever it was — and taking a `saturating_sub` in each direction is what
+    // stops the unsigned wrap the single-sided version had.
+    let short = live_end.saturating_sub(base).max(top.saturating_sub(floor));
+    if short > 0 {
+        return Err(short);
+    }
+    Ok(())
+}
+
+/// **Place the wave transient tier for the forward about to run.**
+///
+/// The tier does not exist between forwards. This brings it into being with
+/// `bytes` of extent, immediately left of the weight floor, and returns its base.
+/// The region ceiling drops to that base for the duration, so no arena can be
+/// stamped into the ground the tier now occupies.
+///
+/// # Measured down from `W`, because anchoring at the frontier is not yet safe
+///
+/// The design places the tier at the arena frontier `A`
+/// (`docs/elastic_vram_partition.md` §7 phase 2), which leaves the whole
+/// remainder in one contiguous run adjacent to the weight side so the boundary
+/// can be moved to `A + T` in the same operation. Measured down from `W` the
+/// same bytes are free but stranded mid-span, and the weight side can only find
+/// them later through a control loop. The memory order is what it should be
+/// either way:
+///
+/// ```text
+/// | persist | KV regions … | transient | expert slots |
+/// ```
+///
+/// **The reclaim is unaffected by the choice**, because it never came from where
+/// the tier sits: it comes from `bytes` being this wave's price rather than the
+/// widest wave's. What is lost is the placement's second job — handing the
+/// remainder over immediately.
+///
+/// # Why the frontier is not built: it is refuted, not deferred
+///
+/// Anchoring the tier at `A` was built twice and both attempts are worth having
+/// here, because the first one's evidence pointed somewhere the second one ruled
+/// out.
+///
+/// **First attempt.** `Q8_0 x20` produced silently wrong output on every
+/// session, reproducibly, while the region pool looked untouched: identical arena
+/// creations (577, max index 163), zero class promotions, zero refusals, zero
+/// fresh claims taken while the tier stood. That last figure was misleading —
+/// the counters only observe the window in which the tier is *placed*, and the
+/// tier was being released and re-taken between every layer phase, so claims
+/// arriving in those gaps were invisible and still advanced `next` and moved the
+/// tier under the sweep.
+///
+/// **Second attempt**, after [`super::bump_arena::plan_wave_transient`] began
+/// reserving the tier for the whole forward — which closes that blind spot and
+/// holds the address fixed for a sweep. The silent corruption became a loud
+/// refusal, and the refusals said what the first attempt could not:
+///
+/// ```text
+/// [tier-refusal] ... (ceiling 16, next 16, total 332) — count 1025
+/// ```
+///
+/// **1025 refusals inside one forward, at the same placement.** The gap between
+/// the frontier and the tier would have to be hundreds of regions, not a
+/// headroom — because the quantized KV path creates size-class arenas *as it
+/// compresses*, on the persistence thread, throughout the forward. §7's premise
+/// for phase 2 is that persistence takes spare slots inside arenas already
+/// claimed and only rarely needs a region of its own. On the quantized path that
+/// is simply false, and no admit phase can fix it: the destination arenas are
+/// not knowable until the compressor has chosen formats.
+///
+/// So the tier stays measured down from `W`. **The reclaim does not depend on
+/// this** — it comes from `bytes` being this wave's price rather than the widest
+/// wave's — and the placement's other job, handing the freed run to the weight
+/// side, is done instead by moving `W` itself to the exact figure each pass.
+pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
     with_pool(stream, |pool| {
         let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
-        if pool.transient_carved + len > pool.transient_bytes {
+        // Reserving the forward's tier starts the window the per-forward claim
+        // peak is measured over — the number that decides whether the tier could
+        // ever sit at the arena frontier. See the section above.
+        pool.fresh_this_forward = 0;
+        let floor = pool.weight_floor;
+        // **The anchor needs a seed, so it only applies where one exists.** A
+        // guard opened without a forward behind it — a helper at load, a test —
+        // has predicted nothing, and anchoring its tier at the frontier with a
+        // zero gap sets the ceiling to the live count and refuses the very next
+        // arena. Those callers take the safe placement; the reserve being unset
+        // is exactly the signal that they are one.
+        let base = if frontier_anchor_enabled() && pool.claim_reserve > 0 {
+            // The tier at the arena frontier, plus room for the claims that
+            // arrive after it. **Seeded and corrected**: the seed is what the
+            // caller predicted this forward would still claim
+            // ([`set_claim_reserve`]), the correction is what forwards have
+            // actually taken. The seed alone would be wrong whenever the
+            // compressor is working through a backlog; the observation alone
+            // cannot bootstrap, because a gap of zero refuses the first claim
+            // and kills the forward that would have measured it.
+            let gap = pool.claim_reserve.max(pool.fresh_per_forward_peak);
+            pool.region_base + ((pool.next + gap) * REGION_BYTES) as u64
+        } else {
+            floor.saturating_sub(len as u64)
+        };
+        let live_end = pool.live_end();
+        if let Err(short) = tier_fits(base, len, live_end, floor) {
+            // Not "the KV side is short of regions" — the tier itself does not
+            // fit. Recording it as pressure is still right: both are relieved by
+            // the same move, and the weight side is the only thing that can make
+            // it.
+            pool.kv_pressure += (short as usize).div_ceil(REGION_BYTES);
             candle::bail!(
-                "transient tier exhausted: {len} B on top of {} B carved exceeds the {} B span",
-                pool.transient_carved,
-                pool.transient_bytes,
+                "wave transient tier needs {len} B below the weight floor {floor:#x}, \
+                 and the {} live KV regions below it reach to {live_end:#x} — {short} B \
+                 into the ground the tier needs. The boundary moves at the expert \
+                 pipeline's end of pass; this wave is too wide for the current one.",
+                pool.live_watermark(),
             )
         }
-        pool.transient_carved += len;
-        Ok(pool.transient_end - pool.transient_carved as u64)
+        if tier_poison_enabled() {
+            // SAFETY: `[base, base+len)` is mapped device memory inside the
+            // reservation, and the quiesce above retired every reader of it.
+            //
+            // The context is bound first and the result checked, because a
+            // memset that silently fails is a diagnostic that silently lies —
+            // and this one is used to decide whether a bug is real.
+            stream
+                .context()
+                .bind_to_thread()
+                .and_then(|()| unsafe { memset_d8_sync(base, 0xCD, len) })
+                .map_err(candle::Error::wrap)?;
+        }
+        pool.transient_base = Some(base);
+        pool.transient_bytes = len;
+        // Held past the release, so the ground this tier stood on is still the
+        // KV side's ceiling when the next forward comes to place one.
+        pool.tier_reserve = len;
+        Ok(base)
+    })
+}
+
+/// Whether to anchor the tier at the arena frontier instead of the weight floor.
+///
+/// `KV_TIER_FRONTIER=1`. Off by default because it does not yet hold — see
+/// [`place_transient`] — and kept switchable rather than deleted because the
+/// thing that was refuting it (unbudgeted compressor demand) is now priced by
+/// admission, so the question is open again and worth re-asking cheaply.
+fn frontier_anchor_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KV_TIER_FRONTIER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether to fill the transient tier with a poison byte as it is placed.
+///
+/// `KV_TIER_POISON=1`. Off by default: it costs a synchronous device memset of
+/// the whole tier on every forward.
+fn tier_poison_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KV_TIER_POISON")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Predict how many regions will still be claimed after this forward's tier is
+/// reserved, so the tier can leave room for them.
+///
+/// This is `docs/elastic_vram_partition.md` §7 phase 1's third term reaching the
+/// placement: admit claims the wave's own KV, but the compressor allocates its
+/// quantize destinations *while the forward runs*, and those destinations are
+/// size classes that may have no arena yet. With the tier measured down from the
+/// weight floor there is room above the frontier for them and this is inert;
+/// anchored at the frontier it is what makes the anchor possible at all.
+///
+/// A **bound**, not a forecast: the caller passes what this wave writes, and a
+/// sealed copy is never larger than the active one it compresses. Over-reserving
+/// costs the weight side a little ground for one forward; under-reserving costs
+/// a refused claim, which fails one.
+pub fn set_claim_reserve(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<()> {
+    with_pool(stream, |pool| {
+        pool.claim_reserve = regions;
+        Ok(())
+    })
+}
+
+/// The tier vanishes: nothing is live in it, and the arenas that were laid out
+/// inside it are detached.
+///
+/// **Its ground is not handed back to the KV side.** `tier_reserve` keeps the
+/// ceiling where the tier left it until the next [`place_transient`] moves it,
+/// because a region claimed in the gap between two forwards could not be given
+/// up again in time for the second one — see that field. What the release *does*
+/// give back is the tier's weight in [`RegionPool::spare_regions`]'s demand
+/// term, which is how the ground reaches the side that can actually use it.
+pub(crate) fn release_transient(stream: &std::sync::Arc<CudaStream>) {
+    let _ = with_pool(stream, |pool| {
+        pool.transient_base = None;
+        pool.transient_bytes = 0;
+        Ok(())
+    });
+}
+
+/// Carve the persistence thread's staging block, out of the fixed left end.
+///
+/// Separate from [`place_transient`] because the block is: it is carved **once**
+/// and never moves, where the wave tier is placed and released every forward.
+/// The persistence thread's copy stream is not synchronised to a wave, so its
+/// ranges can be live at any moment one begins — it is the one domain that
+/// cannot be allowed to vanish, and therefore the one that needs a fixed
+/// address.
+pub(crate) fn carve_persist(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
+    with_pool(stream, |pool| {
+        let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
+        if pool.persist_carved + len > PERSIST_SPAN_BYTES {
+            candle::bail!(
+                "persistence staging block exhausted: {len} B on top of {} B carved \
+                 exceeds the {PERSIST_SPAN_BYTES} B block",
+                pool.persist_carved,
+            )
+        }
+        let base = pool.span_base + pool.persist_carved as u64;
+        pool.persist_carved += len;
+        Ok(base)
+    })
+}
+
+/// Claim the reservation if it does not exist, and report the span's right edge.
+///
+/// The address an expert cache builds its [`super::weight_zone::WeightZone`]
+/// from: slots fill leftward from here.
+pub fn span_end(stream: &std::sync::Arc<CudaStream>) -> Result<u64> {
+    with_pool(stream, |pool| Ok(pool.span_end()))
+}
+
+/// Bytes the weight side may **ever** hold — the span less
+/// [`MIN_ELASTIC_RESERVE`].
+///
+/// The cap the expert cache sizes itself against, replacing
+/// `VramGovernor::expert_budget`. It is a *position*, not a budget: there is no
+/// arithmetic here about what anything else might want, because everything else
+/// is on the other side of the floor by construction.
+pub fn weight_capacity_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
+    with_pool(stream, |pool| {
+        Ok(pool.span_bytes.saturating_sub(MIN_ELASTIC_RESERVE))
+    })
+}
+
+/// Bytes the weight side takes **at load** — the span less
+/// [`INITIAL_KV_RESERVE`].
+///
+/// The opening position, not the limit. [`weight_capacity_bytes`] is how far the
+/// zone may grow once the KV side has shown what it actually uses; this is where
+/// it starts, before any wave has said anything.
+pub fn initial_weight_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
+    with_pool(stream, |pool| {
+        Ok(pool.span_bytes.saturating_sub(INITIAL_KV_RESERVE))
+    })
+}
+
+/// Place the weight side's left edge at `floor` and re-derive the KV side.
+///
+/// Called at model load to open the boundary, and between waves to move it.
+/// Returns the region count that survives.
+pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Result<usize> {
+    let ordinal = stream.context().ordinal();
+    // **The latch.** Moving the boundary evicts experts and relocates others; a
+    // wave in flight may be reading either. The design's answer is that this
+    // only ever runs at the expert pipeline's end-of-pass, which is a property
+    // of the call site — so it is checked here rather than trusted, in the one
+    // place every move goes through.
+    if super::bump_arena::wave_is_live(ordinal) {
+        candle::bail!(
+            "refusing to move the weight boundary while a wave generation is open: \
+             a retraction evicts and relocates expert slots, and a wave in flight \
+             may be reading them. The boundary moves at the expert pipeline's \
+             end-of-pass, where no GEMM for the pass is still being issued."
+        )
+    }
+    with_pool(stream, |pool| {
+        let total = pool.set_weight_floor(floor)?;
+        log::debug!(
+            "reservation: weight floor at {floor:#x} — {} MiB to the weight side, \
+             {total} regions to KV",
+            (pool.span_end() - floor) / (1024 * 1024),
+        );
+        Ok(total)
+    })
+}
+
+/// **The negotiation, from the KV side.**
+///
+/// `(wanted, spare)` — regions the KV side asked for and could not get since the
+/// last call, and regions it is holding free beyond `slack` that the weight side
+/// could take. Draining is destructive: the caller is expected to act on it.
+///
+/// Exactly one of the two is ever non-zero in practice, and they are returned
+/// together so the weight side makes one decision per pass rather than reacting
+/// to two independent signals that could disagree within a wave.
+///
+pub fn take_kv_demand(stream: &std::sync::Arc<CudaStream>, slack: usize) -> Result<(usize, usize)> {
+    with_pool(stream, |pool| {
+        let wanted = std::mem::take(&mut pool.kv_pressure);
+        if wanted > 0 {
+            // The KV side just proved it wants everything it has and more. Pin
+            // the mark at the top so the weight side cannot read the regions it
+            // is about to be handed as "spare" on the very next pass.
+            pool.kv_peak_window = pool.total;
+            return Ok((wanted, 0));
+        }
+        Ok((0, pool.spare_regions(slack).min(KV_GROW_STEP)))
+    })
+}
+
+/// The address the weight floor would sit at if the weight side gave up
+/// `regions` more regions (positive) or took `regions` fewer (negative).
+///
+/// Expressed as an address rather than a count so the caller — which thinks in
+/// slots, not regions — converts once, in one direction, using
+/// [`super::weight_zone::WeightZone::capacity_for_frontier`].
+pub fn weight_floor_after(stream: &std::sync::Arc<CudaStream>, delta: isize) -> Result<u64> {
+    with_pool(stream, |pool| {
+        let shift = (delta.unsigned_abs() * REGION_BYTES) as u64;
+        let floor = if delta >= 0 {
+            (pool.weight_floor + shift).min(pool.span_end())
+        } else {
+            pool.weight_floor.saturating_sub(shift)
+        };
+        Ok(floor.max(pool.span_base + MIN_ELASTIC_RESERVE as u64))
     })
 }
 
@@ -597,7 +1431,13 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         free: pool.free_count(),
         peak_live: pool.peak_live,
         transient_bytes: pool.transient_bytes,
-        transient_carved: pool.transient_carved,
+        transient_ceiling: pool.region_ceiling(),
+        fresh_claims_during_wave: pool.fresh_claims_during_wave,
+        refusals_during_wave: pool.refusals_during_wave,
+        weight_bytes: (pool.span_end() - pool.weight_floor) as usize,
+        slack_bytes: layout_span(pool.span_base, pool.span_bytes, pool.weight_floor).slack,
+        reserved_bytes: pool.reservation.reserved_bytes(),
+        granularity: pool.reservation.granularity(),
     })
 }
 
@@ -783,39 +1623,294 @@ mod tests {
         Ok(())
     }
 
-    /// **The whole reservation is exactly `kv_floor`.**
+    /// **The tier never stands on a live region**, however full the KV side is.
     ///
-    /// The governor hands the expert cache `usable − kv_floor − scratch_margin`,
-    /// so what is left when the first KV cache is built is
-    /// `kv_floor + scratch_margin`. Out of that, the reservation claims its two
-    /// sides and leaves the cushion on the CUDA pool — where the gallery arena,
-    /// the grow-only scratches and the threaded pipeline's combine target still
-    /// live. The identity is what makes `kv_floor` mean one thing:
-    /// **the VRAM the KV subsystem owns, transient tier included.**
+    /// The regression this pins: the fit test used to bound the tier below by
+    /// the *start* of the KV side, so a tier measured down from `W` was accepted
+    /// while it sat on top of the highest live arenas. `region_ceiling` refuses
+    /// later claims but cannot revoke one already made, so the wave wrote its
+    /// intermediates into live KV bytes — silently, with no error anywhere.
+    ///
+    /// Pure arithmetic, so it holds on a machine with no GPU.
+    #[test]
+    fn the_tier_never_overlaps_a_live_region() {
+        let r = REGION_BYTES as u64;
+        let region_base = 0x1000_0000u64;
+        let floor = region_base + 332 * r; // 332 regions
+        let len = 4 * REGION_BYTES; // a decode-sized tier
+        let base = floor - len as u64; // the default placement
+
+        // Empty KV side: the tier sits above every region and fits.
+        assert!(super::tier_fits(base, len, region_base, floor).is_ok());
+
+        // 328 live regions — the tier lands exactly on the frontier, no overlap.
+        let live_end = region_base + 328 * r;
+        assert!(
+            super::tier_fits(base, len, live_end, floor).is_ok(),
+            "abutting the frontier is not overlapping it"
+        );
+
+        // 329 live: one region of the tier is inside live KV. Refuse.
+        let live_end = region_base + 329 * r;
+        assert_eq!(
+            super::tier_fits(base, len, live_end, floor),
+            Err(r),
+            "one region short must be reported as one region short"
+        );
+
+        // The old bound — the start of the KV side — accepted every one of
+        // these. The whole span being live is the extreme case.
+        let live_end = region_base + 332 * r;
+        assert_eq!(super::tier_fits(base, len, live_end, floor), Err(4 * r));
+    }
+
+    /// The shortfall is reported from **whichever** side binds, and never wraps.
+    ///
+    /// The frontier anchor computes its base upward from the arenas, so it
+    /// overshoots `floor` rather than undershooting `live_end` — the direction
+    /// the single-sided `region_base - base` could not express, and underflowed
+    /// on: in release it wrapped to ~2^64 and drove `kv_pressure` to a retraction
+    /// request larger than the span.
+    #[test]
+    fn the_tier_shortfall_reports_both_directions_without_wrapping() {
+        let r = REGION_BYTES as u64;
+        let region_base = 0x1000_0000u64;
+        let floor = region_base + 100 * r;
+
+        // Anchored above the frontier and running two regions past the floor.
+        let base = region_base + 99 * r;
+        let len = 3 * REGION_BYTES;
+        assert_eq!(
+            super::tier_fits(base, len, region_base, floor),
+            Err(2 * r),
+            "overshooting the floor is a two-region shortfall, not a wrap"
+        );
+
+        // Both bounds violated at once: the larger of the two is what the
+        // boundary has to move by.
+        let base = region_base + 10 * r;
+        let live_end = region_base + 12 * r;
+        let len = 95 * REGION_BYTES;
+        assert_eq!(
+            super::tier_fits(base, len, live_end, floor),
+            Err(5 * r),
+            "past the floor by 5 regions, into live by 2 — the binding one is 5"
+        );
+    }
+
+    /// **The span is `usable` less the pool cushion — and nothing else.**
+    ///
+    /// Specifically it is *not* also less the dense weights. They are resident
+    /// by the time this runs, so `usable()` has already netted them out of `C`;
+    /// subtracting `class_reserved(Weights)` here as well would book the same
+    /// bytes twice. The load order is what makes that mistake look like
+    /// prudence, so the identity is pinned rather than left to a comment.
     ///
     /// A pure-arithmetic test, so it holds on a machine with no GPU.
     #[test]
-    fn the_reservation_claims_exactly_the_kv_floor() {
-        let margin = 1024 * 1024 * 1024;
-        for floor_mib in [3072usize, 5120, 6144] {
-            let floor = floor_mib * 1024 * 1024;
-            let usable = floor + margin; // what the expert loader leaves behind
-            let claim = super::kv_span_from(usable, margin) + super::TRANSIENT_SPAN_BYTES;
+    fn the_span_is_usable_less_the_cushion_and_nothing_else() {
+        let mib = 1024 * 1024;
+        let cushion = 512 * mib;
+        let capacity = 14_592 * mib;
+        for dense_mib in [0usize, 1024, 4096] {
+            let dense = dense_mib * mib;
+            // What `usable()` reports once `dense` bytes are resident: the drop
+            // in headroom since C was measured is exactly the weights.
+            let usable = capacity - dense;
             assert_eq!(
-                claim,
-                floor,
-                "a {floor_mib} MiB floor must claim exactly that, not {} MiB",
-                claim / (1024 * 1024)
+                super::span_from(usable, cushion),
+                capacity - dense - cushion,
+                "the weights must be subtracted once, not twice, at {dense_mib} MiB"
             );
         }
     }
 
-    /// A card too small to hold the transient tier asks for no KV rather than
-    /// wrapping into a colossal span.
+    /// **The tier's ceiling binds the free list, not just fresh regions.**
+    ///
+    /// A region freed while the tier was small — or absent, between forwards —
+    /// keeps its index, and the next wave's tier can be placed below it. Handing
+    /// it out then puts KV writes inside the wave's own intermediates, and
+    /// nothing downstream would notice until the output was wrong.
+    ///
+    /// Pure arithmetic against `region_ceiling`, so it holds with no GPU: what
+    /// the bug was is a `free.pop()` that never consulted the ceiling at all.
     #[test]
-    fn a_span_smaller_than_the_transient_tier_yields_no_kv() {
-        assert_eq!(super::kv_span_from(super::TRANSIENT_SPAN_BYTES / 2, 0), 0);
-        assert_eq!(super::kv_span_from(0, 1024), 0);
+    fn the_tier_ceiling_binds_recycled_regions() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 4096 * mib;
+        let l = super::layout_span(base, span, base + span as u64);
+        // A tier placed 8 regions below the weight floor drops the ceiling by 8.
+        let tier = 8 * REGION_BYTES;
+        let tier_base = (base + span as u64) - tier as u64;
+        let ceiling = ((tier_base - l.region_base) as usize) / REGION_BYTES;
+        assert_eq!(
+            ceiling,
+            l.total - 8,
+            "the tier must remove exactly its own regions from the ceiling"
+        );
+        // Every index at or above the ceiling is inside the tier — whether it is
+        // fresh or recycled is not a property the address knows about.
+        for idx in ceiling..l.total {
+            let addr = l.region_base + (idx * REGION_BYTES) as u64;
+            assert!(
+                addr >= tier_base,
+                "region {idx} sits inside the tier at {tier_base:#x}"
+            );
+        }
+        assert!(
+            l.region_base + ((ceiling - 1) * REGION_BYTES) as u64 + REGION_BYTES as u64
+                <= tier_base,
+            "the last usable region must end at or before the tier"
+        );
+    }
+
+    /// A span too small for the persist block yields no regions rather than
+    /// wrapping into a colossal one. (`span_from` itself is only
+    /// `usable − cushion`; a span that cannot hold the fixed block is refused
+    /// outright in `create`.)
+    ///
+    /// Note what is *not* subtracted: the wave tier. At rest it occupies
+    /// nothing, so its ground belongs to the KV side until a forward places it.
+    #[test]
+    fn a_span_smaller_than_the_persist_block_yields_no_regions() {
+        assert_eq!(super::span_from(0, 1024), 0, "a cushion larger than usable");
+        let base = 0x1_0000_0000u64;
+        let persist = super::PERSIST_SPAN_BYTES;
+        let l = super::layout_span(base, persist, base + persist as u64);
+        assert_eq!(l.total, 0, "the persist block leaves nothing for KV");
+        assert_eq!(l.slack, 0);
+        // A span below even that stays sane rather than wrapping.
+        let l = super::layout_span(base, persist / 2, base + (persist / 2) as u64);
+        assert_eq!(l.total, 0);
+        assert_eq!(l.slack, 0);
+        // And the tier's worth of ground *is* the KV side's while nothing runs.
+        let with_tier = persist + super::MAX_WAVE_TRANSIENT_BYTES;
+        let l = super::layout_span(base, with_tier, base + with_tier as u64);
+        assert_eq!(
+            l.total,
+            super::MAX_WAVE_TRANSIENT_BYTES / REGION_BYTES,
+            "at rest the tier's ground belongs to the KV side"
+        );
+    }
+
+    /// The layout is positional from the right: the persist block is at the
+    /// left, the transient tier is measured back from the weight floor, and the
+    /// regions are what is left in the middle. Nothing overlaps and nothing
+    /// escapes the span.
+    #[test]
+    fn the_layout_partitions_the_span_without_overlap() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        for span_mib in [3072usize, 8192, 14336] {
+            for weight_mib in [0usize, 1024, 4096] {
+                let span = span_mib * mib;
+                let span_end = base + span as u64;
+                let floor = span_end - (weight_mib * mib) as u64;
+                let l = super::layout_span(base, span, floor);
+
+                // Only the persist block is fixed; the regions start straight
+                // after it and run up to the weight floor. The wave tier is not
+                // in the layout at all — it exists only while a forward runs.
+                assert_eq!(l.region_base, base + super::PERSIST_SPAN_BYTES as u64);
+                let region_end = l.region_base + (l.total * REGION_BYTES) as u64;
+                assert!(
+                    region_end <= l.weight_floor,
+                    "regions ran into the weight side at {span_mib}/{weight_mib}"
+                );
+                assert!(l.weight_floor <= span_end, "weight side past the span end");
+                assert_eq!(
+                    region_end + l.slack as u64,
+                    l.weight_floor,
+                    "slack must account for exactly the rounding remainder"
+                );
+            }
+        }
+    }
+
+    /// A weight floor beyond either edge is clamped rather than wrapped. The
+    /// floor arrives from arithmetic done a crate away, and a wrapped
+    /// subtraction here would produce an address that looks plausible.
+    #[test]
+    fn the_layout_clamps_a_floor_outside_the_span() {
+        let base = 0x1_0000_0000u64;
+        let span = 4096 * 1024 * 1024;
+        let past_end = super::layout_span(base, span, base + span as u64 + 4096);
+        assert_eq!(past_end, super::layout_span(base, span, base + span as u64));
+        let before_start = super::layout_span(base, span, 0);
+        assert_eq!(
+            before_start.total, 0,
+            "a floor left of the regions leaves none"
+        );
+    }
+
+    /// **The transient tier is not in the resting layout at all.**
+    ///
+    /// Between forwards it occupies nothing, so the regions run from the persist
+    /// block straight to the weight floor. That is what makes the tier the one
+    /// block in the span that can change size: at the moment its extent changes
+    /// it holds nothing, so a resize leaves no hole and moves no data — and it is
+    /// why it can sit *between* the arenas and the weights, absorbing both sides'
+    /// movement, which nothing at a fixed address could do.
+    #[test]
+    fn the_resting_layout_has_no_transient_tier() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 12288 * mib;
+        let span_end = base + span as u64;
+        let expected = base + super::PERSIST_SPAN_BYTES as u64;
+        for weight_mib in [0usize, 512, 2048, 6144, 9216] {
+            let l = super::layout_span(base, span, span_end - (weight_mib * mib) as u64);
+            assert_eq!(l.region_base, expected, "regions start after persist");
+            // Every byte between the persist block and the weight floor is
+            // available to regions when no forward is running.
+            let floor = l.weight_floor;
+            assert_eq!(
+                l.total * REGION_BYTES + l.slack,
+                (floor - expected) as usize,
+                "resting layout left a gap at weight={weight_mib} MiB"
+            );
+        }
+    }
+
+    /// Moving the boundary changes exactly one thing: how many regions exist.
+    /// Every megabyte the weight side gives up becomes KV regions, one for one
+    /// (modulo the rounding the slack accounts for).
+    #[test]
+    fn giving_ground_becomes_regions_one_for_one() {
+        let base = 0x1_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 12288 * mib;
+        let span_end = base + span as u64;
+        let at = |weight_mib: usize| {
+            super::layout_span(base, span, span_end - (weight_mib * mib) as u64)
+        };
+
+        let wide = at(6144);
+        let narrow = at(4096);
+        assert_eq!(
+            narrow.total - wide.total,
+            (2048 * mib) / REGION_BYTES,
+            "2048 MiB of weights is exactly that many regions of KV"
+        );
+    }
+
+    /// The whole span is accounted for: persist + regions + slack + weights is
+    /// exactly the span, at every boundary position. (No transient term — at
+    /// rest it has none.)
+    #[test]
+    fn every_byte_of_the_span_is_accounted_for() {
+        let base = 0x2_0000_0000u64;
+        let mib = 1024 * 1024;
+        let span = 9216 * mib;
+        let span_end = base + span as u64;
+        for weight_mib in [0usize, 512, 2048, 6144] {
+            let floor = span_end - (weight_mib * mib) as u64;
+            let l = super::layout_span(base, span, floor);
+            let weights = (span_end - l.weight_floor) as usize;
+            let total = super::PERSIST_SPAN_BYTES + l.total * REGION_BYTES + l.slack + weights;
+            assert_eq!(total, span, "span unaccounted at weight={weight_mib} MiB");
+        }
     }
 
     /// Live + free accounts for every region: nothing leaks out of the span.

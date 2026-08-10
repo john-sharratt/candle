@@ -31,6 +31,7 @@
 
 use super::types::ExpertSlot;
 use candle::Result;
+use candle_nn::kv_cache::WeightZone;
 use std::collections::HashMap;
 
 /// Number of early MoE layers whose experts are never evicted.
@@ -56,7 +57,7 @@ pub(crate) const PREFETCH_EVICT_WINDOW: usize = 5;
 ///
 /// ## Slot lifecycle
 ///
-/// Each slot is either free (in `free_slots`), or occupied (has an
+/// Each slot is either free (in the zone's free list), or occupied (has an
 /// `ExpertSlot` and a `slot_to_key` entry).  Occupied slots have a
 /// `last_used` timestamp that determines eviction order.
 ///
@@ -64,12 +65,22 @@ pub(crate) const PREFETCH_EVICT_WINDOW: usize = 5;
 /// Free:     slots[i] = None,  slot_to_key[i] = None
 /// Occupied: slots[i] = Some(ExpertSlot), slot_to_key[i] = Some((moe, exp))
 /// ```
+///
+/// ## Where a slot's bytes come from
+///
+/// The [`WeightZone`] owns the addresses. It is the right-hand side of the
+/// device reservation, and it is also **the free list** — there is no second one
+/// here. That matters for more than tidiness: the zone hands out the *rightmost*
+/// free slot, which keeps live experts packed away from the boundary the KV side
+/// pushes against, and a duplicate `Vec` free list here would have silently
+/// undone that ordering on every eviction (`push` puts the freed index on top,
+/// so the next load takes it back regardless of where it sits).
 pub struct ExpertCacheInner {
     /// VRAM slots — created on-demand, indexed by slot_idx.
     /// **No Arc wrapping** — sole ownership.
     pub(crate) slots: Vec<Option<ExpertSlot>>,
-    /// Free slot indices (populated at init, drained on first loads).
-    pub(crate) free_slots: Vec<usize>,
+    /// The addresses, and the free list over them.
+    pub(crate) zone: WeightZone,
     /// Forward lookup: `(moe_layer_idx, expert_idx) -> slot_idx`.
     pub(crate) key_to_slot: HashMap<(usize, usize), usize>,
     /// Per-slot usage timestamp — higher = more recently used.
@@ -91,14 +102,15 @@ pub struct ExpertCacheInner {
 }
 
 impl ExpertCacheInner {
-    /// Create a new empty cache with `num_slots` free slots.
+    /// Create a new empty cache over `zone`'s slots.
     ///
     /// * `num_moe_layers` — total MoE layers (e.g. 48)
     /// * `experts_per_layer` — experts per layer (e.g. 128)
-    pub(crate) fn new(num_slots: usize, num_moe_layers: usize, experts_per_layer: usize) -> Self {
+    pub(crate) fn new(zone: WeightZone, num_moe_layers: usize, experts_per_layer: usize) -> Self {
+        let num_slots = zone.capacity();
         Self {
             slots: (0..num_slots).map(|_| None).collect(),
-            free_slots: (0..num_slots).rev().collect(),
+            zone,
             key_to_slot: HashMap::new(),
             last_used: vec![0u32; num_slots],
             generation: 0,
@@ -107,6 +119,81 @@ impl ExpertCacheInner {
             num_moe_layers,
             experts_per_layer,
         }
+    }
+
+    /// Slots that exist — the zone's capacity, which is also `slots.len()`.
+    pub(crate) fn num_slots(&self) -> usize {
+        self.zone.capacity()
+    }
+
+    /// Slots not currently holding an expert.
+    pub(crate) fn free_len(&self) -> usize {
+        self.zone.free_count()
+    }
+
+    /// Take the rightmost free slot, without evicting anything.
+    ///
+    /// `None` means every slot is occupied — the signal to consult the eviction
+    /// policy, never a reason to skip it. Position decides *where*; temperature
+    /// decides *who*.
+    pub(crate) fn take_free(&mut self) -> Option<usize> {
+        self.zone.alloc()
+    }
+
+    /// Return a slot whose contents are gone.
+    pub(crate) fn put_free(&mut self, slot_idx: usize) {
+        self.slots[slot_idx] = None;
+        self.zone.release(slot_idx);
+    }
+
+    /// Device address of slot `slot_idx`'s first byte.
+    pub(crate) fn slot_base(&self, slot_idx: usize) -> u64 {
+        self.zone.slot_base(slot_idx)
+    }
+
+    /// Take `target - capacity` more slots from the KV side. Returns how many.
+    ///
+    /// The per-slot bookkeeping grows with the zone. Nothing is loaded into the
+    /// new slots here — they join the free list and the next miss takes them,
+    /// after every closer hole.
+    pub(crate) fn grow_zone(&mut self, target: usize) -> usize {
+        let gained = self.zone.grow_to(target);
+        if gained > 0 {
+            let n = self.zone.capacity();
+            self.slots.resize_with(n, || None);
+            self.last_used.resize(n, 0);
+            self.slot_to_key.resize(n, None);
+        }
+        gained
+    }
+
+    /// Give `capacity - target` slots back to the KV side.
+    ///
+    /// Returns the plan the caller must perform on the bytes: relocate the
+    /// hottest doomed occupants into surviving free slots, evict the rest. The
+    /// bookkeeping *inside the zone* is already applied; the per-slot tables
+    /// here are truncated once the caller has moved what it is going to move,
+    /// which is why this returns before touching them.
+    pub(crate) fn retract_zone(&mut self, target: usize) -> candle_nn::kv_cache::RetractPlan {
+        let scores: Vec<f32> = (0..self.zone.capacity())
+            .map(|i| self.slot_to_key[i].map_or(0.0, |(layer, expert)| self.score(layer, expert)))
+            .collect();
+        self.zone.retract_to(target, |i| scores[i])
+    }
+
+    /// Drop the per-slot tables to the zone's current capacity.
+    ///
+    /// Separate from [`Self::retract_zone`] because the caller has to move bytes
+    /// and rewrite `slot_to_key` for the relocations in between; truncating
+    /// first would take the entries it still needs to read.
+    pub(crate) fn truncate_tables(&mut self) {
+        let n = self.zone.capacity();
+        self.slots.truncate(n);
+        self.last_used.truncate(n);
+        self.slot_to_key.truncate(n);
+        // Anything the truncation removed is gone from VRAM; the location map
+        // must not still point at it.
+        self.key_to_slot.retain(|_, &mut slot| slot < n);
     }
 
     /// Promote a slot's timestamp (the hot path — one array write).
@@ -217,7 +304,10 @@ impl ExpertCacheInner {
         current_layer: usize,
     ) -> Result<(usize, Option<(usize, usize)>, Option<ExpertSlot>)> {
         // ── Try free slots first ──
-        if let Some(free) = self.free_slots.pop() {
+        //
+        // Drained before the policy is consulted at all: if any slot is free, no
+        // eviction happens, whatever the scores say.
+        if let Some(free) = self.zone.alloc() {
             return Ok((free, None, None));
         }
 
@@ -403,7 +493,9 @@ impl ExpertCacheInner {
             if let (Some(key), Some(slot)) = (evicted_key, evicted_slot) {
                 evicted_pairs.push((key, slot));
             }
-            self.free_slots.push(slot_idx);
+            // Back to the zone, not to a local list: it decides where the next
+            // load lands, and it is what the KV side reads to find the frontier.
+            self.zone.release(slot_idx);
         }
         evicted_pairs
     }
@@ -427,9 +519,18 @@ impl ExpertCacheInner {
 mod tests {
     use super::*;
 
+    /// A cache of `n` slots over a zone with no device behind it.
+    ///
+    /// The zone is pure arithmetic — addresses and indices — so the whole
+    /// eviction policy still exercises with no GPU and no model load, exactly as
+    /// it did when the free list was a local `Vec`.
+    fn cache(n: usize) -> ExpertCacheInner {
+        ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n), 48, 128)
+    }
+
     /// Mark a slot occupied by `(layer, expert)` without a real `ExpertSlot`
     /// (eviction selection reads only the bookkeeping tables, never the VRAM
-    /// buffers), so the policy can be exercised with no GPU or model load.
+    /// buffers).
     fn occupy(
         inner: &mut ExpertCacheInner,
         slot: usize,
@@ -438,7 +539,13 @@ mod tests {
         last_used: u32,
         freq: f32,
     ) {
-        inner.free_slots.retain(|&s| s != slot);
+        // The zone hands out the rightmost free index, and every test here
+        // occupies ascending from 0, so the two agree. Asserting rather than
+        // searching keeps the fixture honest: a test that stopped filling in
+        // order would fail here rather than quietly occupy a different slot than
+        // the one its assertions name.
+        let taken = inner.zone.alloc().expect("a free slot");
+        assert_eq!(taken, slot, "fixture must occupy slots in ascending order");
         inner.slot_to_key[slot] = Some((layer, expert));
         inner.key_to_slot.insert((layer, expert), slot);
         inner.last_used[slot] = last_used;
@@ -449,12 +556,12 @@ mod tests {
     fn forced_eviction_targets_lowest_frequency() {
         // Four behind-the-wave experts at the same layer; the least-frequently
         // used (lowest score) is evicted, keeping the hot experts resident.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 10, 100, 1, 8.0);
         occupy(&mut inner, 1, 10, 101, 2, 3.0);
         occupy(&mut inner, 2, 10, 102, 3, 0.5); // coldest
         occupy(&mut inner, 3, 10, 103, 4, 5.0);
-        assert!(inner.free_slots.is_empty());
+        assert!(inner.free_len() == 0);
 
         let (slot, evicted_key, _) = inner.allocate_slot(20).unwrap();
         assert_eq!(evicted_key, Some((10, 102)));
@@ -465,7 +572,7 @@ mod tests {
     fn end_of_pass_evicts_lowest_scored() {
         // End-of-pass drops the lowest-scored non-pinned slot and keeps the hot
         // ones; pinned layers are never considered.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned (layer < PINNED_LAYERS)
         occupy(&mut inner, 1, 10, 101, 2, 5.0);
         occupy(&mut inner, 2, 20, 102, 3, 0.2); // coldest non-pinned
@@ -489,7 +596,7 @@ mod tests {
         // current=10, n=48, window=5 → eligible layers 5..9 (the 5 just-behind).
         // A never-used expert at L-3 (layer 7) is evicted before a hot expert at
         // the furthest L-1 (layer 9): usage dominates distance.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 9, 100, 5, 8.0); // L-1, furthest, but hot
         occupy(&mut inner, 1, 7, 102, 5, 0.0); // L-3, never used
         occupy(&mut inner, 2, 30, 103, 5, 9.0); // out of window (dist 20)
@@ -505,7 +612,7 @@ mod tests {
     #[test]
     fn prefetch_evict_prefers_farther_among_equally_cold() {
         // Two never-used experts in-window → the farther (L-1) goes first.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1 (dist 47), cold
         occupy(&mut inner, 1, 6, 101, 5, 0.0); // L-4 (dist 44), cold
         let (_, key, _) = inner
@@ -521,7 +628,7 @@ mod tests {
         // current=10, window=5: a never-used near-future expert (layer 12, dist 2)
         // is OUT of window and must be protected; only the in-window (hot) expert
         // is eligible.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 12, 200, 5, 0.0); // near-future, never used — protected
         occupy(&mut inner, 1, 8, 201, 5, 9.0); // L-2, in window, hot
         let (_, key, _) = inner
@@ -541,7 +648,7 @@ mod tests {
         // current=2, n=62, window=5: the window (L-1..L-5 = layers 1,0,61,60,59)
         // has only the tail layers 59..61 non-pinned. A never-used near-future
         // layer (5, dist 3) is out of window and protected.
-        let mut inner = ExpertCacheInner::new(4, 62, 128);
+        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 4, 4), 62, 128);
         occupy(&mut inner, 0, 61, 100, 5, 1.0); // tail, in window
         occupy(&mut inner, 1, 5, 101, 5, 0.0); // near-future (dist 3), protected
         let (_, key, _) = inner
@@ -556,7 +663,7 @@ mod tests {
     fn prefetch_evict_batch_returns_victims_in_priority_order() {
         // One scan yields multiple victims, best-first: equally-cold L-1 then L-2;
         // the hot L-3 is left resident. Exercises the dense double-buffer path.
-        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        let mut inner = cache(4);
         occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1, cold
         occupy(&mut inner, 1, 8, 101, 5, 0.0); // L-2, cold
         occupy(&mut inner, 2, 7, 102, 5, 5.0); // L-3, hot — kept
@@ -569,7 +676,7 @@ mod tests {
 
     #[test]
     fn prefetch_evict_none_when_all_pinned() {
-        let mut inner = ExpertCacheInner::new(3, 48, 128);
+        let mut inner = cache(3);
         occupy(&mut inner, 0, 0, 100, 1, 0.0);
         occupy(&mut inner, 1, 1, 101, 2, 0.0);
         occupy(&mut inner, 2, 2, 102, 3, 0.0);
@@ -578,7 +685,7 @@ mod tests {
 
     #[test]
     fn pinned_layers_never_evicted() {
-        let mut inner = ExpertCacheInner::new(3, 48, 128);
+        let mut inner = cache(3);
         occupy(&mut inner, 0, 0, 100, 1, 0.0);
         occupy(&mut inner, 1, 1, 101, 2, 0.0);
         occupy(&mut inner, 2, 2, 102, 3, 0.0);
@@ -590,7 +697,7 @@ mod tests {
     fn hot_expert_survives_a_cold_one() {
         // Same layer (same position factor): the frequently-used expert is kept
         // and the cold one evicted — the cache is frequency-dominated.
-        let mut inner = ExpertCacheInner::new(2, 48, 128);
+        let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 9, 9.0);
         occupy(&mut inner, 1, 10, 51, 1, 0.0);
 
@@ -607,7 +714,7 @@ mod tests {
         // A (hot) expert behind the wave is still evicted in preference to a
         // (cold) one ahead of it — never drop an expert not yet executed this
         // pass, so eviction can never cascade into later layers.
-        let mut inner = ExpertCacheInner::new(2, 48, 128);
+        let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 5, 5.0); // behind, hot
         occupy(&mut inner, 1, 30, 51, 0, 0.0); // ahead, cold
 
