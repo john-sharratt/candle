@@ -14,6 +14,50 @@ prompt slots) and **decode** (one token per session, batched across sessions).
 
 ---
 
+## Campaign status (measured)
+
+The invariant campaign landed the productive fixes and **measured out** the rest.
+Commits on `deepseek-flash`: 4d5246d2, c9305f8a, 30a05446. Every step held the bit
+gates (mirror/gather/compressor) and model StoryRewrite [1,4,8,1] at 100% valid;
+config-8 prefill 558 → 590 t/s.
+
+**Fixed:** Inv 6 (`Tensor::empty` — no zero-then-overwrite, 5 hot sites); Inv 2
+(`force_contiguous` per-row storm consolidated to one bounded retained-state copy;
+no-op `contiguous` dropped); Inv 3/4 decode comp-idx built on-device (broadcast);
+Inv 5 batched `lm_head` + batched prefill out-proj (span 1448→46 ms); Inv 1 emit-type
+**output** (attention kernels emit F32 → int8 out-proj, no widening cast); Inv 1 #8
+(`ape`/`norm_w` F32 at load → compressor casts are proven no-ops).
+
+**Measured out — NOT productive fixes (do not "finish" these blindly):**
+- **Inv 5 multi-slot prefill ATTENTION kernel** — REFUTED. Config-8 `prefill:kernel`
+  is only **~65 ms**; the per-seq loop's attention launch is negligible. The prefill
+  wall is MoE + readback-drain bound (`deepseek:moe` ~4.1 s, `moe:sort` ~3.1 s —
+  mostly GPU drain absorbed at the sanctioned expert-id readback), not the attention
+  kernel. Building a multi-slot prefill kernel cannot move the wall.
+- **Inv 1 emit-type INPUT** (q/kv F32→BF16) — necessary boundary conversion. The
+  kernel wants bf16 input (an f32-input kernel would 2× the per-tile re-read); the
+  cast is the f32-norm→bf16-kernel rounding. Eliminating it needs a candle-nn
+  `rms_norm` that stores bf16 — a fork for marginal gain.
+- **Inv 4 MoE counting-sort** (`engine.rs:411-444`) — rides the **sanctioned**
+  expert-id readback (`indices.to_vec2`, needed to schedule streaming pinned→VRAM
+  uploads). The sort post-processes already-host data; `submit_moe_work` consumes host
+  `assignments`. Moving it to GPU means re-uploading + reworking the bit-exact
+  streaming submit for a host sort whose visible cost is GPU drain, not sort compute.
+- **Inv 3/4/5 out-of-regime recall** (`kernel_attention.rs:621` + wave Host arm) —
+  deep-prompt only (corpus wider than the shortlist), NOT exercised by the gate. The
+  per-token *recall* (not exact top-k) is required for prefill≡decode parity, so it
+  can't be naively batched; a parity-safe batched on-device recall is a large,
+  unvalidatable-by-current-gate effort for an uncommon path.
+
+**Doc corrections found while verifying:** `paged.rs:208-210` (`CorpusCache::build`)
+and `gallery.rs:1704/1766` are test/bench-only, not hot sites (Inv 6 had 5 real
+sites, not 7).
+
+The priority list at the bottom predates these measurements; the "multi-slot prefill
+kernel" and "GPU MoE bucketize" items there are the ones measured out above.
+
+---
+
 ## The invariants (the destination)
 
 1. **No `to_dtype` in the loop — kernels emit the final type.** Every dtype conversion on
