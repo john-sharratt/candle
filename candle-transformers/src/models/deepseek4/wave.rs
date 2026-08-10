@@ -1159,7 +1159,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
             pipeline_record("prefill:pool", t_ppool);
 
             // ── Prefill pass 2: per seq — append pooled entries, select, gather,
-            // attend, write back, project out ──
+            // attend, write back; the F32 attention outputs are collected and
+            // out-projected in ONE batched GEMM after the loop (invariant 5). ──
+            let mut prefill_os: Vec<Tensor> = Vec::with_capacity(prefill_seqs.len());
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
@@ -1329,17 +1331,24 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 )?;
                 session.backings()[l].set_len(seq, base_resident + s_len);
                 pipeline_record("prefill:writeback", t_pwb);
-                let t_poutp = profile_now();
-                // Kernel output is F32, token-major [s_len, h, hd] → [1, s_len, h,
-                // hd], exactly the [b, s, h, hd] `output_proj` wants — no cast, no
-                // transpose (the kernel emits F32; it used to transpose to
-                // [1,h,s,hd] just for output_proj to transpose back).
-                let o = out.reshape((1, s_len, a.n_heads(), a.head_dim()))?;
-                attn_rows.push(a.output_proj(&o, 1, s_len)?);
-                pipeline_record("prefill:outproj", t_poutp);
+                // Collect this seq's F32 token-major attention output
+                // [1, s_len, h, hd] (exactly [b,s,h,hd] — no cast, no transpose);
+                // the out-proj is deferred to one batched GEMM after the loop.
+                prefill_os.push(out.reshape((1, s_len, a.n_heads(), a.head_dim()))?);
                 if l + 1 == n_layers {
                     entry.absorbed = base + s_len;
                 }
+            }
+            // Batched prefill out-proj: ONE grouped GEMM over the whole prompt span
+            // (all seqs' rows concatenated on the token axis) instead of a per-seq
+            // launch. Emitted as a single [1, prefill_total, dim] attn_rows entry,
+            // preserving the [decode | prefill | glue] order. Bit-identical to the
+            // per-seq out-proj (each row is independent).
+            if !prefill_os.is_empty() {
+                let t_poutp = profile_now();
+                let o_all = Tensor::cat(&prefill_os, 1)?; // [1, prefill_total, h, hd]
+                attn_rows.push(a.output_proj(&o_all, 1, prefill_total)?);
+                pipeline_record("prefill:outproj", t_poutp);
             }
             if !prefill_seqs.is_empty() {
                 pipeline_record("deepseek:prefill_attn", t_prefill);

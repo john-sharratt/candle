@@ -251,7 +251,10 @@ fn load_compressor(
     // matmul weight) and stays dense.
     let wkv = qlinear_int8(m, &format!("{prefix}_kv.weight"), device, mode)?;
     let wgate = qlinear_int8(m, &format!("{prefix}_gate.weight"), device, mode)?;
-    let ape = dequant_native(m, &format!("{prefix}_ape.weight"), device)?;
+    // ape/norm stored F32 so the compressor's per-call `to_dtype(F32)` on these
+    // constants is a proven no-op (no in-loop copy). Widening ape via the same
+    // native→F32 path the per-call cast used keeps it bit-identical.
+    let ape = dequant_native(m, &format!("{prefix}_ape.weight"), device)?.to_dtype(DType::F32)?;
     let norm = dequant_f32(m, &format!("{prefix}_norm.weight"), device)?;
     Ok(Compressor::new(
         wkv,
