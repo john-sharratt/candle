@@ -578,7 +578,7 @@ template <typename T, int HEAD_DIM, int ROPE_DIM>
 void launch_latent_decode(
     const T* q,
     const uint8_t* headers,
-    T* out,
+    float* out, // final attention output is F32 (fed straight to int8 out-proj)
     const T* kv_new,
     const int8_t* nope_i8,    // two-region cache: nope int8 [G, NOPE_DIM]
     const float* nope_scale,  // per-nope-band scales [G, NOPE_BANDS]
@@ -627,7 +627,7 @@ void launch_latent_decode(
         window_size, max_sel, dbg);
 
     const int num_rows = num_slots * n_q_head;
-    latent_combine_kernel<T, HEAD_DIM, ROPE_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
+    latent_combine_kernel<float, HEAD_DIM, ROPE_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
         out, pa, pm, q_pos, sinks, rope_tab, num_rows, n_q_head, num_splits);
 
     // On-device write-len advance: only the live-buffer decode path relies on

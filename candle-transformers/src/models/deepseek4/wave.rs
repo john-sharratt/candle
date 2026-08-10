@@ -1090,7 +1090,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let t_doutp = profile_now();
                 // Kernel output is token-major [n_dec, h, hd]; `output_proj` takes
                 // [b, s, h, hd] (here b=n_dec, s=1).
-                let o = out.to_dtype(DType::F32)?.reshape((n_dec, 1, h, hd))?;
+                let o = out.reshape((n_dec, 1, h, hd))?; // kernel emits F32
                 let proj = a.output_proj(&o, n_dec, 1)?; // [n_dec, 1, dim]
                                                          // One reshaped view instead of `n_dec` narrow slices — the rows are
                                                          // concatenated along axis 1 below exactly as the prefill/glue rows are,
@@ -1330,13 +1330,11 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 session.backings()[l].set_len(seq, base_resident + s_len);
                 pipeline_record("prefill:writeback", t_pwb);
                 let t_poutp = profile_now();
-                // Kernel output is token-major [s_len, h, hd] → [1, s_len, h, hd],
-                // exactly the [b, s, h, hd] `output_proj` wants — no transpose (it
-                // used to transpose to [1,h,s,hd] just for output_proj to transpose
-                // back).
-                let o = out
-                    .to_dtype(DType::F32)?
-                    .reshape((1, s_len, a.n_heads(), a.head_dim()))?;
+                // Kernel output is F32, token-major [s_len, h, hd] → [1, s_len, h,
+                // hd], exactly the [b, s, h, hd] `output_proj` wants — no cast, no
+                // transpose (the kernel emits F32; it used to transpose to
+                // [1,h,s,hd] just for output_proj to transpose back).
+                let o = out.reshape((1, s_len, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o, 1, s_len)?);
                 pipeline_record("prefill:outproj", t_poutp);
                 if l + 1 == n_layers {
@@ -1383,10 +1381,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     session.backings()[l].k_format().to_tag(),
                     st.ws(),
                 )?;
-                // Token-major [g_len, h, hd] → [1, g_len, h, hd] = [b, s, h, hd].
-                let o = out
-                    .to_dtype(DType::F32)?
-                    .reshape((1, g_len, a.n_heads(), a.head_dim()))?;
+                // F32 token-major [g_len, h, hd] → [1, g_len, h, hd] = [b, s, h, hd].
+                let o = out.reshape((1, g_len, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o, 1, g_len)?);
             }
             if !glue_seqs.is_empty() {

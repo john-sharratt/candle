@@ -371,8 +371,8 @@ pub fn kernel_attn_decode_step(
         None,
     )?;
 
-    // Kernel output is token-major [1, h, hd]; `output_proj` takes [b, s, h, hd].
-    let o = out.to_dtype(DType::F32)?.reshape((1, 1, h, hd))?;
+    // Kernel output is F32, token-major [1, h, hd]; `output_proj` takes [b,s,h,hd].
+    let o = out.reshape((1, 1, h, hd))?;
     a.output_proj(&o, 1, 1)
 }
 

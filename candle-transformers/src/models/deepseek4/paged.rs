@@ -373,8 +373,10 @@ pub fn paged_latent_decode_raw(
     let stream = dev.cuda_stream();
 
     // Pure kernel output (final store, not accumulation — the acc/ml workspace
-    // holds the running softmax): allocate uninit, the kernel writes every element.
-    let out = Tensor::empty((num_slots, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
+    // holds the running softmax): allocate uninit, the kernel writes every
+    // element. F32 — the kernel emits full-precision output (the int8 out-proj
+    // consumes F32, so no bf16→F32 widening cast downstream).
+    let out = Tensor::empty((num_slots, n_q_head, HEAD_DIM), DType::F32, q.device())?;
     let num_splits = decode_num_splits(num_slots, n_q_head, num_splits_override);
     if num_slots * n_q_head * num_splits > WORKSPACE_CAP {
         candle::bail!(
@@ -401,7 +403,7 @@ pub fn paged_latent_decode_raw(
 
     let q_ptr = cuda_ptr!(q, half::bf16);
     let hdr_ptr = headers_ptr;
-    let out_ptr = cuda_ptr!(&out, half::bf16);
+    let out_ptr = cuda_ptr!(&out, f32); // kernel emits F32
     let kv_ptr = cuda_ptr!(kv_new, half::bf16);
     let ni8_p = cuda_ptr!(&cache.nope_i8, u8);
     let nsc_p = cuda_ptr!(&cache.nope_scale, f32);
@@ -562,7 +564,8 @@ pub fn paged_latent_prefill_raw(
     };
     let stream = dev.cuda_stream();
     // Pure kernel output (final store): allocate uninit, the kernel writes all.
-    let out = Tensor::empty((total_q, n_q_head, HEAD_DIM), DType::BF16, q.device())?;
+    // F32 — full-precision output straight into the int8 out-proj (no widening).
+    let out = Tensor::empty((total_q, n_q_head, HEAD_DIM), DType::F32, q.device())?;
     // The prefill's split factor is 1 unless pinned by the override.
     let num_splits = num_splits_override.clamp(1, 32);
     // Queries are mutually independent (per-query position, selection, and
@@ -595,7 +598,7 @@ pub fn paged_latent_prefill_raw(
 
     let q_ptr = cuda_ptr!(q, half::bf16);
     let hdr_ptr = headers_ptr;
-    let out_ptr = cuda_ptr!(&out, half::bf16);
+    let out_ptr = cuda_ptr!(&out, f32); // kernel emits F32
     let pos_ptr = cuda_ptr!(q_pos, u32);
     let (fresh_ptr, fresh_rows, fresh_base) = match kv_fresh {
         Some((t, base)) => (cuda_ptr!(t, half::bf16), t.dim(0)?, base),
@@ -644,7 +647,7 @@ pub fn paged_latent_prefill_raw(
             candle_kernels::paged_latent::run_paged_latent_prefill_bf16(
                 (q_ptr + (base * n_q_head * HEAD_DIM * 2) as u64) as *const core::ffi::c_void,
                 hdr_ptr as *const u8,
-                (out_ptr + (base * n_q_head * HEAD_DIM * 2) as u64) as *mut core::ffi::c_void,
+                (out_ptr + (base * n_q_head * HEAD_DIM * 4) as u64) as *mut core::ffi::c_void, // F32 out: 4 B/elem
                 (pos_ptr + (base * 4) as u64) as *const u32,
                 fresh_ptr as *const core::ffi::c_void,
                 ni8_p as *const u8,
@@ -2775,7 +2778,13 @@ mod tests {
             case.num_splits,
             None,
         )?;
-        out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+        // Kernel now emits F32; round to bf16 (reproducing the old in-kernel
+        // `__float2bfloat16` store, RNE) so the mirror stays bit-exact — the
+        // mirror side is `bf16_round_host`'d in `run_case`.
+        out.to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
     }
 
     fn bf16_round_host(vals: &[f32]) -> Vec<f32> {
@@ -3539,7 +3548,12 @@ mod tests {
             None,
         )?;
         drop(generation);
-        let arena_out = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        // Kernel emits F32; round to bf16 to match the bf16-reproduced `synth`.
+        let arena_out = out
+            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         let mismatches = synth
             .iter()
@@ -4902,7 +4916,11 @@ mod tests {
                 2,
                 None,
             )?;
-            out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+            // Kernel emits F32; round to bf16 to match the bf16 mirror.
+            out.to_dtype(DType::BF16)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()
         };
 
         // Path A: every token authored host-side.

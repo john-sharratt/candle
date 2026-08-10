@@ -15,7 +15,7 @@
 extern "C" void run_paged_latent_prefill_bf16(
     const void* q_ptr,          // [total_q, H, 512] bf16, pre-RoPE
     const uint8_t* headers_ptr, // SlotHeader[1] (arena holds the committed prefix)
-    void* o_ptr,                // [total_q, H, 512] bf16, de-rotated
+    void* o_ptr,                // [total_q, H, 512] F32, de-rotated final output
     const uint32_t* q_pos,      // [total_q]
     const void* kv_fresh,       // [fresh_rows, 512] bf16 pre-RoPE (this layer's latents)
     const uint8_t* nope_i8,     // [G, 448] two-region cache: nope int8
@@ -46,7 +46,7 @@ extern "C" void run_paged_latent_prefill_bf16(
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     latent_attn::launch_latent_prefill<__nv_bfloat16, 512, 64>(
-        (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)o_ptr, q_pos,
+        (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr, q_pos,
         (const __nv_bfloat16*)kv_fresh, (const int8_t*)nope_i8, nope_scale,
         (const __nv_bfloat16*)rope_bf, comp_pos, comp_idx, comp_cnt,
         sinks, rope_tab, partial_acc, partial_ml, (int8_t*)comp_i8, comp_scale,
@@ -152,7 +152,7 @@ extern "C" void run_latent_build_corpus_cache(
 extern "C" void run_paged_latent_decode_bf16(
     const void* q_ptr,          // [slots, H, 512] bf16, pre-RoPE
     const uint8_t* headers_ptr, // SlotHeader[slots]
-    void* o_ptr,                // [slots, H, 512] bf16, de-rotated final output
+    void* o_ptr,                // [slots, H, 512] F32, de-rotated final output
     const void* kv_new,         // [slots, 512] bf16, pre-RoPE latent
     const uint8_t* nope_i8,     // [G_total, 448] two-region cache: nope int8
     const float* nope_scale,    // [G_total, 14] per-nope-band scales
@@ -177,7 +177,7 @@ extern "C" void run_paged_latent_decode_bf16(
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     latent_attn::launch_latent_decode<__nv_bfloat16, 512, 64>(
-        (const __nv_bfloat16*)q_ptr, headers_ptr, (__nv_bfloat16*)o_ptr,
+        (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr,
         (const __nv_bfloat16*)kv_new, (const int8_t*)nope_i8, nope_scale,
         (const __nv_bfloat16*)comp_rope, comp_idx, comp_cnt, comp_pos, q_pos,
         sinks, rope_tab, partial_acc, partial_ml,
