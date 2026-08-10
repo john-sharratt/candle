@@ -15,7 +15,7 @@ use candle::{DType, Result, Tensor};
 use crate::models::profile::{pipeline_record, profile_now};
 
 use super::attention::{rms_norm, Attention};
-use super::compressor::IncrementalCompressor;
+use super::compressor::{GroupPool, IncrementalCompressor};
 use super::config::LayerKind;
 use super::gallery::{CorpusSnapshot, FloatGallery};
 use super::linear::shared_int8_pair;
@@ -371,131 +371,247 @@ pub fn kernel_attn_decode_step(
         None,
     )?;
 
-    let o = out.to_dtype(DType::F32)?.reshape((1, h, 1, hd))?;
+    // Kernel output is token-major [1, h, hd]; `output_proj` takes [b, s, h, hd].
+    let o = out.to_dtype(DType::F32)?.reshape((1, 1, h, hd))?;
     a.output_proj(&o, 1, 1)
 }
 
-/// Whole-prompt batched prefill preparation. Every stateless projection is
-/// hoisted OUT of the token loop into one GEMM over the full prompt `xs`
-/// `[1, s, dim]`: the attention `wq_a`/`wq_b`/`wkv` (+ norms) and BOTH streaming
-/// compressors' `wkv`/`wgate`. The token loop then only does the cheap stateful
-/// work — buffering the pre-projected compressor rows, emitting a group when one
-/// completes (`push_projected*`), and the per-token causal selection — so token
-/// `t` still selects exactly over the entries completed by `t`. The projection
-/// is the only thing moved out of the loop; the pooling/emit/selection semantics
-/// (and their outputs) are unchanged. Returns the batched pre-RoPE bf16 query
-/// `[s, n_heads, HEAD_DIM]`, latent `[s, HEAD_DIM]`, and each token's absolute
-/// selected compressed GIDs.
-#[allow(clippy::type_complexity)]
-pub fn kernel_attn_prefill_prepare_batched(
-    a: &Attention,
-    seq: &mut KernelLayerSeqState,
-    xs: &Tensor,
-    rope: &RotaryCache,
-    base: usize,
-) -> Result<(Tensor, Tensor, Vec<Vec<u32>>)> {
+/// A prefill wave's corpus selection, produced by
+/// [`kernel_attn_prefill_select`].
+pub enum PrefillSel {
+    /// Fully on-device (in-regime CSA, or the empty-corpus case): `comp_idx`
+    /// `[s, kmax]` holds each token's selected **absolute** entry ids ascending
+    /// (`u32::MAX`-padded past `comp_cnt`), `comp_cnt` `[s]` the per-token counts.
+    /// The ids index a gather of the whole visible corpus `0..n_corpus`, so the
+    /// caller gathers that range and uses `comp_idx`/`comp_cnt` directly — no
+    /// host readback, union, or remap.
+    Device {
+        comp_idx: Tensor,
+        comp_cnt: Tensor,
+        n_corpus: usize,
+    },
+    /// Host per-token absolute GIDs (out-of-regime CSA recall, HCA attend-all,
+    /// SWA none) — the caller unions, gathers, and remaps them on the host.
+    Host(Vec<Vec<u32>>),
+}
+
+/// The WHOLE prefill span's stateless projections, computed ONCE over every
+/// prompt sequence's rows ([`kernel_attn_prefill_project_batched`]). Every
+/// projection is row-independent, so this is bit-identical to projecting each
+/// sequence separately — the same batching decode's `dprep` already does — but
+/// one GEMM/quantize instead of one per sequence. [`kernel_attn_prefill_assemble`]
+/// slices each sequence's rows back out.
+pub struct PrefillProj {
+    /// Pre-RoPE bf16 query `[total, n_heads, HEAD_DIM]`.
+    pub q_bf: Tensor,
+    /// Pre-RoPE bf16 latent `[total, HEAD_DIM]` (also the arena writeback source).
+    pub kv_bf: Tensor,
+    /// q-normed low-rank query `[1, total, q_lora_rank]` — the indexer query source.
+    pub qr_all: Tensor,
+    /// F32 hidden `[1, total, dim]` (a view of `x`) — the indexer `query_space` source.
+    pub xs: Tensor,
+    /// Attention compressor rows `(kv, score)` `[total, cd]` (`None` on SWA layers).
+    pub comp_proj: Option<(Tensor, Tensor)>,
+    /// Indexer compressor rows `(kv, score)` `[total, cd]` (`None` when no indexer).
+    pub icomp_proj: Option<(Tensor, Tensor)>,
+}
+
+/// The projected + assembled state for ONE prefill sequence
+/// ([`kernel_attn_prefill_assemble`]), consumed by the wave's batched pool +
+/// [`kernel_attn_prefill_select`]. `q_bf`/`kv_bf`/`qr_all`/`xs` are slices (views)
+/// of the batched [`PrefillProj`].
+pub struct PrefillPrep {
+    /// Pre-RoPE bf16 query slice `[s, n_heads, HEAD_DIM]`.
+    pub q_bf: Tensor,
+    /// Pre-RoPE bf16 latent slice `[s, HEAD_DIM]` (also the arena writeback source).
+    pub kv_bf: Tensor,
+    /// q-normed low-rank query slice `[1, s, q_lora_rank]` — the indexer query source.
+    pub qr_all: Tensor,
+    /// F32 hidden slice `[1, s, dim]` — the indexer `query_space` source (out-of-regime).
+    pub xs: Tensor,
+    /// Attention compressor's completed group pool (deferred; `None` if no group
+    /// completed or the layer has no compressor).
+    pub comp_gp: Option<GroupPool>,
+    /// Indexer compressor's completed group pool (shares boundaries with `comp_gp`).
+    pub icomp_gp: Option<GroupPool>,
+    /// Per-token causally-visible entry counts, for the select.
+    pub n_visible: Vec<usize>,
+    /// Corpus entries present BEFORE this prefill (the select's absolute index base).
+    pub base_entries: usize,
+    /// Groups this prefill completes (`== comp_gp.positions.len()`, 0 if none).
+    pub g_total: usize,
+}
+
+/// Batched prefill projections over the WHOLE prompt span `xs` `[1, total, dim]`
+/// (all sequences' rows concatenated) — one `shared_int8_pair`/`wq_b`/norms for
+/// the attention query+latent and one `project_rows` for each streaming
+/// compressor, instead of one set per sequence. Uses the layer's shared compressor
+/// weights (`a.compressor()`/`a.indexer().compressor()`); the per-sequence
+/// streaming STATE lives in [`kernel_attn_prefill_assemble`]. Row-independent ⇒
+/// bit-identical to the former per-seq projection.
+pub fn kernel_attn_prefill_project_batched(a: &Attention, xs: &Tensor) -> Result<PrefillProj> {
     let (h, hd) = (a.n_heads(), a.head_dim());
     let s = xs.dim(1)?;
-    let xs = xs.to_dtype(DType::F32)?;
+    let xs = xs.to_dtype(DType::F32)?; // no-op: hc.pre already yields F32 (a view of x)
 
-    // ── Batched attention projections: ONE GEMM each over all s tokens ──
-    // (`pprep:proj` — the stateless GEMMs, the prefill counterpart of decode's
-    // `dprep:proj`.)
-    let t_proj = profile_now();
     // wq_a and wkv both project `xs`; quantize the activation once and share it.
     let (qa_raw, kv_raw) = shared_int8_pair(&xs, a.wq_a(), a.wkv())?;
-    let qr_all = rms_norm(&qa_raw, a.q_norm(), a.eps())?; // [1,s,qa]
+    let qr_all = rms_norm(&qa_raw, a.q_norm(), a.eps())?; // [1,total,qa]
     let q_all = a.wq_b().forward(&qr_all)?.reshape((1, s, h, hd))?;
     let q_all = a.rms_scale(&q_all)?;
-    let q_bf_all = q_all.reshape((s, h, hd))?.to_dtype(DType::BF16)?; // [s,h,hd]
-    let kv_all = rms_norm(&kv_raw, a.kv_norm(), a.eps())?; // [1,s,hd]
-    let kv_bf_all = kv_all.reshape((s, hd))?.to_dtype(DType::BF16)?; // [s,hd]
+    let q_bf = q_all.reshape((s, h, hd))?.to_dtype(DType::BF16)?; // [total,h,hd]
+    let kv_all = rms_norm(&kv_raw, a.kv_norm(), a.eps())?; // [1,total,hd]
+    let kv_bf = kv_all.reshape((s, hd))?.to_dtype(DType::BF16)?; // [total,hd]
 
-    // ── Batched compressor projections (attention-comp + indexer-comp) ──
-    let comp_proj = match seq.comp.as_ref() {
-        Some(c) => Some(c.project_rows(&xs)?), // (kv [s,cd], score [s,cd])
+    let comp_proj = match a.compressor() {
+        Some(c) => Some(c.project_rows(&xs)?), // (kv [total,cd], score [total,cd])
         None => None,
     };
-    let icomp_proj = match seq.icomp.as_ref() {
-        Some(ic) => Some(ic.project_rows(&xs)?),
+    let icomp_proj = match a.indexer() {
+        Some(ix) => Some(ix.compressor().project_rows(&xs)?),
         None => None,
     };
-    pipeline_record("pprep:proj", t_proj);
 
-    // ── pprep:push — build the WHOLE prompt's compressed corpus in ONE batched
-    // emit + ONE append, the carried-state-aware batch form of the per-token
-    // push loop (bit-identical by `emit_groups_batched_matches_streamed`),
-    // instead of `s` per-token pool/append launches. The per-token select below
-    // reads a causal PREFIX of it. `comp`/`icomp` share group boundaries, so one
-    // emit drives the attn entries (pre-RoPE) and the indexer keys (roped). ──
-    let t_push = profile_now();
+    Ok(PrefillProj {
+        q_bf,
+        kv_bf,
+        qr_all,
+        xs,
+        comp_proj,
+        icomp_proj,
+    })
+}
+
+/// Slice ONE sequence's rows `[off, off+s)` out of the batched [`PrefillProj`] and
+/// run its stateful compressor ASSEMBLE (state advance + deferred group pool),
+/// WITHOUT pooling — the wave pools every sequence together in one launch
+/// ([`Compressor::pool_and_norm`]) before appending + selecting per sequence.
+/// `comp`/`icomp` share group boundaries, so both assemble in lockstep; the state
+/// advances every call (partial rows buffered) even when no group completes.
+/// Bit-identical corpus to the streamed per-token push
+/// (`emit_groups_batched_matches_streamed`).
+pub fn kernel_attn_prefill_assemble(
+    seq: &mut KernelLayerSeqState,
+    proj: &PrefillProj,
+    off: usize,
+    s: usize,
+) -> Result<PrefillPrep> {
+    // This sequence's rows (views of the batched projections).
+    let q_bf = proj.q_bf.narrow(0, off, s)?;
+    let kv_bf = proj.kv_bf.narrow(0, off, s)?;
+    let qr_all = proj.qr_all.narrow(1, off, s)?;
+    let xs = proj.xs.narrow(1, off, s)?;
+    let comp_slice = match &proj.comp_proj {
+        Some((k, sc)) => Some((k.narrow(0, off, s)?, sc.narrow(0, off, s)?)),
+        None => None,
+    };
+    let icomp_slice = match &proj.icomp_proj {
+        Some((k, sc)) => Some((k.narrow(0, off, s)?, sc.narrow(0, off, s)?)),
+        None => None,
+    };
+
+    let t_asm = profile_now();
     let ratio_comp = seq.comp.as_ref().map_or(1, |c| c.ratio());
     let l0 = seq.comp.as_ref().map_or(0, |c| c.buffered_len()); // carried partial group
     let base_entries = seq.gallery.as_ref().map_or(0, |g| g.len()); // corpus before this prefill
-    let mut g_total = 0usize;
-    if let (Some(comp), Some(gallery), Some((ck, cs))) =
-        (seq.comp.as_mut(), seq.gallery.as_mut(), comp_proj.as_ref())
-    {
-        if let Some((attn_entries, positions)) = comp.emit_groups_projected(ck, cs, None)? {
-            g_total = positions.len();
-            let key_entries = match (seq.icomp.as_mut(), icomp_proj.as_ref()) {
-                (Some(ic), Some((ik, is))) => {
-                    let (keys, kpos) = ic
-                        .emit_groups_projected(ik, is, Some(rope))?
-                        .expect("indexer compressor shares group boundaries");
-                    debug_assert_eq!(kpos, positions, "comp/icomp group boundaries diverged");
-                    keys // [g_total, index_head_dim]
-                }
-                _ => Tensor::zeros((g_total, 1), DType::F32, xs.device())?,
-            };
-            gallery.append_batch(&attn_entries, &key_entries, &positions)?;
-        } else if let (Some(ic), Some((ik, is))) = (seq.icomp.as_mut(), icomp_proj.as_ref()) {
-            let none = ic.emit_groups_projected(ik, is, Some(rope))?;
-            debug_assert!(none.is_none(), "compressor group boundaries diverged");
-        }
-    }
-    pipeline_record("pprep:push", t_push);
+    let comp_gp = match (seq.comp.as_mut(), comp_slice.as_ref()) {
+        (Some(comp), Some((ck, cs))) => comp.assemble_groups(ck, cs)?,
+        _ => None,
+    };
+    let icomp_gp = match (seq.icomp.as_mut(), icomp_slice.as_ref()) {
+        (Some(ic), Some((ik, is))) => ic.assemble_groups(ik, is)?,
+        _ => None,
+    };
+    debug_assert_eq!(
+        comp_gp.as_ref().map(|g| g.positions.clone()),
+        icomp_gp.as_ref().map(|g| g.positions.clone()),
+        "comp/icomp group boundaries diverged"
+    );
+    let g_total = comp_gp.as_ref().map_or(0, |g| g.positions.len());
+    pipeline_record("pprep:assemble", t_asm);
 
-    // ── pprep:select — causal select over the up-front corpus. Each token sees
-    // the entries present before this prefill plus the groups completed through
-    // it (`(l0 + t + 1) / ratio`); bounding the select to that prefix reproduces
-    // the per-token incremental gallery exactly. ──
-    let t_sel = profile_now();
+    // Each token sees the entries present before this prefill plus the groups
+    // completed through it (`(l0 + t + 1) / ratio`); bounding the select to that
+    // prefix reproduces the per-token incremental gallery exactly.
     let n_visible: Vec<usize> = (0..s)
         .map(|t| base_entries + ((l0 + t + 1) / ratio_comp).min(g_total))
         .collect();
-    let idx_rows: Vec<Vec<u32>> = match a.kind() {
+
+    Ok(PrefillPrep {
+        q_bf,
+        kv_bf,
+        qr_all,
+        xs,
+        comp_gp,
+        icomp_gp,
+        n_visible,
+        base_entries,
+        g_total,
+    })
+}
+
+/// Whole-prompt corpus SELECT for one prefill sequence, run AFTER its pooled
+/// entries are appended to `gallery`. Returns the [`PrefillSel`] (fully on-device
+/// for the in-regime CSA path; host per-token GIDs otherwise). Split out of the
+/// prep so the compressor pool + gallery append can batch across all prompt
+/// sequences in between (the pool is the prefill hot spot).
+pub fn kernel_attn_prefill_select(
+    a: &Attention,
+    gallery: Option<&FloatGallery>,
+    prep: &PrefillPrep,
+    rope: &RotaryCache,
+    base: usize,
+) -> Result<PrefillSel> {
+    let t_sel = profile_now();
+    let s = prep.xs.dim(1)?;
+    let n_visible = &prep.n_visible;
+    let (base_entries, g_total) = (prep.base_entries, prep.g_total);
+    let sel: PrefillSel = match a.kind() {
         LayerKind::Csa => {
             let ix = a.indexer().expect("CSA layer has an indexer");
             let m = shortlist_m(ix.top_k());
             let max_nv = base_entries + g_total; // widest window (the last token)
             if max_nv == 0 {
-                vec![Vec::new(); s]
+                PrefillSel::Host(vec![Vec::new(); s])
             } else if max_nv <= m.min(1024) {
                 // In-regime: the shortlist covers every token's window, so
                 // two-stage recall degenerates to the exact full Indexer top-k —
-                // do the whole prompt in one batched query GEMM + one rescore +
-                // one argsort (bit-identical to the per-token loop by
-                // `batched_causal_select_matches_per_token`). Kills the per-token
-                // select launches that dominated `pprep:select`.
-                let (q_raw, weights) =
-                    ix.query_gemm_batched(&xs.reshape((s, ()))?, &qr_all.reshape((s, ()))?)?;
+                // one batched query GEMM + one rescore + one argsort, kept FULLY
+                // ON-DEVICE (bit-identical selection to the per-token loop by
+                // `batched_causal_select_matches_per_token`).
+                let t_q = profile_now();
+                let (q_raw, weights) = ix.query_gemm_batched(
+                    &prep.xs.reshape((s, ()))?,
+                    &prep.qr_all.reshape((s, ()))?,
+                )?;
                 let q_idx = ix.rope_query_batched(&q_raw, rope, base)?; // [s,h,ih]
-                let gallery = seq.gallery.as_ref().unwrap();
-                gallery.batched_causal_select(&q_idx, &weights, &n_visible, ix.top_k())?
+                pipeline_record("psel:query", t_q);
+                let gallery = gallery.expect("CSA layer has a gallery");
+                let t_bcs = profile_now();
+                let (comp_idx, comp_cnt, n_corpus) = gallery.batched_causal_select_device(
+                    &q_idx,
+                    &weights,
+                    n_visible,
+                    ix.top_k(),
+                )?;
+                pipeline_record("psel:bcs", t_bcs);
+                PrefillSel::Device {
+                    comp_idx,
+                    comp_cnt,
+                    n_corpus,
+                }
             } else {
-                // Out-of-regime (corpus wider than the shortlist): the exact
-                // batched top-k would diverge from the per-token recall
-                // approximation the decode path uses, so keep the per-token
-                // recall select to preserve prefill≡decode parity on deep prompts.
-                let gallery = seq.gallery.as_ref().unwrap();
+                // Out-of-regime (corpus wider than the shortlist): keep the
+                // per-token recall select to preserve prefill≡decode parity on
+                // deep prompts.
+                let gallery = gallery.expect("CSA layer has a gallery");
                 let mut rows = Vec::with_capacity(s);
                 for (t, &n_vis) in n_visible.iter().enumerate() {
                     let gids = if n_vis == 0 {
                         Vec::new()
                     } else {
-                        let x_t = xs.narrow(1, t, 1)?;
-                        let qr_t = qr_all.narrow(1, t, 1)?;
+                        let x_t = prep.xs.narrow(1, t, 1)?;
+                        let qr_t = prep.qr_all.narrow(1, t, 1)?;
                         let (qi, w) = ix.query_space(&x_t, &qr_t, rope, base + t)?;
                         let (g, k) =
                             gallery.two_stage_select_causal(&qi, &w, m, ix.top_k(), n_vis)?;
@@ -507,14 +623,16 @@ pub fn kernel_attn_prefill_prepare_batched(
                     };
                     rows.push(gids);
                 }
-                rows
+                PrefillSel::Host(rows)
             }
         }
-        LayerKind::Hca => n_visible.iter().map(|&n| (0..n as u32).collect()).collect(),
-        LayerKind::SlidingWindow => vec![Vec::new(); s],
+        LayerKind::Hca => {
+            PrefillSel::Host(n_visible.iter().map(|&n| (0..n as u32).collect()).collect())
+        }
+        LayerKind::SlidingWindow => PrefillSel::Host(vec![Vec::new(); s]),
     };
     pipeline_record("pprep:select", t_sel);
-    Ok((q_bf_all, kv_bf_all, idx_rows))
+    Ok(sel)
 }
 
 /// What a decode session's corpus selection will be, captured BEFORE the select

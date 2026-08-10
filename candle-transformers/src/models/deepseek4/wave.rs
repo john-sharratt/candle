@@ -18,17 +18,61 @@ use candle::{DType, Device, Result, Tensor};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
 };
+use candle_nn::kv_cache::CHUNK_SIZE;
 
 use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
 use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
 use super::kernel_attention::{
     kernel_attn_decode_capture, shortlist_m, DecodeSel, KernelLayerSeqState, KernelLayerStatic,
+    PrefillSel,
 };
 use super::linear::shared_int8_pair;
 use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
 use crate::models::expert_lre::PipelineStats;
 use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
+
+use super::compressor::{Compressor, GroupPool};
+use super::rope::RotaryCache;
+
+/// Pool EVERY prefill sequence's deferred compressor groups in ONE launch across
+/// the whole prompt fleet — the cross-sequence emit batch that replaces the
+/// per-sequence pool (the prefill hot spot). Concatenates the `Some`
+/// [`GroupPool`]s on the group axis, runs one [`Compressor::pool_and_norm`], and
+/// splits the pooled `[ΣG, d]` result back per sequence (`None` for a sequence
+/// that completed no group). Bit-identical per group to pooling each sequence
+/// separately (`pool_batched_across_seqs_matches_per_seq`). `rope` is `Some` for
+/// the roped indexer keys, `None` for the pre-RoPE attention entries.
+fn pool_prefill_across_seqs(
+    c: &Compressor,
+    gps: &[Option<&GroupPool>],
+    rope: Option<&RotaryCache>,
+) -> Result<Vec<Option<Tensor>>> {
+    let mut out: Vec<Option<Tensor>> = (0..gps.len()).map(|_| None).collect();
+    let some: Vec<(usize, &GroupPool)> = gps
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, g)| g.map(|g| (i, g)))
+        .collect();
+    if some.is_empty() {
+        return Ok(out);
+    }
+    let pool_kv = Tensor::cat(&some.iter().map(|(_, g)| &g.pool_kv).collect::<Vec<_>>(), 0)?;
+    let pool_score = Tensor::cat(
+        &some.iter().map(|(_, g)| &g.pool_score).collect::<Vec<_>>(),
+        0,
+    )?;
+    let positions: Vec<u32> = some.iter().flat_map(|(_, g)| g.positions.clone()).collect();
+    let pooled = c.pool_and_norm(&pool_kv, &pool_score, &positions, rope)?; // [ΣG, d]
+    let mut off = 0usize;
+    for (i, g) in &some {
+        let n = g.positions.len();
+        out[*i] = Some(pooled.narrow(0, off, n)?.contiguous()?);
+        off += n;
+    }
+    Ok(out)
+}
 
 /// One layer's resident sliding-window ring, captured for turn-seal
 /// persistence (Artifact A of docs/deepseek_turn_seal_persistence.md).
@@ -658,11 +702,17 @@ impl ManagedBatchedModel for DeepSeekBatched {
         }
         for (pi, &s) in prefill_seqs.iter().enumerate() {
             let resident = prefill_resident[pi];
-            // Ensure the FULL prompt range so the post-launch arena write-back
-            // has its chunks; the header stays at the committed prefix (resident).
-            let ensure_to = resident + prefill_lens[pi].saturating_sub(1);
+            // Allocate the WHOLE prompt's write chunks up front — this extends the
+            // block table over `[resident, resident+s_len)` WITHOUT moving the
+            // writer/committed prefix (`set_len` stays `resident`), so the header
+            // snapshot built below covers every write chunk. The post-launch arena
+            // writeback (`paged_latent_glue_scatter`) addresses those chunks
+            // through that immutable snapshot, so they MUST be present before it is
+            // taken (a chunk allocated after the snapshot is invisible to the
+            // scatter → OOB). The header the attention reads is unchanged: extra
+            // trailing chunks past `resident` are never read (window/pos-bounded).
             for backing in session.backings() {
-                backing.ensure_for_batch_entries(&[(s, ensure_to)], 1)?;
+                backing.ensure_for_offset(s, resident, prefill_lens[pi])?;
                 backing.set_len(s, resident);
             }
             overrides.push((s, resident));
@@ -1032,7 +1082,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // (the group GEMMs are row-independent) and collapses `8·n_dec`
                 // group-GEMM launches to 8.
                 let t_doutp = profile_now();
-                let o = out.to_dtype(DType::F32)?.reshape((n_dec, h, 1, hd))?;
+                // Kernel output is token-major [n_dec, h, hd]; `output_proj` takes
+                // [b, s, h, hd] (here b=n_dec, s=1).
+                let o = out.to_dtype(DType::F32)?.reshape((n_dec, 1, h, hd))?;
                 let proj = a.output_proj(&o, n_dec, 1)?; // [n_dec, 1, dim]
                                                          // One reshaped view instead of `n_dec` narrow slices — the rows are
                                                          // concatenated along axis 1 below exactly as the prefill/glue rows are,
@@ -1046,93 +1098,184 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // decode absorption, validated by `wave_prefill_state_matches_decode_steps`),
             // which replaced the per-token launch loop that dominated the profile.
             let t_prefill = profile_now();
+            // ── Prefill projections: ONE batched projection over the WHOLE prompt
+            // span (all sequences' rows), exactly as decode's `dprep` batches over
+            // all decode rows — one `shared_int8_pair`/`wq_b`/`project_rows` instead
+            // of one set per sequence. Row-independent ⇒ bit-identical.
+            let t_pprep = profile_now();
+            let prefill_total: usize = prefill_lens.iter().sum();
+            let proj = if prefill_total == 0 {
+                None
+            } else {
+                let xs_all = x.narrow(1, decode_seqs.len(), prefill_total)?;
+                Some(super::kernel_attention::kernel_attn_prefill_project_batched(a, &xs_all)?)
+            };
+            // ── Prefill pass 1: per seq, slice the batched projections + run the
+            // stateful compressor ASSEMBLE (state advance + deferred pool inputs).
+            let mut preps: Vec<super::kernel_attention::PrefillPrep> =
+                Vec::with_capacity(prefill_seqs.len());
+            {
+                let proj = proj.as_ref();
+                let mut off = 0usize;
+                for (pi, &seq) in prefill_seqs.iter().enumerate() {
+                    let s_len = prefill_lens[pi];
+                    let e = state.get_mut(&seq).expect("ensured above");
+                    preps.push(super::kernel_attention::kernel_attn_prefill_assemble(
+                        &mut e.layers[l],
+                        proj.expect("prefill rows imply a projection"),
+                        off,
+                        s_len,
+                    )?);
+                    off += s_len;
+                }
+            }
+            pipeline_record("prefill:prep", t_pprep);
+
+            // ── Prefill pool: pool every sequence's completed compressor groups
+            // in ONE launch across the whole prompt fleet (`Compressor::pool_and_norm`)
+            // instead of a per-seq pool — the prefill hot spot. `comp` = attention
+            // entries (pre-RoPE), `icomp` = indexer keys (roped); both share group
+            // boundaries. Bit-identical per group to the per-seq pool
+            // (`pool_batched_across_seqs_matches_per_seq`).
+            let t_ppool = profile_now();
+            let comp_refs: Vec<Option<&super::compressor::GroupPool>> =
+                preps.iter().map(|p| p.comp_gp.as_ref()).collect();
+            let icomp_refs: Vec<Option<&super::compressor::GroupPool>> =
+                preps.iter().map(|p| p.icomp_gp.as_ref()).collect();
+            let comp_entries = match a.compressor() {
+                Some(c) => pool_prefill_across_seqs(c, &comp_refs, None)?,
+                None => vec![None; preps.len()],
+            };
+            let icomp_keys = match a.indexer() {
+                Some(ix) => pool_prefill_across_seqs(ix.compressor(), &icomp_refs, Some(rope))?,
+                None => vec![None; preps.len()],
+            };
+            pipeline_record("prefill:pool", t_ppool);
+
+            // ── Prefill pass 2: per seq — append pooled entries, select, gather,
+            // attend, write back, project out ──
             let mut row_cursor = decode_seqs.len();
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
+                let prep = &preps[pi];
                 let entry = state.get_mut(&seq).expect("ensured above");
-                // One launch over the whole prompt. Per token: host projections +
-                // causal corpus-select (identical to the decode step's selection),
-                // then a single `paged_latent_prefill` reads the committed prefix
-                // `[0,base)` from the arena and the prompt `[base,base+s)` from the
-                // fresh bf16 latents (`kv_fresh`) — matching the per-token diagonal.
-                // Whole-prompt batched prep: all stateless projections in a few
-                // GEMMs (was the per-token GEMV loop that dominated prefill).
-                let t_pprep = profile_now();
-                let xs = x.narrow(1, row_cursor, s_len)?;
-                let (q_all, kv_all, idx_rows) =
-                    super::kernel_attention::kernel_attn_prefill_prepare_batched(
-                        a,
-                        &mut entry.layers[l],
-                        &xs,
-                        rope,
-                        base,
-                    )?;
-                pipeline_record("prefill:prep", t_pprep);
+                // Append this seq's pooled entries + keys to its gallery (if a
+                // group completed) — the former in-prep append, now that the pool
+                // ran batched. HCA (no indexer) stores a 1-wide placeholder key.
+                let t_pappend = profile_now();
+                if let Some(gp) = prep.comp_gp.as_ref() {
+                    let entry_t = comp_entries[pi]
+                        .as_ref()
+                        .expect("a completed comp group was pooled");
+                    let key_t = match icomp_keys[pi].as_ref() {
+                        Some(k) => k.clone(),
+                        None => Tensor::zeros((prep.g_total, 1), DType::F32, entry_t.device())?,
+                    };
+                    entry.layers[l]
+                        .gallery
+                        .as_mut()
+                        .expect("a completed comp group implies a gallery")
+                        .append_batch(entry_t, &key_t, &gp.positions)?;
+                }
+                pipeline_record("ppush:append", t_pappend);
+                // Select over the POST-append gallery.
+                let sel = super::kernel_attention::kernel_attn_prefill_select(
+                    a,
+                    entry.layers[l].gallery.as_ref(),
+                    prep,
+                    rope,
+                    base,
+                )?;
+                let q_all = &prep.q_bf;
+                let kv_all = &prep.kv_bf;
                 let dev = q_all.device();
                 let t_pgather = profile_now();
-                // Gather ONLY the union of selected entries onto the GPU (tier-
-                // aware — works when the gallery has spilled to CPU RAM past
-                // HOT_ENTRY_CAP), then remap each query's absolute GIDs to their
-                // dense index in that compacted set. `comp_idx` indexes the small
-                // union, so the launch never needs the whole (possibly-spilled)
-                // corpus resident.
-                let mut union: Vec<u32> = idx_rows.iter().flatten().copied().collect();
-                union.sort_unstable();
-                union.dedup();
-                // `pgather:corpus` — GPU gather of the selected-entry union into a
-                // contiguous corpus cache (decode's `decode:gather`/`decode:cache`).
-                let t_pg_corpus = profile_now();
-                let cache = match entry.layers[l].gallery.as_ref() {
-                    Some(g) if !union.is_empty() => {
-                        let ids = Tensor::from_vec(union.clone(), union.len(), dev)?;
-                        let (ni8, nsc, rbf, cpos) = g.gather_corpus(&ids)?;
-                        super::paged::CorpusCache::from_gathered(ni8, nsc, rbf, cpos, union.len())?
+                // Assemble the corpus cache + per-token (`comp_idx`, `comp_cnt`).
+                // In-regime CSA selects fully on-device: gather the WHOLE visible
+                // corpus `0..n_corpus` and use its absolute-id selection directly —
+                // no host readback / union / remap. Out-of-regime/HCA/SWA still hand
+                // back per-token host GIDs, unioned + remapped as before.
+                let (cache, comp_idx, comp_cnt) = match sel {
+                    PrefillSel::Device {
+                        comp_idx,
+                        comp_cnt,
+                        n_corpus,
+                    } => {
+                        let cache = match entry.layers[l].gallery.as_ref() {
+                            Some(g) if n_corpus > 0 => {
+                                let ids = Tensor::arange(0u32, n_corpus as u32, dev)?;
+                                let (ni8, nsc, rbf, cpos) = g.gather_corpus(&ids)?;
+                                super::paged::CorpusCache::from_gathered(
+                                    ni8, nsc, rbf, cpos, n_corpus,
+                                )?
+                            }
+                            _ => st.empty_corpus_cache()?,
+                        };
+                        (cache, comp_idx, comp_cnt)
                     }
-                    _ => st.empty_corpus_cache()?,
+                    PrefillSel::Host(idx_rows) => {
+                        // Gather ONLY the union of selected entries (tier-aware —
+                        // works when the gallery has spilled past HOT_ENTRY_CAP),
+                        // then remap each query's absolute GIDs to their dense index
+                        // in that compacted set.
+                        let mut union: Vec<u32> = idx_rows.iter().flatten().copied().collect();
+                        union.sort_unstable();
+                        union.dedup();
+                        let cache = match entry.layers[l].gallery.as_ref() {
+                            Some(g) if !union.is_empty() => {
+                                let ids = Tensor::from_vec(union.clone(), union.len(), dev)?;
+                                let (ni8, nsc, rbf, cpos) = g.gather_corpus(&ids)?;
+                                super::paged::CorpusCache::from_gathered(
+                                    ni8,
+                                    nsc,
+                                    rbf,
+                                    cpos,
+                                    union.len(),
+                                )?
+                            }
+                            _ => st.empty_corpus_cache()?,
+                        };
+                        let remap: HashMap<u32, u32> = union
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &g)| (g, i as u32))
+                            .collect();
+                        let max_sel = idx_rows.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
+                        let mut idx_flat = vec![u32::MAX; s_len * max_sel];
+                        let mut cnt_v = vec![0u32; s_len];
+                        for (t, gids) in idx_rows.iter().enumerate() {
+                            // Contract: each row's compressed indices are strictly
+                            // ascending (the gallery returns ascending GIDs and the
+                            // union is sorted, so the remap is monotonic). Attention
+                            // is order-independent, but callers must uphold this.
+                            let mut prev: i64 = -1;
+                            for (j, &g) in gids.iter().enumerate() {
+                                let mapped = remap[&g];
+                                debug_assert!(
+                                    (mapped as i64) > prev,
+                                    "comp_idx row {t} not strictly ascending: {mapped} after {prev}"
+                                );
+                                prev = mapped as i64;
+                                idx_flat[t * max_sel + j] = mapped;
+                            }
+                            cnt_v[t] = gids.len() as u32;
+                        }
+                        (
+                            cache,
+                            Tensor::from_vec(idx_flat, (s_len, max_sel), dev)?,
+                            Tensor::from_vec(cnt_v, s_len, dev)?,
+                        )
+                    }
                 };
-                pipeline_record("pgather:corpus", t_pg_corpus);
-                // `pgather:remap` — HOST per-token remap of each query's absolute
-                // GIDs to their dense index in the compacted union, and the
-                // `comp_idx`/`comp_cnt`/`q_pos` uploads. O(s·max_sel) host work with
-                // no decode analogue (decode selects one row).
-                let t_pg_remap = profile_now();
-                let remap: HashMap<u32, u32> = union
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &g)| (g, i as u32))
-                    .collect();
-                let max_sel = idx_rows.iter().map(|v| v.len()).max().unwrap_or(0).max(1);
-                let mut idx_flat = vec![u32::MAX; s_len * max_sel];
-                let mut cnt_v = vec![0u32; s_len];
-                for (t, gids) in idx_rows.iter().enumerate() {
-                    // Contract: each row's compressed indices are strictly
-                    // ascending (the gallery returns ascending GIDs and the union
-                    // is sorted, so the remap is monotonic). The attention is
-                    // order-independent, but callers must uphold this.
-                    let mut prev: i64 = -1;
-                    for (j, &g) in gids.iter().enumerate() {
-                        let mapped = remap[&g];
-                        debug_assert!(
-                            (mapped as i64) > prev,
-                            "comp_idx row {t} not strictly ascending: {mapped} after {prev}"
-                        );
-                        prev = mapped as i64;
-                        idx_flat[t * max_sel + j] = mapped;
-                    }
-                    cnt_v[t] = gids.len() as u32;
-                }
-                let comp_idx = Tensor::from_vec(idx_flat, (s_len, max_sel), dev)?;
-                let comp_cnt = Tensor::from_vec(cnt_v, s_len, dev)?;
                 let q_pos = &prefill_q_pos[pi]; // wave-invariant, hoisted above the layer loop
-                pipeline_record("pgather:remap", t_pg_remap);
                 pipeline_record("prefill:gather", t_pgather);
                 let t_pkern = profile_now();
                 let out = super::paged::paged_latent_prefill_raw(
-                    &q_all,
+                    q_all,
                     hdr_of(l, decode_seqs.len() + pi),
                     q_pos,
-                    Some((&kv_all, base)),
+                    Some((kv_all, base)),
                     &cache,
                     &comp_idx,
                     &comp_cnt,
@@ -1152,16 +1295,43 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // the chunk it fills serialises its ABSOLUTE rope via `base_pos`.
                 let t_pwb = profile_now();
                 let base_resident = base - prefill_base_ev[pi] as usize;
-                let kv_4d = kv_all.reshape((1, 1, s_len, a.head_dim()))?;
-                session.backings()[l].write_contiguous(seq, base_resident, &kv_4d, &kv_4d)?;
+                // The write chunks were allocated up front (before the header
+                // snapshot) so the scatter can address them through that snapshot;
+                // no per-layer ensure here (it would allocate post-snapshot chunks
+                // the scatter can't see).
+                // Fused single-launch arena write: one warp per prompt token
+                // scatters that token's latent across its bands (each band stored
+                // in the slot's `store_fmt`) into the seq's write chunk, addressed
+                // through the slot header's block table by (logical block,
+                // in-block offset) — the
+                // SAME `store_band_elem` path the glue scatter and the kernel's
+                // fresh diagonal use, so the bytes are identical to the per-chunk
+                // write_contiguous it replaces (gated by
+                // `wave_prefill_state_matches_decode_steps`). Collapses the
+                // per-chunk × per-band narrow/cast/slice_set launch storm
+                // (~CHUNK-count × LATENT_N_BANDS × 3 launches) to one kernel.
+                let (wslice, wblk): (Vec<u32>, Vec<u32>) = (0..s_len)
+                    .map(|t| {
+                        let off = base_resident + t;
+                        ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
+                    })
+                    .unzip();
+                super::paged::paged_latent_glue_scatter(
+                    kv_all,
+                    hdr_of(l, decode_seqs.len() + pi),
+                    &Tensor::from_vec(wslice, s_len, dev)?,
+                    &Tensor::from_vec(wblk, s_len, dev)?,
+                )?;
                 session.backings()[l].set_len(seq, base_resident + s_len);
                 pipeline_record("prefill:writeback", t_pwb);
                 let t_poutp = profile_now();
+                // Kernel output is token-major [s_len, h, hd] → [1, s_len, h, hd],
+                // exactly the [b, s, h, hd] `output_proj` wants — no transpose (it
+                // used to transpose to [1,h,s,hd] just for output_proj to transpose
+                // back).
                 let o = out
                     .to_dtype(DType::F32)?
-                    .reshape((1, s_len, a.n_heads(), a.head_dim()))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
+                    .reshape((1, s_len, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o, 1, s_len)?);
                 pipeline_record("prefill:outproj", t_poutp);
                 if l + 1 == n_layers {
@@ -1209,11 +1379,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     session.backings()[l].k_format().to_tag(),
                     st.ws(),
                 )?;
+                // Token-major [g_len, h, hd] → [1, g_len, h, hd] = [b, s, h, hd].
                 let o = out
                     .to_dtype(DType::F32)?
-                    .reshape((1, g_len, a.n_heads(), a.head_dim()))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
+                    .reshape((1, g_len, a.n_heads(), a.head_dim()))?;
                 attn_rows.push(a.output_proj(&o, 1, g_len)?);
             }
             if !glue_seqs.is_empty() {
@@ -1372,7 +1541,12 @@ mod tests {
             .with_int8mode(Int8Mode::Performance)
             .with_timeout_secs(1800);
 
-        let configs = [1usize, 4, 8]
+        // Trailing second `1`: by the end of the sweep the streaming expert
+        // cache's Markov transition matrix is warm (learned from the 1+4+8
+        // runs), so this final single-session pass reads the STEADY-STATE
+        // single-token decode rate — the leading `1` reads it cold (predictor
+        // untrained), and the gap between the two is the prefetch payoff.
+        let configs = [1usize, 4, 8, 1]
             .into_iter()
             .map(|n| TestConfig {
                 mode: InferenceMode::BF16,

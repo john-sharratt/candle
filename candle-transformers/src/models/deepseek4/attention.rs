@@ -162,7 +162,8 @@ impl Attention {
         let o = self.rope_last(&o, rope, 0, true)?; // inverse
 
         // --- grouped low-rank output projection ---
-        self.output_proj(&o, b, s)
+        // `output_proj` takes token-major [b,s,h,hd]; `o` is [b,h,s,hd] here.
+        self.output_proj(&o.transpose(1, 2)?.contiguous()?, b, s)
     }
 
     /// RoPE the trailing `rope_head_dim` dims of a `[.., seq, head_dim]` tensor (seq at
@@ -265,11 +266,14 @@ impl Attention {
     pub(crate) fn output_proj(&self, o: &Tensor, b: usize, s: usize) -> Result<Tensor> {
         let (h, hd, ng, olr) = (self.n_heads, self.head_dim, self.n_groups, self.o_lora_rank);
         let per_group = (h / ng) * hd;
-        // [b,h,s,hd] -> [b,s,h,hd] -> [b,s,ng,per_group]
-        let o = o
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, s, ng, per_group))?;
+        // `o` is [b, s, h, hd] (TOKEN-major, exactly as the paged decode/prefill
+        // kernels emit) — regroup the head axis into the `ng` o_lora groups with a
+        // free reshape, NO transpose. (The paged wave used to transpose the
+        // kernel's token-major output into [b,h,s,hd] just so this could transpose
+        // it back — two cancelling transposes + two contiguous copies per prefill
+        // seq per layer. The reference `forward`/`decode` paths, whose `sink_attend`
+        // yields [b,h,s,hd], transpose into this layout before calling.)
+        let o = o.reshape((b, s, ng, per_group))?;
         // Per group g: o[:,:,g,:] `[b*s, per_group]` @ wo_a[g]ᵀ -> `[b*s, olr]`, run as an int8-KO
         // linear. Concatenated over groups on the head axis → `[b, s, ng·olr]`. When every
         // `wo_a` is int8-KO the whole set runs in ONE grouped launch (see `grouped_output_proj`);
@@ -539,7 +543,8 @@ impl IncrementalAttention<'_> {
         // --- sink softmax + value gather → de-rotate at `pos` → grouped output projection ---
         let o = a.sink_attend(&scores, &kv_full.reshape((1, kcount, hd))?)?; // [1,h,1,hd]
         let o = a.rope_last(&o, rope, pos, true)?;
-        let out = a.output_proj(&o, 1, 1)?; // [1,1,dim]
+        // `output_proj` takes token-major [b,s,h,hd]; `o` is [1,h,1,hd] here.
+        let out = a.output_proj(&o.transpose(1, 2)?.contiguous()?, 1, 1)?; // [1,1,dim]
 
         self.pos += 1;
         Ok(out)

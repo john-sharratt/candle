@@ -21,26 +21,30 @@ fn sign_words(dim: usize) -> usize {
 /// (`nope_i8`/`nope_scale`/`rope_bf`) plus the Indexer `keys` — spills from the
 /// GPU (hot) to CPU RAM (warm). The `signs` + `pos` index stays GPU-resident at
 /// any depth (the BDP scan reads all of it, and it is tiny — `sign_words·4 + 4`
-/// bytes/entry); the canonical `attn` f32 is always CPU-archival. Below the
-/// threshold a gallery is fully hot, so short conversations and the reference
-/// paths pay nothing; beyond it the resident footprint is bounded to the index
-/// while the corpus grows in RAM and the bounded selection is gathered back per
-/// query (int8, ~576 B/entry — 3.5× cheaper to re-heat than the old f32 pair).
+/// bytes/entry). Below the threshold a gallery is fully hot, so short
+/// conversations and the reference paths pay nothing; beyond it the resident
+/// footprint is bounded to the index while the corpus grows in RAM and the
+/// bounded selection is gathered back per query (int8, ~576 B/entry).
 /// At 8192 entries (`ratio 4` ⇒ ~32k tokens) the hot cache is ≤4.7 MB/gallery.
 const HOT_ENTRY_CAP: usize = 8192;
 
 /// Compressed-corpus store with a packed sign index. The `signs`/`pos` index is
-/// always GPU-resident and `attn` is always CPU-archival; the HOT two-region
-/// cache + `keys` spill to CPU RAM past [`HOT_ENTRY_CAP`] entries (`spilled`),
-/// keeping the resident footprint bounded at unbounded depth (§L). Grows by
-/// doubling.
+/// always GPU-resident; the HOT two-region cache + `keys` spill to CPU RAM past
+/// [`HOT_ENTRY_CAP`] entries (`spilled`), keeping the resident footprint bounded
+/// at unbounded depth (§L). Grows by doubling.
+///
+/// The two-region cache (`nope_i8`/`nope_scale`/`rope_bf`) IS the canonical
+/// stored latent — there is no separate f32 archive. Reference/bench callers
+/// that want the dense f32 rows reconstruct them from the two-region
+/// ([`Self::two_region_rows_f32`]), i.e. exactly what the decode/prefill kernels
+/// read; the live attention path reads the two-region directly and never
+/// materialises f32.
 pub struct FloatGallery {
-    attn: Tensor, // [cap, head_dim] f32, pre-RoPE — CANONICAL, always CPU-archival
     keys: Tensor, // [cap, index_head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
     // The HOT retrieval artifact: the position-free two-region cache, built from
-    // `attn` on append. The decode/prefill readers rotate the rope bands at read
-    // time; the f32 `attn` is only needed to (re)build this. GPU while hot, CPU
-    // when spilled (re-heated per query by `gather_corpus`).
+    // the incoming rows on append. The decode/prefill readers rotate the rope
+    // bands at read time. GPU while hot, CPU when spilled (re-heated per query by
+    // `gather_corpus`).
     nope_i8: Tensor,    // [cap, nope_dim] u8  (nope int8)
     nope_scale: Tensor, // [cap, nope_bands] f32 (per-nope-band amax)
     rope_bf: Tensor,    // [cap, rope_dim] bf16 (rope pre-rotation)
@@ -88,10 +92,6 @@ impl FloatGallery {
         }
         let cap = initial_cap.max(1);
         Ok(Self {
-            // `attn` is ARCHIVAL (CPU) — the two-region cache is the hot artifact,
-            // built from the incoming GPU rows on append, so the canonical f32 is
-            // only needed to (re)build it and never sits in VRAM.
-            attn: Tensor::zeros((cap, head_dim), DType::F32, &Device::Cpu)?,
             keys: Tensor::zeros((cap, index_head_dim), DType::F32, device)?,
             nope_i8: Tensor::zeros((cap, NOPE_DIM), DType::U8, device)?,
             nope_scale: Tensor::zeros((cap, NOPE_BANDS), DType::F32, device)?,
@@ -115,7 +115,7 @@ impl FloatGallery {
 
     /// The device the spillable tier — the two-region cache + Indexer `keys` —
     /// currently lives on (CPU once spilled). `signs`/`pos` are always on
-    /// [`Self::device`]; `attn` is always CPU-archival.
+    /// [`Self::device`].
     fn float_device(&self) -> Device {
         if self.spilled {
             Device::Cpu
@@ -132,10 +132,12 @@ impl FloatGallery {
         self.len == 0
     }
 
-    /// The live attended-entry view `[len, head_dim]` — what the decode
-    /// kernel's compressed pass gathers from (`comp_ptr`).
+    /// The live attended-entry rows `[len, head_dim]` f32, reconstructed from the
+    /// two-region cache (reference/bench only — the live path reads the
+    /// two-region directly). Returns exactly what the decode/prefill kernels see.
     pub fn attn_entries(&self) -> Result<Tensor> {
-        self.attn.narrow(0, 0, self.len.max(1))
+        let n = self.len.max(1);
+        self.two_region_rows_f32(&self.nope_i8, &self.nope_scale, &self.rope_bf, 0, n)
     }
 
     /// The live position view `[len]` (`comp_pos`).
@@ -173,7 +175,6 @@ impl FloatGallery {
             nt.slice_set(t, 0, 0)?;
             Ok(nt)
         };
-        self.attn = grow(&self.attn, self.head_dim, DType::F32, &Device::Cpu)?;
         self.keys = grow(&self.keys, self.index_head_dim, DType::F32, &fdev)?;
         // The two-region cache lives on the spillable tier alongside `keys`
         // (GPU while hot, CPU once spilled).
@@ -193,8 +194,8 @@ impl FloatGallery {
     }
 
     /// Move the HOT tier — the two-region cache + Indexer `keys` — from GPU to
-    /// CPU RAM once the entry count crosses [`HOT_ENTRY_CAP`] (`attn` is already
-    /// CPU-archival; `signs`/`pos` stay GPU). One-way: the corpus only grows,
+    /// CPU RAM once the entry count crosses [`HOT_ENTRY_CAP`] (`signs`/`pos` stay
+    /// GPU). One-way: the corpus only grows,
     /// and re-heating the whole spilled tier would defeat the bound — per-query
     /// gathers pull the bounded working set back instead.
     fn maybe_spill(&mut self, prospective_len: usize) -> Result<()> {
@@ -268,17 +269,11 @@ impl FloatGallery {
         // Cross the spill threshold AFTER the hot build (so the just-built rows
         // move down with the rest of the tier on the crossing append).
         self.maybe_spill(self.len + n)?;
-        // Archive the canonical f32 to CPU (`attn` is never hot). When the
-        // incoming rows are already CPU, archive them directly rather than
-        // round-tripping through the GPU copy. Place the Indexer keys on their
-        // current tier (GPU until the spill).
-        let attn_cpu = if attn_rows.device().is_cpu() {
-            attn_rows.clone()
-        } else {
-            attn_gpu.to_device(&Device::Cpu)?
-        };
+        // The two-region cache built above IS the stored latent — no separate
+        // f32 archive (the old canonical-f32 CPU copy was reference-only and its
+        // blocking D2H drained the prefill/decode pipeline every append). Place
+        // the Indexer keys on their current tier (GPU until the spill).
         let key_rows = key_rows.to_device(&self.float_device())?;
-        self.attn.slice_set(&attn_cpu, 0, self.len)?;
         self.keys.slice_set(&key_rows, 0, self.len)?;
         self.pos.slice_set(&pos_t, 0, self.len)?;
         self.signs.slice_set(&new_signs, 0, self.len)?;
@@ -286,25 +281,59 @@ impl FloatGallery {
         Ok(())
     }
 
-    /// Gather the `attn` rows and positions for `gids` (absolute entry ids,
-    /// GPU u32) into a COMPACTED GPU pair — `(attn [k, head_dim], pos [k])` —
-    /// regardless of which tier the corpus lives on. The kernel then walks the
-    /// selection densely (`comp_idx = 0..k`). The only work that scales with
-    /// depth is the BDP scan over the resident sign index; this gather touches
-    /// exactly the `k` selected rows, so it is bounded at any corpus size.
+    /// Gather the dense f32 rows and positions for `gids` (absolute entry ids,
+    /// GPU u32) into a COMPACTED GPU pair — `(attn [k, head_dim], pos [k])`.
+    /// Reconstructs the rows from the compacted two-region (`gather_corpus` is
+    /// tier-aware), so it returns exactly what the decode/prefill kernels read.
+    /// Reference/rebuild callers only — the hot path is `gather_corpus`.
     #[cfg(feature = "cuda")]
     pub fn gather_selected(&self, gids: &Tensor) -> Result<(Tensor, Tensor)> {
-        let pos = self.positions()?.index_select(gids, 0)?; // GPU
-                                                            // `attn` is CPU-archival: read the k indices back (bounded), gather on
-                                                            // CPU, upload the compacted rows. (The hot path is `gather_corpus`; this
-                                                            // canonical-f32 gather is only for rebuild/reference callers.)
-        let gids_cpu = gids.to_device(&Device::Cpu)?;
-        let attn = self
-            .attn
-            .narrow(0, 0, self.len.max(1))?
-            .index_select(&gids_cpu, 0)?
-            .to_device(&self.device)?;
+        let (ni8, nsc, rbf, pos) = self.gather_corpus(gids)?;
+        let k = pos.dim(0)?;
+        let attn = self.two_region_rows_f32(&ni8, &nsc, &rbf, 0, k)?;
         Ok((attn.contiguous()?, pos.contiguous()?))
+    }
+
+    /// Reconstruct dense f32 latent rows `[n, head_dim]` from `n` two-region rows
+    /// (`nope_i8`/`nope_scale`/`rope_bf`, starting at `lo`) — the exact inverse
+    /// of `build_corpus_cache_into`: nope band value `= int8 · per-band scale`,
+    /// rope band `= bf16 → f32`. Returns what the kernels read. Host-side
+    /// (reference/bench only — the live attention path reads the two-region
+    /// directly and never materialises f32); the result lands on the gallery
+    /// device.
+    fn two_region_rows_f32(
+        &self,
+        nope_i8: &Tensor,
+        nope_scale: &Tensor,
+        rope_bf: &Tensor,
+        lo: usize,
+        n: usize,
+    ) -> Result<Tensor> {
+        let ni8: Vec<u8> = nope_i8.narrow(0, lo, n)?.flatten_all()?.to_vec1::<u8>()?;
+        let nsc: Vec<f32> = nope_scale
+            .narrow(0, lo, n)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rbf: Vec<f32> = rope_bf
+            .narrow(0, lo, n)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let hd = self.head_dim;
+        let mut out = vec![0f32; n * hd];
+        for i in 0..n {
+            for band in 0..NOPE_BANDS {
+                let scale = nsc[i * NOPE_BANDS + band];
+                for j in 0..SUB_DIM {
+                    let d = band * SUB_DIM + j;
+                    out[i * hd + d] = (ni8[i * NOPE_DIM + d] as i8 as f32) * scale;
+                }
+            }
+            for j in 0..ROPE_DIM {
+                out[i * hd + NOPE_DIM + j] = rbf[i * ROPE_DIM + j];
+            }
+        }
+        Tensor::from_vec(out, (n, hd), &self.device)
     }
 
     /// Gather the HOT two-region cache for `gids` into a COMPACTED GPU tuple —
@@ -577,46 +606,46 @@ impl FloatGallery {
         Ok((gids_sorted.contiguous()?, k))
     }
 
-    /// Whole-prompt batched causal select: score every prompt token's roped
-    /// query against the corpus at once and take each token's causal top-k in a
-    /// few launches, replacing the per-token [`Self::two_stage_select_causal`]
-    /// loop. `q_idx` `[s, n_idx_heads, index_head_dim]` are the roped per-token
-    /// queries, `weights` `[s, n_idx_heads]` the gate weights, and `n_visible[t]`
-    /// the number of causally-visible entries for token `t` (`≤ len`).
+    /// Whole-prompt batched causal select, **fully on-device**: score every
+    /// prompt token's roped query against the corpus and take each token's causal
+    /// top-k, returning the selection as GPU tensors — no `to_vec2`/host-sort/union
+    /// round-trip (the readback that dominated `pprep:select`). `q_idx`
+    /// `[s, n_idx_heads, index_head_dim]` are the roped per-token queries,
+    /// `weights` `[s, n_idx_heads]` the gate weights, `n_visible[t]` the number of
+    /// causally-visible entries for token `t` (`≤ len`).
+    ///
+    /// Returns `(comp_idx [s, kmax] u32, comp_cnt [s] u32, n_corpus)`:
+    /// `comp_idx[t]` holds token `t`'s selected **absolute** entry ids ascending,
+    /// `u32::MAX`-padded past `comp_cnt[t]`; the caller gathers the whole visible
+    /// corpus (`0..n_corpus`) so those absolute ids index the gather directly.
+    /// Bit-identical selection to the per-token [`Self::two_stage_select_causal`]
+    /// loop in the in-regime case (widest window ≤ shortlist ⇒ two-stage == full
+    /// top-k), gated by `batched_causal_select_matches_per_token`.
     ///
     /// **Regime:** valid ONLY when the widest causal window fits the shortlist
-    /// width (`max(n_visible) ≤ top_m` at the call site, which the caller checks).
-    /// There the recall shortlist covers everything, so two-stage selection
-    /// degenerates to the exact full Indexer top-k — this computes exactly that,
-    /// bit-identical to `two_stage_select_causal(.., n_visible[t])` per token (a
-    /// unit gate proves it). For deeper prompts the caller keeps the per-token
-    /// recall path (whose shortlist approximation the batched exact top-k would
-    /// diverge from). The device argsort caps at 1024 columns, matched by the
-    /// same window bound. Returns each token's selected absolute entry ids,
-    /// ascending.
+    /// (`max(n_visible) ≤ top_m ≤ 1024` at the call site — the device argsort caps
+    /// at 1024 columns), so the gallery is never spilled (hot-only: reads
+    /// `scoring_keys()` in place).
     #[cfg(feature = "cuda")]
-    pub fn batched_causal_select(
+    pub fn batched_causal_select_device(
         &self,
         q_idx: &Tensor,
         weights: &Tensor,
         n_visible: &[usize],
         top_k: usize,
-    ) -> Result<Vec<Vec<u32>>> {
-        // Hot-only: reads `scoring_keys()` in place (not the tier-aware
-        // `gather_keys`), so the gallery must be GPU-resident or the rescore
-        // matmul mixes devices. The caller's regime gate (max n_visible ≤
-        // shortlist width ≤ 1024) keeps the corpus far below HOT_ENTRY_CAP, so an
-        // in-regime gallery is never spilled.
+    ) -> Result<(Tensor, Tensor, usize)> {
         debug_assert!(
             !self.spilled,
-            "batched_causal_select is hot-only (regime-gated below HOT_ENTRY_CAP)"
+            "batched_causal_select_device is hot-only (regime-gated below HOT_ENTRY_CAP)"
         );
         let s = q_idx.dim(0)?;
         let h = q_idx.dim(1)?;
         let ih = self.index_head_dim;
         let n_corpus = n_visible.iter().copied().max().unwrap_or(0).min(self.len);
         if n_corpus == 0 || top_k == 0 {
-            return Ok(vec![Vec::new(); s]);
+            let idx = Tensor::full(u32::MAX, (s, 1), &self.device)?;
+            let cnt = Tensor::zeros(s, DType::U32, &self.device)?;
+            return Ok((idx, cnt, 0));
         }
         // scores[t,h,g] = relu(q_th · k_g); weighted[t,g] = Σ_h scores · w_th.
         let keys = self.scoring_keys()?.narrow(0, 0, n_corpus)?; // [n_corpus, ih]
@@ -627,37 +656,46 @@ impl FloatGallery {
             .relu()?;
         let weighted = scores.broadcast_mul(&weights.reshape((s, h, 1))?)?.sum(1)?; // [s, n_corpus]
                                                                                     // Causal mask formed ON DEVICE: column g is invalid for token t once
-                                                                                    // g ≥ n_visible[t]. `col < count` → {1,0}; `affine(1e30, −1e30)` →
-                                                                                    // {0, −1e30} exactly (1·1e30 − 1e30 = 0), added so masked entries
-                                                                                    // never enter any top-k. Bit-identical to a host mask, without the
-                                                                                    // per-call H2D of an s×n_corpus buffer.
-        let counts: Vec<u32> = n_visible
+                                                                                    // g ≥ n_visible[t]. `col < vis` → {1,0}; `affine(1e30, −1e30)` → {0, −1e30}
+                                                                                    // exactly (1·1e30 − 1e30 = 0), added so masked entries never enter any top-k.
+        let vis: Vec<u32> = n_visible
             .iter()
             .map(|&nv| nv.min(n_corpus) as u32)
             .collect();
-        let counts = Tensor::from_vec(counts, (s, 1), &self.device)?;
+        let vis = Tensor::from_vec(vis, (s, 1), &self.device)?;
         let col = Tensor::arange(0u32, n_corpus as u32, &self.device)?.reshape((1, n_corpus))?;
         let mask = col
-            .broadcast_lt(&counts)?
+            .broadcast_lt(&vis)?
             .to_dtype(DType::F32)?
             .affine(1e30, -1e30)?; // valid → 0, masked → −1e30
         let weighted = weighted.broadcast_add(&mask)?;
-        // One batched descending argsort; the column index IS the absolute entry
-        // id (keys are `[0, n_corpus)` in order).
+        // Descending argsort → each token's gids by score; the column index IS the
+        // absolute entry id (keys are `[0, n_corpus)` in order).
         let kmax = top_k.min(n_corpus);
         let order = weighted
             .arg_sort_last_dim(false)?
             .narrow(1, 0, kmax)?
-            .contiguous()?; // [s, kmax] u32
-        let order_v = order.to_vec2::<u32>()?;
-        let mut out = Vec::with_capacity(s);
-        for (t, &nv) in n_visible.iter().enumerate() {
-            let k_t = top_k.min(nv.min(n_corpus));
-            let mut ids: Vec<u32> = order_v[t][..k_t].to_vec();
-            ids.sort_unstable();
-            out.push(ids);
-        }
-        Ok(out)
+            .contiguous()?; // [s, kmax] u32 — gids by score, desc
+                            // Per-token valid count = min(top_k, n_visible[t], n_corpus).
+        let cnt_v: Vec<u32> = n_visible
+            .iter()
+            .map(|&nv| top_k.min(nv.min(n_corpus)) as u32)
+            .collect();
+        let comp_cnt = Tensor::from_vec(cnt_v, s, &self.device)?; // [s]
+                                                                  // Keep the first `cnt[t]` selected gids; sentinel the rest with `n_corpus`
+                                                                  // (f32-exact since n_corpus ≤ 1024, and sorts after every valid gid), sort
+                                                                  // the row ASCENDING (the compressed-index contract), then map the sentinel
+                                                                  // to the `u32::MAX` skip-pad. Positions past `cnt[t]` are never read (the
+                                                                  // kernel bounds iteration by `comp_cnt`) — the pad is for the contract.
+        let colk = Tensor::arange(0u32, kmax as u32, &self.device)?.reshape((1, kmax))?;
+        let keep = colk.broadcast_lt(&comp_cnt.reshape((s, 1))?)?; // [s, kmax] u8
+        let sentinel = Tensor::full(n_corpus as u32, (s, kmax), &self.device)?;
+        let masked = keep.where_cond(&order, &sentinel)?;
+        let perm = masked.to_dtype(DType::F32)?.arg_sort_last_dim(true)?; // ascending
+        let sorted = masked.gather(&perm, 1)?; // [s, kmax] ascending gids, sentinels last
+        let maxpad = Tensor::full(u32::MAX, (s, kmax), &self.device)?;
+        let comp_idx = sorted.lt(&sentinel)?.where_cond(&sorted, &maxpad)?; // sentinel → MAX
+        Ok((comp_idx, comp_cnt, n_corpus))
     }
 
     /// Reference selector: the full Indexer top-k over ALL entries (no recall
@@ -900,7 +938,6 @@ impl FloatGallery {
         // (identical to the live append's `sign_pack`).
         let signs = sign_pack(&keys)?;
         let mut g = Self {
-            attn: Tensor::zeros((cap, NOPE_DIM + ROPE_DIM), DType::F32, &Device::Cpu)?,
             keys,
             nope_i8,
             nope_scale,
@@ -1963,8 +2000,12 @@ mod tests {
         Ok(())
     }
 
-    /// Gate (b): the corpus pair reads back bit-for-bit (float passthrough —
-    /// the corpus's job is retrieval, not compression).
+    /// Gate (b): `keys`/`pos` read back bit-for-bit across the grow-triggering
+    /// second append (lossless tiers), and `attn_entries` reconstructs the dense
+    /// f32 EXACTLY as the deterministic two-region dequant of the input (int8
+    /// nope · per-band amax ‖ bf16 rope) — the f32 archive is gone, so the
+    /// reconstruction equals what the kernels read, asserted against the
+    /// recomputed quantized bytes (no tolerance).
     #[test]
     #[ignore]
     fn gallery_round_trip_raw_bytes() -> Result<()> {
@@ -1991,8 +2032,45 @@ mod tests {
                 .i((before..before + n, ..))?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
-            for (i, (&a, &b)) in attn.iter().zip(&got_attn).enumerate() {
-                assert_eq!(a.to_bits(), b.to_bits(), "attn[{i}]");
+            // `attn_entries` reconstructs the dense f32 from the lossy two-region,
+            // so it is NOT the input. Its contract is to be the EXACT dequant of
+            // the gallery's OWN stored bytes: nope band `= int8 · per-band scale`,
+            // rope tail `= bf16 → f32`. Recompute that from the stored tensors and
+            // assert bit-for-bit (the accessor reads the right rows post-growth and
+            // applies the scale correctly). The rope tail is additionally a true
+            // bf16 passthrough of the input. The input→int8 quantization itself is
+            // gated bit-exact by the `build_corpus_cache` mirror test.
+            let ni8: Vec<u8> = g
+                .nope_i8
+                .i((before..before + n, ..))?
+                .flatten_all()?
+                .to_vec1::<u8>()?;
+            let nsc: Vec<f32> = g
+                .nope_scale
+                .i((before..before + n, ..))?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for i in 0..n {
+                for band in 0..NOPE_BANDS {
+                    let scale = nsc[i * NOPE_BANDS + band];
+                    for j in 0..SUB_DIM {
+                        let d = band * SUB_DIM + j;
+                        let expected = (ni8[i * NOPE_DIM + d] as i8 as f32) * scale;
+                        assert_eq!(
+                            got_attn[i * HD + d].to_bits(),
+                            expected.to_bits(),
+                            "nope attn[{i}][{d}]"
+                        );
+                    }
+                }
+                for d in NOPE_DIM..HD {
+                    let expected = half::bf16::from_f32(attn[i * HD + d]).to_f32();
+                    assert_eq!(
+                        got_attn[i * HD + d].to_bits(),
+                        expected.to_bits(),
+                        "rope attn[{i}][{d}] not a bf16 passthrough of the input"
+                    );
+                }
             }
             for (i, (&a, &b)) in keys.iter().zip(&got_keys).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "keys[{i}]");
@@ -2378,7 +2456,10 @@ mod tests {
         // Causal bound grows with position (groups completing), capped at n_corpus.
         let n_visible: Vec<usize> = (0..n_tok).map(|t| ((t + 1) * 5).min(n_corpus)).collect();
 
-        let batched = gal.batched_causal_select(&q_idx, &weights, &n_visible, top_k)?;
+        let (comp_idx, comp_cnt, _n) =
+            gal.batched_causal_select_device(&q_idx, &weights, &n_visible, top_k)?;
+        let comp_idx = comp_idx.to_vec2::<u32>()?;
+        let comp_cnt = comp_cnt.to_vec1::<u32>()?;
 
         for t in 0..n_tok {
             let qt = q_idx.narrow(0, t, 1)?.reshape((n_heads, IH))?;
@@ -2391,7 +2472,11 @@ mod tests {
             } else {
                 gids_t.to_vec1::<u32>()?
             };
-            assert_eq!(batched[t], expect, "token {t} (n_visible={})", n_visible[t]);
+            // The device select returns absolute gids ascending, MAX-padded past
+            // `comp_cnt`; the first `comp_cnt[t]` must equal the per-token oracle.
+            let got: Vec<u32> = comp_idx[t][..comp_cnt[t] as usize].to_vec();
+            assert_eq!(comp_cnt[t] as usize, expect.len(), "token {t} count");
+            assert_eq!(got, expect, "token {t} (n_visible={})", n_visible[t]);
         }
         Ok(())
     }
@@ -2594,10 +2679,6 @@ mod tests {
             "corpus past HOT_ENTRY_CAP must have spilled"
         );
         assert!(
-            !gal.attn.device().is_cuda(),
-            "attn must be on CPU when spilled"
-        );
-        assert!(
             !gal.keys.device().is_cuda(),
             "keys must be on CPU when spilled"
         );
@@ -2625,7 +2706,7 @@ mod tests {
         );
 
         // gather_selected feeds the reference path a compacted GPU pair of the
-        // canonical f32, gathered from CPU-archival RAM.
+        // dense f32, reconstructed from the (spilled) two-region cache.
         let (comp, comp_pos) = gal.gather_selected(&sel_t)?;
         assert_eq!(comp.dims(), &[top_k, HD]);
         assert_eq!(comp_pos.dims(), &[top_k]);

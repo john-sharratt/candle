@@ -87,6 +87,42 @@ These apply repo-wide. They are deliberate standing decisions, not suggestions.
 
 ---
 
+## Hot-Path Invariants (Prefill & Decode)
+
+The batched inference loop (`forward_wave` and everything it calls per layer, per wave)
+must satisfy these six invariants. They are the standing target that turns the current
+single-session rate into the compute-bound ceiling (**prefill ≥ 1000 t/s, decode ≥ 50 t/s**).
+Every violation is a place the GPU sits idle, round-trips through the host, or does work the
+architecture says is unnecessary. Full study + per-invariant violation catalogue with
+`file:line` references lives in `docs/deepseek_hot_path_invariants.md` (authoritative).
+
+1. **No `to_dtype` in the loop — kernels emit the final type.** Every dtype conversion on
+   the hot path is a full-tensor memory pass a kernel could have avoided by writing its
+   output in the type the next consumer wants. Norms emit the kernel's input type; attention
+   kernels emit the out-proj's input type.
+2. **No `contiguous` / `force_contiguous` in the loop.** A `contiguous()` is an allocate-plus-copy
+   of the whole tensor. If a consumer needs a layout, teach it to read the layout that exists
+   (offset + stride), or produce that layout directly from the kernel that made the data.
+3. **No unnecessary GPU→CPU transfers.** Exactly two sanctioned readbacks: (a) MoE expert
+   routing (`indices` → host), because the streaming `ExpertCache` schedules pinned→VRAM
+   uploads by expert id; and (b) the embedding lookup (token ids → host, CPU `index_select`,
+   transfer in), a pure index + transfer that keeps the embed table off VRAM. Everything else —
+   comp-idx assembly, select remaps, gather indices — stays on the GPU.
+4. **Run as much as possible on the GPU.** No host-side compute a kernel can do: no host
+   counting-sort, no host set-union/dedup/remap. Host code issues launches; it does not
+   compute over per-token data. (The two transfers in #3 are the only exceptions.)
+5. **Everything in prefill and decode runs fully batched.** One launch over all slots / all
+   sessions, not a per-seq or per-token loop. Decode batches select, gather, attention, and
+   out-proj across sessions; prefill must reach the same shape — a multi-slot attention kernel
+   over all prompt slots, not one launch per sequence.
+6. **Never zero memory in the inference loop — it will be written anyway.** A buffer a kernel
+   fully overwrites must be allocated uninitialised (`alloc_uninit`), never `Tensor::zeros`
+   (a second full-width `memset` on the exact bytes the kernel is about to stamp). The only
+   buffers that may be zeroed are ones whose zero value is read before being written: atomic
+   accumulators (`atomicAdd`/`atomicMax` targets), scatter bases, and ragged padding.
+
+---
+
 ## Build Commands
 
 ```bash
