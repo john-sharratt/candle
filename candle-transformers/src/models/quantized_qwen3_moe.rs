@@ -16,6 +16,8 @@ use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
 #[cfg(feature = "cuda")]
+use super::expert_lre::ExpertCacheSetup;
+#[cfg(feature = "cuda")]
 use super::expert_lre::GpuDispatchTables;
 #[cfg(feature = "cuda")]
 use super::expert_lre::{layer_geometries, slot_bytes_for};
@@ -39,7 +41,7 @@ use candle::quantized::cuda::{
     MOE_MAX_TOPK,
 };
 #[cfg(feature = "cuda")]
-use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
+use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
@@ -1023,8 +1025,6 @@ pub struct ModelWeights {
     expert_cache: Option<Arc<ExpertCache>>,
     #[allow(dead_code)]
     _mmap: Option<Arc<memmap2::Mmap>>,
-    #[cfg(feature = "cuda")]
-    _mmap_registration: Option<MmapRegistration>,
     device: Device,
     /// Inference numeric mode for the dense (non-expert) projections. Baked into each dense
     /// `QMatMul` at load; retained here for introspection. Experts are unaffected (always FP16).
@@ -1309,6 +1309,34 @@ fn warm_mmap(mmap: &memmap2::Mmap) {
     );
 }
 
+/// The load-time choices a GGUF load takes that are not properties of the file.
+///
+/// There were two entry points for the first of these — `from_gguf_by_path` and
+/// `from_gguf_by_path_with_int8` — and a second knob would have made a third. A
+/// struct with defaults takes any number of them, and is where the next one
+/// goes.
+#[derive(Debug, Clone, Default)]
+pub struct GgufLoadOptions {
+    /// The numeric mode for dense projections *and* MoE experts. [`Int8Mode::Off`]
+    /// is the FP16 reference; an int8 mode repacks every dense weight (attention
+    /// q/k/v/o, MoE router gate, dense-MLP gate/up/down, lm_head) to its KO twin
+    /// so forward runs the q8a128 int8 tensor-core matmul, and stages each
+    /// expert's gate/up/down as their KO twins so the grouped expert matmul runs
+    /// int8 too.
+    ///
+    /// `None` picks it from the device and the checkpoint's size.
+    pub int8mode: Option<Int8Mode>,
+    /// Directory for the persistent repacked expert pack (`docs/expert_cache_design.md` §5).
+    ///
+    /// `None` — the default — uses a temp file that is unlinked as soon as it is
+    /// open, which costs the ~42 s repack on every start. A caller that will
+    /// restart often passes the GGUF's own directory, where one pack is shared by
+    /// every workspace on that checkpoint and survives a substrate wipe.
+    ///
+    /// MoE-only: the other architectures have no expert cache and ignore it.
+    pub expert_pack_dir: Option<std::path::PathBuf>,
+}
+
 impl ModelWeights {
     /// Load model from GGUF via reader (non-mmap path).
     /// MoE layers load all experts to VRAM (no LRU cache in this path).
@@ -1541,8 +1569,6 @@ impl ModelWeights {
             // (The mmap path sets this to Some(...) for cross-layer LRU.)
             expert_cache: None,
             _mmap: None,
-            #[cfg(feature = "cuda")]
-            _mmap_registration: None,
             wave_shapes: WaveShapes {
                 hidden: hidden_size,
                 intermediate: expert_ffn_size,
@@ -1569,35 +1595,41 @@ impl ModelWeights {
     /// `progress`, when supplied, is called with `(layers_loaded, num_layers)`
     /// after each layer's weights have been mounted — drives a UI progress
     /// bar without coupling this loader to the daemon's progress type.
+    ///
+    /// Load-time knobs take their defaults; [`ModelWeights::from_gguf_with_options`]
+    /// sets them.
     pub fn from_gguf_by_path(
         file_path: &std::path::Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
-        // VRAM-aware auto: int8 Precision on int8-MMA-capable GPUs when the
-        // weights leave headroom, else Performance (smaller footprint); FP16 Off
-        // on CPU. Sized by the GGUF length. Explicit-mode callers use
-        // `from_gguf_by_path_with_int8` instead.
-        let model_bytes = std::fs::metadata(file_path)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
-        let int8mode = Int8Mode::auto_sized(device, model_bytes);
-        Self::from_gguf_by_path_with_int8(file_path, device, progress, int8mode)
+        Self::from_gguf_with_options(file_path, device, progress, GgufLoadOptions::default())
     }
 
-    /// Like [`ModelWeights::from_gguf_by_path`] but selects the inference numeric `int8mode` for
-    /// the whole model — dense projections *and* MoE experts. [`Int8Mode::Off`] is the FP16
-    /// reference; an int8 mode repacks every dense weight (attention q/k/v/o, MoE router gate,
-    /// dense-MLP gate/up/down, lm_head) to its KO twin so forward runs the q8a128 int8 tensor-core
-    /// matmul, and stages each expert's gate/up/down as their KO twins through the [`ExpertCache`]
-    /// repack-to-host/DMA pipeline so the grouped expert matmul runs int8 too.
-    pub fn from_gguf_by_path_with_int8(
+    /// Like [`ModelWeights::from_gguf_by_path`] but with the load-time knobs set
+    /// explicitly rather than defaulted — see [`GgufLoadOptions`].
+    pub fn from_gguf_with_options(
         file_path: &std::path::Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
-        int8mode: Int8Mode,
+        options: GgufLoadOptions,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
+
+        // VRAM-aware auto when the caller did not choose: int8 Precision on
+        // int8-MMA-capable GPUs when the weights leave headroom, else
+        // Performance (smaller footprint); FP16 Off on CPU. Sized by the GGUF
+        // length.
+        let int8mode = match options.int8mode {
+            Some(m) => m,
+            None => {
+                let model_bytes = std::fs::metadata(file_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                Int8Mode::auto_sized(device, model_bytes)
+            }
+        };
+        let expert_pack_dir = options.expert_pack_dir;
 
         tracing::info!(
             "Inference int8 mode: {int8mode:?} (dense projections + MoE experts; \
@@ -1617,20 +1649,21 @@ impl ModelWeights {
         // One mmap per model here, so this single call IS the whole mapped size.
         candle::vram::set_weights_mmap(mmap.len() as u64);
 
-        // Mmap warming is handled by ExpertCache::new() (prewarm_expert_cache)
-        // which fills VRAM slots first, then warms remaining pages.
-        // For non-MoE models, warm_mmap() is called below after cache building.
-
-        // Register mmap with CUDA for DMA acceleration
-        #[cfg(feature = "cuda")]
-        let _mmap_guard = if matches!(device, Device::Cuda(_)) {
-            register_mmap_cuda(&mmap)
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let _mmap_guard: Option<()> = None;
+        // **The mapping is deliberately not host-registered.**
+        //
+        // `register_mmap_cuda` pins the whole file so H2D copies out of it run
+        // at full DMA bandwidth without a bounce. For a dense model that is the
+        // right trade — the mmap *is* the weight source, read for the life of
+        // the process. Here it is not: the experts move to the pack file at
+        // startup, and what remains live in the mapping is the dense tensors and
+        // the embedding table, gathered a few tokens at a time.
+        //
+        // Registering would lock all 18.6 GB of it, non-pageable, for the
+        // process lifetime — competing directly with the warm expert tier, which
+        // wants 17.8 GB of pinned RAM for the same 31.5 GB machine and is the
+        // thing that keeps expert loads off the disk. The one-time load-path
+        // speedup is not worth a permanent claim on the memory the hot path
+        // needs.
 
         // Parse GGUF
         let mut cursor = std::io::Cursor::new(&mmap[..]);
@@ -2229,10 +2262,11 @@ impl ModelWeights {
                 );
                 zone
             } else {
-                // No device reservation on a non-CUDA device: the legacy prewarm
-                // path allocates each expert from the host allocator, so the zone
-                // exists only to count slots and hand out indices.
-                WeightZone::new(0, 0, total_experts, total_experts)
+                // A cuda build on a CPU device has no expert path at all, and
+                // `ExpertCache::new` says so. The zone it would be handed has no
+                // device reservation behind it, so a plausible-looking one built
+                // here would only make the failure land further from its cause.
+                WeightZone::new(0, 0, 0, 0)
             };
             #[cfg(not(feature = "cuda"))]
             let zone = WeightZone::new(0, 0, total_experts, total_experts);
@@ -2246,16 +2280,17 @@ impl ModelWeights {
                 .map(|cb| move |done: usize, _total: usize| cb(num_layers + done, total_units));
             let cache_progress: Option<&dyn Fn(usize, usize)> =
                 cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
-            let cache = ExpertCache::new(
-                mmap.clone(),
-                all_host_refs,
+            let cache = ExpertCache::new(ExpertCacheSetup {
+                mmap: mmap.clone(),
+                host_refs: all_host_refs,
                 zone,
                 device,
-                n_expert,
-                Some(file_path),
-                cache_progress,
+                experts_per_layer: n_expert,
+                gguf_path: file_path,
+                expert_pack_dir: expert_pack_dir.as_deref(),
+                progress: cache_progress,
                 int8mode,
-            )?;
+            })?;
             // Record the resident expert footprint with the governor. Reporting
             // only — nothing sizes itself from this any more.
             #[cfg(feature = "cuda")]
@@ -2328,8 +2363,6 @@ impl ModelWeights {
             lm_head,
             expert_cache,
             _mmap: Some(mmap),
-            #[cfg(feature = "cuda")]
-            _mmap_registration: _mmap_guard,
             wave_shapes: WaveShapes {
                 hidden: hidden_size,
                 intermediate: expert_ffn_size,
@@ -2650,8 +2683,18 @@ mod tests {
         println!("int8 mode = {int8mode:?}\n");
 
         let load_model = || {
-            let model =
-                ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, None, int8mode)?;
+            // Keep the pack beside the checkpoint. The gate reloads the model
+            // once per invocation while iterating, and a persistent pack turns
+            // the ~42 s repack into a read.
+            let model = ModelWeights::from_gguf_with_options(
+                &model_path,
+                &device,
+                None,
+                GgufLoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                },
+            )?;
             println!("✓ Model loaded\n");
             let inv_freq = model
                 .rope_inv_freq()

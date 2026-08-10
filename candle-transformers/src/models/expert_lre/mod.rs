@@ -140,7 +140,8 @@
 //! | [`cache`]      | `ExpertCacheInner` — slot management and eviction policy |
 //! | [`compute`]    | SwiGLU expert computation and `QMatMul` re-export |
 //! | [`transition`] | `TransitionMatrix` — online-learned routing predictor |
-//! | [`pinned`]     | `PinnedPool` — pinned host memory warm tier |
+//! | [`pack`]       | `ExpertPack` — the authoritative cold tier on disk |
+//! | [`pinned`]     | `WarmPool` — pinned host memory warm tier, and its draw |
 //! | [`pipeline`]   | `PipelineState`, background thread, DMA loading |
 //! | [`handle`]     | `ExpertCache` public API and `PipelineMode` |
 
@@ -153,6 +154,7 @@ mod gpu_dispatch;
 mod handle;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
+mod pack;
 mod pinned;
 mod pipeline;
 mod transition;
@@ -163,6 +165,8 @@ pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
 pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
+#[cfg(feature = "cuda")]
+pub use handle::ExpertCacheSetup;
 /// What the weight zone must be carved into to hold one expert.
 ///
 /// The model loader needs this **before** the cache exists: the zone's slot size

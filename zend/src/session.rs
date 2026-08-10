@@ -553,6 +553,10 @@ impl InferenceState {
         // expanded by `preemptive_prefill` itself.
         let before_text: String = pre_collection_prelude(&proj_builder);
 
+        // The expert pack lives beside the checkpoint, so it is shared by every
+        // workspace on this model, survives `--wipe-substrate`, and turns the
+        // ~42 s expert repack into a read on every restart after the first.
+        let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
         let mut builder = qwen30()
             .builder()
             .system_prompt(&before_text)
@@ -581,6 +585,9 @@ impl InferenceState {
                     .map(|l| (l.id, l.on_corrupt_turn))
                     .collect(),
             );
+        if let Some(dir) = expert_pack_dir {
+            builder = builder.expert_pack_dir(dir);
+        }
         let conv_config = builder.conversation_config();
 
         // Per-layer progress callback — the library reports

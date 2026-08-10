@@ -472,7 +472,7 @@ mod cuda_impl {
         // duration so the pipeline's reader threads can borrow them by id.
         let mut sealed_handles: std::collections::HashMap<
             crate::persistence::segment::SegmentId,
-            crate::persistence::direct_io::DirectFile,
+            candle::direct_io::DirectFile,
         > = std::collections::HashMap::new();
         for batch in &plan.chunks {
             if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {

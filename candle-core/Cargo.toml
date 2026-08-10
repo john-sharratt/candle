@@ -45,9 +45,17 @@ ug = { workspace = true }
 ug-cuda = { workspace = true, optional = true }
 ug-metal = { workspace = true, optional = true }
 
+# `direct_io` needs the O_DIRECT flag, which is not in `std`. Unconditional on
+# unix rather than behind the `mkl`/`accelerate` features that pull the optional
+# `libc` above, because the direct-I/O reader is not feature-gated.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # Windows-only VRAM measurement backend (DXGI) for the VRAM Governor's DXGI
-# probe. Compiled only on Windows (used only under the `cuda` feature); absent
-# on Linux/macOS.
+# probe (compiled only on Windows, used only under the `cuda` feature), plus the
+# Win32 ReadFile + OVERLAPPED bindings `direct_io` issues positioned reads
+# through. The two crates coexist: `windows` is the typed wrapper the DXGI probe
+# wants, `windows-sys` the raw FFI the read path wants.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.54", features = [
     "Win32_Graphics_Dxgi",
@@ -55,6 +63,11 @@ windows = { version = "0.54", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Foundation",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]

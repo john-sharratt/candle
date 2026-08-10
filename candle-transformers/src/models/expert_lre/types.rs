@@ -31,12 +31,24 @@ pub struct PipelineStats {
     pub expert_hits: usize,
     /// Expert cache misses (loaded from pinned or mmap).
     pub expert_misses: usize,
-    /// Experts evicted from VRAM (drip + end-of-pass).
+    /// Experts evicted from VRAM (drip + end-of-pass). A drop, not a copy —
+    /// the cold tier already holds every expert, so there is no matching
+    /// device-to-host transfer to count.
     pub evictions: usize,
-    /// H2D DMA transfers (pinned → VRAM).
+    /// H2D DMA transfers into VRAM, from either host tier.
     pub dma_loads: usize,
-    /// D2H DMA transfers (VRAM → pinned).
-    pub dma_evicts: usize,
+    /// Loads served by the warm tier (H2D from pinned host memory).
+    pub warm_loads: usize,
+    /// Loads that missed both resident tiers and read the pack file.
+    pub cold_loads: usize,
+    /// **Gauge**, not a tally: experts the warm tier holds, of the model's
+    /// total. Reported beside the load counts because the two only make sense
+    /// together — a cold-load count is a verdict on this number, and reading
+    /// them in different places is how a warm tier sized at a third of the model
+    /// went unnoticed while it sent two thirds of every miss to disk.
+    pub warm_slots: usize,
+    /// Experts in the model, so `warm_slots` reads as a fraction.
+    pub total_experts: usize,
     /// Speculative prefetch loads that landed in VRAM.
     pub prefetch_loads: usize,
     /// Hint-driven speculative loads.
@@ -73,14 +85,16 @@ impl PipelineStats {
             .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
-    /// Reset all counters to zero. `resident_vram_bytes` is a live gauge, not a
-    /// per-interval tally, so it survives the reset (otherwise an inline-mode
-    /// cache — which never re-seeds it via a classify — would read 0 forever).
+    /// Reset the per-interval tallies. The three **gauges** —
+    /// `resident_vram_bytes`, `warm_slots`, `total_experts` — survive it: they
+    /// describe the cache's shape rather than what it did since the last reset,
+    /// and an inline-mode cache (which never re-seeds them via a classify) would
+    /// otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
-            let resident = s.resident_vram_bytes;
+            let gauges = (s.resident_vram_bytes, s.warm_slots, s.total_experts);
             *s = Self::default();
-            s.resident_vram_bytes = resident;
+            (s.resident_vram_bytes, s.warm_slots, s.total_experts) = gauges;
         }
     }
 

@@ -117,6 +117,11 @@ pub struct ModelBuilder {
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
     /// by default ⇒ every layer defaults to `DropConversation`.
     layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
+    /// Directory for the persistent repacked expert pack.
+    ///
+    /// `None` (the default) uses a temp file, unlinked as soon as it is open, so
+    /// nothing is left on disk and the repack is paid on every start.
+    expert_pack_dir: Option<PathBuf>,
 }
 
 impl ModelBuilder {
@@ -143,8 +148,30 @@ impl ModelBuilder {
             workspace_path: None,
             disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
+            expert_pack_dir: None,
             spec,
         }
+    }
+
+    /// Keep the repacked expert pack in `dir` instead of a temp file.
+    ///
+    /// The pack is the expert cache's cold tier: every expert, in the layout the
+    /// kernels consume, so an eviction from VRAM can be a drop rather than a
+    /// copy (`docs/expert_cache_design.md`). It is a pure function of the
+    /// checkpoint, so a persistent one lets a restart skip the ~42 s repack and
+    /// map straight to serving.
+    ///
+    /// The natural argument is the GGUF's own directory: one pack is then shared
+    /// by every workspace using that checkpoint, it survives a substrate wipe,
+    /// and it is deleted by the same act that deletes the model. Unset, the pack
+    /// goes to a temp file that is unlinked the moment it is open — an embedder,
+    /// an example or a test must never have a 16.6 GiB file appear beside its
+    /// model without asking.
+    ///
+    /// MoE-only; the other architectures have no expert cache and ignore it.
+    pub fn expert_pack_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.expert_pack_dir = Some(dir.into());
+        self
     }
 
     /// Set the per-layer corrupt-turn policy map (from the projection schema).
@@ -658,8 +685,20 @@ impl ModelBuilder {
                 )?))
             }
             ModelArch::Qwen3Moe => {
-                use candle_transformers::models::quantized_qwen3_moe::ModelWeights;
-                let raw = ModelWeights::from_gguf_by_path(model_path, device, progress)?;
+                use candle_transformers::models::quantized_qwen3_moe::{
+                    GgufLoadOptions, ModelWeights,
+                };
+                // The only arch with an expert cache, so the only one the pack
+                // directory reaches.
+                let raw = ModelWeights::from_gguf_with_options(
+                    model_path,
+                    device,
+                    progress,
+                    GgufLoadOptions {
+                        int8mode: None,
+                        expert_pack_dir: self.expert_pack_dir.clone(),
+                    },
+                )?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
                         "model missing rope inv_freq".into(),

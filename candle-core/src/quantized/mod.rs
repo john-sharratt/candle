@@ -762,8 +762,7 @@ impl GgmlDType {
     /// KV-side Rust `QType` in `candle_kernels/src/simple/quantized.rs`,
     /// the matmul-side Rust `QType` in `candle_kernels/src/quantized/api.rs`,
     /// and every `qtype: i32` FFI argument — all use `GgmlDType as u32`.
-    #[allow(dead_code)]
-    pub(crate) fn from_u32(u: u32) -> Result<Self> {
+    pub fn from_u32(u: u32) -> Result<Self> {
         let dtype = match u {
             0 => Self::F32,
             1 => Self::F16,
@@ -823,8 +822,7 @@ impl GgmlDType {
     ///
     /// ⚠ This is NOT the GGUF/GGML on-disk file-format code.  Use
     /// `to_gguf_file_code` when writing integers to GGUF/GGML files.
-    #[allow(dead_code)]
-    pub(crate) fn to_u32(self) -> u32 {
+    pub fn to_u32(self) -> u32 {
         self as u32
     }
 

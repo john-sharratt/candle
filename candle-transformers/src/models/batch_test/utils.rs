@@ -1678,8 +1678,26 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.dma_loads)),
             ),
             (
-                "DMA evicts (D2H)",
-                Box::new(|s: &PipelineStats| format!("{}", s.dma_evicts)),
+                "Warm tier slots",
+                Box::new(|s: &PipelineStats| {
+                    if s.total_experts == 0 {
+                        format!("{}", s.warm_slots)
+                    } else {
+                        format!(
+                            "{} ({:.0}%)",
+                            s.warm_slots,
+                            100.0 * s.warm_slots as f64 / s.total_experts as f64
+                        )
+                    }
+                }),
+            ),
+            (
+                "Warm loads (RAM)",
+                Box::new(|s: &PipelineStats| format!("{}", s.warm_loads)),
+            ),
+            (
+                "Cold loads (pack)",
+                Box::new(|s: &PipelineStats| format!("{}", s.cold_loads)),
             ),
             (
                 "Evictions",

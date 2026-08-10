@@ -38,19 +38,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
 
-# Direct-I/O cold-load reader: positional ReadFile / OVERLAPPED on Windows,
-# pread64 + O_DIRECT on Linux. Windows needs windows-sys for the Win32
-# ReadFile + OVERLAPPED bindings; Linux needs libc for the O_DIRECT flag.
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-] }
-
 [dev-dependencies]
 anyhow = { workspace = true }
 half = { workspace = true }

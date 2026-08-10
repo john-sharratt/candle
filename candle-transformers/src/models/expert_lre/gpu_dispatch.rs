@@ -10,7 +10,7 @@
 //!
 //! Built at cache construction, after the (synchronous) prewarm has staged
 //! every expert into its final VRAM slot: for the threaded/mmap cache that is
-//! `ExpertCache::new` after `startup_two_tier`, for the reader path
+//! `ExpertCache::new` after the startup fill, for the reader path
 //! `new_prepopulated`. Both hold the slot map by value at that point, so no
 //! cross-thread choreography is needed. Construction is best-effort: any
 //! anomaly (a missing expert, a non-uniform shape or dtype, a non-CUDA slot)
@@ -261,6 +261,7 @@ mod tests {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            warm_backed: vec![],
         }
     }
 
@@ -343,6 +344,7 @@ mod tests {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            warm_backed: vec![],
         };
         assert!(
             GpuDispatchTables::build(&inner, &cuda).is_none(),

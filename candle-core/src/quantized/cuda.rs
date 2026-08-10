@@ -161,9 +161,21 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     unsafe {
         // CU_MEMHOSTALLOC_DEVICEMAP = 0x02
+        // The size and the standing pinned total are in the message because an
+        // out-of-memory without them is unactionable: pinned allocations fail
+        // against what every *other* pinned claim in the process has already
+        // taken, and the amount asked for is the only clue to which caller this
+        // was.
         sys::cuMemHostAlloc(&mut host_ptr, size, 0x02)
             .result()
-            .map_err(|e| crate::Error::Msg(format!("cuMemHostAlloc failed: {:?}", e)))?;
+            .map_err(|e| {
+                crate::Error::Msg(format!(
+                    "cuMemHostAlloc failed for {:.1} MiB (pinned already held: {:.1} GiB): {:?}",
+                    size as f64 / (1024.0 * 1024.0),
+                    crate::vram::host_pinned_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                    e,
+                ))
+            })?;
         let mut dev_ptr: sys::CUdeviceptr = 0;
         let res = sys::cuMemHostGetDevicePointer_v2(&mut dev_ptr, host_ptr, 0);
         if let Err(e) = res.result() {

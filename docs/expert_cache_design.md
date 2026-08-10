@@ -1,15 +1,16 @@
 # The Expert Cache — VRAM ↔ RAM ↔ NVMe
 
-> **Status — Design, not built.** Replaces the two-tier VRAM↔pinned-RAM expert
-> cache (`candle-transformers/src/models/expert_lre/`) with a three-tier one
-> whose cold tier is authoritative. The change is motivated by a specific defect:
-> the current tiers are **mutually exclusive**, which forces eviction to be a
-> device-to-host *copy* and makes VRAM residency a function of how much host RAM
-> was allocated. §2 is that defect; §3 is the shape that removes it.
+> **Status — Built.** Replaces the two-tier VRAM↔pinned-RAM expert cache
+> (`candle-transformers/src/models/expert_lre/`) with a three-tier one whose cold
+> tier is authoritative. The change is motivated by a specific defect: the old
+> tiers were **mutually exclusive**, which forced eviction to be a device-to-host
+> *copy* and made VRAM residency a function of how much host RAM was allocated.
+> §2 is that defect; §3 is the shape that removes it; §12 is what the build
+> settled that the design left open.
 >
 > Every number in this document is measured on the RTX 4090 Mobile 16 GB dev
-> machine with Qwen3-30B-A3B unless it says otherwise, and §10 lists what is
-> **not** measured and must be before building.
+> machine with Qwen3-30B-A3B unless it says otherwise. §10 listed what had to be
+> measured before building; §12.1 records what the tree already answered.
 
 ---
 
@@ -62,10 +63,24 @@ contains. **It is pure waste, and it exists only because of the exclusive-or.**
 
 Because `pinned_occupied = total_experts − vram_slots` always, and the pool is a
 single `cuMemAllocHost` that never grows, VRAM can never hold fewer experts than
-`total_experts − pinned_capacity`. Measured: 6144 − 4004 = **2140 slots**, a
-floor nothing in the code states or enforces.
+`total_experts − pinned_capacity`. That is a hard floor on VRAM residency set by
+a host allocation, and it runs the dependency backwards: how far the *device*
+boundary may move is decided by how much *host* RAM was claimed at startup.
+
+The floor moved twice while this defect stood, which is itself the argument.
+Originally the pool was sized `total − vram + vram/10` from the boundary's
+**opening** position — 4004 slots, floor 6144 − 4004 = **2140**, and nothing in
+the code stated or enforced it, so a retraction could walk straight past it and
+destroy experts (`docs/elastic_vram_partition.md` §13c). The elastic-partition
+commit `d2cecd84` then inverted the derivation, sizing the pool from a *chosen*
+floor instead — `min_vram_expert_slots = total/4` plus churn, so 4864 slots and
+**14.1 GB** of pinned host memory on a 31.5 GB machine. That is the better of the
+two and still the wrong shape: the machine spends host RAM in proportion to how
+far the boundary *might* move, whether it moves or not.
 
 ### 2.3 The eviction budget and the swap depth are the same slots
+
+At the boundary's opening position, under the original sizing:
 
 ```
 pinned capacity           4004
@@ -81,10 +96,16 @@ Those 237 free slots are simultaneously:
 - the **entire budget** for the elastic VRAM boundary
   (`docs/elastic_vram_partition.md`) to retract
 
-They trade one for one. The pool was sized `total − vram + vram/10`, so the "10%
-headroom" is almost exactly the two layers of churn the pipeline needs — leaving
-**nothing** for the boundary. A live rebuild confirmed it: the retraction asked
-for 4436 regions and delivered `relocated=0 evicted=0`.
+They trade one for one, and the "10% headroom" is almost exactly the two layers
+of churn the pipeline needs — leaving **nothing** for the boundary. A live
+rebuild confirmed it: the retraction asked for 4436 regions and delivered
+`relocated=0 evicted=0`.
+
+Sizing from the floor bought headroom rather than removing the conflict:
+4864 − 3767 = 1097 free, less `CHURN_RESERVE_LAYERS × 128 = 256` reserved, leaves
+~841 slots — about 2.4 GB of concession, paid for with 2.5 GB *more* pinned RAM
+than the version that could concede nothing. **The two uses still share one pool,
+and the pool is still the price of both.**
 
 ### 2.4 It produces states with no answer
 
@@ -106,9 +127,9 @@ always be answerable is the wrong model.
 ## 3. The shape
 
 ```text
-cold    repacked file, .substrate/experts.pack     authoritative, write-once, all 6144
-warm    pinned host RAM                            static, immutable, stratified subset
-hot     VRAM                                       dynamic cache, eviction = drop
+cold    <gguf dir>/<model>.<id>.experts.pack   authoritative, write-once, all 6144
+warm    pinned host RAM                        static, immutable, stratified subset
+hot     VRAM                                   dynamic cache, eviction = drop
 ```
 
 Disk is not a fallback state an expert degrades into. It is where every expert
@@ -219,6 +240,13 @@ one contiguous blob per expert, not the original GGUF tensors. Three reasons:
 3. **It decouples the hot path from the checkpoint format.** Reading the original
    would make GGUF packing decisions into cache performance regressions.
 
+The record layout **is** the VRAM slot layout — same three projections at the
+same aligned offsets — so a load is one read and three copies with nothing
+rearranged in between, and the same code path serves a warm promotion and a cold
+miss. Records are padded to a 4 KiB sector because the reads bypass the page
+cache (§12.1), which also makes the warm pool's slots the right size to be read
+into directly.
+
 ### 5.2 Where it lives — and why not `.substrate/`
 
 **Not under `.substrate/`.** The pack is a pure function of the *checkpoint*; the
@@ -299,6 +327,64 @@ uninvited.
 
 ---
 
+### 5.6 The pack is checked against the formula that wrote it
+
+Every other field of the pack's identity describes the **input**: which
+checkpoint, which numeric mode, which record geometry. None describes the
+**function**. Change how the repack lays bytes out at unchanged sizes, offsets
+and dtypes — a different permutation, a moved rounding step, a fixed bug — and
+every one of those checks still passes. The stale pack is reused and the model
+serves subtly wrong weights for its whole expert set, silently, across restarts
+and substrate wipes, until someone notices the outputs drifted.
+
+A version constant does not close this, because it depends on whoever changed
+the formula remembering to bump it — and the failure of that memory is exactly
+the case worth defending against. **So the check runs the formula instead.**
+
+At startup, a fixed table of `(source dtype → target dtype)` pairs is swept: every
+quantisation an expert weight can arrive as, repacked every way the engine can
+repack it — straight to the gemx K/128 layout, and to each of the KO twins the
+two int8 modes select. Each pair gets a deterministic reference matrix; the
+outputs are hashed together into `repack_fp`, which the header carries and every
+open compares.
+
+Three properties make it worth its ~36 small repacks:
+
+- **The inventory is part of the hash.** Adding a dtype, removing one, or
+  changing which twin a mode selects moves the fingerprint even when every byte
+  of every repack is unchanged. A pair the repack *refuses* hashes as a refusal,
+  so gaining support for a type invalidates old packs too.
+- **It covers types this model does not contain.** The sweep is a property of the
+  build, not the run. A binary that repacks Q5_K differently is stale whether or
+  not today's checkpoint has a Q5_K tensor in it — which matters because the next
+  checkpoint might.
+- **The reference data cannot go NaN.** Every byte of the pattern is ≤ 60, so no
+  `f16` scale read out of it can have an all-ones exponent. A
+  dequantise-requantise path would otherwise hash NaN payload bits, which are not
+  guaranteed stable, and the fingerprint would drift on its own.
+
+### 5.7 Records carry a checksum, checked in bulk
+
+Each record's `fletcher32` goes in a trailer after the records — a trailer
+because the writer streams 16.6 GiB and never seeks, so the only place a value
+known *after* writing a record can go is the end.
+
+It is verified on the **bulk** path: the startup fill, where thousands of records
+land at once, the cores are idle waiting on the drive, and the work parallelises.
+It is **not** verified on the per-miss cold read, and that is measured rather
+than assumed. A `fletcher32` over 2.9 MB costs about as much as the read it
+follows, on the pipeline thread, in front of a forward that is waiting for it:
+with it there the gate lost **more than half its throughput** — 723 → 299 t/s on
+the narrowest config — to insure ~850 records per config.
+
+What the trailer defends is the *medium* — bit rot, a bad sector, a truncating
+filesystem — on a file that lives beside the checkpoint for as long as the
+checkpoint does. It is not defending against a half-written pack (the writer
+publishes by rename, so an incomplete one is never visible) or against two
+writers colliding (§12.7). The residual exposure is one unverified expert of
+6,144 in a layer that sums eight of them, against a checkpoint that carries no
+per-tensor checksum of its own.
+
 ## 6. The warm tier — static, stratified, immutable
 
 The warm tier is filled **once**, at startup, and never changes. No eviction
@@ -312,7 +398,7 @@ and never cleared. A warm tier with an eviction policy could not make that
 promise, and the residency struct would need the two fields kept in step against
 a policy that moves underneath it.
 
-### 6.1 Why a random subset is the right default
+### 6.1 Why a random subset is the right default — over the right pool
 
 A uniform random subset of size *X*% yields **X% hit rate on accesses**,
 whatever the popularity distribution: each access lands on some expert, and each
@@ -324,6 +410,24 @@ VRAM, so the accesses that reach RAM are *misses*: the long tail. The tail is fa
 flatter than the head, and random sampling of a flat distribution is close to
 optimal. The property that would normally make random naive is exactly what makes
 it sound here — it sits behind a tier that has already skimmed the skew.
+
+**But that same sentence names the pool the draw must run over, and the first
+build got it wrong.** If VRAM has already skimmed the skew, then the experts VRAM
+*holds* are not part of the miss stream at all, and a warm slot spent on one buys
+nothing until that expert is evicted. Drawing uniformly over all 6,144 spent 36 %
+of the tier on guaranteed hits.
+
+The startup fill takes the first `vram_slots` experts in flat `(layer, expert)`
+order, so the pool the draw should run over is everything past that prefix — and
+the tier only has to be the size of VRAM's *complement*, not of the model, to
+cover every miss. On Qwen3-30B-A3B that is 3,767 experts rather than 6,144: it
+turns "hold the whole model in RAM" from a requirement into a nicety. The
+two-tier cache had this property for free, by construction, because pinned *was*
+the complement; this is the one thing the exclusive-or was buying, and it has to
+be re-bought deliberately.
+
+Slots past the complement are not wasted — they insure VRAM-resident experts
+against eviction — but they are the second call on the tier, not the first.
 
 ### 6.2 Why the sample is stratified per layer
 
@@ -353,6 +457,49 @@ spare, and `cuMemAllocHost` refusing is the answer to "was that too much".
 
 This is the change §2.3 makes possible: pinned capacity stops being
 `total_experts − vram_slots` and becomes free.
+
+**Free is not the same as arbitrary, and "what the machine can spare" has a
+precise meaning that took two wrong answers to find.** It is not a *share* of
+spare RAM — the first build took half, left 2,241 of 6,144 experts warm, and sent
+64 % of every miss to disk. And it is not measured against *total* RAM either: a
+dev box with an editor and a browser open is 12 GB down before the process
+starts, so a tier sized against the total succeeds by consuming every free page
+and leaves the next pinned allocation in the same process to fail with
+`CUDA_ERROR_OUT_OF_MEMORY` — which is what a 46 MB staging ring did.
+
+The rule that survives contact:
+
+```text
+ask for   every expert
+bounded by min(what the machine is big enough for, what it has free now − headroom)
+backed by cuMemAllocHost halving on refusal
+```
+
+with the headroom (3 GiB) reserved for everything the process allocates *after*
+the warm tier — the staging ring, the routing buffer, the substrate's pinned
+cold-load scratch, the `PinnedStager` arenas, and the warm KV tier. Pinned pages
+cannot be reclaimed under pressure, so a tier that fits by exactly nothing does
+not degrade, it fails.
+
+### 6.3.1 The tier does not have to hold the model, and past a point should not
+
+On the dev box the tier lands at **4,979 of 6,144 experts (81 %)** — 14.4 GB of
+the 17.8 GB the whole set needs — because ~17.7 GB is free at load time with an
+editor and a browser running, not because 31.5 GiB is too small. It would hold
+everything on an idle machine, and does trivially on the production box.
+
+**That shortfall costs almost nothing, and closing it further costs more than it
+saves.** Two mechanisms make the difference: the draw covers VRAM's complement
+first (§6.1), so every miss is covered at startup; and eviction weighs what a
+reload costs (§12.6), so VRAM keeps the experts the tier could not take. Together
+they hold cold reads to 4 % of loads at 81 % coverage.
+
+Lowering the headroom to 1 GiB was measured. The tier grew to 5,090 slots and
+cold loads halved (986 → 435) — and **throughput did not improve**: flat to 1–2 %
+down, single-stream falling further. Past the knee, pinned pages come out of the
+page cache and the warm KV tier, and the reads they save are no longer on the
+critical path. The tier's job is to cover the miss stream, not to mirror the
+model.
 
 ### 6.4 Refinements deliberately not taken yet
 
@@ -483,3 +630,249 @@ never reclaim, and it competes with the page cache holding the same file (§10.3
 unfavourably, the right answer may be no warm tier: read the pack file and let
 the OS cache it. That would be a *simpler* system than this document describes,
 and it should be allowed to win.
+
+---
+
+## 12. What the build settled
+
+### 12.1 §10's first three questions were already answered in the tree
+
+The measurements §10 asks for were framed as unknowns. Two of them are not: the
+substrate's cold-load path had already met them and written the answers down.
+
+**§10.1 — disk→VRAM is not direct on this platform, and the tree says so.**
+`candle-conversation/src/persistence/cold_load.rs` states it outright: GPUDirect
+Storage depends on the `nvidia-fs` kernel module NVIDIA does not ship for
+Windows, and `libcufile` is not in the Windows CUDA Toolkit. DirectStorage is a
+D3D12 API and not reachable from CUDA. So `Disk → VRAM` is
+`disk → host buffer → VRAM`, exactly as suspected.
+
+**§10.3 — the page cache is not a free warm tier here; it is the thing that had
+to be bypassed.** The honest baseline §10.3 proposes — no explicit warm tier,
+let the OS cache the pack — is the configuration the substrate already tried and
+abandoned. Through the ordinary buffered path a read into `cuMemAllocHost`'d
+memory caps at **~7–10 MB/s** on Windows. `direct_io.rs` exists because of that:
+`FILE_FLAG_NO_BUFFERING` / `O_DIRECT` positioned reads into a sector-aligned
+pinned buffer, at the device's real sequential bandwidth.
+
+That module is now `candle-core/src/direct_io.rs` rather than a private module of
+the persistence layer. The expert cache sits *below* `candle-conversation` in the
+crate graph and could not reach it where it was written, and a second
+implementation of the Windows `ReadFile`+`OVERLAPPED` path was the alternative.
+It moved unchanged, with its tests.
+
+**§10.2, §10.4 and §10.5 remain open**, and none of them gates the build: they
+size the warm tier, and §6.3 makes that a number the machine chooses rather than
+a constant to get right. On the production box — NVMe RAID faster than the bus —
+the answer may well be to size it to zero, which §11 already allowed.
+
+### 12.2 The pack replaces the repack on every boot but the first
+
+A consequence §5.4 predicted and the build confirms in shape: with a persistent
+pack, startup reads only the experts it is going to place — the VRAM fill and the
+warm membership — and touches the GGUF's expert regions not at all. The ~42 s
+repack becomes a read. `zend` passes the GGUF's own directory, so its packs
+persist; the batched-forwarding gate does the same, because it reloads the model
+once per invocation while iterating.
+
+### 12.3 The warm tier is sized from the machine, and that is where the RAM went
+
+§6.3 says the warm tier is sized by what can be spared. What that turns out to
+mean on the dev box is the point of the whole change:
+
+| | before (`d2cecd84`) | after |
+|---|---|---|
+| pinned expert pool | 14.1 GB, fixed by `total − total/4 + churn` | half of what is spare after weights and the OS |
+| what sets it | how far the boundary might retract | how much RAM the machine has |
+| KV warm budget (`host_ram_budget`) | negative — pinned + mmap exceeded RAM | the other half |
+
+`candle::vram::host_ram_budget` computes the warm-KV budget as
+`total − pinned − weights_mmap − os_keep`. With a 14.1 GB pinned pool and a
+17.3 GB mapped checkpoint on a 31.5 GB machine, that was negative: the expert
+cache was consuming the KV warm tier's entire budget as a side effect of a
+residency floor nobody had asked for. Sizing the warm tier from spare RAM instead
+hands those bytes back, and `cuMemAllocHost` halving on refusal means the number
+does not have to be right, only close.
+
+### 12.4 Removing the cap exposed a missing quiesce at the boundary
+
+The gate found it, once in four runs: `CUDA_ERROR_ILLEGAL_ADDRESS` on the widest
+config (`Q4_0`, 20 contexts) — the only one that puts enough KV pressure to make
+the boundary move a long way. The other fifteen passed, and so did three
+subsequent runs of the same binary, which is the signature of an ordering hazard
+rather than a wrong address.
+
+**The bug is not in this document's design; it is one the design's success
+reaches.** The KV side quiesces before re-tenanting a *recycled* region
+(`region_pool::claim_region`), because a region on its free list may still be
+under read by a kernel launched earlier. Ground arriving from the weight side is
+not recycled — it is **fresh**, claimed by advancing `pool.next` past a ceiling
+that has just moved — and that path has no wait at all. That was correct for as
+long as it stood: while the concession was capped at free pinned slots, the
+ceiling never moved over ground an expert had been sitting on, so a fresh region
+had genuinely never been anyone's.
+
+With the cap gone it moves over gigabytes of it. `renegotiate_boundary` runs at
+end of pass, and "the pass ended" means its expert GEMMs were *issued*, not that
+they retired — so publishing a lower floor lets the KV side memset bytes those
+GEMMs are still reading. The fault then surfaces in whatever unrelated kernel is
+running when it lands, which is why it looks random.
+
+The fix is a device-wide synchronize on **both** directions of the handover,
+immediately before the new floor is published and before newly-taken regions can
+be filled. A GPU-side `cudaStreamWaitEvent` cannot do this job: it orders two
+streams we know about, while the readers include the persistence thread's copy
+stream, and the *host* is what has to know the ground is quiet before it tells
+the other side it may have it. It is the same quiesce `claim_region` performs,
+for the same reason, at the one place where memory changes side.
+
+It costs a full drain, paid only when the boundary actually moves.
+
+**The general form is worth stating**: a cap that keeps a mechanism from
+operating also keeps its hazards untested. The three guards
+`docs/elastic_vram_partition.md` §13c added were correct, and they were also the
+reason that document could report the boundary as working while it had never
+moved a byte.
+
+### 12.5 The regression, and the three things that fixed it
+
+The first build of this design was **30 % slower than the two-tier cache it
+replaced**, on every config. It is now faster than that cache on every config,
+and the gap between those two statements is the most useful thing in this
+document.
+
+| config | two-tier (before) | three-tier, first build | three-tier, now |
+|---|---|---|---|
+| F16 × 1 | 377.5 | 389.1 | **708.1** (+87 %) |
+| BF16 × 1 | 509.4 | 455.1 | **780.6** (+53 %) |
+| BF16 × 10 | 1931.4 | 1626.1 | **2726.1** (+41 %) |
+| Q8_0 × 20 | 2448.1 | 1596.0 | **2732.5** (+12 %) |
+| Q4_0 × 4 | 1800.5 | 1368.9 | **2329.9** (+29 %) |
+| C0 × 2 | 961.0 | 818.4 | **1424.0** (+48 %) |
+| C5 × 2 | 940.1 | 830.7 | **1442.3** (+53 %) |
+| C9 × 2 | 951.4 | 833.7 | **1463.1** (+54 %) |
+| Q4_0 × 20 | 2423.4 | 1655.0 | **2735.1** (+13 %) |
+
+t/s aggregate, `test_parallel_batched_forwarding`, RTX 4090 Mobile,
+Qwen3-30B-A3B. Single-stream t/s rose 20–35 % alongside.
+
+**What was wrong was never the architecture — it was that the tier which makes
+the architecture affordable had been sized by three separate guesses.** The
+diagnostic that found it was a single counter pair, `warm_loads` / `cold_loads`,
+added to the stats table: 15,993 cold against 9,089 warm on Q8_0 × 20 says
+immediately that two thirds of every miss is a synchronous NVMe read, and no
+amount of profiling around the edges says it as fast. That is why the warm
+tier's *size* is now reported in the same table as its hit rate — a cold-load
+count is a verdict on that number, and reading the two in different places is
+exactly how this went unnoticed.
+
+Three fixes, in order of what they bought:
+
+1. **Size against available RAM, ask for every expert** (§6.3). 2,241 → 4,979
+   slots. Cold loads on Q8_0 × 20: 15,993 → 4,038.
+2. **Draw the membership from VRAM's complement** (§6.1). The tier now covers
+   the entire miss stream at startup instead of spending a third of itself on
+   experts VRAM already holds.
+3. **Put the reload cost in the eviction score** (§12.6). Cold loads 4,038 →
+   986, and +11 % on the widest config.
+
+And one thing that was simply in the way: the loader was still calling
+`register_mmap_cuda`, pinning all 18.6 GB of the GGUF so H2D copies out of it
+would not bounce. For a dense model that is right — the mapping *is* the weight
+source. Here the experts move to the pack at startup and what stays live is the
+dense tensors and the embedding table, so it was locking 18.6 GB, non-pageable,
+for the process lifetime, in direct competition with the tier that keeps expert
+loads off the disk. The MoE loader no longer registers it, and separately no
+longer declares the GGUF's expert regions to the host-RAM budget as resident
+weight bytes — they are read once, to build the pack, and never again.
+
+### 12.6 Eviction learned what a reload costs
+
+A mechanism the design did not anticipate, and which only exists because the
+tiers stopped being exclusive.
+
+The two-tier cache had one reload cost: every expert not in VRAM was in pinned
+RAM *by construction*, so every eviction was worth the same and the score could
+be pure temperature. Under three tiers an expert either has a warm copy — ~116 µs
+H2D at PCIe bandwidth — or it does not, and comes back as a 2.9 MB
+page-cache-bypassing NVMe read near a millisecond. An eviction policy blind to
+that difference is choosing at random between outcomes an order of magnitude
+apart.
+
+So `slot_eviction_score` is now `frequency × position × reload_cost`, with
+`reload_cost` ∈ {1, 4} by whether the warm tier holds the expert. The cache then
+converges on the right shape without anyone specifying it: **VRAM drifts toward
+holding what is expensive to re-acquire, the warm tier covers what is cheap, and
+the experts that churn are the ones whose churn costs least.**
+
+The 4 is measured, not derived. The cost ratio is nearer 8, and at 8 the term
+stops tilting the ordering and starts replacing it — cold-only experts are held
+past the point their temperature justifies, hit rate falls (44.8 % → 44.3 % on
+Q8_0 × 20), and every config was slower than at 4.
+
+### 12.7 What the code review found
+
+Six defects, none of them in the shape of the design and all of them in what the
+build had to decide for itself.
+
+**Mandatory-and-small must allocate before elastic-and-large.** The cold-tier
+staging ring (46 MB, required) was allocated *after* the warm tier (~14 GB,
+elastic, halves itself when refused). On a machine the warm tier had just filled
+— the reuse path immediately after a run that wrote 16.6 GiB, so the page cache
+was full and `avail_phys` read high — the 46 MB failed and the model load died
+with `CUDA_ERROR_OUT_OF_MEMORY`. It should have been a slightly smaller warm
+tier. Reversing the order is the fix and it made the tier *bigger*, not smaller
+(5,100 slots against 4,979), because the warm sizing now runs against a machine
+whose mandatory allocations are already accounted. A sector-aligned host
+fallback inside the ring is the belt: it must never be a plain `Vec`, whose
+alignment `FILE_FLAG_NO_BUFFERING` rejects.
+
+**Geometry validates where the bytes go, not what they are.** §5's identity —
+GGUF length, a 4 MiB checksum, and the record geometry — misses a repack that
+emits *different bytes* at identical sizes, offsets and dtypes: a changed
+permutation, moved rounding in the quantizer. That pack validates and serves
+subtly wrong weights for the model's entire expert set, silently, and survives a
+substrate wipe. §5.6 is the answer, and it is stronger than the one this review
+first got: a reference sweep over every quantisation rather than a probe of the
+one expert this model happens to start with.
+
+**Nothing checked the record bytes against the medium.** §5.7 adds a per-record
+checksum in a trailer, verified on the bulk fill. Deliberately *not* on the
+per-miss cold read: with it there the gate lost more than half its throughput,
+which is the wrong price for insuring a derived cache against a failure the
+checkpoint it derives from is not insured against.
+
+**A shared pack needs a private temp file.** §5.2 puts the pack beside the
+checkpoint precisely so several workspaces share one, and the pack's name is a
+pure function of that checkpoint — so the fixed `.partial` sibling was the same
+path for every process that decided to build it. Two daemons starting together
+interleave their writes into one file and both rename it into place; the header
+is written first and is identical, so the result validates. The temp name now
+carries the pid and a nanosecond stamp.
+
+**An all-resident cache wants no warm tier.** When VRAM holds every expert
+nothing is ever evicted — `post_compute` returns before the eviction and boundary
+passes — so a warm slot could only be read by a load that misses, and none does.
+The old two-tier code had this guard (`if all_resident { 0 }`) and the rewrite
+dropped it, pinning the model's size in host RAM to serve nothing and paying a
+full-pack read at startup for it.
+
+**`O_DIRECT` does not exist on Apple targets.** `libc` does not define it, so
+naming it under `cfg(unix)` is a build failure rather than a slow path — and
+`direct_io` is now in `candle-core`, which is every crate's dependency. Linux
+keeps `O_DIRECT`; other unixes open buffered, which is correct but cached.
+
+**A cuda build has no CPU expert path, and should say so at load.** The rewrite
+made this an error where it had been a silent success followed by a panic on the
+first MoE layer — but the doc still advertised a non-CUDA path and the caller
+still built a plausible-looking host-side `WeightZone` for it. Both are gone, and
+the message now names the reason and the two ways out.
+
+### 12.8 Ephemeral packs are unlinked while open, not deleted on drop
+
+§5.2 asks for "a temp file unlinked at exit". The build takes the older and more
+robust reading: the pack is unlinked **immediately after it is opened for
+reading**, and stays fully readable through the open handles until the process
+ends. Unix has always allowed this; Windows does too, because `std::fs` opens
+with `FILE_SHARE_DELETE`. Nothing is left behind however the process ends —
+including a kill, which no drop handler survives.

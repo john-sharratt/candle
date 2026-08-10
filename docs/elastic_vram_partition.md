@@ -728,6 +728,7 @@ Per the repo's standing rule, these are replaced rather than kept alongside:
 | `GovernorConfig::balloon_target_frac`, `balloon_floor` | One reserve, one expression (§5). |
 | `region_pool::kv_span_from` / `kv_span_target` / `floor_deficit` | The span is everything; there is no partition arithmetic left to get wrong. |
 | `TRANSIENT_SPAN_BYTES` as a fixed carve | The transient extent is per-wave. |
+| The retraction cap against free pinned slots, `handle::CHURN_RESERVE_LAYERS`, `min_vram_expert_slots`, and the "weight side cannot concede" refusal | All four existed only to keep a retraction from destroying experts that had nowhere to go. The expert cache's cold tier now holds every expert always (`docs/expert_cache_design.md`), so an eviction is a bookkeeping change and a retraction has no destination to find. §13c's constraint is gone with them. |
 
 `scratch_margin` survives as `pool_cushion`, renamed to say what it is: the
 memory left *outside* the reservation for the CUDA pool, not a cushion held
@@ -1221,6 +1222,28 @@ needs a destination slot. `docs/expert_cache_design.md` is the fix — a cold ti
 that always holds a copy, so eviction becomes a drop — and it is a **prerequisite
 for this design, not an optimisation of it**. Everything below is what was built
 to stop the limit doing damage while it stands.
+
+> **That limit no longer stands.** The three-tier expert cache is built. Eviction
+> is `residency.vram = None`, the concession is uncapped, and the retraction's
+> range is the full `[MIN_ELASTIC_RESERVE, max_slots]` span this document was
+> written to deliver. The guards described in "Three defects" below were correct
+> against the cache as it was; two of the three are deleted with it, and the
+> paragraphs are kept because the *reasoning* — that a boundary must never move
+> further than the data behind it can survive — is what the new invariant
+> discharges rather than what it makes irrelevant.
+>
+> **And the boundary moving for the first time found a hazard §8 does not
+> cover.** `claim_region` quiesces before re-tenanting a *recycled* region, but a
+> region arriving from the weight side is claimed on the **fresh** path, which
+> has no wait — safe only for as long as the ceiling never moved over ground an
+> expert had occupied, which the cap guaranteed. A retraction publishes the new
+> floor while the pass's expert GEMMs are issued but not retired, so the KV side
+> could memset bytes still under read. Both directions of the handover now sit
+> behind a device-wide synchronize
+> (`expert_lre::pipeline::quiesce_before_handover`); see
+> `docs/expert_cache_design.md` §12.4. **A cap that stops a mechanism operating
+> also stops its hazards being found** — which is why this document could report
+> the boundary as working while it had never moved a byte.
 
 ### Three defects the gate could never have found
 

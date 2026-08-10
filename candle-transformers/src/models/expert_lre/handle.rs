@@ -16,11 +16,19 @@ use super::compute::compute_experts_grouped;
 #[cfg(feature = "cuda")]
 use super::gpu_dispatch::GpuDispatchTables;
 #[cfg(feature = "cuda")]
-use super::pinned::{ExpertLocation, LayerGeometry, PinnedPool};
+use super::pack::{
+    open_or_create, repack_fingerprint, LayerSpansInput, PackIdentity, PackSource, PackSpec,
+    RecordLayout,
+};
+#[cfg(feature = "cuda")]
+use super::pinned::{stratified_membership, ExpertResidency, WarmPool};
 #[cfg(not(feature = "cuda"))]
 use super::pipeline::prewarm_expert_cache;
 #[cfg(feature = "cuda")]
-use super::pipeline::startup_two_tier;
+use super::pipeline::{
+    slot_bytes_for, slot_offsets, startup_from_pack, startup_repack, ColdStaging, StartupTargets,
+    COLD_STAGING_BUFFERS,
+};
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 use super::transition::TransitionMatrix;
 use super::types::{
@@ -29,6 +37,7 @@ use super::types::{
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]
@@ -38,40 +47,99 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
-// Pinned pool sizing
+// Warm tier sizing
 // ============================================================================
 
-/// Layers' worth of experts the pinned pool keeps free for the swap pipeline.
+/// The seed for the warm tier's stratified draw.
 ///
-/// A swap is evict-then-load: moving an expert VRAM→pinned **consumes** a free
-/// pinned slot, and the matching pinned→VRAM load gives one back. Net zero, but
-/// the pool needs slack for the turnover — at zero free slots there is no way to
-/// evict to make room to load, nor to load to make room to evict.
-///
-/// One layer is the batch bound: `evict_for_prefetch_batch` is asked for as many
-/// experts as a layer is short, and a layer has `experts_per_layer` of them. Two
-/// covers the prefetch running a layer ahead
-/// ([`super::cache::PREFETCH_EVICT_WINDOW`] looks back that far for candidates).
-///
-/// This is reserved *from the boundary*, not shared with it — the two competing
-/// for one pool is what made a retraction able to stall the pipeline.
-pub(crate) const CHURN_RESERVE_LAYERS: usize = 2;
+/// Fixed rather than random so that two runs of the same build on the same model
+/// warm the same experts: a change in expert-cache hit rate is then attributable
+/// to the change under test, not to which experts got lucky at startup.
+const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 
-/// The smallest number of experts VRAM may hold, as a fraction of the model.
+/// Host RAM left unclaimed by the warm tier, for everything the process needs
+/// after it.
 ///
-/// This is the **design input** the pinned pool is sized from, and therefore the
-/// real answer to "how far can the boundary move". A quarter of the model leaves
-/// the weight side able to give up three quarters of its residency to the KV
-/// side for a wide prefill, and take it back for decode.
+/// The warm tier is the single largest host allocation the engine makes and the
+/// first one it makes, so whatever it takes, the rest of the process must live
+/// in what remains — the cold-tier staging ring, the routing buffer, the
+/// substrate's pinned cold-load and elevate scratch (192 MiB between them), the
+/// `PinnedStager` arenas, and the warm **KV** tier's pageable arenas.
 ///
-/// It is a choice, not a measurement, and it is bounded by host RAM: every slot
-/// of shrink range costs one pinned slot, so lowering it trades host RAM for
-/// VRAM roughly one for one. That is the trade the two-tier design exists to
-/// make — host RAM is the plentiful side — but it is not free, and
-/// `cuMemAllocHost` refusing at load is how a machine says the fraction is too
-/// low for it.
-fn min_vram_expert_slots(total_experts: usize) -> usize {
-    total_experts / 4
+/// Sizing the tier to the last free page is what makes this necessary: pinned
+/// pages cannot be reclaimed under pressure, so a warm tier that fits by exactly
+/// nothing leaves the next allocation to fail instead of merely running slower.
+/// That happened — a 46 MB staging ring failed with `CUDA_ERROR_OUT_OF_MEMORY`
+/// immediately after a warm pool sized against *total* RAM took every free page
+/// on a machine with 12 GB already in use by other processes.
+///
+/// **3 GiB rather than the ~250 MiB those allocations actually total, because
+/// the tier is past its knee well before it runs out of room.** Lowering this to
+/// 1 GiB was measured: the tier grew from 4,979 slots to 5,090, cold loads
+/// halved (986 → 435), and throughput did not improve — flat to 1–2 % down, with
+/// single-stream t/s falling further (204.5 → 197.0). Once the draw covers
+/// VRAM's complement (§6.1) the remaining cold reads are not the bottleneck, and
+/// pinned pages taken past that point are taken from the page cache and the warm
+/// KV tier, which this gate barely exercises and a daemon workload does. When
+/// the performance argument is a wash, the safety argument decides.
+const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
+
+/// How many warm slots to ask for: **every expert the machine will actually
+/// give room for.**
+///
+/// The target is the whole model. A miss that reaches the cold tier is a
+/// synchronous NVMe read on the pipeline thread, so the warm tier is not an
+/// optimisation over the pack — it is what keeps the pack off the critical path.
+/// The first build of this sized it as a *share* of spare RAM (half), which left
+/// 2,241 of 6,144 experts warm and sent **64 % of every miss to disk**;
+/// aggregate throughput fell by a third against the two-tier cache it replaced.
+///
+/// The bound is **available** RAM, not total. Total is what the machine has;
+/// available is what it will give, and on a dev box with an editor and a browser
+/// open the two differ by 12 GB. `host_ram_budget` reasons in totals because its
+/// other callers ask "is this machine big enough for this model", which is a
+/// question about the machine. This one is "may I have these pages now", which
+/// is a question about this moment.
+///
+/// `cuMemAllocHost` remains the authority — [`WarmPool::new`] halves on refusal
+/// — but a refusal costs half the tier, so the first ask should be one that can
+/// succeed.
+fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
+    if stride == 0 {
+        return 0;
+    }
+    let (Some(total_ram), Some(available)) = (
+        candle::vram::total_physical_ram(),
+        candle::vram::available_physical_ram(),
+    ) else {
+        // No probe on this platform: take no warm tier rather than guess at a
+        // number that could be most of the machine. Every expert is still
+        // served, from the pack.
+        tracing::warn!(
+            target: "candle_transformers::expert_lre",
+            "warm tier: no host-RAM probe on this platform; running cold-tier only"
+        );
+        return 0;
+    };
+    let budget = candle::vram::host_ram_budget(total_ram);
+    // Two ceilings, both real: what the machine is big enough for, and what it
+    // has free this second.
+    let affordable = budget
+        .kv_warm_budget_bytes
+        .min(available.saturating_sub(WARM_TIER_HEADROOM)) as usize;
+    let slots = (affordable / stride).min(total_experts);
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        total_gib = total_ram as f64 / 1e9,
+        available_gib = available as f64 / 1e9,
+        budgeted_gib = budget.kv_warm_budget_bytes as f64 / 1e9,
+        weights_gib = budget.weights_reserved_bytes as f64 / 1e9,
+        take_gib = (slots * stride) as f64 / 1e9,
+        slots,
+        of = total_experts,
+        "warm tier: sized against available RAM"
+    );
+    slots
 }
 
 // ============================================================================
@@ -197,30 +265,55 @@ unsafe impl Send for PinnedRoutingBuffer {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for PinnedRoutingBuffer {}
 
+/// Everything [`ExpertCache::new`] needs, gathered rather than passed as nine
+/// positional arguments.
+///
+/// `zone` is the weight side of the device reservation, already sized: its
+/// capacity **is** the resident-expert count. There is no budget arithmetic left
+/// at this level — `VramGovernor::expert_budget` used to divide bytes by
+/// `max_expert_size` here, and the zone's capacity is that same quotient taken
+/// once, against a span whose extent is a fact rather than a forecast.
+pub struct ExpertCacheSetup<'a> {
+    /// The GGUF, mapped. Read only while the pack is being built.
+    pub mmap: Arc<memmap2::Mmap>,
+    /// Per-`[layer][expert]` byte ranges into that mapping.
+    pub host_refs: Vec<Vec<MmapExpertRef>>,
+    /// The weight side of the device reservation.
+    pub zone: WeightZone,
+    pub device: &'a Device,
+    pub experts_per_layer: usize,
+    /// The checkpoint the experts come from — names the pack and identifies it.
+    pub gguf_path: &'a std::path::Path,
+    /// Where a persistent pack lives, or `None` for a temp file that is
+    /// unlinked as soon as it is open and costs a repack every boot.
+    pub expert_pack_dir: Option<&'a std::path::Path>,
+    pub progress: Option<&'a dyn Fn(usize, usize)>,
+    pub int8mode: Int8Mode,
+}
+
 impl ExpertCache {
     /// Create a new expert cache with a background pipeline thread.
     ///
-    /// **CUDA path (two-tier):** GPU-repacks every expert from GGUF to K/128,
-    /// fills VRAM slots first, overflows to a pinned host-memory pool.
-    /// After startup the GGUF mmap is no longer needed.
+    /// **CUDA path:** opens the pack file for this checkpoint — building it by
+    /// repacking every expert out of the GGUF if there is not already a matching
+    /// one — then fills the warm and hot tiers from it. After startup the GGUF's
+    /// expert regions are never read again. Requires an actual CUDA device: a
+    /// cuda-feature build handed a CPU device fails here rather than later.
     ///
-    /// **Non-CUDA path:** fills VRAM from mmap (legacy GGML path).
-    #[allow(clippy::too_many_arguments)]
-    /// `zone` is the weight side of the device reservation, already sized: its
-    /// capacity **is** the resident-expert count. There is no budget arithmetic
-    /// left at this level — `VramGovernor::expert_budget` used to divide bytes by
-    /// `max_expert_size` here, and the zone's capacity is that same quotient
-    /// taken once, against a span whose extent is a fact rather than a forecast.
-    pub fn new(
-        mmap: Arc<memmap2::Mmap>,
-        host_refs: Vec<Vec<MmapExpertRef>>,
-        zone: WeightZone,
-        device: &Device,
-        experts_per_layer: usize,
-        _gguf_path: Option<&std::path::Path>,
-        progress: Option<&dyn Fn(usize, usize)>,
-        int8mode: candle::quantized::Int8Mode,
-    ) -> Result<Self> {
+    /// **Non-CUDA builds** (`not(feature = "cuda")`) take a separate path
+    /// entirely, filling from the mmap with no pack and no warm tier.
+    pub fn new(setup: ExpertCacheSetup<'_>) -> Result<Self> {
+        let ExpertCacheSetup {
+            mmap,
+            host_refs,
+            zone,
+            device,
+            experts_per_layer,
+            gguf_path,
+            expert_pack_dir,
+            progress,
+            int8mode,
+        } = setup;
         let num_moe_layers = host_refs.len();
         let num_slots = zone.capacity();
         let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
@@ -288,93 +381,171 @@ impl ExpertCache {
             );
         }
 
-        // ── CUDA two-tier startup ──
+        // ── CUDA startup: the pack, then the two resident tiers from it ──
         #[cfg(feature = "cuda")]
-        let (pinned_pool, expert_locations, layer_geometries, all_resident) =
+        let (pack, warm, cold_staging, residency, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
                 let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
-
-                // **Size the pinned pool for the smallest VRAM residency the
-                // boundary may ever reach, not for the one it happens to open
-                // at.**
-                //
-                // An expert is in VRAM or pinned and nowhere else, so
-                // `pinned_occupied = total_experts − vram_slots` at all times.
-                // Shrink VRAM and pinned occupancy grows one for one — but the
-                // pool is a single `cuMemAllocHost` that never grows, so
-                // whatever slack it opens with is the *entire* budget for the
-                // boundary to move.
-                //
-                // Sizing it from `num_slots` (the opening position) made that
-                // budget accidental: it came out as 10% of wherever the boundary
-                // started, and that 10% is also the swap pipeline's in-flight
-                // depth — `evict_for_prefetch_batch` takes up to a layer's worth
-                // at a time, with prefetch running a layer or two ahead. The two
-                // uses shared one pool, so on a live rebuild the retraction asked
-                // for thousands of regions, found the churn slack was all there
-                // was, and delivered nothing.
-                //
-                // Sizing it from the *floor* instead makes the dependency run one
-                // way: pick how small the weight side may get, and the pool is
-                // whatever guarantees every expert has somewhere to be at that
-                // extreme, plus churn depth on top. Above the floor the pool
-                // simply carries empty slots, which is exactly what headroom
-                // looks like.
-                //
-                // The allocation is the feasibility test. There is no need to ask
-                // the OS what is available — `cuMemAllocHost` either succeeds or
-                // it does not, and pinned pages are non-pageable, so a refusal is
-                // a real answer and not a hint. Failure propagates and the
-                // process stops at load with the numbers in the message.
                 let total_experts = num_moe_layers * experts_per_layer;
                 let all_resident = num_slots >= total_experts;
-                let num_pinned = if all_resident {
-                    0
-                } else {
-                    let floor = min_vram_expert_slots(total_experts);
-                    let churn = CHURN_RESERVE_LAYERS * experts_per_layer;
-                    total_experts.saturating_sub(floor) + churn
-                };
-                let slot_size = geoms
+
+                // **The GGUF's expert regions become dead pages here.** They are
+                // read once — streaming, to build the pack — and never again:
+                // every later load comes from the pack, the warm pool, or VRAM.
+                // The loader declared the whole mapping as resident weight
+                // bytes, which is right for a dense model where the mmap *is*
+                // the weight source, and wrong here by 16.6 GiB of a 18.6 GB
+                // file. That reservation is subtracted from the host-RAM budget
+                // the warm tier is then sized out of, so leaving it in place
+                // does not merely misreport — it takes the RAM away from the
+                // tier whose whole job is to stop those pages being needed.
+                let expert_source_bytes: u64 = host_refs
                     .iter()
-                    .map(|g| g.total_repacked_size)
-                    .max()
-                    .unwrap_or(0);
-
-                let mut pool = PinnedPool::new(num_pinned, slot_size)?;
-
-                // Initialize location tracking. Every expert starts as `Pinned { slot_idx: 0 }`;
-                // `startup_two_tier` below overwrites each entry with its real resident-VRAM or
-                // pinned-slot location as it repacks the weights.
-                let mut locations: Vec<Vec<ExpertLocation>> = Vec::with_capacity(num_moe_layers);
-                for _ in 0..num_moe_layers {
-                    let mut layer_locs = Vec::with_capacity(experts_per_layer);
-                    for _ in 0..experts_per_layer {
-                        layer_locs.push(ExpertLocation::Pinned { slot_idx: 0 });
-                    }
-                    locations.push(layer_locs);
-                }
-
-                // Run startup: GGUF → GPU repack → VRAM or pinned.
-                startup_two_tier(
-                    &mut inner,
-                    &mut pool,
-                    &mut locations,
-                    &geoms,
-                    &mmap,
-                    &host_refs,
-                    cuda_dev,
-                    progress,
+                    .flatten()
+                    .map(|r| (r.gate_len + r.up_len + r.down_len) as u64)
+                    .sum();
+                let live_weight_bytes = (mmap.len() as u64).saturating_sub(expert_source_bytes);
+                candle::vram::set_weights_mmap(live_weight_bytes);
+                tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    mapped_gib = mmap.len() as f64 / 1e9,
+                    dead_gib = expert_source_bytes as f64 / 1e9,
+                    live_gib = live_weight_bytes as f64 / 1e9,
+                    "expert cache: the GGUF's expert pages are the pack's job now"
                 );
 
-                (pool, locations, geoms, all_resident)
+                // The pack's record layout **is** the VRAM slot's layout: same
+                // three projections, same aligned offsets. One geometry, so a
+                // load is a read and a copy with nothing rearranged in between.
+                let slot_bytes = slot_bytes_for(&geoms);
+                let layers: Vec<LayerSpansInput> = geoms
+                    .iter()
+                    .map(|g| {
+                        let (gate, up, down, _) = slot_offsets(g);
+                        LayerSpansInput {
+                            gate: (gate, g.gate_repacked_size, g.gate_dtype),
+                            up: (up, g.up_repacked_size, g.up_dtype),
+                            down: (down, g.down_repacked_size, g.down_dtype),
+                        }
+                    })
+                    .collect();
+                let layouts: Vec<RecordLayout> =
+                    layers.iter().copied().map(RecordLayout::from).collect();
+                // Run the repack over a reference matrix in every quantisation
+                // the engine supports, and hash it. The pack's validity is then
+                // checked against what this build *produces* and not only
+                // against where it would put it — see `pack::fingerprint`.
+                let source = open_or_create(PackSpec {
+                    dir: expert_pack_dir,
+                    gguf_path,
+                    identity: PackIdentity::of(&mmap, int8mode, repack_fingerprint(cuda_dev)),
+                    num_layers: num_moe_layers,
+                    experts_per_layer,
+                    slot_bytes,
+                    layers,
+                })?;
+
+                // The warm tier is sized by what the machine can spare, not by
+                // what residency demands — the cold tier serves every expert at
+                // any warm size, including zero.
+                let stride = candle::direct_io::round_up_sector(slot_bytes);
+                // **Before the warm tier, not after.** This is 46 MB and
+                // mandatory; the warm tier is ~14 GB and elastic. Taking the
+                // elastic one first left this to fail on a machine the warm
+                // tier had just filled — a model load dying with
+                // `CUDA_ERROR_OUT_OF_MEMORY` where it should have been a
+                // slightly smaller warm tier. The order is the fix; the
+                // aligned-host fallback inside is the belt.
+                let cold_staging = ColdStaging::new(stride, COLD_STAGING_BUFFERS)?;
+                // **A cache that holds every expert in VRAM wants no warm tier
+                // at all.** Nothing is ever evicted in that state — `post_compute`
+                // returns before the eviction and boundary passes — so a warm
+                // slot could only ever be read if a load missed, and no load
+                // does. Sizing it anyway would pin the model's size in host RAM
+                // to serve nothing, and pay a full-pack read at startup for it.
+                let want_warm = if all_resident {
+                    0
+                } else {
+                    warm_slots_for(stride, total_experts)
+                };
+                // `num_slots` is exactly what the startup fill will take into
+                // VRAM, in flat order, so it is the prefix the draw skips over.
+                let membership = stratified_membership(
+                    num_moe_layers,
+                    experts_per_layer,
+                    want_warm,
+                    num_slots,
+                    WARM_DRAW_SEED,
+                );
+                let mut warm = WarmPool::new(membership.len(), stride);
+                // A refusal shortens the draw rather than leaving slots the pool
+                // does not have: `ram` must never name a slot outside it.
+                let membership = &membership[..membership.len().min(warm.num_slots())];
+
+                let mut residency =
+                    vec![vec![ExpertResidency::default(); experts_per_layer]; num_moe_layers];
+                // The eviction policy weighs what a reload would cost, so it has
+                // to know which experts the warm tier holds before the first
+                // victim is chosen.
+                inner.set_warm_backed(membership);
+                let targets = StartupTargets {
+                    inner: &mut inner,
+                    warm: &mut warm,
+                    residency: &mut residency,
+                    membership,
+                    geoms: &geoms,
+                    layouts: &layouts,
+                    stride,
+                };
+                let pack = match source {
+                    PackSource::Ready(pack) => {
+                        startup_from_pack(
+                            targets,
+                            &pack,
+                            num_moe_layers,
+                            experts_per_layer,
+                            cuda_dev,
+                            progress,
+                        )?;
+                        pack
+                    }
+                    PackSource::Build(mut writer) => {
+                        startup_repack(
+                            targets,
+                            &mut writer,
+                            &mmap,
+                            &host_refs,
+                            cuda_dev,
+                            progress,
+                        )?;
+                        writer.finish()?
+                    }
+                };
+
+                // The pack's stride is what the geometry said it would be — the
+                // buffers above were cut to it before the file was opened.
+                debug_assert_eq!(pack.stride(), stride);
+                (pack, warm, cold_staging, residency, geoms, all_resident)
             } else {
-                // Non-CUDA device — empty pinned pool + empty locations.
-                let pool = PinnedPool::empty();
-                let locations: Vec<Vec<ExpertLocation>> = Vec::new();
-                let geoms: Vec<LayerGeometry> = Vec::new();
-                let all_resident = num_slots >= num_moe_layers * experts_per_layer;
-                (pool, locations, geoms, all_resident)
+                // **A cuda-feature build has no expert path for a CPU device,
+                // and never had one.** Every tier is device-side or DMA-bound:
+                // the hot tier is weight-zone slots, the warm tier is pinned
+                // host memory the GPU reads, the pack's records are uploaded
+                // with `cuMemcpyHtoD`. The `not(feature = "cuda")` build has a
+                // separate mmap path (`prewarm_expert_cache`); this build does
+                // not, and cannot borrow it — the zone it would fill has no
+                // device reservation behind it.
+                //
+                // This used to construct an empty pool and empty tables and
+                // return successfully, which meant the load *appeared* to work
+                // and the first MoE layer panicked indexing an empty
+                // per-layer table. Failing here says the same thing at the
+                // point where it can still be acted on.
+                candle::bail!(
+                    "MoE expert cache: this build has CUDA compiled in but was given {device:?}. \
+                     The expert tiers are all device-side or DMA-bound, so there is no CPU path — \
+                     run on a CUDA device, or build without the `cuda` feature for the mmap path."
+                )
             };
 
         // ── Non-CUDA prewarm path ──
@@ -413,6 +584,8 @@ impl ExpertCache {
             );
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;
+                s.warm_slots = warm.num_slots();
+                s.total_experts = num_moe_layers * experts_per_layer;
             }
         }
 
@@ -439,9 +612,13 @@ impl ExpertCache {
             #[cfg(feature = "cuda")]
             copy_stream,
             #[cfg(feature = "cuda")]
-            pinned_pool,
+            pack,
             #[cfg(feature = "cuda")]
-            expert_locations,
+            warm,
+            #[cfg(feature = "cuda")]
+            cold_staging,
+            #[cfg(feature = "cuda")]
+            residency,
             #[cfg(feature = "cuda")]
             layer_geometries,
             num_moe_layers,
@@ -515,6 +692,9 @@ impl ExpertCache {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            // Inline mode holds every expert in VRAM and never evicts, so no
+            // reload cost is ever weighed.
+            warm_backed: vec![],
         };
         // All experts are VRAM-resident and never move, so their weight
         // addresses are static: capture them once into device pointer tables

@@ -99,6 +99,105 @@ pub fn host_perf() -> Option<HostPerf> {
     None
 }
 
+/// `MEMORYSTATUSEX` — the layout `GlobalMemoryStatusEx` fills. Fixed since
+/// Windows 2000; `length` must be set to the struct's own size before the call.
+#[cfg(windows)]
+#[repr(C)]
+struct MemoryStatusEx {
+    length: u32,
+    memory_load: u32,
+    total_phys: u64,
+    avail_phys: u64,
+    total_page_file: u64,
+    avail_page_file: u64,
+    total_virtual: u64,
+    avail_virtual: u64,
+    avail_extended_virtual: u64,
+}
+
+#[cfg(windows)]
+fn memory_status() -> Option<MemoryStatusEx> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut s = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut s) };
+    (ok != 0).then_some(s)
+}
+
+/// Total physical RAM in bytes, or `None` where the platform has no probe here.
+///
+/// The *level* [`host_ram_budget`] needs as its denominator. Read from the
+/// machine rather than passed in because the expert cache decides its warm tier
+/// before any caller with a `sysinfo` handle is in scope.
+#[cfg(windows)]
+pub fn total_physical_ram() -> Option<u64> {
+    memory_status().map(|s| s.total_phys).filter(|&b| b > 0)
+}
+
+/// Physical RAM the OS says is available **right now**, or `None` where the
+/// platform has no probe here.
+///
+/// Distinct from [`total_physical_ram`] in the way that matters to anyone about
+/// to take a large non-pageable allocation: total is what the machine has, this
+/// is what it will actually give. A dev box with an editor, a browser and a
+/// language server open can be 12 GB down before the process starts, and a
+/// pinned pool sized against the total then succeeds by consuming every free
+/// page — leaving the *next* pinned allocation in the same process to fail.
+///
+/// Windows counts free + standby (reclaimable cache) pages, Linux's
+/// `MemAvailable` is the kernel's own estimate of the same thing.
+#[cfg(windows)]
+pub fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|s| s.avail_phys).filter(|&b| b > 0)
+}
+
+#[cfg(target_os = "linux")]
+pub fn available_physical_ram() -> Option<u64> {
+    meminfo_field("MemAvailable:")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn available_physical_ram() -> Option<u64> {
+    None
+}
+
+/// One field of `/proc/meminfo`, in bytes.
+#[cfg(target_os = "linux")]
+fn meminfo_field(key: &str) -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        // "MemTotal:       32873416 kB"
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb * 1024);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn total_physical_ram() -> Option<u64> {
+    meminfo_field("MemTotal:")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn total_physical_ram() -> Option<u64> {
+    None
+}
+
 /// Pages read from disk per second since the previous call, derived from the
 /// cumulative counter. First call (and any call after a probe failure) returns
 /// `None` — a rate needs two samples. Callers poll at their own cadence; the
@@ -148,8 +247,11 @@ pub fn pages_in_per_sec() -> Option<f64> {
 /// it capped — a machine that cannot hold its model resident must swap by
 /// definition, and the budget states that instead of hiding it.
 ///
-/// Dev box: `31.5 − 11.05 pinned − 17.3 weights − 2 os = ~1.15 GiB` of warm
-/// budget — small but real. 186 GB box: `186 − 12 − 18 − 2 ≈ 154 GiB`.
+/// Dev box, expert tier resident: `31.5 − 14.4 pinned − 0.7 weights − 1 os
+/// ≈ 15.4 GiB` of warm budget. The weights term is small because the MoE loader
+/// declares only the GGUF's *live* pages — its expert regions move to the pack
+/// file at startup and are never read again. 186 GB box:
+/// `186 − 12 − 18 − 1 ≈ 155 GiB`.
 #[derive(Debug, Clone, Copy)]
 pub struct HostRamBudget {
     pub total_bytes: u64,
@@ -176,21 +278,20 @@ fn buffer_pct() -> u64 {
     })
 }
 
-/// Fixed OS floor inside the non-weights region: `CANDLE_HOST_RAM_OS_KEEP_MB`,
-/// default 2 GiB. Keeps warm-KV growth from starving the OS itself; everything
-/// else in the buffer region is warm KV's to use.
-fn os_keep_bytes() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_HOST_RAM_OS_KEEP_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&mb| mb > 0)
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(2 * 1024 * 1024 * 1024)
-    })
-}
+/// Fixed OS floor inside the non-weights region: keeps warm-KV growth from
+/// starving the OS itself. Everything else in the buffer region is warm KV's to
+/// use.
+///
+/// It bounds the warm **KV** tier and nothing else — the expert cache's warm tier
+/// is bounded by available RAM, which on every machine measured is far tighter,
+/// so this never reaches it.
+///
+/// 1 GiB rather than 2: warm-KV arenas are pageable, so this floor is a
+/// throttle on growth rather than a guard against failure — the failure mode it
+/// prevents is paging, which `pages_in_per_sec` measures directly and after the
+/// fact. A GiB is enough for the OS on any machine that can host this engine at
+/// all, and the GiB it releases goes to the tier that has a use for it.
+const OS_KEEP_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Pure budget arithmetic — see [`HostRamBudget`]. Exposed separately from
 /// [`host_ram_budget`] so both machines' numbers pin down in unit tests without
@@ -229,7 +330,7 @@ pub fn host_ram_budget(total_ram: u64) -> HostRamBudget {
         super::host_pinned_bytes(),
         super::weights_mmap_bytes(),
         buffer_pct(),
-        os_keep_bytes(),
+        OS_KEEP_BYTES,
     )
 }
 
@@ -262,24 +363,41 @@ mod tests {
     /// caps the weights only (they fit: 17.3 < 31.5 − 9.45); warm KV then gets
     /// what pinned + weights + the OS floor leave — small but REAL, not zero.
     #[test]
-    fn dev_box_gets_a_small_real_warm_budget() {
+    fn dev_box_gets_a_real_warm_budget() {
+        // The dev box with the expert cache resident: 14.4 GiB pinned for the
+        // warm expert tier, and only the GGUF's *live* pages declared as
+        // weights — its expert regions move to the pack file at startup and are
+        // never read again, so declaring the whole 17.3 GiB mapping (which this
+        // test used to) reserved RAM for bytes nothing faults back in.
         let total = (31.5 * GIB as f64) as u64;
-        let pinned = (11.05 * GIB as f64) as u64;
-        let weights = (17.3 * GIB as f64) as u64;
-        let b = host_ram_budget_from(total, pinned, weights, 30, 2 * GIB);
+        let pinned = (14.4 * GIB as f64) as u64;
+        let weights = (0.7 * GIB as f64) as u64;
+        let b = host_ram_budget_from(total, pinned, weights, 30, OS_KEEP_BYTES);
         assert_eq!(
             b.buffer_bytes,
             total / 100 * 30,
             "30% of 31.5 > 4 GiB floor"
         );
         assert!(!b.weights_capped);
-        let expect = total - pinned - weights - 2 * GIB;
-        assert_eq!(b.kv_warm_budget_bytes, expect);
+        assert_eq!(
+            b.kv_warm_budget_bytes,
+            total - pinned - weights - OS_KEEP_BYTES
+        );
         assert!(
-            b.kv_warm_budget_bytes > GIB && b.kv_warm_budget_bytes < 2 * GIB,
-            "~1.15 GiB expected, got {}",
+            b.kv_warm_budget_bytes > 15 * GIB,
+            "the warm KV tier should have real room once the pack owns the \
+             expert bytes, got {}",
             b.kv_warm_budget_bytes
         );
+    }
+
+    /// The OS floor is a constant, not a knob. It bounds warm **KV** growth
+    /// only — the expert cache's warm tier is bounded by available RAM, which is
+    /// far tighter — so a change here is a change to how much the KV tier may
+    /// take before it starts paging.
+    #[test]
+    fn the_os_floor_is_one_gib() {
+        assert_eq!(OS_KEEP_BYTES, GIB);
     }
 
     /// The 186 GB box: weights fully reserved and a huge warm budget remains —

@@ -1,20 +1,25 @@
-//! Direct-I/O reader for the cold-load fast path.
+//! Direct-I/O reader: positioned reads that bypass the OS page cache.
 //!
-//! The cold-load fast path reads a turn's worth of chunk records (10s of
-//! MB, typically one coalesced stripe) into a pageable host scratch in
-//! the [`ColdLoadStager`](super::cold_load::ColdLoadStager). Through the
-//! normal `seek + read_exact` path that read goes through the OS page
-//! cache, which on Windows in particular caps NVMe sequential reads at
-//! ~7–10 MB/s when the destination is `cuMemHostAlloc`'d (and even with
-//! the pageable two-step landing pad we still pay the cache-fill round
-//! trip).
+//! Two subsystems read large, sector-aligned records off NVMe straight
+//! into host memory the GPU will DMA from: the substrate's cold-load
+//! path (`candle-conversation`, chunk records) and the expert cache's
+//! cold tier (`candle-transformers`, one repacked expert per record).
+//! Both want the same thing and neither can get it from
+//! `seek + read_exact`, which goes through the page cache — on Windows
+//! that caps NVMe sequential reads at ~7–10 MB/s when the destination is
+//! `cuMemHostAlloc`'d, and even with a pageable landing pad it still pays
+//! the cache-fill round trip.
 //!
-//! This module replaces that read path with **direct I/O** — bypass the
-//! page cache entirely so the NVMe controller DMAs straight into the
-//! caller's aligned host buffer — and uses **per-stripe scoped threads**
+//! This module is **direct I/O** — the NVMe controller DMAs straight into
+//! the caller's aligned host buffer — plus **per-stripe scoped threads**
 //! to keep multiple NVMe submissions in flight at once. The disk-bound
 //! step then runs at the device's actual sequential bandwidth (multi-GB/s
 //! on a Gen4/Gen5 SSD).
+//!
+//! It lives in `candle-core` because it is an OS primitive with no
+//! knowledge of what the bytes mean, and because the expert cache sits
+//! below `candle-conversation` in the crate graph and so could not reach
+//! it where it was first written.
 //!
 //! ## Alignment requirements
 //!
@@ -26,10 +31,11 @@
 //!
 //! We hardcode the alignment to **4 KiB** ([`DIRECT_IO_SECTOR`]). Modern
 //! NVMe drives expose a 4 KiB logical sector; older 512 e drives
-//! over-align to 4 KiB harmlessly. Our records are already padded to
-//! 4 KiB on disk ([`super::record::ALIGN`] = 4096), so stripe offsets
-//! and stripe lengths fall on sector boundaries naturally. Buffer
-//! addresses are aligned by [`AlignedScratch`] below.
+//! over-align to 4 KiB harmlessly. Both callers pad their records to
+//! 4 KiB on disk, so stripe offsets and stripe lengths fall on sector
+//! boundaries naturally. Buffer addresses are aligned by
+//! [`AlignedScratch`] below, or by `cuMemAllocHost`, which returns
+//! page-aligned memory.
 //!
 //! ## Cross-platform
 //!
@@ -47,7 +53,7 @@ use std::path::Path;
 
 /// Sector size we align every direct-I/O read to. 4 KiB covers every
 /// modern NVMe sector size (512 e, 4 Kn, 4 KiB logical) and matches the
-/// on-disk record padding ([`super::record::ALIGN`]).
+/// on-disk record padding both callers use.
 pub const DIRECT_IO_SECTOR: usize = 4096;
 
 /// Maximum NVMe queue depth a single [`DirectFile`] will keep in flight.
@@ -67,11 +73,11 @@ pub const DIRECT_IO_SECTOR: usize = 4096;
 /// single handle through a serialised IRP queue. So [`DirectFile`]
 /// opens this many handles up front and each worker thread reads
 /// through its own. Per-handle cost on open is ~5–50 µs; one-time at
-/// substrate open.
+/// open.
 pub const MAX_CONCURRENT_READS: usize = 16;
 
 /// A sector-aligned host scratch buffer — the destination for direct-I/O
-/// reads. Grown on demand; reused across cold loads.
+/// reads. Grown on demand; reused across loads.
 ///
 /// Backed by `std::alloc::alloc_zeroed` with a 4 KiB layout so the
 /// buffer's base address satisfies the direct-I/O alignment requirement.
@@ -160,20 +166,24 @@ impl Drop for AlignedScratch {
     }
 }
 
-fn round_up_sector(n: usize) -> usize {
+/// Round `n` up to the next [`DIRECT_IO_SECTOR`] boundary.
+///
+/// Public because a caller laying out records in a file has to pad each
+/// one to the same boundary the reader will demand of it.
+pub fn round_up_sector(n: usize) -> usize {
     (n + DIRECT_IO_SECTOR - 1) & !(DIRECT_IO_SECTOR - 1)
 }
 
 /// One stripe to read: the file offset and a sector-aligned, non-overlapping
-/// destination slice. Built by the caller from the cold-load batch.
+/// destination slice. Built by the caller from its own batch.
 pub struct StripeRead<'a> {
     pub file_offset: u64,
     pub dest: &'a mut [u8],
 }
 
-/// A direct-I/O read handle on a log file — opened with O_DIRECT
-/// (Linux) / FILE_FLAG_NO_BUFFERING (Windows). Independent of the
-/// buffered-write handle held by [`LogFile`]; reads through this handle
+/// A direct-I/O read handle on a file — opened with O_DIRECT
+/// (Linux) / FILE_FLAG_NO_BUFFERING (Windows). Independent of any
+/// buffered-write handle on the same path; reads through this handle
 /// bypass the page cache.
 ///
 /// Holds [`MAX_CONCURRENT_READS`] independent file descriptors on the
@@ -213,9 +223,9 @@ impl DirectFile {
     }
 
     /// Read `dest.len()` bytes at `offset` using a specific handle
-    /// from the pool. The pipeline's reader workers each own a fixed
-    /// handle index so concurrent reads dispatch to independent
-    /// kernel I/O queues (true QD>1 on Windows).
+    /// from the pool. Reader workers each own a fixed handle index so
+    /// concurrent reads dispatch to independent kernel I/O queues (true
+    /// QD>1 on Windows).
     ///
     /// `handle_idx` is taken modulo [`MAX_CONCURRENT_READS`] so
     /// callers can hash arbitrary worker IDs through.
@@ -231,7 +241,7 @@ impl DirectFile {
     }
 
     /// Number of independent file handles the pool owns — also the
-    /// natural reader-thread count for the pipelined cold-load.
+    /// natural reader-thread count for a pipelined load.
     pub fn n_handles(&self) -> usize {
         self.handles.len()
     }
@@ -320,13 +330,31 @@ fn debug_alignment(offset: u64, dest: &[u8]) {
 
 // ── Platform-specific open + pread implementations ──────────────────────
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
         .open(path)
+}
+
+/// Unix without `O_DIRECT` — macOS and the BSDs, where the flag does not exist
+/// (`libc` does not define it for Apple targets at all, so naming it here is a
+/// build failure rather than a slow path).
+///
+/// These platforms open buffered. Reads are correct and the alignment
+/// invariants still hold; what is lost is the cache bypass, so a large read
+/// also populates the page cache it was meant to avoid. Acceptable because
+/// neither is a deployment target for this engine — Windows is the dev machine
+/// and Linux the production one — and a build that does not compile on a
+/// contributor's laptop is worse than one that reads through the cache on it.
+///
+/// macOS could get most of the way there with `fcntl(F_NOCACHE)`; it is not
+/// written here because nothing in reach can test it.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_direct(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new().read(true).open(path)
 }
 
 #[cfg(unix)]
@@ -408,7 +436,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("kvtier_direct_io_{tag}_{nanos}.bin"));
+        p.push(format!("candle_direct_io_{tag}_{nanos}.bin"));
         p
     }
 
@@ -436,6 +464,16 @@ mod tests {
         let ptr = s.as_mut_slice(8 * 4096).as_ptr();
         assert_eq!(ptr as usize % DIRECT_IO_SECTOR, 0);
         assert!(s.capacity() >= 8 * 4096);
+    }
+
+    /// `round_up_sector` is the padding rule a writer must follow for the
+    /// reader's alignment demands to hold.
+    #[test]
+    fn round_up_sector_pads_to_the_next_boundary() {
+        assert_eq!(round_up_sector(0), 0);
+        assert_eq!(round_up_sector(1), DIRECT_IO_SECTOR);
+        assert_eq!(round_up_sector(DIRECT_IO_SECTOR), DIRECT_IO_SECTOR);
+        assert_eq!(round_up_sector(DIRECT_IO_SECTOR + 1), 2 * DIRECT_IO_SECTOR);
     }
 
     /// End-to-end direct-I/O read: write a sector-aligned file

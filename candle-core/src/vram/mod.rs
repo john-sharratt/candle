@@ -39,7 +39,8 @@ mod probe_dxgi;
 pub use budget::GovernorConfig;
 pub use diag::{BudgetRow, BudgetTable};
 pub use host_probe::{
-    host_perf, host_ram_budget, host_ram_budget_from, pages_in_per_sec, HostPerf, HostRamBudget,
+    available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from, pages_in_per_sec,
+    total_physical_ram, HostPerf, HostRamBudget,
 };
 pub use managed::is_oom;
 pub use reading::{BudgetWatchHandle, ProbeKind, VramProbe, VramReading};

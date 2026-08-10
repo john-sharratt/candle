@@ -48,10 +48,10 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
 use super::cold_load::ColdLoadStager;
-use super::direct_io::DirectFile;
 use super::record::{decode_record, ChunkPayload};
 use super::segment::SegmentId;
 use super::SubstratePersistence;
+use candle::direct_io::DirectFile;
 
 /// Cross-thread raw pointer to the pinned scratch's base. Bundled into
 /// a `Send + Sync` wrapper because the bare `*mut u8` would block the

@@ -26,7 +26,6 @@ pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
-pub mod direct_io;
 pub mod elevate;
 pub mod header_index;
 pub mod inherit;
@@ -55,6 +54,7 @@ use thiserror::Error;
 use crate::substrate::Substrate;
 
 use accounting::RecordAccounting;
+use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
@@ -382,7 +382,7 @@ impl SubstratePersistence {
 
     /// The cache-bypassing read handles for the active segment — exposed
     /// for the pipelined cold-load reader pool.
-    pub(super) fn active_direct_file(&self) -> &direct_io::DirectFile {
+    pub(super) fn active_direct_file(&self) -> &DirectFile {
         self.segments.active_direct_file()
     }
 
@@ -390,12 +390,12 @@ impl SubstratePersistence {
     /// the caller for the duration of one cold-load. The GPU pipeline holds
     /// several of these at once (a turn spanning a seal), so they are opened
     /// directly rather than borrowed from the read pool.
-    pub(super) fn open_sealed_direct(&self, segment: SegmentId) -> Result<direct_io::DirectFile> {
+    pub(super) fn open_sealed_direct(&self, segment: SegmentId) -> Result<DirectFile> {
         self.segments.open_sealed_direct(segment)
     }
 
     /// The cache-bypassing read handles for the `i`-th inherited log.
-    pub(super) fn inherited_direct_file(&self, i: usize) -> &direct_io::DirectFile {
+    pub(super) fn inherited_direct_file(&self, i: usize) -> &DirectFile {
         self.inherited[i].direct_file()
     }
 
