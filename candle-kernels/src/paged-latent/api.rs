@@ -101,10 +101,13 @@ extern "C" {
         headers_ptr: *const u8,
         o_ptr: *mut c_void,
         q_pos: *const u32,
-        // This layer's just-computed latents [fresh_rows, 512] bf16, keyed at
-        // positions fresh_base + j (FP8-round-tripped in-kernel so key bits
-        // match what future waves read from the arena). Null when fresh_rows=0.
-        kv_fresh: *const c_void,
+        // [total_q] which prefill seq each query belongs to (selects its arena
+        // slot header + fresh-diagonal slice — the whole prefill fleet in one launch).
+        seq_of: *const u32,
+        // All prefill seqs' just-computed latents packed [total_new, 512] bf16,
+        // keyed at positions new_meta[s].base + j (FP8-round-tripped in-kernel so
+        // key bits match what future waves read from the arena).
+        kv_new: *const c_void,
         // Two-region corpus cache (same the decode reads): nope int8 `[G,448]` +
         // per-nope-band scale `[G,14]`, rope pre-rotation bf16 `[G,64]`.
         nope_i8: *const u8,
@@ -136,8 +139,9 @@ extern "C" {
         softmax_scale: f32,
         window_size: i32,
         max_sel: i32,
-        fresh_rows: i32,
-        fresh_base: i32,
+        // [n_seq*4] per-seq new-token diagonal metadata (one uint4 each):
+        // {rows, base, start, -}.
+        new_meta: *const u32,
         num_splits: i32,
         // Writer-chunk float format tag (`ArenaFormat`): the fresh diagonal is
         // fake-quantized to it so its bits match what future waves read from the

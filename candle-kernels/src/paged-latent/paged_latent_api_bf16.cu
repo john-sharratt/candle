@@ -14,10 +14,11 @@
 
 extern "C" void run_paged_latent_prefill_bf16(
     const void* q_ptr,          // [total_q, H, 512] bf16, pre-RoPE
-    const uint8_t* headers_ptr, // SlotHeader[1] (arena holds the committed prefix)
+    const uint8_t* headers_ptr, // SlotHeader[n_seq] (one arena slot per prefill seq)
     void* o_ptr,                // [total_q, H, 512] F32, de-rotated final output
     const uint32_t* q_pos,      // [total_q]
-    const void* kv_fresh,       // [fresh_rows, 512] bf16 pre-RoPE (this layer's latents)
+    const uint32_t* seq_of,     // [total_q] prefill seq index per query
+    const void* kv_new,         // [total_new, 512] bf16 pre-RoPE — this wave's latents (all seqs packed)
     const uint8_t* nope_i8,     // [G, 448] two-region cache: nope int8
     const float* nope_scale,    // [G, 14] per-nope-band scale
     const void* rope_bf,        // [G, 64] rope pre-rotation bf16
@@ -38,20 +39,19 @@ extern "C" void run_paged_latent_prefill_bf16(
     float softmax_scale,
     int32_t window_size,
     int32_t max_sel,
-    int32_t fresh_rows,
-    int32_t fresh_base,
+    const uint32_t* new_meta,    // [n_seq*4] {rows, base, start, -} per seq
     int32_t num_splits,
     int32_t store_fmt,     // writer-chunk float format tag (fresh-diagonal quant)
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     latent_attn::launch_latent_prefill<__nv_bfloat16, 512, 64>(
-        (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr, q_pos,
-        (const __nv_bfloat16*)kv_fresh, (const int8_t*)nope_i8, nope_scale,
+        (const __nv_bfloat16*)q_ptr, headers_ptr, (float*)o_ptr, q_pos, seq_of,
+        (const __nv_bfloat16*)kv_new, (const int8_t*)nope_i8, nope_scale,
         (const __nv_bfloat16*)rope_bf, comp_pos, comp_idx, comp_cnt,
         sinks, rope_tab, partial_acc, partial_ml, (int8_t*)comp_i8, comp_scale,
         (int8_t*)comp_v8, comp_vmax, g_total, total_q, n_q_head, softmax_scale,
-        window_size, max_sel, fresh_rows, fresh_base, num_splits,
+        window_size, max_sel, (const uint4*)new_meta, num_splits,
         store_fmt, stream);
 }
 

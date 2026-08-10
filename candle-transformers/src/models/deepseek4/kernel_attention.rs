@@ -418,12 +418,11 @@ pub struct PrefillProj {
 
 /// The projected + assembled state for ONE prefill sequence
 /// ([`kernel_attn_prefill_assemble`]), consumed by the wave's batched pool +
-/// [`kernel_attn_prefill_select`]. `q_bf`/`kv_bf`/`qr_all`/`xs` are slices (views)
-/// of the batched [`PrefillProj`].
+/// [`kernel_attn_prefill_select`]. `kv_bf`/`qr_all`/`xs` are slices (views)
+/// of the batched [`PrefillProj`]. (The query goes to the batched kernel straight
+/// from `PrefillProj.q_bf`, so no per-seq query slice is kept here.)
 pub struct PrefillPrep {
-    /// Pre-RoPE bf16 query slice `[s, n_heads, HEAD_DIM]`.
-    pub q_bf: Tensor,
-    /// Pre-RoPE bf16 latent slice `[s, HEAD_DIM]` (also the arena writeback source).
+    /// Pre-RoPE bf16 latent slice `[s, HEAD_DIM]` (the arena writeback source).
     pub kv_bf: Tensor,
     /// q-normed low-rank query slice `[1, s, q_lora_rank]` — the indexer query source.
     pub qr_all: Tensor,
@@ -496,8 +495,8 @@ pub fn kernel_attn_prefill_assemble(
     off: usize,
     s: usize,
 ) -> Result<PrefillPrep> {
-    // This sequence's rows (views of the batched projections).
-    let q_bf = proj.q_bf.narrow(0, off, s)?;
+    // This sequence's rows (views of the batched projections). The query is not
+    // sliced — the batched kernel consumes `PrefillProj.q_bf` whole.
     let kv_bf = proj.kv_bf.narrow(0, off, s)?;
     let qr_all = proj.qr_all.narrow(1, off, s)?;
     let xs = proj.xs.narrow(1, off, s)?;
@@ -538,7 +537,6 @@ pub fn kernel_attn_prefill_assemble(
         .collect();
 
     Ok(PrefillPrep {
-        q_bf,
         kv_bf,
         qr_all,
         xs,

@@ -461,7 +461,7 @@ pub fn paged_latent_decode_raw(
 
 /// FP8-E4M3 writer-format tag (`KvFormat::to_tag`) — the single-latent window's
 /// default storage. The synthetic-slot test/bench callers author FP8 slots, so
-/// their fresh diagonal fake-quants to this.
+/// their new-token diagonal fake-quants to this.
 #[cfg(feature = "cuda")]
 pub(crate) fn fp8_store_tag() -> u8 {
     use candle_nn::kv_cache::KvFormat;
@@ -477,7 +477,7 @@ pub fn paged_latent_prefill(
     q: &Tensor,
     headers: &Tensor,
     q_pos: &Tensor,
-    kv_fresh: Option<(&Tensor, usize)>,
+    kv_new: Option<(&Tensor, usize)>,
     cache: &CorpusCache,
     comp_idx: &Tensor,
     comp_cnt: &Tensor,
@@ -487,7 +487,7 @@ pub fn paged_latent_prefill(
     softmax_scale: f32,
     window_size: usize,
     num_splits_override: usize,
-    // Writer-chunk float format tag: the fresh diagonal fake-quants to it.
+    // Writer-chunk float format tag: the new-token diagonal fake-quants to it.
     store_fmt: u8,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
@@ -508,11 +508,27 @@ pub fn paged_latent_prefill(
             _ => candle::bail!("expected CUDA storage for headers"),
         }
     };
+    // Single-seq convenience: build the 1-seq batched arrays (all queries → seq 0)
+    // and dispatch to the batched `_raw`.
+    let total_q = q.dim(0)?;
+    let seq_of = Tensor::zeros(total_q, DType::U32, q.device())?;
+    let (kv_t, rows, base) = match kv_new {
+        Some((t, base)) => (t.clone(), t.dim(0)? as u32, base as u32),
+        None => (
+            Tensor::zeros((1, HEAD_DIM), DType::BF16, q.device())?,
+            0u32,
+            0u32,
+        ),
+    };
+    // 1-seq new-token metadata: {rows, base, start=0, -}.
+    let new_meta = Tensor::from_vec(vec![rows, base, 0u32, 0u32], (1, 4), q.device())?;
     paged_latent_prefill_raw(
         q,
         hdr_ptr,
         q_pos,
-        kv_fresh,
+        &seq_of,
+        &kv_t,
+        &new_meta,
         cache,
         comp_idx,
         comp_cnt,
@@ -531,12 +547,18 @@ pub fn paged_latent_prefill(
 #[cfg(feature = "cuda")]
 pub fn paged_latent_prefill_raw(
     q: &Tensor,
+    // Base of the prefill seqs' contiguous SlotHeader array (one slot per seq);
+    // `seq_of[qi]` indexes into it.
     headers_ptr: u64,
     q_pos: &Tensor,
-    // This layer's just-computed latents `[fresh_rows, 512]` bf16 keyed at
-    // `fresh_base + j` — the batched-wave source for tokens not yet written to
-    // the arena. `None` on the settled-slot path.
-    kv_fresh: Option<(&Tensor, usize)>,
+    // `[total_q]` u32 — which prefill seq each query belongs to (selects its
+    // arena slot + new-token diagonal slice; the whole prefill fleet in one launch).
+    seq_of: &Tensor,
+    // All prefill seqs' just-computed latents packed `[total_new, 512]` bf16;
+    // seq `s`'s rows start at `new_meta[s].start`, keyed at `new_meta[s].base + j`.
+    kv_new: &Tensor,
+    // `[n_seq, 4]` u32 per-seq new-token diagonal metadata: {rows, base, start, -}.
+    new_meta: &Tensor,
     cache: &CorpusCache,
     comp_idx: &Tensor,
     comp_cnt: &Tensor,
@@ -600,10 +622,9 @@ pub fn paged_latent_prefill_raw(
     let hdr_ptr = headers_ptr;
     let out_ptr = cuda_ptr!(&out, f32); // kernel emits F32
     let pos_ptr = cuda_ptr!(q_pos, u32);
-    let (fresh_ptr, fresh_rows, fresh_base) = match kv_fresh {
-        Some((t, base)) => (cuda_ptr!(t, half::bf16), t.dim(0)?, base),
-        None => (0u64, 0usize, 0usize),
-    };
+    let seq_ptr = cuda_ptr!(seq_of, u32);
+    let new_ptr = cuda_ptr!(kv_new, half::bf16);
+    let meta_ptr = cuda_ptr!(new_meta, u32);
     // Two-region corpus cache (the same the decode reads) — no per-prefill
     // rebuild from f32; the pre-pass dequantizes, ropes, then bakes into the int8
     // QK/PV scratch below.
@@ -642,14 +663,15 @@ pub fn paged_latent_prefill_raw(
         // scratch on the ordered stream); later chunks pass g_total=0.
         let g_pass = if base == 0 { g_total as i32 } else { 0 };
         // Query-indexed inputs/outputs advance by `base`; the key sources
-        // (arena, kv_fresh, comp) are launch-invariant.
+        // (arena, kv_new, comp) are launch-invariant.
         unsafe {
             candle_kernels::paged_latent::run_paged_latent_prefill_bf16(
                 (q_ptr + (base * n_q_head * HEAD_DIM * 2) as u64) as *const core::ffi::c_void,
                 hdr_ptr as *const u8,
                 (out_ptr + (base * n_q_head * HEAD_DIM * 4) as u64) as *mut core::ffi::c_void, // F32 out: 4 B/elem
                 (pos_ptr + (base * 4) as u64) as *const u32,
-                fresh_ptr as *const core::ffi::c_void,
+                (seq_ptr + (base * 4) as u64) as *const u32, // per-query seq, advanced with the chunk
+                new_ptr as *const core::ffi::c_void,
                 ni8_p as *const u8,
                 nsc_p as *const f32,
                 rbf_p as *const core::ffi::c_void,
@@ -670,8 +692,7 @@ pub fn paged_latent_prefill_raw(
                 softmax_scale,
                 window_size as i32,
                 max_sel as i32,
-                fresh_rows as i32,
-                fresh_base as i32,
+                meta_ptr as *const u32,
                 num_splits as i32,
                 store_fmt as i32,
                 stream.cu_stream() as *mut core::ffi::c_void,
@@ -2907,7 +2928,7 @@ mod tests {
             .iter()
             .flat_map(|t| t.iter().copied())
             .collect();
-        let kv_fresh =
+        let kv_new =
             Tensor::from_vec(fresh_vals, (n - split_at, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
         let qf_tail: Vec<f32> = qs[split_at * H..]
             .iter()
@@ -2926,7 +2947,7 @@ mod tests {
             &q_tail,
             &fslots.headers,
             &pos_tail,
-            Some((&kv_fresh, split_at)),
+            Some((&kv_new, split_at)),
             &CorpusCache::build(&comp, &comp_pos)?,
             &idx_tail,
             &cnt_tail,
@@ -3064,7 +3085,7 @@ mod tests {
     /// the decode oracle, fresh-source rows anchored to an f64 reference no
     /// looser than the settled rows are. Guards the chunk pointer arithmetic
     /// (q/out/q_pos/comp_idx/comp_cnt advances) and the launch-invariant
-    /// fresh-key positions (`fresh_base + j`, never q_pos-derived — a
+    /// new-key positions (`new_meta.base + j`, never q_pos-derived — a
     /// chunk-shifted q_pos read here corrupts every fresh key past the
     /// boundary and reads out of bounds).
     #[test]
@@ -3182,7 +3203,7 @@ mod tests {
             .iter()
             .flat_map(|t| t.iter().copied())
             .collect();
-        let kv_fresh =
+        let kv_new =
             Tensor::from_vec(fresh_vals, (n - split_at, HEAD_DIM), &dev)?.to_dtype(DType::BF16)?;
         let qf_tail: Vec<f32> = qs[split_at * H..]
             .iter()
@@ -3201,7 +3222,7 @@ mod tests {
             &q_tail,
             &fslots.headers,
             &pos_tail,
-            Some((&kv_fresh, split_at)),
+            Some((&kv_new, split_at)),
             &CorpusCache::build(&comp, &comp_pos)?,
             &idx_tail,
             &cnt_tail,

@@ -16,24 +16,32 @@ prompt slots) and **decode** (one token per session, batched across sessions).
 
 ## Campaign status (measured)
 
-The invariant campaign landed the productive fixes and **measured out** the rest.
-Commits on `deepseek-flash`: 4d5246d2, c9305f8a, 30a05446. Every step held the bit
-gates (mirror/gather/compressor) and model StoryRewrite [1,4,8,1] at 100% valid;
-config-8 prefill 558 → 590 t/s.
+The invariant campaign landed **every** structural fix; only three residuals remain,
+each with a measured/analysed reason. Commits on `deepseek-flash`: 4d5246d2,
+c9305f8a, 30a05446, 74abb3e6. Every step held the bit gates
+(mirror/gather/compressor) and model StoryRewrite [1,4,8,1] at 100% valid; config-8
+prefill 558 → 593 t/s.
 
 **Fixed:** Inv 6 (`Tensor::empty` — no zero-then-overwrite, 5 hot sites); Inv 2
 (`force_contiguous` per-row storm consolidated to one bounded retained-state copy;
 no-op `contiguous` dropped); Inv 3/4 decode comp-idx built on-device (broadcast);
-Inv 5 batched `lm_head` + batched prefill out-proj (span 1448→46 ms); Inv 1 emit-type
-**output** (attention kernels emit F32 → int8 out-proj, no widening cast); Inv 1 #8
-(`ape`/`norm_w` F32 at load → compressor casts are proven no-ops).
+Inv 5 batched `lm_head` + batched prefill out-proj (span 1448→46 ms) + **multi-slot
+prefill attention kernel** (below); Inv 1 emit-type **output** (attention kernels
+emit F32 → int8 out-proj, no widening cast); Inv 1 #8 (`ape`/`norm_w` F32 at load →
+compressor casts are proven no-ops).
 
-**Measured out — NOT productive fixes (do not "finish" these blindly):**
-- **Inv 5 multi-slot prefill ATTENTION kernel** — REFUTED. Config-8 `prefill:kernel`
-  is only **~65 ms**; the per-seq loop's attention launch is negligible. The prefill
-  wall is MoE + readback-drain bound (`deepseek:moe` ~4.1 s, `moe:sort` ~3.1 s —
-  mostly GPU drain absorbed at the sanctioned expert-id readback), not the attention
-  kernel. Building a multi-slot prefill kernel cannot move the wall.
+**Inv 5 multi-slot prefill attention kernel — BUILT (74abb3e6).** Prefill attention
+was the last per-seq loop; it now fires ONE kernel launch per wave across the whole
+prompt fleet (a per-query `seq_of[qi]` picks each query's arena slot + fresh-diagonal
+slice; the corpus is packed via `gather_corpus_batched`). `prefill:kernel` collapses
+from ~65 ms (×688 per-seq launches) to ~40 ms (×129 = one/wave). As predicted the
+**wall is flat** (~593 t/s config-8 — prefill is MoE/readback-drain bound, not the
+attention kernel), so this closes the invariant *structurally*, not as a speed win.
+One numerics note: at multi-seq the int8-V scale `comp_vmax` is global over the packed
+corpus (was per-seq) — inside the int8-PV tolerance envelope; 1-seq mirror gates stay
+bit-exact (1 seq ⇒ global == per-seq).
+
+**Residuals — analysed, not productive to fix:**
 - **Inv 1 emit-type INPUT** (q/kv F32→BF16) — necessary boundary conversion. The
   kernel wants bf16 input (an f32-input kernel would 2× the per-tile re-read); the
   cast is the f32-norm→bf16-kernel rounding. Eliminating it needs a candle-nn
@@ -53,8 +61,9 @@ Inv 5 batched `lm_head` + batched prefill out-proj (span 1448→46 ms); Inv 1 em
 and `gallery.rs:1704/1766` are test/bench-only, not hot sites (Inv 6 had 5 real
 sites, not 7).
 
-The priority list at the bottom predates these measurements; the "multi-slot prefill
-kernel" and "GPU MoE bucketize" items there are the ones measured out above.
+The priority list at the bottom predates these measurements: the "multi-slot prefill
+kernel" is now BUILT (structural, wall-flat, above), and "GPU MoE bucketize" is the
+MoE-sort residual (rides the sanctioned readback).
 
 ---
 

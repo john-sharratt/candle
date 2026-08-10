@@ -100,9 +100,10 @@ template <typename T, int HEAD_DIM, int ROPE_DIM>
 __global__ void __launch_bounds__(PF_WARPS * 32, 2)
 latent_prefill_kernel(
     const T* __restrict__ q,               // [total_q, H, HEAD_DIM] pre-RoPE
-    const uint8_t* __restrict__ headers,   // SlotHeader[1]
+    const uint8_t* __restrict__ headers,   // SlotHeader[n_seq] (one arena slot per prefill seq)
     const uint32_t* __restrict__ q_pos,    // [total_q]
-    const T* __restrict__ kv_fresh,        // [fresh_rows, HEAD_DIM] pre-RoPE
+    const uint32_t* __restrict__ seq_of,   // [total_q] which prefill seq each query belongs to
+    const T* __restrict__ kv_new,          // [total_new, HEAD_DIM] pre-RoPE — this wave's latents (all seqs packed)
     const int8_t* __restrict__ comp_i8,    // [G_total, HEAD_DIM] roped+per-band int8 (scratch)
     const float* __restrict__ comp_scale,  // [G_total, NPAL] per-band scale (scratch)
     const int8_t* __restrict__ comp_v8,    // [G_total, HEAD_DIM] per-dim-global int8 V (scratch)
@@ -118,9 +119,12 @@ latent_prefill_kernel(
     float softmax_scale,
     int window_size,
     int max_sel,
-    int fresh_rows,
-    int fresh_base,
-    int store_fmt   // writer-chunk float format tag (fresh-diagonal fake-quant)
+    // Per-seq new-token diagonal metadata `[n_seq]`, one uint4 each:
+    //   x = rows  (this seq's new-token count)
+    //   y = base  (position the diagonal starts at — the causal guard)
+    //   z = start (its first row in the packed `kv_new`)
+    const uint4* __restrict__ new_meta,
+    int store_fmt   // writer-chunk float format tag (new-diagonal fake-quant)
 ) {
     constexpr int SUB = HEAD_DIM / NPAL;
     constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
@@ -145,7 +149,14 @@ latent_prefill_kernel(
     float m_run[2];
     float l_run[2];
 
-    const SlotHeader& slot = get_slot_header(headers, 0);
+    // This query's prefill sequence selects its arena slot + new-token diagonal
+    // slice: new_meta[seq] = {rows, base, start, -}.
+    const int seq = (int)seq_of[qi];
+    const uint4 nm = new_meta[seq];
+    const int new_rows_q = (int)nm.x; // this seq's new-token count
+    const int new_base_q = (int)nm.y; // position its diagonal starts at (causal guard)
+    const T* kv_new_q = kv_new + (int64_t)nm.z * HEAD_DIM; // its rows in packed kv_new
+    const SlotHeader& slot = get_slot_header(headers, seq);
     const uint32_t n_slices = slot.n_slices;
     const uint64_t slices_ptr = slot.slices_ptr;
     const uint32_t n_sel = comp_cnt ? comp_cnt[qi] : 0;
@@ -181,7 +192,7 @@ latent_prefill_kernel(
         }
     };
 
-    if (n_slices == 0 && n_sel == 0 && fresh_rows == 0) {
+    if (n_slices == 0 && n_sel == 0 && new_rows_q == 0) {
         #pragma unroll
         for (int s = 0; s < PF_GDIMS / 8; ++s)
             #pragma unroll
@@ -244,9 +255,9 @@ latent_prefill_kernel(
 
     int n_win_tiles = 0;
     for (int s = 0; s < (int)n_slices; ++s) n_win_tiles += slice_tiles(s);
-    const int n_fresh_tiles = (fresh_rows + PF_KEYS - 1) / PF_KEYS;
+    const int n_new_tiles = (new_rows_q + PF_KEYS - 1) / PF_KEYS;
     const int n_comp_tiles = ((int)n_sel + PF_KEYS - 1) / PF_KEYS;
-    const int n_tiles = n_win_tiles + n_fresh_tiles + n_comp_tiles;
+    const int n_tiles = n_win_tiles + n_new_tiles + n_comp_tiles;
 
     const int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
     int tile_lo = split_idx * tiles_per_split;
@@ -306,13 +317,13 @@ latent_prefill_kernel(
                     ident_read();
                 }
             }
-        } else if (tile_idx < n_win_tiles + n_fresh_tiles) {
+        } else if (tile_idx < n_win_tiles + n_new_tiles) {
             int fj = (tile_idx - n_win_tiles) * PF_KEYS + key;
-            if (fj < fresh_rows) {
-                key_pos = fresh_base + fj;
+            if (fj < new_rows_q) {
+                key_pos = new_base_q + fj;
                 if (key_pos <= my_pos && key_pos > my_pos - window_size) {
                     valid = true;
-                    const T* src = kv_fresh + (int64_t)fj * HEAD_DIM;
+                    const T* src = kv_new_q + (int64_t)fj * HEAD_DIM;
                     // The fresh diagonal is attended before it is read back from
                     // the arena, so it must match the writer chunk's storage
                     // precision: FP8 storage fake-quants here; BF16/F16/F32
@@ -331,7 +342,7 @@ latent_prefill_kernel(
                 }
             }
         } else {
-            int e = (tile_idx - n_win_tiles - n_fresh_tiles) * PF_KEYS + key;
+            int e = (tile_idx - n_win_tiles - n_new_tiles) * PF_KEYS + key;
             if (e < (int)n_sel) {
                 uint32_t gid = comp_idx[(int64_t)qi * max_sel + e];
                 // Causal guard: drop a compressed entry that sits in this query's
@@ -528,7 +539,7 @@ latent_prefill_kernel(
 
         for (int tile = tile_lo; tile < tile_hi; ++tile) {
             stage_tile(tile);
-            const bool comp_tile = tile >= n_win_tiles + n_fresh_tiles;
+            const bool comp_tile = tile >= n_win_tiles + n_new_tiles;
             if (comp_tile) {
                 // Comp tile: sVt is a pure byte gather of the pre-quantized
                 // per-dim-global operand (comp_v8) — no per-tile max/requant,
@@ -536,14 +547,14 @@ latent_prefill_kernel(
                 // PV finished at the loop-end barrier, and nothing here reads
                 // sK, so the gather's global loads overlap the sK staging.
                 // Lane l holds key l's gid; a warp shuffle broadcasts it.
-                const int e0 = (tile - n_win_tiles - n_fresh_tiles) * PF_KEYS;
+                const int e0 = (tile - n_win_tiles - n_new_tiles) * PF_KEYS;
                 const uint32_t my_gid = (e0 + lane < (int)n_sel)
                     ? comp_idx[(int64_t)qi * max_sel + e0 + lane]
                     : 0xFFFFFFFFu;
                 // The epilogue scale is the kernel-constant comp_vmax; comp
                 // tiles are the contiguous tail, so fill s_vscale once at the
                 // split's first comp tile (window tiles rewrite it per tile).
-                const int comp_lo = n_win_tiles + n_fresh_tiles;
+                const int comp_lo = n_win_tiles + n_new_tiles;
                 const int first_comp = tile_lo > comp_lo ? tile_lo : comp_lo;
                 for (int d = tid; d < HEAD_DIM; d += PF_WARPS * 32) {
                     if (tile == first_comp) s_vscale[d] = comp_vmax[d];
@@ -906,10 +917,11 @@ __global__ void latent_quant_v_corpus_kernel(
 template <typename T, int HEAD_DIM, int ROPE_DIM>
 void launch_latent_prefill(
     const T* q,
-    const uint8_t* headers,
+    const uint8_t* headers,          // SlotHeader[n_seq]
     float* out, // final attention output is F32 (fed straight to int8 out-proj)
     const uint32_t* q_pos,
-    const T* kv_fresh,
+    const uint32_t* seq_of,          // [total_q]
+    const T* kv_new,
     // Two-region corpus cache (the same the decode reads): nope int8 [G,NOPE_DIM]
     // + per-nope-band scale [G,NOPE_BANDS], rope pre-rotation bf16 [G,ROPE_DIM].
     const int8_t* nope_i8,
@@ -932,8 +944,7 @@ void launch_latent_prefill(
     float softmax_scale,
     int window_size,
     int max_sel,
-    int fresh_rows,
-    int fresh_base,
+    const uint4* new_meta,        // [n_seq] {rows, base, start, -}
     int num_splits,
     // Writer-chunk float format tag: the fresh diagonal fake-quants to it.
     int store_fmt,
@@ -975,9 +986,9 @@ void launch_latent_prefill(
     dim3 grid(total_q, 1, num_splits);
     dim3 block(PF_WARPS * 32);
     latent_prefill_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, smem, stream>>>(
-        q, headers, q_pos, kv_fresh, comp_i8, comp_scale, comp_v8, comp_vmax,
+        q, headers, q_pos, seq_of, kv_new, comp_i8, comp_scale, comp_v8, comp_vmax,
         comp_idx, comp_cnt, comp_pos, rope_tab, pa, pm, total_q, n_q_head, softmax_scale,
-        window_size, max_sel, fresh_rows, fresh_base, store_fmt);
+        window_size, max_sel, new_meta, store_fmt);
 
     const int num_rows = total_q * n_q_head;
     latent_prefill_combine_kernel<float, HEAD_DIM, ROPE_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
