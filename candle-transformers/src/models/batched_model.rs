@@ -43,8 +43,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_wave, plan_wave_transient, set_claim_reserve, LayerPhase, ModelGeometry, WavePlan,
-    REGION_BYTES, WAVE_FORWARD_BYTES,
+    begin_wave, end_wave_transient, plan_wave_transient, set_claim_reserve, LayerPhase,
+    ModelGeometry, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
 };
 use candle_nn::Module;
 
@@ -261,6 +261,23 @@ pub trait BatchedModelCore {
     /// Snapshot expert pipeline telemetry counters (if this model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
         None
+    }
+
+    /// Ask the weight side to hand ground to the KV side now, answering with the
+    /// bytes conceded.
+    ///
+    /// For a caller whose KV allocation just failed, or which can see it is
+    /// about to. The boundary otherwise moves only at the end of a completed
+    /// forward, which a wave that cannot allocate never reaches. `regions` is the
+    /// quantity the caller measured — never a counter it drained, which is what
+    /// this replaced and what took the expert zone below its working minimum.
+    /// Zero is an ordinary answer: the zone is at its floor, or a wave is still
+    /// in flight.
+    ///
+    /// Dense models have no movable boundary and return zero.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        let _ = regions;
+        0
     }
 
     /// Live VRAM bytes held by the model's weights — fixed base weights plus the
@@ -499,6 +516,20 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             .map(|c| c.kv_caches.dtype())
             .unwrap_or(DType::F32);
         let embed_dtype = activation_dtype(cache_dtype);
+
+        // **Phase 0: hand back the previous forward's tier.**
+        //
+        // It is held past its guards on purpose (`release_if_last`), and
+        // `plan_wave_transient` used to be what returned it — one phase too
+        // late. Admit runs first and claims against a pool the old tier is still
+        // capping, so it can be refused by a reservation belonging to a forward
+        // that has already finished. Invisible while every wave succeeds, fatal
+        // the moment one fails: the failed wave's tier stands, every retry's
+        // admit is refused by it, and the engine spins.
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(d) = self.model.device() {
+            end_wave_transient(&d.cuda_stream());
+        }
 
         // **Phase 1: admit.** Claim every KV slot this wave will write, for
         // every layer in the range, before a single byte of it computes — so the

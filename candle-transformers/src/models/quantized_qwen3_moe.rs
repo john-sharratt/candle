@@ -20,7 +20,7 @@ use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
 use super::expert_lre::GpuDispatchTables;
 #[cfg(feature = "cuda")]
-use super::expert_lre::{layer_geometries, slot_bytes_for};
+use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
 use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
@@ -1121,6 +1121,12 @@ impl BatchedModelCore for ModelWeights {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.expert_cache.as_ref().map(|cache| cache.expert_stats())
+    }
+
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.expert_cache
+            .as_ref()
+            .map_or(0, |cache| cache.request_kv_ground(regions))
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -2244,7 +2250,11 @@ impl ModelWeights {
                 };
                 let capacity = slots_in(initial_bytes);
                 let limit = slots_in(limit_bytes);
-                let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit);
+                // The zone's floor, and the only bound on how much expert
+                // residency the KV side can buy — so it is the pinning rule's
+                // own arithmetic, not a fraction of wherever the boundary opened.
+                let floor = minimum_resident_slots(n_expert);
+                let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
                 // Place the boundary. Everything left of it belongs to the KV
                 // side, and the region count is re-derived from it here rather
                 // than assumed anywhere.
@@ -2253,6 +2263,7 @@ impl ModelWeights {
                     target: "candle_transformers::quantized_qwen3_moe",
                     slots = capacity,
                     max_slots = limit,
+                    floor_slots = floor,
                     total_experts,
                     slot_bytes,
                     weight_gib = (capacity * slot_bytes) as f64 / 1e9,
@@ -2266,10 +2277,10 @@ impl ModelWeights {
                 // `ExpertCache::new` says so. The zone it would be handed has no
                 // device reservation behind it, so a plausible-looking one built
                 // here would only make the failure land further from its cause.
-                WeightZone::new(0, 0, 0, 0)
+                WeightZone::new(0, 0, 0, 0, 0)
             };
             #[cfg(not(feature = "cuda"))]
-            let zone = WeightZone::new(0, 0, total_experts, total_experts);
+            let zone = WeightZone::new(0, 0, total_experts, total_experts, 0);
             let capacity = zone.capacity();
             let slot_bytes = zone.slot_bytes();
 
@@ -2300,7 +2311,27 @@ impl ModelWeights {
                     (capacity * slot_bytes) as u64,
                 );
             }
-            Some(Arc::new(cache))
+            let cache = Arc::new(cache);
+            // **Open the shop.** From here a KV arena claim that runs out of
+            // ground can buy more, at the price of expert residency, instead of
+            // refusing and leaving the demand for something else to interpret.
+            //
+            // Registered against this device's ordinal, because the weight zone
+            // it sells from is this device's. A `Weak` so the registry — which
+            // outlives every model, being static — does not keep the cache alive
+            // past the model that owns it; a dead reference answers zero, the
+            // same answer as no seller, and the next model on this ordinal
+            // replaces the registration outright.
+            #[cfg(feature = "cuda")]
+            {
+                let seller = Arc::downgrade(&cache);
+                candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
+                    seller
+                        .upgrade()
+                        .map_or(0, |cache| cache.request_kv_ground(regions))
+                });
+            }
+            Some(cache)
         } else {
             None
         };

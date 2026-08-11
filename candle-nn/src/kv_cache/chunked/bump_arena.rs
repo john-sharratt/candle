@@ -723,21 +723,103 @@ fn with_wave_domain<R>(
 /// A forward that begins while a guard from the previous one is still live keeps
 /// that reservation rather than moving it — the tier cannot move under a live
 /// generation, and refusing here would fail a forward for a bookkeeping reason.
-pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+/// Hand back the previous forward's tier **before this one claims its KV.**
+///
+/// The tier's ground is deliberately held past the guard's drop
+/// ([`release_if_last`]) so a region freed between forwards cannot be handed to
+/// someone else and move the next tier. [`plan_wave_transient`] is what returns
+/// it — and that is one phase too late.
+///
+/// A forward runs admit *first*: §7 phase 1 claims every KV slot the wave will
+/// write so the frontier is final when phase 2 prices the tier against it. But
+/// the previous tier is still standing during phase 1, and
+/// [`super::region_pool::claim_region`] caps the pool at its base — so admit is
+/// refused by a reservation belonging to a forward that has already finished.
+///
+/// While every wave succeeds this is invisible: the tier is re-placed each time
+/// at the same width, and admit's claims fit below it. It becomes fatal the
+/// moment one wave fails. The failed wave's tier stays, the retry's admit is
+/// refused by it, that attempt fails too, and the engine spins — which is
+/// exactly what the daemon did, at 1,500 refusals a second, with `class 4096 B`
+/// named in the error because active K is what admit claims.
+///
+/// So the release moves here, ahead of admit. The guard is the same one
+/// `plan_wave_transient` applies: a forward that begins while a generation from
+/// the previous one is still live keeps that reservation rather than moving it,
+/// because the tier cannot move under a live generation.
+///
+/// # Every caller outside a forward, not just the next one
+///
+/// Admit is the *first* thing a stale tier blocks, not the only one. The
+/// scheduler's relief ladder runs in the same inter-forward gap and claims
+/// regions on nearly every rung, and one consequence there is worse than a
+/// refused claim: the pool's region ceiling reads `transient_base` while a tier
+/// is placed, and that is an *address*, fixed where the last forward put it.
+/// Move the weight boundary and it does not follow — so **a placed tier makes
+/// the ceiling deaf to the boundary**, and the ladder's last
+/// rung, the only one that adds ground rather than recycling it, hands over
+/// weight-side ground that no rung above it can reach.
+///
+/// The contract is therefore "call this before touching the region pool from
+/// outside a forward", and the `live_generations` guard is what makes it safe to
+/// state that broadly: a caller that is wrong about being outside a forward
+/// finds a live generation and changes nothing.
+pub fn end_wave_transient(stream: &Arc<CudaStream>) {
     let stream = stream.clone();
-    with_wave_domain(&stream, |domain| {
-        domain.planned = Some(per_phase);
+    let _ = with_wave_domain(&stream, |domain| {
         if domain.live_generations > 0 {
             return Ok(());
         }
-        // The previous forward's ground goes back before this one's frontier is
-        // measured, so the reservation is taken against a partition that already
-        // reflects everything admit claimed.
+        if domain.placed_at.take().is_some() {
+            release_transient(&stream);
+            domain.reserved_by_forward = false;
+        }
+        Ok(())
+    });
+}
+
+/// Price and reserve this forward's transient tier.
+///
+/// # Three lock scopes, and the middle one is deliberate
+///
+/// The release and the record happen under the wave-domain lock; the
+/// **placement does not**, and it must not. [`place_transient`] buys ground from
+/// the weight side when live arenas hold the tier's footprint, that purchase
+/// blocks on the expert pipeline thread, and the boundary move it performs calls
+/// [`wave_is_live`] — which takes this very lock. Holding it across the purchase
+/// deadlocks the two threads against each other.
+///
+/// So there is a window between releasing the old tier and placing the new one
+/// in which another thread may claim a region into the ground the placement
+/// wants. That is not a hazard, it is the same case the placement already
+/// handles: it buys what the claim took. The window is precisely what the old
+/// `tier_reserve` existed to close, and closing it that way cost more than
+/// leaving it open — a standing withholding of the last tier's width, refusing
+/// arena claims against memory nobody owned.
+pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+    let stream = stream.clone();
+    // The previous forward's ground goes back before this one's frontier is
+    // measured, so the reservation is taken against a partition that already
+    // reflects everything admit claimed.
+    let place = with_wave_domain(&stream, |domain| {
+        domain.planned = Some(per_phase);
+        if domain.live_generations > 0 {
+            return Ok(false);
+        }
         if domain.placed_at.take().is_some() {
             release_transient(&stream);
         }
-        let total: usize = per_phase.iter().sum();
-        domain.placed_at = Some(place_transient(&stream, total)?);
+        Ok(true)
+    })?;
+    if !place {
+        return Ok(());
+    }
+    // Outside the lock. A failure here leaves no tier standing and
+    // `reserved_by_forward` clear, so the forward that fails takes nothing with
+    // it — the next one starts against the whole partition.
+    let base = place_transient(&stream, per_phase.iter().sum())?;
+    with_wave_domain(&stream, |domain| {
+        domain.placed_at = Some(base);
         domain.reserved_by_forward = true;
         Ok(())
     })
@@ -764,6 +846,23 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
     let ordinal = stream.context().ordinal() as u32;
     let arena_idx = phase_index(phase) as u32;
     let stream = stream.clone();
+    // **Any placement happens before the lock is taken.** [`place_transient`] can
+    // buy ground from the weight side, that purchase blocks on the expert
+    // pipeline thread, and the boundary move it performs re-enters this very
+    // mutex through [`wave_is_live`]. Placing from inside the closure below
+    // deadlocks the two threads against each other —
+    // [`plan_wave_transient`] is restructured for the same reason.
+    //
+    // Only the unplanned caller reaches it: a guard opened with no forward
+    // behind it (a test, a migration helper, a `rows == 0` forward that skipped
+    // phase 2) owns its own reservation, and this is where that is taken.
+    let unplanned_base = match with_wave_domain(&stream, |domain| {
+        Ok((domain.live_generations == 0 && domain.placed_at.is_none())
+            .then(|| domain.planned.unwrap_or_else(fallback_plan)))
+    })? {
+        Some(plan) => Some(place_transient(&stream, plan.iter().sum())?),
+        None => None,
+    };
     with_wave_domain(&stream, |domain| {
         let arena = &domain.arenas[phase_index(phase)];
         if arena.is_live() {
@@ -799,9 +898,21 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                 None => {
                     // No forward priced this one, so nothing will hand the
                     // ground back for it — the reservation is the guard's and
-                    // drops with it.
-                    let total: usize = plan.iter().sum();
-                    let base = place_transient(&stream, total)?;
+                    // drops with it. Placed above, outside the lock.
+                    //
+                    // Absent only if the domain gained a generation or a tier
+                    // between that placement and this line, which would mean
+                    // laying these spans out on ground priced for a different
+                    // occupant. Refuse rather than corrupt (principle 7).
+                    let base = unplanned_base.ok_or_else(|| {
+                        candle::Error::Msg(
+                            "wave domain: the tier's ground was priced with no \
+                             generation live and one appeared before it could be \
+                             laid out. The spans this guard would hand out are not \
+                             the ones that were reserved."
+                                .into(),
+                        )
+                    })?;
                     domain.placed_at = Some(base);
                     domain.reserved_by_forward = false;
                     base

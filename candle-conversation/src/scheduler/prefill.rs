@@ -7,6 +7,7 @@ use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
+use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
 use candle_transformers::models::batched_inference::PendingGlue;
 use std::collections::{HashMap, HashSet};
 
@@ -33,6 +34,22 @@ const LOAD_SETPOINT_FLOOR_REGIONS: usize = 24;
 /// context is to leave KV resident rather than evict it defensively.
 const DECODE_SETPOINT_DIVISOR: usize = 16;
 const DECODE_SETPOINT_FLOOR_REGIONS: usize = 8;
+
+/// What one [`Scheduler::compress_pending_turns`] pass achieved.
+///
+/// The two fields answer different questions and the caller needs both:
+/// `compressed == 0` alone cannot distinguish "there was nothing pending" from
+/// "the rung ran and the pool refused it ground", and those want opposite
+/// responses — the first is a quiet pass, the second is the compress-to-free
+/// rung failing at the moment compression is what would relieve the pressure.
+#[derive(Default)]
+pub(super) struct CompressPass {
+    /// Turns whose hot copy was replaced by its quantized form.
+    compressed: usize,
+    /// The pass stopped early because a quantize destination could not be
+    /// allocated, rather than because it ran out of work or hit its budget.
+    refused: bool,
+}
 
 fn env_regions(var: &str) -> Option<usize> {
     std::env::var(var)
@@ -278,9 +295,31 @@ impl Scheduler {
             return false;
         };
 
+        // **Hand back a finished forward's transient tier before recycling
+        // anything.** The tier outlives the guards that used it — a forward's
+        // outputs escape into its caller — so relief, which runs between
+        // forwards, can find one still standing over ground its wave no longer
+        // needs. Every rung below claims regions, so it goes back first.
+        //
+        // This is not tidiness. `region_ceiling` is `transient_base` while a tier
+        // is placed: an *address*, fixed where the last forward put it. Move the
+        // weight boundary and it does not follow. So **a placed tier makes the
+        // ceiling deaf to the boundary** — the last rung concedes weight-side
+        // ground and the rungs above it still cannot claim a region, because the
+        // cap is pinned at wherever the tier was placed. That is the shape of the
+        // section-prefill wedge: the weight side conceded down to its floor
+        // across thousands of retries while the ceiling never moved off 293.
+        //
+        // Declines while a wave generation is live, which is the one case where
+        // the tier is genuinely still in use.
+        if let Device::Cuda(d) = self.session.device() {
+            end_wave_transient(&d.cuda_stream());
+        }
+
         let mut released = self.session.release_empty_arenas().unwrap_or(0);
         let mut gallery_freed = 0u64;
         let mut compressed = 0usize;
+        let mut compress_refused = false;
         let mut flushed = false;
         let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
 
@@ -320,7 +359,9 @@ impl Scheduler {
             let budget = want
                 .saturating_mul(VRAM_COMPRESS_HYSTERESIS)
                 .min(vram_compress_max());
-            compressed = self.compress_pending_turns(budget);
+            let pass = self.compress_pending_turns(budget);
+            compressed = pass.compressed;
+            compress_refused = pass.refused;
             released += self.session.release_empty_arenas().unwrap_or(0);
         }
 
@@ -341,8 +382,42 @@ impl Scheduler {
             released += self.session.release_empty_arenas().unwrap_or(0);
         }
 
+        // **Last resort, and the only one that adds ground rather than
+        // recycling it.** Everything above reclaims KV the engine already owns —
+        // compress a turn, evict a cold tail, drop an empty arena — and all of
+        // it is worth nothing against a workload with nothing reclaimable. A
+        // base conversation's sections are permanent by design: they are not
+        // turns, so there is no turn to compress and no tail to evict, and a
+        // section prefill that outgrows its ground stalls with every relief
+        // counter reading zero. That is exactly how it failed.
+        //
+        // The weight side is holding ground in that case, and the boundary is
+        // meant to move. It could not: the give-back runs at the end of a
+        // completed forward, and the wave that needs it never completes. Asking
+        // here breaks that circle — this is between waves, which is where the
+        // move is safe, and a refusal (a wave still open, or the zone already at
+        // its floor) comes back as zero rather than as a wait.
+        //
+        // **`want` is the ask.** It is the shortfall this pass measured against
+        // the setpoint, and passing it is the whole of the fix for the run that
+        // died here: the boundary used to read an accumulated count of refused
+        // claims instead, which said 4,436 regions on a pass whose own `want_mib`
+        // was 448 — 28 regions. It conceded 5,752 MiB, evicted 1,598 experts, and
+        // put the zone under its pinned working set, after which nothing ran.
+        // The number was in this function the whole time; it just was not sent.
+        let mut conceded = 0u64;
+        if self.vram_under_pressure_for(phase) {
+            conceded = self
+                .model
+                .request_kv_ground(want.div_ceil(region_bytes()) as usize);
+        }
+
         let still = self.vram_under_pressure_for(phase);
-        let acted = released > 0 || gallery_freed > 0 || compressed > 0 || evicted.count > 0;
+        let acted = released > 0
+            || gallery_freed > 0
+            || compressed > 0
+            || evicted.count > 0
+            || conceded > 0;
         if acted {
             relief_trace::note("sched", "relieve", want, evicted.bytes as u64);
         }
@@ -360,9 +435,11 @@ impl Scheduler {
                     warm_flushed = flushed,
                     gallery_freed_mib = gallery_freed / (1 << 20),
                     turns_compressed = compressed,
+                    compress_refused,
                     turns_evicted = evicted.count,
                     evicted_mib = evicted.bytes / (1 << 20),
                     arenas_released = released,
+                    conceded_mib = conceded / (1 << 20),
                     free_regions = free,
                     setpoint_regions = setpoint,
                     relieved = !still,
@@ -370,7 +447,13 @@ impl Scheduler {
                 )
             };
         }
-        if acted {
+        // A refused compression is not an action, but it *is* an event: the rung
+        // that shrinks a resident turn in place was asked to run and could not
+        // get the ground to run in. Left at DEBUG it reads as `turns_compressed=0`,
+        // identical to a pass with nothing to compress — which is how the
+        // feedback loop running backwards (compression is what relieves the
+        // pressure that refuses it) stayed invisible through the whole wedge.
+        if acted || compress_refused {
             emit!(info);
         } else {
             emit!(debug);
@@ -1131,7 +1214,7 @@ impl Scheduler {
     /// turns get quantized on seal regardless; pressure only pulls it earlier.
     /// Turns whose hot is already quant (a prior pass, or persistence, beat us
     /// to them) are skipped via [`sealed_has_compressible_chunk`] so an undrained
-    /// warm backlog doesn't re-walk finished turns. Returns the turns compressed.
+    /// warm backlog doesn't re-walk finished turns.
     ///
     /// [`sealed_has_compressible_chunk`]: candle_nn::kv_cache::ChunkedKvBacking::sealed_has_compressible_chunk
     /// Bring forward the quantization of up to `budget_bytes` of completed float
@@ -1140,19 +1223,19 @@ impl Scheduler {
     /// episodes — a few seconds each — rather than one multi-second blocking
     /// compression of *everything* pending (a 697-turn / 23 GiB / 66 s stall was
     /// the symptom). The background persistence thread drains the rest.
-    fn compress_pending_turns(&mut self, budget_bytes: u64) -> usize {
+    fn compress_pending_turns(&mut self, budget_bytes: u64) -> CompressPass {
         // Need an engine-wide turn policy to compress against; without one turns
         // stay native float (lossless capture) and there is nothing to bring
         // forward.
         let base = match self.session.compression_policy() {
             Some(p) => p,
-            None => return 0,
+            None => return CompressPass::default(),
         };
         let n_layers = self.session.num_layers();
         let device = self.session.device().clone();
         let copy_stream = match &device {
             Device::Cuda(d) => d.cuda_stream(),
-            _ => return 0,
+            _ => return CompressPass::default(),
         };
         // Bound `backings`' immutable borrow of `self.session` to a disjoint
         // field from `self.elevate_pinned_scratch` (the `&mut` below), exactly
@@ -1161,9 +1244,10 @@ impl Scheduler {
 
         let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
         let mut compressed = 0usize;
+        let mut refused = false;
         // Estimated float bytes queued for compression so far — the bound.
         let mut collected: u64 = 0;
-        for conv in convs {
+        'convs: for conv in convs {
             if collected >= budget_bytes {
                 break; // Budget met — the rest drains next episode / in the background.
             }
@@ -1225,6 +1309,30 @@ impl Scheduler {
                                 q_per[slot].push(qi);
                             }
                         }
+                        Err(e) if is_device_oom(&e) => {
+                            // **The pool refused a quantize destination.** This
+                            // rung cannot fix that: the ground it needs comes
+                            // from the rungs below (evict a cold tail) or from
+                            // the boundary (`request_kv_ground`), and both of
+                            // them run after this returns. Every remaining group
+                            // would be refused for the same reason, so stop the
+                            // pass rather than burn a kernel launch per group
+                            // rediscovering it.
+                            //
+                            // Reported, not retried and not waited on. Waiting
+                            // here would deadlock: this runs on the scheduler
+                            // thread, and the scheduler thread is what would
+                            // release the ground — both the rung below and the
+                            // next wave's `end_wave_transient` are further down
+                            // this same call stack's future.
+                            tracing::debug!(
+                                "compress_pending_turns: layer {layer} was refused a quantize \
+                                 destination, stopping the pass: {e}"
+                            );
+                            refused = true;
+                            ok.fill(false);
+                            break;
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "compress_pending_turns: layer {layer} quantize failed: {e} (last CUDA kernel: {})",
@@ -1241,10 +1349,31 @@ impl Scheduler {
                 // multi-turn V-duplication window), and the very next reproject on
                 // THIS thread reads them. Mirrors the persistence thread's
                 // post-batch `device.synchronize()`.
-                if let Err(e) = device.synchronize() {
+                let sync_failed = if let Err(e) = device.synchronize() {
                     tracing::warn!(
                         "compress_pending_turns: device sync failed: {e:?} — skipping this group's installs"
                     );
+                    true
+                } else {
+                    false
+                };
+                // Leaving **after** the sync, not at the refusal. The layers that
+                // quantized before it left kernels in flight writing into
+                // `q_per`'s destination arenas, and dropping those handles
+                // returns their regions to the pool — so an early exit would
+                // hand a region back while a kernel was still writing into it.
+                // `ok` is all-false for this group, so the swap below is a no-op
+                // for it either way.
+                //
+                // **Before the sync's own bail-out**, because that one only skips
+                // a group: leaving the refusal check behind it means a failed sync
+                // resumes the pass and launches quantizes for every remaining
+                // group, each of which the pool refuses for the same reason the
+                // first one was refused.
+                if refused {
+                    break 'convs;
+                }
+                if sync_failed {
                     continue;
                 }
                 // Atomic swap under one write lock: replace each residence's hot
@@ -1269,7 +1398,10 @@ impl Scheduler {
             // turns we just compressed without waiting for its 5 s tick.
             self.persist_trigger.fire();
         }
-        compressed
+        CompressPass {
+            compressed,
+            refused,
+        }
     }
 
     /// Continuous-fair-wave prefill throttle: how many transformer layers a

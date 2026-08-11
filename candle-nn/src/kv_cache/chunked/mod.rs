@@ -108,13 +108,14 @@ pub use super::arena_table::ArenaLocation;
 pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
-    begin_wave, persistence_domain_stats, plan_wave_transient, wave_domain_stats, BumpRange,
-    Generation as WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
+    begin_wave, end_wave_transient, persistence_domain_stats, plan_wave_transient,
+    wave_domain_stats, BumpRange, Generation as WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
+    WAVE_FORWARD_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use region_pool::{
-    initial_weight_bytes, set_claim_reserve, set_weight_floor, span_end, take_kv_demand,
-    weight_capacity_bytes, weight_floor_after,
+    initial_weight_bytes, kv_spare_regions, set_claim_reserve, set_ground_broker, set_weight_floor,
+    span_end, weight_capacity_bytes, weight_floor_after,
 };
 #[cfg(feature = "cuda")]
 pub use region_pool::{region_stats, RegionStats, REGION_BYTES};

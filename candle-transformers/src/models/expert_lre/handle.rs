@@ -677,8 +677,10 @@ impl ExpertCache {
     ) -> Self {
         // Every slot is occupied and none ever moves, so the zone exists only to
         // answer "which index is where" — the addresses are the pre-built
-        // storages' own, not the zone's, and nothing here allocates from it.
-        let mut zone = WeightZone::new(0, 0, slots.len(), slots.len());
+        // storages' own, not the zone's, and nothing here allocates from it. The
+        // floor is the whole capacity for the same reason: nothing may retract a
+        // zone whose slots it does not own.
+        let mut zone = WeightZone::new(0, 0, slots.len(), slots.len(), slots.len());
         for _ in 0..slots.len() {
             zone.alloc();
         }
@@ -1108,6 +1110,51 @@ impl ExpertCache {
         self.prev_layer_experts
             .lock()
             .map_or_else(|_| vec![], |v| v.clone())
+    }
+
+    /// Buy `regions` of weight-side ground for the KV side, and answer with the
+    /// bytes it conceded.
+    ///
+    /// **The caller states the quantity.** It is either an arena claim that has
+    /// run the KV side out and is asking for what it is about to allocate, or the
+    /// scheduler's relief asking for its measured setpoint shortfall. Both know
+    /// the number; neither can accumulate one, because the request does not
+    /// outlive the call that made it. What this replaced — a running count of
+    /// refused claims drained here — could and did: 4,436 regions against a
+    /// twenty-eight-region need, paid in full.
+    ///
+    /// **For a caller that is stuck.** The boundary otherwise moves at the end of
+    /// a forward pass, which is unreachable when the KV side cannot allocate the
+    /// arenas that pass needs — a wave fails, nothing completes, `post_compute`
+    /// never runs, and the ground that would unblock it is never offered.
+    ///
+    /// Zero is an ordinary answer: the zone may already sit at its floor, or a
+    /// wave generation may still be open, in which case `set_weight_floor`
+    /// refuses and this reports that it did. The caller decides whether to retry
+    /// on that basis rather than spinning on a claim that cannot succeed.
+    ///
+    /// Blocks on the pipeline thread's reply — it owns the cache state and is
+    /// the only place a boundary move is safe.
+    pub fn request_kv_ground(&self, regions: usize) -> u64 {
+        let PipelineMode::Threaded { tx } = &self.mode else {
+            // Inline mode holds every expert in VRAM and never moves the
+            // boundary; there is no ground to offer.
+            return 0;
+        };
+        if regions == 0 {
+            return 0;
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if tx
+            .send(PipelineMessage::RenegotiateBoundary {
+                regions,
+                response_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
     }
 
     /// Snapshot and reset all profile accumulators (forward + pipeline threads).

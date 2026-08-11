@@ -163,6 +163,8 @@ mod types;
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
+pub use cache::minimum_resident_slots;
+#[cfg(feature = "cuda")]
 pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
 #[cfg(feature = "cuda")]

@@ -96,7 +96,7 @@ use candle::quantized::pinned_staging::PinnedBuf;
 use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{set_weight_floor, take_kv_demand, weight_floor_after};
+use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, weight_floor_after};
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaEvent, CudaStream};
 use std::collections::HashSet;
@@ -1676,7 +1676,9 @@ impl PipelineState {
             #[cfg(feature = "cuda")]
             {
                 let t = profile_now();
-                if let Err(e) = self.renegotiate_boundary() {
+                // No `want`: end of pass is the *growing* direction. A KV side
+                // that is short does not wait for this — it buys at the claim.
+                if let Err(e) = self.renegotiate_boundary(None) {
                     tracing::warn!("boundary renegotiation failed: {e}");
                 }
                 self.profile.record("pipe_boundary", t);
@@ -1688,54 +1690,74 @@ impl PipelineState {
         }
     }
 
-    /// Move the weight/KV boundary to match what the last pass actually needed.
+    /// Move the weight/KV boundary. `want` is regions the KV side is asking for;
+    /// `None` asks the opposite question — how much it is holding free that the
+    /// weight side could take back.
     ///
-    /// **This is the elastic partition.** The KV side records what it asked for
-    /// and could not get (`take_kv_demand`); this gives that ground up, or takes
-    /// back regions the KV side is holding free. It runs at end of pass because
-    /// that is the only moment the weight side is safe to change: the pipeline
-    /// thread owns the cache here, and no expert GEMM for this pass is still
-    /// being issued.
+    /// **This is the elastic partition.** It runs on the pipeline thread because
+    /// that is the only place the weight side is safe to change: this thread owns
+    /// the cache, and no expert GEMM for the pass is still being issued.
+    ///
+    /// # `want` is stated by the caller, never inferred here
+    ///
+    /// It used to come from `take_kv_demand`, which drained a running count of
+    /// refused claims. That count was of *events*, and this function spent it as
+    /// *regions*: one failed section-quantize drain walked the size-class ladder
+    /// and left 4,436 behind it, against a KV side that was 28 regions short. The
+    /// retraction that followed evicted 1,598 experts and put the zone below its
+    /// own pinned working set, after which every forward failed `cannot evict
+    /// (all pinned)` — 1,774 times, until the daemon was killed.
+    ///
+    /// Now the number arrives from whoever knows it: an arena claim that ran out
+    /// asks for the regions it is claiming, and the scheduler's relief asks for
+    /// its measured setpoint shortfall. Neither can accumulate, because neither
+    /// survives the call that made it.
     ///
     /// Both directions are **non-destructive by preference**. Growing takes only
     /// free regions. Shrinking relocates the hottest doomed experts into free
     /// slots below the new frontier and drops the rest, exactly as an ordinary
     /// eviction does — so the worst case is a reload, never a loss.
     ///
-    /// **Nothing caps how far it may retract.** The concession used to be capped
-    /// at the expert cache's free pinned slots, because an evicted expert needed
-    /// somewhere to be, and that cap was measured at 0–109 usable slots — a
-    /// retraction asking for 4,436 regions delivered `relocated=0 evicted=0`.
+    /// **The retraction stops at the zone's floor and nowhere else.** It was once
+    /// capped at the expert cache's free pinned slots, because an evicted expert
+    /// needed somewhere to be, and that cap was measured at 0–109 usable slots.
     /// With the cold tier authoritative there is no destination to find, so the
-    /// range is the full `[MIN_ELASTIC_RESERVE, max_slots]` span the elastic
-    /// partition was written to deliver.
+    /// range is the full `[floor, max_slots]` span the elastic partition was
+    /// written to deliver — where `floor` is `minimum_resident_slots`, the fewest
+    /// this cache can serve a token with. That floor is now the *only* thing
+    /// bounding how much residency the KV side can buy, so it is measured from
+    /// the pinning rule rather than guessed as a fraction (see `WeightZone::new`).
     ///
     /// **Ground changes hands only behind a device quiesce** — see
     /// [`Self::quiesce_before_handover`]. Removing the cap is what made that
     /// necessary: while a retraction moved nothing, no byte ever changed owner.
+    ///
+    /// Answers with the **bytes conceded to the KV side** — zero when the
+    /// boundary held or moved the other way.
     #[cfg(feature = "cuda")]
-    fn renegotiate_boundary(&mut self) -> Result<()> {
+    fn renegotiate_boundary(&mut self, want: Option<usize>) -> Result<u64> {
         let Device::Cuda(cd) = &self.device else {
-            return Ok(());
+            return Ok(0);
         };
         let stream = cd.cuda_stream();
-        let (wanted, spare) = take_kv_demand(&stream, KV_REGION_SLACK)?;
-        if wanted == 0 && spare == 0 {
-            return Ok(());
-        }
-
         // One conversion, one direction: regions the KV side is short (positive
         // ⇒ the floor moves right, the weight side shrinks) or holding spare
         // (negative ⇒ the floor moves left, the weight side grows).
-        let delta = if wanted > 0 {
-            wanted as isize
-        } else {
-            -(spare as isize)
+        let delta = match want {
+            Some(0) | None => {
+                let spare = kv_spare_regions(&stream, KV_REGION_SLACK)?;
+                if spare == 0 {
+                    return Ok(0);
+                }
+                -(spare as isize)
+            }
+            Some(wanted) => wanted as isize,
         };
         let floor = weight_floor_after(&stream, delta)?;
+        let before = self.inner.zone.capacity();
         let target = self.inner.zone.capacity_for_frontier(floor);
-        if target == self.inner.zone.capacity() {
-            return Ok(());
+        if target == before {
+            return Ok(0);
         }
 
         if target > self.inner.zone.capacity() {
@@ -1748,11 +1770,13 @@ impl PipelineState {
                 set_weight_floor(&stream, self.inner.zone.frontier_for_capacity())?;
                 tracing::debug!(
                     target: "candle_transformers::expert_lre",
-                    gained, spare, slots = self.inner.zone.capacity(),
+                    gained,
+                    spare = -delta,
+                    slots = self.inner.zone.capacity(),
                     "weight side took free KV regions"
                 );
             }
-            return Ok(());
+            return Ok(0);
         }
 
         // The zone decides who moves and who goes; this performs it.
@@ -1786,15 +1810,19 @@ impl PipelineState {
         // The conceded slots stop being ours the moment the floor moves.
         self.quiesce_before_handover()?;
         set_weight_floor(&stream, self.inner.zone.frontier_for_capacity())?;
+        let conceded =
+            (before - self.inner.zone.capacity()) as u64 * self.inner.zone.slot_bytes() as u64;
         tracing::debug!(
             target: "candle_transformers::expert_lre",
-            wanted,
+            wanted = delta,
             relocated = plan.relocate.len(),
             evicted = plan.evict.len(),
             slots = self.inner.zone.capacity(),
+            floor_slots = self.inner.zone.min_capacity(),
+            conceded_mib = conceded / (1 << 20),
             "weight side gave ground to KV"
         );
-        Ok(())
+        Ok(conceded)
     }
 
     /// Retire every kernel in flight before a byte changes owner.
@@ -2245,6 +2273,30 @@ pub(crate) fn spawn_pipeline_thread(
                         let snap = state.profile.snapshot();
                         state.profile.reset();
                         let _ = response_tx.send(snap);
+                    }
+                    // The give-back, reachable without a completed forward. The
+                    // scheduler asks when a wave could not allocate; answering
+                    // zero is a legitimate outcome (nothing spare, or a wave
+                    // generation still open), and the caller retries or gives up
+                    // on that basis rather than spinning.
+                    PipelineMessage::RenegotiateBoundary {
+                        regions,
+                        response_tx,
+                    } => {
+                        #[cfg(feature = "cuda")]
+                        let conceded = match state.renegotiate_boundary(Some(regions)) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!("requested boundary move failed: {e}");
+                                0
+                            }
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let conceded = {
+                            let _ = regions;
+                            0u64
+                        };
+                        let _ = response_tx.send(conceded);
                     }
                 }
             }

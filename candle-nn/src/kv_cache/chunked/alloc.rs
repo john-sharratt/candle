@@ -256,12 +256,44 @@ impl BackingInner {
         };
         let stream = cuda.cuda_stream();
         let Some(region) = region_pool::claim_region(&stream)? else {
+            // **Name which of the two refusals this is.** A claim that runs out
+            // of ground buys more from the weight side, so reaching here means
+            // one of exactly two things: a wave's tier stands over the free
+            // regions (no concession can reach them — the wave must narrow), or
+            // the purchase itself was refused because the weight zone is at its
+            // floor. They want opposite responses and the message has to say
+            // which. It used to report only `live` and assert the reservation
+            // was occupied, which sent the first investigation of this looking
+            // for a KV leak while the real answer was 31 free regions standing
+            // under a 496 MiB tier.
+            let s = region_pool::region_stats(stream.context().ordinal());
+            let (live, total, blocked, ceiling, tier) = s
+                .map(|s| {
+                    (
+                        s.live,
+                        s.total,
+                        s.blocked,
+                        s.transient_ceiling,
+                        s.transient_bytes,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
+            if blocked > 0 {
+                candle::bail!(
+                    "{KV_DEVICE_OOM_MARKER}: no region is claimable for class {} B — the wave's \
+                     {} MiB transient tier caps the pool at {ceiling} of {total} regions, all \
+                     {live} of which are live. {blocked} regions above the tier are unowned but \
+                     out of reach until the wave ends. This is a wave too wide for the ground \
+                     below the tier, not an exhausted reservation.",
+                    key.class.bytes(),
+                    tier / (1 << 20),
+                )
+            }
             candle::bail!(
-                "{KV_DEVICE_OOM_MARKER}: every region of the KV reservation is \
-                 occupied ({} live) — nothing left to stamp for class {} B",
-                region_pool::region_stats(stream.context().ordinal())
-                    .map(|s| s.live)
-                    .unwrap_or(0),
+                "{KV_DEVICE_OOM_MARKER}: no region is claimable for class {} B — every one of \
+                 the KV reservation's {total} regions is occupied ({live} live), and the weight \
+                 side would not sell any. It is at its floor: the fewest expert slots the cache \
+                 can serve a token with. The partition has nothing left to trade.",
                 key.class.bytes(),
             )
         };

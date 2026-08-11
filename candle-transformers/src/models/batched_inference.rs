@@ -3058,6 +3058,14 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Buy `regions` of weight-side ground for the KV side, answering with the
+    /// bytes conceded. See `BatchedModel::request_kv_ground` — this is the path a
+    /// stalled scheduler uses to break a wave that cannot allocate.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        let _ = regions;
+        0
+    }
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -3597,6 +3605,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.model().request_kv_ground(regions)
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {

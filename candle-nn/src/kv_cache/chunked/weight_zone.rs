@@ -147,6 +147,23 @@ pub struct WeightZone {
     /// in slots. [`Self::grow_to`] clamps to it, so the floor cannot be crossed
     /// by any path that grows the zone.
     limit: usize,
+    /// The fewest slots the cache can serve a token with — the weight side's own
+    /// floor, symmetric with `limit`.
+    ///
+    /// A model with no resident experts cannot run: every layer would miss every
+    /// expert, and each miss would want a slot that does not exist. So the
+    /// boundary may take the zone down to a working minimum and no further,
+    /// however loudly the KV side asks. See [`Self::retract_to`].
+    ///
+    /// **The stated figure, not the effective one.** A zone that opens below its
+    /// own floor is already as small as it can be, so the *effective* floor is
+    /// `min(floor, capacity)` — and that has to be recomputed on every read
+    /// rather than stored, because a zone can open small and then
+    /// [`Self::grow_to`] past its floor. Freezing the clamp at construction
+    /// would leave such a zone retractable to its opening size for ever, which is
+    /// the permanent all-pinned state the floor exists to prevent. See
+    /// [`Self::min_capacity`].
+    floor: usize,
     /// Free slot indices, **lowest first**: `pop` yields the rightmost free spot.
     free: BinaryHeap<Reverse<usize>>,
     /// Occupancy, indexed by slot. Length is always `capacity`.
@@ -160,19 +177,57 @@ impl WeightZone {
     /// `capacity` slots live.
     ///
     /// `capacity` starts wherever the caller wants the boundary; `limit` is the
-    /// floor's expression in slots and nothing may grow past it.
-    pub fn new(span_end: u64, slot_bytes: usize, capacity: usize, limit: usize) -> Self {
+    /// ceiling's expression in slots and nothing may grow past it; `floor` is the
+    /// fewest slots the cache can serve a token with and nothing may retract
+    /// below it.
+    ///
+    /// # The floor is the caller's to state, and it is measured
+    ///
+    /// It was a fraction — an eighth of the opening capacity — on the reasoning
+    /// that "an eighth is enough that every layer's routed experts have somewhere
+    /// to land". That was never measured and it is false for a wide batch: with
+    /// three pinned layers of 128 experts, 384 slots can be occupied by experts
+    /// the eviction scan is forbidden to touch, and an eighth of a 2,377-slot
+    /// opening is 297. The daemon reached exactly that number, every resident
+    /// slot held a pinned-layer expert, and every load afterwards failed with
+    /// `cannot evict (all pinned)` — 1,774 times, until it was killed.
+    ///
+    /// A fraction cannot express that, because the quantity it has to clear is a
+    /// property of the *model* (pinned layers × experts per layer), not of
+    /// wherever the boundary happened to open. So the zone takes the figure
+    /// rather than inventing one, and the expert cache — which owns the pinning
+    /// rule — computes it.
+    ///
+    /// Clamped to `capacity`: a zone that opens below its own floor is already as
+    /// small as it can be, and refusing to construct it would fail a load that
+    /// can still run.
+    pub fn new(
+        span_end: u64,
+        slot_bytes: usize,
+        capacity: usize,
+        limit: usize,
+        floor: usize,
+    ) -> Self {
         let capacity = capacity.min(limit);
         Self {
             span_end,
             slot_bytes,
             capacity,
             limit,
+            floor,
             free: (0..capacity).map(Reverse).collect(),
             occupied: vec![false; capacity],
             live: 0,
             peak_live: 0,
         }
+    }
+
+    /// The zone's retraction floor right now, in slots.
+    ///
+    /// Derived rather than stored, so that a zone which opens below its floor and
+    /// later grows past it is protected by the real figure from that moment on.
+    pub fn min_capacity(&self) -> usize {
+        self.floor.min(self.capacity)
     }
 
     /// Slots that fit between `frontier` and the span's right edge.
@@ -314,6 +369,24 @@ impl WeightZone {
     /// The bookkeeping is applied here. The returned [`RetractPlan`] is what the
     /// caller must do to the bytes to make them agree.
     pub fn retract_to(&mut self, new_capacity: usize, score: impl Fn(usize) -> f32) -> RetractPlan {
+        // **The weight side has a floor of its own, and it had none.**
+        // `MIN_ELASTIC_RESERVE` bounds how far the weight side may *grow* — it
+        // protects the KV side's minimum. Nothing bounded the other direction,
+        // so a caller that asked repeatedly could retract the zone to nothing.
+        //
+        // One did. A wedged scheduler asked for ground on every retry of a wave
+        // that could not succeed, each refusal was counted as a region of
+        // boundary demand, and the boundary paid: six experts evicted per step,
+        // one region at a time, until `slots=0` and the model had no experts at
+        // all. The demand was spurious — the ceiling was a placed tier the
+        // boundary cannot move — but a zone that can be asked to reach zero will
+        // reach zero eventually whatever the reason, and an engine that has
+        // evicted its last expert cannot serve a token.
+        //
+        // Conceding *less* than asked is a slowdown. Conceding everything is an
+        // engine that no longer works, so the floor holds even against a caller
+        // that insists.
+        let new_capacity = new_capacity.max(self.min_capacity());
         if new_capacity >= self.capacity {
             return RetractPlan::default();
         }
@@ -425,8 +498,105 @@ mod tests {
     const SLOT: usize = 3 * 1024 * 1024;
     const END: u64 = 0x8000_0000;
 
+    /// A zone of `capacity` slots whose floor is an eighth of it — the fraction
+    /// the floor used to be computed as internally, kept here only so these
+    /// fixtures keep exercising a floor well below their capacity.
     fn zone(capacity: usize) -> WeightZone {
-        WeightZone::new(END, SLOT, capacity, capacity)
+        WeightZone::new(END, SLOT, capacity, capacity, capacity / 8)
+    }
+
+    /// **The zone cannot be asked down to nothing**, however insistent the
+    /// caller.
+    ///
+    /// A wedged scheduler asked for ground on every retry of a wave that could
+    /// not succeed. Each ask conceded a region and evicted six experts, and the
+    /// zone went 2,377 slots → 0: `weights=0MiB`, every expert destroyed, and
+    /// the wave no closer to running because the ceiling was a placed tier the
+    /// boundary cannot move.
+    #[test]
+    fn retraction_stops_at_the_weight_floor() {
+        let mut z = zone(800);
+        assert_eq!(z.min_capacity(), 100);
+
+        // Asked for everything in one step: the floor holds.
+        z.retract_to(0, |_| 0.0);
+        assert_eq!(z.capacity(), 100);
+
+        // Asked again and again, as the retry loop did: still the floor.
+        for _ in 0..50 {
+            z.retract_to(0, |_| 0.0);
+        }
+        assert_eq!(z.capacity(), 100, "repeated asks must not walk it down");
+    }
+
+    /// Above the floor a retraction is unimpeded — the whole point of the
+    /// elastic boundary is that the KV side can take most of the zone.
+    #[test]
+    fn the_floor_does_not_impede_an_ordinary_retraction() {
+        let mut z = zone(800);
+        z.retract_to(200, |_| 0.0);
+        assert_eq!(z.capacity(), 200, "the KV side may take most of the zone");
+    }
+
+    /// **The floor is the caller's figure, not a fraction of the opening
+    /// capacity** — and that distinction is what the daemon died on.
+    ///
+    /// A fraction cannot express "the pinned layers' experts must fit", because
+    /// that quantity belongs to the model and the fraction belongs to wherever
+    /// the boundary happened to open. With 3 pinned layers of 128 experts the
+    /// working minimum is 385 slots; an eighth of a 2,377-slot opening is 297.
+    /// The boundary retracted to exactly 297, every resident slot came to hold a
+    /// pinned-layer expert, and 1,774 consecutive forwards failed `cannot evict
+    /// (all pinned)` — a state nothing can leave, because leaving it requires
+    /// evicting something and every candidate is pinned.
+    #[test]
+    fn the_floor_is_the_caller_s_measured_minimum() {
+        let mut z = WeightZone::new(END, SLOT, 2377, 2377, 385);
+        assert_eq!(z.min_capacity(), 385, "the stated floor, not 2377/8 = 297");
+        z.retract_to(0, |_| 0.0);
+        assert_eq!(
+            z.capacity(),
+            385,
+            "a zone asked for everything stops at the pinned working set"
+        );
+
+        // A zone that opens below its own floor is already as small as it can
+        // be — clamped rather than refused, so a small card still loads.
+        let small = WeightZone::new(END, SLOT, 64, 64, 385);
+        assert_eq!(small.min_capacity(), 64);
+    }
+
+    /// **The floor applies from the moment the zone is big enough to have one.**
+    ///
+    /// A zone that opens below its floor is clamped to its capacity — but the
+    /// clamp is a statement about *now*, not a permanent concession. Store it at
+    /// construction and a zone that opens small and then grows keeps the small
+    /// figure for ever, so the KV side can buy it straight back down to its
+    /// opening size and park it in the all-pinned state the floor exists to
+    /// prevent.
+    #[test]
+    fn a_grown_zone_is_held_to_the_real_floor() {
+        let mut z = WeightZone::new(END, SLOT, 64, 4000, 385);
+        assert_eq!(
+            z.min_capacity(),
+            64,
+            "below its floor, the floor is capacity"
+        );
+
+        z.grow_to(2000);
+        assert_eq!(z.capacity(), 2000);
+        assert_eq!(
+            z.min_capacity(),
+            385,
+            "past the floor, the stated floor applies"
+        );
+
+        z.retract_to(0, |_| 0.0);
+        assert_eq!(
+            z.capacity(),
+            385,
+            "and a grown zone cannot be taken back below it"
+        );
     }
 
     /// Slot addresses descend as the index rises, are disjoint, and tile the
@@ -483,7 +653,7 @@ mod tests {
     /// while the working set does not need it.
     #[test]
     fn newly_gained_space_is_used_last() {
-        let mut z = WeightZone::new(END, SLOT, 4, 8);
+        let mut z = WeightZone::new(END, SLOT, 4, 8, 0);
         for _ in 0..4 {
             z.alloc().unwrap();
         }
@@ -498,12 +668,12 @@ mod tests {
     /// that grows the zone may cross it.
     #[test]
     fn growth_is_clamped_by_the_limit() {
-        let mut z = WeightZone::new(END, SLOT, 4, 6);
+        let mut z = WeightZone::new(END, SLOT, 4, 6, 0);
         assert_eq!(z.grow_to(100), 2, "only up to the limit");
         assert_eq!(z.capacity(), 6);
         assert_eq!(z.grow_to(100), 0, "already there");
         // And the constructor clamps too.
-        let z2 = WeightZone::new(END, SLOT, 99, 6);
+        let z2 = WeightZone::new(END, SLOT, 99, 6, 0);
         assert_eq!(z2.capacity(), 6);
     }
 
@@ -617,7 +787,7 @@ mod tests {
     /// slot, and rounding up would hand out an address past the span.
     #[test]
     fn capacity_for_frontier_rounds_down_and_clamps() {
-        let z = WeightZone::new(END, SLOT, 0, 10);
+        let z = WeightZone::new(END, SLOT, 0, 10, 0);
         assert_eq!(z.capacity_for_frontier(END), 0);
         assert_eq!(z.capacity_for_frontier(END - SLOT as u64), 1);
         assert_eq!(
@@ -638,7 +808,7 @@ mod tests {
     /// Nothing leaks out of the zone and nothing is double-counted.
     #[test]
     fn every_slot_is_either_live_or_free() {
-        let mut z = WeightZone::new(END, SLOT, 16, 32);
+        let mut z = WeightZone::new(END, SLOT, 16, 32, 0);
         let mut rng = 0x243f_6a88_85a3_08d3u64;
         let mut next = || {
             rng ^= rng << 13;
@@ -688,7 +858,7 @@ mod tests {
     fn hot_experts_drift_right_across_frontier_churn() {
         const HOT: usize = 8;
         const COLD: usize = 24;
-        let mut z = WeightZone::new(END, SLOT, 32, 32);
+        let mut z = WeightZone::new(END, SLOT, 32, 32, 0);
 
         // slot -> expert id, and expert id -> score. Hot ids are 0..HOT.
         let mut tenant: Vec<Option<usize>> = vec![None; 32];
@@ -775,7 +945,7 @@ mod tests {
     /// the refill finds room and no ordering accumulates.
     #[test]
     fn without_relocation_the_gradient_does_not_appear() {
-        let mut z = WeightZone::new(END, SLOT, 32, 32);
+        let mut z = WeightZone::new(END, SLOT, 32, 32, 0);
         let mut tenant: Vec<Option<usize>> = vec![None; 32];
         const HOT: usize = 8;
 

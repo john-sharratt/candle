@@ -311,4 +311,29 @@ pub enum PipelineMessage {
         /// Oneshot channel for returning the snapshot.
         response_tx: mpsc::SyncSender<ProfileSnapshot>,
     },
+    /// Sell `regions` of weight-side ground to the KV side, now, outside the
+    /// end-of-pass that normally drives the boundary.
+    ///
+    /// **The boundary's give-back is otherwise unreachable from a stalled
+    /// wave.** `renegotiate_boundary` runs in `post_compute`, at the end of a
+    /// *completed* forward — so a wave that cannot allocate never completes,
+    /// never reaches it, and never gets the ground that would let it complete.
+    ///
+    /// This is that reader, and it is how an arena claim buys the ground it
+    /// needs: the eviction still happens here, on the pipeline thread, where the
+    /// cache state lives and no expert GEMM of this thread's is in flight, while
+    /// the *quantity* comes from the claim that knows it. The KV side used to
+    /// record demand in a counter for this to drain, and a counter of refused
+    /// attempts is not a count of regions — one drain read 4,436 against a
+    /// twenty-eight-region shortfall.
+    ///
+    /// Answers with the bytes conceded — zero if the boundary could not move,
+    /// which includes the zone already sitting at its floor, and the case where a
+    /// wave generation is still open and `set_weight_floor` refuses.
+    RenegotiateBoundary {
+        /// Regions the KV side is asking for.
+        regions: usize,
+        /// Oneshot channel for the bytes handed to the KV side.
+        response_tx: mpsc::SyncSender<u64>,
+    },
 }

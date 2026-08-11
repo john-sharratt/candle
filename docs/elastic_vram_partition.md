@@ -1332,7 +1332,94 @@ never runs a KV side to exhaustion.
 
 ---
 
+## 13e. The daemon wedge: a budget that promised ground the allocator refused
+
+A `zend --wipe-substrate` run stalled during section prefill and spun until it
+was killed. Diagnosed from the log; three defects, all now fixed.
+
+```
+21:18:02  weight side took free KV regions gained=46 spare=8 slots=2423
+21:18:33  kv-regions: live=293 free=31 of 324 | tier=496MiB (ceiling 293) | refusals=9382
+21:18:37  ...                                                              refusals=12488
+```
+
+### The budget counted regions the ceiling forbids
+
+`RegionPool::free_count` was `self.free.len() + (total - next)` — regions nobody
+owns — and `alloc::vram_budget_available` is `free × REGION_BYTES`. So the
+admission budget included ground the tier's ceiling makes unclaimable.
+
+A wide section prefill placed a **496 MiB** transient tier; the ceiling landed at
+293 of 324 regions; live reached exactly 293. The 31 regions above the ceiling —
+the tier's own footprint — were reported free, admission was told it had 496 MiB,
+planned a wave against it, and every claim was refused. 12,488 refusals in four
+seconds.
+
+**This is §13c's third guard, applied to only one of its two consumers.** That
+fix taught `spare_regions` to price `transient_bytes.max(tier_reserve)` into the
+weight side's demand. The admission side asks the same question through a
+different function, and it was never corrected. `free` now means *claimable
+now*, with the difference reported separately as `blocked` — a region is in
+exactly one of three states, and `live + free + blocked == total`.
+
+### The give-back was unreachable from a stalled wave
+
+`renegotiate_boundary` had exactly one caller: `post_compute`, at the end of a
+**completed** forward. A wave that cannot allocate never completes, never
+reaches it, and never gets the ground that would let it complete. The demand was
+recorded the whole time — `kv_pressure` incremented on every one of those 12,488
+refusals — with nothing able to read it.
+
+This is precisely the hole §"What actually deletes it" names: *"what deletes this
+is not an exact boundary but a claim that can block — a refused arena claim that
+waits for the next boundary move instead of failing the forward."* The claim
+still does not block, but the boundary is now reachable without one:
+`PipelineMessage::RenegotiateBoundary` lets the scheduler ask from its relief
+path, between waves, where the move is safe. It answers with the bytes conceded,
+and zero — nothing spare, or a wave still open — is an ordinary answer the caller
+acts on rather than spinning past.
+
+That placement matters for a second reason. Every other lever in `relieve`
+*recycles* KV the engine already owns: compress a turn, evict a cold tail, drop
+an empty arena. A base conversation's **sections are permanent by design** — not
+turns — so against this workload all of them read zero, which is exactly what the
+log showed (`turns_compressed=0 turns_evicted=0 arenas_released=0`). Asking the
+weight side is the only lever that *adds* ground, and it was the one missing.
+
+### The fourth defect, which none of these fix
+
+The three above are containment. The wedge outlived them, because the ceiling is
+`transient_base` whenever a tier is placed, and a failed wave leaves its tier
+standing: `plan_wave_transient` releases and re-places at the start of each
+forward but early-returns while `live_generations > 0`, so a generation that
+survives a failed wave step pins the ceiling for the life of the process. The
+second run showed it exactly — the ceiling held at **293 regions** through
+thousands of retries while the weight side conceded everything it had, total
+324 → 743 regions and `weights=0MiB`, with `place_transient` never once bailing.
+
+The fix is **not** to release the tier on failure. That removes the symptom and
+leaves the cause: a wave that does not know its own size until it is running.
+§15 is the cause.
+
+### The error blamed the wrong thing
+
+> `every region of the KV reservation is occupied (293 live)`
+
+The reservation had 324 regions and 31 were free. What was true is that
+everything *below the tier's ceiling* was occupied — and `refusals_during_wave`
+already knew, at 12,488. The message now distinguishes the two cases and names
+the tier width, the ceiling and the blocked count, because they call for opposite
+responses: a boundary move, or a narrower wave.
+
+---
+
 ## 13. Open
+
+> **§15 is the way forward for most of what follows.** A wave that reserves its
+> region demand before it runs — which is computable exactly, because a forward
+> writes only the active format (§15.1) — removes the mid-wave claim, and with it
+> the frontier-anchor question, the tier-placement hazard, and the whole class of
+> stalls in §13e. Read it before picking anything up from this list.
 
 ### The phase-locked forward (§7), now that the plan is trustworthy
 
@@ -1507,3 +1594,365 @@ Two design claims survived contact unchanged and are worth recording as such:
 the second subtraction look like prudence, and the test that pins it deliberately
 records the tally), and **the reserve must apply on the balloon's fast path**
 (§5 — that path is the one that runs, and it was applying no reserve at all).
+
+---
+
+## 15. Deterministic waves — and the phase that gave the ground back too late
+
+§13e's wedge looked like a wave discovering its resource demand mid-flight.
+**It was not.** The reserve-then-run architecture is already built; what was
+broken was one phase of the *tier's* lifetime, and the fix is in §15.3.
+
+This section keeps the design reasoning, because it is what made the real defect
+visible, and records in §15.6 the two confident wrong turns taken along the
+way — both of which the code contradicted.
+
+### 15.1 The class distribution *is* known before the wave
+
+The argument against predicting a wave's region demand was that regions are
+claimed per size class and the class is chosen per 32-token block by the
+compression policy, from the data. That argument is about the **compressor**. It
+does not apply to the wave, for two reasons:
+
+1. **A forward writes only the active format.** New KV is appended unquantized;
+   `active_kv_formats` derives it from the configured format and the device, and
+   on GPU with a quantized config it is `K = R16`, `V = F16`. Two formats, from
+   config, never hardcoded.
+2. **Quantized KV is fixed for the wave's duration.** Sealed blocks are attention
+   *input* — read-only, already placed, already counted. The wave does not
+   allocate into a quantized class at all.
+
+The ladder turns those two formats into two classes: rung `4096` covers
+`R16, F32`; rung `2048` covers `F16, BF16`. So on the production geometry a wave
+touches exactly **class 4096 for K and class 2048 for V**.
+
+The failing run says so directly. Across the whole wedge, only two classes moved:
+
+```
+2048B=96a/1536MiB(live 1535MiB)   4096B=192a/3072MiB(live 3070MiB)
+448B/512B/576B/640B/1088B = 1 arena each, 0 MiB live
+```
+
+Two classes, growing together, at the 2:1 arena ratio `R16` : `F16` implies.
+
+### 15.2 The demand does not need computing — it needs assigning
+
+An earlier draft of this section derived the wave's region demand as exact
+arithmetic over `active_kv_formats`, the ladder and `chunks_per_region`. That
+formula is correct and it should not be built, because there is a better
+property available than *computing the answer exactly*: **not needing an answer
+at all.**
+
+The engine already has the primitive. `ensure_for_batch_entries(entries, add)`
+allocates every chunk a set of sequences will need for the tokens they are about
+to append, under one lock, for the whole batch. Call it before the wave and it
+either succeeds — in which case the wave's storage exists and the wave allocates
+nothing — or it fails, which is the admission answer, exactly, with no model of
+the answer in between.
+
+That is strictly better than arithmetic. A computed demand is a *claim about* the
+allocator that can drift from it: a new format, a changed `N_PALETTE`, another
+sub-band, and the formula is quietly wrong while still returning a number. An
+`ensure` cannot drift, because it is the allocator.
+
+So there is no demand model, no `set_claim_reserve`, no
+`fresh_per_forward_peak` correction, and no admission comparison against
+`vram_budget_available`. **The allocation is the measurement.**
+
+**And this is what the engine already does.** `forward_batch_layers` phase 1 is
+`admit_wave_kv`: *"Claim every KV slot this wave will write, for every layer in
+the range, before a single byte of it computes — so the arena frontier is final
+when the transient tier is reserved against it."* Decode's claims are made by the
+caller through `ensure_for_batch_entries_all` — all layers, once per step, for
+the reason its comment gives: per-layer it cost 48 lock acquisitions per decoded
+token in a steady state where the answer is almost always "nothing to allocate".
+The prefill entry does not claim its own chunks at all; its test fixtures stand
+in for `wave_admit` and say so.
+
+There is therefore no demand model left to build. `set_claim_reserve` still
+computes one on every forward, and it is read at a single site behind a flag that
+is off — dead weight rather than a mechanism.
+
+### 15.3 The wave should not call the allocator at all
+
+The distinction that matters is not "the wave's claims never fail" but "the wave
+makes no claims". A path that cannot fail still has an error return, still has to
+be reasoned about at every call site, and still fails the day an assumption
+underneath it moves. A path that is *never reached* cannot do any of that, and
+the difference is testable: `fresh_claims_during_wave` should be **zero for
+inference by construction**, and any non-zero reading is a named bug rather than
+a tuning signal.
+
+It also collapses the concurrency question. If the wave and the compressor both
+claim during a forward, every reservation scheme is a race between two claimants
+on one pool, and the wave's own arenas are the widest thing on the card with room
+in them — precisely what scarcity promotion (§15.5) reaches for. If the wave
+claims nothing, there is one claimant during a wave and the race does not exist.
+
+**And the wave already does not call it.** Phase 1 admits every slot; the only
+in-layer `ensure_chunked_capacity_batch` left is inside
+`prefill_attention_simple`, a `#[allow(dead_code)]` fallback for configurations
+where the paged kernels do not apply. Reading that fallback as the hot path is
+the second wrong turn recorded in §15.6.
+
+So the property this subsection argues for is already held — which is why the
+defect had to be somewhere else, and §15.3.1 is where.
+
+### 15.3.1 What was actually broken: the tier came back one phase too late
+
+A forward's tier is deliberately held past its guards' drop — `release_if_last`
+returns the ground only when the forward did **not** reserve it — so that a
+region freed between forwards cannot be handed to someone else and move the next
+tier. `plan_wave_transient` was what returned it.
+
+That is **phase 2**. Admit is **phase 1**. So a forward claimed its KV while the
+*previous* forward's tier still stood, and `claim_region` caps the pool at that
+tier's base: admit could be refused by a reservation belonging to a forward that
+had already finished.
+
+While every wave succeeds this is invisible — the next tier is re-placed at the
+same width and admit's claims fit below it. It becomes fatal the moment one wave
+fails. The failed wave's tier stays; the retry's admit is refused by it; that
+attempt fails too; and the engine spins. Which is exactly what the daemon did:
+1,500 refusals a second, `class 4096 B` named in the error because active K is
+precisely what admit claims, the ceiling frozen at 293 regions, and the weight
+side stripped to nothing trying to satisfy a demand no boundary move could.
+
+The fix is `end_wave_transient`, called as **phase 0**, ahead of admit. It
+applies the same guard `plan_wave_transient` applied — a forward beginning while
+a generation from the previous one is still live keeps that reservation, because
+the tier cannot move under a live generation — and does it where the frontier is
+about to be measured rather than after.
+
+#### Why the pre-wave ensure is the one place that can afford to fail
+
+The move is not merely earlier — it is to **the only point in the cycle where
+every remedy exists.** Inside a wave, an allocation that comes up short has
+nothing available to it: the tier caps the pool at its own base, relief cannot
+run because there is no safe point, and the boundary cannot move because a wave
+generation is open. Failure there is terminal, which is why §13e's wedge could
+only spin.
+
+Before the wave, none of that holds. No tier is placed, so the whole span below
+the weight floor is claimable. The compressor can be run, cold tails evicted,
+empty arenas swept. The boundary can move, because nothing is in flight. And if
+after all of that the ground still is not there, the wave can simply be
+**narrowed** — which is the correct response and is only available before the
+first token is embedded.
+
+So the pre-wave ensure has the entire relief and boundary machinery behind it,
+and every one of those mechanisms was already built to run at exactly this
+moment. That is the sense in which this is not a workaround: §7's phase-locked
+forward says to settle the resource question in a phase where settling it is
+safe, and then run. The engine currently settles it 48 layers deep inside the
+run, in the one phase where nothing can help.
+
+### 15.4 The compressor is the other claimant, and it may block
+
+The wave and the compressor have opposite requirements, and the current design
+has them the wrong way round: the wave discovers its size mid-flight and dies,
+while the compressor's demand is *predicted* up front by `set_claim_reserve` — a
+number that, in the shipping configuration, nothing reads. It is consumed at one
+site, inside `if frontier_anchor_enabled()`, and `KV_TIER_FRONTIER` is off by
+default.
+
+The asymmetry is not incidental — it is the whole reason the two can be sized by
+different means. The wave writes **one format per band**, so its demand is exact.
+The compressor writes a format chosen per 32-token block per sub-band
+(`alloc_sealed_blocks_bulk` takes `n_kv_head × N_PALETTE` formats per spec), so
+its demand genuinely is not. Which is fine, because it is the one that can wait.
+
+| | may block? | so its demand is |
+|---|---|---|
+| the wave | **never** — a forward that waits is a stalled engine | exact, and reserved before it starts |
+| the compressor | **yes** — it is asynchronous and off the critical path | dynamic, satisfied lazily |
+
+So the compressor needs no prediction at all. It keeps a floor of one spare arena
+per class it is live in, and when that runs out it **blocks**: publishes what it
+needs and resumes when the ground exists. It waits on arena growth, not on wave
+state, so the two never have to agree about anything.
+
+That blocking claim is also what §"What actually deletes it" says is needed to
+delete `INITIAL_KV_RESERVE` — *"a refused arena claim that waits for the next
+boundary move instead of failing the forward"*. Siting it on the actor that can
+afford to wait is what makes it safe.
+
+#### 15.4.1 Correction: the compressor cannot block *where it runs*
+
+The table above is right about which actor can afford to wait and wrong about
+whether this one is able to. `compress_pending_turns` is rung 3 of
+`relieve_vram_pressure`, which runs **on the scheduler thread**. Waiting there
+waits on the thread that would do the releasing: rung 4's eviction, rung 5's
+`request_kv_ground`, and the next forward's `end_wave_transient` are all further
+down the same call stack's future. A compressor that blocks on arena growth from
+this call site deadlocks the engine outright.
+
+The persistence thread's copy of the same work (`quantize_section_batch`,
+`persistence/thread.rs`) *is* asynchronous and could block as described. But it
+is not the one that runs under pressure — relief is — so building it there fixes
+nothing that was broken.
+
+**What was actually wrong was upstream of the claim.** The compressor was being
+refused because relief ran under a transient tier belonging to a forward that had
+already finished, and — worse than the refusal itself — a placed tier pins
+`region_ceiling` at `transient_base`, where a released one reads
+`weight_floor - tier_reserve`. Those are the same address until the boundary
+moves. So rung 5, the only rung that *adds* ground rather than recycling it,
+conceded weight-side regions that rung 3 could not reach, and the ladder's one
+escape from a workload with nothing reclaimable fed a step that was structurally
+unable to spend it.
+
+Relief now hands the tier back before its first rung, which is the same fix as
+§15.3.1 applied to the other side of the gap: the tier's lifetime ends with its
+forward, not with whoever next happens to place one. And the compressor's own
+failure path is now honest — a refusal is separated from a genuine kernel error,
+stops the pass instead of retrying per group, and reaches the relief log as
+`compress_refused` rather than as `turns_compressed=0`, which was indistinguishable
+from a pass with nothing to do.
+
+`INITIAL_KV_RESERVE` therefore stays. The blocking claim that would delete it
+belongs on the persistence thread, and nothing has yet needed it there.
+
+### 15.5 What the research settled
+
+The four questions this section opened with, answered against the code.
+
+**K and V are one class or two, by config and device — never assume.**
+`active_kv_formats` collapses them for a float-configured backing
+(`Float(d), Float(d)`) and on CPU (`F16, F16`), and splits them on GPU with a
+quantized config (`R16, F16` → classes `4096` and `2048`). The reservation
+derives both through `class_for_format(fmt, elems_per_chunk)`; there is no
+production geometry to hardcode.
+
+**The compressor's class *set* is knowable, only its distribution is not.**
+`CompressionPolicy::k_candidates()` / `v_candidates()` enumerate every format the
+policy may select at the configured level. So the floor is not "one spare arena
+per class it is *currently* live in" — a rule with nothing to say about a class
+touched for the first time — but **one spare arena per class in the candidate
+set**, which is computable at startup and covers first touch by construction.
+First touch is otherwise an ordinary claim: `claim_slot_promoting` →
+`stamp_region_promoting` → `claim_fresh_region` → `register_arena` +
+`ensure_arena_exists`, and it can fail like any other.
+
+**Nothing wakes a blocked compressor, because nothing blocks.** There is no wait
+and no demand signal today: `compress_pending_turns` handles a failed quantize
+with `tracing::warn!`, `ok.fill(false)`, `break` — it abandons the group and
+moves on. So §15.4's blocking claim is new machinery, not a change to an existing
+wait, and it needs to wait on the *pool* rather than on any single event (region
+release, boundary move, and wave end are three, and waiting on one misses the
+other two).
+
+That silence is a finding in its own right. **Under KV pressure the compressor
+quietly gives up, and compression is the thing that would have relieved the
+pressure.** The feedback loop runs backwards at exactly the moment it matters,
+and it is invisible — a warn line, no counter, no demand recorded. It may well be
+part of why the wedge's relief reported `turns_compressed=0`; the log cannot
+distinguish "no turns to compress" from "compression was attempted and
+abandoned", which is itself worth fixing.
+
+**Promotion is unreachable from a reserved wave, and dangerous in the other
+direction.** `stamp_region_promoting` is strictly scarcity-gated: it fires only
+when `claim_fresh_region` has already failed, and it never stamps a new region
+for the wider class — it takes a free slot in one that already exists. (The first
+version *did* walk the ladder stamping; one refusal became seven and the gate
+lost 30 % of single-stream decode.) A reserved wave holds its regions, so its
+claims never fail, so promotion cannot fire for it.
+
+The hazard is the reverse: a *starved compressor* promoting into the wave's
+class. That is what §15.3 answers by reserving slots rather than regions.
+
+### 15.6 Two wrong turns, recorded
+
+The three fixes in §13e stand — they are correct independently, and the false
+boundary demand in particular was destroying the expert cache. What was wrong was
+the reasoning about what remained.
+
+**"The wave discovers its size mid-flight."** It does not. §15.2's property was
+already built, in phase 1 and in `ensure_for_batch_entries_all`. The argument
+that led there was sound in shape and false in fact, and it produced a section of
+exact arithmetic that should never be implemented.
+
+**"Releasing the tier on a failed wave is a hack that hides the real problem."**
+Asserted twice, and wrong. It reads as a hack *only* under the belief above — if
+a wave allocated lazily, returning the tier would indeed paper over a wave that
+could still outgrow its ground. Because the wave admits up front, the tier's
+lifetime **is** the problem, and returning it before admit is the fix rather than
+a cover for one.
+
+Both were checked only after the code contradicted them: the first by finding
+phase 1 already claiming everything, the second by finding that the only in-layer
+`ensure` left is dead code. The lesson worth keeping is that **a diagnosis which
+makes a small fix look like a hack deserves the same scrutiny as one which makes
+a large fix look necessary.** The first kind is more comfortable to hold and no
+more likely to be true.
+
+### 15.6a The reserve was load-bearing for a reason it never stated
+
+Deleting `tier_reserve` produced NaN in the first real conversation after it
+landed, and the mechanism is worth recording in full because the reasoning that
+removed it was correct about everything it considered.
+
+The stated case against the reserve holds. It withheld the **last** tier's width
+against the **next** placement, from a quantity that ranged 4–34 regions inside a
+single run; it could not protect a wider tier and it stranded ground a narrower
+one had left. What it *also* did — and what no comment on it said — was keep the
+KV side off the band the last tier had been writing into.
+
+`claim_region` cleans a region before re-letting it: a device-wide quiesce, then
+a zero fill. It keyed that on **`recycled`** — whether the region came off the
+free list — which quietly assumes the free list is the only way a region arrives
+holding someone else's bytes. It is not:
+
+| how ground arrives | readers still running? | stale bytes? | was it cleaned? |
+|---|---|---|---|
+| freed by an arena | yes | yes | **yes** |
+| vacated by the transient tier | **yes** | **yes** | **no** |
+| conceded by the weight boundary | no (`quiesce_before_handover`) | **yes** | **no** |
+
+With the reserve in place the second row was unreachable — the ceiling never rose
+into the tier's band, so no claim could land there. Removing it made the row
+reachable in one step: the tier is released at phase 0, the ceiling jumps to the
+boundary, and `next` advances into ground the *previous forward's attention and
+FFN kernels are still writing*. Those claims are **fresh**, never on the free
+list, so they took neither the quiesce nor the zero. A KV arena and a wave's
+activations then shared bytes.
+
+It presents as a size threshold, because the frontier has to reach that band: a
+38-token turn was perfect and the 779-token turn after it decoded to `!!!!!`.
+
+The fix is to key cleaning on **state rather than provenance** — `dirty_epoch`,
+"the epoch when these bytes last belonged to someone else, zero for never" —
+and to stamp it from all three rows. The third row was a second live instance of
+the same omission: every boundary concession handed the KV side unzeroed expert
+weights, fifteen times in one forty-two-minute run.
+
+**The general lesson, which is the reusable part.** A guard whose stated
+justification is weak may still be holding up something unstated, and the
+argument that retires it will not mention what it does not know about. What would
+have caught this is not better reasoning about the reserve — the reasoning was
+sound — but asking of the *invariant underneath*: cleaning exists so that no
+tenant reads the last one's bytes, so every way a region can change hands must
+reach it. That question is answerable from the code and does not depend on
+guessing what a removed guard was secretly for.
+
+### 15.7 What is still open
+
+`end_wave_transient` closes the wedge's mechanism, on both sides of the gap
+between forwards: phase 0 of the next wave (§15.3.1) and the first rung of relief
+(§15.4.1). The compressor no longer fails silently and no longer fails for a
+reason that no rung of the ladder could fix.
+
+Three things remain, none of them load-bearing for the wedge:
+
+- **`set_claim_reserve` is computed and thrown away.** Phase 2 prices the
+  compressor's destinations into `claim_reserve` on every forward; the only read
+  is inside `if frontier_anchor_enabled()`, and `KV_TIER_FRONTIER` is off. With
+  the tier measured down from the weight floor there is room above the frontier
+  anyway, so it is inert rather than wrong — but it is arithmetic no one consumes,
+  and it should either become the anchor's seed for real or go.
+- **`INITIAL_KV_RESERVE` stays.** Deleting it needs the blocking claim of §15.4,
+  which belongs on the persistence thread, and nothing has yet needed it there.
+- **The 496 MiB tier for eight forwards of thirty tokens is unexamined**
+  (`a=114MiB b=358MiB`). If it is over-priced, the ceiling sits lower than it has
+  to on every forward, and the whole class of problem in §15 gets rarer by
+  arithmetic rather than by mechanism.

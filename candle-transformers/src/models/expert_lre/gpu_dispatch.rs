@@ -270,7 +270,7 @@ mod tests {
     /// constructed full, so the fixture cannot disagree with the allocator about
     /// what occupancy looks like.
     fn full_zone(n: usize) -> candle_nn::kv_cache::WeightZone {
-        let mut zone = candle_nn::kv_cache::WeightZone::new(1 << 30, 4096, n, n);
+        let mut zone = candle_nn::kv_cache::WeightZone::new(1 << 30, 4096, n, n, 0);
         for _ in 0..n {
             zone.alloc().expect("a fresh zone has every slot free");
         }
