@@ -28,6 +28,11 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
+#[cfg(feature = "cuda")]
+use candle::quantized::cuda::{
+    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128, moe_bucketize,
+    moe_route, silu_mul_q8a128, Q8a128Operand, GROUPED_GEMM_TILE_W,
+};
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
@@ -851,6 +856,134 @@ impl ExpertCache {
             return None;
         }
         Some(gd)
+    }
+
+    /// GPU-native resident MoE executor: route → bucketize → gather → grouped
+    /// GEMM ×3 → SwiGLU → deterministic scatter, entirely on the compute stream
+    /// with no routing readback. This is the **all-resident** fast lane — the
+    /// only caller is the qwen3 `SparseMoeBlock` (every expert VRAM-resident).
+    /// DeepSeek's paged cache uses the host `submit_moe_work` path.
+    ///
+    /// Every active expert is already VRAM-resident with a static address
+    /// (`GpuDispatchTables`), so the per-layer weight-pointer table is the
+    /// prebuilt static table and there is **no active-list readback, no DMA, and
+    /// no flag-wait** — every expert forward runs entirely on the compute stream.
+    ///
+    /// `router_logits` is `[num_tokens, num_experts]`; `op` is the q8a1024
+    /// activation the experts consume. Returns `Some([num_tokens, hidden_dim])`
+    /// (the caller reshapes), or `Ok(None)` when the GPU-native dispatch tables
+    /// are unavailable (sparse/oversized id space, or a dead pipeline) so the
+    /// caller falls back to the host path — this is the single dispatch-table
+    /// lookup (the caller does not pre-check). Bit-identical to the host-
+    /// orchestrated expert path — the bucketize tables reproduce the CPU
+    /// counting-sort and the grouped GEMM / gather / silu / scatter kernels are
+    /// shared verbatim.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_moe_gpu(
+        &self,
+        moe_layer_idx: usize,
+        router_logits: &Tensor,
+        op: &Q8a128Operand,
+        k: usize,
+        num_experts: usize,
+        norm_topk_prob: bool,
+        out_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        let device = router_logits.device().clone();
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("forward_moe_gpu: expected a CUDA device"),
+        };
+        let num_tokens = router_logits.dim(0)?;
+
+        // Single dispatch-table lookup: `None` ⇒ no GPU-native path, caller uses host.
+        let gd = match self.live_gpu_dispatch(moe_layer_idx, num_experts) {
+            Some(gd) => gd,
+            None => return Ok(None),
+        };
+        let hidden_dim = gd.down_nrows;
+
+        // 1. Fused GPU routing; the flattened weights feed the scatter directly.
+        let t = profile_now();
+        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, norm_topk_prob)?;
+        let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
+        self.record_profile("fwd_routing", t);
+
+        // 2. On-device bucketize into the shared reusable workspace.
+        let t = profile_now();
+        let mut ws = gd
+            .workspace
+            .lock()
+            .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
+        moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
+        let a_ub = num_tokens * k;
+        // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and each
+        // expert adds at most one partial tile.
+        let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + num_experts);
+        let expert_base = gd
+            .expert_base(moe_layer_idx)
+            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
+
+        // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
+        let stacked = fused_moe_gather_q8a128(op, &ws.tok_ids, a_ub, &cuda_dev)?;
+        let gate_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.gate_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype,
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let up_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.up_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype, // up shares gate's KO dtype
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev)?;
+        let down_out = grouped_qmatmul_dev_q8a128(
+            &inter_acts,
+            &gd.down_ptrs,
+            expert_base,
+            num_experts,
+            gd.down_dtype,
+            gd.down_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        // The int8 matmul emits F32; the fused scatter requires the compute dtype.
+        let down_out = down_out.to_dtype(out_dtype)?;
+
+        // 4. Deterministic scatter — identical accumulation order to the host path.
+        let ys = Tensor::zeros((num_tokens, hidden_dim), out_dtype, &device)?;
+        fused_deterministic_scatter(
+            &ys,
+            &down_out,
+            &ws.perm,
+            &weights_flat,
+            &ws.rw_ids,
+            &ws.token_starts,
+            num_tokens,
+            &cuda_dev,
+        )?;
+        self.record_profile("fwd_expert_gpu", t);
+        Ok(Some(ys))
     }
 
     /// Get mutable access to the pinned routing buffer.

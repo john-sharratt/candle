@@ -8,16 +8,22 @@
 // (grouped GEMM), and the token-major segment tables (deterministic scatter) —
 // entirely on the device.
 //
-// The kernel is a SINGLE thread block of 128 threads and uses NO atomics, so
-// every output is bit-deterministic:
-//   * phase 1 — thread `e` owns expert `e` and counts its assignments by
-//     scanning the whole top-k list (an id ≥ n_experts is the router's
-//     "no expert" sentinel for an empty slot and is skipped);
-//   * phase 2 — thread 0 prefix-scans the 128 counts into bucket offsets,
+// The kernel is a SINGLE thread block of BUCKETIZE_THREADS (256) threads. Every
+// output is bit-deterministic:
+//   * phase 1 — a grid-stride per-expert histogram: each assignment is read
+//     ONCE and bumped into its expert's shared bin with an atomicAdd (an id
+//     ≥ n_experts is the router's "no expert" sentinel and is skipped). The
+//     sums are order-independent, so the counts — and every table derived from
+//     them — are identical to a serial scan, at O(a_ub) instead of
+//     O(n_experts × a_ub) work;
+//   * phase 2 — thread 0 prefix-scans the counts into bucket offsets,
 //     accumulates the per-expert tile counts, and writes the device header;
-//   * phase 3 — thread `e` re-scans the list in ascending assignment order and
-//     writes its own bucket sequentially: the grouping is STABLE in
-//     (token, slot) order, matching the CPU sort exactly;
+//   * phase 3 — a chunked STABLE counting-sort scatter: the list is split into
+//     NCHUNK contiguous chunks, each chunk counts its assignments per expert, a
+//     per-expert exclusive prefix across chunks gives each chunk its write base,
+//     and each chunk scatters in ascending i. Chunks ordered + within-chunk
+//     ascending ⇒ each bucket is STABLE (ascending i), matching the CPU sort
+//     exactly, in O(a_ub) work (no per-expert full rescan);
 //   * phase 4 — each thread emits its expert's GEMM tiles (≤ tile_w tokens
 //     per tile); the tail up to the launch bound is padded with `b_cnt = 0`
 //     tiles the grouped kernel skips, so the HOST needs no data-dependent
@@ -40,13 +46,16 @@
 
 #include <stdint.h>
 
-// 256 threads so thread e can own expert e for up to 256 experts (some MoE models have
-// 256 routed experts; Qwen3-MoE has 128). Phase-1/3/4 are one-thread-per-expert; phase-4b/5
-// are BUCKETIZE_THREADS grid-stride, so both scale together.
+// 256 threads: phase 2/4 are one-thread-per-expert (up to 256 routed experts;
+// Qwen3-MoE has 128), phase 1/4b/5 are grid-stride, and phase 3 is one-thread-
+// per-chunk. All scale with the block width.
 #define BUCKETIZE_THREADS 256
 #define MAX_EXPERTS 256
 #define MAX_TOPK 32
 #define INVALID_ROW 0xFFFFFFFFu
+// Phase-3 chunk-table budget (ints). NCHUNK = SH_CC_INTS / n_experts chunks.
+#define SH_CC_INTS 8192
+#define SH_CC_MAX_CHUNK 128
 
 extern "C" __global__ void moe_bucketize_kernel(
     const uint32_t* __restrict__ topk_ids, // [n_tokens * k] row-major
@@ -74,20 +83,30 @@ extern "C" __global__ void moe_bucketize_kernel(
     __shared__ int32_t sh_tile_pref[MAX_EXPERTS + 1];
     __shared__ int32_t sh_scan[BUCKETIZE_THREADS + 1];
     __shared__ int32_t sh_header[3]; // n_active, total_valid, num_tiles
+    // Per-chunk per-expert scratch for the phase-3 stable scatter, flat
+    // `[NCHUNK][n_experts]` with a runtime `n_experts` stride. 8192 ints (32 KB)
+    // gives NCHUNK = 8192/n_experts chunks — 64 at 128 experts, 32 at 256.
+    __shared__ int32_t sh_cc[SH_CC_INTS];
 
-    // ── Phase 1: per-expert counts (thread e owns expert e) ──
-    int my_count = 0;
-    if (tid < n_experts) {
-        for (int i = 0; i < a_ub; i++) {
-            if (topk_ids[i] == (uint32_t)tid) {
-                my_count++;
-            }
-        }
-    }
-    if (tid < MAX_EXPERTS) {
-        sh_counts[tid] = my_count;
+    // ── Phase 1: per-expert histogram (grid-stride, shared-memory atomics) ──
+    // Each assignment is read ONCE and atomically bumped into its expert's
+    // shared bin — O(a_ub) work instead of the O(n_experts × a_ub) scan where
+    // every thread re-read the whole list. Summation is order-independent, so
+    // the counts (and therefore every downstream table) are identical to the
+    // serial scan: the change is bit-exact, just far faster for large prefill
+    // `a_ub` (the single-block kernel's dominant cost).
+    for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
+        sh_counts[e] = 0;
     }
     __syncthreads();
+    for (int i = tid; i < a_ub; i += BUCKETIZE_THREADS) {
+        const uint32_t e = topk_ids[i];
+        if (e < (uint32_t)n_experts) {
+            atomicAdd(&sh_counts[e], 1);
+        }
+    }
+    __syncthreads();
+    const int my_count = (tid < n_experts) ? sh_counts[tid] : 0;
 
     // ── Phase 2: offsets + tile prefix + header (thread 0, ≤128 iterations) ──
     if (tid == 0) {
@@ -119,18 +138,63 @@ extern "C" __global__ void moe_bucketize_kernel(
     const int32_t total_valid = sh_header[1];
     const int32_t num_tiles = sh_header[2];
 
-    // ── Phase 3: stable bucket write (thread e re-scans in ascending i) ──
-    if (tid < n_experts && my_count > 0) {
-        int32_t cursor = sh_offsets[tid];
-        for (int i = 0; i < a_ub; i++) {
-            if (topk_ids[i] == (uint32_t)tid) {
-                tok_ids[cursor] = (uint32_t)(i / k);
-                weight_ids[cursor] = (uint32_t)i;
-                inv[i] = (uint32_t)cursor;
-                cursor++;
+    // ── Phase 3: chunked STABLE counting-sort scatter (O(a_ub) work) ──
+    // Split the list into NCHUNK contiguous chunks. Pass 1: each chunk-thread
+    // counts its chunk's assignments per expert into `sh_cc[chunk][e]`. A
+    // per-expert exclusive prefix across chunks (seeded at `sh_offsets[e]`) turns
+    // those counts into each chunk's write base for each expert. Pass 2: each
+    // chunk re-scans in ASCENDING i and writes every assignment at `base[e]++`.
+    // Chunks are ordered and within a chunk i is ascending, so each expert's
+    // bucket comes out STABLE (ascending i) — bit-identical to the CPU sort —
+    // and no expert ever rescans the whole list.
+    const int NCHUNK =
+        (SH_CC_INTS / n_experts < SH_CC_MAX_CHUNK) ? (SH_CC_INTS / n_experts) : SH_CC_MAX_CHUNK;
+    const int chunk_len = (a_ub + NCHUNK - 1) / NCHUNK;
+    for (int idx = tid; idx < NCHUNK * n_experts; idx += BUCKETIZE_THREADS) {
+        sh_cc[idx] = 0;
+    }
+    __syncthreads();
+    // Pass 1: per-chunk per-expert counts.
+    if (tid < NCHUNK) {
+        const int lo = tid * chunk_len;
+        const int hi = (lo + chunk_len < a_ub) ? (lo + chunk_len) : a_ub;
+        int32_t* cc = &sh_cc[tid * n_experts];
+        for (int i = lo; i < hi; i++) {
+            const uint32_t e = topk_ids[i];
+            if (e < (uint32_t)n_experts) {
+                cc[e]++;
             }
         }
     }
+    __syncthreads();
+    // Per-expert exclusive prefix across chunks: sh_cc[c][e] becomes chunk c's
+    // write base for expert e. Thread e owns expert e, sweeps the NCHUNK counts.
+    if (tid < n_experts) {
+        int32_t run = sh_offsets[tid];
+        for (int c = 0; c < NCHUNK; c++) {
+            const int idx = c * n_experts + tid;
+            const int32_t v = sh_cc[idx];
+            sh_cc[idx] = run;
+            run += v;
+        }
+    }
+    __syncthreads();
+    // Pass 2: stable scatter using each chunk's per-expert running base.
+    if (tid < NCHUNK) {
+        const int lo = tid * chunk_len;
+        const int hi = (lo + chunk_len < a_ub) ? (lo + chunk_len) : a_ub;
+        int32_t* base = &sh_cc[tid * n_experts];
+        for (int i = lo; i < hi; i++) {
+            const uint32_t e = topk_ids[i];
+            if (e < (uint32_t)n_experts) {
+                const int32_t pos = base[e]++;
+                tok_ids[pos] = (uint32_t)(i / k);
+                weight_ids[pos] = (uint32_t)i;
+                inv[i] = (uint32_t)pos;
+            }
+        }
+    }
+    __syncthreads();
 
     // ── Phase 4: tile tables + padding ──
     if (tid < n_experts && my_count > 0) {

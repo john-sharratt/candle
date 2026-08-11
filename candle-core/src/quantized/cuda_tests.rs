@@ -7763,6 +7763,131 @@ fn assert_bucketize_case(
     Ok(())
 }
 
+/// Assert every `moe_bucketize` output table is bit-identical to the CPU
+/// reference for a workspace already run on `ids` — the gate the micro-bench
+/// runs before timing each config.
+#[cfg(test)]
+fn assert_bucketize_ws(
+    dev: &CudaDevice,
+    ws: &MoeBucketizeWorkspace,
+    ids: &[u32],
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+    tile_w: usize,
+    label: &str,
+) -> Result<()> {
+    let reference = bucketize_ref(ids, n_tokens, k, n_experts, tile_w);
+    let a_ub = n_tokens * k;
+    assert_eq!(
+        dev.memcpy_dtov(&ws.header.slice(..4))?,
+        reference.header.to_vec(),
+        "{label}: header"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.tok_ids.slice(..a_ub))?,
+        reference.tok_ids,
+        "{label}: tok_ids"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.weight_ids.slice(..a_ub))?,
+        reference.weight_ids,
+        "{label}: weight_ids"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.tile_expert.slice(..a_ub))?,
+        reference.tile_expert,
+        "{label}: tile_expert"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.tile_b_start.slice(..a_ub))?,
+        reference.tile_b_start,
+        "{label}: tile_b_start"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.tile_b_cnt.slice(..a_ub))?,
+        reference.tile_b_cnt,
+        "{label}: tile_b_cnt"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.perm.slice(..a_ub))?,
+        reference.perm,
+        "{label}: perm"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.rw_ids.slice(..a_ub))?,
+        reference.rw_ids,
+        "{label}: rw_ids"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&ws.token_starts.slice(..n_tokens + 1))?,
+        reference.token_starts,
+        "{label}: token_starts"
+    );
+    Ok(())
+}
+
+/// Micro-benchmark harness for `moe_bucketize`. For each size regime qwen3
+/// actually hits (k=8, 128 experts) plus a 256-expert stress case, it FIRST
+/// asserts every output table is bit-identical to the CPU reference, then times
+/// the kernel end-to-end (wall clock, one sync per batch of launches). Prints
+/// µs/call and throughput. `--ignored` (needs a GPU); run with `--nocapture`.
+#[test]
+#[ignore]
+fn bench_moe_bucketize() -> Result<()> {
+    use std::time::Instant;
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let tile_w = 32usize;
+    let iters = 300usize;
+
+    // (n_tokens, k, n_experts, label)
+    let configs: &[(usize, usize, usize, &str)] = &[
+        (1, 8, 128, "decode-1"),
+        (64, 8, 128, "decode-64"),
+        (512, 8, 128, "prefill-512"),
+        (2048, 8, 128, "prefill-2048"),
+        (4096, 8, 128, "prefill-4096"),
+        (8192, 8, 128, "prefill-8192"),
+        (4096, 8, 256, "prefill-4096-e256"),
+    ];
+
+    println!("\n=== moe_bucketize micro-bench (tile_w={tile_w}, iters={iters}) ===");
+    println!(
+        "{:<20} {:>8} {:>7} {:>12} {:>14}",
+        "config", "a_ub", "n_exp", "us/call", "M-assign/s"
+    );
+    for &(n_tokens, k, n_experts, label) in configs {
+        let a_ub = n_tokens * k;
+        // Deterministic pseudo-random dense routing (all slots valid).
+        let ids: Vec<u32> = (0..a_ub)
+            .map(|i| ((i as u64).wrapping_mul(2654435761) % n_experts as u64) as u32)
+            .collect();
+        let t = crate::Tensor::from_vec(ids.clone(), (n_tokens, k), &device)?;
+        let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
+
+        // Correctness gate FIRST — every table bit-exact vs the CPU sort.
+        moe_bucketize(&t, n_experts, tile_w, &mut ws)?;
+        assert_bucketize_ws(&dev, &ws, &ids, n_tokens, k, n_experts, tile_w, label)?;
+
+        // Warm up, then time `iters` launches with a single trailing sync.
+        for _ in 0..20 {
+            moe_bucketize(&t, n_experts, tile_w, &mut ws)?;
+        }
+        let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            moe_bucketize(&t, n_experts, tile_w, &mut ws)?;
+        }
+        let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
+        let us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let massign = (a_ub as f64) / (us * 1e-6) / 1e6;
+        println!("{label:<20} {a_ub:>8} {n_experts:>7} {us:>12.2} {massign:>14.1}");
+    }
+    Ok(())
+}
+
 /// The GPU-native dispatch gate: `grouped_qmatmul_dev_q8a128` (full resident
 /// pointer table + `moe_bucketize` device tile tables, upper-bound launch) must
 /// produce BIT-IDENTICAL output rows to the host-orchestrated `grouped_qmatmul`

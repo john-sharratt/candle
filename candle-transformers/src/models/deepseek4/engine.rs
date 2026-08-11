@@ -405,9 +405,9 @@ impl Dsv4Engine {
 
         // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),
         // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
-        // The ONE intrinsic wave-path readback: the streaming expert cache
-        // schedules pinned→VRAM uploads by expert id, so the routing indices
-        // must be host-visible (amortized across every row of the wave).
+        // The ONE intrinsic wave-path readback: the paged expert cache schedules
+        // pinned→VRAM uploads by expert id, so the routing indices must be
+        // host-visible (amortized across every row of the wave).
         let t_sort = profile_now();
         super::readback::note_readback();
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
