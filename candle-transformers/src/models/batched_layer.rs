@@ -1184,11 +1184,17 @@ fn paged_decode_attention<'w>(
             raw_out
         }
     };
-    for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
-        cache.set_current_seq_len(offset + 1)?;
-    }
-
-    // After writing each decode token, eagerly quantize any newly-sealed chunk.
+    // The token's usage advance does NOT happen here, and must not. This runs
+    // once per layer as the sweep passes through, but a decode step with a
+    // creep group active is split across several `forward_wave` segment calls —
+    // and each of those rebuilds the decode metadata from the caches. A
+    // per-layer advance makes the layers between two segments genuinely
+    // disagree (swept layers one token ahead), which the layer-invariance
+    // guard then reads as corruption. In-step attention never needs the
+    // advance: the new token is read through the position map's write-slot
+    // entry, built against the pre-step usage. The advance is bookkeeping for
+    // the NEXT step, and `forward_wave_contexts` performs it once, for every
+    // layer at once, when the step's head completes.
     Ok(out)
 }
 

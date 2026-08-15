@@ -306,6 +306,21 @@ impl WeightZone {
         self.span_end - (self.capacity * self.slot_bytes) as u64
     }
 
+    /// The frontier the zone will publish *after* [`Self::grow_to`] takes it to
+    /// `target` — `target` under the same clamps that method applies.
+    ///
+    /// **Growth publishes its floor before it moves.** Telling the KV side about
+    /// a boundary is the step that can be refused (a wave generation open on the
+    /// span), and a zone that grew against a refused floor holds slots whose
+    /// addresses lie *below* the boundary the KV side still believes in — ground
+    /// both sides think they own. Publishing first makes the refusal land while
+    /// the zone is still untouched, which is why the address has to be derivable
+    /// from a capacity the zone does not have yet.
+    pub fn frontier_after_growth(&self, target: usize) -> u64 {
+        let reached = target.min(self.limit).max(self.capacity);
+        self.span_end - (reached * self.slot_bytes) as u64
+    }
+
     /// Take the rightmost free slot, or `None` when every slot is occupied.
     ///
     /// `None` is the signal to evict, and the choice of victim belongs to the
@@ -802,6 +817,34 @@ mod tests {
             "clamped by the limit, not by the address"
         );
         assert_eq!(z.capacity_for_frontier(END + 1), 0, "past the end is none");
+    }
+
+    /// The address growth publishes **before** it grows has to be the one the
+    /// zone will actually reach — under `grow_to`'s own clamps, not the caller's
+    /// ask. Publishing a floor for a capacity the limit forbids hands the KV side
+    /// a boundary the weight side never occupies; publishing one below the
+    /// current capacity would move the boundary backwards on a growth.
+    #[test]
+    fn the_floor_growth_publishes_is_the_one_growth_reaches() {
+        let mut z = WeightZone::new(END, SLOT, 4, 10, 0);
+        assert_eq!(
+            z.frontier_after_growth(7),
+            END - 7 * SLOT as u64,
+            "an ordinary growth publishes its target"
+        );
+        assert_eq!(
+            z.frontier_after_growth(40),
+            END - 10 * SLOT as u64,
+            "clamped by the limit, exactly as grow_to clamps it"
+        );
+        assert_eq!(
+            z.frontier_after_growth(1),
+            z.frontier_for_capacity(),
+            "a target below the capacity moves nothing"
+        );
+        // And the published address is what the zone holds once it has grown.
+        z.grow_to(7);
+        assert_eq!(z.frontier_for_capacity(), END - 7 * SLOT as u64);
     }
 
     /// Every slot is either live or free, at every point in a mixed sequence.

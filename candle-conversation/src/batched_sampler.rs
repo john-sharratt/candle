@@ -561,6 +561,19 @@ impl BatchedSampler {
             // it); a no-op when the list is empty.
             let seq_logits = apply_banned(&seq_logits, config)?;
 
+            // Structural: ban the think-close token while outside a think block —
+            // there is nothing for it to close there, and a stray one derails the
+            // turn (see `think_close_ban_active`).
+            let seq_logits = if think_close_ban_active(config, state) {
+                let dtype = seq_logits.dtype();
+                let dims = seq_logits.dims().to_vec();
+                let mut v: Vec<f32> = seq_logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                ban(&mut v, config.segment_close_token_id as u32);
+                Tensor::from_vec(v, dims, seq_logits.device())?.to_dtype(dtype)?
+            } else {
+                seq_logits
+            };
+
             // Token suppression: while inside a segment, subtract the per-turn
             // penalty from each suppress-token logit. Mirrors the kernel's
             // in-segment gate, so tokens outside the segment are never touched.
@@ -753,9 +766,40 @@ impl BatchedSampler {
         // Get EOS token
         let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
 
-        // Build banned tokens buffer
-        let banned_tokens = &config.banned_tokens;
-        let num_banned = banned_tokens.len() as i32;
+        // Build banned tokens buffer.
+        //
+        // Per-sequence when any row carries the structural think-close ban
+        // (`think_close_ban_active` — a `</think>` outside a think block is
+        // never valid output): each row gets the shared deny-list plus, for
+        // rows outside a block, the close id; `-1` is the kernel's "empty
+        // slot" sentinel. The kernel has carried this per-seq mode from the
+        // start (`banned_tokens_per_seq > 0`); this is its first caller.
+        // With no row needing the ban, the shared list goes down the legacy
+        // global path untouched.
+        let think_ban_rows = states
+            .iter()
+            .zip(configs.iter())
+            .any(|(s, c)| think_close_ban_active(c, s));
+        let (banned_tokens, num_banned, banned_per_seq) = if think_ban_rows {
+            let stride = config.banned_tokens.len() + 1;
+            let mut flat: Vec<i32> = Vec::with_capacity(states.len() * stride);
+            for (s, c) in states.iter().zip(configs.iter()) {
+                flat.extend_from_slice(&config.banned_tokens);
+                flat.push(if think_close_ban_active(c, s) {
+                    c.segment_close_token_id
+                } else {
+                    -1
+                });
+            }
+            (flat, 0, stride as i32)
+        } else {
+            (
+                config.banned_tokens.clone(),
+                config.banned_tokens.len() as i32,
+                0,
+            )
+        };
+        let banned_tokens = &banned_tokens;
 
         // No stencil here — constrained rows were resolved before the kernel.
         let stencil: &[i32] = &[];
@@ -860,6 +904,7 @@ impl BatchedSampler {
             &token_counts,
             banned_tokens,
             num_banned,
+            banned_per_seq,
             &recent_tokens,
             &recent_lens,
             stencil,
@@ -1159,6 +1204,7 @@ impl BatchedSampler {
         token_counts: &[i32],
         banned_tokens: &[i32],
         num_banned: i32,
+        banned_per_seq: i32,
         recent_tokens: &[i32],
         recent_lens: &[i32],
         stencil: &[i32],
@@ -1335,7 +1381,7 @@ impl BatchedSampler {
                     tc_ptr as *const i32,
                     ban_ptr as *const i32,
                     num_banned,
-                    0, // banned_tokens_per_seq (global banned list)
+                    banned_per_seq,
                     recent_ptr as *const i32,
                     recent_lens_ptr as *const i32,
                     self.max_recent_len as i32,
@@ -1415,6 +1461,29 @@ fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tens
         ban(&mut v, b as u32);
     }
     Tensor::from_vec(v, dims, logits.device())?.to_dtype(dtype)
+}
+
+/// Whether the structural think-close ban applies to this row right now.
+///
+/// **A `</think>` outside a think block is never valid output.** It is a
+/// structural token: inside a block the steering owns it (a sampled close is
+/// intercepted and replaced by the stencil's canonical prefill), and outside a
+/// block there is nothing for it to close. The window this guards is real and
+/// was hit twice on the same turn shape: the stencil finishes its walk at the
+/// prefilled close, steering ends, and the very next free-decoded tokens have
+/// no owner for the close id — the model emitted a second `</think>`, and with
+/// the segment state already cleared every think-scoped control (DRY,
+/// suppression) was off, so nothing resisted it. The turn's answer then
+/// derailed off the malformed transcript.
+///
+/// Gated on the sampler's own `in_segment` — deliberately not a new flag. This
+/// state has desynced from its twins twice before, and the ban is shaped to
+/// fail safe against both directions: wrongly *outside* (ban active in a think
+/// block) cannot strand the block, because closing it is the stencil's job and
+/// the hard-cap closer script forces the token rather than sampling it;
+/// wrongly *inside* (ban off after a close) is exactly today's behaviour.
+fn think_close_ban_active(config: &SamplingConfig, state: &SequenceSamplingState) -> bool {
+    config.segment_close_token_id >= 0 && !state.in_segment
 }
 
 /// Subtract the suppression penalty from each `segment_suppress_tokens` logit.
@@ -1944,6 +2013,62 @@ mod tests {
             .sample_batch(&logits, &mut [&mut state], &[&config])
             .expect("sample");
         assert_eq!(tokens[0], 60, "banned best token → next best");
+    }
+
+    // ── Structural think-close ban ─────────────────────────────────────
+
+    /// **A `</think>` outside a think block is never sampleable.** The stencil
+    /// owns the close inside a block; outside one there is nothing to close,
+    /// and a stray close after the stencil's walk has finished is exactly what
+    /// produced the doubled `</think>` that derailed a live turn — twice, on
+    /// the same turn shape.
+    #[test]
+    fn a_think_close_outside_a_think_block_is_banned() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.segment_open_token_id = 89;
+        config.segment_close_token_id = 90;
+        let mut state = make_state();
+        assert!(!state.in_segment, "a turn starts outside any think block");
+        assert!(think_close_ban_active(&config, &state));
+
+        let logits = logits_from_rows(&[&[(90, 100.0), (60, 50.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(
+            tokens[0], 60,
+            "the close token must be unreachable outside a block"
+        );
+    }
+
+    /// Inside a block the ban is off: the model must stay free to emit the
+    /// close (the steering intercepts it — `TokenClosedDrop` — or the hard-cap
+    /// closer forces it; the sampler's job is only to not fight either).
+    #[test]
+    fn a_think_close_inside_a_think_block_is_free() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.segment_open_token_id = 89;
+        config.segment_close_token_id = 90;
+        let mut state = make_state();
+        state.enter_segment();
+        assert!(!think_close_ban_active(&config, &state));
+
+        let logits = logits_from_rows(&[&[(90, 100.0), (60, 50.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 90, "inside a block the close samples normally");
+    }
+
+    /// Without segment tracking configured (close id < 0) the ban never
+    /// activates — reference models with no think protocol are untouched.
+    #[test]
+    fn no_think_protocol_means_no_ban() {
+        let config = SamplingConfig::argmax();
+        let state = make_state();
+        assert!(!think_close_ban_active(&config, &state));
     }
 
     #[test]

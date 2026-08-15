@@ -37,6 +37,27 @@ use crate::substrate::TreeNodeMeta;
 use crate::summary_tree::exchange;
 use crate::summary_tree::probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
 use crate::summary_tree::tree::carry_run;
+
+/// How many of a timeline's newest Normal turns stay **verbatim** — no
+/// exchange whose last member sits inside this tail is absorbed into a
+/// summary leaf, however settled it is.
+///
+/// Compression exists to bound old context, and it trades fidelity for room —
+/// a trade that is all loss on the conversation's working tail, where the
+/// model needs its own recent exchanges word-for-word (to quote them, list
+/// them, or follow up on them) and where a few turns of raw dialogue cost
+/// almost nothing. `exchange::is_settled` alone protects only the frontier
+/// exchange, so the moment a new exchange opened, the previous one became
+/// absorbable: measured, a four-question conversation had its first turn
+/// compressed sixty-four seconds after it sealed — while the user was typing
+/// question three — and by question five ("what did I ask you?") the
+/// projection held digests where the dialogue had been, and the model
+/// answered that it had no access to the conversation history.
+///
+/// Eight Normal turns is three to four exchanges — a tool round-trip spans
+/// several turns. An **archived** timeline is exempt: it is terminal, nothing
+/// will ever need its tail verbatim, and the peak cover wants it sealed.
+const RAW_TAIL_TURNS: usize = 8;
 use crate::summary_tree::TurnKind;
 
 /// How often the summariser wakes up on its own when no triggers
@@ -248,7 +269,9 @@ pub fn run_pass(
         // must not abort the whole pass — it would starve every other
         // timeline, including freshly-started conversations. Log it and move
         // on; only a hard error propagates and stops the thread.
-        if let Err(e) = absorb_pending_turns(conversation, runner, timeline, max_concurrent) {
+        if let Err(e) =
+            absorb_pending_turns(conversation, runner, timeline, max_concurrent, RAW_TAIL_TURNS)
+        {
             match e {
                 ProbeError::Hard(_) => return Err(e),
                 ProbeError::Soft(msg) | ProbeError::Permanent(msg) => {
@@ -310,11 +333,15 @@ pub fn run_pass(
 /// 4. Persist every change as `TreeMetadata` redo-log records.  Nodes are
 ///    immutable once written — no root pointer, no rotations, no dirty bit
 ///    (`docs/immutable_summary_forest.md`).
+/// `raw_tail` is how many of the timeline's newest Normal turns stay verbatim
+/// — production passes [`RAW_TAIL_TURNS`]; tests that exercise settledness and
+/// batching pass `0` so their small fixtures stay legible.
 fn absorb_pending_turns(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,
     timeline: TimelineId,
     max_concurrent: usize,
+    raw_tail: usize,
 ) -> Result<(), ProbeError> {
     loop {
         // Collect up to `max_concurrent` eligible pending Normal turns, so
@@ -393,6 +420,19 @@ fn absorb_pending_turns(
                     timeline = %timeline,
                     normal = %normal_idx,
                     "absorb: frontier exchange, deferring until a later turn settles it",
+                );
+                deferred.push(normal_idx);
+                continue;
+            }
+            // Settled is necessary, not sufficient: the exchange must also have
+            // left the conversation's verbatim tail (see [`RAW_TAIL_TURNS`]).
+            // An archived timeline is terminal and compresses to the end.
+            if !finalize && normals.len() - group.end < raw_tail {
+                tracing::trace!(
+                    target: "candle_conversation::summariser",
+                    timeline = %timeline,
+                    normal = %normal_idx,
+                    "absorb: exchange still inside the verbatim tail, deferring",
                 );
                 deferred.push(normal_idx);
                 continue;
@@ -826,7 +866,7 @@ mod tests {
             inner: MockProbeRunner::new(conv.clone()),
             fail_on: n1,
         };
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
 
         // Every SoT leaf's children, across the whole tree.
         let mut summarised: Vec<TurnIndex> = Vec::new();
@@ -895,7 +935,7 @@ mod tests {
         let _normal1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
         assert_eq!(conv.pending_summary_len(timeline), 2);
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         // #0 sealed; the frontier #1 stays pending.
         assert_eq!(conv.pending_summary_len(timeline), 1);
         // The SoT leaf over #0 is recorded - its index follows the two Normals.
@@ -940,7 +980,7 @@ mod tests {
         assert_eq!(conv.pending_summary_len(timeline), 3);
 
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         // Only the frontier sentinel remains; the round-trip is drained.
         assert_eq!(
             conv.pending_summary_len(timeline),
@@ -975,7 +1015,7 @@ mod tests {
         assert_eq!(conv.pending_summary_len(timeline), 1);
 
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
 
         assert!(
             leaf_children(&conv, timeline).is_empty(),
@@ -990,14 +1030,14 @@ mod tests {
         // The response lands, but [call, response] is now the frontier, so it
         // still defers - the fabrication guard holds until a later turn settles it.
         let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         assert!(
             leaf_children(&conv, timeline).is_empty(),
             "the round-trip is still the frontier - not yet sealed"
         );
         // A later turn settles it -> seals as ONE leaf over both halves.
         let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         assert_eq!(
             leaf_children(&conv, timeline),
             vec![vec![call, response]],
@@ -1017,7 +1057,7 @@ mod tests {
         let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
 
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         let leaves = leaf_children(&conv, timeline);
         assert_eq!(leaves.len(), 2, "two settled exchanges, two leaves");
         assert!(leaves.contains(&vec![n0]));
@@ -1028,6 +1068,64 @@ mod tests {
     /// a summariser pass seals it too, so an archived conversation has no hole in
     /// its peak cover.
     #[test]
+    /// **A live conversation's recent turns are never compressed.** The
+    /// summariser absorbs an exchange only once `RAW_TAIL_TURNS` newer turns
+    /// exist — the working tail stays verbatim, because a model that needs to
+    /// quote or follow up on its own recent exchanges cannot do it from a
+    /// digest. Measured before this gate: a four-question conversation had its
+    /// first turn compressed 64 s after sealing, and by "what did I ask you?"
+    /// the model answered that it had no access to the conversation history.
+    /// Archiving is the exemption — a terminal timeline compresses to the end.
+    #[test]
+    fn the_recent_tail_stays_verbatim_until_the_conversation_outgrows_it() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let runner = MockProbeRunner::new(conv.clone());
+
+        // A short conversation: every turn is inside the tail. Nothing absorbs,
+        // everything stays pending for a later pass.
+        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        for i in 1..4u32 {
+            conv.write()
+                .append_with_blocks(timeline, 10, i as u64, i as u64 + 1);
+        }
+        absorb_pending_turns(&conv, &runner, timeline, 4, RAW_TAIL_TURNS).expect("absorb ok");
+        assert!(
+            leaf_children(&conv, timeline).is_empty(),
+            "four turns, tail of eight: the whole conversation is verbatim"
+        );
+        assert_eq!(conv.pending_summary_len(timeline), 4, "all still pending");
+
+        // The conversation grows past the tail: the oldest turns become
+        // absorbable, the newest eight stay raw.
+        for i in 4..12u32 {
+            conv.write()
+                .append_with_blocks(timeline, 10, i as u64, i as u64 + 1);
+        }
+        absorb_pending_turns(&conv, &runner, timeline, 16, RAW_TAIL_TURNS).expect("absorb ok");
+        let absorbed: Vec<TurnIndex> = leaf_children(&conv, timeline).concat();
+        assert!(
+            absorbed.contains(&n0),
+            "the oldest turn has left the tail and compresses"
+        );
+        let newest_raw = TurnIndex(11);
+        assert!(
+            !absorbed.contains(&newest_raw),
+            "the newest turn is deep inside the verbatim tail"
+        );
+
+        // Archived → terminal: the tail exemption ends and everything seals.
+        conv.write().set_archived(timeline, true);
+        absorb_pending_turns(&conv, &runner, timeline, 16, RAW_TAIL_TURNS).expect("absorb ok");
+        let absorbed: Vec<TurnIndex> = leaf_children(&conv, timeline).concat();
+        assert!(
+            absorbed.contains(&newest_raw),
+            "archiving compresses the conversation to its end"
+        );
+        assert_eq!(conv.pending_summary_len(timeline), 0);
+    }
+
+    #[test]
     fn archiving_seals_the_deferred_frontier_exchange() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
@@ -1036,7 +1134,7 @@ mod tests {
         let runner = MockProbeRunner::new(conv.clone());
 
         // Live: n0 settles (n1 is its successor); n1 is the frontier and defers.
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         assert_eq!(leaf_children(&conv, timeline), vec![vec![n0]]);
         assert_eq!(
             conv.pending_summary_len(timeline),
@@ -1046,7 +1144,7 @@ mod tests {
 
         // Archive → a finalising pass seals the frontier n1 too.
         conv.write().set_archived(timeline, true);
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         let leaves = leaf_children(&conv, timeline);
         assert_eq!(leaves.len(), 2, "archived: frontier sealed");
         assert!(
@@ -1070,7 +1168,7 @@ mod tests {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, MERGE_FANOUT * 2).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, MERGE_FANOUT * 2, 0).expect("absorb ok");
         // MERGE_FANOUT Normal turns → that many SoT leaves → one SoS peak over them.
         let peaks = conv.read().peaks_of(timeline);
         assert_eq!(peaks.len(), 1, "the SoS should be the sole peak");
@@ -1101,7 +1199,7 @@ mod tests {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, (sealed as usize + 1) * 2)
+        absorb_pending_turns(&conv, &runner, timeline, (sealed as usize + 1) * 2, 0)
             .expect("absorb ok");
         let mut levels: Vec<u8> = conv
             .read()

@@ -26,7 +26,7 @@ correction changed the shape of the whole document.
 | **Admit phase**: every KV claim made before the forward, for every layer | **built** (`wave_admit`, §13b) |
 | Tier reserved for the **forward**, not per phase — every sweep at fixed offsets | **built** (`plan_wave_transient`, §13b) |
 | Admission capped by KV room as well as compute and tier: `R = min(8192, transient-fits, KV-fits)` | **built** (`prefill_width_cap`) |
-| Tier anchored at the arena frontier `A` | **refuted** — the quantized path claims regions mid-forward at the same order as the KV itself (§13b) |
+| Tier anchored at the arena frontier `A` | **built** — the mid-forward region claims that refuted it were the sealing thread creating arenas inside the wave, which is now blocked (§13b) |
 | Boundary set exactly instead of by a decaying estimate | **refuted** — the boundary is set against the *next* wave's demand, which no exactness reaches (§13b) |
 | The weight side *taking* the ground the tier gives back | **open** — needs a refused claim that can block (§13) |
 
@@ -1117,26 +1117,39 @@ understated a live sequence by ~3.7x. Both errors are the same shape — chargin
 for one of two states a block passes through — and the fix for both is to charge
 for the moment they overlap.
 
-### The frontier anchor still cannot be tested here, and now for a clear reason
+### The frontier anchor: a gap was built for demand that should not exist
 
-With the compressor priced, the anchor was re-run behind `KV_TIER_FRONTIER=1`
-and failed on the first forward:
+With the compressor priced, the anchor was re-run and failed on the first
+forward:
 
 ```
 every region of the KV reservation is occupied (4 live) —
 nothing left to stamp for class 4096 B
 ```
 
-The gap between frontier and tier has to be **seeded**, not learned: it starts at
-zero, the first claim after the reservation is refused, and the forward dies
-before the measurement that would widen it.
+The reading at the time was that the gap between frontier and tier has to be
+**seeded**, not learned: it starts at zero, the first claim after the
+reservation is refused, and the forward dies before the measurement that would
+widen it. So a seed was built — `set_claim_reserve` carried a per-forward
+prediction into the placement and the tier landed at
+`frontier + max(seed, observed peak)`.
 
-So a seed was built. `set_claim_reserve` carries a per-forward prediction into
-the placement, and the tier lands at `frontier + max(seed, observed peak)` —
-prediction for the cold case, observation for the case where a backlog makes the
-compressor run ahead of the wave. The forward bounds its own prediction by what
-it *writes*, since a sealed copy is never larger than the active block it
-compresses.
+**That was solving the wrong problem, and the whole apparatus is now deleted.**
+A wave is pre-allocated end to end: everything it writes is claimed by admit,
+everything it attends over is resident before it opens, and the tier is placed
+against the arena frontier as it stands at that instant. The sealing thread runs
+concurrently and may fill arenas throughout the wave — that is the point of it
+running concurrently — but *creating* one claims a region and moves the very
+frontier the tier was measured against. There is no gap wide enough to make that
+safe; there is only not doing it.
+
+`BackingInner::arena_window` blocks a creation until no tier stands and no wave
+generation is live, and `plan_wave_transient` waits for any open window before it
+reads the frontier. With no claims arriving after the placement the gap has
+nothing to absorb, so `set_claim_reserve`, `fresh_per_forward_peak`,
+`fresh_this_forward` and the `KV_TIER_FRONTIER` switch are gone and the anchor is
+unconditional. `fresh_claims_during_wave` and `refusals_during_wave` survive as
+tripwires that must read zero.
 
 Two defects surfaced on the way and both are fixed, because both were real
 regardless of the anchor:
@@ -1147,12 +1160,12 @@ regardless of the anchor:
   tier standing at whatever the frontier was then. Invisible at `W − T`, fatal at
   the frontier. Reservations now record whether a forward owns them.
 - **The anchor applied where no seed existed.** Those same unplanned callers
-  predicted nothing, so the anchor gave them a zero gap. It now applies only
-  where a reserve has been set, which is exactly the signal that a forward is
-  behind it.
+  predicted nothing, so the anchor gave them a zero gap. With the gap gone this
+  is no longer a distinction the placement has to make: an unplanned guard packs
+  against the frontier exactly as a forward's tier does.
 
-With both fixed the anchor still does not survive the gate, and the trace says
-why:
+The trace that closed the seeded version is worth keeping, because it is the
+clearest statement of what was actually wrong:
 
 ```
 [arena-create] index=0..3          <- the gap, consumed
@@ -1160,17 +1173,12 @@ why:
 ```
 
 The seed was four regions and the first forward claimed four before asking for a
-fifth. Not a wrong shape — a cold start allocates its backing lazily, so demand
-arrives that no prediction from *this wave's* token count covers, and the
-observation that would correct it only exists from forward two onward.
-
-**This is where the gate stops being able to help.** Its harness sets caches up
-lazily inside the first forward; the daemon establishes them through admission,
-which is also where the seed's real source (`per_block_seal_bytes` against the
-in-flight backlog) lives. Both remaining questions — can the anchor sit at `A`,
-can the boundary be exact — are questions about admission, and **the gate has
-none**. The anchor is left switchable rather than deleted so that asking again
-costs one environment variable.
+fifth. Read as a sizing problem it is unanswerable — a cold start allocates its
+backing lazily, so demand arrives that no prediction from *this wave's* token
+count covers, and the observation that would correct it only exists from forward
+two onward. Read as an ordering problem it answers itself: those four arenas had
+no business being created after the tier was placed. They are created before it
+now, in the gap the wave loop already opens for the boundary move.
 
 ---
 
@@ -1583,7 +1591,7 @@ measurement the span itself had clipped.
 
 | Designed | Built | Why |
 |---|---|---|
-| Tier placed at the arena frontier `A`, after all KV is loaded | Placed hard-right, at `W − T`, at the first `begin_wave` | Built at `A` first and the gate killed it: `every region occupied (2 live)`. **Arenas are created throughout the layer loop, not before it**, so anchoring at the live watermark froze KV growth for the whole wave. `W − T` gives the arenas every region below the tier. Same reclaim, but the freed run is stranded mid-span instead of adjacent to the weights — which is what §7 phase 3 fixes. |
+| Tier placed at the arena frontier `A`, after all KV is loaded | **As designed**, after two reverts | Built at `A` first and the gate killed it: `every region occupied (2 live)`. **Arenas were being created throughout the layer loop, not before it**, so anchoring at the live watermark froze KV growth for the whole wave. It was placed hard-right at `W − T` instead, which gave the arenas every region below the tier and stranded the freed run mid-span. The premise was the thing to fix, not the placement: those arenas are the sealing thread's, `BackingInner::arena_window` now makes their creation wait for the gap between forwards, and the anchor holds (§13b). |
 | Boundary moves at wave start, KV side retracts on contact | Moves at the expert pipeline's end of pass; KV side records demand | No phase exists yet in which the pipeline thread is known idle, so a synchronous cross-thread eviction is unsafe (§7a). Dissolved by the phase lock. |
 | Fill the weight side to `MIN_ELASTIC_RESERVE` at load | Open at `INITIAL_KV_RESERVE` instead | **The design was right and this is a crutch.** It fails the gate only because nothing corrects the boundary afterwards — the give-back costs a pass a failing claim does not have (§7a). Under §7 the constant deletes and the floor is the only number left (§2). |
 | — | `order_copies_after_compute` | Not designed at all: fixed-address slots lost the ordering guarantee `cuMemAllocAsync` was silently providing (§8). |
@@ -1669,9 +1677,10 @@ token in a steady state where the answer is almost always "nothing to allocate".
 The prefill entry does not claim its own chunks at all; its test fixtures stand
 in for `wave_admit` and say so.
 
-There is therefore no demand model left to build. `set_claim_reserve` still
-computes one on every forward, and it is read at a single site behind a flag that
-is off — dead weight rather than a mechanism.
+There is therefore no demand model left to build, and the one that existed —
+`set_claim_reserve`, priced on every forward and read at a single site — is
+deleted. The compressor's demand is not predicted any more; it is *ordered*
+(§15.4).
 
 ### 15.3 The wave should not call the allocator at all
 
@@ -1747,20 +1756,30 @@ forward says to settle the resource question in a phase where settling it is
 safe, and then run. The engine currently settles it 48 layers deep inside the
 run, in the one phase where nothing can help.
 
-### 15.4 The compressor is the other claimant, and it may block
+### 15.4 The compressor is the other claimant, and it blocks
 
-The wave and the compressor have opposite requirements, and the current design
-has them the wrong way round: the wave discovers its size mid-flight and dies,
-while the compressor's demand is *predicted* up front by `set_claim_reserve` — a
-number that, in the shipping configuration, nothing reads. It is consumed at one
-site, inside `if frontier_anchor_enabled()`, and `KV_TIER_FRONTIER` is off by
-default.
+The wave and the compressor have opposite requirements, and the design had them
+the wrong way round: the wave discovered its size mid-flight and died, while the
+compressor's demand was *predicted* up front by `set_claim_reserve`.
 
-The asymmetry is not incidental — it is the whole reason the two can be sized by
-different means. The wave writes **one format per band**, so its demand is exact.
-The compressor writes a format chosen per 32-token block per sub-band
+The asymmetry is not incidental — it is the whole reason the two are sized by
+different means. The wave writes **one format per band**, so its demand is exact
+and `admit_wave_kv` claims all of it before the forward opens. The compressor
+writes a format chosen per 32-token block per sub-band
 (`alloc_sealed_blocks_bulk` takes `n_kv_head × N_PALETTE` formats per spec), so
-its demand genuinely is not. Which is fine, because it is the one that can wait.
+its demand genuinely is not knowable in advance. Which is fine, because it is the
+one that can wait.
+
+**So it waits.** The compressor may allocate KV throughout a wave — filling
+arenas that already exist moves nothing and is the point of it running
+concurrently. What it may not do is *create* an arena, because that claims a
+region and moves the arena frontier the running wave's tier was placed against.
+`BackingInner::arena_window` blocks such a creation until no tier stands and no
+wave generation is live; `plan_wave_transient` waits for any open window before
+it reads the frontier, so a forward cannot begin underneath a half-created arena.
+The wait is taken above the storage write lock, because a forward's admit needs
+that lock and a caller sleeping while holding it would deadlock against the very
+wave it is waiting to end.
 
 | | may block? | so its demand is |
 |---|---|---|
@@ -1944,12 +1963,12 @@ reason that no rung of the ladder could fix.
 
 Three things remain, none of them load-bearing for the wedge:
 
-- **`set_claim_reserve` is computed and thrown away.** Phase 2 prices the
-  compressor's destinations into `claim_reserve` on every forward; the only read
-  is inside `if frontier_anchor_enabled()`, and `KV_TIER_FRONTIER` is off. With
-  the tier measured down from the weight floor there is room above the frontier
-  anyway, so it is inert rather than wrong — but it is arithmetic no one consumes,
-  and it should either become the anchor's seed for real or go.
+- **`set_claim_reserve` is gone.** It priced the compressor's destinations into a
+  gap above the arena frontier on every forward, and the gap existed to absorb
+  arena creations that should never have happened inside a wave. With those
+  ordered instead (§15.4) the gap has nothing to absorb, so the seed, the
+  `fresh_per_forward_peak` correction and the `KV_TIER_FRONTIER` switch all
+  delete and the tier anchors at `A` unconditionally.
 - **`INITIAL_KV_RESERVE` stays.** Deleting it needs the blocking claim of §15.4,
   which belongs on the persistence thread, and nothing has yet needed it there.
 - **The 496 MiB tier for eight forwards of thirty tokens is unexamined**

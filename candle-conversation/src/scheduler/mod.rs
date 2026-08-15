@@ -3500,8 +3500,27 @@ impl Scheduler {
         // reconcile pass — rather than piling onto a tight card and starving
         // foreground decode + the persist thread's hot→warm drain. (The structural
         // path above is deterministic and cheap, so it is deliberately not gated.)
+        //
+        // **Relief runs before the deferral, or the deferral never ends.** The
+        // free-region count this gate reads is not scarcity under the elastic
+        // partition — ground can be recycled from released arenas or bought back
+        // from a weight side that took the span's slack while the engine was
+        // quiet. And pressure is otherwise relieved only at end of wave, so on an
+        // idle engine whose only pending work IS the summariser, a bare deferral
+        // is a livelock: no waves without the probe, no relief without a wave, no
+        // probe under pressure. Measured: the weight side had grown to 9.9 GiB
+        // against a 124-region KV span, free sat at 9–22 under a setpoint of 24,
+        // and the same turn was deferred at ~4 Hz for six minutes — thousands of
+        // warns, and the summary tree starved for the life of the run. The
+        // scheduler is by definition between waves here, which is exactly where
+        // the relief ladder is legal — same call the elevate and section paths
+        // make. Deferral remains for the case relief cannot fix: a genuinely
+        // busy card, which is what this gate was built for.
         if self.vram_under_pressure() {
-            return Err("SubmitSummaryProbe: deferred — VRAM under pressure".to_string());
+            self.relieve_vram_pressure("summary", prefill::VramPhase::Load);
+            if self.vram_under_pressure() {
+                return Err("SubmitSummaryProbe: deferred — VRAM under pressure".to_string());
+            }
         }
 
         // Reserve the job id up front so both passes tag their `SealAction`

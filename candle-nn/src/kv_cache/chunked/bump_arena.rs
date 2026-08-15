@@ -47,7 +47,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::{current, ThreadId};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::wave_provenance::WaveTicket;
@@ -306,15 +307,35 @@ impl BumpArena {
 /// gate is supposed to have sized the wave to fit *before* assembly starts. An
 /// overflow here means the gate was wrong, which is worth a loud failure rather
 /// than a silent allocation behind its back.
+/// The relative offset of the next carve, aligned as an **absolute address**.
+///
+/// `(base + cursor)` is what the kernel dereferences, so that is what alignment
+/// has to hold on — rounding the offset alone assumes the span's base is itself
+/// aligned, and the bases are not: `begin_wave` lays the three phase spans out
+/// back-to-back at the plan's raw byte counts, so any unaligned plan entry
+/// shifts every span after it. On the dense Qwen3 plan that put the FFN span at
+/// an address ≡ 8 (mod 16), and every "256-aligned" activation carved from it
+/// inherited the skew — which the tensor-core kernels' 16-byte `cp.async`
+/// reads fault on (`CUDA_ERROR_MISALIGNED_ADDRESS`). The plans are also
+/// normalised at recording so this costs no padding in practice; doing it here
+/// as well makes the guarantee local to the carve instead of hostage to every
+/// layout site.
+fn aligned_start(base: u64, cursor: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+    let align = align as u64;
+    let abs = base + cursor as u64;
+    let aligned = (abs + align - 1) & !(align - 1);
+    (aligned - base) as usize
+}
+
 fn bump<'a>(
     inner: &'a Mutex<Inner>,
     name: &'static str,
     len: usize,
     align: usize,
 ) -> Result<BumpRange<'a>> {
-    debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
     let mut inner = inner.lock().unwrap();
-    let start = (inner.cursor + align - 1) & !(align - 1);
+    let start = aligned_start(inner.base, inner.cursor, align);
     let end = start
         .checked_add(len)
         .ok_or_else(|| candle::Error::Msg(format!("{name}: bump allocation overflowed usize")))?;
@@ -361,9 +382,8 @@ fn bump<'a>(
 /// the `'w` already on the operand instead. Returning `None` on exhaustion
 /// rather than erroring, for the reason given on [`resolve_wave_alloc`].
 fn bump_raw(inner: &Mutex<Inner>, name: &'static str, len: usize, align: usize) -> Option<u64> {
-    debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
     let mut inner = inner.lock().ok()?;
-    let start = (inner.cursor + align - 1) & !(align - 1);
+    let start = aligned_start(inner.base, inner.cursor, align);
     let end = start.checked_add(len)?;
     if end > inner.capacity {
         return None;
@@ -626,6 +646,32 @@ struct WaveDomain {
     /// Without the distinction a single unplanned `begin_wave` at load pins the
     /// tier at whatever the frontier was then, for the life of the process.
     reserved_by_forward: bool,
+    /// Callers currently creating KV arenas outside a wave — see
+    /// [`enter_arena_window`].
+    ///
+    /// **The wave is pre-allocated end to end**, and a new arena is the one
+    /// allocation that cannot be: it claims a region the partition did not have
+    /// spoken for, and the tier's placement is measured against the arena
+    /// frontier at the instant the forward begins. A count rather than a flag
+    /// because the compressor and the fork path can both be inside one.
+    arena_windows: usize,
+    /// Whether a forward is between its first and last line.
+    ///
+    /// **`live_generations == 0` does not mean "no forward is running".** It
+    /// falls to zero at every phase boundary — a layer's attention guard drops
+    /// before its FFN guard opens, and the head span opens after the last
+    /// layer's has gone — so a thread that read it as "the partition is idle"
+    /// would take the gap in the middle of a forward and pull the tier out from
+    /// under the next phase. That is the §13b failure.
+    ///
+    /// This is set from the end of admit to the end of `forward_wave_contexts`
+    /// and is what [`enter_arena_window`] actually waits on; `live_generations`
+    /// then covers the tail, where the forward has returned but its logits still
+    /// sit on the head span.
+    forward_open: bool,
+    /// Which thread opened the forward, so [`enter_arena_window`] can tell a
+    /// *wait* from a **self-deadlock**.
+    forward_thread: Option<ThreadId>,
 }
 
 /// What to reserve per phase when a wave opens without having priced itself.
@@ -635,7 +681,26 @@ struct WaveDomain {
 /// deliberately the worst case rather than a guess — an under-sized fallback
 /// would exhaust a span rather than merely waste one.
 fn fallback_plan() -> [usize; 3] {
-    [WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES]
+    align_phase_plan([WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES])
+}
+
+/// The boundary every phase span's base must land on.
+///
+/// The same quantum ops carve at (`INHERIT_ALIGN` in candle-core), because the
+/// spans are laid out back-to-back and each span's base is the previous one's
+/// end: an entry that is not a multiple of this shifts every span after it off
+/// the boundary, and a carve's alignment is only as good as its span's base
+/// (see [`aligned_start`]).
+const WAVE_SPAN_ALIGN: usize = 256;
+
+/// A phase plan with every entry rounded up to [`WAVE_SPAN_ALIGN`].
+///
+/// Applied where a plan enters the domain — recording and fallback — so every
+/// consumer (the tier purchase sums it, the span layout walks it) sees the same
+/// figures and the spans always start aligned. The rounding is priced into the
+/// tier: the purchase is the sum of the *rounded* entries.
+fn align_phase_plan(plan: [usize; 3]) -> [usize; 3] {
+    plan.map(|bytes| bytes.div_ceil(WAVE_SPAN_ALIGN) * WAVE_SPAN_ALIGN)
 }
 
 /// Arena coordinate for a domain that is **not** a wave half.
@@ -664,11 +729,23 @@ fn wave_domains() -> &'static Mutex<HashMap<usize, WaveDomain>> {
     DOMAINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn with_wave_domain<R>(
+/// Signalled whenever a domain's `placed_at`, `live_generations` or
+/// `arena_windows` changes — the three fields the two waits below read.
+fn wave_gate() -> &'static Condvar {
+    static GATE: OnceLock<Condvar> = OnceLock::new();
+    GATE.get_or_init(Condvar::new)
+}
+
+type DomainMap = HashMap<usize, WaveDomain>;
+
+/// The domain for `ordinal`, created on first touch.
+///
+/// Split out of [`with_wave_domain`] because the waits below have to re-read the
+/// domain after each wake-up, and the guard they hold is the raw map lock.
+fn domain_entry<'a>(
+    map: &'a mut DomainMap,
     stream: &Arc<CudaStream>,
-    f: impl FnOnce(&mut WaveDomain) -> Result<R>,
-) -> Result<R> {
-    let mut map = wave_domains().lock().unwrap();
+) -> (usize, &'a mut WaveDomain) {
     let ordinal = stream.context().ordinal();
     let domain = match map.entry(ordinal) {
         Entry::Occupied(o) => o.into_mut(),
@@ -684,9 +761,223 @@ fn with_wave_domain<R>(
             planned: None,
             placed_at: None,
             reserved_by_forward: false,
+            arena_windows: 0,
+            forward_open: false,
+            forward_thread: None,
         }),
     };
-    f(domain)
+    (ordinal, domain)
+}
+
+fn lock_domains() -> MutexGuard<'static, DomainMap> {
+    wave_domains().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn with_wave_domain<R>(
+    stream: &Arc<CudaStream>,
+    f: impl FnOnce(&mut WaveDomain) -> Result<R>,
+) -> Result<R> {
+    let mut map = lock_domains();
+    let (_, domain) = domain_entry(&mut map, stream);
+    let r = f(domain);
+    drop(map);
+    wave_gate().notify_all();
+    r
+}
+
+/// Permission to create KV arenas, held for as long as the creation takes.
+///
+/// Dropping it lets a forward that is waiting to place its tier proceed.
+pub struct ArenaWindow {
+    ordinal: usize,
+}
+
+impl Drop for ArenaWindow {
+    fn drop(&mut self) {
+        {
+            let mut map = lock_domains();
+            if let Some(domain) = map.get_mut(&self.ordinal) {
+                domain.arena_windows = domain.arena_windows.saturating_sub(1);
+            }
+        }
+        wave_gate().notify_all();
+    }
+}
+
+/// Take the partition for as long as it takes to create one KV arena, or refuse.
+///
+/// **A wave is pre-allocated end to end.** Everything it writes is claimed by
+/// `admit_wave_kv` and everything it attends over is resident before it opens,
+/// and the transient tier is then placed against the arena frontier *as it
+/// stands at that moment*. A region claimed after that point is claimed against
+/// a partition the wave has already measured: the tier's ceiling either hides
+/// the ground (the claim fails with the span half empty) or the arena lands
+/// where the tier is about to sit.
+///
+/// The sealing thread is allowed to allocate KV during a wave — that is the
+/// whole point of it running concurrently — but only **into arenas that already
+/// exist**. Needing a new one is the case this refuses.
+///
+/// # It refuses rather than waits, and that is the whole design
+///
+/// Waiting here was tried and deadlocked the daemon three times, each from a
+/// different direction, and the third one showed why the shape is wrong rather
+/// than the placement:
+///
+/// ```text
+/// substrate-persistence   migrate_sealed_layers_to_cpu_batch   <- holds state.write()
+///                           alloc_chunk_for_key
+///                             enter_arena_window   -> Condvar::wait   (for the forward to end)
+/// conversation-scheduler  forward_layer_batched_mixed
+///                           prefill_capture::maybe_capture
+///                             Cache::chunked_writer_start_idx -> state.read()  (for persistence)
+/// ```
+///
+/// This function is a **leaf of the allocator**, reached from arbitrary depth
+/// under whatever locks the caller happens to hold — `chunk_ops` holds the
+/// sequence-state write lock across the allocation loop, and the forward needs a
+/// read on it mid-layer. Any blocking edge here can be closed into a cycle by
+/// some caller, and moving the wait above one lock only relocates the problem to
+/// the next one. There is no placement that fixes a wait; there is only not
+/// waiting.
+///
+/// **The invariant is unharmed by refusing.** The caller is a sealing pass, and
+/// it is already built to fail non-destructively and retry — "the group stays
+/// hot-float + consistent and retries next pass". So the arena is still created
+/// only between forwards, which is the property that matters; what changes is
+/// that the thread goes back to its own work instead of sleeping inside the
+/// allocator holding somebody's lock. That is also the codebase's own principle
+/// (refuse rather than corrupt) rather than an import into it.
+///
+/// The one cost is that a sealing pass can be starved by back-to-back forwards.
+/// `fresh_claims_during_wave` / `refusals_during_wave` stay zero either way, so
+/// the signal for that is the compression backlog, not these.
+///
+/// # It hands back a standing tier, and must
+///
+/// A forward's tier is *not* released when the forward ends — it stands until
+/// the next forward's phase 0 returns it. So a caller arriving between forwards
+/// finds ground that is nobody's and marked as somebody's; it returns it here,
+/// which is also what the first deadlock was really about.
+///
+/// # What this replaced
+///
+/// Nothing blocked, and the pool budgeted for the breach instead: a per-forward
+/// `claim_reserve` seeded a gap above the arena frontier, `fresh_per_forward_peak`
+/// grew that gap from observation, and `refusals_during_wave` counted the claims
+/// that fell in the gap's shadow anyway. The measurement those carried —
+/// "hundreds of fresh regions per forward, because the compressor creates
+/// size-class arenas as it chooses formats" — was read as proof the tier could
+/// not sit at the arena frontier. It was proof of this.
+pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
+    let (ordinal, had_tier) = {
+        let mut map = lock_domains();
+        let (ordinal, domain) = domain_entry(&mut map, stream);
+        // **The forward's own thread is a placement bug, not a race**, so it is
+        // named separately and *without* the retry marker — a caller that loops
+        // on that marker would spin forever on a defect no retry can clear.
+        // Every allocation a wave needs is claimed by `admit_wave_kv` before the
+        // forward is opened, which is why opening it before admit stopped the
+        // engine outright.
+        if domain.forward_open && domain.forward_thread == Some(current().id()) {
+            candle::bail!(
+                "creating a KV arena from inside the forward that owns the partition: this \
+                 thread opened the wave, so nothing it does can end it. The wave's storage \
+                 is claimed by `admit_wave_kv` before the forward opens — an arena wanted \
+                 after that point is one the transient tier has already been placed against."
+            )
+        }
+        if domain.forward_open || domain.live_generations > 0 {
+            candle::bail!(
+                "{KV_ARENA_MID_WAVE}: a forward owns the partition, and the transient tier \
+                 was placed against the arena frontier as it stood when that forward began. \
+                 Creating an arena now moves the frontier under it. Retry once the wave has \
+                 ended — the wave's own storage is claimed by `admit_wave_kv` before it \
+                 opens, so nothing it needs depends on this."
+            )
+        }
+        // The partition is ours: nothing is running on it and nothing is holding
+        // a span. A tier still standing belongs to a forward that has finished
+        // with it, and the ground under it is the ground this arena is about to
+        // be carved from.
+        let had_tier = domain.placed_at.take().is_some();
+        if had_tier {
+            domain.reserved_by_forward = false;
+        }
+        // Counted before the lock drops, so a forward cannot begin placing a
+        // tier in the gap between here and the release below.
+        domain.arena_windows += 1;
+        (ordinal, had_tier)
+    };
+    // **Outside the map lock, and it has to be.** The lock order everywhere else
+    // is map → pool, and a forward inside `place_transient` holds the pool lock
+    // while it blocks on the expert pipeline thread — which reaches back for the
+    // map lock through `wave_is_live`. Releasing from under the map lock closes
+    // that into a cycle.
+    if had_tier {
+        release_transient(stream);
+    }
+    Ok(ArenaWindow { ordinal })
+}
+
+/// Marker every mid-wave arena refusal carries, so a caller that has a retry can
+/// tell this apart from a genuine allocation failure.
+pub const KV_ARENA_MID_WAVE: &str = "kv arena creation deferred: wave in flight";
+
+/// Declare a forward in progress; the returned value ends it when dropped.
+///
+/// Held for the whole of `forward_wave_contexts`, so every `?` inside it clears
+/// the flag on the way out. See [`WaveDomain::forward_open`] for why
+/// `live_generations` cannot do this job.
+pub struct ForwardOpen {
+    ordinal: usize,
+}
+
+impl Drop for ForwardOpen {
+    fn drop(&mut self) {
+        {
+            let mut map = lock_domains();
+            if let Some(domain) = map.get_mut(&self.ordinal) {
+                domain.forward_open = false;
+                domain.forward_thread = None;
+            }
+        }
+        wave_gate().notify_all();
+    }
+}
+
+/// Open the forward's claim on the partition.
+///
+/// **Call this after admit, not before.** Admit is the forward creating its own
+/// arenas, and it goes through `enter_arena_window` like any other creator — so
+/// opening the claim first has the forward thread wait on a flag only it can
+/// clear.
+pub fn begin_forward(stream: &Arc<CudaStream>) -> ForwardOpen {
+    let mut map = lock_domains();
+    let (ordinal, domain) = domain_entry(&mut map, stream);
+    domain.forward_open = true;
+    domain.forward_thread = Some(current().id());
+    ForwardOpen { ordinal }
+}
+
+/// Wait for every open arena window to close, holding the map lock throughout.
+///
+/// The caller is a forward about to measure the arena frontier; the guard it
+/// gets back is the same one it must keep while it decides, so no window can
+/// open between the wait and the decision.
+fn await_arena_windows<'a>(
+    mut map: MutexGuard<'a, DomainMap>,
+    stream: &Arc<CudaStream>,
+) -> MutexGuard<'a, DomainMap> {
+    loop {
+        let (_, domain) = domain_entry(&mut map, stream);
+        if domain.arena_windows == 0 {
+            return map;
+        }
+        map = wave_gate()
+            .wait(map)
+            .unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// Price **and reserve** the transient tier for the forward about to run.
@@ -790,27 +1081,38 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
 /// deadlocks the two threads against each other.
 ///
 /// So there is a window between releasing the old tier and placing the new one
-/// in which another thread may claim a region into the ground the placement
-/// wants. That is not a hazard, it is the same case the placement already
-/// handles: it buys what the claim took. The window is precisely what the old
-/// `tier_reserve` existed to close, and closing it that way cost more than
-/// leaving it open — a standing withholding of the last tier's width, refusing
-/// arena claims against memory nobody owned.
+/// in which another thread may claim a *slot* in a region an arena already
+/// holds. That is not a hazard: the placement measures the arena frontier, and
+/// filling an existing arena does not move it. What may not happen in that
+/// window is a **new arena**, which does move the frontier — hence the wait on
+/// [`enter_arena_window`] below, taken before the frontier is read and held
+/// until the tier is recorded.
 pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+    // Normalised once, here, so the recorded plan, the tier purchase below, and
+    // the span layout in `begin_wave` all see the same rounded figures — a raw
+    // sum against a rounded layout would place a tier the last span overruns.
+    let per_phase = align_phase_plan(per_phase);
     let stream = stream.clone();
     // The previous forward's ground goes back before this one's frontier is
     // measured, so the reservation is taken against a partition that already
     // reflects everything admit claimed.
-    let place = with_wave_domain(&stream, |domain| {
+    let place = {
+        // **Anyone mid-way through creating an arena finishes first.** The
+        // placement below reads the arena frontier; a half-created arena would
+        // move it after the read.
+        let mut map = await_arena_windows(lock_domains(), &stream);
+        let (_, domain) = domain_entry(&mut map, &stream);
         domain.planned = Some(per_phase);
         if domain.live_generations > 0 {
-            return Ok(false);
+            false
+        } else {
+            if domain.placed_at.take().is_some() {
+                release_transient(&stream);
+            }
+            true
         }
-        if domain.placed_at.take().is_some() {
-            release_transient(&stream);
-        }
-        Ok(true)
-    })?;
+    };
+    wave_gate().notify_all();
     if !place {
         return Ok(());
     }
@@ -853,14 +1155,50 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
     // deadlocks the two threads against each other —
     // [`plan_wave_transient`] is restructured for the same reason.
     //
-    // Only the unplanned caller reaches it: a guard opened with no forward
+    // Two callers reach it. One is the unplanned guard — opened with no forward
     // behind it (a test, a migration helper, a `rows == 0` forward that skipped
-    // phase 2) owns its own reservation, and this is where that is taken.
-    let unplanned_base = match with_wave_domain(&stream, |domain| {
-        Ok((domain.live_generations == 0 && domain.placed_at.is_none())
-            .then(|| domain.planned.unwrap_or_else(fallback_plan)))
-    })? {
-        Some(plan) => Some(place_transient(&stream, plan.iter().sum())?),
+    // phase 2) — which owns its own reservation, taken here.
+    //
+    // **The other is a plan that has outgrown the tier standing under it**, and
+    // that one is a silent-corruption path, not a convenience.
+    // [`plan_wave_transient`] records `planned` *before* it checks whether it may
+    // place, so a forward that arrives while the previous one's outputs are still
+    // held updates the plan and leaves the old, narrower tier where it is. If the
+    // generations then drop before this guard opens, the rebase below hands the
+    // arenas capacities from the new plan on top of the old tier's base — and
+    // nothing downstream re-checks, so the spans simply run off the tier's top
+    // into the weight zone and write over expert slots.
+    //
+    // So the tier is re-placed whenever it cannot hold the plan. Re-placing is
+    // safe here for the same reason the rebase is: no generation is live.
+    let replan = {
+        // Same reason as [`plan_wave_transient`]: a placement reads the arena
+        // frontier, so no arena may be half-created when it does.
+        let mut map = await_arena_windows(lock_domains(), &stream);
+        let (_, domain) = domain_entry(&mut map, &stream);
+        if domain.live_generations > 0 {
+            None
+        } else {
+            let plan = domain.planned.unwrap_or_else(fallback_plan);
+            let wanted: usize = plan.iter().sum();
+            let standing = domain.placed_at.and_then(|_| {
+                super::region_pool::region_stats(stream.context().ordinal())
+                    .map(|s| s.transient_bytes)
+            });
+            match standing {
+                Some(bytes) if bytes >= wanted => None,
+                _ => Some(plan),
+            }
+        }
+    };
+    wave_gate().notify_all();
+    let unplanned_base = match replan {
+        Some(plan) => {
+            // Hand the old one back first when there is one, so its ground is
+            // marked dirty and the next tenant cleans it.
+            release_transient(&stream);
+            Some(place_transient(&stream, plan.iter().sum())?)
+        }
         None => None,
     };
     with_wave_domain(&stream, |domain| {
@@ -893,29 +1231,41 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
         // either, so this is also where their reservation is taken.
         if domain.live_generations == 0 {
             let plan = domain.planned.unwrap_or_else(fallback_plan);
+            // **A re-placement supersedes the recorded base.** The replan path
+            // above released the standing tier and placed a new one at the
+            // CURRENT frontier, but `placed_at` still holds where the OLD tier
+            // stood — using it would lay the spans at the old base with the new
+            // plan's widths, writing wave intermediates over whatever now owns
+            // the ground between the two addresses (live KV chunks when the
+            // frontier moved up, expert slots when the plan overruns the old
+            // extent). Silent corruption both ways, found independently by
+            // three reviewers. The freshly returned address is authoritative
+            // whenever it exists.
+            if let Some(base) = unplanned_base {
+                domain.placed_at = Some(base);
+                // A replan belongs to the forward whose plan outgrew the tier;
+                // an unplanned guard's placement is its own. Preserve whichever
+                // ownership was already recorded when a tier stood, and default
+                // a fresh placement to guard-owned exactly as before.
+                if domain.planned.is_none() {
+                    domain.reserved_by_forward = false;
+                }
+            }
             let base = match domain.placed_at {
                 Some(base) => base,
                 None => {
-                    // No forward priced this one, so nothing will hand the
-                    // ground back for it — the reservation is the guard's and
-                    // drops with it. Placed above, outside the lock.
-                    //
-                    // Absent only if the domain gained a generation or a tier
-                    // between that placement and this line, which would mean
-                    // laying these spans out on ground priced for a different
-                    // occupant. Refuse rather than corrupt (principle 7).
-                    let base = unplanned_base.ok_or_else(|| {
-                        candle::Error::Msg(
-                            "wave domain: the tier's ground was priced with no \
-                             generation live and one appeared before it could be \
-                             laid out. The spans this guard would hand out are not \
-                             the ones that were reserved."
-                                .into(),
-                        )
-                    })?;
-                    domain.placed_at = Some(base);
-                    domain.reserved_by_forward = false;
-                    base
+                    // No tier recorded and none was just placed: the domain
+                    // gained a generation or lost its tier between the pricing
+                    // above and this line, which would mean laying these spans
+                    // out on ground priced for a different occupant. Refuse
+                    // rather than corrupt (principle 7).
+                    return Err(candle::Error::Msg(
+                        "wave domain: the tier's ground was priced with no \
+                         generation live and one appeared before it could be \
+                         laid out. The spans this guard would hand out are not \
+                         the ones that were reserved."
+                            .into(),
+                    ));
                 }
             };
             let mut at = base;
@@ -940,10 +1290,15 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
 /// because a forward's head span is *returned to its caller* — the tier's
 /// lifetime is the union of the guards, not any one function's body.
 fn release_if_last(ordinal: usize) {
-    let mut map = match wave_domains().lock() {
-        Ok(m) => m,
-        Err(e) => e.into_inner(),
-    };
+    release_if_last_locked(ordinal);
+    // A caller waiting in `enter_arena_window` is waiting on exactly this: the
+    // last generation dropping. Signalled outside the lock so it wakes into a
+    // free mutex.
+    wave_gate().notify_all();
+}
+
+fn release_if_last_locked(ordinal: usize) {
+    let mut map = lock_domains();
     let Some(domain) = map.get_mut(&ordinal) else {
         return;
     };
@@ -1017,17 +1372,31 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
 ///
 /// **The one thing the moving boundary must never do is move mid-wave.** A
 /// retraction evicts experts and relocates others, and a wave in flight may be
-/// reading either; the design's answer is that the boundary moves only at the
-/// expert pipeline's end-of-pass, where no GEMM for the pass is still being
-/// issued. That is a structural property of where `renegotiate_boundary` is
-/// called from, and this is what lets `set_weight_floor` check it rather than
+/// reading either; the design's answer is that the boundary moves only between
+/// forwards — the wave loop's own gap, and the arena claim that has run the KV
+/// side out before a wave has begun. That is a structural property of where
+/// `renegotiate_boundary` is called from, and this is what lets
+/// `set_weight_floor` check it rather than
 /// trust it (principle 7: refuse rather than corrupt).
 pub fn wave_is_live(ordinal: usize) -> bool {
+    // One definition of "a wave is running", shared by the arena gate and the
+    // boundary latch. Arena liveness alone is FALSE at every phase boundary —
+    // a layer's attention guard drops before its FFN guard opens — which is
+    // the §13b hole `forward_open` was introduced to close for the arena gate;
+    // reading only the arenas here left `set_weight_floor`'s latch with that
+    // same hole, so a boundary move reached from off the wave thread (a fork's
+    // buy_ground, the scheduler's relief) could retract the zone mid-forward
+    // in the gap and evict expert slots the next phase names via `slot_base`.
+    // `live_generations` covers the tail after the forward returns, while the
+    // logits still sit on the head span.
     wave_domains()
         .lock()
         .map(|map| {
-            map.get(&ordinal)
-                .is_some_and(|d| d.arenas.iter().any(|a| a.is_live()))
+            map.get(&ordinal).is_some_and(|d| {
+                d.forward_open
+                    || d.live_generations > 0
+                    || d.arenas.iter().any(|a| a.is_live())
+            })
         })
         .unwrap_or(false)
 }
@@ -1083,6 +1452,8 @@ pub(crate) fn persistence_domain(stream: &Arc<CudaStream>) -> Result<BumpArena> 
 #[cfg(test)]
 mod tests {
 
+    use super::{align_phase_plan, aligned_start, WAVE_SPAN_ALIGN};
+
     /// Ranges from one generation never overlap — the property that removes
     /// the need for any slot table or disjointness bookkeeping (§3.6).
     #[test]
@@ -1090,7 +1461,7 @@ mod tests {
         let (base, cap) = (0x1000u64, 4096usize);
         let mut cursor = 0usize;
         let mut alloc = |len: usize, align: usize| -> (u64, usize) {
-            let start = (cursor + align - 1) & !(align - 1);
+            let start = aligned_start(base, cursor, align);
             assert!(start + len <= cap);
             cursor = start + len;
             (base + start as u64, len)
@@ -1109,18 +1480,59 @@ mod tests {
     fn alignment_only_moves_the_cursor_forward() {
         for align in [1usize, 4, 16, 256, 4096] {
             for cursor in 0usize..64 {
-                let start = (cursor + align - 1) & !(align - 1);
+                let start = aligned_start(0, cursor, align);
                 assert!(start >= cursor, "align {align} moved cursor {cursor} back");
                 assert_eq!(start % align, 0);
                 assert!(start - cursor < align, "over-aligned");
             }
         }
     }
+
+    /// Alignment holds on the **absolute address**, whatever the span's base —
+    /// the dense-Qwen3 fault shape: a base ≡ 8 (mod 16) made every carve whose
+    /// *offset* was 256-aligned land at an address the tensor-core kernels'
+    /// 16-byte `cp.async` reads fault on.
+    #[test]
+    fn carves_align_absolutely_even_on_an_unaligned_base() {
+        for base in [8u64, 88, 0x1008, 0xb1d4c5758] {
+            for cursor in [0usize, 1, 100, 4096] {
+                for align in [16usize, 256] {
+                    let start = aligned_start(base, cursor, align);
+                    let abs = base + start as u64;
+                    assert_eq!(abs % align as u64, 0, "base {base:#x} cursor {cursor}");
+                    assert!(start >= cursor, "moved backward");
+                    assert!(abs - (base + cursor as u64) < align as u64, "over-aligned");
+                }
+            }
+        }
+        // An aligned base costs nothing extra: identical to offset-only rounding.
+        assert_eq!(aligned_start(0x1000, 100, 256), 256);
+        assert_eq!(aligned_start(0x1000, 0, 256), 0);
+    }
+
+    /// Plans are rounded to the span quantum where they are recorded, so the
+    /// back-to-back layout keeps every span base on the boundary and the tier
+    /// purchase (the sum) covers the layout exactly.
+    #[test]
+    fn phase_plans_round_to_the_span_quantum() {
+        let plan = align_phase_plan([1, WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN + 1]);
+        assert_eq!(
+            plan,
+            [WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN, 2 * WAVE_SPAN_ALIGN]
+        );
+        assert_eq!(align_phase_plan([0, 0, 0]), [0, 0, 0]);
+        // Already-rounded plans pass through unchanged.
+        let exact = [4 * WAVE_SPAN_ALIGN, 512 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
+        assert_eq!(align_phase_plan(exact), exact);
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
 mod wave_tests {
-    use super::{begin_wave, wave_domain_stats, LayerPhase};
+    use super::{
+        begin_forward, begin_wave, enter_arena_window, plan_wave_transient, wave_domain_stats,
+        LayerPhase,
+    };
     use candle::{Device, Result};
 
     /// The wave domain is process-global and `cargo test` runs tests in
@@ -1134,6 +1546,120 @@ mod wave_tests {
             Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
             _ => None,
         }
+    }
+
+    /// **An arena cannot be created while a wave is open — and the caller is
+    /// told so rather than parked.**
+    ///
+    /// The wave is pre-allocated end to end and its transient tier is placed
+    /// against the arena frontier as it stands when the forward begins, so
+    /// creating an arena mid-wave moves that frontier under it. Refusing is what
+    /// keeps that from being a *blocking* edge: this is a leaf of the allocator,
+    /// reached under whatever locks its caller holds, and a wait here deadlocked
+    /// the daemon three times against three different locks.
+    ///
+    /// The refusal carries [`KV_ARENA_MID_WAVE`] so a sealing pass can tell it
+    /// from a real allocation failure and retry on the next one.
+    #[test]
+    fn creating_an_arena_mid_wave_is_refused_not_parked() -> Result<()> {
+        use std::sync::mpsc;
+
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
+
+        // From another thread, so this is the ordinary sealing case rather than
+        // the forward's own thread.
+        let (tx, rx) = mpsc::channel();
+        let s2 = s.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(enter_arena_window(&s2).err().map(|e| e.to_string()));
+        })
+        .join()
+        .expect("prober panicked");
+
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the prober must answer immediately, never park")
+            .expect("an arena window must not open with a wave generation live");
+        assert!(
+            err.contains(super::KV_ARENA_MID_WAVE),
+            "the refusal must be marked retryable so the sealing pass comes back: {err}"
+        );
+
+        // Once the wave is over the same request succeeds.
+        drop(guard);
+        drop(enter_arena_window(&s)?);
+        Ok(())
+    }
+
+    /// **The forward's own thread gets a different refusal, and deliberately no
+    /// retry marker.**
+    ///
+    /// A sealing thread refused mid-wave should come back later; the forward
+    /// thread asking for an arena it should have claimed in admit is a placement
+    /// bug, and a caller looping on [`KV_ARENA_MID_WAVE`] would spin on it
+    /// forever. Opening the forward before admit did exactly this and stopped
+    /// the engine.
+    #[test]
+    fn the_forward_thread_is_told_it_is_a_placement_bug() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let open = begin_forward(&s);
+        let err = enter_arena_window(&s)
+            .err()
+            .expect("the forward's own thread must be refused")
+            .to_string();
+        assert!(
+            err.contains("admit_wave_kv"),
+            "the error must say where the allocation belonged instead: {err}"
+        );
+        assert!(
+            !err.contains(super::KV_ARENA_MID_WAVE),
+            "a placement bug must not be marked retryable, or the caller spins: {err}"
+        );
+        drop(open);
+        // And once the forward is over, the same thread is an ordinary caller.
+        drop(enter_arena_window(&s)?);
+        Ok(())
+    }
+
+    /// **A tier left standing between forwards must not refuse an arena window.**
+    ///
+    /// The tier is not handed back when a forward ends — it stands until the
+    /// next forward's phase 0 returns it. So a caller that keyed on `placed_at`
+    /// would be refused (or, in the first version, parked) over ground that is
+    /// nobody's: 55 threads asleep at zero CPU with `tier=96MiB` above an
+    /// otherwise idle partition and the status endpoint frozen at `Prefilling
+    /// tool sections`. The caller has to hand the tier back itself.
+    #[test]
+    fn an_idle_tier_does_not_block_an_arena_window() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+
+        // A forward places its tier and returns; nothing releases it.
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, [1 << 20, 1 << 20, 1 << 20])?;
+        }
+        let placed = super::super::region_pool::region_stats(ordinal)
+            .map(|r| r.transient_bytes)
+            .unwrap_or(0);
+        assert!(placed > 0, "the forward should have left a tier standing");
+
+        // The window opens anyway, and the ground comes back with it.
+        let window = enter_arena_window(&s)?;
+        assert_eq!(
+            super::super::region_pool::region_stats(ordinal)
+                .map(|r| r.transient_bytes)
+                .unwrap_or(0),
+            0,
+            "the waiter must hand back the tier it waited past, or the ground it \
+             is about to carve an arena from is still spoken for"
+        );
+        drop(window);
+        Ok(())
     }
 
     /// Inside a wave, ranges come from the half and do not overlap.

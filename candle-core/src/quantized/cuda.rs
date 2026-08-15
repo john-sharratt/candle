@@ -5277,6 +5277,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
         let tbs_ptr = base + off_tbs as u64;
         let tbc_ptr = base + off_tbc as u64;
         unsafe {
+            crate::set_kernel_breadcrumb("run_grouped_quantized_matmul", file!(), line!());
             run_grouped_quantized_matmul(
                 wptr_ptr as *const std::ffi::c_void,
                 te_ptr as *const std::ffi::c_void,

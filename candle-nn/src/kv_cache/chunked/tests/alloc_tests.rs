@@ -23,6 +23,123 @@ fn k_gid_snapshot(backing: &ChunkedKvBacking) -> Vec<Vec<i64>> {
         .collect()
 }
 
+/// The refusal→hint→creation round trip, on a real device.
+///
+/// A sealing pass turned away mid-wave is only useful if the refusal *says what
+/// it wanted*: without that, the next pass rediscovers the same need at the same
+/// depth, after redoing the work that led there, and is refused again if a wave
+/// happens to be running. With it, the gap between forwards creates the arena
+/// and the next pass only ever fills it — which is legal at any point in a wave.
+#[cfg(all(test, feature = "cuda"))]
+mod deferred_arena_tests {
+    use crate::kv_cache::arena_table::ArenaLocation;
+    use crate::kv_cache::chunked::arena::ArenaKey;
+    use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
+    use crate::kv_cache::chunked::size_class::SizeClass;
+    use crate::kv_cache::chunked::{begin_wave, ChunkedKvBacking, KV_ARENA_MID_WAVE};
+    use crate::kv_cache::LayerPhase;
+    use candle::{DType, Device, Result};
+
+    #[test]
+    fn a_refused_arena_is_remembered_and_made_in_the_gap() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let Device::Cuda(cd) = &device else {
+            unreachable!()
+        };
+        let stream = cd.cuda_stream();
+
+        // A class the backing has no arena for yet, so serving it needs a
+        // creation rather than a free slot.
+        let key = ArenaKey::new(SizeClass::at(SizeClass::COUNT - 1), ArenaLocation::Gpu);
+
+        // Inside a wave, that creation is refused — and the refusal is marked
+        // retryable so the sealing pass knows to come back.
+        let guard = begin_wave(&stream, LayerPhase::Attention)?;
+        let err = backing
+            .alloc_chunk_for_key(key)
+            .err()
+            .expect("a class with no arena cannot be served mid-wave")
+            .to_string();
+        assert!(
+            err.contains(KV_ARENA_MID_WAVE),
+            "the refusal must be marked retryable: {err}"
+        );
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "the demand must not be satisfied while the wave is still running"
+        );
+        drop(guard);
+
+        // In the gap it is created — from the record, with nothing having to
+        // rediscover the need.
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            1,
+            "the refusal recorded the class it wanted; the gap must act on it"
+        );
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "the record is drained, not replayed — a second gap must not \
+             create a second arena for the same class"
+        );
+
+        // And the allocation the wave refused now succeeds against the arena
+        // that already exists, which is the point: filling is always legal.
+        backing
+            .alloc_chunk_for_key(key)
+            .expect("the class has an arena now, so no creation is needed");
+        Ok(())
+    }
+
+    /// **A deferral must never be laundered into scarcity.**
+    ///
+    /// `alloc_chunk_run_for_key` answers a failed stamp by promoting to a wider
+    /// class and retrying four times, then reports `VRAM exhaustion on arena
+    /// creation`. That is the right answer when no region can be had and the
+    /// wrong one when a region can be had *next wave* — and the wrong one is
+    /// what shipped: the `1088 B` class froze at 49 arenas with 75 regions
+    /// claimable, the hot→warm drain stalled at 634 MiB, and the log blamed VRAM
+    /// while a fifth of the reservation stood free.
+    #[test]
+    fn a_run_refused_mid_wave_reports_the_deferral_not_exhaustion() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let Device::Cuda(cd) = &device else {
+            unreachable!()
+        };
+        let stream = cd.cuda_stream();
+        let key = ArenaKey::new(SizeClass::at(SizeClass::COUNT - 2), ArenaLocation::Gpu);
+
+        let guard = begin_wave(&stream, LayerPhase::Attention)?;
+        let err = backing
+            .alloc_chunk_run_for_key(key, 4)
+            .err()
+            .expect("a run needing a new arena cannot be served mid-wave")
+            .to_string();
+        drop(guard);
+
+        assert!(
+            err.contains(KV_ARENA_MID_WAVE),
+            "the run allocator must hand the deferral back as itself: {err}"
+        );
+        assert!(
+            !err.contains("VRAM exhaustion"),
+            "a deferral reported as exhaustion sends the next investigation \
+             looking for a KV leak that is not there: {err}"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +982,205 @@ mod tests {
             let backing = create_test_backing();
             backing.alloc_sequence().unwrap();
             assert!(backing.reserve_glue_gap_chunk(999, 4).is_err());
+        }
+    }
+
+    // ==================== Cross-Layer Capacity Tests ====================
+
+    /// `ensure_for_batch_entries_all` speaks for every layer, so a layer whose
+    /// block structure has drifted from layer 0's must still be asked.
+    mod layer_capacity_tests {
+        use super::*;
+        use crate::kv_cache::chunked::CHUNK_SIZE;
+
+        /// One layer's backing holding a single sequence of exactly 32 tokens —
+        /// a tail chunk that is precisely full, with nothing writable behind it.
+        fn layer_with_full_tail() -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+            let v = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+            backing.write_contiguous(0, 0, &k, &v).unwrap();
+            // `write_contiguous` places bytes; the window's valid token count is
+            // the writer's to advance, exactly as the prefill path does.
+            backing.set_len(0, 32);
+            backing
+        }
+
+        #[test]
+        fn every_layer_is_asked_not_only_layer_zero() {
+            // The skew a windowed creep prefill leaves behind: the resumed layer
+            // already carries an empty writer chunk for the next window, the
+            // layers still pending resume carry the exactly-full tail. Asking
+            // layer 0 alone reads "writable tail, nothing to allocate" and
+            // suppresses the allocation every other layer needs.
+            let layers = vec![layer_with_full_tail(), layer_with_full_tail()];
+            layers[0].push_empty_writer_chunk(0).unwrap();
+
+            let entries = [(0usize, 32usize)];
+            assert!(
+                layers[0].validate_decode_batch_state(&entries).is_ok(),
+                "precondition: the skewed layer already has a writable tail"
+            );
+            assert!(
+                layers[1].validate_decode_batch_state(&entries).is_err(),
+                "precondition: the lagging layer's tail is exactly full"
+            );
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
+        }
+
+        /// One layer's backing holding a single sequence of `tokens` tokens.
+        fn layer_with(tokens: usize) -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let k = Tensor::ones((1, 4, tokens, 32), DType::BF16, &Device::Cpu).unwrap();
+            let v = Tensor::ones((1, 4, tokens, 32), DType::BF16, &Device::Cpu).unwrap();
+            backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, tokens);
+            backing
+        }
+
+        /// `(block count, index of the chunk the write slot resolves to,
+        /// total tokens)` — the part of a layer's structure the shared decode
+        /// position map is built from, read the way the metadata builder reads
+        /// it.
+        fn observed_layout(backing: &ChunkedKvBacking) -> (usize, usize, usize) {
+            let state = backing.state.read().expect("lock");
+            let slot = state.sequences[0].as_ref().expect("slot");
+            let chunks = slot.chunks_slice();
+            let start = slot.writer_start_idx().min(chunks.len().saturating_sub(1));
+            let writer = (start..chunks.len())
+                .find(|&i| {
+                    (chunks[i].offset as usize + chunks[i].usage as usize) < CHUNK_SIZE
+                })
+                .unwrap_or(chunks.len().saturating_sub(1));
+            let tokens = chunks.iter().map(|c| c.usage as usize).sum();
+            (chunks.len(), writer, tokens)
+        }
+
+        #[test]
+        fn diverged_writer_index_is_reconciled() {
+            // The hazard the reconciliation exists for: both layers have a
+            // WRITABLE tail, so neither needs an allocation, but they resolve
+            // the write slot to different chunks. The kernel scatters through
+            // the per-layer slice while attention reads through the one shared
+            // position map, so this divergence corrupts silently — there is no
+            // fault and no wrong-looking number to notice.
+            let layers = vec![layer_with(20), layer_with(20)];
+            layers[0].push_empty_writer_chunk(0).unwrap();
+
+            assert_eq!(observed_layout(&layers[0]), (2, 1, 20));
+            assert_eq!(
+                observed_layout(&layers[1]),
+                (1, 0, 20),
+                "precondition: the layers disagree on the write slot"
+            );
+
+            let entries = [(0usize, 20usize)];
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            let unified = observed_layout(&layers[0]);
+            assert_eq!(
+                observed_layout(&layers[1]),
+                unified,
+                "every layer must resolve the write slot to the same chunk"
+            );
+            assert_eq!(unified.2, 20, "reconciliation must not shift any position");
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
+        }
+
+        #[test]
+        fn diverged_token_windows_are_an_error_not_a_repair() {
+            // Appending a common writer chunk equalises trailing structure, and
+            // the tail heal may drop up to one chunk's worth of undelivered
+            // tokens. A spread wider than a chunk is more than any single
+            // failed operation leaves behind, so no repair may claim it.
+            let layers = vec![layer_with(20), layer_with(2 * CHUNK_SIZE)];
+            let entries = [(0usize, 20usize)];
+
+            let err = ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1)
+                .expect_err("a spread past one chunk cannot share one position map");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("could not be reconciled or healed"),
+                "the error must name both repairs it outlived, got: {msg}"
+            );
+        }
+
+        /// **A failed wave's skew heals instead of bricking the sequence.**
+        ///
+        /// The decode sweep advances each layer's usage as that layer completes,
+        /// so a wave that dies mid-sweep leaves the early layers one token ahead
+        /// — undelivered tokens, since the wave never retired. The forward path
+        /// now rolls that back at the failure; this covers the same state
+        /// arriving from before the rollback existed, or through a substrate
+        /// reload of a sealed turn that captured it. The next decode truncates
+        /// every layer to the shortest, reconciles the trailing structure, and
+        /// proceeds — the alternative was refusing this sequence forever.
+        #[test]
+        fn a_failed_waves_tail_skew_is_healed_not_refused() {
+            // Layer 0 one token ahead of layer 1: the exact signature of a wave
+            // that died between layer 0's advance and layer 1's.
+            let layers = vec![layer_with(33), layer_with(32)];
+            let entries = [(0usize, 32usize)];
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1)
+                .expect("a one-token tail skew is healable and must not refuse the decode");
+
+            // Both layers agree on every data window afterwards, and both are
+            // writable — the healed sequence decodes like any other.
+            let layouts: Vec<_> = layers.iter().map(observed_layout).collect();
+            assert_eq!(
+                layouts[0], layouts[1],
+                "healing must leave the layers identical, got {layouts:?}"
+            );
+            assert_eq!(
+                layouts[0].2, 32,
+                "the undelivered token is dropped, the delivered ones stay"
+            );
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| panic!("layer {li} not decodable after heal: {e}"));
+            }
+        }
+
+        #[test]
+        fn uniform_layers_still_allocate_once_each() {
+            // The common case must be unchanged: every layer's tail is full, so
+            // every layer takes the allocation path and ends up writable.
+            let layers = vec![layer_with_full_tail(), layer_with_full_tail()];
+            let entries = [(0usize, 32usize)];
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            let counts: Vec<usize> = layers
+                .iter()
+                .map(|b| b.sequence_block_count(0).expect("slot"))
+                .collect();
+            assert_eq!(counts, vec![2, 2], "one fresh writer chunk per layer");
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
         }
     }
 }

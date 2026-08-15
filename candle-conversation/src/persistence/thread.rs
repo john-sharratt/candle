@@ -546,6 +546,23 @@ pub(crate) fn effective_turn_policy(
 /// error kinds won't be helped by evicting, so they don't signal.
 ///
 /// [`is_device_oom`]: candle_nn::kv_cache::is_device_oom
+/// Whether a hot→warm failure is the wave-in-flight deferral rather than a fault.
+///
+/// A sealing pass allocates its quantize destinations and its CPU warm copies as
+/// it goes, and some of those need an arena that does not exist yet. Creating one
+/// claims a region and so moves the arena frontier a running wave's transient
+/// tier was placed against, which is why `enter_arena_window` refuses it.
+///
+/// The refusal is **normal operation**, not an error: the group stays hot-float
+/// and consistent and the next pass finds the gap between forwards. It reaches
+/// the same `break 'work false` a genuine fault does, so the only thing that has
+/// to differ is what gets said about it — a warning with a CUDA breadcrumb reads
+/// as a fault, and this is the engine doing what it was built to do.
+fn is_wave_deferral(err: &candle::Error) -> bool {
+    err.to_string()
+        .contains(candle_nn::kv_cache::KV_ARENA_MID_WAVE)
+}
+
 fn signal_vram_starvation(device: &Device, err: &candle::Error) {
     if !candle_nn::kv_cache::is_device_oom(err) {
         return;
@@ -631,6 +648,14 @@ fn migrate_group_hot_to_warm(
                     alloc_ms,
                 ) {
                     Ok(v) => gpu_hot_per_layer = v,
+                    Err(e) if is_wave_deferral(&e) => {
+                        tracing::debug!(
+                            "cache: hot→warm quantize deferred — a wave holds the partition \
+                             and the destinations need a new arena; retrying next pass"
+                        );
+                        *quantize_ms += t_q.elapsed().as_millis() as u64;
+                        break 'work false;
+                    }
                     Err(e) => {
                         // CUDA errors are async — surfaced on the next sync call,
                         // not at the launch site; use the breadcrumb to identify it.
@@ -675,11 +700,18 @@ fn migrate_group_hot_to_warm(
             *quantize_ms += dt;
             *convert_ms += dt;
             if let Err(e) = conv {
-                tracing::warn!(
-                    "cache: hot→warm batched convert failed: {e} (last CUDA kernel on this thread: {})",
-                    candle::last_cuda_kernel_launch()
-                );
-                signal_vram_starvation(device, &e);
+                if is_wave_deferral(&e) {
+                    tracing::debug!(
+                        "cache: hot→warm convert deferred — a wave holds the partition; \
+                         retrying next pass"
+                    );
+                } else {
+                    tracing::warn!(
+                        "cache: hot→warm batched convert failed: {e} (last CUDA kernel on this thread: {})",
+                        candle::last_cuda_kernel_launch()
+                    );
+                    signal_vram_starvation(device, &e);
+                }
                 break 'work false;
             }
         }
@@ -705,6 +737,13 @@ fn migrate_group_hot_to_warm(
         drop(per_layer_refs); // release the borrow of gpu_hot_per_layer
         let warm_per_layer = match warm_result {
             Ok(v) => v,
+            Err(e) if is_wave_deferral(&e) => {
+                tracing::debug!(
+                    "cache: hot→warm DtoH deferred — a wave holds the partition and the CPU \
+                     warm copy needs a new arena; retrying next pass"
+                );
+                break 'work false;
+            }
             Err(e) => {
                 tracing::warn!(
                     "cache: hot→warm batched DtoH failed: {e} (last CUDA kernel on this thread: {})",
@@ -839,6 +878,27 @@ fn run_pass(
     // post-migrate sync, because the scheduler was otherwise free to unmap
     // those arenas underneath the select kernel. Nothing unmaps any more; see
     // `candle_nn::kv_cache::migrate_flight`.
+    // **Create what the last pass was refused, before this one starts.**
+    //
+    // A pass that needed a new arena mid-wave was turned away at the leaf of the
+    // allocator and recorded the size class it wanted. Here — between forwards,
+    // with no KV lock held and no wave in flight — is where that can be made.
+    // The pass below then finds the arena already there and only *fills* it,
+    // which is legal at any point in a wave, so it no longer matters whether a
+    // forward starts underneath it.
+    //
+    // Silent when there is nothing owed, and silently deferred again if a
+    // forward has already started: the demand stays recorded for the next gap.
+    for backing in backings.iter() {
+        match backing.create_deferred_arenas() {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                "cache: created {n} arena(s) a wave-deferred sealing pass asked for"
+            ),
+            Err(e) => tracing::warn!("cache: deferred arena creation failed: {e}"),
+        }
+    }
+
     let migrate_guard = candle_nn::kv_cache::migrate_flight();
     for (cc, group) in groups {
         let effective = effective_turn_policy(compression_policy, cc);

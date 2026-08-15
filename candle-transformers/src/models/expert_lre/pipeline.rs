@@ -1077,8 +1077,17 @@ impl PipelineState {
 
         let mut loaded_slots: Vec<(usize, usize, ExpertSlot)> = Vec::with_capacity(to_load.len());
 
+        // **Every slot in `to_load` is allocated and keyless right now**, and it
+        // stays keyless until the install below. So a failure anywhere in this
+        // phase hands the batch back to the caller while the zone still counts
+        // those slots as occupied — and a slot the zone holds with no expert in
+        // it is one neither `alloc` nor the eviction scans can ever return. Ten
+        // failed loads is ten slots gone for the life of the process.
+        //
+        // Hence the explicit unwinding rather than `?`: the error still
+        // propagates unchanged, but the slots go back first.
         #[cfg(feature = "cuda")]
-        {
+        let outcome = (|| -> Result<()> {
             // Before any byte moves: the slots below may still be under read by
             // the previous layer's GEMM.
             self.order_copies_after_compute()?;
@@ -1087,10 +1096,11 @@ impl PipelineState {
                 let expert_slot = self.load_expert(moe_idx, expert_idx, slot_base)?;
                 loaded_slots.push((expert_idx, slot_idx, expert_slot));
             }
-        }
+            Ok(())
+        })();
 
         #[cfg(not(feature = "cuda"))]
-        {
+        let outcome = (|| -> Result<()> {
             let mmap_bytes: &[u8] = &self.mmap;
             for &(expert_idx, slot_idx) in &to_load {
                 let mmap_ref = &self.host_refs[moe_idx][expert_idx];
@@ -1098,6 +1108,16 @@ impl PipelineState {
                     load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode)?;
                 loaded_slots.push((expert_idx, slot_idx, expert_slot));
             }
+            Ok(())
+        })();
+
+        if let Err(e) = outcome {
+            for &(_, slot_idx) in &to_load {
+                if self.inner.slot_to_key[slot_idx].is_none() {
+                    self.inner.zone.release(slot_idx);
+                }
+            }
+            return Err(e);
         }
 
         // ── Record single fence event ──
@@ -1667,22 +1687,23 @@ impl PipelineState {
             }
             self.profile.record("pipe_eviction", t);
 
-            // ── The boundary negotiation ──
+            // **The boundary does not move from here.**
             //
-            // Last thing in the pass, after the eviction above has already
-            // produced whatever free slots it was going to: whether the weight
-            // side gives ground to KV or takes some back is decided from what
-            // actually happened, not from a forecast.
-            #[cfg(feature = "cuda")]
-            {
-                let t = profile_now();
-                // No `want`: end of pass is the *growing* direction. A KV side
-                // that is short does not wait for this — it buys at the claim.
-                if let Err(e) = self.renegotiate_boundary(None) {
-                    tracing::warn!("boundary renegotiation failed: {e}");
-                }
-                self.profile.record("pipe_boundary", t);
-            }
+            // This was the growing direction's call site, and "end of pass" is
+            // what made it look safe: the eviction above has produced whatever
+            // free slots it was going to, and no GEMM for the pass is still being
+            // *issued*. But end-of-pass on this thread is the middle of a forward
+            // on the other one — `post_compute` runs the instant a MoE layer's
+            // work is answered, while the forward thread is still inside
+            // `ffn_forward` holding that layer's FFN wave guard. A wave arena is
+            // live, and moving the boundary under one evicts and relocates slots
+            // the wave may be reading.
+            //
+            // So the move lives where the wave genuinely is not: the wave loop's
+            // inter-forward gap, beside the transient tier's hand-back
+            // (`batched_model::forward_wave` phase 0 → `reclaim_spare_ground`).
+            // The KV side's own direction is unchanged — it buys at the claim,
+            // through `request_kv_ground`, and does not wait for a pass to end.
 
             // Reset per-pass adaptive counters.
             self.pass_misses = 0;
@@ -1696,7 +1717,10 @@ impl PipelineState {
     ///
     /// **This is the elastic partition.** It runs on the pipeline thread because
     /// that is the only place the weight side is safe to change: this thread owns
-    /// the cache, and no expert GEMM for the pass is still being issued.
+    /// the cache. *When* it may run is a separate condition and a stricter one —
+    /// no wave generation open on the span — which neither this function nor its
+    /// thread can establish. Both callers reach it from outside a forward, and
+    /// `set_weight_floor` checks rather than trusts that.
     ///
     /// # `want` is stated by the caller, never inferred here
     ///
@@ -1765,9 +1789,37 @@ impl PipelineState {
             // until this instant, and "free" there means no host-side gid names
             // them, not that no kernel is still reading them.
             self.quiesce_before_handover()?;
-            let gained = self.inner.grow_zone(target);
+            // **The floor moves first, and the zone follows it.**
+            //
+            // `set_weight_floor` is refusable — it declines while a wave
+            // generation is open on the span — and this ran the other way round:
+            // `grow_zone` applied, then the publish, then `?` carried the refusal
+            // out to a caller that logs a warning. What it left behind was a zone
+            // one slot wider than the boundary the KV side had been told about,
+            // so the next miss allocated the new top slot and handed the GEMM
+            // `slot_base(capacity)` — an address exactly one `slot_bytes` *below*
+            // `weight_floor`, which is KV ground.
+            //
+            // Measured: `gate weights for expert 43 are at 0xee10c0000, below the
+            // weight floor 0xee1384000`, one slot down, from the first wave step
+            // of a bulk ingest — and every later symptom (experts unable to
+            // evict, KV unable to reclaim regions the failed steps never retired)
+            // hung off that one refusal.
+            //
+            // Growing shrinks the KV side, so publishing first is also the safe
+            // order in its own right: the KV side stops handing out the ground
+            // before the weight side starts filling it. A refusal now lands with
+            // nothing yet moved, and the next pass tries again.
+            let grown_floor = self.inner.zone.frontier_after_growth(target);
+            let gained = if grown_floor < self.inner.zone.frontier_for_capacity() {
+                set_weight_floor(&stream, grown_floor)?;
+                self.inner.grow_zone(target)
+            } else {
+                // `grow_to` clamps to the zone's limit, so a target past it moves
+                // no boundary and must publish none.
+                0
+            };
             if gained > 0 {
-                set_weight_floor(&stream, self.inner.zone.frontier_for_capacity())?;
                 tracing::debug!(
                     target: "candle_transformers::expert_lre",
                     gained,
@@ -1778,6 +1830,44 @@ impl PipelineState {
             }
             return Ok(0);
         }
+
+        // **Refuse before touching anything, exactly as the growth path does.**
+        //
+        // This check used to sit at the end, just before `set_weight_floor` —
+        // after `retract_zone` had already shrunk the zone, after the
+        // relocations had moved experts, after the evictions, and after
+        // `truncate_tables`. When it refused, `?` carried the error out through
+        // a caller that logs it as a warning, so the whole retraction stayed
+        // half-applied: the zone believed it was smaller while experts were
+        // still live at indices past the new capacity, and the next pass handed
+        // one of their addresses to a grouped GEMM.
+        //
+        // Measured: `boundary renegotiation failed: refusing to move the weight
+        // boundary while a wave generation is open` at t=00:59:49.222, then at
+        // t=00:59:49.844 a gate weight pointer exactly `slot_bytes` below
+        // `weight_floor` — `slot_base(capacity)`, one slot past the last valid
+        // index. That address is KV ground, and reading it is the
+        // CUDA_ERROR_ILLEGAL_ADDRESS this hunt has been chasing.
+        //
+        // The growth branch above already had this right: quiesce, *then*
+        // `grow_zone`. Retraction is the same handover and gets the same order.
+        //
+        // A zone already sitting on its floor concedes nothing, and `retract_to`
+        // clamps to that floor rather than reporting it — so the answer is known
+        // here, before a device-wide synchronize is spent on it. The relief
+        // ladder asks on every rung of every failed wave; at the floor that was
+        // 188 consecutive quiesces to arrive at zero each time.
+        if target.max(self.inner.zone.min_capacity()) >= before {
+            tracing::debug!(
+                target: "candle_transformers::expert_lre",
+                wanted = delta,
+                slots = before,
+                floor_slots = self.inner.zone.min_capacity(),
+                "weight side is on its floor and can concede no further ground"
+            );
+            return Ok(0);
+        }
+        self.quiesce_before_handover()?;
 
         // The zone decides who moves and who goes; this performs it.
         let plan = self.inner.retract_zone(target);
@@ -1807,9 +1897,57 @@ impl PipelineState {
         // Only now: the relocations above read `slot_to_key` for the slots the
         // truncation removes.
         self.inner.truncate_tables();
+
+        // **`residency` is the fifth table, and the truncation cannot reach it.**
+        //
+        // `truncate_tables` cleans `slots`, `last_used`, `slot_to_key` and
+        // `key_to_slot` — every structure `inner` owns. `residency` lives on
+        // *this* struct, so a retraction left it still claiming
+        // `vram = Some(idx)` for slots the zone had just given up. Those entries
+        // are what say "this expert is resident, in that slot", so the next pass
+        // resolved one to an address at or below the frontier and handed it to a
+        // grouped GEMM: `slot_base(idx)` for `idx >= capacity` is below
+        // `weight_floor`, which is KV ground.
+        //
+        // Measured before this: gate weights for expert 49 exactly one
+        // `slot_bytes` below the floor, and experts 27 and 28 sharing a single
+        // address three slots below it — two keys resolving to one slot because
+        // both had stale residency pointing into the conceded range.
+        //
+        // Cleared here rather than inside `truncate_tables` because that is a
+        // method on `inner`, which has no access to `residency`; keeping the two
+        // adjacent is what makes the pairing visible.
+        let cap = self.inner.zone.capacity();
+        for layer in self.residency.iter_mut() {
+            for res in layer.iter_mut() {
+                if res.vram.is_some_and(|s| s >= cap) {
+                    res.vram = None;
+                }
+            }
+        }
         // The conceded slots stop being ours the moment the floor moves.
         self.quiesce_before_handover()?;
-        set_weight_floor(&stream, self.inner.zone.frontier_for_capacity())?;
+        // **A refused publish here has to be undone, not carried out.**
+        //
+        // Retraction cannot publish first the way growth does — the floor moving
+        // right is what hands the KV side ground the experts above it are only
+        // now vacating. So the refusable step stays last, and the failure it can
+        // still produce is repaired instead of propagated: the zone believes it
+        // is smaller while `pool.weight_floor` says otherwise, and *both* sides
+        // lose the ground — the weight side has evicted off it, the KV side was
+        // never told it may use it. Worse, the next attempt computes its target
+        // from the unmoved floor, finds it equal to the capacity already reached,
+        // and returns zero: the relief loop then asks 188 times in a row and is
+        // answered `conceded_mib=0` every time while nothing is actually pinned.
+        //
+        // Growing the zone back is a true rollback. The doomed slots were evicted
+        // or relocated, so they are free; restoring the capacity restores the
+        // agreement between the zone and the published floor, and the only cost
+        // is reloading experts that were dropped for nothing.
+        if let Err(e) = set_weight_floor(&stream, self.inner.zone.frontier_for_capacity()) {
+            self.inner.grow_zone(before);
+            return Err(e);
+        }
         let conceded =
             (before - self.inner.zone.capacity()) as u64 * self.inner.zone.slot_bytes() as u64;
         tracing::debug!(
@@ -1837,10 +1975,10 @@ impl PipelineState {
     /// the ceiling never moved over ground an expert had been sitting on, so a
     /// fresh region had never been anyone's.
     ///
-    /// Now it has. `renegotiate_boundary` runs at end of pass on the pipeline
-    /// thread, and "the pass ended" means its expert GEMMs were *issued*, not
-    /// that they retired. Publishing a lower floor lets the KV side memset and
-    /// write bytes those GEMMs are still reading, which surfaces as
+    /// Now it has. `renegotiate_boundary` runs between forwards, and "between
+    /// forwards" bounds only what is being *issued* — the last pass's expert
+    /// GEMMs may still be executing. Publishing a lower floor lets the KV side
+    /// memset and write bytes those GEMMs are still reading, which surfaces as
     /// `CUDA_ERROR_ILLEGAL_ADDRESS` in whatever unrelated kernel is running when
     /// the fault lands. The same applies in reverse when the weight side takes
     /// regions back: an expert upload would overwrite bytes a KV kernel is
@@ -1894,6 +2032,18 @@ impl PipelineState {
             return Ok(());
         };
         let Some(key) = self.inner.slot_to_key[from] else {
+            // **Nothing to move, so give the destination back.**
+            // `WeightZone::retract_to` marks `to` occupied when it builds the
+            // plan — it deals in occupancy and cannot see keys — so returning
+            // here without releasing leaves a slot the zone believes is taken
+            // and the tables believe is empty. It is then invisible to `alloc`
+            // (not on the free list) and to both eviction scans (no key), and
+            // it never comes back.
+            //
+            // Self-amplifying, which is what made it fatal: one such slot in a
+            // later retraction's doomed range produces another, and this run
+            // retracted twenty-four times.
+            self.inner.zone.release(to);
             return Ok(());
         };
         let geom = &self.layer_geometries[key.0];

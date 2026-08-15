@@ -764,12 +764,20 @@ impl Scheduler {
     /// Free KV regions right now, and the setpoint for `phase` — the two
     /// numbers every pressure and admission decision is made from.
     ///
+    /// "Free" includes regions a standing transient tier has blocked
+    /// (`stats.blocked`): every decision made from this pair concerns work
+    /// scheduled for a *later* forward, and that forward's phase 0 releases the
+    /// tier before any of its claims run. Counting only the tier-capped free
+    /// count made every wave's own scratch read as KV pressure from the
+    /// scheduler's seat, shedding sequences to relieve ground that was never
+    /// occupied.
+    ///
     /// `None` before the reservation exists, which the callers read as "no
     /// pressure, nothing to spend": there is no KV on the device yet to be
     /// under pressure about.
     fn kv_region_state(&self, phase: VramPhase) -> Option<(usize, usize)> {
         let stats = self.kv_regions()?;
-        Some((stats.free, setpoint_regions(phase, stats.total)))
+        Some((stats.free + stats.blocked, setpoint_regions(phase, stats.total)))
     }
 
     /// The KV side's region counters, or `None` before the reservation exists.

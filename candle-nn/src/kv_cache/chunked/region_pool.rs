@@ -291,41 +291,26 @@ struct RegionPool {
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
     ///
-    /// The measurement that decides whether the tier can sit at the arena
-    /// frontier. Every one of these is a claim that arrived *after* the admit
-    /// phase, so with the tier anchored at the frontier it would be refused
-    /// rather than served. Cumulative for the process; a run that ends with zero
-    /// is a run in which admit really was exhaustive.
+    /// **A tripwire that must read zero.** A region claim creates an arena, and
+    /// an arena may only be created between forwards —
+    /// `BackingInner::arena_window` blocks until then. A non-zero reading names
+    /// a creation path that skipped that gate and moved the arena frontier under
+    /// a tier already placed against it.
+    ///
+    /// It used to be a *measurement*: the count of claims that would have to fit
+    /// in a gap above the frontier for the tier to be anchored there, which on
+    /// the quantized path ran into the hundreds because the compressor creates
+    /// size-class arenas as it chooses formats. That number was read as proof
+    /// the frontier anchor was impossible. It was proof the sealing thread was
+    /// allocating arenas inside the wave.
     fresh_claims_during_wave: usize,
     /// Region claims refused because the tier's base was the ceiling.
     ///
-    /// **The only refusal the KV side records, and the only one the boundary
-    /// cannot answer.** A claim that runs out of ground with no tier standing
-    /// buys more (`set_ground_broker`); these are claims the partition had room
-    /// for and a running wave's tier blocked, so the fix is admitting earlier or
-    /// running narrower, not moving the boundary.
+    /// The same tripwire from the other side: a claim that ran out of ground
+    /// *with a tier standing* is a claim that arrived inside a wave. A claim
+    /// that runs out with no tier standing is ordinary pressure and buys more
+    /// (`set_ground_broker`).
     refusals_during_wave: usize,
-    /// Fresh regions wanted since the current forward reserved its tier, and the
-    /// largest that count has ever reached.
-    ///
-    /// **The number that refuted anchoring the tier at the arena frontier.** For
-    /// that placement to work, everything claimed after a forward begins has to
-    /// fit in a gap left above the frontier — and on the quantized path this
-    /// peaks in the hundreds, because the compressor creates size-class arenas
-    /// as it chooses formats. Kept because it is the standing evidence for where
-    /// the tier sits, and because a workload that drove it to zero would be one
-    /// where the frontier anchor became possible again.
-    fresh_this_forward: usize,
-    fresh_per_forward_peak: usize,
-    /// Regions to leave free below the tier for claims that arrive *after* it is
-    /// reserved — the seed for the frontier anchor's gap.
-    ///
-    /// Set per forward by whoever knows the workload
-    /// ([`set_claim_reserve`]); `fresh_per_forward_peak` corrects it upward from
-    /// observation. A seed is required rather than merely helpful: learned alone,
-    /// the gap starts at zero, the first claim after the reservation is refused,
-    /// and the forward dies before the measurement that would widen it.
-    claim_reserve: usize,
     /// Highest demand seen in the window that is closing, and in the one before
     /// it. The mark the weight side measures "spare" against is the larger of
     /// the two — see [`RegionPool::spare_regions`].
@@ -731,9 +716,6 @@ impl RegionPool {
             persist_carved: 0,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
-            fresh_this_forward: 0,
-            fresh_per_forward_peak: 0,
-            claim_reserve: 0,
             // Opens at the top: the weight side must watch the KV side stay
             // small before it may take anything, never assume it will.
             // Both windows open at the top: the weight side must watch the KV
@@ -747,18 +729,6 @@ impl RegionPool {
 
     fn span_end(&self) -> u64 {
         self.span_base + self.span_bytes as u64
-    }
-
-    /// Note that a fresh region was wanted during the current forward.
-    ///
-    /// Raises the per-forward peak the tier's gap is sized from. Called on the
-    /// satisfied path *and* on the refused one — see the refusal branch for why
-    /// counting only the satisfied ones deadlocks the headroom.
-    fn note_fresh_demand(&mut self) {
-        self.fresh_this_forward += 1;
-        if self.fresh_this_forward > self.fresh_per_forward_peak {
-            self.fresh_per_forward_peak = self.fresh_this_forward;
-        }
     }
 
     /// The lowest address the wave transient tier may not reach below: one past
@@ -799,21 +769,19 @@ impl RegionPool {
     /// **Not "regions nobody owns".** The two differ whenever a wave's transient
     /// tier is placed, because the tier caps the pool at
     /// [`Self::region_ceiling`] and everything above that is unclaimable however
-    /// free it looks. Counting the difference is not a reporting nicety: this
-    /// number *is* the admission budget —
-    /// `alloc::vram_budget_available` is `free × REGION_BYTES` — so an
-    /// over-count is a promise the allocator then refuses to keep.
+    /// free it looks. Counting the difference matters because this number
+    /// answers "what would `claim_region` hand out right now" — a claim made
+    /// while the tier stands must be refused at the ceiling, and reporting the
+    /// tier's own ground as claimable is a promise the allocator then refuses
+    /// to keep. (A wide section prefill once did exactly that: a 496 MiB tier
+    /// capped the ceiling at 293 regions, the 31 above it were reported free,
+    /// and admission planned against them — 12,488 refusals in four seconds
+    /// with no forward completing.)
     ///
-    /// It did exactly that. A wide section prefill placed a 496 MiB tier, the
-    /// ceiling landed at 293 regions, live reached 293, and the 31 regions above
-    /// the ceiling — the tier's own ground — were reported free. Admission was
-    /// told it had 496 MiB, planned against it, and every claim was refused:
-    /// 12,488 refusals in the last four seconds before the daemon was killed,
-    /// with no forward completing and therefore no way to give the ground back.
-    ///
-    /// The weight side was taught this in the same shape (`spare_regions` prices
-    /// the tier into its demand); this is the other consumer of the same
-    /// question, which that fix missed.
+    /// Callers whose decision lands *after* the tier releases — admission
+    /// budgets, scheduler pressure, the weight-side negotiation — must add
+    /// [`Self::ceiling_blocked`] back on top; [`RegionStats`] carries both
+    /// numbers so each consumer picks the horizon it is actually deciding for.
     fn free_count(&self) -> usize {
         // The heap is unordered under iteration, so this counts rather than
         // short-circuits — a few hundred entries on a path that runs per wave,
@@ -1028,7 +996,14 @@ impl RegionPool {
         let by_history = self
             .total
             .saturating_sub(self.kv_peak_window.max(self.kv_peak_prev_window));
-        let by_occupancy = self.free_count();
+        // Occupancy counts tier-blocked ground as unoccupied: the boundary only
+        // moves with no wave open, so a standing tier is idle — its bytes are
+        // dead until the next forward's phase 0 releases it — and its *future*
+        // demand is already priced into the window peak above (`demand` includes
+        // `transient_bytes` every time a tier stands). Counting the blocked
+        // ground as occupied here would charge the tier twice and pin the
+        // boundary wherever a tier happened to be standing.
+        let by_occupancy = self.free_count() + self.ceiling_blocked();
         by_history.min(by_occupancy).saturating_sub(slack)
     }
 }
@@ -1107,7 +1082,7 @@ pub(crate) fn ensure(stream: &std::sync::Arc<CudaStream>) -> Result<()> {
 /// mapping touch, recycled ones from an explicit fill here, so a new tenant
 /// never reads the last one's data (invariant 4).
 pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option<RegionHandle>> {
-    match with_pool(stream, |pool| try_claim(pool, stream, Attempt::First))? {
+    match with_pool(stream, |pool| try_claim(pool, stream))? {
         Claim::Got(handle) => return Ok(Some(handle)),
         // A tier is standing: the ground above it exists but belongs to a
         // running wave, and no amount of weight-side concession reaches it. The
@@ -1124,7 +1099,7 @@ pub(crate) fn claim_region(stream: &std::sync::Arc<CudaStream>) -> Result<Option
     if buy_ground(stream, KV_BUY_STEP)? == 0 {
         return Ok(None);
     }
-    match with_pool(stream, |pool| try_claim(pool, stream, Attempt::AfterBuying))? {
+    match with_pool(stream, |pool| try_claim(pool, stream))? {
         Claim::Got(handle) => Ok(Some(handle)),
         _ => Ok(None),
     }
@@ -1139,25 +1114,7 @@ enum Claim {
     Exhausted,
 }
 
-/// Which of [`claim_region`]'s two passes this is.
-///
-/// **One claim is one unit of demand**, however many attempts it takes. The
-/// retry after a purchase is the same claim reaching the same conclusion with
-/// more ground under it, so it must not raise the counters a second time —
-/// `fresh_per_forward_peak` decides how wide a gap the frontier anchor would
-/// need, and doubling every bought claim would inflate it by exactly the claims
-/// the purchase already answered.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Attempt {
-    First,
-    AfterBuying,
-}
-
-fn try_claim(
-    pool: &mut RegionPool,
-    stream: &std::sync::Arc<CudaStream>,
-    attempt: Attempt,
-) -> Result<Claim> {
+fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Result<Claim> {
     {
         // **The ceiling binds the free list too.** A region freed while a tier
         // stands keeps its index, and that tier is placed below it. Handing it
@@ -1183,18 +1140,30 @@ fn try_claim(
             let Reverse(idx) = pool.free.pop().expect("peeked");
             (idx, true)
         } else if pool.next < ceiling {
-            // **A fresh region claimed while the tier is placed is a claim the
-            // admit phase did not make.** Counted rather than refused: the tier
-            // sits at the weight floor today, so there is room above the
-            // frontier for these; placing it *at* the frontier
-            // (`docs/elastic_vram_partition.md` §7 phase 2) is what turns each
-            // of these into a refusal, and this is the measurement that says how
-            // many there would be.
+            // **A region claimed while a tier stands is an invariant breach.**
+            //
+            // Every region claim creates an arena, and an arena may only be
+            // created between forwards — `BackingInner::arena_window` blocks
+            // until then. So reaching here with a tier placed means some path
+            // creates arenas without that gate, and the tier the running wave is
+            // using was placed against a frontier that has just moved under it.
+            //
+            // Counted, loudly, rather than refused: refusing would turn a
+            // bookkeeping hole into a failed forward, and the claim itself is
+            // still served from ground nobody holds. The counter is a tripwire
+            // that must read zero, not a tuning input — it used to be the latter,
+            // and `fresh_per_forward_peak` grew a gap above the frontier to
+            // accommodate exactly the claims this now forbids.
             if pool.transient_base.is_some() {
                 pool.fresh_claims_during_wave += 1;
-            }
-            if attempt == Attempt::First {
-                pool.note_fresh_demand();
+                log::warn!(
+                    "reservation: fresh region claimed with the wave tier placed at {:#x} \
+                     — an arena was created inside a wave (count {}). Every creation must \
+                     pass BackingInner::arena_window, which waits for the gap between \
+                     forwards.",
+                    pool.transient_base.unwrap_or(0),
+                    pool.fresh_claims_during_wave,
+                );
             }
             pool.next += 1;
             (pool.next - 1, false)
@@ -1216,15 +1185,9 @@ fn try_claim(
             // What this shortfall calls for is a narrower wave or a released
             // tier, and `refusals_during_wave` is what says so.
             //
-            // **The demand is still demand.** Only the *remedy* differs between
-            // this branch and the one below: the gap the frontier anchor would
-            // have to leave is measured by what claims arrive after a forward
-            // begins, and a claim the tier refused is exactly such a claim. Not
-            // noting it here is what would let the anchor settle on a gap too
-            // small to serve the claims that made it necessary.
-            if attempt == Attempt::First {
-                pool.note_fresh_demand();
-            }
+            // **Like the branch above, this now reads zero or something is
+            // wrong.** A claim reaching the ceiling with a tier standing is a
+            // claim that arrived inside a wave, which `arena_window` forbids.
             pool.refusals_during_wave += 1;
             if super::alloc::arena_stats_enabled() {
                 eprintln!(
@@ -1241,15 +1204,7 @@ fn try_claim(
             // Exhausted with no tier standing. The caller buys ground and comes
             // back; this attempt only reports what it found.
             //
-            // **A refusal is demand too, and the gap must hear about it.**
-            // Counting only satisfied claims would let the headroom deadlock:
-            // too small a gap refuses the claim, the refusal never raises the
-            // peak, and the next forward reserves the same too-small gap for
-            // ever. So the demand is noted whether or not it was met.
-            if attempt == Attempt::First {
-                pool.note_fresh_demand();
-            }
-            // **And the weight side must hear about it too.** A refusal is the
+            // **The weight side must hear about it.** A refusal is the
             // KV side asking for more and being told no, and
             // [`RegionPool::spare_regions`]'s third guard reads this stamp to
             // decide that a side refused inside the last window has no spare
@@ -1465,34 +1420,22 @@ fn tier_fits(base: u64, len: usize, live_end: u64, floor: u64) -> std::result::R
 /// **Place the wave transient tier for the forward about to run.**
 ///
 /// The tier does not exist between forwards. This brings it into being with
-/// `bytes` of extent, immediately left of the weight floor, and returns its base.
+/// `bytes` of extent, packed against the arena frontier, and returns its base.
 /// The region ceiling drops to that base for the duration, so no arena can be
 /// stamped into the ground the tier now occupies.
 ///
-/// # Measured down from `W`, because anchoring at the frontier is not yet safe
+/// # Anchored at the arena frontier `A`
 ///
-/// The design places the tier at the arena frontier `A`
-/// (`docs/elastic_vram_partition.md` §7 phase 2), which leaves the whole
-/// remainder in one contiguous run adjacent to the weight side so the boundary
-/// can be moved to `A + T` in the same operation. Measured down from `W` the
-/// same bytes are free but stranded mid-span, and the weight side can only find
-/// them later through a control loop. The memory order is what it should be
-/// either way:
+/// `docs/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
+/// in one contiguous run adjacent to the weight side, so the boundary can be
+/// moved to `A + T` in the same operation rather than through a control loop
+/// hunting for bytes stranded mid-span:
 ///
 /// ```text
 /// | persist | KV regions … | transient | expert slots |
 /// ```
 ///
-/// **The reclaim is unaffected by the choice**, because it never came from where
-/// the tier sits: it comes from `bytes` being this wave's price rather than the
-/// widest wave's. What is lost is the placement's second job — handing the
-/// remainder over immediately.
-///
-/// # Why the frontier is not built: it is refuted, not deferred
-///
-/// Anchoring the tier at `A` was built twice and both attempts are worth having
-/// here, because the first one's evidence pointed somewhere the second one ruled
-/// out.
+/// # It took two failed attempts to find what was actually in the way
 ///
 /// **First attempt.** `Q8_0 x20` produced silently wrong output on every
 /// session, reproducibly, while the region pool looked untouched: identical arena
@@ -1512,19 +1455,22 @@ fn tier_fits(base: u64, len: usize, live_end: u64, floor: u64) -> std::result::R
 /// [tier-refusal] ... (ceiling 16, next 16, total 332) — count 1025
 /// ```
 ///
-/// **1025 refusals inside one forward, at the same placement.** The gap between
-/// the frontier and the tier would have to be hundreds of regions, not a
-/// headroom — because the quantized KV path creates size-class arenas *as it
-/// compresses*, on the persistence thread, throughout the forward. §7's premise
-/// for phase 2 is that persistence takes spare slots inside arenas already
-/// claimed and only rarely needs a region of its own. On the quantized path that
-/// is simply false, and no admit phase can fix it: the destination arenas are
-/// not knowable until the compressor has chosen formats.
+/// **1025 refusals inside one forward, at the same placement.** That was read as
+/// a bound on how wide a gap the anchor would need — hundreds of regions — and
+/// the anchor was abandoned for a placement measured down from the weight floor,
+/// with a `claim_reserve` gap sized to absorb the claims.
 ///
-/// So the tier stays measured down from `W`. **The reclaim does not depend on
-/// this** — it comes from `bytes` being this wave's price rather than the widest
-/// wave's — and the placement's other job, handing the freed run to the weight
-/// side, is done instead by moving `W` itself to the exact figure each pass.
+/// It was the wrong reading. Those 1025 claims are the compressor creating
+/// size-class arenas *while the forward runs*, on the persistence thread, and a
+/// wave is meant to be pre-allocated end to end: everything it writes is claimed
+/// by admit and everything it attends over is resident before it opens. The
+/// sealing thread may fill arenas throughout the wave — that is the point of it
+/// running concurrently — but creating one moves the very frontier this
+/// placement is measured against. `BackingInner::arena_window` now makes that
+/// creation wait for the gap between forwards, and
+/// [`super::bump_arena::plan_wave_transient`] waits for any such window to close
+/// before it reads the frontier. With no claims arriving after the placement,
+/// the gap that absorbed them is not needed and the anchor holds.
 ///
 /// # It buys its ground rather than having it withheld
 ///
@@ -1576,32 +1522,28 @@ enum Placed {
 fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed> {
     with_pool(stream, |pool| {
         let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
-        // Reserving the forward's tier starts the window the per-forward claim
-        // peak is measured over — the number that decides whether the tier could
-        // ever sit at the arena frontier. See the section above.
-        pool.fresh_this_forward = 0;
         let floor = pool.weight_floor;
-        // **The anchor needs a seed, so it only applies where one exists.** A
-        // guard opened without a forward behind it — a helper at load, a test —
-        // has predicted nothing, and anchoring its tier at the frontier with a
-        // zero gap sets the ceiling to the live count and refuses the very next
-        // arena. Those callers take the safe placement; the reserve being unset
-        // is exactly the signal that they are one.
-        let base = if frontier_anchor_enabled() && pool.claim_reserve > 0 {
-            // The tier at the arena frontier, plus room for the claims that
-            // arrive after it. **Seeded and corrected**: the seed is what the
-            // caller predicted this forward would still claim
-            // ([`set_claim_reserve`]), the correction is what forwards have
-            // actually taken. The seed alone would be wrong whenever the
-            // compressor is working through a backlog; the observation alone
-            // cannot bootstrap, because a gap of zero refuses the first claim
-            // and kills the forward that would have measured it.
-            let gap = pool.claim_reserve.max(pool.fresh_per_forward_peak);
-            pool.region_base + ((pool.next + gap) * REGION_BYTES) as u64
-        } else {
-            floor.saturating_sub(len as u64)
-        };
+        // **The tier sits at the arena frontier, with no gap above it.**
+        //
+        // A gap would be room for claims arriving after the placement, and there
+        // are none: every region claim creates an arena,
+        // `BackingInner::arena_window` makes arena creation wait for the gap
+        // between forwards, and `plan_wave_transient` waits for any window still
+        // open before it reads the frontier here. So the frontier this measures
+        // is the frontier for the whole forward.
+        //
+        // The gap it replaces was seeded per forward (`set_claim_reserve`) and
+        // grown from observation (`fresh_per_forward_peak`), and both existed to
+        // absorb the compressor's mid-wave arena creation. With that forbidden,
+        // the tier packs directly against the arenas and every byte between it
+        // and the weight floor stays claimable — which is the ground the failing
+        // ingest ran out of while `blocked` said the tier was standing on it.
+        //
+        // `live_end` rather than the `next` watermark: a region freed from the
+        // top of the span is ground the tier may stand on, and measuring from
+        // the bump pointer would strand it for the life of the process.
         let live_end = pool.live_end();
+        let base = live_end;
         if let Err(short) = tier_fits(base, len, live_end, floor) {
             return Ok(Placed::Short(
                 (short as usize).div_ceil(REGION_BYTES).max(1),
@@ -1626,21 +1568,6 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
     })
 }
 
-/// Whether to anchor the tier at the arena frontier instead of the weight floor.
-///
-/// `KV_TIER_FRONTIER=1`. Off by default because it does not yet hold — see
-/// [`place_transient`] — and kept switchable rather than deleted because the
-/// thing that was refuting it (unbudgeted compressor demand) is now priced by
-/// admission, so the question is open again and worth re-asking cheaply.
-fn frontier_anchor_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("KV_TIER_FRONTIER")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 /// Whether to fill the transient tier with a poison byte as it is placed.
 ///
 /// `KV_TIER_POISON=1`. Off by default: it costs a synchronous device memset of
@@ -1651,27 +1578,6 @@ fn tier_poison_enabled() -> bool {
         std::env::var("KV_TIER_POISON")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-    })
-}
-
-/// Predict how many regions will still be claimed after this forward's tier is
-/// reserved, so the tier can leave room for them.
-///
-/// This is `docs/elastic_vram_partition.md` §7 phase 1's third term reaching the
-/// placement: admit claims the wave's own KV, but the compressor allocates its
-/// quantize destinations *while the forward runs*, and those destinations are
-/// size classes that may have no arena yet. With the tier measured down from the
-/// weight floor there is room above the frontier for them and this is inert;
-/// anchored at the frontier it is what makes the anchor possible at all.
-///
-/// A **bound**, not a forecast: the caller passes what this wave writes, and a
-/// sealed copy is never larger than the active one it compresses. Over-reserving
-/// costs the weight side a little ground for one forward; under-reserving costs
-/// a refused claim, which fails one.
-pub fn set_claim_reserve(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<()> {
-    with_pool(stream, |pool| {
-        pool.claim_reserve = regions;
-        Ok(())
     })
 }
 
@@ -1774,9 +1680,17 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
     let ordinal = stream.context().ordinal();
     // **The latch.** Moving the boundary evicts experts and relocates others; a
     // wave in flight may be reading either. The design's answer is that this
-    // only ever runs at the expert pipeline's end-of-pass, which is a property
-    // of the call site — so it is checked here rather than trusted, in the one
-    // place every move goes through.
+    // only ever runs between forwards, which is a property of the call site — so
+    // it is checked here rather than trusted, in the one place every move goes
+    // through.
+    //
+    // It has already caught a call site that was wrong about that. The weight
+    // side's take-back was driven from the expert pipeline's end-of-pass, which
+    // reads as "outside a wave" and is not: the pipeline answers a MoE layer
+    // while the forward thread sits inside `ffn_forward`, under that layer's FFN
+    // wave guard. Callers must treat a refusal as a refusal — see
+    // `renegotiate_boundary`, which for a while applied its half of the move and
+    // then let this bail propagate as a warning.
     if super::bump_arena::wave_is_live(ordinal) {
         candle::bail!(
             "refusing to move the weight boundary while a wave generation is open: \
@@ -1832,6 +1746,55 @@ pub fn weight_floor_after(stream: &std::sync::Arc<CudaStream>, delta: isize) -> 
             pool.weight_floor.saturating_sub(shift)
         };
         Ok(floor.max(pool.span_base + MIN_ELASTIC_RESERVE as u64))
+    })
+}
+
+/// The reservation's addresses, as they stand right now.
+///
+/// Every device pointer this engine hands a KV kernel has to land somewhere in
+/// here, and which somewhere decides whether it is legal. Published so
+/// [`super::guard`] can answer that question without duplicating the layout —
+/// there is exactly one authority for where the boundary is, and it is this
+/// module.
+#[derive(Debug, Clone, Copy)]
+pub struct SpanLayout {
+    /// First byte of the whole reservation.
+    pub span_base: u64,
+    /// One past its last byte.
+    pub span_end: u64,
+    /// First byte of the region range — the persistence staging block sits
+    /// between `span_base` and here.
+    pub region_base: u64,
+    /// Bytes carved from the staging block so far.
+    pub persist_carved: usize,
+    /// Regions the KV side currently has.
+    pub total: usize,
+    /// The weight side's left edge: KV below, expert slots above.
+    pub weight_floor: u64,
+    /// The wave transient tier, while one stands.
+    pub transient_base: Option<u64>,
+    pub transient_bytes: usize,
+}
+
+impl SpanLayout {
+    /// One past the last byte of the region range.
+    pub fn region_end(&self) -> u64 {
+        self.region_base + (self.total * REGION_BYTES) as u64
+    }
+}
+
+/// The reservation's current addresses, or `None` if this device has none yet.
+pub fn span_layout(ordinal: usize) -> Option<SpanLayout> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).map(|pool| SpanLayout {
+        span_base: pool.span_base,
+        span_end: pool.span_end(),
+        region_base: pool.region_base,
+        persist_carved: pool.persist_carved,
+        total: pool.total,
+        weight_floor: pool.weight_floor,
+        transient_base: pool.transient_base,
+        transient_bytes: pool.transient_bytes,
     })
 }
 
@@ -2112,14 +2075,17 @@ mod tests {
     /// **A region the ceiling forbids is not free**, and the daemon wedged on
     /// the difference.
     ///
-    /// `free` is the admission budget — `vram_budget_available` is
-    /// `free × REGION_BYTES` — so counting unreachable ground there is a promise
-    /// the allocator then refuses to keep. That is what happened: a wide section
-    /// prefill placed a 496 MiB tier, the ceiling landed at 293 of 324 regions,
-    /// live reached 293, and the 31 regions above the ceiling were reported free.
-    /// Admission planned against 496 MiB it could not have and every claim was
-    /// refused — 12,488 of them in four seconds, with no forward completing to
-    /// move the boundary.
+    /// `free` answers "what would a claim get right now", so counting
+    /// unreachable ground there is a promise the allocator then refuses to
+    /// keep. That is what happened: a wide section prefill placed a 496 MiB
+    /// tier, the ceiling landed at 293 of 324 regions, live reached 293, and
+    /// the 31 regions above the ceiling were reported free. Admission planned
+    /// against 496 MiB it could not have and every claim was refused — 12,488
+    /// of them in four seconds, with no forward completing to move the
+    /// boundary. Consumers deciding for *after* the tier releases add
+    /// `blocked` back on (`vram_budget_available` is
+    /// `(free + blocked) × REGION_BYTES`), which is honest precisely because
+    /// `free` itself is not inflated.
     #[test]
     fn ground_under_the_tier_is_not_counted_as_free() {
         // The shape at the wedge: 324 regions all handed out at least once
@@ -2221,7 +2187,7 @@ mod tests {
         let region_base = 0x1000_0000u64;
         let floor = region_base + 332 * r; // 332 regions
         let len = 4 * REGION_BYTES; // a decode-sized tier
-        let base = floor - len as u64; // the default placement
+        let base = floor - len as u64; // an arbitrary base, hard against the floor
 
         // Empty KV side: the tier sits above every region and fits.
         assert!(super::tier_fits(base, len, region_base, floor).is_ok());
@@ -2245,6 +2211,48 @@ mod tests {
         // these. The whole span being live is the extreme case.
         let live_end = region_base + 332 * r;
         assert_eq!(super::tier_fits(base, len, live_end, floor), Err(4 * r));
+    }
+
+    /// **The placement anchors at the arena frontier, and only the floor can
+    /// refuse it.**
+    ///
+    /// `try_place` sets `base = live_end`, so the live-region side of
+    /// [`tier_fits`] is satisfied by construction — a tier that begins where the
+    /// arenas end cannot overlap them — and every byte between the tier's top
+    /// and the weight floor stays claimable. What binds instead is the floor:
+    /// when the tier does not fit in the run above the frontier, the shortfall
+    /// is what the boundary must move by, which is exactly what `Placed::Short`
+    /// asks the weight side for.
+    ///
+    /// The placement this replaced measured *down* from the floor, which left
+    /// the free run stranded between the arenas and the tier where only a
+    /// control loop could find it.
+    #[test]
+    fn the_tier_anchors_at_the_frontier_and_only_the_floor_refuses() {
+        let r = REGION_BYTES as u64;
+        let region_base = 0x1000_0000u64;
+        let floor = region_base + 100 * r;
+
+        // 40 regions live, an 8-region tier: it abuts the arenas and there are
+        // 52 regions of claimable ground above it.
+        let live_end = region_base + 40 * r;
+        let len = 8 * REGION_BYTES;
+        assert!(
+            super::tier_fits(live_end, len, live_end, floor).is_ok(),
+            "a tier beginning where the arenas end never overlaps them"
+        );
+
+        // An empty KV side is the same rule with the frontier at the bottom.
+        assert!(super::tier_fits(region_base, len, region_base, floor).is_ok());
+
+        // 95 live regions leave 5 for an 8-region tier: three short, and the
+        // floor is the only side that can be.
+        let live_end = region_base + 95 * r;
+        assert_eq!(
+            super::tier_fits(live_end, len, live_end, floor),
+            Err(3 * r),
+            "the shortfall is what the weight boundary has to concede"
+        );
     }
 
     /// The shortfall is reported from **whichever** side binds, and never wraps.

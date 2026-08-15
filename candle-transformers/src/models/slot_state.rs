@@ -212,6 +212,23 @@ impl KvHeadHost {
 
     /// Serialise this head into `buf` in the exact layout the CUDA kernel expects.
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        // **Every KV pointer the attention kernels dereference passes through
+        // here**, which makes this the one place worth checking them.
+        //
+        // `k_ptr` / `v_ptr` are per-palette addresses resolved against an arena's
+        // placement, and once they are in this buffer nothing looks at them again
+        // until a kernel follows them. A wrong one then reports as
+        // `CUDA_ERROR_ILLEGAL_ADDRESS` on whichever thread next synchronises,
+        // naming a kernel that may be several launches back and may belong to a
+        // different thread entirely — three production crashes named three
+        // kernels between them and two were bystanders.
+        //
+        // Checked against the reservation's actual layout, so this catches a
+        // pointer into the transient tier (a wave's intermediates and a KV arena
+        // given the same bytes), into the weight side (expert slots), or outside
+        // the span altogether — the three ways a resolved address can be wrong.
+        #[cfg(feature = "cuda")]
+        self.check_pointers();
         // k_pal/v_pal share `pal_len` (= head_dim/4 bytes, bit-packed); only the
         // valid prefix is serialized so the byte layout matches the CUDA struct.
         // Sizes for k_scale / v_scale are encoded in the array types
@@ -232,6 +249,41 @@ impl KvHeadHost {
         }
         for &s in &self.v_scale {
             buf.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+
+    /// Every non-null per-palette address must name KV ground. See
+    /// [`Self::serialize_into`].
+    ///
+    /// **Zero is legal and means "this palette is unused"** — a head whose
+    /// format needs fewer than `N_PALETTE` sub-bands leaves the tail null, and
+    /// the kernel keys on the format rather than the pointer. Only a non-null
+    /// address that names memory this engine does not own is a bug.
+    ///
+    /// The length checked is one chunk's payload for the head's format: that is
+    /// what the kernel reads from each pointer, so it is the range that has to
+    /// be inside the arena rather than merely starting there.
+    #[cfg(feature = "cuda")]
+    fn check_pointers(&self) {
+        use candle_nn::kv_cache::expect_kv_range;
+
+        // Ordinal 0: this engine runs one device, and `span_layout` answers
+        // `None` for any device with no reservation, so a wrong guess here
+        // disables the check rather than misfiring.
+        const DEV: usize = 0;
+        for (side, ptrs) in [("k_ptr", &self.k_ptr), ("v_ptr", &self.v_ptr)] {
+            for (p_idx, &addr) in ptrs.iter().enumerate() {
+                if addr == 0 {
+                    continue;
+                }
+                expect_kv_range(
+                    DEV,
+                    addr,
+                    1,
+                    &format!("{side}[{p_idx}]"),
+                    "KvHead::serialize_into",
+                );
+            }
         }
     }
 }

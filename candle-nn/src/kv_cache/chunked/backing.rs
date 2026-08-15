@@ -158,6 +158,20 @@ pub(crate) struct BackingInner {
     /// seal runs single-threaded so it's uncontended. Mirrors `KvSamplerGpu`.
     #[cfg(feature = "cuda")]
     pub(crate) prov_sign_scratch: Mutex<Option<ProvSignScratch>>,
+    /// Size classes a mid-wave refusal wanted an arena for.
+    ///
+    /// **The refusal's only useful output.** A sealing pass discovers it needs a
+    /// new arena at the leaf of the allocator, several frames deep and with
+    /// locks held, and is told to come back later — but "come back later" on its
+    /// own means rediscovering the same need at the same depth on the next pass,
+    /// after redoing the selection work that led there. Recording the class
+    /// turns the refusal into an instruction: create *this*, in the gap, and the
+    /// next pass will find it and only ever fill it, which is allowed at any
+    /// time (`BackingInner::create_deferred_arenas`).
+    ///
+    /// A `Vec` rather than a set because `ArenaKey` is two small enums and the
+    /// ladder has eight classes — membership is a linear scan over single digits.
+    pub(crate) deferred_arenas: Mutex<Vec<super::arena::ArenaKey>>,
 }
 
 /// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
@@ -536,6 +550,7 @@ impl ChunkedKvBacking {
             ),
             #[cfg(feature = "cuda")]
             prov_sign_scratch: Mutex::new(None),
+            deferred_arenas: Mutex::new(Vec::new()),
         });
 
         // Register for cooperative compaction

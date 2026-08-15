@@ -18,12 +18,14 @@ use super::arena::ArenaKey;
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::backing::KV_DEVICE_OOM_MARKER;
+#[cfg(feature = "cuda")]
+use super::bump_arena::{enter_arena_window, ArenaWindow, KV_ARENA_MID_WAVE};
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 #[cfg(feature = "cuda")]
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
-use super::types::{ChunkWindow, CHUNK_SIZE};
+use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
 use super::{Arena, ArenaLocation};
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::chunked::backing::BackingInner;
@@ -43,12 +45,20 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 ///
 /// `None` when this device has no reservation yet (non-CUDA, or before the
 /// first KV cache exists) — callers treat that as "unknown", never as zero.
+///
+/// Counts `free + blocked`, not `free` alone. `blocked` is unowned ground the
+/// current wave's transient tier stands on, and this budget is spent by the
+/// *next* forward's admission — which claims in phase 1, after phase 0 has
+/// released that tier, so the blocked ground is claimable by the time any
+/// claim priced against this number runs. Counting only `free` made every
+/// standing tier read as KV pressure between forwards and admission starved
+/// itself against ground it was guaranteed to get back.
 #[cfg(feature = "cuda")]
 pub fn vram_budget_available(device: &Device) -> Option<usize> {
     let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
         return None;
     };
-    region_pool::region_stats(gpu_id).map(|s| s.free * region_pool::REGION_BYTES)
+    region_pool::region_stats(gpu_id).map(|s| (s.free + s.blocked) * region_pool::REGION_BYTES)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -222,7 +232,176 @@ impl BackingInner {
         ArenaKey::for_format(format, self.elems_per_chunk(), location)
     }
 
+    /// Claim the gap between forwards for one arena, or refuse.
+    ///
+    /// `None` — no gate at all — in the two cases where creating an arena cannot
+    /// disturb a wave:
+    ///
+    /// - **a CPU arena**, which is a host `Tensor::zeros` ([`Self::claim_slab`]).
+    ///   It claims no region, sits nowhere in the reservation, and cannot move
+    ///   the arena frontier the transient tier was placed against. Gating it was
+    ///   a bug, not caution: the hot→warm migration allocates its warm copies
+    ///   exactly this way, under the sequence-state write lock, and blocking
+    ///   there deadlocked the daemon against a forward that wanted the same lock
+    ///   mid-layer.
+    /// - **a CPU device**, which has no reservation and no tier.
+    ///
+    /// Every caller of [`Self::create_arena`] must hold one of these. The one
+    /// that cannot take it here — [`ChunkedKvBacking::alloc_chunk_with_arenas`]
+    /// creates arenas with the storage write lock already held — takes it at its
+    /// own call site instead, above that lock.
+    #[cfg(feature = "cuda")]
+    pub(super) fn arena_window(&self, key: ArenaKey) -> Result<Option<ArenaWindow>> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(None);
+        };
+        if key.location == ArenaLocation::Cpu {
+            return Ok(None);
+        }
+        enter_arena_window(&cd.cuda_stream()).map(Some)
+    }
+
+    /// The same gate for an operation that **cannot be refused part-way**.
+    ///
+    /// A fork is per *layer* — `KvCache::fork` runs once per layer and the caller
+    /// loops over all forty-eight — and there is no transaction across them. So a
+    /// refusal on layer N leaves N forked layers and 48−N unforked ones, which is
+    /// not a deferred fork: it is a sequence whose token windows differ by layer,
+    /// which no single decode position map can describe. It surfaced as
+    /// `chunked decode layout diverged across layers … could not be reconciled`
+    /// on the first message of a new conversation.
+    ///
+    /// Refusing costs more than proceeding here, so this one proceeds — but
+    /// only past the *wave-in-flight* refusal. That refusal it absorbs and
+    /// **records the class**, so the next inter-forward gap creates an arena
+    /// for it and the case stops arising; the region claim is still counted by
+    /// `fresh_claims_during_wave`, so an engine that takes this path often says
+    /// so in the `in-wave-arenas` tripwire rather than hiding it. Every other
+    /// error — a poisoned gate, a driver fault — is not a deferral and
+    /// propagates: proceeding past a broken gate would fork against arenas
+    /// whose state can no longer be trusted.
+    #[cfg(feature = "cuda")]
+    pub(super) fn arena_window_uninterruptible(
+        &self,
+        key: ArenaKey,
+    ) -> Result<Option<ArenaWindow>> {
+        match self.arena_window(key) {
+            Ok(w) => Ok(w),
+            Err(e) if Self::is_wave_deferral(&e) => {
+                self.note_deferred_arena(key);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether an allocation failure is the wave-in-flight deferral.
+    ///
+    /// A deferral means "the ground exists, come back between forwards"; every
+    /// other failure here means "there is no ground". They call for opposite
+    /// responses, so no path may fold one into the other.
+    #[cfg(feature = "cuda")]
+    fn is_wave_deferral(e: &candle::Error) -> bool {
+        e.to_string().contains(KV_ARENA_MID_WAVE)
+    }
+
+    /// Remember that a wave-in-flight refusal wanted an arena of this class.
+    ///
+    /// Idempotent per class: one arena of a class serves every chunk that fits
+    /// it, so a pass refused twenty times for `1088 B` needs one arena, not
+    /// twenty. Recording the count would over-create on the very workload the
+    /// refusal is most common on.
+    #[cfg(feature = "cuda")]
+    fn note_deferred_arena(&self, key: ArenaKey) {
+        if let Ok(mut pending) = self.deferred_arenas.lock() {
+            if !pending.contains(&key) {
+                pending.push(key);
+            }
+        }
+    }
+
+    /// Create the arenas that mid-wave refusals asked for, and answer with how
+    /// many were made.
+    ///
+    /// **Call this between forwards, with no KV lock held** — the top of a
+    /// sealing pass is the intended site. It is the other half of the refusal:
+    /// the pass that was turned away recorded what it wanted, and this creates
+    /// it while the partition is idle, so the pass that follows finds the arena
+    /// already there and only ever *fills* it. Filling is legal at any time; it
+    /// is creation that moves the arena frontier, and this is what keeps the two
+    /// apart without either side waiting on the other.
+    ///
+    /// Refusals here are ordinary and silent: if a forward has started, the
+    /// demand stays recorded and the next gap gets it. Only a genuine allocation
+    /// failure — the reservation truly full — propagates.
+    #[cfg(feature = "cuda")]
+    pub(super) fn create_deferred_arenas(&self) -> Result<usize> {
+        let pending: Vec<ArenaKey> = match self.deferred_arenas.lock() {
+            Ok(mut p) => std::mem::take(&mut *p),
+            Err(_) => return Ok(0),
+        };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut made = 0usize;
+        let mut remaining = pending.into_iter();
+        while let Some(key) = remaining.next() {
+            // Every exit that does not finish this key puts back the key **and
+            // everything after it** — the list was taken whole, so leaving with
+            // only the current one restored would silently drop the rest and
+            // the classes behind it would never be created. That holds for the
+            // benign "a wave started" refusal and for genuine errors alike: an
+            // error aborts this drain, not the demand, and the next gap must
+            // still see it.
+            let requeue = |first: ArenaKey, rest: &mut dyn Iterator<Item = ArenaKey>| {
+                self.note_deferred_arena(first);
+                for key in rest {
+                    self.note_deferred_arena(key);
+                }
+            };
+            // One window per arena rather than one for the batch: a forward that
+            // arrives mid-drain then takes the partition at the next arena
+            // instead of waiting for the whole list.
+            let window = match self.arena_window(key) {
+                Ok(w) => w,
+                Err(e) if Self::is_wave_deferral(&e) => {
+                    requeue(key, &mut remaining);
+                    break;
+                }
+                Err(e) => {
+                    requeue(key, &mut remaining);
+                    return Err(e);
+                }
+            };
+            let idx = self.pool.register_arena(key);
+            match self.create_arena(key, idx).and_then(|arena| {
+                self.storage.try_write(|s| {
+                    if !s.has_arena(idx) {
+                        s.push_arena(arena, idx);
+                    }
+                    Ok(())
+                })
+            }) {
+                Ok(()) => made += 1,
+                Err(e) => {
+                    // The slab (if it was even created) never reached storage:
+                    // release the registration so the index is not leaked, and
+                    // put the demand back so the next gap retries it.
+                    self.pool.force_release_arena(idx);
+                    drop(window);
+                    requeue(key, &mut remaining);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(made)
+    }
+
     /// Create one arena: a `chunks x class_bytes` slab of raw bytes.
+    ///
+    /// **Only ever between forwards.** The caller holds an
+    /// [`Self::arena_window`], because this claims a region and so moves the
+    /// arena frontier a running wave's transient tier was placed against.
     ///
     /// There is no float/quantized fork any more. A slot is a fixed number of
     /// bytes and its tenant is whatever the owning chunk's tag says it is, so
@@ -331,6 +510,11 @@ impl ChunkedKvBacking {
     /// Allocate a chunk with pre-acquired arena lock.
     /// This version takes a pre-acquired arenas lock to avoid deadlock when called
     /// from contexts that already hold the arena lock.
+    ///
+    /// **The caller must already hold an [`BackingInner::arena_window`].** Both
+    /// branches below can create an arena, and they do it with the storage write
+    /// lock held — so they cannot wait for the inter-forward gap themselves
+    /// without sleeping on a lock a forward's admit needs.
     pub(super) fn alloc_chunk_with_arenas(
         &self,
         arena_state: &mut ArenaStorageState,
@@ -491,6 +675,15 @@ impl ChunkedKvBacking {
         self.inner.alloc_chunk_for_key(key)
     }
 
+    /// Create the arenas that mid-wave refusals asked this backing for.
+    ///
+    /// See [`BackingInner::create_deferred_arenas`]. Between forwards only, with
+    /// no KV lock held — the top of a sealing pass.
+    #[cfg(feature = "cuda")]
+    pub fn create_deferred_arenas(&self) -> Result<usize> {
+        self.inner.create_deferred_arenas()
+    }
+
     /// See [`BackingInner::alloc_chunk_run_for_key`].
     pub(super) fn alloc_chunk_run_for_key(
         &self,
@@ -560,6 +753,17 @@ impl BackingInner {
     fn stamp_region_promoting(&self, key: ArenaKey) -> Result<(ArenaKey, usize)> {
         let stamp_err = match self.claim_fresh_region(key) {
             Ok(arena_idx) => return Ok((key, arena_idx)),
+            // **A wave-in-flight deferral is not scarcity, and must not be
+            // treated as it.** Promotion exists to stop a rare format stamping a
+            // whole region for itself when no region can be had; here a region
+            // can be had, just not this instant. Widening in response puts the
+            // chunk in the wrong class for a reason that will have passed by the
+            // next pass — and, worse, the caller's retry loop then reports the
+            // failure as `VRAM exhaustion on arena creation` while a fifth of the
+            // reservation stands free. Hand the deferral straight back so it
+            // reaches the sealing pass as itself.
+            #[cfg(feature = "cuda")]
+            Err(e) if Self::is_wave_deferral(&e) => return Err(e),
             Err(e) => e,
         };
         // No region. Look for a wider class that already has one with room.
@@ -654,6 +858,7 @@ impl BackingInner {
         }
         if let Some(gids) = self.pool.allocate_run_for(key, len) {
             self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+            self.replenish_if_nearly_dry(key, len);
             return Ok(gids);
         }
         // No existing arena has tail room: register a fresh one and claim from
@@ -676,12 +881,14 @@ impl BackingInner {
             key = placed;
             let _ = arena_chunks;
             if let Some(gids) = self.pool.allocate_run_for_in(key, arena_idx, len) {
+                self.replenish_if_nearly_dry(key, len);
                 return Ok(gids);
             }
             // Raced into our fresh arena — the racer may equally have vacated
             // tail room elsewhere; check the whole pool before registering again.
             if let Some(gids) = self.pool.allocate_run_for(key, len) {
                 self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+                self.replenish_if_nearly_dry(key, len);
                 return Ok(gids);
             }
         }
@@ -742,17 +949,78 @@ impl BackingInner {
             }
             out.extend(batch);
         }
+        // One single-slot probe for the whole batch, at the final key. The bulk
+        // allocator takes arbitrary slots rather than contiguous runs, so "could
+        // this batch run again" has no cheap probe — but "is the class bone dry"
+        // does, and a dry class is the case that costs the sealer a deferred
+        // pass.
+        self.replenish_if_nearly_dry(key, 1);
         Ok(out)
     }
 
+    /// Keep the sealer one arena ahead of its demand: if `key`'s class could
+    /// not serve `len` more slots right now, ask the next inter-forward gap
+    /// for an arena — **before** anything actually runs out.
+    ///
+    /// This is the sealing buffer. The sealer may fill existing arenas at any
+    /// point in a wave but may only *create* one between forwards, so a class
+    /// that runs dry mid-wave costs a deferred pass: the selection work is
+    /// redone and the hot→warm drain slips a wave. Probing after each
+    /// successful allocation converts that into a class that is replenished in
+    /// the gap *before* the next pass needs it — steady state never sees the
+    /// refusal, and the deferral remains only for the cold start of a class no
+    /// one has used yet.
+    ///
+    /// The probe is an allocate-and-drop, the same pattern
+    /// [`Self::stamp_region_promoting`] uses: dropping the gids returns the
+    /// slots, so it observes without consuming. CPU classes are skipped — their
+    /// creation is never gated, so there is nothing to get ahead of.
+    #[cfg(feature = "cuda")]
+    fn replenish_if_nearly_dry(&self, key: ArenaKey, len: usize) {
+        if key.location == ArenaLocation::Cpu {
+            return;
+        }
+        // Read-only: an allocate-and-drop probe here permanently burns run
+        // capacity, because a run claim advances the arena's never-used
+        // high-water mark and dropped run gids recycle through the singleton
+        // stack that run claims never read. Measured consequence of the probe:
+        // every successful run allocation consumed double its length, arenas
+        // ran dry mid-sweep, and the in-wave refusal this function exists to
+        // prevent came back.
+        if !self.pool.run_would_fit(key, len.max(1)) {
+            self.note_deferred_arena(key);
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn replenish_if_nearly_dry(&self, _key: ArenaKey, _len: usize) {}
+
     /// Ensure that an arena exists at the given index in storage.
-    /// Creates the arena if it does not exist yet.
+    ///
+    /// Creates the arena if it does not exist yet — **waiting for the gap
+    /// between forwards to do it**. A wave is pre-allocated end to end, and a
+    /// new arena is the one KV allocation that cannot be: it moves the arena
+    /// frontier the running wave's transient tier was placed against. Filling an
+    /// existing arena is unrestricted and is what the sealing thread does for
+    /// nearly every chunk; only the creation waits.
+    ///
+    /// A refusal **records what it wanted** before it propagates, so the next
+    /// pass can create it in the gap rather than rediscovering the need at the
+    /// same depth and failing the same way — see [`Self::create_deferred_arenas`].
     pub(super) fn ensure_arena_exists(&self, arena_idx: usize, key: ArenaKey) -> Result<()> {
         let exists = self.storage.read(|s| s.has_arena(arena_idx))?;
         if exists {
             return Ok(());
         }
 
+        #[cfg(feature = "cuda")]
+        let _window = match self.arena_window(key) {
+            Ok(w) => w,
+            Err(e) => {
+                self.note_deferred_arena(key);
+                return Err(e);
+            }
+        };
         let arena = self.create_arena(key, arena_idx)?;
         self.storage.try_write(|s| {
             if !s.has_arena(arena_idx) {
@@ -1044,72 +1312,406 @@ impl ChunkedKvBacking {
         }
     }
 
-    /// Ensure chunks for a sparse batch of `(batch_idx, offset)` entries.
+    /// What [`Self::ensure_for_batch_entries_all`] needs to know about this
+    /// layer, read under ONE guard: whether
+    /// [`Self::ensure_for_batch_entries`] would allocate anything, and each
+    /// entry's [`DecodeLayout`].
     ///
-    /// This is the partial-batch analogue of [`ensure_for_offsets`]. It acquires
-    /// the chunked state write-lock once and applies allocation/tail-writability
-    /// checks only for the provided sequence slots.
-    /// Whether [`Self::ensure_for_batch_entries`] would allocate anything —
-    /// a read-only predicate over this layer's block table.
-    ///
-    /// Exists so the all-layers form can decide ONCE instead of per layer.
-    pub fn batch_entries_need_work(&self, entries: &[(usize, usize)], add: usize) -> Result<bool> {
-        if add == 0 {
-            return Ok(false);
-        }
+    /// Both answers come from the same block-table walk, and the steady-state
+    /// decode step asks 48 layers this question per token, so they are read
+    /// together rather than under a guard each. A layout is `None` for a slot
+    /// that is not allocated — such an entry always reports work, and an
+    /// unallocated slot has no layout to compare against the other layers.
+    fn probe_decode_entries(
+        &self,
+        entries: &[(usize, usize)],
+        add: usize,
+    ) -> Result<(bool, Vec<Option<DecodeLayout>>)> {
         let state = self
             .state
             .read()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut needs_work = false;
+        let mut layouts = Vec::with_capacity(entries.len());
         for &(batch_idx, _off) in entries.iter() {
-            if batch_idx >= state.sequences.len() {
-                return Ok(true); // out of range -> let the real call report it
-            }
-            let Some(slot) = state.sequences[batch_idx].as_ref() else {
-                return Ok(true); // slot needs allocating
+            let slot = state.sequences.get(batch_idx).and_then(|s| s.as_ref());
+            let Some(slot) = slot else {
+                // Out of range or unallocated: let the real call allocate the
+                // slot, or report the index.
+                needs_work = true;
+                layouts.push(None);
+                continue;
             };
+            layouts.push(Some(slot.decode_layout()));
+            if add == 0 || needs_work {
+                continue;
+            }
             let available = slot
                 .last_chunk()
                 .map(|cw| CHUNK_SIZE - (cw.offset as usize + cw.usage as usize).min(CHUNK_SIZE))
                 .unwrap_or(0);
             if available < add || self.tail_needs_new_block(&state, batch_idx) {
-                return Ok(true);
+                needs_work = true;
             }
         }
-        Ok(false)
+        Ok((needs_work && add != 0, layouts))
     }
 
     /// Ensure EVERY layer's backing has capacity for the upcoming write.
     ///
-    /// Hoisted out of the per-layer decode loop deliberately. The block
-    /// structure is layer-invariant — every layer is extended by this same call
-    /// with identical `entries`/`add`, which is why the decode path already
-    /// builds its position map from layer 0 and applies it to all layers. So the
-    /// PLAN is computed once, from the first backing; only when work is genuinely
-    /// needed does this touch all of them.
+    /// Hoisted out of the per-layer decode loop deliberately, but only the
+    /// EXPENSIVE half was hoisted. `ensure_for_batch_entries` takes the state
+    /// write guard, walks `ensure_max_blocks`, and allocates GIDs it usually
+    /// drops again; running that 48 times per decoded token, in a steady state
+    /// where the answer is "nothing to allocate", was almost entirely wasted
+    /// work. What each layer still answers for itself is the read-only probe —
+    /// one read guard over its own block table — and only the layers that
+    /// report work enter the allocation path.
     ///
-    /// Doing the plan per layer cost 48 lock acquisitions and 48 tail-predicate
-    /// passes **per decoded token** — the steady state is "nothing to allocate",
-    /// so that was almost entirely wasted work on the hot path.
+    /// **Each layer is asked, because layer 0 cannot answer for the rest.**
+    /// Block structure is *meant* to be layer-invariant, and in steady decode it
+    /// is, but it is not unconditionally so: a windowed creep prefill leaves the
+    /// resumed layers holding an empty writer chunk for the next window while
+    /// the layers still pending resume hold a full tail — the same skew
+    /// `BatchedInferenceSession::reserve_glue_gap` has to pad out before it can
+    /// reserve a gap index every layer agrees on. While layer 0 answered for all
+    /// of them, "layer 0 has a writable tail" suppressed the allocation those
+    /// other layers needed, and the first one reached refused the step:
+    /// `computed write len 32 is invalid for chunk_size 32` out of
+    /// `validate_decode_state`, mid-conversation, on a tail that was exactly
+    /// full. A `debug_assert!` asserting the invariance is not a check in the
+    /// release build the daemon runs.
+    ///
+    /// This is also the last point before the decode metadata builder collapses
+    /// all 48 layers onto ONE position map, so the same probe carries the
+    /// layout each layer would produce and [`Self::unify_decode_layout`]
+    /// establishes the invariance that map depends on.
     pub fn ensure_for_batch_entries_all(
         backings: &[ChunkedKvBacking],
         entries: &[(usize, usize)],
         add: usize,
     ) -> Result<()> {
-        let Some(first) = backings.first() else {
-            return Ok(());
-        };
-        if !first.batch_entries_need_work(entries, add)? {
-            debug_assert!(
-                backings
+        let mut layouts: Vec<Vec<Option<DecodeLayout>>> = Vec::with_capacity(backings.len());
+        for b in backings {
+            let (needs_work, layout) = b.probe_decode_entries(entries, add)?;
+            if needs_work {
+                b.ensure_for_batch_entries(entries, add)?;
+                // The allocation changed this layer's structure, so the layout
+                // read alongside the predicate no longer describes it.
+                layouts.push(b.probe_decode_entries(entries, 0)?.1);
+            } else {
+                layouts.push(layout);
+            }
+        }
+        Self::unify_decode_layout(backings, entries, &layouts)
+    }
+
+    /// Bring every layer's block structure for `entries` back into agreement,
+    /// so the one position map built from layer 0 describes all of them.
+    ///
+    /// The map encodes a `(slice_idx, in_blk)` pair per logical token and a
+    /// final entry naming the write slot, and every layer's slot header points
+    /// at it. The per-layer `write_slice` the kernel SCATTERS through, however,
+    /// comes from that layer's own block table. Let the two disagree and the
+    /// token is written into one chunk while attention is told to read it from
+    /// another — no fault, no error, just a wrong answer.
+    ///
+    /// Divergence is repaired rather than reported because it is a state the
+    /// engine legitimately produces: a windowed creep prefill leaves the
+    /// resumed layers holding an empty writer chunk for the next window while
+    /// the layers still pending resume do not have one, the same skew
+    /// `BatchedInferenceSession::reserve_glue_gap` pads out before it can pick
+    /// one gap index. The repair gives every layer a fresh empty writer chunk
+    /// at a common index: pad the short layers up to the longest, then push one
+    /// more onto ALL of them, so afterwards every layer has the same block
+    /// count and its writer is that last, empty chunk. An empty chunk carries
+    /// no tokens, so it shifts no position — the cumulative-usage rope base of
+    /// every earlier chunk is untouched.
+    ///
+    /// What cannot be repaired is a difference in the token windows themselves:
+    /// the shared prefix of the map is then wrong for some layer and no
+    /// appending fixes it. That is a corrupted block table, and it errors.
+    /// The first chunk index whose `(offset, usage)` differs between any two
+    /// layers, with both readings and the layer numbers — the sentence that
+    /// turns a digest mismatch into a place to look.
+    ///
+    /// Compares every layer against layer 0 and reports the earliest index that
+    /// disagrees. Earliest rather than all of them because a partially-applied
+    /// per-layer operation diverges from the point it stopped, so the first
+    /// index *is* the boundary, and the layer number says how far it got.
+    fn first_window_divergence(
+        backings: &[ChunkedKvBacking],
+        batch_idx: usize,
+    ) -> Option<String> {
+        let windows = |b: &ChunkedKvBacking| -> Option<Vec<(u16, u32)>> {
+            let state = b.state.read().ok()?;
+            let slot = state.sequences.get(batch_idx)?.as_ref()?;
+            Some(
+                slot.chunks_slice()
                     .iter()
-                    .all(|b| !b.batch_entries_need_work(entries, add).unwrap_or(true)),
-                "block structure must be layer-invariant: layer 0 needs no work but another layer does"
-            );
-            return Ok(());
+                    .map(|c| (c.offset, c.usage))
+                    .collect(),
+            )
+        };
+        let all: Vec<Option<Vec<(u16, u32)>>> = backings.iter().map(windows).collect();
+        let base = all.first()?.as_ref()?;
+        // The earliest chunk any layer disagrees with layer 0 about.
+        let mut first_bad: Option<usize> = None;
+        for other in all.iter().flatten().skip(1) {
+            for i in 0..base.len().min(other.len()) {
+                if base[i] != other[i] {
+                    first_bad = Some(first_bad.map_or(i, |f: usize| f.min(i)));
+                    break;
+                }
+            }
+        }
+        let Some(i) = first_bad else {
+            let lens: Vec<usize> = all.iter().flatten().map(|w| w.len()).collect();
+            let (min, max) = (lens.iter().min()?, lens.iter().max()?);
+            return Some(format!(
+                "Windows agree chunk-for-chunk; the layers hold between {min} and {max} \
+                 chunks, so the difference is in trailing structure alone."
+            ));
+        };
+        // **Group the layers by what they hold there.** Which layers differ is
+        // the whole diagnosis: one layer out of forty-eight means something
+        // special-cases that index, a contiguous prefix means a per-layer loop
+        // stopped early, and a scatter means an operation applied per layer with
+        // its own predicate. "Layer 0 differs from layer 1" distinguishes none
+        // of those, which is why the first report of this could not be placed.
+        let mut groups: Vec<((u16, u32), Vec<usize>)> = Vec::new();
+        for (li, w) in all.iter().enumerate() {
+            let Some(w) = w else { continue };
+            let Some(&v) = w.get(i) else { continue };
+            match groups.iter_mut().find(|(k, _)| *k == v) {
+                Some((_, ls)) => ls.push(li),
+                None => groups.push((v, vec![li])),
+            }
+        }
+        let render = |ls: &[usize]| -> String {
+            if ls.len() > 6 {
+                format!("{} layers ({}…{})", ls.len(), ls[0], ls[ls.len() - 1])
+            } else {
+                format!(
+                    "layer{} {}",
+                    if ls.len() == 1 { "" } else { "s" },
+                    ls.iter()
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        };
+        let split = groups
+            .iter()
+            .map(|(v, ls)| format!("(offset {}, usage {}) on {}", v.0, v.1, render(ls)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "First difference at chunk {i} of {}: {split}.",
+            base.len(),
+        ))
+    }
+
+    /// Repair a divergence confined to the tail: truncate every layer to the
+    /// shortest layer's token count. Answers whether the layers agree afterwards.
+    ///
+    /// **A failed wave's signature, healed from its own properties.** The layer
+    /// sweep advances usage per layer, so a wave that dies mid-sweep leaves the
+    /// early layers up to one attention window ahead of the rest — tokens that
+    /// were never delivered, since the wave that wrote them never retired. The
+    /// rollback in `forward_wave` undoes that at the failure; this covers the
+    /// state that predates the rollback or arrived through the substrate, where
+    /// a sealed turn can persist the skew and reload it into a fresh sequence.
+    ///
+    /// Cutting to the shortest is sound precisely because the surplus is
+    /// undelivered: no sampled token, no turn, no summary refers to it. Two
+    /// guards keep this from ever being a destructive repair:
+    ///
+    /// - **Spread cap.** The layers may differ by at most `CHUNK_SIZE` tokens —
+    ///   the most one failed operation leaves behind. A wider spread is not a
+    ///   failed wave and gets no repair.
+    /// - **The sealed prefix is untouchable.** `truncate_sequence_to_tokens`
+    ///   clamps at the sealed boundary rather than cut Arc-shared ground, so a
+    ///   "tail" divergence that is actually deep history leaves those layers
+    ///   unchanged — and the verification below then reads the layers as still
+    ///   disagreeing and reports the heal as failed, which it is.
+    /// Whether any two layers hold `batch_idx`'s **tokens** differently —
+    /// per-chunk `(offset, usage)` with trailing empty chunks ignored, so
+    /// trailing structure (which the writer-pad repair owns) does not count.
+    fn data_windows_disagree(backings: &[ChunkedKvBacking], batch_idx: usize) -> bool {
+        let data_windows = |b: &ChunkedKvBacking| -> Option<Vec<(u16, u32)>> {
+            let state = b.state.read().ok()?;
+            let slot = state.sequences.get(batch_idx)?.as_ref()?;
+            let mut w: Vec<(u16, u32)> = slot
+                .chunks_slice()
+                .iter()
+                .map(|c| (c.offset, c.usage))
+                .collect();
+            while w.last().is_some_and(|&(_, u)| u == 0) {
+                w.pop();
+            }
+            Some(w)
+        };
+        let mut layers = backings.iter().filter_map(data_windows);
+        match layers.next() {
+            Some(base) => !layers.all(|w| w == base),
+            None => false,
+        }
+    }
+
+    fn heal_tail_divergence(
+        backings: &[ChunkedKvBacking],
+        batch_idx: usize,
+        target_tokens: usize,
+    ) -> Result<bool> {
+        let totals: Vec<usize> = backings
+            .iter()
+            .filter_map(|b| {
+                let state = b.state.read().ok()?;
+                let slot = state.sequences.get(batch_idx)?.as_ref()?;
+                Some(slot.chunks_slice().iter().map(|c| c.usage as usize).sum())
+            })
+            .collect();
+        let (Some(&min), Some(&max)) = (totals.iter().min(), totals.iter().max()) else {
+            return Ok(false);
+        };
+        // The session's own offset — how many tokens have actually been
+        // delivered — is the anchor, not the shortest layer. Truncating to the
+        // min looked equivalent until a failed wave left *every* layer with the
+        // surplus token but one of them one further along: min was then
+        // offset+1, and "heal to the shortest" preserved a token the caller
+        // never received. Three honesty checks before touching anything:
+        if min < target_tokens {
+            // A layer holds fewer tokens than the session has delivered.
+            // Truncation cannot restore missing history.
+            return Ok(false);
+        }
+        if max == target_tokens {
+            // Every layer already sits at the delivered count, yet the windows
+            // disagree — that is mid-history corruption, not a tail surplus.
+            return Ok(false);
+        }
+        if max - target_tokens > CHUNK_SIZE {
+            // A surplus past one chunk is more than any single failed wave
+            // leaves behind.
+            return Ok(false);
         }
         for b in backings {
-            b.ensure_for_batch_entries(entries, add)?;
+            b.truncate_sequence_to_tokens(batch_idx, target_tokens)?;
+        }
+        // Verified, not assumed — and on the *data* windows, with trailing
+        // empty chunks ignored. The truncation can leave layers with different
+        // counts of empty tail chunks, and that is trailing structure the
+        // caller's writer-pad repair equalises; what the heal has to establish
+        // is that every token the layers still hold is held identically.
+        let healed = !Self::data_windows_disagree(backings, batch_idx);
+        if healed {
+            tracing::warn!(
+                batch_idx,
+                dropped = max - target_tokens,
+                total = target_tokens,
+                "chunked decode: healed per-layer tail divergence by truncating every \
+                 layer to the session's delivered offset — the dropped tokens were \
+                 written by a wave that failed before delivering them"
+            );
+        }
+        Ok(healed)
+    }
+
+    fn unify_decode_layout(
+        backings: &[ChunkedKvBacking],
+        entries: &[(usize, usize)],
+        layouts: &[Vec<Option<DecodeLayout>>],
+    ) -> Result<()> {
+        for (ei, &(batch_idx, offset)) in entries.iter().enumerate() {
+            let mut seen = layouts.iter().filter_map(|l| l[ei]);
+            let Some(first) = seen.next() else {
+                continue;
+            };
+            if seen.all(|l| l == first) {
+                continue;
+            }
+
+            // Two repairs compose here, and **the heal runs first**. The
+            // structure repair's `push_empty_writer_chunk` advances
+            // `writer_start_idx` past every existing chunk — sealing them — and
+            // a failed wave's surplus token lives in exactly the chunk that
+            // would seal. Repairing structure first therefore puts the surplus
+            // beyond the heal's reach (truncation clamps at the sealed
+            // boundary), which is how the first ordering of this loop turned a
+            // healable one-token skew into a refusal. So: while the layers hold
+            // *tokens* differently, heal; once only trailing structure differs,
+            // pad and push a common writer.
+            let mut tail_healed = false;
+            loop {
+                if Self::data_windows_disagree(backings, batch_idx) {
+                    if !tail_healed && Self::heal_tail_divergence(backings, batch_idx, offset)? {
+                        tail_healed = true;
+                        continue;
+                    }
+                } else {
+                    // Tokens agree; equalise trailing structure. Re-read rather
+                    // than trust: this round starts from the layers as they
+                    // are, not from the caller's pre-repair probe.
+                    let fresh: Vec<Option<DecodeLayout>> = backings
+                        .iter()
+                        .map(|b| b.probe_decode_entries(entries, 0).map(|(_, l)| l[ei]))
+                        .collect::<Result<_>>()?;
+                    let max_blocks = fresh.iter().flatten().map(|l| l.blocks).max().unwrap_or(0);
+                    for (li, backing) in backings.iter().enumerate() {
+                        let Some(layout) = fresh[li] else {
+                            continue;
+                        };
+                        for _ in layout.blocks..=max_blocks {
+                            backing.push_empty_writer_chunk(batch_idx)?;
+                        }
+                    }
+
+                    let after: Vec<Option<DecodeLayout>> = backings
+                        .iter()
+                        .map(|b| b.probe_decode_entries(entries, 0).map(|(_, l)| l[ei]))
+                        .collect::<Result<_>>()?;
+                    let mut it = after.iter().flatten();
+                    let Some(&expected) = it.next() else { break };
+                    if it.all(|l| *l == expected) {
+                        break;
+                    }
+                }
+
+                // **Name the chunk, not just the digest.** The digest proves
+                // a difference and says nothing about where, and "somewhere
+                // in fifty-eight chunks" is not a lead — the first time this
+                // fired the cause (a per-layer fork refused part-way) had to
+                // be inferred from what the user happened to be doing. The
+                // windows are already in hand; reporting the first index
+                // that differs, with both sides' values, costs a walk of a
+                // list this code has just read.
+                let detail = Self::first_window_divergence(backings, batch_idx)
+                    .unwrap_or_else(|| "no per-chunk difference found on re-read".to_string());
+                candle::bail!(
+                    "chunked decode layout diverged across layers for batch_idx {batch_idx} \
+                     and could not be reconciled or healed: {detail} Appending a common \
+                     writer chunk equalises trailing structure, and a tail difference of up \
+                     to one chunk is healed by truncating every layer to the shortest — a \
+                     difference that survives both is either deep in the sealed history or \
+                     wider than any single failed operation leaves, which no repair from \
+                     here can be trusted with."
+                )
+            }
+
+            // `warn`, not `debug`: layers disagreeing on block structure is an
+            // anomaly the engine repaired, not routine bookkeeping, and it is
+            // rare by construction — the repair leaves every layer identical,
+            // so a second report means something re-created the skew. If this
+            // ever becomes frequent enough to be noise, the frequency is the
+            // finding.
+            tracing::warn!(
+                batch_idx,
+                tail_healed,
+                "chunked decode: layer block structure diverged; reconciled onto a common \
+                 writer chunk"
+            );
         }
         Ok(())
     }

@@ -680,11 +680,25 @@ impl Cache {
     /// This makes an offset-`N` re-prefill idempotent — re-running a prefill at the
     /// same offset must not stack stale tail chunks. Unlike `reset`, it keeps the
     /// backing slot allocated. No-op when already ≤ `offset` tokens.
-    pub(crate) fn truncate_chunked_to_tokens(&mut self, offset: usize) {
-        self.current_seq_len = offset;
+    /// Cut this layer's chunked storage back to `offset` cum-tokens.
+    ///
+    /// **Fallible, and the failure must reach the caller.** This is called once
+    /// per layer with a common offset (`admit_wave_kv`), so a failure that is
+    /// swallowed here does not truncate one layer while the other forty-seven
+    /// truncate — and the host-side `current_seq_len` is updated either way, so
+    /// nothing downstream can tell. The layers then hold different token windows
+    /// for the same sequence, which no single decode position map can describe;
+    /// it surfaced as `chunked decode layout diverged across layers … First
+    /// difference at chunk 67: (offset 0, usage 26) … (offset 0, usage 25)` on
+    /// the first decode after a fork.
+    ///
+    /// The length is set only once the storage agrees with it, for the same
+    /// reason: a length that describes a truncation that did not happen is worse
+    /// than no truncation, because it is not detectable.
+    pub(crate) fn truncate_chunked_to_tokens(&mut self, offset: usize) -> Result<()> {
         match &mut self.storage {
             CacheStorage::Chunked(c) => {
-                let _ = c.backing.truncate_sequence_to_tokens(c.batch_idx, offset);
+                c.backing.truncate_sequence_to_tokens(c.batch_idx, offset)?;
             }
             CacheStorage::Contiguous { all_data } => {
                 if offset == 0 {
@@ -692,6 +706,8 @@ impl Cache {
                 }
             }
         }
+        self.current_seq_len = offset;
+        Ok(())
     }
 
     /// Fork this cache, creating a new cache that shares data via copy-on-write.
@@ -1243,9 +1259,15 @@ impl KvCache {
     /// Truncate both K and V to exactly `offset` cum-tokens, freeing any chunks
     /// beyond it. Makes an offset-`N` (re)prefill idempotent (see
     /// [`Cache::truncate_chunked_to_tokens`]).
-    pub fn truncate_to_offset(&mut self, offset: usize) {
-        self.k.truncate_chunked_to_tokens(offset);
-        self.v.truncate_chunked_to_tokens(offset);
+    ///
+    /// Both sides run even when the first fails: K and V must land at the same
+    /// length or every later read pairs a key with the wrong value, so a K
+    /// failure must not leave V untried. The first error is still reported —
+    /// after both truncations have executed.
+    pub fn truncate_to_offset(&mut self, offset: usize) -> Result<()> {
+        let k = self.k.truncate_chunked_to_tokens(offset);
+        let v = self.v.truncate_chunked_to_tokens(offset);
+        k.and(v)
     }
 
     /// Fork this KV cache, creating a new cache that shares data via copy-on-write.

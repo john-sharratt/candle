@@ -1123,10 +1123,11 @@ impl ExpertCache {
     /// refused claims drained here — could and did: 4,436 regions against a
     /// twenty-eight-region need, paid in full.
     ///
-    /// **For a caller that is stuck.** The boundary otherwise moves at the end of
-    /// a forward pass, which is unreachable when the KV side cannot allocate the
-    /// arenas that pass needs — a wave fails, nothing completes, `post_compute`
-    /// never runs, and the ground that would unblock it is never offered.
+    /// **For a caller that is stuck.** The other direction — the weight side
+    /// taking back ground the KV side is not using — only runs between forwards
+    /// ([`Self::reclaim_spare_ground`]), and a KV side that cannot allocate the
+    /// arenas a wave needs never reaches the next one. This is the path that
+    /// breaks that.
     ///
     /// Zero is an ordinary answer: the zone may already sit at its floor, or a
     /// wave generation may still be open, in which case `set_weight_floor`
@@ -1148,6 +1149,45 @@ impl ExpertCache {
         if tx
             .send(PipelineMessage::RenegotiateBoundary {
                 regions,
+                response_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
+    }
+
+    /// The other direction: take back KV regions that are standing free.
+    ///
+    /// **Call this only between forwards.** Moving the boundary evicts and
+    /// relocates expert slots, and a wave in flight may be reading either, so
+    /// `set_weight_floor` refuses while a wave generation is open on the span.
+    ///
+    /// This used to be driven from the pipeline thread's `post_compute`, which
+    /// runs the instant a MoE layer's work is answered — with the forward thread
+    /// still inside `ffn_forward` holding that layer's FFN wave guard. So it was
+    /// asked forty-eight times a forward from inside the wave, and whether it
+    /// landed came down to a race with the forward thread's phase transitions:
+    /// refused in the common case, and in the narrow window between one layer's
+    /// guard dropping and the next one's opening, granted — at the cost of a
+    /// device-wide quiesce in the middle of a forward. Neither outcome is one the
+    /// engine should depend on, which is why the caller is now the wave loop's
+    /// own inter-forward gap, alongside the transient tier's hand-back.
+    ///
+    /// Answers with the bytes taken — always zero, since this direction concedes
+    /// nothing; the value exists so the two directions share a signature.
+    pub fn reclaim_spare_ground(&self) -> u64 {
+        let PipelineMode::Threaded { tx } = &self.mode else {
+            return 0;
+        };
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        // Zero regions is the growth question — "how much is the KV side holding
+        // that I could take?" — as against a positive count, which is the KV side
+        // stating what it needs.
+        if tx
+            .send(PipelineMessage::RenegotiateBoundary {
+                regions: 0,
                 response_tx,
             })
             .is_err()

@@ -640,6 +640,11 @@ impl Scheduler {
         // stay live across the steered spans.  (The injected `</think>` clears it
         // for real in `inject_stencil_prefills`.)
         //
+        // The structural think-close ban (`think_close_ban_active`) leans on this
+        // restore too: it arms whenever `in_segment` is false, so without the
+        // re-arm a steered block's first dropped close would ban every later
+        // close attempt and pin the continuation spans to their forced caps.
+        //
         // A suppressed close also ends one span and opens the next, so the EOT
         // ramp's clock (`segment_len`) restarts here.  This is the single
         // chokepoint every suppressed close passes through — a model `</think>`,

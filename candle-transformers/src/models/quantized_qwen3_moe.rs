@@ -1129,6 +1129,12 @@ impl BatchedModelCore for ModelWeights {
             .map_or(0, |cache| cache.request_kv_ground(regions))
     }
 
+    fn reclaim_spare_ground(&self) {
+        if let Some(cache) = self.expert_cache.as_ref() {
+            cache.reclaim_spare_ground();
+        }
+    }
+
     fn resident_weight_bytes(&self) -> Option<usize> {
         // Fixed base weights + the live resident-expert footprint (0 when no
         // global expert cache). Rises/falls as experts page VRAM↔pinned RAM.

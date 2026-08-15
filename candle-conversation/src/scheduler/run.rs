@@ -517,6 +517,41 @@ impl Scheduler {
                     );
                 }
                 self.log_kv_memory();
+                // **Create what the sealing thread was refused — here, because
+                // this is the gap.**
+                //
+                // A pass refused mid-wave records the size class it wanted, and
+                // the first version had the persistence thread act on that
+                // record at the top of its own next pass. That never fired: the
+                // sealing thread has to *find* a gap, and the gap between one
+                // wave and the next is narrower than a sealing pass. Measured —
+                // the `1088 B` class frozen at 49 arenas with 75 regions
+                // claimable, the hot→warm drain stuck at 634 MiB, and
+                // `alloc_chunk_run_for_key` reporting "unsatisfied after 4 fresh
+                // arenas … VRAM exhaustion" every few hundred milliseconds while
+                // the reservation was a fifth empty.
+                //
+                // The wave loop does not have to find the gap; it *is* the gap.
+                // This runs on the thread that owns the forward, between two of
+                // them, so no wave generation is live and the creation cannot be
+                // refused for the reason the sealing thread's was.
+                match self.session.create_deferred_arenas() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(
+                        target: "candle_conversation::scheduler::vram_relief",
+                        arenas_created = n,
+                        "created arenas a wave-deferred sealing pass asked for"
+                    ),
+                    Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
+                }
+                // And wake the sealing pass now that its ground exists, rather
+                // than leaving it to the 5 s tick. Guarded on there being work —
+                // an atomic load — so an idle engine is not woken once per wave
+                // to find nothing. The trigger coalesces on a one-slot channel,
+                // so a pass already running or already queued absorbs this.
+                if self.persist_trigger.pending_warm_bytes() > 0 {
+                    self.persist_trigger.fire();
+                }
                 // Last resort under heavy backlog: block the wave loop on a
                 // device sync so ingest stops outrunning the drain and the
                 // primary stream empties — letting the (short, batched) hot→warm
@@ -631,10 +666,15 @@ impl Scheduler {
         // The reservation's KV side. `free` is the pressure signal admission
         // reads; `peak_live` against `total` says how close the startup
         // partition came to binding, which is what step 7 tunes.
+        //
+        // The last two must read zero. A region claim creates an arena, arena
+        // creation waits for the gap between forwards, and the wave's tier is
+        // placed against the arena frontier as it stands at that moment — so a
+        // claim arriving with a tier standing is an arena created inside a wave.
         if let Some(r) = candle_nn::kv_cache::region_stats(0) {
             tracing::debug!(
                 "kv-regions: live={} peak={} free={} of {} ({}MiB) | tier={}MiB \
-                 (ceiling {} regions) | weights={}MiB | late-claims={} refusals={}",
+                 (ceiling {} regions) | weights={}MiB | in-wave-arenas={} in-wave-refusals={}",
                 r.live,
                 r.peak_live,
                 r.free,

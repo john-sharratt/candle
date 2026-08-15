@@ -130,13 +130,13 @@ pub fn publish(pass: &str, report: IngestReport) {
 }
 
 /// Every pass that has run, keyed by name. Empty before any pass completes.
+///
+/// Callers that derive aggregates (the API's `incomplete` flag) do so over this
+/// one snapshot rather than through per-question helpers here — a helper would
+/// take a second snapshot that can disagree with the pass list it is answering
+/// about.
 pub fn latest() -> BTreeMap<String, IngestReport> {
     slot().read().map(|g| g.clone()).unwrap_or_default()
-}
-
-/// Whether ANY pass is known to have left its map incomplete.
-pub fn any_incomplete() -> bool {
-    latest().values().any(|r| r.is_incomplete())
 }
 
 #[cfg(test)]
@@ -211,6 +211,10 @@ mod publish_tests {
         let all = latest();
         assert!(!all["pass_a_test"].is_incomplete());
         assert!(all["pass_b_test"].is_incomplete());
-        assert!(any_incomplete(), "one bad pass makes the whole map suspect");
+        // The API's aggregate, as it computes it — any-of over one snapshot.
+        assert!(
+            all.values().any(|r| r.is_incomplete()),
+            "one bad pass makes the whole map suspect"
+        );
     }
 }

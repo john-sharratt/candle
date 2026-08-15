@@ -52,14 +52,17 @@ pub use chunked::wave_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    begin_wave, end_wave_transient, plan_wave_transient, wave_domain_stats, BumpRange,
-    WaveGeneration, WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, wave_domain_stats,
+    BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
+    WAVE_FORWARD_BYTES,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::{expect_kv_range, span_layout, SpanLayout};
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    initial_weight_bytes, kv_spare_regions, set_claim_reserve, set_ground_broker, set_weight_floor,
-    span_end, weight_capacity_bytes, weight_floor_after,
+    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
+    weight_capacity_bytes, weight_floor_after,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{region_stats, RegionStats, REGION_BYTES};

@@ -311,13 +311,16 @@ pub enum PipelineMessage {
         /// Oneshot channel for returning the snapshot.
         response_tx: mpsc::SyncSender<ProfileSnapshot>,
     },
-    /// Sell `regions` of weight-side ground to the KV side, now, outside the
-    /// end-of-pass that normally drives the boundary.
+    /// Move the boundary: sell `regions` of weight-side ground to the KV side,
+    /// or — with `regions` zero — take back whatever the KV side is holding
+    /// spare.
     ///
-    /// **The boundary's give-back is otherwise unreachable from a stalled
-    /// wave.** `renegotiate_boundary` runs in `post_compute`, at the end of a
-    /// *completed* forward — so a wave that cannot allocate never completes,
-    /// never reaches it, and never gets the ground that would let it complete.
+    /// **Both directions arrive here, and both come from outside a wave.** The
+    /// give-back is what an arena claim that has run out asks for, on the spot;
+    /// the take-back is asked once per forward, from the wave loop's
+    /// inter-forward gap. Neither may run under a live wave generation, and a
+    /// stalled wave is exactly why the give-back cannot wait for a forward to
+    /// complete — the wave that cannot allocate is the one that would have to.
     ///
     /// This is that reader, and it is how an arena claim buys the ground it
     /// needs: the eviction still happens here, on the pipeline thread, where the

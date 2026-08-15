@@ -1044,6 +1044,21 @@ impl ChunkedKvBacking {
             );
             let (active_k_fmt, active_v_fmt) =
                 active_kv_formats(self.inner.storage.k_format(), on_gpu);
+            // The fork's destination chunks can need an arena that does not
+            // exist, and `alloc_chunk_with_arenas` creates it under the storage
+            // write lock — so the window is taken here, above that lock.
+            //
+            // **Uninterruptible**, because a fork is per layer and the caller
+            // loops over all of them with no transaction: refusing here forks
+            // some layers and not others, and a sequence whose token windows
+            // differ by layer is exactly what the decode position map cannot
+            // describe. Proceeding past a wave-in-flight refusal claims at
+            // worst one region mid-wave, which the `in-wave-arenas` tripwire
+            // reports; refusing corrupts the sequence silently. A genuine
+            // error still propagates — the `?` fires only for failures that
+            // are not the deferral, and those mean the gate itself is broken.
+            #[cfg(feature = "cuda")]
+            let _window = self.inner.arena_window_uninterruptible(k_key)?;
             let target_gids = self.inner.storage.write(|arena_state| {
                 let mut gid_vec: Vec<ChunkGid> = Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
 
@@ -1930,14 +1945,29 @@ impl ChunkedKvBacking {
         Ok(new_tokens)
     }
 
-    /// Truncate the sequence to exactly `target_tokens` cum-tokens, freeing any
-    /// writer-owned chunks/usage beyond it. Makes an offset-`N` re-prefill
-    /// idempotent: a caller (e.g. the bench harness's repeat loop) that re-runs a
-    /// prefill at the same offset must not stack stale tail chunks on top of the
-    /// previous run. Arc-shared prefix chunks (below `writer_start_idx`) are never
-    /// shrunk — `target_tokens` always covers them (it is ≥ the shared prefix
-    /// length). No-op when the sequence already holds ≤ `target_tokens` tokens
-    /// (growth is handled by `set_len`).
+    /// Truncate the sequence's **writer-owned tail** to `target_tokens`
+    /// cum-tokens. Makes an offset-`N` re-prefill idempotent: a caller (e.g.
+    /// the bench harness's repeat loop) that re-runs a prefill at the same
+    /// offset must not stack stale tail chunks on top of the previous run.
+    /// No-op when the sequence already holds ≤ `target_tokens` tokens (growth
+    /// is handled by `set_len`).
+    ///
+    /// **Sealed ground is not this operation's to cut.** Chunks below
+    /// `writer_start_idx` are Arc-shared projected layout — substrate borrows,
+    /// injected sections, and reprojection's reserved glue gaps — so a target
+    /// that falls inside them is clamped up to the sealed boundary and only
+    /// the writable chunks beyond it are freed. That case is not hypothetical:
+    /// a slot with a **deferred glue fire** counts its reserved gap tokens in
+    /// the chunk windows (the reproject stamps them at assembly so the fire
+    /// can scatter into place) but not in the scheduler's offset (glue "must
+    /// not advance its slot" until it fires), so every such slot arrives here
+    /// with `target` short of the sealed cum by exactly the pending glue. This
+    /// used to be a bail that one caller silently discarded — which made the
+    /// no-op accidental and the first caller to *propagate* errors killed the
+    /// wave with `target 1334 cuts into the Arc-shared prefix`. The clamp is
+    /// that no-op as a contract instead of an accident, and it is also what
+    /// keeps stale-tail cutting alive on the same slot: writable chunks past
+    /// the sealed boundary still go.
     pub fn truncate_sequence_to_tokens(
         &self,
         batch_idx: usize,
@@ -1960,17 +1990,26 @@ impl ChunkedKvBacking {
             return Ok(());
         }
         let writer_start = slot.writer_start_idx();
+        let sealed_cum: usize = slot.chunks_slice()[..writer_start.min(n)]
+            .iter()
+            .map(|c| c.usage as usize)
+            .sum();
+        let target_tokens = target_tokens.max(sealed_cum);
+        if total <= target_tokens {
+            return Ok(());
+        }
         let mut cum = 0usize;
         for i in 0..n {
             let usage = slot.chunks_slice()[i].usage as usize;
-            if cum + usage >= target_tokens {
+            // The `i + 1` bound keeps the landing at or past the last sealed
+            // chunk even when trailing sealed chunks hold zero tokens — landing
+            // earlier would `truncate_chunks` sealed layout away on a token
+            // count that never covered it.
+            if cum + usage >= target_tokens && i + 1 >= writer_start.min(n) {
                 let keep = target_tokens - cum;
-                if i < writer_start && keep < usage {
-                    candle::bail!(
-                        "truncate_sequence_to_tokens: target {target_tokens} cuts into the \
-                         Arc-shared prefix (chunk {i}, writer_start {writer_start})"
-                    );
-                }
+                // The clamp above puts the cut at or past the sealed boundary:
+                // a chunk below `writer_start` can be landed on only with
+                // `keep == usage`, which trims nothing from it.
                 // Keep chunks 0..=i (chunk i trimmed to `keep` tokens, possibly 0 →
                 // it becomes the empty writer chunk) and free everything after.
                 slot.chunk_at_mut(i).unwrap().usage = keep as u32;

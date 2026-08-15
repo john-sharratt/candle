@@ -421,6 +421,24 @@ impl ChunkWindow {
     }
 }
 
+/// One layer's view of a sequence's block structure, reduced to the parts the
+/// shared decode position map is built from.
+///
+/// Two layers whose `DecodeLayout` agree produce identical maps and can share
+/// one; two that disagree cannot. Produced by
+/// [`SequenceState::decode_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DecodeLayout {
+    /// Fold over every chunk's `(offset, usage)` window, in chunk order.
+    pub(super) digest: u64,
+    /// Number of allocated chunks — the slice count the map indexes into.
+    pub(super) blocks: usize,
+    /// Index of the chunk the write slot resolves to. This is the one field
+    /// the map records for a token that does not exist yet, and the one the
+    /// per-layer `write_slice` in the slot header must match.
+    pub(super) writer: usize,
+}
+
 /// Opaque snapshot of a slot's writer-owned chunks, taken by
 /// [`super::ChunkedKvBacking::split_off_writer_tail`] and restored by
 /// [`super::ChunkedKvBacking::extend_writer_tail`].
@@ -917,6 +935,36 @@ impl SequenceState {
             }
         }
         n - 1
+    }
+
+    /// Everything the shared decode position map is derived from, reduced to a
+    /// comparable value.
+    ///
+    /// The decode metadata builder constructs ONE position map per sequence — a
+    /// `(slice_idx, in_blk)` entry per logical token, plus a final entry naming
+    /// the write slot — from layer 0's block table, and hands it to all 48
+    /// layers. That is only sound while every layer's block table agrees, and
+    /// block structure is not unconditionally layer-uniform: a windowed creep
+    /// prefill leaves resumed layers holding an empty writer chunk the layers
+    /// still pending resume do not have. Comparing this value across layers is
+    /// how the decode entry point establishes the invariant instead of assuming
+    /// it. See [`super::ChunkedKvBacking::ensure_for_batch_entries_all`].
+    pub(super) fn decode_layout(&self) -> DecodeLayout {
+        // FNV-1a over each chunk's window. Order matters and the windows are the
+        // whole of what the map encodes, so a fold over `(offset, usage)` in
+        // chunk order captures exactly as much as the map does and no more.
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for c in &self.chunks {
+            for field in [c.offset as u64, c.usage as u64] {
+                digest ^= field;
+                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        DecodeLayout {
+            digest,
+            blocks: self.chunks.len(),
+            writer: self.decode_write_chunk_idx(),
+        }
     }
 
     /// Per-chunk `(offset, len, cum_before)` window using the SAME derivation the

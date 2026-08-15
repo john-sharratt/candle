@@ -820,16 +820,20 @@ impl BatchedInferenceSession {
         // Entry at index state.offset is the write slot for the new token.
         let mut pm_flat: Vec<u32> = Vec::new();
         let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
-        // Ensure backings are sized for the upcoming decode write so the
-        // slot's chunks reflect the post-write layout when we read them.
+        // `(slice count, write slice)` the map was built against, per sequence.
+        // Both are read from layer 0 while the map is one buffer every layer's
+        // slot header points at, so every layer's own answer is checked against
+        // them below rather than assumed equal.
+        let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
+        // Ensure backings are sized for the upcoming decode write so the slot's
+        // chunks reflect the post-write layout when we read them, and reconcile
+        // any block-structure skew between layers — the map built below is one
+        // buffer describing all of them.
         //
-        // ALL layers at once, and once per decode step — not once per layer. The
-        // plan is layer-invariant (this position map is itself built from layer 0
-        // and applied to every layer), so `ensure_for_batch_entries_all` decides
-        // from the first backing and only walks the rest when work is actually
-        // needed. Per-layer, this cost 48 lock acquisitions and 48 tail-predicate
-        // passes per decoded token, in a steady state where the answer is almost
-        // always "nothing to allocate".
+        // ALL layers at once, and once per decode step rather than once per
+        // layer: only the layers that need an allocation take the write guard,
+        // which is what the per-layer form cost 48 times per decoded token in a
+        // steady state where the answer is "nothing to allocate".
         ChunkedKvBacking::ensure_for_batch_entries_all(&self.backings, &seq_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
             let entry_start = pm_flat.len();
@@ -872,6 +876,7 @@ impl BatchedInferenceSession {
                 .get(wi)
                 .map_or(0, |c| c.offset as u32 + c.token_count as u32);
             pm_flat.push(((wi as u32) << 16) | wi_within);
+            pm_slot_shape.push((n_ch as u32, wi as u32));
         }
 
         // Upload position_map via the pinned stager — zero-copy PCIe read,
@@ -913,6 +918,24 @@ impl BatchedInferenceSession {
 
             // Append this layer's headers (24 bytes × n_active).
             for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
+                // The kernel SCATTERS the new token through this layer's own
+                // `write_slice` and READS it back through the shared map's write
+                // slot. A layer whose block table disagrees with the one the map
+                // was built from writes the token into one chunk and attends to
+                // another — silently, with no fault and no wrong-looking number
+                // anywhere. `ensure_for_batch_entries_all` reconciles the layers
+                // before this point; this is where that is worth confirming,
+                // because both values are already in hand.
+                let (exp_slices, exp_write) = pm_slot_shape[i];
+                if (n_slices, write_slice) != (exp_slices, exp_write) {
+                    candle::bail!(
+                        "decode metadata: layer {layer_idx} describes sequence {} as \
+                         {n_slices} slices writing slice {write_slice}, but the position map \
+                         every layer shares was built from layer 0 as {exp_slices} slices \
+                         writing slice {exp_write}",
+                        seq_offsets[i].0
+                    )
+                }
                 let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
                 all_headers.extend_from_slice(&n_slices.to_le_bytes());
                 all_headers.extend_from_slice(&write_slice.to_le_bytes());
@@ -1317,6 +1340,27 @@ impl BatchedInferenceSession {
             total_freed += backing.release_empty_arenas()?;
         }
         Ok(total_freed)
+    }
+
+    /// Create the arenas that mid-wave refusals recorded, and answer with how
+    /// many were made.
+    ///
+    /// **Call this from the wave loop, between forwards.** The sealing thread is
+    /// what gets refused, but it is the wrong party to satisfy the demand: it has
+    /// to *find* a gap, and on this engine the gap between one wave and the next
+    /// is narrower than a sealing pass, so it never won one — the `1088 B` class
+    /// stayed frozen at 49 arenas with 75 regions free while the hot→warm drain
+    /// sat at 634 MiB and never moved.
+    ///
+    /// The wave loop does not have to find the gap; it *is* the gap. Running here
+    /// makes the demand converge in one wave instead of never.
+    #[cfg(feature = "cuda")]
+    pub fn create_deferred_arenas(&self) -> Result<usize> {
+        let mut made = 0;
+        for backing in &self.backings {
+            made += backing.create_deferred_arenas()?;
+        }
+        Ok(made)
     }
 
     /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
@@ -2886,16 +2930,24 @@ pub trait ManagedBatchedModel {
     ///
     /// Every token writes one K and one V element per KV head per layer, so the
     /// per-row cost is fixed by geometry and the only variable is how many free
-    /// regions remain. Deliberately measured against `free` rather than against
-    /// the elastic floor: the boundary moves at the expert pipeline's end of
-    /// pass, so ground the weight side is currently holding is not available to
-    /// *this* wave however willing it might be to give it up later.
+    /// regions remain. Deliberately measured against `free + blocked` rather
+    /// than against the elastic floor: the boundary moves at the expert
+    /// pipeline's end of pass, so ground the *weight side* is holding is not
+    /// available to this wave however willing it might be to give it up later —
+    /// but ground the previous forward's transient tier has blocked is. This
+    /// cap is read at the top of `forward_wave`, when that tier is still
+    /// standing; the forward it sizes releases the tier in its own phase 0,
+    /// before any claim priced here runs. Counting only `free` made every wide
+    /// prefill's own tier throttle the next one: the tier's ground read as
+    /// gone, the cap collapsed to a few hundred tokens, and a ten-context
+    /// prefill fragmented into a dozen narrow waves that each re-loaded the
+    /// expert working set — bulk prefill fell from ~2.1K t/s to ~700.
     ///
     /// One region of margin, because a sequence's chunks do not pack a region
     /// exactly and the last one is partly wasted.
     fn kv_width_cap(&self, act_dtype: DType) -> Option<usize> {
         let stats = candle_nn::kv_cache::region_stats(0)?;
-        let free = stats.free.saturating_sub(1);
+        let free = (stats.free + stats.blocked).saturating_sub(1);
         let per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
         let per_row_all_layers = per_row.checked_mul(self.num_layers())?;
         if per_row_all_layers == 0 {
@@ -3386,8 +3438,25 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(&pre_off, &pre_lens, dev)?);
 
         let mut glue_meta = BatchedPrefillMeta::new_ragged(&glue_off, &glue_lens, dev)?;
+        // Staged glue is consumed only by a wave that carries glue rows. The
+        // descriptors are staged immediately before the gap-fill forward they
+        // describe — but that forward can die before reaching this point (its
+        // decode metadata refuses first), and the staging then sits on the
+        // session for whatever wave comes next. A glue-less wave that takes it
+        // fails `build_glue_meta` with "N glue descriptors vs 0 input_lens",
+        // which is how a dead wave's leftovers killed the titler twice. Stale
+        // staging is dropped, loudly: the reproject that staged it re-stages
+        // when its own retry runs.
         #[cfg(feature = "cuda")]
-        if let Some(pending) = session.take_pending_glue() {
+        if glue_lens.is_empty() {
+            if let Some(stale) = session.take_pending_glue() {
+                tracing::warn!(
+                    n = stale.len(),
+                    "dropping glue descriptors staged by a wave that never ran its \
+                     gap-fill forward — this wave carries no glue rows"
+                );
+            }
+        } else if let Some(pending) = session.take_pending_glue() {
             glue_meta.glue = build_glue_meta(pending, &glue_lens, dev)?;
         }
         let glue_headers = DecodeHeaders::Prefill(glue_meta);
@@ -3522,7 +3591,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
             (None, _) => None,
         };
-        let (phase, head_span) = self.forward_wave_contexts(
+        let wave = self.forward_wave_contexts(
             &mut contexts,
             n_decode,
             n_prefill,
@@ -3533,7 +3602,33 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             layer_start,
             layer_end,
             x_in,
-        )?;
+        );
+        // **A failed wave leaves no trace.** The layer sweep advances each
+        // layer's usage as that layer completes, so an error anywhere in it —
+        // and the relief design treats failing a wave as routine — leaves the
+        // early layers one token ahead of the rest. The rollback restores every
+        // row to its entry length on every layer of the range, which is what
+        // makes the retry a retry rather than a decode against per-layer token
+        // windows. This is the single choke point every wave goes through; the
+        // sweep itself stays free to advance eagerly, because whatever it did
+        // is undone here on the way out.
+        let (phase, head_span) = match wave {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rb) = super::wave_admit::rollback_wave_kv(
+                    &mut contexts,
+                    layer_start,
+                    layer_end,
+                ) {
+                    candle::bail!(
+                        "wave failed ({e}) and the KV rollback that keeps that failure \
+                         recoverable also failed ({rb}) — the affected sequences may hold \
+                         per-layer token windows"
+                    )
+                }
+                return Err(e);
+            }
+        };
         // Output ordering. The single-token prefills were folded into the decode
         // group, so the internal row order is
         // `[orig-decode | single-prefills | multi-prefills | glue]`.
@@ -3560,7 +3655,67 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 }
             }
             WavePhase::Logits(l) => {
+                // **The decode rows' usage advances here — once per step, every
+                // layer at once — and nowhere else.** The per-layer advance used
+                // to live inside the decode attention, which meant a step split
+                // across creep segments held layers on both sides of the segment
+                // boundary at different lengths; each later segment's metadata
+                // rebuild then read its own step's half-done bookkeeping as
+                // per-layer corruption, and the repair for *real* corruption
+                // truncated the freshly-written token off the swept layers —
+                // token duplication in the visible text was the symptom.
+                //
+                // The head having run is the definition of "the step completed":
+                // logits exist only when the final segment reached layer N, so
+                // this fires exactly once per delivered token — and never for a
+                // failed wave, which leaves nothing for the rollback to undo on
+                // these rows. In-step attention never needed the advance; it
+                // reads the new token through the position map's write slot,
+                // built against the pre-step usage.
+                //
+                // `n_decode` is the internal group — caller decode rows plus the
+                // folded single-token prefills, which advance by their one token
+                // the same way. Glue rows must not advance and are past
+                // `n_decode + n_prefill`; multi-token prefills advance per layer
+                // inside their own sweep because a creep cohort's layers are
+                // *legitimately* at different lengths across waves.
+                //
+                // **The logits copy comes FIRST.** `into_vec` is the last
+                // fallible step of the arm — an async CUDA fault surfaces on
+                // this sync — and it sits outside the wave-error rollback (the
+                // `match wave` above already resolved Ok). Advancing before it
+                // would leave every layer advanced for a token the caller never
+                // receives; the retry then writes into offset+1 with a stale KV
+                // row at offset. Copy first, advance after, and nothing is
+                // advanced for an undelivered token.
                 let lg = l.into_vec()?;
+                // The advance itself is per layer with no transaction, so a
+                // failure at layer k is unwound here — truncating the advanced
+                // layers back to their entry length, the same idempotent
+                // operation admit performs — before the error propagates. Left
+                // as-is, layers 0..k at offset+1 against the rest at offset is
+                // exactly the per-layer divergence this consolidation exists to
+                // prevent, and the wave rollback cannot reach it.
+                for i in 0..n_decode {
+                    let offset = contexts[i].offset;
+                    let mut advance = || -> Result<()> {
+                        for cache in contexts[i].kv_caches.caches.iter_mut() {
+                            cache.set_current_seq_len(offset + 1)?;
+                        }
+                        Ok(())
+                    };
+                    if let Err(e) = advance() {
+                        for c in contexts[..=i].iter_mut() {
+                            let off = c.offset;
+                            let _ = c
+                                .kv_caches
+                                .caches
+                                .iter_mut()
+                                .try_for_each(|cache| cache.truncate_to_offset(off));
+                        }
+                        return Err(e);
+                    }
+                }
                 let out = if single.is_empty() {
                     lg
                 } else {

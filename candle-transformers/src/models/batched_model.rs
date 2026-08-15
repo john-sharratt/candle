@@ -43,7 +43,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_wave, end_wave_transient, plan_wave_transient, set_claim_reserve, LayerPhase,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase,
     ModelGeometry, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
 };
 use candle_nn::Module;
@@ -267,18 +267,29 @@ pub trait BatchedModelCore {
     /// bytes conceded.
     ///
     /// For a caller whose KV allocation just failed, or which can see it is
-    /// about to. The boundary otherwise moves only at the end of a completed
-    /// forward, which a wave that cannot allocate never reaches. `regions` is the
-    /// quantity the caller measured — never a counter it drained, which is what
-    /// this replaced and what took the expert zone below its working minimum.
-    /// Zero is an ordinary answer: the zone is at its floor, or a wave is still
-    /// in flight.
+    /// about to. The other direction runs only between forwards
+    /// ([`Self::reclaim_spare_ground`]), which a wave that cannot allocate never
+    /// reaches. `regions` is the quantity the caller measured — never a counter
+    /// it drained, which is what this replaced and what took the expert zone
+    /// below its working minimum. Zero is an ordinary answer: the zone is at its
+    /// floor, or a wave is still in flight.
     ///
     /// Dense models have no movable boundary and return zero.
     fn request_kv_ground(&self, regions: usize) -> u64 {
         let _ = regions;
         0
     }
+
+    /// The opposite direction: let the weight side take back KV regions that are
+    /// standing free.
+    ///
+    /// **Only legal between forwards.** A boundary move evicts and relocates
+    /// expert slots, so it may not run under a live wave generation — see
+    /// `ExpertCache::reclaim_spare_ground` for what happened when it was driven
+    /// from the expert pipeline's end-of-pass instead.
+    ///
+    /// Dense models have no movable boundary and do nothing.
+    fn reclaim_spare_ground(&self) {}
 
     /// Live VRAM bytes held by the model's weights — fixed base weights plus the
     /// **time-varying** resident-expert footprint (MoE experts page VRAM↔RAM
@@ -529,6 +540,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = self.model.device() {
             end_wave_transient(&d.cuda_stream());
+            // **And the boundary's growing direction, in the one gap it is legal
+            // in.** Every guard from the previous forward is dropped and this
+            // one has opened none, so no wave generation is live — the condition
+            // `set_weight_floor` checks, and the condition a retraction's
+            // evictions and relocations actually need. It runs after the tier is
+            // handed back because a placed tier caps the pool at a fixed address
+            // that the boundary cannot move, which would make the spare-region
+            // count this reads an underestimate.
+            //
+            // The KV side's direction is not here: a claim that runs out buys
+            // its ground on the spot (`request_kv_ground`) rather than waiting
+            // for a forward that its own failure is preventing.
+            self.model.reclaim_spare_ground();
         }
 
         // **Phase 1: admit.** Claim every KV slot this wave will write, for
@@ -572,30 +596,43 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         // region is the floor the tier is carved in anyway.
                         WAVE_FORWARD_BYTES,
                     ];
-                    // **Phase 1's third term, reaching the placement.** Admit
-                    // claimed this wave's KV; the compressor allocates its
-                    // quantize destinations while the forward runs, and those
-                    // are size classes that may have no arena yet. Reserve room
-                    // for them so they land below the tier rather than moving
-                    // it (§7 phase 1, `set_claim_reserve`).
-                    //
-                    // Bounded by what this wave *writes*: a sealed copy is never
-                    // larger than the active block it compresses, so the active
-                    // volume is an upper bound on the destinations this wave's
-                    // work will eventually need. Steady state is what makes that
-                    // the right shape — everything written must be sealed, so
-                    // the sealing rate tracks the writing rate — and the
-                    // observed per-forward peak corrects it when a backlog makes
-                    // the compressor run ahead of this wave.
-                    let kv_bytes = rows
-                        .saturating_mul(self.model.num_layers())
-                        .saturating_mul(2 * self.model.n_kv_head() * self.model.head_dim())
-                        .saturating_mul(embed_dtype.size_in_bytes());
-                    set_claim_reserve(&d.cuda_stream(), kv_bytes.div_ceil(REGION_BYTES))?;
+                    // The tier packs directly against the arena frontier, with no
+                    // room reserved above it. Nothing claims a region after this
+                    // point: a region claim creates an arena, and arena creation
+                    // waits for the gap between forwards
+                    // (`BackingInner::arena_window`), which `plan_wave_transient`
+                    // in turn waits on before it reads the frontier. The
+                    // compressor keeps running through the forward — it fills
+                    // arenas that already exist, which moves nothing.
                     plan_wave_transient(&d.cuda_stream(), per_phase)?;
                 }
             }
         }
+
+        // **From here to the end of this function, the forward owns the
+        // partition.**
+        //
+        // Held rather than inferred, because the obvious inference is wrong: a
+        // wave generation is *not* live for the whole forward — it drops at
+        // every phase boundary — so both `enter_arena_window` and the boundary
+        // latch (`wave_is_live`) read this flag, and `live_generations` covers
+        // only the tail after this returns, where the logits still sit on the
+        // head span.
+        //
+        // **After phase 2, and that is not a detail — in either direction.**
+        // Admit is the forward creating its own arenas through the same gate
+        // the sealing thread uses, so opening the flag before admit had the
+        // forward waiting on itself (the daemon froze mid-load). And phase 2's
+        // tier placement may *buy ground* from the weight side, whose
+        // `set_weight_floor` refuses while `wave_is_live` — which now reads
+        // this flag — so opening it before the placement would refuse the
+        // tier's own purchase. The sweep is what needs the partition frozen;
+        // the flag opens exactly where the sweep begins.
+        #[cfg(feature = "cuda")]
+        let _forward_open = match self.model.device() {
+            Device::Cuda(d) => Some(begin_forward(&d.cuda_stream())),
+            _ => None,
+        };
 
         // Combined residual: embed every row flat `[1, total, hidden]`, or resume
         // a paused wave from its persisted stream.

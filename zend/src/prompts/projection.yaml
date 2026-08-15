@@ -214,9 +214,14 @@ system_prompt:
     - kind: section
       id: history_stance
       content: |+
-        Earlier turns in the history are your own prior work, even where they appear
-        condensed or summarised. Build on what you already examined, concluded, and
-        decided rather than recapping or re-deriving it.
+        Earlier turns of THIS conversation are your own prior work, even where they
+        appear condensed or summarised. Build on what you already examined, concluded,
+        and decided rather than recapping or re-deriving it. The history may also
+        contain workspace reference material — folder summaries and code notes
+        produced by background indexing, recognisable by their terse
+        list-and-summarize shape. Treat that as background knowledge you happen to
+        have, never as something this user said, asked, or was told in this
+        conversation.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when the catalog
@@ -541,6 +546,18 @@ layers:
         # narrowly loses to generic prose folders (docs/). 3 = root + 2 content;
         # the queried dir ranks top-3 across every probed query. See §83.
         selection: { kind: top_k, k: 3 }
+        # Cuts the zero floor so the pre-belief path (fork/startup, no probe:
+        # every folder scores exactly 0) selects nothing and the `default`
+        # below re-injects the workspace root alone. Without this the group
+        # inherited the layer's 0.0 placeholder, zero-score folders stayed
+        # eligible, and TopK's tie-break (ascending key = ingestion order)
+        # seeded the SAME arbitrary leaf folders into every conversation's
+        # view — which the model, reading dialogue-shaped ingest turns under
+        # the history stance, adopted as "what the user previously asked".
+        # Proven with a conversation whose only content was "hello": it cited
+        # `zend/scripts/` and "a project with 11 members" unprompted. The live
+        # belief loop is untouched (its own min/evict of 250 governs there).
+        score_threshold: 1.0
         default: { tag: "." }
         # Concept B: strong structural attention buys extra cluster slots.
         budget_adaptive: { per_extra: 800, absolute_max: 5 }

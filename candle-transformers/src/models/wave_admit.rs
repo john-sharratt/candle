@@ -84,8 +84,12 @@ pub(crate) fn admit_wave_kv(
         // Prefill idempotency, for prefill *and* glue: truncate each sequence's
         // KV to exactly its `offset` cum-tokens, so a re-prefill at the same
         // offset does not stack duplicate chunks behind the decode writer.
+        // Propagated, not discarded: this runs once per layer with a common
+        // offset, so a failure that is swallowed truncates some layers and not
+        // others and leaves the sequence with per-layer token windows. Failing
+        // the wave is the recoverable outcome; the divergence is not.
         for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
-            cache.truncate_to_offset(offset);
+            cache.truncate_to_offset(offset)?;
         }
 
         // Prefill only, from here down. A sequence starting at zero is cleared
@@ -102,6 +106,48 @@ pub(crate) fn admit_wave_kv(
         // writer slice.
         for (i, &add) in q_lens[..n_prefill].iter().enumerate() {
             KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
+        }
+    }
+    Ok(())
+}
+
+/// Undo a failed wave's per-layer bookkeeping: truncate every row, on every
+/// layer of the range, back to the length it entered the wave with.
+///
+/// **This is what makes a wave failure recoverable, and nothing else does.**
+/// The engine's relief design *fails waves on purpose* — an expert-cache miss
+/// under pressure, a refused claim, an admission shortfall all surface as a
+/// failed wave that the scheduler relieves and retries. But the layer sweep
+/// advances each layer's usage as that layer completes (`set_current_seq_len`
+/// in the decode and prefill attention paths), so a wave that dies between
+/// layer 0's advance and layer 47's leaves the sequence with per-layer token
+/// windows — layer 0 one token ahead of the other forty-seven, in the
+/// measured case. No later decode can describe that with the single position
+/// map every layer shares, so the sequence is bricked by exactly the failure
+/// the design calls routine.
+///
+/// The rows' entry lengths are still in hand — `SequenceContext::offset` is
+/// the pre-wave length for all three groups (decode's headers assert it
+/// against the backing) — and truncating to them is the same idempotency
+/// operation admit performs on the way in. Chunks the advance touched are at
+/// or past `writer_start_idx` by construction (`set_len` never writes below
+/// it), and `truncate_sequence_to_tokens` clamps at the sealed boundary
+/// besides, so the rollback can never reach Arc-shared ground — including the
+/// reserved glue gaps of a slot whose deferred fire this failed wave was
+/// carrying, which must survive for the retry to scatter into.
+///
+/// Covers every row including decode — admit skips decode because decode's
+/// claims were made by the caller, but the *advance* happens for decode rows
+/// too, so the rollback cannot.
+pub(crate) fn rollback_wave_kv(
+    contexts: &mut [SequenceContext],
+    layer_start: usize,
+    layer_end: usize,
+) -> Result<()> {
+    for c in contexts.iter_mut() {
+        let offset = c.offset;
+        for layer_idx in layer_start..layer_end {
+            c.kv_caches.caches[layer_idx].truncate_to_offset(offset)?;
         }
     }
     Ok(())

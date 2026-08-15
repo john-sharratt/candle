@@ -1166,6 +1166,22 @@ impl ChunkGidPool {
         )
     }
 
+    /// Whether a run of `len` consecutive slots could be claimed right now,
+    /// **without claiming it**.
+    ///
+    /// A run claim advances an arena's never-used high-water mark
+    /// irreversibly — dropped run gids recycle through the singleton free
+    /// stack, which `try_claim_run` never reads — so an allocate-and-drop
+    /// "probe" permanently burns `len` slots of contiguous capacity. This is
+    /// the read-only question that probe was trying to ask.
+    pub fn run_would_fit(&self, key: ArenaKey, len: usize) -> bool {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return false;
+        };
+        let tables = pool.tables.read().unwrap();
+        tables.values().any(|t| t.run_fits(len))
+    }
+
     /// [`Self::allocate_run_for`] against one specific arena index — see
     /// `ChunkPool::allocate_run_in` for why the caller targets the arena it
     /// just registered instead of re-walking.
