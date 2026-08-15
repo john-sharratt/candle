@@ -1,3 +1,11 @@
+//! Gemma family causal-LM text generation example (v1/v2/v3).
+//!
+//! `--which` selects the checkpoint (2b/7b/2b-it/7b-it, v1.1 variants,
+//! CodeGemma, gemma-2 2b/9b, gemma-3 1b), dispatched to `gemma::Model`,
+//! `gemma2::Model`, or `gemma3::Model` behind a shared `Model` enum.
+//! Gemma-3-instruct prompts are wrapped in `<start_of_turn>`/`<end_of_turn>`
+//! chat markers; `--use-flash-attn` enables flash attention.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

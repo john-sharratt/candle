@@ -1,3 +1,12 @@
+//! Multi-GPU LLaMA-2/3 text generation via NCCL tensor parallelism.
+//!
+//! Single binary re-execs itself as `--num-shards` child processes (one per
+//! GPU, `--rank` unset in the parent); each child opens `Device::new_cuda(rank)`
+//! and joins an NCCL `Comm` via a shared `Id` handshaked through a `--comm-file`
+//! on disk. Weights load sharded through `ShardedSafeTensors::var_builder`
+//! (see `model.rs`, a local NCCL-aware Llama impl distinct from
+//! `candle_transformers::models::llama`); only rank 0 prints generated tokens.
+
 // An implementation of LLaMA https://github.com/facebookresearch/llama
 //
 // This is based on nanoGPT in a similar way to:

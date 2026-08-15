@@ -886,6 +886,24 @@ pub trait ContentResolver {
         None
     }
 
+    /// Whether the projection TARGET is an append-only ingest layer — i.e. this
+    /// projection is a conversation GENERATING its own content, not a dialogue
+    /// RETRIEVING from a corpus.
+    ///
+    /// The distinction decides whether a turn on the target's own timeline has
+    /// to earn its place. Retrieval must: the corpus is large and belief
+    /// selection is the whole point. Generation must not: an ingest turn is
+    /// inserted and immediately decoded against, so it has no wide-Q belief yet,
+    /// scores zero, and is filtered out by its own group's band — leaving the
+    /// decode unable to see the request it is answering. (Observed: a folder
+    /// summary decode replying "the user hasn't asked a specific question yet"
+    /// with the request one turn back in the same conversation.)
+    ///
+    /// Default `false` — an ordinary projection retrieves.
+    fn target_is_ingest_self(&self) -> bool {
+        false
+    }
+
     /// The turn in `group` whose gather-scope decl tags contain `tag`, if any.
     /// Used to resolve a group's declared `default` member (a workspace-root
     /// cluster tagged `"."`, etc.) when normal selection is empty — so the
@@ -1605,9 +1623,9 @@ impl Substrate {
                 // Skip residences pinned into the current wave's working set: a
                 // slot the in-flight decode is actively attending is about to be
                 // (or is being) elevated warm→hot on the shared copy stream and
-                // under the same `enter_migrate()` guard this drain holds. Backing
-                // it up hot→warm right now is redundant work that MONOPOLISES the
-                // persistence thread + guard + stream against the very elevation
+                // on the persistence thread this drain runs on. Backing it up
+                // hot→warm right now is redundant work that MONOPOLISES the
+                // persistence thread + stream against the very elevation
                 // the decode is blocked on — the tier-migration livelock where the
                 // same working set churns hot→warm every pass while the decode
                 // lands zero forwards. Defer its warm copy until it leaves the
@@ -1646,6 +1664,25 @@ impl Substrate {
                 }
                 (slot.hot.is_some() && slot.warm.is_none()).then_some(slot.byte_size)
             })
+            .sum()
+    }
+
+    /// Number of residences holding a warm (host RAM) copy — the population the
+    /// RAM purge draws its victims from. The persistence thread gates its purge
+    /// on this being non-zero, so a workspace with nothing warm never pays the
+    /// OS memory query.
+    pub fn warm_resident_count(&self) -> usize {
+        self.warm_lru.len()
+    }
+
+    /// Total bytes held by warm (host RAM) copies — the byte size of the purge
+    /// population. This is the one host-side quantity admission throttling can
+    /// actually shrink, so the memory report needs it in bytes, not just as a
+    /// residence count. O(warm residences), taken once per persistence pass.
+    pub fn warm_resident_bytes(&self) -> u64 {
+        self.warm_lru
+            .iter()
+            .map(|idx| self.residence[idx.0].byte_size)
             .sum()
     }
 
@@ -1715,8 +1752,8 @@ impl Substrate {
                 // analogue of the hot→warm skip in `snapshot_pending_warm` (the fix
                 // 47a9c5ba applied only to the hot→warm leg). A just-cold-recalled
                 // working set lands warm-resident and would be gathered warm→cold on
-                // the very next pass; that GPU gather runs OUTSIDE the `enter_migrate`
-                // guard and shares the copy stream + the sealed arenas the in-flight
+                // the very next pass; that GPU gather shares the copy stream and
+                // the sealed arenas the in-flight
                 // decode is still creeping into (Arc-shared via `inject_arc_sealed`),
                 // so it de-syncs the slot's per-layer fill (layer 0 races a chunk
                 // ahead) and the concurrent reproject's `reserve_glue_gap` trips
@@ -1960,14 +1997,33 @@ impl Substrate {
         })
     }
 
-    /// Drop warm-tier residences from the LRU tail until the system
-    /// has at least `headroom_target` bytes of available RAM after
-    /// the upcoming `incoming_bytes` allocation lands.
+    /// Ceiling on warm bytes one [`Self::purge_warm_to_target`] call may free.
     ///
-    /// Threshold per the design: `max(2 GiB, 5% × total_ram)`. The
-    /// caller passes the OS-reported `(total_ram, available_ram)` —
-    /// keeping the OS query at the orchestrator level so the substrate
-    /// stays sysinfo-free and unit-testable without mocking.
+    /// The purge chases a *total free RAM* threshold, which a process holding a
+    /// large non-pageable allocation can be structurally unable to reach — an
+    /// 11 GB pinned MoE expert pool on a 32 GB box is never released, so no
+    /// amount of warm shedding lifts free RAM over a 2 GiB bar. This bound turns
+    /// that unreachable case from "drain the entire warm tier every pass, and
+    /// pay a cold re-fetch on every subsequent read" into a slow trickle, while
+    /// leaving the reachable case (transient warm growth during a bulk ingest)
+    /// fully served — 1 GiB is several passes' worth of migration output.
+    const WARM_PURGE_MAX_BYTES_PER_PASS: u64 = 1024 * 1024 * 1024;
+
+    /// Drop warm-tier residences from the LRU tail until the warm tier fits its
+    /// host-RAM **budget** (`candle::vram::host_ram_budget` — total minus the OS
+    /// buffer, the pinned pools, and the fully-reserved weights), leaving room
+    /// for `incoming_bytes` about to be installed.
+    ///
+    /// Budget-based, not availability-based. The old threshold compared OS
+    /// "available" against `max(2 GiB, 5%)` — a number the mmap'd weights push
+    /// down as the page cache fills, so on a box whose model fills RAM the purge
+    /// drained the ENTIRE warm tier every pass chasing a target no amount of
+    /// purging could reach. Against the budget, a zero-budget machine correctly
+    /// keeps warm transient-only, and a large-RAM machine finally gets to RETAIN
+    /// its warm tier up to the computed ceiling instead of an arbitrary floor.
+    /// The caller passes the budget — keeping the gauge/env reads at the
+    /// orchestrator level so the substrate stays dependency-free and
+    /// unit-testable.
     ///
     /// **Invariants:**
     /// - Only warm bytes are freed (`residence.warm = None`); hot and
@@ -1976,16 +2032,24 @@ impl Substrate {
     ///   hot→warm DMA.
     /// - LRU-ordered: pops from the back of `warm_lru`.
     /// - Single batch: no intermediate work between victims.
+    /// - **Bounded**: at most [`WARM_PURGE_MAX_BYTES_PER_PASS`] per call.
+    ///
+    /// The per-pass bound is what makes an UNREACHABLE target safe. The
+    /// threshold counts total free RAM, but a large share of this process's
+    /// footprint can be non-pageable and permanent — an 11 GB pinned MoE expert
+    /// pool on a 32 GB box leaves free RAM structurally under a 2 GiB
+    /// threshold no matter how much warm KV is shed. Unbounded, the loop then
+    /// drains the ENTIRE warm tier every pass chasing a target it can never
+    /// reach, and every subsequent read pays a cold re-fetch. Bounded, the same
+    /// state degrades to steady incremental shedding: real relief when the
+    /// target is reachable, a slow trickle when it is not.
     ///
     /// Returns a [`PurgeReport`] with `count` victims and `bytes`
     /// freed (sum of `residence.byte_size`).
-    pub fn purge_warm_to_target(
-        &mut self,
-        incoming_bytes: u64,
-        available_ram: u64,
-        total_ram: u64,
-    ) -> PurgeReport {
-        let threshold: u64 = std::cmp::max(2 * 1024 * 1024 * 1024, total_ram / 20);
+    pub fn purge_warm_to_budget(&mut self, warm_budget: u64, incoming_bytes: u64) -> PurgeReport {
+        // Room the incoming install needs comes out of the same budget.
+        let target: u64 = warm_budget.saturating_sub(incoming_bytes);
+        let mut warm_now: u64 = self.warm_resident_bytes();
         let mut freed_bytes: u64 = 0;
         let mut count: usize = 0;
         // Residences popped off the LRU tail that we must NOT drop (their warm
@@ -1993,11 +2057,12 @@ impl Substrate {
         // loop so a later pass reclaims them once a lower tier lands.
         let mut skipped: Vec<ResidenceIndex> = Vec::new();
         loop {
-            // available + freed - incoming >= threshold ?
-            let projected = available_ram
-                .saturating_add(freed_bytes)
-                .saturating_sub(incoming_bytes);
-            if projected >= threshold {
+            if warm_now <= target {
+                break;
+            }
+            // Per-pass bound: an unreachable target must degrade to incremental
+            // shedding, not a full drain of the warm tier on every pass.
+            if freed_bytes >= Self::WARM_PURGE_MAX_BYTES_PER_PASS {
                 break;
             }
             // Pop LRU off the back of the warm list.
@@ -2016,6 +2081,7 @@ impl Substrate {
             let slot = &mut self.residence[idx.0];
             if slot.warm.take().is_some() {
                 freed_bytes = freed_bytes.saturating_add(slot.byte_size);
+                warm_now = warm_now.saturating_sub(slot.byte_size);
                 count += 1;
                 tracing::trace!(
                     target: "candle_conversation::persistence::tier",
@@ -2037,10 +2103,8 @@ impl Substrate {
                 target: "candle_conversation::persistence::tier",
                 count,
                 bytes = freed_bytes,
-                threshold,
+                warm_budget,
                 incoming_bytes,
-                available_ram,
-                total_ram,
                 "warm purge batch complete"
             );
         }
@@ -2691,9 +2755,20 @@ impl Substrate {
     /// Push a turn onto the pending-summary queue.  Used during
     /// cold-load reconstruction (§4) to re-enqueue orphan turns whose
     /// summary parent didn't survive a crash.
+    ///
+    /// Timelines in APPEND-ONLY ingest layers (repo_map, code_reading) never
+    /// enqueue, regardless of their per-timeline `summarize` flag: ingest
+    /// turns are background reference whose summaries the ingest pipeline
+    /// itself owns, and letting them queue here storms the summariser with
+    /// pointless decodes during a repo scan (competing with the ingest's own
+    /// forwards for the GPU). Enforced at the mechanism so no ingest path can
+    /// forget to clear the flag.
     pub fn push_pending_summary(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        // One map lookup: the entry carries its layer, so the per-timeline
+        // flag and the append-only-layer refusal read off the same borrow
+        // (`append_only_layers` is a disjoint field).
         if let Some(tl) = self.timelines.get_mut(&timeline) {
-            if !tl.summarize {
+            if !tl.summarize || self.append_only_layers.contains(&tl.layer) {
                 return;
             }
             tl.pending_summary_queue.push_back(idx);
@@ -4103,6 +4178,36 @@ impl Substrate {
     /// present after load. Tombstoned timelines are excluded — a dead
     /// conversation must never count as a cache hit (it no longer serves
     /// retrieval), or its file would silently vanish from the layer.
+    /// Like [`Self::timelines_with_metadata`], but also admits a tombstoned
+    /// timeline when it carries a distillation mode.
+    ///
+    /// For the calibration resume filter only. A calibration exemplar's designed
+    /// end state is archived + distilled(`ProvenanceOnly`) + tombstoned: out of
+    /// the live gather, still answering the belief scan by signature. The
+    /// live-only lookup cannot see that state, so the resume filter read every
+    /// such exemplar as "never ran" and regenerated it — ~196 per boot.
+    ///
+    /// The distill requirement is the whole point: an ORDINARY tombstone still
+    /// means gone, and must stay invisible to provenance and to these checks.
+    /// Only the distill flag distinguishes "retired by design, sigs retained"
+    /// from "retired, finished".
+    pub fn timelines_with_metadata_including_distilled(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Vec<TimelineId> {
+        self.timelines
+            .iter()
+            .filter(|(tid, tl)| {
+                let live = !self.tombstoned_timelines.contains(tid);
+                let distilled_tombstone = !live && self.distill_mode(**tid).is_some();
+                (live || distilled_tombstone)
+                    && tl.custom.get(key).map(|v| v.as_str()) == Some(value)
+            })
+            .map(|(tid, _)| *tid)
+            .collect()
+    }
+
     pub fn timelines_with_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
         self.timelines
             .iter()
@@ -5460,7 +5565,7 @@ mod tests {
         let residence = sub.turn_residence(timeline, idx).unwrap();
         // Drop hot, install a marker warm payload, set byte_size for
         // accounting. The actual SealedSequence content doesn't matter
-        // for the purge — purge_warm_to_target counts `residence.
+        // for the purge — purge_warm_to_budget counts `residence.
         // byte_size`, not the warm vec's bytes.
         sub.residence[residence.0].hot = None;
         sub.residence[residence.0].byte_size = bytes;
@@ -5493,10 +5598,8 @@ mod tests {
         install_warm_only(&mut sub, timeline, 1_000_000, true);
         install_warm_only(&mut sub, timeline, 1_000_000, true);
 
-        // 64 GB total, 32 GB available, incoming 1 MB. Threshold is
-        // max(2 GiB, 5% * 64 GB) = 3.2 GB. 32 GB - 1 MB >> 3.2 GB.
-        let r =
-            sub.purge_warm_to_target(1_000_000, 32 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024);
+        // Warm holds 2 MB against a 32 GiB budget — nothing to shed.
+        let r = sub.purge_warm_to_budget(32 * 1024 * 1024 * 1024, 1_000_000);
         assert_eq!(r.count, 0);
         assert_eq!(r.bytes, 0);
     }
@@ -5512,19 +5615,9 @@ mod tests {
         let a = install_warm_only(&mut sub, timeline, 500_000_000, true);
         let b = install_warm_only(&mut sub, timeline, 500_000_000, true);
 
-        // 8 GB total, 2 GB available, incoming 1 GB. Threshold is
-        // max(2 GiB = 2_147_483_648, 8 GB / 20 = 400 MB) = 2 GiB.
-        // projected = 2 GB - 1 GB = 1 GB < 2 GiB → must purge.
-        // After dropping a (500 MB): projected = 1 GB + 500 MB = 1.5 GB
-        //   still < 2 GiB → drop b.
-        // After dropping b: projected = 1 GB + 1 GB = 2 GB. 2 GB <
-        //   2 GiB (2 GiB = 2.147 GB) → still under, but warm_lru is
-        //   now empty, so loop exits.
-        let r = sub.purge_warm_to_target(
-            1_000_000_000,
-            2 * 1000 * 1000 * 1000,
-            8 * 1000 * 1000 * 1000,
-        );
+        // Warm holds 1 GB; the budget is 500 MB and an incoming 500 MB recall
+        // needs its room too → target 0 → both LRU victims go.
+        let r = sub.purge_warm_to_budget(500_000_000, 500_000_000);
         assert_eq!(r.count, 2, "both warm residences should be popped");
         assert_eq!(r.bytes, 1_000_000_000);
         assert!(sub.residence[a.0].warm.is_none(), "a (LRU) dropped first");
@@ -5542,9 +5635,8 @@ mod tests {
         let a = install_warm_only(&mut sub, timeline, 500_000_000, false);
         let b = install_warm_only(&mut sub, timeline, 500_000_000, true);
 
-        // Tight headroom that would otherwise purge both: 8 GB total, 1 GB
-        // available, incoming 0, threshold 2 GiB. projected = 1 GB < 2 GiB.
-        let r = sub.purge_warm_to_target(0, 1_000_000_000, 8 * 1000 * 1000 * 1000);
+        // A zero budget would otherwise purge both.
+        let r = sub.purge_warm_to_budget(0, 0);
         // Only the cold-backed residence (b) is dropped; the un-backed one (a)
         // is preserved and stays warm-resident.
         assert_eq!(r.count, 1, "only the cold-backed warm is purgeable");
@@ -5564,38 +5656,95 @@ mod tests {
     #[test]
     fn purge_handles_empty_warm_lru() {
         let mut sub = Substrate::new();
-        // No warm residences exist; the loop should exit on the first
-        // `pop_back` returning None.
-        let r = sub.purge_warm_to_target(
-            10 * 1024 * 1024 * 1024,
-            1024 * 1024 * 1024,      // 1 GiB available
-            64 * 1024 * 1024 * 1024, // 64 GiB total
-        );
+        // No warm residences exist; warm_now = 0 <= any target → no-op even at
+        // a zero budget with a large incoming reservation.
+        let r = sub.purge_warm_to_budget(0, 10 * 1024 * 1024 * 1024);
         assert_eq!(r.count, 0);
         assert_eq!(r.bytes, 0);
     }
 
-    /// 5% rule fires when 5% × total_ram > 2 GiB. With 256 GB total
-    /// the threshold is 12.8 GB, not 2 GiB.
+    /// A ZERO budget must not drain the whole warm tier in one pass.
+    ///
+    /// The zero-budget machine still fills warm transiently mid-drain; shedding
+    /// it all at once each pass would turn every later read into a cold
+    /// re-fetch. The per-pass bound turns "over budget" into steady incremental
+    /// shedding.
     #[test]
-    fn purge_threshold_is_max_of_2gib_and_5_percent() {
+    fn a_zero_budget_sheds_incrementally_not_everything() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // 24 warm residences of 256 MiB each = 6 GiB of warm tier.
+        const VICTIM: u64 = 256 * 1024 * 1024;
+        for _ in 0..24 {
+            install_warm_only(&mut sub, timeline, VICTIM, true);
+        }
+        assert_eq!(sub.warm_resident_count(), 24);
+
+        let r = sub.purge_warm_to_budget(0, 0);
+
+        // Exactly the per-pass bound is shed — 1 GiB, i.e. four victims — and the
+        // rest of the warm tier survives for the next pass.
+        assert_eq!(r.bytes, Substrate::WARM_PURGE_MAX_BYTES_PER_PASS);
+        assert_eq!(r.count, 4);
+        assert_eq!(sub.warm_resident_count(), 20);
+
+        // A second pass sheds the next slice rather than everything at once.
+        let r2 = sub.purge_warm_to_budget(0, 0);
+        assert_eq!(r2.count, 4);
+        assert_eq!(sub.warm_resident_count(), 16);
+    }
+
+    /// A budget the warm tier only slightly exceeds sheds exactly enough — the
+    /// bound must not make the purge over-shed when the target is reachable.
+    #[test]
+    fn a_reachable_budget_stops_at_the_target() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        const VICTIM: u64 = 256 * 1024 * 1024;
+        for _ in 0..24 {
+            install_warm_only(&mut sub, timeline, VICTIM, true);
+        }
+        // 6 GiB warm against a budget one victim short of it.
+        let budget = 23 * VICTIM;
+        let r = sub.purge_warm_to_budget(budget, 0);
+        assert_eq!(r.count, 1);
+        assert_eq!(r.bytes, VICTIM);
+        assert_eq!(sub.warm_resident_count(), 23);
+    }
+
+    /// The persistence thread gates its RAM purge on this count, so it must
+    /// track the warm population regardless of HOW warm was produced — the
+    /// migration is not warm's only producer (cold recalls land warm too), and a
+    /// gate that misses those routes lets warm grow unbounded while the purge
+    /// stays silent.
+    #[test]
+    fn warm_resident_count_tracks_the_purgeable_population() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        assert_eq!(sub.warm_resident_count(), 0);
+
+        install_warm_only(&mut sub, timeline, 1024, true);
+        install_warm_only(&mut sub, timeline, 2048, true);
+        assert_eq!(sub.warm_resident_count(), 2);
+
+        // Purging drops them out of the population, so a workspace that has been
+        // purged clean stops paying for the OS query.
+        let r = sub.purge_warm_to_budget(0, 0);
+        assert_eq!(r.count, 2);
+        assert_eq!(sub.warm_resident_count(), 0);
+    }
+
+    /// The purge fires exactly at the budget boundary: warm at or under the
+    /// budget is untouched; one byte of incoming reservation over tips it.
+    #[test]
+    fn purge_fires_exactly_at_the_budget_boundary() {
         let (_, _, timeline, mut sub) = make_timeline();
         // One LRU warm victim of 2 GB.
         install_warm_only(&mut sub, timeline, 2_000_000_000, true);
 
-        // 256 GB total, 14 GB available, incoming 0. Threshold =
-        // max(2 GiB, 256 GB * 0.05 = 12.8 GB) = 12.8 GB.
-        // projected = 14 GB > 12.8 GB → no purge.
-        let r = sub.purge_warm_to_target(0, 14 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
-        assert_eq!(r.count, 0, "14 GB available > 5% × 256 GB threshold");
+        // Warm == budget → nothing shed.
+        let r = sub.purge_warm_to_budget(2_000_000_000, 0);
+        assert_eq!(r.count, 0, "warm exactly at budget stays");
 
-        // Now 13 GB available, threshold still 12.8 GB. projected =
-        // 13 GB > 12.8 GB → still no purge.
-        let r = sub.purge_warm_to_target(0, 13 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
-        assert_eq!(r.count, 0);
-
-        // 12 GB available → projected < threshold → purge fires.
-        let r = sub.purge_warm_to_target(0, 12 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
+        // Incoming reservation pushes the target below current warm → shed.
+        let r = sub.purge_warm_to_budget(2_000_000_000, 1);
         assert_eq!(r.count, 1);
         assert_eq!(r.bytes, 2_000_000_000);
     }
@@ -6353,6 +6502,40 @@ mod tests {
         );
     }
 
+    /// A timeline in an append-only ingest layer (repo_map, code_reading)
+    /// never enqueues turns for the summariser, regardless of its own
+    /// `summarize` flag — enforced in `push_pending_summary` itself so no
+    /// ingest path can forget to clear the flag. A dialogue timeline on a
+    /// normal layer still enqueues.
+    #[test]
+    fn append_only_layer_turns_never_enqueue_for_summary() {
+        use crate::projection::{GroupId, LayerId, TimelineAllocator};
+        let mut sub = Substrate::new();
+        let alloc = TimelineAllocator::new();
+
+        let ingest_layer = LayerId::for_test(1);
+        let ingest_tl = alloc.next();
+        sub.register_timeline(ingest_tl, ingest_layer, GroupId::for_test(1));
+        sub.mark_layer_append_only(ingest_layer);
+
+        let dlg_tl = alloc.next();
+        sub.register_timeline(dlg_tl, LayerId::for_test(2), GroupId::for_test(2));
+
+        sub.push_pending_summary(ingest_tl, TurnIndex(0));
+        sub.push_pending_summary(dlg_tl, TurnIndex(0));
+
+        assert_eq!(
+            sub.pending_summary_len(ingest_tl),
+            0,
+            "append-only ingest turn must not queue for the summariser"
+        );
+        assert_eq!(
+            sub.pending_summary_len(dlg_tl),
+            1,
+            "dialogue turn must still queue"
+        );
+    }
+
     /// Replaying a coupling record makes the round-trip visible to the
     /// summariser and selector. Idempotent: the records carry no ordering, and a
     /// recovery walk may present the same one twice.
@@ -6824,6 +7007,52 @@ mod tests {
             sub.timelines_with_metadata("content_sha256", "h1"),
             vec![tl]
         );
+    }
+
+    /// The distill-inclusive lookup admits a tombstoned timeline ONLY when it is
+    /// distilled, and an ordinary tombstone stays invisible.
+    ///
+    /// A calibration exemplar's designed end state is archived + distilled
+    /// (`ProvenanceOnly`) + tombstoned — out of the live gather, still answering
+    /// the belief scan by signature. The live-only lookup could not see it, so
+    /// the calibration resume filter read every finished exemplar as "never ran"
+    /// and regenerated it. Widening the filter to ALL tombstones would have been
+    /// wrong in the other direction: a genuinely retired conversation must stay
+    /// ignored by provenance and by these checks. The distill flag is the only
+    /// thing that separates the two.
+    #[test]
+    fn distill_inclusive_lookup_admits_only_distilled_tombstones() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let live = alloc.next();
+        let corpus = alloc.next();
+        let retired = alloc.next();
+        let mut sub = Substrate::new();
+        for t in [live, corpus, retired] {
+            sub.register_timeline(t, layer, group);
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("calib".to_string(), "marker-1".to_string());
+            sub.merge_custom(t, &m);
+        }
+        // `corpus` is the provenance corpus: distilled AND tombstoned.
+        sub.distill_timeline(corpus, DistillMode::ProvenanceOnly);
+        sub.tombstone_timeline(corpus);
+        // `retired` is an ordinary tombstone — gone, and must stay gone.
+        sub.tombstone_timeline(retired);
+
+        let mut got = sub.timelines_with_metadata_including_distilled("calib", "marker-1");
+        got.sort();
+        let mut want = vec![live, corpus];
+        want.sort();
+        assert_eq!(got, want, "distilled tombstone admitted, ordinary one not");
+        assert!(
+            !got.contains(&retired),
+            "an ordinary tombstone must remain invisible to calibration/provenance"
+        );
+
+        // The live-only lookup is unchanged — everything else still wants it.
+        assert_eq!(sub.timelines_with_metadata("calib", "marker-1"), vec![live]);
     }
 
     #[test]

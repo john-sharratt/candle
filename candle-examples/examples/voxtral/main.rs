@@ -1,3 +1,12 @@
+//! Voxtral speech-to-text transcription (`mistralai/Voxtral-Mini-3B-2507`).
+//!
+//! `--input` is a wav file path, or `sample:<name>` to fetch a demo clip
+//! (e.g. `sample:jfk`) from the `Narsil/candle-examples` HF dataset; default
+//! is `jfk.wav`. Model download/loading lives in the local `download` and
+//! `model` modules (`VoxtralModel`); CUDA builds default to GPU unless
+//! `--cpu` is set, CPU-only builds always run on CPU. Decodes the wav with
+//! `candle_examples::audio::pcm_decode` and prints the transcribed text.
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use hf_hub::api::sync::Api;

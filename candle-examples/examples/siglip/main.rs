@@ -1,3 +1,14 @@
+//! Zero-shot image-text matching with SigLIP/SigLIP2 (`candle_transformers::
+//! models::siglip::Model`): scores a set of candidate text sequences against
+//! one or more images via a sigmoid (not softmax-normalized-together)
+//! contrastive loss, then softmaxes per-image here for display.
+//!
+//! `--which` selects SigLIP v1 (base-patch16-224) or SigLIP2 at several
+//! patch16 resolutions (224/256/384/512, base or large). `--images` and
+//! `--sequences` are comma-delimited lists (defaults to two sample images and
+//! three sample captions); `--image-size` overrides the config's default
+//! input resolution.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

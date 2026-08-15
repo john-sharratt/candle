@@ -1,3 +1,12 @@
+//! Vision Transformer (ViT-Base/16) ImageNet classification
+//! (`google/vit-base-patch16-224`).
+//!
+//! `--image` is preprocessed to 224x224 via
+//! `candle_examples::imagenet::load_image224`; `--model` overrides the
+//! default hub checkpoint. Single forward pass through
+//! `vit::Model::new(&vit::Config::vit_base_patch16_224(), 1000, vb)`,
+//! printing the top-5 predicted ImageNet classes with probabilities.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

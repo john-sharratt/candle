@@ -3,28 +3,72 @@ use crate::{Layout, Result, WithDType};
 pub use cudarc;
 use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
 
-use super::{CudaDevice, CudaError, WrapErr};
+use super::{Backing, CudaDevice, CudaError, CudaStorage, WrapErr};
 
 pub type S = super::CudaStorageSlice;
 
+/// An op's output slice together with the [`Backing`] the storage wrapping it
+/// must carry.
+///
+/// Returned as a pair, never separately: a wave range marked `Owned` is a double
+/// free and a pool buffer marked `Lease` is a permanent leak, so the only safe
+/// shape is one where the allocation decides its own tag. Every `f` below
+/// produces this by calling [`super::alloc_inheriting`] rather than `dev.alloc`.
+pub type Out<T> = (CudaSlice<T>, Backing);
+
+/// The same pairing for the dtype-erased dispatchers.
+pub type OutS = (S, Backing);
+
 pub trait Map1 {
+    /// `origin` is the operand's backing — the arena this op's output should be
+    /// allocated from, so a result computed over wave-backed memory stays on it.
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
         &self,
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         layout: &Layout,
-    ) -> Result<CudaSlice<T>>;
+        origin: Backing,
+    ) -> Result<Out<T>>;
 
-    fn map(&self, s: &S, d: &CudaDevice, l: &Layout) -> Result<S> {
-        let out = match s {
-            S::U8(s) => S::U8(self.f(s, d, l)?),
-            S::U32(s) => S::U32(self.f(s, d, l)?),
-            S::I64(s) => S::I64(self.f(s, d, l)?),
-            S::BF16(s) => S::BF16(self.f(s, d, l)?),
-            S::F16(s) => S::F16(self.f(s, d, l)?),
-            S::F32(s) => S::F32(self.f(s, d, l)?),
-            S::F64(s) => S::F64(self.f(s, d, l)?),
-            S::F8E4M3(s) => S::F8E4M3(self.f(s, d, l)?),
+    /// Takes the whole [`CudaStorage`], not just its slice: the slice is dtype
+    /// and bytes, the storage is where those bytes came from, and the second is
+    /// exactly what this dispatch exists to pass along.
+    fn map(&self, s: &CudaStorage, d: &CudaDevice, l: &Layout) -> Result<OutS> {
+        let o = s.backing;
+        let out = match &s.slice {
+            S::U8(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::U8(v), b)
+            }
+            S::U32(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::U32(v), b)
+            }
+            S::I64(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::I64(v), b)
+            }
+            S::BF16(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::BF16(v), b)
+            }
+            S::F16(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::F16(v), b)
+            }
+            S::F32(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::F32(v), b)
+            }
+            S::F64(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::F64(v), b)
+            }
+            S::F8E4M3(x) => {
+                let (v, b) = self.f(x, d, l, o)?;
+                (S::F8E4M3(v), b)
+            }
+            S::Moved => S::unreachable_moved(),
         };
         Ok(out)
     }
@@ -38,63 +82,56 @@ pub trait Map2 {
         src2: &CudaSlice<T>,
         layout2: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>>;
+        origin: Backing,
+    ) -> Result<Out<T>>;
 
-    fn map(&self, s1: &S, l1: &Layout, s2: &S, l2: &Layout, d: &CudaDevice) -> Result<S> {
-        let out = match (s1, s2) {
-            (S::U8(s1), S::U8(s2)) => S::U8(self.f(s1, l1, s2, l2, d)?),
-            (S::U32(s1), S::U32(s2)) => S::U32(self.f(s1, l1, s2, l2, d)?),
-            (S::I64(s1), S::I64(s2)) => S::I64(self.f(s1, l1, s2, l2, d)?),
-            (S::BF16(s1), S::BF16(s2)) => S::BF16(self.f(s1, l1, s2, l2, d)?),
-            (S::F16(s1), S::F16(s2)) => S::F16(self.f(s1, l1, s2, l2, d)?),
-            (S::F32(s1), S::F32(s2)) => S::F32(self.f(s1, l1, s2, l2, d)?),
-            (S::F64(s1), S::F64(s2)) => S::F64(self.f(s1, l1, s2, l2, d)?),
-            (S::F8E4M3(s1), S::F8E4M3(s2)) => S::F8E4M3(self.f(s1, l1, s2, l2, d)?),
-            _ => Err(CudaError::InternalError(
-                "dtype mismatch in binary op".to_string(),
-            ))?,
-        };
-        Ok(out)
-    }
-}
-
-pub trait Map3 {
-    #[allow(clippy::too_many_arguments)]
-    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
-        &self,
-        src1: &CudaSlice<T>,
-        layout1: &Layout,
-        src2: &CudaSlice<T>,
-        layout2: &Layout,
-        src3: &CudaSlice<T>,
-        layout3: &Layout,
-        dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>>;
-
-    #[allow(clippy::too_many_arguments)]
+    /// Inherits from the **first** operand. Both share one `'w` by the time they
+    /// reach here — variance already unified them at the shorter — so either
+    /// would serve, and naming one keeps the rule stated in a single place.
     fn map(
         &self,
-        s1: &S,
+        s1: &CudaStorage,
         l1: &Layout,
-        s2: &S,
+        s2: &CudaStorage,
         l2: &Layout,
-        s3: &S,
-        l3: &Layout,
         d: &CudaDevice,
-    ) -> Result<S> {
-        let out = match (s1, s2, s3) {
-            (S::U8(s1), S::U8(s2), S::U8(s3)) => S::U8(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::U32(s1), S::U32(s2), S::U32(s3)) => S::U32(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::I64(s1), S::I64(s2), S::I64(s3)) => S::I64(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::BF16(s1), S::BF16(s2), S::BF16(s3)) => S::BF16(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::F16(s1), S::F16(s2), S::F16(s3)) => S::F16(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::F32(s1), S::F32(s2), S::F32(s3)) => S::F32(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::F64(s1), S::F64(s2), S::F64(s3)) => S::F64(self.f(s1, l1, s2, l2, s3, l3, d)?),
-            (S::F8E4M3(s1), S::F8E4M3(s2), S::F8E4M3(s3)) => {
-                S::F8E4M3(self.f(s1, l1, s2, l2, s3, l3, d)?)
+    ) -> Result<OutS> {
+        let o = s1.backing;
+        let out = match (&s1.slice, &s2.slice) {
+            (S::U8(a), S::U8(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::U8(v), b)
+            }
+            (S::U32(a), S::U32(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::U32(v), b)
+            }
+            (S::I64(a), S::I64(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::I64(v), b)
+            }
+            (S::BF16(a), S::BF16(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::BF16(v), b)
+            }
+            (S::F16(a), S::F16(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::F16(v), b)
+            }
+            (S::F32(a), S::F32(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::F32(v), b)
+            }
+            (S::F64(a), S::F64(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::F64(v), b)
+            }
+            (S::F8E4M3(a), S::F8E4M3(c)) => {
+                let (v, b) = self.f(a, l1, c, l2, d, o)?;
+                (S::F8E4M3(v), b)
             }
             _ => Err(CudaError::InternalError(
-                "dtype mismatch in ternary op".to_string(),
+                "dtype mismatch in binary op".to_string(),
             ))?,
         };
         Ok(out)
@@ -142,18 +179,21 @@ pub trait Map1Any {
         dev: &CudaDevice,
         layout: &Layout,
         wrap: W,
-    ) -> Result<S>;
+        origin: Backing,
+    ) -> Result<OutS>;
 
-    fn map(&self, s: &S, d: &CudaDevice, l: &Layout) -> Result<S> {
-        let out = match s {
-            S::U8(s) => self.f(s, d, l, S::U8)?,
-            S::U32(s) => self.f(s, d, l, S::U32)?,
-            S::I64(s) => self.f(s, d, l, S::I64)?,
-            S::BF16(s) => self.f(s, d, l, S::BF16)?,
-            S::F16(s) => self.f(s, d, l, S::F16)?,
-            S::F32(s) => self.f(s, d, l, S::F32)?,
-            S::F64(s) => self.f(s, d, l, S::F64)?,
-            S::F8E4M3(s) => self.f(s, d, l, S::F8E4M3)?,
+    fn map(&self, s: &CudaStorage, d: &CudaDevice, l: &Layout) -> Result<OutS> {
+        let o = s.backing;
+        let out = match &s.slice {
+            S::U8(x) => self.f(x, d, l, S::U8, o)?,
+            S::U32(x) => self.f(x, d, l, S::U32, o)?,
+            S::I64(x) => self.f(x, d, l, S::I64, o)?,
+            S::BF16(x) => self.f(x, d, l, S::BF16, o)?,
+            S::F16(x) => self.f(x, d, l, S::F16, o)?,
+            S::F32(x) => self.f(x, d, l, S::F32, o)?,
+            S::F64(x) => self.f(x, d, l, S::F64, o)?,
+            S::F8E4M3(x) => self.f(x, d, l, S::F8E4M3, o)?,
+            S::Moved => S::unreachable_moved(),
         };
         Ok(out)
     }
@@ -167,18 +207,27 @@ pub trait Map2Any {
         src2: &CudaSlice<T>,
         layout2: &Layout,
         dev: &CudaDevice,
-    ) -> Result<S>;
+        origin: Backing,
+    ) -> Result<OutS>;
 
-    fn map(&self, s1: &S, l1: &Layout, s2: &S, l2: &Layout, d: &CudaDevice) -> Result<S> {
-        let out = match (s1, s2) {
-            (S::U8(s1), S::U8(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::U32(s1), S::U32(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::I64(s1), S::I64(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::BF16(s1), S::BF16(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::F16(s1), S::F16(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::F32(s1), S::F32(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::F64(s1), S::F64(s2)) => self.f(s1, l1, s2, l2, d)?,
-            (S::F8E4M3(s1), S::F8E4M3(s2)) => self.f(s1, l1, s2, l2, d)?,
+    fn map(
+        &self,
+        s1: &CudaStorage,
+        l1: &Layout,
+        s2: &CudaStorage,
+        l2: &Layout,
+        d: &CudaDevice,
+    ) -> Result<OutS> {
+        let o = s1.backing;
+        let out = match (&s1.slice, &s2.slice) {
+            (S::U8(a), S::U8(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::U32(a), S::U32(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::I64(a), S::I64(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::BF16(a), S::BF16(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::F16(a), S::F16(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::F32(a), S::F32(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::F64(a), S::F64(c)) => self.f(a, l1, c, l2, d, o)?,
+            (S::F8E4M3(a), S::F8E4M3(c)) => self.f(a, l1, c, l2, d, o)?,
             _ => Err(CudaError::InternalError(
                 "dtype mismatch in binary op".to_string(),
             ))

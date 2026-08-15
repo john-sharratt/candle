@@ -1,3 +1,16 @@
+//! T5 / mT5 example: encoder-only sentence embeddings, or full
+//! encoder-decoder text generation.
+//!
+//! `--which` selects the checkpoint (`t5-small/base/large/3b`,
+//! `google/mt5-small/base/large`), resolved by `T5ModelBuilder::load`
+//! (mT5 pulls its tokenizer from a separate `lmz/mt5-tokenizers` repo).
+//! Without `--prompt`, encodes a fixed demo sentence set and prints the
+//! top-5 most cosine-similar pairs. With `--prompt` and no `--decode`, runs
+//! the encoder only and prints its output tensor. With `--prompt --decode`,
+//! autoregressively generates from `T5ForConditionalGeneration`, optionally
+//! seeded with `--decoder-prompt`; `--disable-cache` turns off decoder KV
+//! caching.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

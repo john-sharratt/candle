@@ -251,6 +251,18 @@ pub struct GlueMarkers {
     pub no_think: String,
 }
 
+/// Which `summarize_examples` option matches a round-trip chain of
+/// `prefilled_pairs` prefilled `(user, assistant)` pairs: one pair is a
+/// `code_reading` scope read (request → call → excerpt → summary), more is the
+/// `repo_map` folder walk (request → list → listing → read → excerpt → summary).
+fn examples_shape(prefilled_pairs: usize) -> &'static str {
+    if prefilled_pairs > 1 {
+        "folder"
+    } else {
+        "file"
+    }
+}
+
 impl Sequence {
     /// Create a new conversation backed by a full projection [`Builder`].
     ///
@@ -496,6 +508,16 @@ impl Sequence {
                     // them at projection time, but do NOT add them
                     // to fixed_prefix — the priming projection must
                     // be coherent for the empty-collection case.
+                    //
+                    // This is also why these members cannot be offloaded as the
+                    // section tree's embedded collections are: those never enter
+                    // `linear_prefix`, so nothing prefills against them once
+                    // their branch is sealed. These do. Offloading them here
+                    // costs every later section its prefix — `prepare_section_
+                    // ingest` finds no sealed substrate entry and skips it,
+                    // building a silently wrong system prompt. The cold-boot hot
+                    // set is therefore bounded by the whole collection span, not
+                    // by one collection, and the KV reservation must cover it.
                     for sec in &coll.sections {
                         if sec.is_template {
                             continue;
@@ -1483,7 +1505,7 @@ impl Sequence {
     }
 
     /// [`insert_turn_tagged`](Self::insert_turn_tagged) + staged provenance
-    /// linkage for ingest turns (repo_map clusters, code_read scopes): after
+    /// linkage for ingest turns (repo_map folders, code_read scopes): after
     /// the turn seals, synthesizes two [`ProjectionEvent`]s — one for the
     /// user half (`start_token: 0`), one for the assistant half — whose
     /// `selection.turns` reference the turn itself and its immediate
@@ -1508,50 +1530,8 @@ impl Sequence {
             // events to; the turn itself was still prefilled.
             return Ok(tokens);
         };
-        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &[])?;
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0)?;
         Ok(tokens)
-    }
-
-    /// Like [`Self::insert_turn_staged`], but `assistant_with_seams` carries
-    /// `seam_marker`s at structural boundaries (e.g. subdirectory headers in a
-    /// repo_map cluster listing). Each marker becomes a **self-referencing**
-    /// projection event, so the belief scan scores the interval between seams as an
-    /// independent retrieval sub-window that resolves back to this turn — a query
-    /// matching one region of the listing surfaces the whole cluster without
-    /// diluting against the rest. The markers are stripped before prefill (they are
-    /// not model tokens); the wide-Q sig is captured over the clean text, and the
-    /// seam offsets index it directly (the sig is dense, one entry per grid token).
-    pub fn insert_turn_staged_windowed(
-        &mut self,
-        user_message: &str,
-        assistant_with_seams: &str,
-        seam_marker: &str,
-        tags: Vec<String>,
-    ) -> crate::Result<()> {
-        let segments: Vec<&str> = assistant_with_seams.split(seam_marker).collect();
-        let clean_assistant = segments.concat();
-        let (assistant_content_start, turn_index, _tokens) =
-            self.insert_turn_inner(user_message, &clean_assistant, tags)?;
-        let Some(idx) = turn_index else {
-            return Ok(());
-        };
-        // Grid-token offset of each seam: tokenize the grid prefix up to it in the
-        // SAME format `insert_turn_inner` seals, so the offset indexes the sig.
-        let mut seams: Vec<u32> = Vec::new();
-        if segments.len() > 1 {
-            let mut prefix = format!(
-                "{}{}{}{}",
-                self.config.dialect.no_think,
-                user_message,
-                self.config.dialect.user_end,
-                self.config.dialect.assistant_start,
-            );
-            for seg in &segments[..segments.len() - 1] {
-                prefix.push_str(seg);
-                seams.push(self.tokenize(&prefix)?.len() as u32);
-            }
-        }
-        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &seams)
     }
 
     /// Shared body of [`insert_turn_tagged`] / [`insert_turn_staged`]: format,
@@ -1731,17 +1711,81 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
     ) -> crate::Result<(u32, u32, usize)> {
+        let (idxs, tokens) = self.ingest_roundtrip_chain_indices(
+            &[(call_user.to_string(), call_assistant.to_string())],
+            response_user,
+            tags,
+            max_summary_tokens,
+            &["file_read".to_string()],
+        )?;
+        match idxs.as_slice() {
+            [call, resp] => Ok((*call, *resp, tokens)),
+            _ => Err(ConversationError::Channel(
+                "scope round-trip: expected exactly two turn indices".into(),
+            )),
+        }
+    }
+
+    /// [`Self::ingest_roundtrip_chain_indices`] for a caller that owns the
+    /// timeline itself (the serial path): couples the chain here rather than
+    /// leaving it to a splice. Returns tokens ingested.
+    pub fn ingest_roundtrip_chain(
+        &mut self,
+        prefilled: &[(String, String)],
+        decode_user: &str,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        force_tools: &[String],
+    ) -> crate::Result<usize> {
+        let (indices, tokens) = self.ingest_roundtrip_chain_indices(
+            prefilled,
+            decode_user,
+            tags,
+            max_summary_tokens,
+            force_tools,
+        )?;
+        // Couple every turn except the last: each prefilled turn belongs with the
+        // one that answers it, so the summariser sees the whole exchange rather
+        // than a call with no response.
+        for idx in indices.iter().take(indices.len().saturating_sub(1)) {
+            self.couple_turn(*idx)?;
+        }
+        Ok(tokens)
+    }
+
+    /// Ingest an N-turn tool round-trip whose LAST assistant turn is decoded.
+    ///
+    /// `prefilled` holds `(user, assistant)` pairs written verbatim — each is a
+    /// request or a `<tool_response>` paired with the `<tool_call>` it provokes.
+    /// `decode_user` is the final user turn (the last tool response); its
+    /// assistant half is the model's own summary, and the only thing generated.
+    ///
+    /// Two turns is the `code_reading` scope shape (one call, one response);
+    /// three is the `repo_map` folder shape (list, then read, then summarise).
+    /// The turns are NOT coupled here, so the parallel path can run this on a
+    /// fork and splice them onto the owning timeline.
+    ///
+    /// `force_tools` names every tool a prefilled call refers to, pinned into the
+    /// catalog so each call is backed by a present definition.
+    pub fn ingest_roundtrip_chain_indices(
+        &mut self,
+        prefilled: &[(String, String)],
+        decode_user: &str,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        force_tools: &[String],
+    ) -> crate::Result<(Vec<u32>, usize)> {
         // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
         // the shared system prompt into its summarizer mode via selection — the
         // generic, per-mode section-toggling design rather than a bespoke per-layer
         // prompt string:
-        //   - tools ON, force-pinned to `file_read`: the round-trip PREFILLS a
-        //     `read_file` tool_call and its tool_response, so the projection must
+        //   - tools ON, force-pinned to the tools the prefill calls: the chain
+        //     PREFILLS tool_calls and their tool_responses, so the projection must
         //     present a coherent tool context or the model can't connect the
         //     prefill to any capability and degrades (refusals, off-language,
         //     hallucinated tool chatter). Enable the tool block and force-select
-        //     exactly the one tool the prefill uses (see `FORCE_TOOL_SELECTOR`) —
-        //     one present, coherent tool, no belief-driven catalog noise.
+        //     exactly those tools (see `FORCE_TOOL_SELECTOR`) — present, coherent,
+        //     no belief-driven catalog noise.
         //   - `persona = summarize`: swaps the "You are Zen, pair programming…"
         //     dialogue frame for the terse code-summarizer frame (content-provided,
         //     English, summary-only) — the fix for the reasoning/refusal/off-language
@@ -1752,27 +1796,38 @@ impl Sequence {
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Present,
         );
+        let pinned_tools = force_tools.join(&crate::projection::FORCE_TOOL_SEPARATOR.to_string());
         self.selection
-            .select(crate::projection::FORCE_TOOL_SELECTOR, "file_read");
+            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools.clone());
         self.selection.select("persona", "summarize");
         self.selection.select("response_length", "terse");
-        //   - `summarize_examples = present`: stuff a few worked example turns
-        //     (unrelated sample files) between the system prompt and this scope's
-        //     turns, so the model imitates the exact request→summary shape — the
-        //     strongest lever against reasoning/refusal/off-language drift.
-        self.selection.set_optional(
-            "summarize_examples",
-            crate::projection::OptionalState::Present,
-        );
-        // Turn A — the call: prefill `[request][tool_call]` + staged provenance.
-        let (call_acs, call_idx, call_tokens) =
-            self.insert_turn_inner(call_user, call_assistant, tags.clone())?;
-        let call_idx = call_idx.ok_or_else(|| {
-            ConversationError::Channel("scope round-trip: call turn produced no index".into())
-        })?;
-        self.persist_staged_ingest_events(call_idx, call_acs, 0.0, &[])?;
-        // Turn B — the response: submit the tool_response and DECODE the summary,
-        // `/no_think` + short + low-temp nucleus. The decode sees Turn A (just recorded).
+        //   - `summarize_examples`: stuff worked example turns between the system
+        //     prompt and this chain's turns so the model imitates the exact
+        //     request→summary shape. The option names the SHAPE of this chain
+        //     (`file` for a scope read, `folder` for a directory round-trip),
+        //     because an example teaches the subject as much as the format: shown
+        //     the file examples, a folder chain summarises the excerpt it was
+        //     handed rather than the directory it was asked about.
+        self.selection
+            .select("summarize_examples", examples_shape(prefilled.len()));
+        // The prefilled turns — each `[user][assistant]` written verbatim, with
+        // staged provenance so a later scan can resolve sig hit → event → turn.
+        let mut indices: Vec<u32> = Vec::with_capacity(prefilled.len() + 1);
+        let mut prefill_tokens = 0usize;
+        for (user, assistant) in prefilled {
+            let (acs, idx, tokens) = self.insert_turn_inner(user, assistant, tags.clone())?;
+            let idx = idx.ok_or_else(|| {
+                ConversationError::Channel(
+                    "round-trip chain: prefilled turn produced no index".into(),
+                )
+            })?;
+            self.persist_staged_ingest_events(idx, acs, 0.0)?;
+            indices.push(idx);
+            prefill_tokens += tokens;
+        }
+        // The final turn — submit the last tool_response and DECODE the summary,
+        // `/no_think` + short + low-temp nucleus. The decode sees every prefilled
+        // turn above (just recorded) in its projected prefix.
         //
         // `/no_think` alone does NOT reliably stop this hybrid 30B MoE from opening
         // a real `<think>` block: the empty block is *decoded*, not baked (see
@@ -1795,16 +1850,16 @@ impl Sequence {
             crate::projection::NO_THINK_SELECTOR,
             crate::projection::OptionalState::Present,
         );
-        // Same tools-ON, single-tool pin as the conversation-level selection above:
-        // the decode's own projection must also carry the coherent `file_read`
-        // context the tool_response turn refers to.
+        // Same tools-ON pin as the conversation-level selection above: the decode's
+        // own projection must also carry the coherent tool context the prefilled
+        // tool_response turns refer to.
         opts.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Present,
         );
         opts.selection
-            .select(crate::projection::FORCE_TOOL_SELECTOR, "file_read");
-        let handle = self.submit_turn_with_options(response_user, opts)?;
+            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools);
+        let handle = self.submit_turn_with_options(decode_user, opts)?;
         // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
         // flag, and this returns `IngestCancelled` instead of waiting out the
         // in-flight summary decode. Dropping `handle` on that early return stops
@@ -1818,12 +1873,13 @@ impl Sequence {
             .and_then(|s| s.turn_index)
             .ok_or_else(|| {
                 ConversationError::Channel(
-                    "scope round-trip: response turn produced no index".into(),
+                    "round-trip chain: decoded turn produced no index".into(),
                 )
             })?;
-        // Records Turn B + its staged provenance events (the decoded-ingest path).
+        // Records the decoded turn + its staged provenance events.
         self.finish_turn_staged(handle, &response)?;
-        Ok((call_idx, resp_idx, call_tokens + resp_tokens))
+        indices.push(resp_idx);
+        Ok((indices, prefill_tokens + resp_tokens))
     }
 
     /// Fork this conversation onto a fresh timeline for one parallel scope
@@ -1890,6 +1946,40 @@ impl Sequence {
         // or scored. The shared chunks stay alive via the file timeline's clones.
         let _ = self.substrate.tombstone_timeline(fork_timeline);
         Ok((new_call.0, new_resp.0))
+    }
+
+    /// [`Self::splice_scope_turns`] for a chain of any length: adopt every turn
+    /// onto this conversation's timeline in order, couple all but the last (each
+    /// prefilled turn belongs with the one answering it), and tombstone the fork.
+    /// Returns the adopted indices in the same order.
+    pub fn splice_chain_turns(
+        &self,
+        fork_timeline: TimelineId,
+        indices: &[u32],
+        tags: Vec<String>,
+    ) -> crate::Result<Vec<u32>> {
+        let target_tl = self.target.timeline;
+        let mut adopted = Vec::with_capacity(indices.len());
+        for idx in indices {
+            let new_idx = self
+                .substrate
+                .adopt_turn(
+                    fork_timeline,
+                    TurnIndex(*idx),
+                    target_tl,
+                    Role::Assistant,
+                    tags.clone(),
+                )
+                .map_err(ConversationError::Model)?;
+            adopted.push(new_idx.0);
+        }
+        for idx in adopted.iter().take(adopted.len().saturating_sub(1)) {
+            self.substrate
+                .couple_turn(target_tl, *idx)
+                .map_err(ConversationError::Model)?;
+        }
+        let _ = self.substrate.tombstone_timeline(fork_timeline);
+        Ok(adopted)
     }
 
     /// Tombstone a per-scope fork that will NOT be spliced onto the file
@@ -1976,7 +2066,7 @@ impl Sequence {
                     .map(|l| l.assistant_content_start())
                     .unwrap_or(0)
             };
-            self.persist_staged_ingest_events(idx, assistant_start, seconds, &[])?;
+            self.persist_staged_ingest_events(idx, assistant_start, seconds)?;
         }
         Ok(text)
     }
@@ -1993,14 +2083,11 @@ impl Sequence {
         turn_index: u32,
         assistant_content_start: u32,
         seconds: f64,
-        seam_offsets: &[u32],
     ) -> crate::Result<()> {
         use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::streams::StreamDecl;
         use crate::projection::event::group_name_of;
-        use crate::projection::{
-            encode_events, staged_ingest_event, ProjectionEvent, SelectedTurn, SystemItem,
-        };
+        use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
         use crate::substrate::ContentResolver;
         use crate::summary_tree::TurnKind;
 
@@ -2061,6 +2148,7 @@ impl Sequence {
                     timeline: Some(timeline.raw()),
                     selected: true,
                     score: 0.0,
+                    qualified: false,
                 })
             };
             let mut turns = Vec::with_capacity(2);
@@ -2073,22 +2161,10 @@ impl Sequence {
             (system, turns)
         };
 
-        let mut events = vec![
+        let events = vec![
             staged_ingest_event(0, 0.0, system.clone(), turns.clone()),
             staged_ingest_event(assistant_content_start, seconds, system, turns),
         ];
-        // Self-referencing sub-window seams: one marker event per structural
-        // boundary. The belief scan reads their `start_token`s and scores each
-        // `[seam_i, seam_{i+1})` interval as a focused window that resolves back to
-        // this turn (see `Substrate::score_belief_groups`). Empty ⇒ the turn scores
-        // as one whole-turn window, unchanged.
-        for &off in seam_offsets {
-            events.push(ProjectionEvent {
-                start_token: off,
-                self_reference: true,
-                ..Default::default()
-            });
-        }
         self.substrate
             .persist_projection_events(
                 turn_stream_id(timeline.raw(), turn_index),
@@ -2120,7 +2196,15 @@ impl Sequence {
                 .wide_q_sigs_blob(timeline, idx)
                 .and_then(decode_wide_sigs)
             {
-                Some(p) => p,
+                // Same head+tail window the live reproject scans (see
+                // `scheduler`'s `QUERY_HEAD_CHUNKS` / `max_probe_tokens`). Without
+                // the cap this scan probes with the WHOLE turn, and a turn can be
+                // arbitrarily large — a single `file_list` result ran to 5.7k
+                // tokens, taking ~7s of scan and scoring every tool in the catalog
+                // nonzero (the listing happened to name every tool's own
+                // definition file), which then carried into the next turn's
+                // opening belief.
+                Some(p) => cap_probe_window(p, self.config.reproject_max_probe_tokens),
                 None => return empty,
             };
             // Concept F: the sealed turn's question window is its persisted
@@ -2849,6 +2933,15 @@ impl Sequence {
     /// Every timeline (across the whole substrate) whose `custom`
     /// metadata contains `key == value`. Used by utility ingests to skip
     /// re-building units already present after substrate load.
+    pub fn find_conversations_by_metadata_including_distilled(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Vec<TimelineId> {
+        self.substrate
+            .find_timelines_by_metadata_including_distilled(key, value)
+    }
+
     pub fn find_conversations_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
         self.substrate.find_timelines_by_metadata(key, value)
     }
@@ -3243,6 +3336,31 @@ impl ProbeCtx {
     }
 }
 
+/// Cap a whole-turn probe to the same head + trailing window the live
+/// reproject scan uses: the turn's first `HEAD` signatures (the user query —
+/// the strongest intent signal in the gallery domain) followed by its most
+/// recent `max_tail`.
+///
+/// A turn is not bounded by anything the engine controls — a tool result goes
+/// into it verbatim — so an uncapped probe is both a cost and a correctness
+/// problem: the scan is O(probe × gallery), and the tail of a large tool
+/// payload is not a query, so scoring it dilutes the turn's actual intent
+/// across whatever the payload happens to mention.
+fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
+    /// Head signatures kept regardless of how far the tail window has slid —
+    /// mirrors the scheduler's `QUERY_HEAD_CHUNKS` (2 chunks of 32).
+    const HEAD: usize = 64;
+    let max_tail = max_tail.max(1);
+    if probe.len() <= HEAD + max_tail {
+        return probe;
+    }
+    let tail_lo = probe.len() - max_tail;
+    let mut out = Vec::with_capacity(HEAD + max_tail);
+    out.extend_from_slice(&probe[..HEAD]);
+    out.extend_from_slice(&probe[tail_lo..]);
+    out
+}
+
 #[cfg(test)]
 mod windowed_ingest_tests {
     use super::windowed_ingest_ranges_impl as w;
@@ -3273,7 +3391,9 @@ mod windowed_ingest_tests {
 
 #[cfg(test)]
 mod window_sealed_tokens_tests {
+    use super::cap_probe_window;
     use super::window_sealed_tokens;
+    use crate::provenance::WideQSig;
     use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
 
     /// Build a one-layer sealed turn with the given per-chunk token
@@ -3391,5 +3511,43 @@ mod window_sealed_tokens_tests {
         assert_eq!(asst[0].chunks[0].offset, 24);
         assert_eq!(asst[0].chunks[0].token_count, 8);
         assert_eq!(asst[0].chunks[1].token_count, 20);
+    }
+
+    /// A probe within the window is untouched — the common case is a normal turn.
+    #[test]
+    fn cap_probe_window_leaves_a_normal_turn_whole() {
+        let probe = vec![WideQSig::default(); 200];
+        assert_eq!(cap_probe_window(probe.clone(), 256).len(), 200);
+        // Exactly at the boundary (HEAD 64 + tail 256) is still whole.
+        let probe = vec![WideQSig::default(); 320];
+        assert_eq!(cap_probe_window(probe, 256).len(), 320);
+    }
+
+    /// The failure case: a turn carrying a large tool payload. The probe becomes
+    /// head + tail rather than the whole 5.7k-token turn.
+    #[test]
+    fn cap_probe_window_bounds_an_oversized_turn() {
+        let mut probe: Vec<WideQSig> = (0..5702)
+            .map(|i| WideQSig {
+                n_heads: i as u16,
+                words: Vec::new(),
+            })
+            .collect();
+        probe.truncate(5702);
+        let capped = cap_probe_window(probe, 256);
+        assert_eq!(capped.len(), 64 + 256);
+        // The head is the turn's opening — the query — not the payload's tail.
+        assert_eq!(capped[0].n_heads, 0);
+        assert_eq!(capped[63].n_heads, 63);
+        // …followed by the most recent window, ending at the turn's last token.
+        assert_eq!(capped[64].n_heads, (5702 - 256) as u16);
+        assert_eq!(capped.last().unwrap().n_heads, 5701);
+    }
+
+    /// A zero cap must not panic or produce an empty probe.
+    #[test]
+    fn cap_probe_window_tolerates_a_zero_cap() {
+        let probe = vec![WideQSig::default(); 1000];
+        assert_eq!(cap_probe_window(probe, 0).len(), 65);
     }
 }

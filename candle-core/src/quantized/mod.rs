@@ -1,7 +1,8 @@
 //! Code for GGML and GGUF files
-use crate::{Context, CpuStorage, DType, Device, Result, Shape, Storage, Tensor};
+use crate::{Context, CpuStorage, DType, Device, LiveTensor, Result, Shape, Storage, Tensor};
 use k_quants::*;
 use std::borrow::Cow;
+use std::marker::PhantomData;
 
 #[cfg(target_feature = "avx2")]
 pub mod avx;
@@ -50,11 +51,9 @@ pub use cuda::{
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    arena_compact_copy, arena_compact_copy_async, arena_compact_patch, arena_compact_patch_async,
-    CompactMove,
+    load_repacked, load_repacked_into, load_repacked_on_stream, repack_to_host,
+    repacked_size_bytes, view_repacked,
 };
-#[cfg(feature = "cuda")]
-pub use cuda::{load_repacked, load_repacked_on_stream, repack_to_host, repacked_size_bytes};
 
 #[cfg(target_feature = "neon")]
 pub mod neon;
@@ -65,11 +64,72 @@ use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
+/// A quantized tensor whose device memory stays valid for `'w`.
+///
+/// `'w` describes the *memory*, not a borrow of any Rust value: an allocation
+/// this tensor owns is live for `'static`, while a view onto memory owned
+/// elsewhere — a KV arena slot, via [`Self::from_leased_cuda_ptr`] — is live
+/// only as long as that owner. [`QTensor`] is the `'static` case and is what
+/// nearly all code means.
+///
+/// The parameter is what stops an arena view outliving its arena. It also
+/// keeps a view out of [`QMatMul`]: `CustomOp1` is implemented for `QTensor`
+/// alone, so a lease — which carries no matrix-row padding — cannot reach the
+/// matmul path at all.
+///
+/// # Variance
+///
+/// Covariant in `'w`, so an owned tensor is accepted wherever a shorter-lived
+/// one is expected:
+///
+/// ```
+/// use candle_core::quantized::{LiveQTensor, QTensor};
+/// fn shorten<'a>(q: QTensor) -> LiveQTensor<'a> { q }
+/// ```
+///
+/// and never the reverse — which is the property that makes the whole
+/// parameter worth having:
+///
+/// ```compile_fail
+/// use candle_core::quantized::{LiveQTensor, QTensor};
+/// fn lengthen<'a>(q: LiveQTensor<'a>) -> QTensor { q }
+/// ```
+///
+/// A lease therefore cannot become a matmul weight, because [`QMatMul`] holds
+/// `Arc<QTensor>`:
+///
+/// ```compile_fail
+/// use candle_core::quantized::{LiveQTensor, QMatMul};
+/// use std::sync::Arc;
+/// fn weight<'a>(q: LiveQTensor<'a>) -> candle_core::Result<QMatMul> {
+///     QMatMul::from_arc(Arc::new(q))
+/// }
+/// ```
+///
+/// while an owned one still can — the control that keeps the `compile_fail`
+/// above from passing for some unrelated reason:
+///
+/// ```
+/// use candle_core::quantized::{QMatMul, QTensor};
+/// use std::sync::Arc;
+/// fn weight(q: QTensor) -> candle_core::Result<QMatMul> {
+///     QMatMul::from_arc(Arc::new(q))
+/// }
+/// ```
 #[derive(Clone)]
-pub struct QTensor {
+pub struct LiveQTensor<'w> {
     storage: QStorage,
     shape: Shape,
+    /// Covariant in `'w`, so a `'static` tensor is usable wherever a shorter
+    /// one is expected but never the reverse. `&'w [u8]` rather than
+    /// `&'w mut [u8]`: writes go through a raw device pointer, so nothing here
+    /// needs invariance, and invariance would reject the coercion above.
+    lease: PhantomData<&'w [u8]>,
 }
+
+/// The everyday quantized tensor: it owns its memory, so that memory is live
+/// for as long as the process cares to keep it.
+pub type QTensor = LiveQTensor<'static>;
 
 impl Device {
     fn qzeros(&self, elem_count: usize, dtype: GgmlDType) -> Result<QStorage> {
@@ -744,8 +804,7 @@ impl GgmlDType {
     /// KV-side Rust `QType` in `candle_kernels/src/simple/quantized.rs`,
     /// the matmul-side Rust `QType` in `candle_kernels/src/quantized/api.rs`,
     /// and every `qtype: i32` FFI argument — all use `GgmlDType as u32`.
-    #[allow(dead_code)]
-    pub(crate) fn from_u32(u: u32) -> Result<Self> {
+    pub fn from_u32(u: u32) -> Result<Self> {
         let dtype = match u {
             0 => Self::F32,
             1 => Self::F16,
@@ -808,8 +867,7 @@ impl GgmlDType {
     ///
     /// ⚠ This is NOT the GGUF/GGML on-disk file-format code.  Use
     /// `to_gguf_file_code` when writing integers to GGUF/GGML files.
-    #[allow(dead_code)]
-    pub(crate) fn to_u32(self) -> u32 {
+    pub fn to_u32(self) -> u32 {
         self as u32
     }
 
@@ -1231,7 +1289,7 @@ impl<T: k_quants::GgmlType + Send + Sync + Clone + 'static> QuantizedType for Ve
     }
 }
 
-impl std::fmt::Debug for QTensor {
+impl std::fmt::Debug for LiveQTensor<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "QTensor[{:?}; {:?}]", self.shape, self.dtype())
     }
@@ -1251,11 +1309,21 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// The constructors, which all allocate.
+///
+/// They are on `QTensor` rather than on `LiveQTensor<'w>` so that `'w` cannot
+/// be *inferred* at a call site: fresh memory is owned, therefore `'static`,
+/// and saying so here is what keeps the parameter meaningful everywhere else.
+/// The accessors and views live in the `impl<'w>` block below.
 impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
-        Ok(Self { storage, shape })
+        Ok(Self {
+            storage,
+            shape,
+            lease: PhantomData,
+        })
     }
 
     /// Create a zero-initialized quantized tensor.
@@ -1309,6 +1377,7 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
+            lease: PhantomData,
         })
     }
 
@@ -1352,7 +1421,15 @@ impl QTensor {
             }
         }
     }
+}
 
+/// Everything that reads, writes, or views an existing quantized tensor, and so
+/// works the same whether it owns its memory or leases it.
+///
+/// Methods here that produce a *new* allocation say `QTensor` in their return
+/// type rather than `Self`: the result is owned, and inheriting the receiver's
+/// `'w` would needlessly shorten it.
+impl<'w> LiveQTensor<'w> {
     pub fn dtype(&self) -> GgmlDType {
         self.storage.dtype()
     }
@@ -1599,13 +1676,14 @@ impl QTensor {
     /// # Returns
     /// A new QTensor with repacked storage
     #[cfg(feature = "cuda")]
-    pub fn repack_gemx(&self) -> Result<Self> {
+    pub fn repack_gemx(&self) -> Result<QTensor> {
         match &self.storage {
             QStorage::Cuda(s) => {
                 let new_storage = s.repack_gemx(&self.shape)?;
-                Ok(Self {
+                Ok(QTensor {
                     storage: QStorage::Cuda(new_storage),
                     shape: self.shape.clone(),
+                    lease: PhantomData,
                 })
             }
             _ => crate::bail!("repack_gemx is only supported on CUDA"),
@@ -1613,7 +1691,7 @@ impl QTensor {
     }
 
     #[cfg(not(feature = "cuda"))]
-    pub fn repack_gemx(&self) -> Result<Self> {
+    pub fn repack_gemx(&self) -> Result<QTensor> {
         crate::bail!("repack_gemx requires the cuda feature")
     }
 
@@ -1684,6 +1762,65 @@ impl QTensor {
         match &self.storage {
             QStorage::Cuda(s) => s.copy_to_host_on_stream(dst, stream),
             _ => crate::bail!("copy_data_to_host_on_stream requires CUDA storage"),
+        }
+    }
+
+    /// A `QTensor` over quantized device memory it does **not** own.
+    ///
+    /// The quantized counterpart of [`crate::Tensor::from_leased_cuda_ptr`],
+    /// and the way a KV arena slot is handed to the block quantize /
+    /// dequantize paths now that an arena is a run of untyped byte slots
+    /// (`docs/archived/arena_unification.md` principle 8). Writes through the returned
+    /// tensor land in the caller's memory — which is the point: cloning a
+    /// `QTensor` is a device-to-device **copy**, so "clone the arena and write
+    /// to it" silently writes to a throwaway.
+    ///
+    /// The view has no matrix-row padding, so it cannot be used as a matmul
+    /// operand — `CustomOp1` is implemented for `QTensor` alone, so the result
+    /// of this call is rejected at compile time. The block quantize /
+    /// dequantize kernels do not read past the data and are the only intended
+    /// consumers.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `ceil(elem_count / block_size) *
+    /// type_size` bytes of device memory that is un-aliased for writes.
+    ///
+    /// The caller also chooses `'w`, and choosing it too long is how this call
+    /// goes wrong: it must not outlive the memory `ptr` addresses. Nothing in
+    /// the arguments pins it, so an unannotated binding can infer `'static`.
+    /// Prefer a wrapper that ties `'w` to a borrow of the owner — the KV
+    /// arena's `qslot_view` returns `LiveQTensor<'a>` from `&'a self`, which
+    /// discharges this obligation by construction.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_leased_cuda_ptr(
+        ptr: u64,
+        dtype: GgmlDType,
+        elem_count: usize,
+        device: &crate::CudaDevice,
+        origin: crate::cuda_backend::wave_provenance::LeaseOrigin,
+    ) -> Result<Self> {
+        let storage =
+            cuda::QCudaStorage::from_leased_device_ptr(ptr, elem_count, dtype, device, origin)?;
+        Ok(Self {
+            storage: QStorage::Cuda(storage),
+            shape: Shape::from(elem_count),
+            lease: PhantomData,
+        })
+    }
+
+    /// A `'static` copy of this tensor's contents.
+    ///
+    /// The sanctioned way to let a lease's data outlive its owner.
+    /// [`QCudaStorage::clone`](cuda::QCudaStorage) is a device-to-device copy
+    /// that always yields owned storage, so this really does allocate — it is
+    /// `Clone` with the lifetime told truthfully, rather than
+    /// `Clone::clone`, which must return `Self` and so needlessly inherits
+    /// `'w`.
+    pub fn to_owned_qtensor(&self) -> QTensor {
+        QTensor {
+            storage: self.storage.clone(),
+            shape: self.shape.clone(),
+            lease: PhantomData,
         }
     }
 
@@ -1843,7 +1980,10 @@ impl QTensor {
     /// arena.quantize_into(&float_data, 64)?;
     /// ```
     #[cfg(feature = "cuda")]
-    pub fn quantize_into(&mut self, src: &Tensor, elem_offset: usize) -> Result<()> {
+    /// `src` may live on an inference wave: this reads its bytes and quantizes
+    /// them into the slot, retaining nothing, so the slot does not outlive the
+    /// generation `src` came from.
+    pub fn quantize_into(&mut self, src: &LiveTensor<'_>, elem_offset: usize) -> Result<()> {
         // Validate device match
         if self.device().location() != src.device().location() {
             crate::bail!("quantize_into: device mismatch")
@@ -2269,11 +2409,12 @@ impl QMatMul {
         QMatMul::from_qtensor(QTensor {
             storage: new_storage,
             shape,
+            lease: PhantomData,
         })
     }
 
     #[allow(unused_variables)]
-    pub fn forward_via_gemx(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward_via_gemx<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
             Self::QTensor(t) => {
                 // For CUDA, we need to call the storage directly with compute_type
@@ -2305,8 +2446,12 @@ impl QMatMul {
                     _ => xs.apply_op1_no_bwd(t.as_ref()),
                 }
             }
-            // For dequantized tensors, use standard matmul
+            // For dequantized tensors, use standard matmul. `matmul` records a
+            // graph edge and so returns its operand's lifetime; the copy is what
+            // makes the result owned. Only the `CANDLE_DEQUANTIZE_ALL` debug
+            // path reaches here, so it is not paid in production.
             Self::Tensor(w) => {
+                let xs = &xs.to_owned_tensor()?;
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
@@ -2315,6 +2460,7 @@ impl QMatMul {
                 xs.matmul(&w)
             }
             Self::TensorF16(w) => {
+                let xs = &xs.to_owned_tensor()?;
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -2331,9 +2477,14 @@ impl QMatMul {
     /// fused RMSNorm/SwiGLU/attention epilogue, so no standalone quantize launch), a `Float`
     /// operand is a plain FP tensor. Dispatches to [`cuda::dense_qmatmul`], which forks the int8
     /// KO tensor-core path vs the FP path and enforces the KO⇔int8 pairing against this weight.
-    /// Returns an F32 result of shape `[lead.., N]`; callers cast back to the compute dtype.
+    /// Returns a result of shape `[lead.., N]` stored at `out_dtype`: the int8 kernel converts its
+    /// F32 accumulator on the store, so there is no cast — and no second buffer — afterwards.
     #[cfg(feature = "cuda")]
-    pub fn forward_dynamic(&self, input: cuda::DynamicTensor) -> Result<Tensor> {
+    pub fn forward_dynamic<'w>(
+        &self,
+        input: cuda::DynamicTensor<'_, 'w>,
+        out_dtype: crate::DType,
+    ) -> Result<LiveTensor<'w>> {
         let t = match self {
             Self::QTensor(t) => t,
             _ => crate::bail!("forward_dynamic requires a QTensor weight"),
@@ -2348,7 +2499,7 @@ impl QMatMul {
         let wptr = cs.data_ptr();
         let wlen = cs.storage_size_in_bytes();
         let wdtype = t.dtype();
-        cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, &device)
+        cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, out_dtype, &device)
     }
 
     /// Fused q/k/v projection in ONE launch: the shared q8a128 activation `op` × the separate KO
@@ -2357,11 +2508,11 @@ impl QMatMul {
     /// [`forward_dynamic`] calls but with full GPU occupancy. Each weight must be a KO QTensor on
     /// CUDA (the int8 twin). See [`cuda::qkv_segmented_matmul`].
     #[cfg(feature = "cuda")]
-    pub fn qkv_segmented(
-        op: &cuda::Q8a128Operand,
+    pub fn qkv_segmented<'w>(
+        op: &cuda::Q8a128Operand<'w>,
         weights: &[&QMatMul],
         out_dtype: crate::DType,
-    ) -> Result<Tensor> {
+    ) -> Result<LiveTensor<'w>> {
         let mut segs = Vec::with_capacity(weights.len());
         let mut device = None;
         for w in weights {
@@ -2377,8 +2528,7 @@ impl QMatMul {
             segs.push((cs.data_ptr(), t.dtype(), t.shape().dims()[0]));
         }
         let device = device.ok_or_else(|| crate::Error::Msg("qkv_segmented: no weights".into()))?;
-        let out = cuda::qkv_segmented_matmul(op, &segs, &device)?;
-        out.to_dtype(out_dtype)
+        cuda::qkv_segmented_matmul(op, &segs, out_dtype, &device)
     }
 
     /// Int8 tensor-core matmul: q8a128 activations × KO weights. The weight must already be the
@@ -2387,15 +2537,26 @@ impl QMatMul {
     /// activation form (q8a128 for any non-`Off` mode). Quantizes the activation here (the
     /// **unfused** path, one standalone launch) then runs [`QMatMul::forward_dynamic`]; the fused
     /// producers bypass this by emitting q8a128 themselves and calling `forward_dynamic` directly.
+    /// The result comes back in `xs`'s dtype — quantizing the activation is not meant to change the
+    /// width the caller sees.
+    ///
     /// Non-CUDA build: the q8a128 × KO int8 matmul is a CUDA tensor-core path — always
     /// errors (the `dummy_cuda` convention).
     #[cfg(not(feature = "cuda"))]
-    pub fn forward_via_int8(&self, _xs: &Tensor, _mode: Int8Mode) -> Result<Tensor> {
+    pub fn forward_via_int8<'w>(
+        &self,
+        _xs: &LiveTensor<'w>,
+        _mode: Int8Mode,
+    ) -> Result<LiveTensor<'w>> {
         crate::bail!("forward_via_int8 requires the cuda feature")
     }
 
     #[cfg(feature = "cuda")]
-    pub fn forward_via_int8(&self, xs: &Tensor, mode: Int8Mode) -> Result<Tensor> {
+    pub fn forward_via_int8<'w>(
+        &self,
+        xs: &LiveTensor<'w>,
+        mode: Int8Mode,
+    ) -> Result<LiveTensor<'w>> {
         let device = match self {
             Self::QTensor(t) => match &t.storage {
                 QStorage::Cuda(cs) => cs.device().clone(),
@@ -2403,8 +2564,9 @@ impl QMatMul {
             },
             _ => crate::bail!("forward_via_int8 requires a KO QTensor weight"),
         };
+        let out_dtype = xs.dtype();
         let acts = cuda::to_dynamic(xs, mode, &device)?;
-        self.forward_dynamic(acts.as_dynamic())
+        self.forward_dynamic(acts.as_dynamic(), out_dtype)
     }
 }
 
@@ -2471,8 +2633,17 @@ impl crate::CustomOp1 for QTensor {
     }
 }
 
-impl crate::Module for QMatMul {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl QMatMul {
+    /// Project an activation that may live on an inference wave.
+    ///
+    /// [`crate::Module`] takes `&Tensor`, so it cannot accept a wave-scoped
+    /// activation — and that restriction is deliberate everywhere else, because
+    /// a module may retain what it is given. This one does not retain, but it
+    /// does *inherit*: the output is allocated from whichever arena `xs` came
+    /// from, so the result is bounded by `xs`'s generation rather than being
+    /// owned. The `Module` impl below is this method at `'static`, where the
+    /// distinction collapses and the result really is owned.
+    pub fn forward_live<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         match self {
             // MXFP4 has no native matmul kernel (and no native FP4 tensor-core MMA on
             // sm_120), so dequantize the weight (fast GPU kernel / CPU codec) and run a
@@ -2488,6 +2659,11 @@ impl crate::Module for QMatMul {
             }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
+                // The dequantized-weight fallback (`CANDLE_DEQUANTIZE_ALL`),
+                // not the production path. `matmul` records a graph edge and so
+                // returns the operand's lifetime; copying off the wave first is
+                // what makes the result owned, and this path can afford it.
+                let xs = &xs.to_owned_tensor()?;
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                     [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
@@ -2496,6 +2672,8 @@ impl crate::Module for QMatMul {
                 xs.matmul(&w)
             }
             Self::TensorF16(w) => {
+                // As the `Tensor` arm: debug-only, so copy off the wave.
+                let xs = &xs.to_owned_tensor()?;
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -2505,6 +2683,12 @@ impl crate::Module for QMatMul {
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
+    }
+}
+
+impl crate::Module for QMatMul {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_live(xs)
     }
 }
 

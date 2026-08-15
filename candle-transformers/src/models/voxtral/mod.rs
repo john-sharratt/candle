@@ -1,3 +1,11 @@
+//! Voxtral speech-to-text model: mel audio encoder + Llama-based decoder.
+//!
+//! [`audio`] extracts log-mel features from raw audio (`N_FFT`/`HOP_LENGTH`/
+//! `N_MELS` below fix the STFT parameters); [`model`] implements the
+//! Whisper-style `VoxtralEncoder` and the `VoxtralForConditionalGeneration`
+//! wrapper that projects encoder output into the decoder's embedding space
+//! via `VoxtralMultiModalProjector`; [`voxtral_llama`] is the Llama decoder
+//! variant used as the language backbone.
 pub mod audio;
 pub mod model;
 pub mod voxtral_llama;

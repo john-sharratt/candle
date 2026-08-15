@@ -1,3 +1,13 @@
+//! Stable Diffusion 3 / 3.5 text-to-image generation (MMDiT architecture).
+//!
+//! `--which` selects `3-medium`, `3.5-large`, `3.5-large-turbo`, or
+//! `3.5-medium`, each pulling its own HF Stability AI repo for the MMDiT
+//! weights and triple CLIP-G/CLIP-L/T5-XXL text encoders (`clip.rs`); the
+//! VAE decode step lives in `vae.rs` and the Euler sampler (with optional
+//! Skip-Layer-Guidance, 3.5-medium only) in `sampling.rs`. Supports
+//! `--use-flash-attn` and per-variant default step count/CFG scale; output
+//! is written to `out.jpg`.
+
 mod clip;
 mod sampling;
 mod vae;

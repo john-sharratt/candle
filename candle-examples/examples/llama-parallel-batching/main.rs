@@ -1,3 +1,12 @@
+//! Continuous-batching benchmark for quantized Llama-3.2-1B via `BatchedInference`.
+//!
+//! Not a CLI (no `clap::Parser`) — a fixed harness. Downloads a GGUF checkpoint
+//! (`bartowski/Llama-3.2-1B-Instruct-GGUF`), wraps `quantized_llama::ModelWeights`
+//! in `BatchedInference`, and drives two sequences with independent
+//! `SequenceContext`/KV caches through `forward_batch` at deliberately
+//! misaligned positions to validate batched decode, then times 100
+//! batched-vs-sequential steps to report the speedup.
+
 /// Parallel Continuous Batching Example for Llama
 use candle::quantized::pinned_staging::PinnedStager;
 use candle::{Device, Result, Tensor};

@@ -1,3 +1,12 @@
+//! Chinese CLIP image/text similarity (`candle_transformers::models::chinese_clip::ChineseClipModel`,
+//! `ChineseClipConfig::clip_vit_base_patch16`).
+//!
+//! `--images` and `--sequences` take comma-delimited lists (default: two
+//! sample images from other examples' assets vs. three Chinese-language
+//! captions); weights/tokenizer default to `OFA-Sys/chinese-clip-vit-base-patch16`.
+//! Computes image/text logits, softmaxes over images, and prints per-image
+//! match probabilities for each caption.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

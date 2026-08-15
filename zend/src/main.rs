@@ -13,31 +13,14 @@
 //! { "provider": "openai", "apiBase": "http://localhost:8080", "model": "zen-code" }
 //! ```
 
-mod api;
-mod chatml;
-mod code_read;
-mod config;
-mod conv_file_store;
-mod conv_files;
-mod download;
-mod ingest;
-mod loading;
-mod log_broadcast;
+// The binary is a thin shell over the `zend` library: CLI parsing, logging
+// setup, and the serve call. Everything else comes from the lib — declaring
+// the modules here as well would compile the whole crate a second time for
+// the bin target, where test-support API (used only through the lib by the
+// test crates) then trips dead-code lints that cannot be honestly fixed.
+// `log_file` is the one genuinely bin-only module: the rotating on-disk log
+// is a property of the daemon process, not of the library.
 mod log_file;
-mod log_line;
-mod model_choice;
-mod projection_event;
-mod raw_read;
-mod refresh_ctx;
-mod repo_scan;
-mod response_section;
-mod session;
-mod tool_def;
-mod tool_summary;
-mod tools;
-mod turn_sink;
-mod types;
-mod watcher;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -47,9 +30,10 @@ use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-use config::DaemonConfig;
-use log_broadcast::{BusWriter, LogBus};
-use session::ZendSession;
+use zend::api;
+use zend::config::DaemonConfig;
+use zend::log_broadcast::{BusWriter, LogBus};
+use zend::session::ZendSession;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -209,9 +193,27 @@ async fn main() -> anyhow::Result<()> {
         1 => "debug",
         _ => "trace",
     };
+    // `candle_nn` carries the KV cache — the arenas, the region pool, the
+    // partition boundary — and it was the one crate in the chain with no
+    // directive at all, so every diagnostic it emits was dropped before reaching
+    // a sink. A block-table reconciliation or a pool anomaly reported itself
+    // into silence, which is the opposite of what these levels are for.
+    //
+    // It sits **one step below** the others, because its debug tier is not
+    // diagnostics: `gid_pool` and `region_pool` narrate every arena sweep and
+    // every region claim, thousands of lines a second under load, which buries
+    // the events worth reading. Anything in that crate that a person needs to
+    // see is logged at `warn` and survives this. `-vv` still opens it fully.
+    let kv_level = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        _ => "debug",
+    };
     let filter = EnvFilter::from_default_env()
         .add_directive(format!("zend={level}").parse()?)
-        .add_directive(format!("candle_conversation={level}").parse()?);
+        .add_directive(format!("candle_conversation={level}").parse()?)
+        .add_directive(format!("candle_transformers={level}").parse()?)
+        .add_directive(format!("candle_nn={kv_level}").parse()?);
 
     let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter.clone());
 

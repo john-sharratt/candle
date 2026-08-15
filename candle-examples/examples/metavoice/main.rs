@@ -1,3 +1,14 @@
+//! MetaVoice-1B two-stage text-to-speech.
+//!
+//! Stage 1 (`transformer::Model`, or `quantized_metavoice::transformer` GGUF
+//! variant behind `--quantized`) turns a BPE-tokenized prompt plus a speaker
+//! embedding into semantic tokens, sampled with classifier-free guidance
+//! (`--guidance-scale` mixes two batched logit rows). Stage 2 (`gpt::Model`)
+//! expands those into hierarchical EnCodec codebook indices via
+//! `adapters::FlattenedInterleavedEncodec2Codebook`/`TiltedEncodec`. Final
+//! audio comes from `candle_transformers::models::encodec::Model::decode`
+//! and is written as a 24kHz wav (`--out-file`).
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,3 +1,13 @@
+//! `tensor-tools` — a CLI for inspecting and converting tensor checkpoint
+//! files, independent of the inference engine.
+//!
+//! A `clap`-derived [`Command`] enum drives four subcommands: `ls` (list
+//! tensor names/shapes, or GGUF metadata keys with `--metadata-keys`),
+//! `print` (dump tensor contents), `quantize` (safetensors -> GGUF, via
+//! [`Quantization`]/[`QuantizationMode`]), and `dequantize` (GGUF ->
+//! safetensors). [`Format`] covers the supported checkpoint formats
+//! (npz, safetensors, PyTorch pickle/pth, ggml, gguf); format is inferred
+//! from the file extension unless `--format` is given.
 use candle::quantized::{gguf_file, GgmlDType, QTensor};
 use candle::{Device, Result};
 use clap::{Parser, Subcommand, ValueEnum};

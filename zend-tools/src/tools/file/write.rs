@@ -5,12 +5,11 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::FileError;
-use crate::state::vfs::VfsError;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
-    /// VFS path to create or overwrite (session-relative, e.g. `src/main.rs`). Required.
+    /// Path to create or overwrite (e.g. `src/main.rs`). The result is held in this session; a project file of the same path is shadowed, never modified on disk. Required.
     #[validate(length(min = 1))]
     pub path: String,
     /// Full file content to write, replacing any existing content. Required.
@@ -44,9 +43,7 @@ impl Tool for FileWrite {
 
     fn run(ctx: &ToolContext, req: WriteRequest) -> Result<WriteResponse, FileError> {
         let bytes = req.content.len();
-        let created = ctx.vfs.write(&req.path, req.content).map_err(|e| match e {
-            VfsError::Full => FileError::VfsFull,
-        })?;
+        let created = ctx.vfs.write(&req.path, req.content)?;
         Ok(WriteResponse {
             path: req.path,
             bytes,

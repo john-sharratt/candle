@@ -1,12 +1,12 @@
 name: file_delete
 category: Files
-description: 'Delete a file from the session virtual filesystem (VFS). Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB VFS budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the path and a deleted flag. VFS contents disappear at session end anyway — explicit deletion is for in-session cleanup. For removing files on remote systems use remote_fs_session_delete.'
+description: 'Remove a file from this session''s view. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the path and a deleted flag. A project file on disk is NOT erased — it is only hidden from this session, and reappears in a new one. For removing files on remote systems use remote_fs_session_delete.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
     path:
-      description: VFS path of the file to delete (session-relative, e.g. `src/main.rs`). Required.
+      description: 'Path of the file to remove from this session''s view (e.g. `src/main.rs`). A project file is hidden, not erased from disk. Required.'
       minLength: 1
       type: string
   required:
@@ -97,4 +97,24 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/downloads/duplicate(1).zip"}}
+  </tool_call><|projection|>
+- |-
+  remove scratch/example.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants that file gone. file_delete removes a path from this session's view. scratch/example.rs was created during this session, so it simply disappears;<|projection|> had it been a project file it would only be hidden, not erased from disk.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_delete", "arguments": {"path": "scratch/example.rs"}}
+  </tool_call><|projection|>
+- |-
+  delete the draft notes.md<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A request to drop the draft. file_delete takes the path and returns a deleted flag. The path here is notes.md.<|projection|> Nothing on disk is erased by this — it only removes the file from what this session sees.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_delete", "arguments": {"path": "notes.md"}}
   </tool_call><|projection|>

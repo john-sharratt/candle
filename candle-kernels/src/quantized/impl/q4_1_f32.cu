@@ -28,6 +28,10 @@ INSTANTIATE_KERNEL_GROUPED_INT8(
     QK4_1_KTILE, QI4_1_KTILE, block_c_q4_1, VDR_Q4_1_KTILE,
     float
 )
+INSTANTIATE_KERNEL_DENSE_INT8_ALL(
+    q4_1_int8,
+    QK4_1_KTILE, QI4_1_KTILE, block_c_q4_1, VDR_Q4_1_KTILE
+)
 
 // DISABLED: dequant_k64 not yet implemented for this quant type
 // MARLIN TENSOR CORE KERNEL

@@ -1,7 +1,23 @@
-//! Implementation of Backend traits for CUDA device
+//! `BackendStorage` implementation for the CUDA backend (`feature = "cuda"`),
+//! the production inference path for this fork.
 //!
+//! `CudaStorage` wraps a `CudaStorageSlice` (one `CudaSlice<T>` variant per
+//! dtype) plus a `CudaDevice`; `BackendDevice for CudaDevice` lives in the
+//! sibling `device.rs`. Generic tensor ops (elementwise, affine, reduce,
+//! indexing, conv, matmul via `cublas`) are each a small unit struct
+//! implementing `Map1`/`Map2`/`Map1Any`/`Map2InPlace`/`Map2Any`, which launch
+//! the AOT-compiled PTX kernels re-exported here as `kernels`
+//! (`candle_kernels::simple::*`) — PTX is embedded at compile time by
+//! `candle-kernels/build.rs`, so no NVCC is needed at runtime. Quantized
+//! matmul dispatches separately from `candle-core/src/quantized/cuda.rs`, and
+//! the paged-decode/paged-prefill/paged-glue/provenance kernels backing the
+//! three-tier KV cache are called directly from `candle-transformers` and
+//! `candle-nn::kv_cache`, bypassing this generic dispatch entirely.
 use crate::backend::{BackendDevice, BackendStorage};
+use crate::forbidden_alloc;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+pub use crate::wave_provenance;
+use crate::wave_provenance::{LeaseOrigin, WaveTicket};
 use crate::{CpuStorage, DType, Layout, Result, WithDType};
 pub use candle_kernels as kernels;
 pub use cudarc;
@@ -102,19 +118,19 @@ pub mod cudnn;
 mod device;
 mod error;
 mod utils;
-pub use device::{CudaDevice, DeviceId};
+pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
-pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
+pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Out, OutS, S};
 
 pub enum SlicePtrOrNull<T> {
-    Ptr(CudaSlice<T>),
+    Ptr(Uploaded<T>),
     Null,
 }
 
 impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
-            SlicePtrOrNull::Ptr(slice) => builder.arg(slice),
+            SlicePtrOrNull::Ptr(slice) => builder.arg(&**slice),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -137,11 +153,17 @@ impl crate::scalar::Scalar {
 }
 
 impl SlicePtrOrNull<usize> {
-    pub fn params_from_layout(dev: &CudaDevice, l: &Layout) -> Result<Self> {
+    /// The dims/stride blob a strided kernel reads, taken from `origin`'s arena.
+    ///
+    /// Built on the host, so there is no operand for provenance to follow — but
+    /// the blob is consumed by the same launch as the tensor it describes, so it
+    /// belongs on that tensor's span. Passing the operand's backing in is what
+    /// says so.
+    pub fn params_from_layout(dev: &CudaDevice, l: &Layout, origin: Backing) -> Result<Self> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.memcpy_stod(&[l.dims(), l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.memcpy_stod_from(&[l.dims(), l.stride()].concat(), origin)?)
         };
         Ok(ds)
     }
@@ -157,9 +179,130 @@ pub enum CudaStorageSlice {
     F32(CudaSlice<f32>),
     F64(CudaSlice<f64>),
     F8E4M3(CudaSlice<F8E4M3>),
+    /// Tombstone left behind when a leased storage's drop moves its slice out.
+    ///
+    /// `CudaSlice::leak` takes `self` by value, so it is unreachable from
+    /// `Drop::drop(&mut self)` without moving the slice out first — and moving
+    /// out of a type that implements `Drop` requires putting something back.
+    /// This variant is that something. It is never observable: it exists only
+    /// between the `mem::replace` and the end of `drop`.
+    ///
+    /// **Named for the hole, not for ownership.** It was `Empty`, which reads as
+    /// "a slice of zero elements" and invites the guess that it means "borrowed"
+    /// or "not owned" — neither is true. Non-ownership is [`Backing::Lease`]'s
+    /// job and is orthogonal to this. A `Moved` slice is the absence left by the
+    /// move, and the only correct thing to do with one is diverge.
+    ///
+    /// The tombstone survives rather than becoming `ManuallyDrop<CudaStorageSlice>`
+    /// (the shape `QCudaStorage` uses) because `slice` is a **public** field with
+    /// ~330 uses in this crate and ~130 more outside it; the wrapper would put a
+    /// deref at every one of them to delete a variant that is unreachable by
+    /// construction. `QCudaStorage`'s field is private with a handful of uses,
+    /// which is why the same fix was proportionate there and is not here.
+    Moved,
+}
+
+/// Who owns the device memory behind a [`CudaStorage`].
+///
+/// A pool allocation is freed on drop, as always. A **leased** one is an offset
+/// into memory this process claimed once and never returns — letting
+/// `CudaSlice::drop` reach `cuMemFreeAsync` on it would be an error, not a
+/// leak. See `docs/archived/arena_unification.md` §3.7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backing {
+    /// Allocated from the stream-ordered pool; freed on drop.
+    Owned,
+    /// A view over memory owned elsewhere; drop releases the view, never the
+    /// memory. The [`LeaseOrigin`] says *whose* memory, which is what lets an
+    /// op allocate its output from the same arena its operand came from.
+    Lease(LeaseOrigin),
+}
+
+impl Backing {
+    /// The wave arena an op reading this storage should allocate its output
+    /// from, or `None` to allocate from the pool.
+    ///
+    /// `None` for owned storage and for foreign leases alike: neither names an
+    /// arena that is a scratch space to carve from.
+    pub fn inherit_ticket(&self) -> Option<WaveTicket> {
+        match self {
+            Self::Owned => None,
+            Self::Lease(origin) => origin.ticket(),
+        }
+    }
+
+    /// The backing an allocation seeded by a bare ticket should inherit.
+    ///
+    /// For the call sites that hold a coordinate rather than an operand — a host
+    /// upload, or work that reached another thread over a channel. Absence is
+    /// real state: no ticket means no arena, and the allocation is an ordinary
+    /// owned one.
+    pub fn from_ticket(ticket: Option<WaveTicket>) -> Self {
+        match ticket {
+            Some(t) => Self::Lease(LeaseOrigin::Wave(t)),
+            None => Self::Owned,
+        }
+    }
 }
 
 impl CudaStorageSlice {
+    /// Diverge on the tombstone variant.
+    ///
+    /// [`CudaStorageSlice::Moved`] exists only between the `mem::replace` and
+    /// the end of a leased [`CudaStorage`]'s `drop`, and nothing else can
+    /// observe one — so every other match over the slice ends here. Returning
+    /// `!` lets one arm serve matches of every result type.
+    #[cold]
+    #[inline(never)]
+    pub fn unreachable_moved() -> ! {
+        unreachable!("CudaStorageSlice::Moved escaped a leased storage's drop")
+    }
+
+    /// Size of the backing allocation in bytes.
+    ///
+    /// The element count times the element width, so it is comparable across
+    /// dtypes — which is what makes it the right unit for allocation
+    /// accounting ([`crate::forbidden_alloc`]) and for budget arithmetic.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            CudaStorageSlice::U8(s) => s.len() * std::mem::size_of::<u8>(),
+            CudaStorageSlice::U32(s) => s.len() * std::mem::size_of::<u32>(),
+            CudaStorageSlice::I64(s) => s.len() * std::mem::size_of::<i64>(),
+            CudaStorageSlice::BF16(s) => s.len() * std::mem::size_of::<bf16>(),
+            CudaStorageSlice::F16(s) => s.len() * std::mem::size_of::<f16>(),
+            CudaStorageSlice::F32(s) => s.len() * std::mem::size_of::<f32>(),
+            CudaStorageSlice::F64(s) => s.len() * std::mem::size_of::<f64>(),
+            CudaStorageSlice::F8E4M3(s) => s.len() * std::mem::size_of::<F8E4M3>(),
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
+        }
+    }
+
+    /// Device address of the first element, whatever the element type.
+    ///
+    /// The read-only twin of [`Self::device_ptr_mut`], and it carries the same
+    /// caveat: no guard is returned, so the caller keeps the storage alive for
+    /// as long as the address is used.
+    pub fn device_ptr(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> u64 {
+        use cudarc::driver::DevicePtr;
+        macro_rules! addr {
+            ($s:expr) => {{
+                let (ptr, _guard) = $s.device_ptr(stream);
+                ptr
+            }};
+        }
+        match self {
+            CudaStorageSlice::U8(s) => addr!(s),
+            CudaStorageSlice::U32(s) => addr!(s),
+            CudaStorageSlice::I64(s) => addr!(s),
+            CudaStorageSlice::BF16(s) => addr!(s),
+            CudaStorageSlice::F16(s) => addr!(s),
+            CudaStorageSlice::F32(s) => addr!(s),
+            CudaStorageSlice::F64(s) => addr!(s),
+            CudaStorageSlice::F8E4M3(s) => addr!(s),
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
+        }
+    }
+
     /// Get a mutable device pointer for in-place operations.
     /// Returns the raw pointer that can be passed to FFI functions.
     ///
@@ -202,6 +345,7 @@ impl CudaStorageSlice {
                 let (ptr, _guard) = s.device_ptr_mut(stream);
                 Ok(ptr as *mut std::ffi::c_void)
             }
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         }
     }
 }
@@ -213,8 +357,15 @@ impl Map1 for Clone {
         s: &CudaSlice<T>,
         _: &CudaDevice,
         _: &Layout,
-    ) -> Result<CudaSlice<T>> {
-        s.try_clone().w()
+        origin: Backing,
+    ) -> Result<Out<T>> {
+        // `CudaSlice::try_clone` allocates its destination, so it reaches the
+        // driver without passing through `CudaDevice::alloc`.
+        forbidden_alloc::record("CudaSlice::try_clone", s.len() * std::mem::size_of::<T>());
+        // `try_clone` allocates its own destination from the pool, so the
+        // copy owns its memory regardless of where the source came from.
+        let _ = origin;
+        Ok((s.try_clone().w()?, Backing::Owned))
     }
 }
 
@@ -245,6 +396,7 @@ fn run_affine_ffi(
     layout: &Layout,
     mul: f64,
     add: f64,
+    origin: Backing,
 ) -> Result<CudaStorageSlice> {
     let shape = layout.shape();
     let dims = shape.dims();
@@ -253,10 +405,10 @@ fn run_affine_ffi(
     let stream = dev.cuda_stream();
 
     // Prepare dims/strides info for non-contiguous tensors
-    let info: Option<CudaSlice<usize>> = if layout.is_contiguous() {
+    let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
         None
     } else {
-        Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+        Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
     };
     let info_ptr = match &info {
         Some(s) => {
@@ -273,6 +425,7 @@ fn run_affine_ffi(
         CudaStorageSlice::F16(_) => DType::F16,
         CudaStorageSlice::BF16(_) => DType::BF16,
         CudaStorageSlice::F8E4M3(_) => DType::F8E4M3,
+        CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         CudaStorageSlice::U8(_) => DType::U8,
         CudaStorageSlice::U32(_) => DType::U32,
         CudaStorageSlice::I64(_) => DType::I64,
@@ -315,6 +468,7 @@ fn run_affine_ffi(
         CudaStorageSlice::F16(s) => affine_impl!(s, F16),
         CudaStorageSlice::BF16(s) => affine_impl!(s, BF16),
         CudaStorageSlice::F8E4M3(s) => affine_impl!(s, F8E4M3),
+        CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         CudaStorageSlice::U8(s) => affine_impl!(s, U8),
         CudaStorageSlice::U32(s) => affine_impl!(s, U32),
         CudaStorageSlice::I64(s) => affine_impl!(s, I64),
@@ -330,6 +484,7 @@ fn run_unary_param_ffi(
     layout: &Layout,
     op: i32,
     param: f64,
+    origin: Backing,
 ) -> Result<CudaStorageSlice> {
     let shape = layout.shape();
     let dims = shape.dims();
@@ -338,10 +493,10 @@ fn run_unary_param_ffi(
     let stream = dev.cuda_stream();
 
     // Prepare dims/strides info for non-contiguous tensors
-    let info: Option<CudaSlice<usize>> = if layout.is_contiguous() {
+    let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
         None
     } else {
-        Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+        Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
     };
     let info_ptr = match &info {
         Some(s) => {
@@ -358,6 +513,7 @@ fn run_unary_param_ffi(
         CudaStorageSlice::F16(_) => DType::F16,
         CudaStorageSlice::BF16(_) => DType::BF16,
         CudaStorageSlice::F8E4M3(_) => DType::F8E4M3,
+        CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         CudaStorageSlice::U8(_) => DType::U8,
         CudaStorageSlice::U32(_) => DType::U32,
         CudaStorageSlice::I64(_) => DType::I64,
@@ -400,6 +556,7 @@ fn run_unary_param_ffi(
         CudaStorageSlice::F16(s) => unary_param_impl!(s, F16),
         CudaStorageSlice::BF16(s) => unary_param_impl!(s, BF16),
         CudaStorageSlice::F8E4M3(s) => unary_param_impl!(s, F8E4M3),
+        CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         _ => crate::bail!("Parametric unary ops only support float types"),
     };
 
@@ -427,13 +584,14 @@ impl Map1 for Im2Col1D {
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         layout: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_im2col1d");
         let shape = layout.shape();
         let dims = shape.dims();
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
-        let ds = dev.memcpy_stod(&[dims, layout.stride()].concat())?;
+        let ds = dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?;
         let src = &src.slice(layout.start_offset()..);
 
         // Get dtype for FFI dispatcher
@@ -444,7 +602,7 @@ impl Map1 for Im2Col1D {
 
         let stream = dev.cuda_stream();
         // SAFETY: Set later by running the kernel.
-        let dst = unsafe { dev.alloc::<T>(threads * self.l_k)? };
+        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, threads * self.l_k, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -465,7 +623,7 @@ impl Map1 for Im2Col1D {
                 );
             }
         }
-        Ok(dst)
+        Ok((dst, out_backing))
     }
 }
 
@@ -493,13 +651,14 @@ impl Map1 for Im2Col {
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         layout: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_im2col");
         let shape = layout.shape();
         let dims = shape.dims();
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
-        let ds = dev.memcpy_stod(&[dims, layout.stride()].concat())?;
+        let ds = dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?;
         let src = &src.slice(layout.start_offset()..);
 
         // Get dtype for FFI dispatcher
@@ -510,7 +669,7 @@ impl Map1 for Im2Col {
 
         let stream = dev.cuda_stream();
         // SAFETY: Set later by running the kernel.
-        let dst = unsafe { dev.alloc::<T>(dst_el)? };
+        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -533,7 +692,7 @@ impl Map1 for Im2Col {
                 );
             }
         }
-        Ok(dst)
+        Ok((dst, out_backing))
     }
 }
 
@@ -545,7 +704,8 @@ impl Map1Any for FastReduce<'_> {
         dev: &CudaDevice,
         layout: &Layout,
         wrap: W,
-    ) -> Result<S> {
+        origin: Backing,
+    ) -> Result<OutS> {
         cuda_breadcrumb!("run_fast_reduce");
         let src_stride = layout.stride();
         let src_dims = layout.shape().dims();
@@ -583,7 +743,7 @@ impl Map1Any for FastReduce<'_> {
         let dtype_i32 = dtype_to_fast_reduce_dtype(dtype);
 
         let stream = dev.cuda_stream();
-        let ds = dev.memcpy_stod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let ds = dev.memcpy_stod_from(&[dims.as_slice(), stride.as_slice()].concat(), origin)?;
         let src = &src.slice(layout.start_offset()..);
 
         if return_index {
@@ -594,7 +754,7 @@ impl Map1Any for FastReduce<'_> {
                 _ => unreachable!(),
             };
             // SAFETY: filled in by the follow up kernel.
-            let out = unsafe { dev.alloc::<u32>(dst_el)? };
+            let (out, out_backing) = unsafe { alloc_inheriting::<u32>(dev, dst_el, origin)? };
             {
                 let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
                 let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -613,7 +773,7 @@ impl Map1Any for FastReduce<'_> {
                     );
                 }
             }
-            Ok(S::U32(out))
+            Ok((S::U32(out), out_backing))
         } else {
             use kernels::simple::reduce::FastReduceOp;
             let op = match self.1 {
@@ -623,7 +783,7 @@ impl Map1Any for FastReduce<'_> {
                 _ => unreachable!(),
             };
             // SAFETY: filled in by the follow up kernel.
-            let out = unsafe { dev.alloc::<T>(dst_el)? };
+            let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
             {
                 let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
                 let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -642,7 +802,7 @@ impl Map1Any for FastReduce<'_> {
                     );
                 }
             }
-            Ok(wrap(out))
+            Ok((wrap(out), out_backing))
         }
     }
 }
@@ -765,7 +925,8 @@ impl<U: UnaryOpT> Map1 for U {
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         layout: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         let shape = layout.shape();
         let dims = shape.dims();
         let el_count = shape.elem_count();
@@ -779,15 +940,15 @@ impl<U: UnaryOpT> Map1 for U {
             let dtype_i32 = dtype_to_unary_dtype(dtype);
 
             // Prepare dims/strides info for non-contiguous tensors
-            let info: Option<CudaSlice<usize>> = if layout.is_contiguous() {
+            let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
                 None
             } else {
-                Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+                Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
             };
 
             let src_slice = &src.slice(start_offset..);
             // SAFETY: Allocated memory will be initialized by the kernel
-            let out = unsafe { dev.alloc::<T>(el_count)? };
+            let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, el_count, origin)? };
             {
                 let info_ptr = match &info {
                     Some(s) => {
@@ -814,7 +975,7 @@ impl<U: UnaryOpT> Map1 for U {
                     );
                 }
             }
-            return Ok(out);
+            return Ok((out, out_backing));
         }
 
         // All unary operations should be handled by FFI dispatcher above
@@ -833,7 +994,8 @@ impl Map1 for IndexSelect<'_> {
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         src_l: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_index_select");
         let ids_l = &self.1;
         let ids = &self.0;
@@ -851,7 +1013,7 @@ impl Map1 for IndexSelect<'_> {
 
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.memcpy_stod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = dev.memcpy_stod_from(&[ids_dims, ids_l.stride()].concat(), origin)?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -868,7 +1030,7 @@ impl Map1 for IndexSelect<'_> {
         let stream = dev.cuda_stream();
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -943,7 +1105,7 @@ impl Map1 for IndexSelect<'_> {
             };
             let _ = ids_ptr; // Suppress unused warning
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -954,7 +1116,8 @@ impl Map1 for Gather<'_> {
         src: &CudaSlice<T>,
         dev: &CudaDevice,
         src_l: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_gather");
         let ids = &self.0;
         let ids_l = &self.1;
@@ -990,7 +1153,7 @@ impl Map1 for Gather<'_> {
         let stream = dev.cuda_stream();
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, el, origin)? };
         {
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
             let (out_ptr, _out_guard) = out.device_ptr(&stream);
@@ -1054,7 +1217,7 @@ impl Map1 for Gather<'_> {
                 _ => unreachable!(), // Already checked above
             };
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1404,7 +1567,8 @@ impl Map2 for Conv1D<'_> {
         k: &CudaSlice<T>,
         k_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_conv1d");
         // Kernel shape: (c_out, c_in_k, k_size)
         // Input shape: (b_size, c_in, l_in) or (c_in, l_in)
@@ -1424,7 +1588,7 @@ impl Map2 for Conv1D<'_> {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         let ds = if dims.len() == 3 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else if dims.len() == 2 {
@@ -1432,7 +1596,7 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.memcpy_stod(&ds)?;
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1457,7 +1621,7 @@ impl Map2 for Conv1D<'_> {
                 );
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1470,7 +1634,8 @@ impl Map2 for Conv2D<'_> {
         k: &CudaSlice<T>,
         k_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_conv2d");
         // Kernel shape: (c_out, c_in_k, h_k, w_k)
         // Input shape: (b_size, c_in, h_in, w_in)
@@ -1490,13 +1655,13 @@ impl Map2 for Conv2D<'_> {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         let ds = if dims.len() == 4 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.memcpy_stod(&ds)?;
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1522,7 +1687,7 @@ impl Map2 for Conv2D<'_> {
                 );
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1536,13 +1701,14 @@ impl Map1 for Col2Im1D {
         col: &CudaSlice<T>,
         dev: &CudaDevice,
         l: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_col2im1d");
         let (b_size, l_in, c_out, k_size) = l.shape().dims4()?;
         let stride = self.stride;
         let l_out = (l_in - 1) * stride + k_size;
         let dst_el = b_size * c_out * l_out;
-        let im = unsafe { dev.alloc::<T>(dst_el)? };
+        let (im, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
 
         // Get dtype for FFI dispatcher
         let dtype = match dtype_to_conv_dtype(T::DTYPE) {
@@ -1569,7 +1735,7 @@ impl Map1 for Col2Im1D {
                 );
             }
         }
-        Ok(im)
+        Ok((im, out_backing))
     }
 }
 
@@ -1582,7 +1748,8 @@ impl Map2 for ConvTranspose1D<'_> {
         k: &CudaSlice<T>,
         k_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_conv_transpose1d");
         // Kernel shape: (c_in_k, c_out, l_k)
         // Input shape: (b_size, c_in, l_in)
@@ -1602,13 +1769,13 @@ impl Map2 for ConvTranspose1D<'_> {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         let ds = if dims.len() == 3 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.memcpy_stod(&ds)?;
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1634,7 +1801,7 @@ impl Map2 for ConvTranspose1D<'_> {
                 );
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1647,7 +1814,8 @@ impl Map2 for ConvTranspose2D<'_> {
         k: &CudaSlice<T>,
         k_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_conv_transpose2d");
         // Kernel shape: (c_in_k, c_out, h_k, w_k)
         // Input shape: (b_size, c_in, h_in, w_in)
@@ -1667,13 +1835,13 @@ impl Map2 for ConvTranspose2D<'_> {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         let ds = if dims.len() == 4 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.memcpy_stod(&ds)?;
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1700,7 +1868,7 @@ impl Map2 for ConvTranspose2D<'_> {
                 );
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1723,7 +1891,8 @@ impl Map1 for Pool2D {
         inp: &CudaSlice<T>,
         dev: &CudaDevice,
         inp_l: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_pool2d");
         // Input shape: (b_size, c, h, w)
         let inp = &inp.slice(inp_l.start_offset()..);
@@ -1746,8 +1915,8 @@ impl Map1 for Pool2D {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.memcpy_stod(&ds)?;
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1786,7 +1955,7 @@ impl Map1 for Pool2D {
                 }
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1797,7 +1966,8 @@ impl Map1 for UpsampleNearest2D {
         inp: &CudaSlice<T>,
         dev: &CudaDevice,
         inp_l: &Layout,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_upsample_nearest2d");
         // Input shape: (b_size, c, h, w)
         let inp = &inp.slice(inp_l.start_offset()..);
@@ -1818,8 +1988,8 @@ impl Map1 for UpsampleNearest2D {
         };
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.memcpy_stod(&ds)?;
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
+        let ds = dev.memcpy_stod_from(&ds, origin)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
 
@@ -1842,7 +2012,7 @@ impl Map1 for UpsampleNearest2D {
                 );
             }
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -1897,7 +2067,8 @@ impl Map2 for WhereCond<'_> {
         f: &CudaSlice<T>,
         layout_f: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!("run_where");
         let ids_l = &self.1;
         let ids = &self.0;
@@ -1916,8 +2087,10 @@ impl Map2 for WhereCond<'_> {
         let shape = ids_l.shape();
         let dims = shape.dims();
         let el = shape.elem_count();
-        let ds = dev
-            .memcpy_stod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+        let ds = dev.memcpy_stod_from(
+            &[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat(),
+            origin,
+        )?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
 
@@ -1927,7 +2100,7 @@ impl Map2 for WhereCond<'_> {
         let stream = dev.cuda_stream();
 
         // SAFETY: Set later by running the kernel.
-        let out = unsafe { dev.alloc::<T>(el)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, el, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (t_ptr, _t_guard) = t.device_ptr(&stream);
@@ -1990,7 +2163,7 @@ impl Map2 for WhereCond<'_> {
                 _ => unreachable!(), // Already checked above
             };
         }
-        Ok(out)
+        Ok((out, out_backing))
     }
 }
 
@@ -2044,7 +2217,8 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         rhs: &CudaSlice<T>,
         rhs_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<CudaSlice<T>> {
+        origin: Backing,
+    ) -> Result<Out<T>> {
         cuda_breadcrumb!(U::KERNEL);
         let shape = lhs_l.shape();
         let dims = shape.dims();
@@ -2059,16 +2233,18 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
             let dtype_i32 = dtype_to_binary_dtype(dtype);
 
             // Prepare dims and strides info for non-contiguous tensors
-            let info: Option<CudaSlice<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+            let info: Option<Uploaded<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
                 None
             } else {
-                Some(dev.memcpy_stod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+                Some(
+                    dev.memcpy_stod_from(&[dims, lhs_l.stride(), rhs_l.stride()].concat(), origin)?,
+                )
             };
 
             let lhs_slice = &lhs.slice(lhs_start..);
             let rhs_slice = &rhs.slice(rhs_start..);
             // SAFETY: Allocated memory will be initialized by the kernel
-            let out = unsafe { dev.alloc::<T>(elem_count)? };
+            let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, elem_count, origin)? };
             {
                 let info_ptr = match &info {
                     Some(s) => {
@@ -2097,7 +2273,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
                     );
                 }
             }
-            return Ok(out);
+            return Ok((out, out_backing));
         }
 
         // All binary operations should be handled by FFI dispatcher above
@@ -2131,7 +2307,8 @@ impl Map2Any for Cmp {
         rhs: &CudaSlice<T>,
         rhs_l: &Layout,
         dev: &CudaDevice,
-    ) -> Result<S> {
+        origin: Backing,
+    ) -> Result<OutS> {
         cuda_breadcrumb!("run_binary_cmp_op");
         let shape = lhs_l.shape();
         let dims = shape.dims();
@@ -2146,16 +2323,16 @@ impl Map2Any for Cmp {
         let dtype_i32 = dtype_to_binary_dtype(dtype);
 
         // Prepare dims and strides info for non-contiguous tensors
-        let info: Option<CudaSlice<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+        let info: Option<Uploaded<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            Some(dev.memcpy_stod_from(&[dims, lhs_l.stride(), rhs_l.stride()].concat(), origin)?)
         };
 
         let lhs_slice = &lhs.slice(lhs_start..);
         let rhs_slice = &rhs.slice(rhs_start..);
         // SAFETY: Allocated memory will be initialized by the kernel
-        let out = unsafe { dev.alloc::<u8>(elem_count)? };
+        let (out, out_backing) = unsafe { alloc_inheriting::<u8>(dev, elem_count, origin)? };
         {
             let info_ptr = match &info {
                 Some(s) => {
@@ -2184,7 +2361,7 @@ impl Map2Any for Cmp {
                 );
             }
         }
-        Ok(S::U8(out))
+        Ok((S::U8(out), out_backing))
     }
 }
 
@@ -2211,12 +2388,131 @@ fn slice_src_and_dst<'a, T>(
 pub struct CudaStorage {
     pub slice: CudaStorageSlice,
     pub device: CudaDevice,
+    /// Whether dropping this storage may free its device memory.
+    /// [`Backing::Owned`] for everything the pool allocated — which is
+    /// everything except the arena leases built by
+    /// [`CudaStorage::from_leased_device_ptr`].
+    pub backing: Backing,
+}
+
+impl CudaStorageSlice {
+    /// Release the handle without freeing the memory behind it.
+    ///
+    /// Calling `leak` rather than merely suppressing the drop is load-bearing:
+    /// it waits on the slice's read/write events, destroys them, and decrements
+    /// the stream's `Arc`. Bare suppression (`mem::forget`) would strand two
+    /// `CudaEvent`s and a stream refcount **per lease** — thousands per second
+    /// on the decode path.
+    ///
+    /// This is the only correct way to dispose of a slice whose memory is owned
+    /// elsewhere (an arena slot, a wave range). Dropping one normally calls
+    /// `cuMemFreeAsync` on an interior pointer, which the driver rejects into a
+    /// silently-recorded error rather than a panic — so the mistake does not
+    /// announce itself.
+    fn leak_view(self) {
+        match self {
+            Self::U8(s) => {
+                s.leak();
+            }
+            Self::U32(s) => {
+                s.leak();
+            }
+            Self::I64(s) => {
+                s.leak();
+            }
+            Self::BF16(s) => {
+                s.leak();
+            }
+            Self::F16(s) => {
+                s.leak();
+            }
+            Self::F32(s) => {
+                s.leak();
+            }
+            Self::F64(s) => {
+                s.leak();
+            }
+            Self::F8E4M3(s) => {
+                s.leak();
+            }
+            Self::Moved => Self::unreachable_moved(),
+        }
+    }
+}
+
+impl Drop for CudaStorage {
+    fn drop(&mut self) {
+        // Exhaustive rather than `!= Lease`: a future `Backing` variant must
+        // state which side it falls on here, instead of silently inheriting the
+        // free path and releasing memory the storage does not own.
+        match self.backing {
+            Backing::Owned => return,
+            Backing::Lease(_) => {}
+        }
+        std::mem::replace(&mut self.slice, CudaStorageSlice::Moved).leak_view();
+    }
+}
+
+impl CudaStorage {
+    /// Wrap `len` elements of device memory at `ptr` as a leased storage.
+    ///
+    /// The memory must outlive every tensor derived from this storage, and must
+    /// already be valid for `T` — arena slots satisfy both: they live in a
+    /// reservation held for the process lifetime, and zero-on-recycle
+    /// (invariant 4) means a slot's bytes are always a legal bit pattern.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `len` elements of `dtype`, be aligned for
+    /// it, and stay live and un-aliased-for-writes for the storage's lifetime.
+    pub unsafe fn from_leased_device_ptr(
+        ptr: u64,
+        len: usize,
+        dtype: DType,
+        device: &CudaDevice,
+        origin: LeaseOrigin,
+    ) -> Result<Self> {
+        let stream = device.cuda_stream();
+        let slice = match dtype {
+            DType::U8 => CudaStorageSlice::U8(stream.upgrade_device_ptr::<u8>(ptr, len)),
+            DType::U32 => CudaStorageSlice::U32(stream.upgrade_device_ptr::<u32>(ptr, len)),
+            DType::I64 => CudaStorageSlice::I64(stream.upgrade_device_ptr::<i64>(ptr, len)),
+            DType::BF16 => CudaStorageSlice::BF16(stream.upgrade_device_ptr::<bf16>(ptr, len)),
+            DType::F16 => CudaStorageSlice::F16(stream.upgrade_device_ptr::<f16>(ptr, len)),
+            DType::F32 => CudaStorageSlice::F32(stream.upgrade_device_ptr::<f32>(ptr, len)),
+            DType::F64 => CudaStorageSlice::F64(stream.upgrade_device_ptr::<f64>(ptr, len)),
+            DType::F8E4M3 => {
+                CudaStorageSlice::F8E4M3(stream.upgrade_device_ptr::<F8E4M3>(ptr, len))
+            }
+        };
+        Ok(Self {
+            slice,
+            device: device.clone(),
+            backing: Backing::Lease(origin),
+        })
+    }
 }
 
 pub trait CudaDType: Sized {
     fn as_cuda_slice(s: &CudaStorage) -> Result<&CudaSlice<Self>>;
     fn as_cuda_slice_mut(s: &mut CudaStorage) -> Result<&mut CudaSlice<Self>>;
     fn wrap_cuda_slice(s: CudaSlice<Self>, dev: CudaDevice) -> CudaStorage;
+
+    /// Wrap `len` elements at a device address the caller does not own.
+    ///
+    /// The typed counterpart of [`CudaStorage::from_leased_device_ptr`], for
+    /// generic kernel wrappers that know their output type as a parameter
+    /// rather than as a runtime [`DType`]. Same lease semantics: dropping the
+    /// storage releases the handle without freeing the memory.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `len` elements of `Self`, be aligned for
+    /// it, and stay live and un-aliased-for-writes for the storage's lifetime.
+    unsafe fn wrap_leased_ptr(
+        ptr: u64,
+        len: usize,
+        dev: CudaDevice,
+        origin: LeaseOrigin,
+    ) -> CudaStorage;
 }
 
 macro_rules! cuda_dtype {
@@ -2248,7 +2544,25 @@ macro_rules! cuda_dtype {
 
             fn wrap_cuda_slice(slice: CudaSlice<Self>, device: CudaDevice) -> CudaStorage {
                 let slice = CudaStorageSlice::$dtype(slice);
-                CudaStorage { slice, device }
+                CudaStorage {
+                    slice,
+                    device,
+                    backing: Backing::Owned,
+                }
+            }
+
+            unsafe fn wrap_leased_ptr(
+                ptr: u64,
+                len: usize,
+                device: CudaDevice,
+                origin: LeaseOrigin,
+            ) -> CudaStorage {
+                let slice = device.cuda_stream().upgrade_device_ptr::<Self>(ptr, len);
+                CudaStorage {
+                    slice: CudaStorageSlice::$dtype(slice),
+                    device,
+                    backing: Backing::Lease(origin),
+                }
             }
         }
     };
@@ -2262,9 +2576,83 @@ cuda_dtype!(f32, F32);
 cuda_dtype!(f64, F64);
 cuda_dtype!(F8E4M3, F8E4M3);
 
+/// Alignment for an inherited output. Matches what `cudaMalloc` guarantees, so a
+/// wave-backed output is as aligned as the pool allocation it replaces for every
+/// vectorised access a kernel makes.
+pub const INHERIT_ALIGN: usize = 256;
+
+/// Allocate an op's output from the arena its **operand** came from, falling
+/// back to the pool.
+///
+/// This is the whole operand-provenance rule in one function. The returned
+/// [`Backing`] is what the caller must stamp on the output storage: pairing the
+/// slice with its backing here — rather than letting the call site name a
+/// `Backing` literal next to an allocation it made separately — is what stops
+/// the two drifting apart, which is the mistake that turns a wave range into a
+/// double free.
+///
+/// # Safety
+///
+/// The returned slice is uninitialised. The caller must have the kernel write it
+/// before anything reads it, exactly as for a bare `dev.alloc`.
+pub unsafe fn alloc_inheriting<T: DeviceRepr>(
+    dev: &CudaDevice,
+    elem_count: usize,
+    from: Backing,
+) -> Result<(CudaSlice<T>, Backing)> {
+    if let Some(ticket) = from.inherit_ticket() {
+        let bytes = elem_count * std::mem::size_of::<T>();
+        if let Some(ptr) = wave_provenance::wave_alloc(ticket, bytes, INHERIT_ALIGN) {
+            // Dropping this slice bare would `cuMemFreeAsync` an address inside
+            // the VMM reservation the wave arenas are carved from — memory the
+            // stream-ordered pool never allocated — so the driver rejects it and
+            // nothing is freed. That is what makes the window between here and
+            // the caller stamping `Backing::Lease` harmless.
+            let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
+            return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
+        }
+    }
+    Ok((dev.alloc::<T>(elem_count)?, Backing::Owned))
+}
+
 impl CudaStorage {
     pub fn wrap_cuda_slice<T: CudaDType>(slice: CudaSlice<T>, device: CudaDevice) -> CudaStorage {
         T::wrap_cuda_slice(slice, device)
+    }
+
+    /// Wrap a slice produced by [`alloc_inheriting`], carrying the backing it
+    /// resolved to.
+    ///
+    /// [`Self::wrap_cuda_slice`] stamps `Backing::Owned`, which is a claim of
+    /// ownership: dropping such a storage frees the memory. Applying it to a
+    /// slice that turned out to be a view over a wave range would hand the
+    /// arena's memory to the pool's free path, so an allocation site that can
+    /// inherit must carry the resolved backing through to the wrap.
+    pub fn wrap_cuda_slice_backed<T: CudaDType>(
+        slice: CudaSlice<T>,
+        device: CudaDevice,
+        backing: Backing,
+    ) -> CudaStorage {
+        let mut storage = T::wrap_cuda_slice(slice, device);
+        storage.backing = backing;
+        storage
+    }
+
+    /// Wrap a borrowed device range as storage of element type `T`.
+    ///
+    /// Kernel wrappers use this for outputs written into a transient span:
+    /// the span owns the memory and its generation frees it, so the storage
+    /// must not.
+    ///
+    /// # Safety
+    /// As [`CudaDType::wrap_leased_ptr`].
+    pub unsafe fn wrap_leased_ptr<T: CudaDType>(
+        ptr: u64,
+        len: usize,
+        device: CudaDevice,
+        origin: LeaseOrigin,
+    ) -> CudaStorage {
+        T::wrap_leased_ptr(ptr, len, device, origin)
     }
 
     pub fn as_cuda_slice<T: CudaDType>(&self) -> Result<&CudaSlice<T>> {
@@ -2273,6 +2661,55 @@ impl CudaStorage {
 
     pub fn as_cuda_slice_mut<T: CudaDType>(&mut self) -> Result<&mut CudaSlice<T>> {
         T::as_cuda_slice_mut(self)
+    }
+
+    /// Copy a range of U32 data from GPU to a host buffer on a specific stream.
+    ///
+    /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy is
+    /// truly asynchronous — the CPU returns immediately and the DMA engine
+    /// handles the transfer.  This is the async DtoH path used for routing
+    /// index transfer without draining the compute pipeline.
+    ///
+    /// `offset` and `elem_count` identify the sub-range of the device slice
+    /// to copy (from `contiguous_offsets` on the tensor layout).  `dst` must
+    /// have at least `elem_count` elements.
+    ///
+    /// Returns `Err` if the storage is not U32.
+    pub fn copy_u32_to_host_on_stream(
+        &self,
+        dst: &mut [u32],
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        offset: usize,
+        elem_count: usize,
+    ) -> Result<()> {
+        match &self.slice {
+            CudaStorageSlice::U32(slice) => {
+                if offset + elem_count > slice.len() {
+                    crate::bail!(
+                        "copy_u32_to_host_on_stream: range {}..{} exceeds slice len {}",
+                        offset,
+                        offset + elem_count,
+                        slice.len(),
+                    );
+                }
+                if dst.len() < elem_count {
+                    crate::bail!(
+                        "copy_u32_to_host_on_stream: dst too small ({} < {})",
+                        dst.len(),
+                        elem_count,
+                    );
+                }
+                let view = slice.slice(offset..offset + elem_count);
+                stream
+                    .memcpy_dtoh(&view, &mut dst[..elem_count])
+                    .map_err(crate::Error::wrap)?;
+                Ok(())
+            }
+            _ => crate::bail!(
+                "copy_u32_to_host_on_stream: expected U32 storage, got {:?}",
+                self.dtype(),
+            ),
+        }
     }
 
     /// In-place sparse addition - mutates the tensor directly without cloning.
@@ -2489,6 +2926,7 @@ impl CudaStorage {
     }
 
     pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        forbidden_alloc::record("CudaStorage::sub_at_indices", self.slice.byte_len());
         let device = self.device().clone();
 
         // Early return for empty indices
@@ -2502,8 +2940,13 @@ impl CudaStorage {
                 CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
                 CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
                 CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+                CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
             };
-            return Ok(Self { slice, device });
+            return Ok(Self {
+                slice,
+                device,
+                backing: Backing::Owned,
+            });
         }
 
         // Clone and then mutate in-place
@@ -2517,8 +2960,10 @@ impl CudaStorage {
                 CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
                 CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
                 CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+                CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
             },
             device,
+            backing: Backing::Owned,
         };
 
         // Use in-place mutation method
@@ -2746,7 +3191,25 @@ impl CudaStorage {
         // 1. We verified buffer size is sufficient
         // 2. The cast_mut kernel has converted the data in-place
         // 3. The buffer memory layout is compatible
-        self.slice = self.reinterpret_slice_as(dtype, elem_count)?;
+        // `reinterpret_slice_as` allocates a *fresh buffer* and copies into it,
+        // so this is a change of ownership, not a retype in place. Two things
+        // follow, and both were previously missed:
+        //
+        //  1. The outgoing slice has to be disposed of according to the backing
+        //     it had. A plain assignment would drop it — and dropping a lease
+        //     calls `cuMemFreeAsync` on memory owned by an arena.
+        //  2. `backing` has to follow the bytes to wherever the *new* buffer
+        //     came from. The destination inherits this storage's arena, so a
+        //     wave-backed cast stays on the wave; hard-coding either answer gets
+        //     one of the two cases wrong (a lease marked `Owned` is a double
+        //     free, a pool buffer marked `Lease` is a permanent leak).
+        let (fresh, fresh_backing) = self.reinterpret_slice_as(dtype, elem_count)?;
+        let previous = std::mem::replace(&mut self.slice, fresh);
+        match self.backing {
+            Backing::Lease(_) => previous.leak_view(),
+            Backing::Owned => drop(previous),
+        }
+        self.backing = fresh_backing;
 
         Ok(true)
     }
@@ -2762,6 +3225,7 @@ impl CudaStorage {
             CudaStorageSlice::F32(s) => s.len() * std::mem::size_of::<f32>(),
             CudaStorageSlice::F64(s) => s.len() * std::mem::size_of::<f64>(),
             CudaStorageSlice::F8E4M3(s) => s.len() * std::mem::size_of::<F8E4M3>(),
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         }
     }
 
@@ -2775,7 +3239,11 @@ impl CudaStorage {
     /// The caller must ensure:
     /// - The buffer contains valid data for the target dtype
     /// - The buffer is large enough to hold `elem_count` elements of the target dtype
-    fn reinterpret_slice_as(&self, dtype: DType, elem_count: usize) -> Result<CudaStorageSlice> {
+    fn reinterpret_slice_as(
+        &self,
+        dtype: DType,
+        elem_count: usize,
+    ) -> Result<(CudaStorageSlice, Backing)> {
         let dev = &self.device;
         let byte_count = elem_count * dtype.size_in_bytes();
         let stream = dev.cuda_stream();
@@ -2814,18 +3282,23 @@ impl CudaStorage {
                 let (ptr, _) = s.device_ptr(&stream);
                 ptr as cudarc::driver::sys::CUdeviceptr
             }
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         };
 
-        // Allocate destination buffer of the correct type and copy raw bytes
+        // Allocate destination buffer of the correct type and copy raw bytes.
+        // The retyped buffer holds the same values this storage already holds,
+        // so it belongs wherever this storage does.
+        let inherit = self.backing;
         macro_rules! alloc_and_copy {
             ($ty:ty, $wrapper:path) => {{
                 use cudarc::driver::DevicePtrMut;
-                let mut dst = unsafe { dev.alloc::<$ty>(elem_count)? };
+                let (mut dst, dst_backing) =
+                    unsafe { alloc_inheriting::<$ty>(dev, elem_count, inherit)? };
                 let (dst_ptr, _) = dst.device_ptr_mut(&stream);
                 unsafe {
                     cudarc::driver::result::memcpy_dtod_sync(dst_ptr, src_ptr, byte_count).w()?;
                 }
-                Ok($wrapper(dst))
+                Ok(($wrapper(dst), dst_backing))
             }};
         }
 
@@ -2842,6 +3315,7 @@ impl CudaStorage {
     }
 
     pub fn div_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        forbidden_alloc::record("CudaStorage::div_at_indices", self.slice.byte_len());
         let device = self.device().clone();
 
         // Early return for empty indices
@@ -2855,8 +3329,13 @@ impl CudaStorage {
                 CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
                 CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
                 CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+                CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
             };
-            return Ok(Self { slice, device });
+            return Ok(Self {
+                slice,
+                device,
+                backing: Backing::Owned,
+            });
         }
 
         // Clone and then mutate in-place
@@ -2870,8 +3349,10 @@ impl CudaStorage {
                 CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
                 CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
                 CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+                CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
             },
             device,
+            backing: Backing::Owned,
         };
 
         // Use in-place mutation method
@@ -2982,6 +3463,7 @@ impl CudaStorage {
                 let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
                 Ok(CpuStorage::F8E4M3(vec))
             }
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         }
     }
 }
@@ -3082,9 +3564,13 @@ impl BackendStorage for CudaStorage {
     type Device = CudaDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        let slice = Clone.map(&self.slice, self.device(), layout)?;
+        let (slice, out_backing) = Clone.map(self, self.device(), layout)?;
         let device = self.device.clone();
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn dtype(&self) -> DType {
@@ -3097,6 +3583,7 @@ impl BackendStorage for CudaStorage {
             CudaStorageSlice::F32(_) => DType::F32,
             CudaStorageSlice::F64(_) => DType::F64,
             CudaStorageSlice::F8E4M3(_) => DType::F8E4M3,
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         }
     }
 
@@ -3116,10 +3603,10 @@ impl BackendStorage for CudaStorage {
         let stream = dev.cuda_stream();
 
         // Prepare dims/strides info for non-contiguous tensors
-        let info: Option<CudaSlice<usize>> = if layout.is_contiguous() {
+        let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+            Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), self.backing)?)
         };
         let info_ptr = match &info {
             Some(s) => {
@@ -3175,6 +3662,7 @@ impl BackendStorage for CudaStorage {
                 let (ptr, _) = slice.slice(src_o..).device_ptr(&stream);
                 (FillDType::F8E4M3 as i32, ptr)
             }
+            S::Moved => S::unreachable_moved(),
         };
 
         // Keep info alive for the kernel call
@@ -3222,17 +3710,28 @@ impl BackendStorage for CudaStorage {
         let dst_dtype_i32 = dtype_to_cast(dtype);
 
         // Prepare dims/strides info for non-contiguous tensors
-        let info: Option<CudaSlice<usize>> = if layout.is_contiguous() {
+        let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+            Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), self.backing)?)
         };
 
         // Use a helper macro to reduce repetition and properly scope the guards
+        // Set by `cast_impl!` to whatever `alloc_inheriting` resolved, so the
+        // result storage is stamped with the backing of the buffer it actually
+        // got rather than an assumed one. Left uninitialised so the compiler
+        // checks every arm assigns it — an arm that allocated without recording
+        // its backing is exactly the drift this pairing exists to prevent.
+        let out_backing;
         macro_rules! cast_impl {
             ($inp_slice:expr, $out_ty:ty, $wrapper:path) => {{
                 let inp = $inp_slice.slice(start_o..);
-                let out = unsafe { dev.alloc::<$out_ty>(el)? };
+                // A cast reading a wave-backed operand writes into the same
+                // generation: the result is consumed within the phase that
+                // produced its input, which is why inheriting is right here and
+                // not merely permissible.
+                let (out, backing) = unsafe { alloc_inheriting::<$out_ty>(dev, el, self.backing)? };
+                out_backing = backing;
                 {
                     let info_ptr = match &info {
                         Some(s) => {
@@ -3385,25 +3884,41 @@ impl BackendStorage for CudaStorage {
             (CudaStorageSlice::F8E4M3(inp), DType::F8E4M3) => {
                 cast_impl!(inp, F8E4M3, CudaStorageSlice::F8E4M3)
             }
+            (CudaStorageSlice::Moved, _) => CudaStorageSlice::unreachable_moved(),
         };
         Ok(Self {
             slice,
             device: dev.clone(),
+            backing: out_backing,
         })
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = run_affine_ffi(&self.slice, &device, layout, mul, add)?;
-        Ok(Self { slice, device })
+        let slice = run_affine_ffi(&self.slice, &device, layout, mul, add, self.backing)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         use kernels::simple::unary::UnaryParamOp;
         let device = self.device().clone();
-        let slice =
-            run_unary_param_ffi(&self.slice, &device, layout, UnaryParamOp::Powf as i32, e)?;
-        Ok(Self { slice, device })
+        let slice = run_unary_param_ffi(
+            &self.slice,
+            &device,
+            layout,
+            UnaryParamOp::Powf as i32,
+            e,
+            self.backing,
+        )?;
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
@@ -3415,8 +3930,13 @@ impl BackendStorage for CudaStorage {
             layout,
             UnaryParamOp::Elu as i32,
             alpha,
+            self.backing,
         )?;
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
@@ -3431,20 +3951,32 @@ impl BackendStorage for CudaStorage {
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device().clone();
-        let slice = FastReduce(sum_dims, op).map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = FastReduce(sum_dims, op).map(self, &device, layout)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Cmp(op).map(&self.slice, lhs_l, &rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = Cmp(op).map(self, lhs_l, rhs, rhs_l, &device)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn unary_impl<U: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         let device = self.device().clone();
-        let slice = U::V.map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = U::V.map(self, &device, layout)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -3454,8 +3986,12 @@ impl BackendStorage for CudaStorage {
         rhs_l: &Layout,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let slice = B::V.map(&self.slice, lhs_l, &rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = B::V.map(self, lhs_l, rhs, rhs_l, &device)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn binary_inplace_impl(
@@ -3504,11 +4040,14 @@ impl BackendStorage for CudaStorage {
 
         // Prepare dims and strides info for non-contiguous rhs
         // Note: lhs is guaranteed contiguous, but rhs may not be
-        let info: Option<CudaSlice<usize>> = if rhs_l.is_contiguous() {
+        let info: Option<Uploaded<usize>> = if rhs_l.is_contiguous() {
             None
         } else {
             // Only need dims and rhs_strides since lhs is contiguous
-            Some(device.memcpy_stod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            Some(device.memcpy_stod_from(
+                &[dims, lhs_l.stride(), rhs_l.stride()].concat(),
+                self.backing,
+            )?)
         };
 
         // Get lhs slice with offset for mutable access
@@ -3566,6 +4105,7 @@ impl BackendStorage for CudaStorage {
                 let (ptr, guard) = s.device_ptr(&stream);
                 (ptr as *const std::ffi::c_void, guard)
             }
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         };
 
         // Offset rhs pointer
@@ -3659,6 +4199,7 @@ impl BackendStorage for CudaStorage {
                 let cpu_storage = slice.stream().memcpy_dtov(slice).w()?;
                 Ok(CpuStorage::F8E4M3(cpu_storage))
             }
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
         }
     }
 
@@ -3671,8 +4212,12 @@ impl BackendStorage for CudaStorage {
         f_l: &Layout,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let slice = WhereCond(self, layout).map(&t.slice, t_l, &f.slice, f_l, &device)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = WhereCond(self, layout).map(t, t_l, f, f_l, &device)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -3687,18 +4232,26 @@ impl BackendStorage for CudaStorage {
 
         let device = self.device().clone();
         if !USE_IM2COL_CONV1D {
-            let slice = Conv1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let (slice, out_backing) = Conv1D(params).map(self, l, kernel, kernel_l, &device)?;
+            return Ok(Self {
+                slice,
+                device,
+                backing: out_backing,
+            });
         }
 
-        let col = Im2Col1D {
+        let (col, col_backing) = Im2Col1D {
             l_k: params.k_size,
             stride: params.stride,
             dilation: params.dilation,
             padding: params.padding,
         }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
+        .map(self, &device, l)?;
+        let col = Self {
+            slice: col,
+            device,
+            backing: col_backing,
+        };
         let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
@@ -3736,8 +4289,13 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv1D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let (slice, out_backing) =
+                Conv1D(params).map(self, inp_l, kernel, kernel_l, &device)?;
+            return Ok(Self {
+                slice,
+                device,
+                backing: out_backing,
+            });
         }
         let l_out = params.l_out();
         let dst_el = params.c_out * l_out * params.b_size;
@@ -3795,7 +4353,11 @@ impl BackendStorage for CudaStorage {
                 "dtype mismatch in conv1d".to_string(),
             ))?,
         };
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn conv_transpose1d(
@@ -3850,11 +4412,15 @@ impl BackendStorage for CudaStorage {
             Col2Im1D {
                 stride: params.stride,
             }
-            .map(&col.slice, &device, &col_l)?
+            .map(&col, &device, &col_l)?
         } else {
-            ConvTranspose1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?
+            ConvTranspose1D(params).map(self, l, kernel, kernel_l, &device)?
         };
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice: slice.0,
+            device,
+            backing: slice.1,
+        })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -3869,19 +4435,27 @@ impl BackendStorage for CudaStorage {
 
         let device = self.device().clone();
         if !USE_IM2COL_CONV2D {
-            let slice = Conv2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let (slice, out_backing) = Conv2D(params).map(self, l, kernel, kernel_l, &device)?;
+            return Ok(Self {
+                slice,
+                device,
+                backing: out_backing,
+            });
         }
 
-        let col = Im2Col {
+        let (col, col_backing) = Im2Col {
             h_k: params.k_h,
             w_k: params.k_w,
             stride: params.stride,
             dilation: params.dilation,
             padding: params.padding,
         }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
+        .map(self, &device, l)?;
+        let col = Self {
+            slice: col,
+            device,
+            backing: col_backing,
+        };
         let h_out = params.out_h();
         let w_out = params.out_w();
         let b = params.b_size;
@@ -3922,8 +4496,13 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv2D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let (slice, out_backing) =
+                Conv2D(params).map(self, inp_l, kernel, kernel_l, &device)?;
+            return Ok(Self {
+                slice,
+                device,
+                backing: out_backing,
+            });
         }
         let (out_w, out_h) = (params.out_w(), params.out_h());
         let dst_el = params.c_out * out_w * out_h * params.b_size;
@@ -3981,7 +4560,11 @@ impl BackendStorage for CudaStorage {
                 "dtype mismatch in conv2d".to_string(),
             ))?,
         };
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn conv_transpose2d(
@@ -3992,35 +4575,47 @@ impl BackendStorage for CudaStorage {
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let slice =
-            ConvTranspose2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) =
+            ConvTranspose2D(params).map(self, l, kernel, kernel_l, &device)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn avg_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Pool2D {
+        let (slice, out_backing) = Pool2D {
             w_k: k.0,
             h_k: k.1,
             w_stride: stride.0,
             h_stride: stride.1,
             op: PoolOp::Avg,
         }
-        .map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        .map(self, &device, l)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn max_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Pool2D {
+        let (slice, out_backing) = Pool2D {
             w_k: k.0,
             h_k: k.1,
             w_stride: stride.0,
             h_stride: stride.1,
             op: PoolOp::Max,
         }
-        .map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        .map(self, &device, l)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _out_sz: usize) -> Result<Self> {
@@ -4029,19 +4624,31 @@ impl BackendStorage for CudaStorage {
 
     fn upsample_nearest2d(&self, l: &Layout, out_w: usize, out_h: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = UpsampleNearest2D(out_w, out_h).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = UpsampleNearest2D(out_w, out_h).map(self, &device, l)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = IndexSelect(ids, ids_l, dim).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = IndexSelect(ids, ids_l, dim).map(self, &device, l)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Gather(ids, ids_l, dim).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let (slice, out_backing) = Gather(ids, ids_l, dim).map(self, &device, l)?;
+        Ok(Self {
+            slice,
+            device,
+            backing: out_backing,
+        })
     }
     fn scatter_set(
         &mut self,
@@ -4175,7 +4782,11 @@ impl BackendStorage for CudaStorage {
             ))?,
         };
         let device = dev.clone();
-        Ok(Self { slice, device })
+        Ok(Self {
+            slice,
+            device,
+            backing: Backing::Owned,
+        })
     }
 
     fn copy2d(

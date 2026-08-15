@@ -363,14 +363,60 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
 }
 
 // INT8 kernels — q8a128 activations × quantized weights on the INT8 m16n8k32
-// tensor core (grouped_tc_int8). Emits TWO entry points per format:
-//   name##_grouped — MoE: device (tile→expert, batch-slice) table, single launch
-//                    over all experts. Same launch ABI as INSTANTIATE_KERNEL_GROUPED.
-//   name##_dense   — regular QMatMul: one weight, implicit tile schedule
-//                    (blockIdx.x → batch slice). Launched from run_quantized_matmul
-//                    on ytype==3.
-// Invoked explicitly for every format with an int8 weight-unpack (all 14), NOT from
-// INSTANTIATE_KERNELS_BASE.
+// tensor core (grouped_tc_int8). Invoked explicitly for every format with an int8
+// weight-unpack (all 14), NOT from INSTANTIATE_KERNELS_BASE.
+//
+// The dense and grouped entries are emitted by separate macros because they are
+// consumed at different widths. A dense projection (q/k/v, o_proj, router,
+// lm_head) is read back at the model's activation dtype, so it stores narrow and
+// carries one entry per output dtype. The grouped (MoE) result feeds straight
+// into the SwiGLU requantisation, where the wider F32 store is load-bearing, so
+// it has exactly one entry.
+//
+//   name##_dense    — regular QMatMul: one weight, implicit tile schedule
+//                     (blockIdx.x → the Bm=16 batch slice). Launched from
+//                     run_quantized_matmul on ytype==3.
+//   name##_dense_m2 — the same, N_SUB=2 (Bm=32): the weight chunk's dequant is
+//                     reused across 2 token sub-tiles per block, halving the
+//                     weight re-reads. The large-M (prefill) regime; the host
+//                     launches it with grid.x = ceil(total_batch / 32).
+//   name##_grouped  — MoE: device (tile→expert, batch-slice) table, single launch
+//                     over all experts. Same ABI as INSTANTIATE_KERNEL_GROUPED.
+#define INSTANTIATE_KERNEL_DENSE_INT8(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense( \
+    const void* __restrict__ weights, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int total_batch, \
+    const int y_stride, const int dst_stride) { \
+    grouped_tc::quantized_matmul_dense_entry_int8<qk, qi, block_type, vdr, dst_t, 1>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride); \
+}
+
+#define INSTANTIATE_KERNEL_DENSE_INT8_M2(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense_m2( \
+    const void* __restrict__ weights, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int total_batch, \
+    const int y_stride, const int dst_stride) { \
+    grouped_tc::quantized_matmul_dense_entry_int8<qk, qi, block_type, vdr, dst_t, 2>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride); \
+}
+
+// The three narrowed dense entries for one format: `base` names the format's int8
+// kernel family without its output-dtype tag (e.g. q4_k_int8), so this emits
+// base##_f16_dense, base##_bf16_dense and base##_f32_dense.
+#define INSTANTIATE_KERNEL_DENSE_INT8_ALL(base, qk, qi, block_type, vdr) \
+    INSTANTIATE_KERNEL_DENSE_INT8(base##_f16, qk, qi, block_type, vdr, half) \
+    INSTANTIATE_KERNEL_DENSE_INT8(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
+    INSTANTIATE_KERNEL_DENSE_INT8(base##_f32, qk, qi, block_type, vdr, float)
+
+#define INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(base, qk, qi, block_type, vdr) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f16, qk, qi, block_type, vdr, half) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f32, qk, qi, block_type, vdr, float)
+
 #define INSTANTIATE_KERNEL_GROUPED_INT8(name, qk, qi, block_type, vdr, dst_t) \
 extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
     const uint64_t* __restrict__ weight_ptrs, \
@@ -384,15 +430,6 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
     grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 2>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
         vy, dst, ncols_x, nrows_x, y_stride, dst_stride); \
-} \
-extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense( \
-    const void* __restrict__ weights, \
-    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
-    const int ncols_x, const int nrows_x, const int total_batch, \
-    const int y_stride, const int dst_stride) { \
-    grouped_tc::quantized_matmul_dense_entry_int8<qk, qi, block_type, vdr, dst_t>( \
-        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
-        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride); \
 }
 
 // Generate all 16 TC32 kernels (tc32_0 through tc32_15)

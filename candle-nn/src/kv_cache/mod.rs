@@ -27,8 +27,8 @@
 //! cache.set_chunked_backing(&backing, batch_idx, None)?;
 //! ```
 
-use candle::quantized::{GgmlDType, QTensor};
-use candle::{DType, Tensor};
+use candle::quantized::GgmlDType;
+use candle::DType;
 
 mod arena_table;
 mod cache;
@@ -36,12 +36,42 @@ mod chunked;
 mod rotating;
 
 pub use arena_table::{
-    ArenaEntry, ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable,
-    ResolvedArenaInfo, N_PALETTE,
+    ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable, ResolvedArenaInfo,
+    N_PALETTE,
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
+pub use chunked::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
+#[cfg(feature = "cuda")]
+pub use chunked::persistence_domain_stats;
+#[cfg(feature = "cuda")]
+pub use chunked::slot_state_stats;
+pub use chunked::wave_plan::{
+    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, wave_domain_stats,
+    BumpRange, ForwardOpen, WaveGeneration, KV_ARENA_MID_WAVE, WAVE_ATTN_BYTES, WAVE_FFN_BYTES,
+    WAVE_FORWARD_BYTES,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{expect_kv_range, span_layout, SpanLayout};
+/// The span's geometry, for the model loader that installs a weight side into it.
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
+    weight_capacity_bytes, weight_floor_after,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{region_stats, RegionStats, REGION_BYTES};
+/// The weight side of the reservation. Pure arithmetic, so it is available
+/// whether or not the crate was built with a GPU backend.
+pub use chunked::{
+    RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+};
+
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
 #[cfg(feature = "cuda")]
@@ -49,63 +79,66 @@ pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
-pub use chunked::set_vram_reserve_bytes;
 #[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub use chunked::{
-    arena_chunks_for_format, arena_gid_stride, LiveChunkRef, MetaGid, SealedChunk, SealedSequence,
-    WriterTail, CHUNK_SIZE,
+    all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
+    payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
-pub use chunked::{enter_migrate, migrate_in_flight, try_enter_relief, MigrateGuard, ReliefGuard};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
-    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvErrorThresholdFactors,
-    LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS,
-    PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS,
-    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS,
+    ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
+    KvErrorThresholdFactors, LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
+    PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS,
 };
 pub use chunked::{ArenaKey, StoragePolicy};
+pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };
 
-// ==================== Paged KV Arenas Trait ====================
-
-/// Trait for accessing paged KV arenas.
+/// The formats **unsealed (active)** KV chunks actually occupy, given the
+/// session's configured *sealed* formats and whether the backing is on GPU.
 ///
-/// This abstraction allows attention kernels to work with any paged KV storage
-/// implementation, and enables testing with mock implementations.
-pub trait PagedKvArenas {
-    /// Number of KV heads.
-    fn n_kv_head(&self) -> usize;
-
-    /// Dimension of each head.
-    fn head_dim(&self) -> usize;
-
-    /// Storage format for K cache.
-    fn k_format(&self) -> KvFormat;
-
-    /// Storage format for V cache.
-    fn v_format(&self) -> KvFormat;
-
-    /// Get float arenas (K, V). Returns None if using quantized storage.
-    fn float_arenas(&self) -> Option<(Vec<Tensor>, Vec<Tensor>)>;
-
-    /// Get quantized arenas (K, V). Returns None if using float storage.
-    fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)>;
-
-    /// Returns true if using quantized storage.
-    fn is_quantized(&self) -> bool {
-        self.k_format().is_quantized() || self.v_format().is_quantized()
+/// A block does not reach its configured format until its turn seals and
+/// quantizes. While a sequence is live, its K sits in `R16` on GPU — raw F16
+/// **plus reserved Q-capture space, 128 bytes per 32 elements, i.e. twice plain
+/// F16** — and its V sits in plain F16. The configured pair (say `Q4_0` + `Q8_0`
+/// at 18 + 34 B) is what the same data costs *after* it settles.
+///
+/// The distinction is load-bearing for admission. Pricing a candidate at the
+/// sealed cost understates what it occupies for its entire working life by
+/// `192 / 52 ≈ 3.7x`: measured, a KV cache admission believed was ~1.5 GiB was
+/// physically 5.7 GiB (R16 3520 MiB + F16 1840 MiB = 94% of it), which is what
+/// pushed a 7.5 GiB expert cache plus KV past a 13.5 GiB ceiling and refused
+/// arena after arena. Admission must reason in ACTIVE formats; only the
+/// steady-state footprint of a finished turn is in sealed formats.
+pub fn active_kv_formats(k_format: KvFormat, on_gpu: bool) -> (KvFormat, KvFormat) {
+    match k_format {
+        // A float-configured backing never quantizes on append: active == sealed.
+        KvFormat::Float(dtype) => (KvFormat::Float(dtype), KvFormat::Float(dtype)),
+        // GPU: K accumulates in R16 (raw + Q-capture space), V in plain F16.
+        KvFormat::Quantized(_) if on_gpu => (
+            KvFormat::Quantized(QuantFormat::R16),
+            KvFormat::Float(candle::DType::F16),
+        ),
+        // CPU: active K stays plain float so partial-token appends need no
+        // block-aligned quantization.
+        KvFormat::Quantized(_) => (
+            KvFormat::Float(candle::DType::F16),
+            KvFormat::Float(candle::DType::F16),
+        ),
     }
 }
 
@@ -346,6 +379,19 @@ impl KvFormat {
         match self {
             Self::Float(dt) => dt.size_in_bytes() as f32,
             Self::Quantized(qf) => qf.bytes_per_elem(),
+        }
+    }
+
+    /// Exact bytes one [`CHUNK_SIZE`]-element block occupies in this format.
+    ///
+    /// The integer counterpart of [`Self::bytes_per_elem`], for callers that
+    /// must account storage in whole blocks — a quantized block's size is not
+    /// generally divisible by its element count (`Q4_0` is 18 bytes for 32
+    /// elements), so per-element arithmetic cannot round-trip it.
+    pub fn bytes_per_block(&self) -> usize {
+        match self {
+            Self::Float(dt) => dt.size_in_bytes() * CHUNK_SIZE,
+            Self::Quantized(qf) => qf.bytes_per_block(),
         }
     }
 

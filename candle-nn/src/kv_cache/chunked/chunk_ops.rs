@@ -11,20 +11,38 @@
 
 // Import from parent module (chunked/mod.rs)
 
+use super::arena::ArenaStorageState;
+#[cfg(feature = "cuda")]
+use super::bump_arena;
+use super::bump_arena::NOT_A_WAVE;
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
+use super::meta_pool::ChunkRecordSrc;
+use super::size_class::payload_bytes_for_tag;
 use super::types::{SealedChunk, SealedSequence};
-use super::{arena_gid_stride, CHUNK_SIZE};
 use super::{Arena, ArenaKey, ChunkedKvBacking};
+use super::{CHUNK_SIZE, GID_STRIDE};
 // Import from kv_cache module (grandparent)
-use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
+use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, N_PALETTE};
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
-use crate::kv_cache::QuantFormat;
-#[cfg(feature = "cuda")]
 use candle::quantized::cuda::SELECT_FMT_F16;
-use candle::quantized::QTensor;
-use candle::{DType, Device, Result, Tensor};
+use candle::{Device, Result, Tensor};
+
+/// The arena keys a run of per-band formats allocates from.
+///
+/// The one place formats are turned into keys, so the "can these bands share a
+/// contiguous run" test is asked of the keys everywhere rather than of the
+/// formats in one place and the keys in another.
+fn band_keys(
+    fmts: &[KvFormat],
+    backing: &ChunkedKvBacking,
+    location: ArenaLocation,
+) -> Result<Vec<ArenaKey>> {
+    fmts.iter()
+        .map(|f| backing.inner.arena_key_for(*f, location))
+        .collect()
+}
 
 // Shared production thresholds are defined in compression_policy.rs and are
 // consumed here directly so the runtime and table harness stay in sync.
@@ -33,150 +51,98 @@ use candle::{DType, Device, Result, Tensor};
 /// (host pinned/heap AND transient GPU staging). Kept deliberately small: the
 /// warm tier fills host RAM with thousands of 16 MiB CPU arenas, so a *large*
 /// contiguous host allocation (the old 2 GiB) can fail on a fragmented heap and
-/// abort the process. At 512 MiB a full ~1.4 GiB pass migrates in ~3 batches
-/// (≈3 DtoH syncs) — still far below the per-layer 48 that made `copy_ms` the
-/// drain bottleneck, while bounding every staging allocation to a size the heap
-/// can reliably supply. The persistence thread pre-sizes its reusable scratch to
+/// abort the process. The persistence thread pre-sizes its reusable scratch to
 /// this at startup (clean heap), so it never has to re-grow under fragmentation.
-pub const MIGRATION_STAGING_CAP_BYTES: usize = 512 * 1024 * 1024;
+///
+/// **This is charged to the reservation, so it is priced in KV regions** — the
+/// GPU half of the staging comes out of the persistence bump domain, whose span
+/// is exactly this cap ([`super::bump_arena::persistence_domain`]), and the
+/// transient tier is subtracted from the KV side before a single region is
+/// carved. 512 MiB costs 32 regions of KV, which on a 16 GiB card is real, and
+/// the measured GPU staging peak on a decode/ingest workload is **29,696 B**.
+///
+/// **All three staging sites now batch against it**, so it is a batch size
+/// rather than a ceiling and the span bounds one group instead of a whole pass:
+/// `migrate_sealed_layers_to_cpu_batch` groups by layer, and
+/// `migrate_sealed_to_gpu_batch_async` (warm→hot elevate) and the hot→warm
+/// gather group by band through [`staging_groups`]. Each group opens its own
+/// generation, so the cursor rewinds between them and peak transient use is one
+/// group. That is what makes lowering it safe — before, two of the three did a
+/// single `bump.alloc(total_bytes)`, and `persistence/elevate.rs` issues the
+/// elevate **once per layer across every warm item**, so a deep elevate simply
+/// exhausted the span and failed the forward.
+///
+/// 64 MiB is sized from the floor the batching can shrink to — a single ~30 MB
+/// layer, so two layers plus headroom — not from the 29,696 B observed peak,
+/// which was measured on runs where the elevate path never executed
+/// (`residences=0`, persist domain `cursor=0 peak=0`) and is therefore a
+/// measurement of this path *not running*. The cost is DtoH syncs on the
+/// hot→warm path (~22 for a ~1.4 GiB pass against the per-layer 48 that made
+/// `copy_ms` the drain bottleneck), paid off the decode path; the gain is
+/// 28 KV regions that the expert cache and context depth get instead.
+pub const MIGRATION_STAGING_CAP_BYTES: usize = 64 * 1024 * 1024;
 
-/// Source formats the quantize-on-evict kernel can ingest directly:
-/// GPU `Float` (any dtype) or `Quantized(R16)`. Anything else has to
-/// take the format-preserving migration path because the selection /
-/// conversion kernels are only compiled for these source layouts.
+/// Split consecutive per-band byte lengths into groups that each fit `cap`.
+///
+/// Returns `(start, end, bytes)` per group, `end` exclusive. **Always takes at
+/// least one element**, so a single band wider than `cap` forms its own
+/// oversized group and makes progress instead of looping forever — the same
+/// rule `migrate_sealed_layers_to_cpu_batch` applies to layers.
+///
+/// Shared by both staging sites so the two cannot drift, and pure so the
+/// boundary arithmetic is testable without a GPU
+/// ([`staging_groups_respect_the_cap`](tests)).
+pub(super) fn staging_groups(lens: &[usize], cap: usize) -> Vec<(usize, usize, usize)> {
+    let mut groups = Vec::new();
+    let mut i = 0usize;
+    while i < lens.len() {
+        let mut j = i;
+        let mut bytes = 0usize;
+        while j < lens.len() {
+            if j > i && bytes + lens[j] > cap {
+                break;
+            }
+            bytes += lens[j];
+            j += 1;
+        }
+        groups.push((i, j, bytes));
+        i = j;
+    }
+    groups
+}
+
+/// Source formats the quantize-on-evict kernel can ingest directly: `Float`
+/// (any dtype) or `Quantized(R16)`. Anything else has to take the
+/// format-preserving migration path because the selection / conversion kernels
+/// are only compiled for these source layouts.
+///
+/// Takes the band's own format tag, read from the chunk rather than from the
+/// arena its gid points into — an arena holds whatever fits its size class and
+/// cannot answer the question (`docs/archived/arena_unification.md` principle 8).
+/// Callers pair this with the arena's `location`, which *is* arena identity.
 #[cfg(feature = "cuda")]
 #[inline]
-pub(super) fn needs_reconcile_source_format(format: KvFormat) -> bool {
-    matches!(
-        format,
-        KvFormat::Float(_) | KvFormat::Quantized(QuantFormat::R16)
-    )
+pub(super) fn needs_reconcile_source_tag(tag: ArenaFormatTag) -> bool {
+    // Every float tag qualifies; of the quantized tags only R16. `Invalid`
+    // reports as quantized, so it correctly fails both arms.
+    !tag.is_quantized() || tag == ArenaFormatTag::R16
 }
 
-/// Byte size of one chunk slot in an arena — the unit
-/// [`super::migrate::kv_migrate_on`] uses for its DMA stride, and the
-/// chunk_byte_stride [`super::backing::BackingInner::resolve_arena_info`]
-/// reports.
+/// Read one chunk-slot's payload bytes from a CPU arena into `dst`. The
+/// reverse of [`ChunkedKvBacking::write_chunk_from_pinned_bytes`].
 ///
-/// For Float arenas: `prod(per_chunk_dims) × dtype.size_in_bytes`.
-/// For Quantized arenas: `(elems_per_chunk / block_size) × type_size`,
-/// inferred from the arena's total element count divided by its
-/// arena_chunks (so it handles any head_dim, not just the canonical
-/// 128).
-///
-/// Used by the cuda-gated `migrate_sealed_to_gpu_batch_async` path and
-/// its test fixtures; cfg'd to that feature so non-cuda builds don't
-/// see it as dead code.
-#[cfg(feature = "cuda")]
-fn chunk_byte_size_of(arena: &Arena) -> Result<usize> {
-    match arena {
-        Arena::Float { data, dtype, .. } => {
-            let dims = data.dims();
-            if dims.is_empty() {
-                return Err(candle::Error::Msg(
-                    "chunk_byte_size_of: arena tensor has zero dims".into(),
-                ));
-            }
-            let n_elems: usize = dims[1..].iter().product();
-            Ok(n_elems * dtype.size_in_bytes())
-        }
-        Arena::Quantized { format, data, .. } => {
-            let kv_fmt = crate::kv_cache::KvFormat::Quantized(*format);
-            let arena_chunks = super::arena_chunks_for_format(kv_fmt);
-            let total_elems = data.shape().elem_count();
-            if arena_chunks == 0 || total_elems == 0 {
-                return Err(candle::Error::Msg(
-                    "chunk_byte_size_of: quantized arena has zero elements or chunks".into(),
-                ));
-            }
-            let elems_per_chunk = total_elems / arena_chunks;
-            let ggml = format.to_ggml_dtype();
-            Ok((elems_per_chunk / ggml.block_size()) * ggml.type_size())
-        }
-    }
-}
-
-/// Read one chunk-slot's bytes from a CPU `Arena::Float` at
-/// `(arena, chunk_idx)` into `dst`. The reverse of
-/// [`ChunkedKvBacking::write_chunk_from_pinned_bytes`]; same dtype
-/// dispatch (`bf16` / `f16` / `f32`).
+/// `dst.len()` is the band's **payload** — how many bytes of the slot are the
+/// chunk — while the slot's address step is the arena's class stride. They are
+/// different numbers, so the offset must never be derived from `dst.len()`:
+/// doing so addresses slot `n` at `n * payload` and walks into a neighbour
+/// (`docs/archived/arena_unification.md` invariant 8).
 fn read_chunk_into_pinned_bytes(arena: &Arena, chunk_idx: usize, dst: &mut [u8]) -> Result<()> {
-    match arena {
-        Arena::Float { data, dtype, .. } => {
-            let dims = data.dims();
-            if dims.is_empty() {
-                return Err(candle::Error::Msg(
-                    "read_chunk_into_pinned_bytes: arena tensor has zero dims".into(),
-                ));
-            }
-            let n_elems: usize = dims[1..].iter().product();
-            let expected_bytes = n_elems * dtype.size_in_bytes();
-            if dst.len() != expected_bytes {
-                return Err(candle::Error::Msg(format!(
-                    "read_chunk_into_pinned_bytes: expected {expected_bytes} bytes, got {}",
-                    dst.len()
-                )));
-            }
-            // Narrow → flatten → to_vec is the only stable path to a
-            // contiguous byte read of a CPU Tensor in candle today. The
-            // Vec allocation is one extra copy on top of the pinned
-            // memcpy; acceptable for the warm→hot path (rare, eviction-
-            // driven). A direct `&[u8]` view into CpuStorage would need
-            // a candle-core API change.
-            let view = data.narrow(0, chunk_idx, 1)?;
-            let flat = view.flatten_all()?;
-            match dtype {
-                DType::BF16 => {
-                    let v: Vec<half::bf16> = flat.to_vec1::<half::bf16>()?;
-                    // SAFETY: bf16 is 2-byte POD; v.len() == n_elems
-                    // (validated via expected_bytes above).
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
-                    };
-                    dst.copy_from_slice(bytes);
-                }
-                DType::F16 => {
-                    let v: Vec<half::f16> = flat.to_vec1::<half::f16>()?;
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
-                    };
-                    dst.copy_from_slice(bytes);
-                }
-                DType::F32 => {
-                    let v: Vec<f32> = flat.to_vec1::<f32>()?;
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
-                    };
-                    dst.copy_from_slice(bytes);
-                }
-                DType::F8E4M3 => {
-                    let v: Vec<float8::F8E4M3> = flat.to_vec1::<float8::F8E4M3>()?;
-                    // SAFETY: F8E4M3 is a 1-byte POD; v.len() == n_elems
-                    // (validated via expected_bytes above).
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
-                    };
-                    dst.copy_from_slice(bytes);
-                }
-                other => {
-                    return Err(candle::Error::Msg(format!(
-                        "read_chunk_into_pinned_bytes: unsupported Float dtype {other:?}"
-                    )))
-                }
-            }
-            Ok(())
-        }
-        Arena::Quantized { data, .. } => {
-            // Same flat-slab story as `write_chunk_from_pinned_bytes`:
-            // one `chunk_byte_stride` of bytes starting at
-            // `chunk_idx * dst.len()`. The HtoD scatter on the next
-            // phase rebuilds the GPU arena chunk-for-chunk from this
-            // pinned scratch.
-            let byte_offset = chunk_idx * dst.len();
-            data.read_bytes_at(byte_offset, dst)?;
-            Ok(())
-        }
-    }
+    let view = arena.slot_bytes(chunk_idx, dst.len())?;
+    // `to_vec1` is the only stable path to a contiguous byte read of a CPU
+    // tensor in candle today; the Vec is one extra copy on top of the pinned
+    // memcpy, acceptable for the warm→hot path (rare, eviction-driven).
+    dst.copy_from_slice(&view.to_vec1::<u8>()?);
+    Ok(())
 }
 
 /// Per-block parameter bundle for [`ChunkedKvBacking::alloc_sealed_blocks_bulk`].
@@ -204,10 +170,16 @@ pub struct BlockAllocSpec {
 impl ChunkedKvBacking {
     /// Read the raw bytes of one chunk slot into `dst`. Works for both
     /// `Arena::Float` (any supported dtype) and `Arena::Quantized`
-    /// (CPU or GPU). The destination buffer must be exactly the
-    /// arena's `chunk_byte_stride` bytes — call sites use
-    /// [`crate::kv_cache::arena_table::ResolvedArenaInfo::chunk_byte_stride`]
-    /// to size it.
+    /// (CPU or GPU).
+    ///
+    /// `dst` must be exactly the chunk's **payload**
+    /// ([`ResolvedArenaInfo::chunk_payload_bytes`]); `slot_stride` is the
+    /// arena's **address step** ([`ResolvedArenaInfo::chunk_byte_stride`]).
+    /// Passing the same value for both is correct only while arenas are
+    /// per-format.
+    ///
+    /// [`ResolvedArenaInfo::chunk_payload_bytes`]: crate::kv_cache::arena_table::ResolvedArenaInfo::chunk_payload_bytes
+    /// [`ResolvedArenaInfo::chunk_byte_stride`]: crate::kv_cache::arena_table::ResolvedArenaInfo::chunk_byte_stride
     pub fn read_chunk_into_bytes(
         &self,
         arena_idx: usize,
@@ -222,43 +194,44 @@ impl ChunkedKvBacking {
         })?
     }
 
-    /// Migrate a chunk from one arena type to another.
+    /// Relocate one chunk slot to a fresh slot of the **same size class**.
     ///
-    /// This is the central operation for moving data between formats (float/quant)
-    /// and locations (GPU/CPU). The source chunk data is copied/converted to a
-    /// newly allocated chunk in the target arena type.
+    /// This is the tier move — hot↔warm — and nothing more. It copies the
+    /// slot's bytes verbatim; it does not, and cannot, change a chunk's
+    /// format. An arena is a run of fixed-stride byte slots that says nothing
+    /// about what occupies them (`docs/archived/arena_unification.md` principle 8), so
+    /// a per-chunk *conversion* has no source format to read here. Format
+    /// changes happen where the formats are known: the quantize / dequantize
+    /// passes in `compress.rs`, which work from the chunk's own band tags.
+    ///
+    /// Requiring the classes to match is what makes the verbatim copy safe:
+    /// equal strides mean the destination slot is exactly as wide as the
+    /// source, so no tenant's bytes can be truncated or spill into a
+    /// neighbour.
     ///
     /// # Arguments
-    /// * `source_gid` - Global chunk ID of the source chunk
-    /// * `target_key` - The format/location to migrate to
+    /// * `source_gid` - Raw id of the source chunk slot
+    /// * `target_key` - Class (must equal the source's) + destination location
     ///
     /// # Returns
-    /// The global chunk ID of the newly allocated chunk in the target arena type.
+    /// The `ChunkGid` of the newly allocated slot.
     pub fn migrate_chunk(&self, source_gid: i64, target_key: ArenaKey) -> Result<ChunkGid> {
         if source_gid < 0 {
             candle::bail!("migrate_chunk: invalid source chunk ID {}", source_gid);
         }
         let source_gid = source_gid as usize;
+        let source_arena_idx = source_gid / GID_STRIDE;
+        let source_chunk_idx = source_gid % GID_STRIDE;
 
-        let arena_chunks = arena_gid_stride();
-        let source_arena_idx = source_gid / arena_chunks;
-        let source_chunk_idx = source_gid % arena_chunks;
-
-        // Capture params for closure
-        let n_kv_head = self.inner.n_kv_head;
-        let chunk_size = CHUNK_SIZE;
-        let head_dim = self.inner.head_dim;
-
-        // Allocate destination GID through the pool ? this is the single allocation path.
+        // Allocate destination GID through the pool — this is the single allocation path.
         let new_gid = {
             let _state = self
                 .state
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            self.alloc_chunk_for_key(target_key.clone())?
+            self.alloc_chunk_for_key(target_key)?
         };
 
-        // Perform the data copy/conversion inside a storage write lock.
         let arena_idx = new_gid.arena_idx();
         let chunk_idx = new_gid.chunk_idx();
         let copy_result = self.inner.storage.try_write(|s| {
@@ -272,32 +245,20 @@ impl ChunkedKvBacking {
             let Some(source_key) = s.arena_key(source_arena_idx) else {
                 return Ok(false);
             };
-
-            if source_key == target_key {
-                Self::copy_chunk_data_static(
-                    s.arenas_mut(),
-                    source_arena_idx,
-                    source_chunk_idx,
-                    arena_idx,
-                    chunk_idx,
-                    n_kv_head,
-                    chunk_size,
-                    head_dim,
-                )?;
-            } else {
-                Self::convert_chunk_data_static(
-                    s.arenas_mut(),
-                    source_arena_idx,
-                    source_chunk_idx,
-                    source_key,
-                    arena_idx,
-                    chunk_idx,
-                    target_key,
-                    n_kv_head,
-                    chunk_size,
-                    head_dim,
-                )?;
+            if source_key.class != target_key.class {
+                candle::bail!(
+                    "migrate_chunk: cannot relocate a {} B slot into a {} B slot —                      a slot move is byte-verbatim and never converts formats",
+                    source_key.slot_stride(),
+                    target_key.slot_stride(),
+                );
             }
+            Self::copy_slot_bytes(
+                s.arenas_mut(),
+                source_arena_idx,
+                source_chunk_idx,
+                arena_idx,
+                chunk_idx,
+            )?;
             Ok(true)
         });
 
@@ -316,499 +277,55 @@ impl ChunkedKvBacking {
                 // strides differ, silent cross-context KV reads when not).
                 // new_gid drops here, returning the dest GID to the pool.
                 Err(candle::Error::Msg(format!(
-                    "migrate_chunk: source arena {source_arena_idx} (gid {source_gid}) vanished \
-                     while its chunk is still referenced — arena freed with live KV"
+                    "migrate_chunk: source arena {source_arena_idx} (gid {source_gid}) vanished                      while its chunk is still referenced — arena freed with live KV"
                 )))
             }
             Err(e) => {
-                // Data copy failed ? new_gid drops here, returning GID to pool.
+                // Data copy failed — new_gid drops here, returning GID to pool.
                 Err(e)
             }
         }
     }
 
-    /// Static helper to copy chunk data (no &self reference for use in closures).
-    #[allow(clippy::too_many_arguments)]
-    fn copy_chunk_data_static(
+    /// Copy one whole slot's bytes between arenas of the same class, crossing
+    /// devices if their locations differ.
+    ///
+    /// The **full stride** moves, not just some payload: this is the one place
+    /// with no chunk in hand to name a format, and the extra bytes are the
+    /// slot's zeroed pad (invariant 4). Copying the whole slot also keeps the
+    /// destination's pad clean without a second write.
+    pub(super) fn copy_slot_bytes(
         arenas: &mut ahash::AHashMap<usize, Arena>,
         src_arena: usize,
         src_chunk: usize,
         dst_arena: usize,
         dst_chunk: usize,
-        _n_kv_head: usize,
-        chunk_size: usize,
-        head_dim: usize,
     ) -> Result<()> {
-        if src_arena == dst_arena {
-            // Same-arena copy: clone/copy source data first to release the immutable
-            // borrow, then take a mutable borrow for the write.
-            let sub_head_dim = (head_dim / N_PALETTE).max(1);
-            let elems_per_chunk = chunk_size * sub_head_dim;
-            match arenas.get(&src_arena) {
-                Some(Arena::Float { data, .. }) => {
-                    let chunk = data.narrow(0, src_chunk, 1)?.copy()?;
-                    match arenas.get_mut(&dst_arena) {
-                        Some(Arena::Float { data, .. }) => data.slice_set(&chunk, 0, dst_chunk)?,
-                        _ => candle::bail!("copy_chunk_data: same-arena Float mismatch"),
-                    }
-                }
-                Some(Arena::Quantized { data, .. }) => {
-                    let src_data_clone = data.clone();
-                    let src_elem_offset = src_chunk * elems_per_chunk;
-                    let dst_elem_offset = dst_chunk * elems_per_chunk;
-                    match arenas.get_mut(&dst_arena) {
-                        Some(Arena::Quantized { data: dst_data, .. }) => {
-                            dst_data.slice_range_copy(
-                                &src_data_clone,
-                                src_elem_offset,
-                                dst_elem_offset,
-                                elems_per_chunk,
-                            )?;
-                        }
-                        _ => candle::bail!("copy_chunk_data: same-arena Quantized mismatch"),
-                    }
-                }
-                None => candle::bail!("copy_chunk_data: src arena {} not found", src_arena),
-            }
-            return Ok(());
-        }
-
-        // Different arenas: extract source data first (clone to release immutable borrow),
-        // then mutably access destination.
-        match arenas.get(&src_arena) {
-            Some(Arena::Float { data, .. }) => {
-                let chunk = data.narrow(0, src_chunk, 1)?.copy()?;
-                match arenas.get_mut(&dst_arena) {
-                    Some(Arena::Float { data: dst_data, .. }) => {
-                        dst_data.slice_set(&chunk, 0, dst_chunk)?;
-                        Ok(())
-                    }
-                    _ => candle::bail!("copy_chunk_data: mismatched arena types"),
-                }
-            }
-            Some(Arena::Quantized { data: src_data, .. }) => {
-                let sub_head_dim = (head_dim / N_PALETTE).max(1);
-                let elems_per_chunk = chunk_size * sub_head_dim;
-                let src_elem_offset = src_chunk * elems_per_chunk;
-                let dst_elem_offset = dst_chunk * elems_per_chunk;
-                let src_dtype = src_data.dtype();
-                // Clone source data to release the immutable borrow before mutably borrowing dst.
-                let src_data_clone = src_data.clone();
-                match arenas.get_mut(&dst_arena) {
-                    Some(Arena::Quantized { data: dst_data, .. }) => {
-                        if src_dtype == dst_data.dtype() {
-                            // Same-format copy: direct byte-level memcpy, no dequant/requant
-                            dst_data.slice_range_copy(
-                                &src_data_clone,
-                                src_elem_offset,
-                                dst_elem_offset,
-                                elems_per_chunk,
-                            )?;
-                            Ok(())
-                        } else {
-                            candle::bail!(
-                                "copy_chunk_data: quant dtype mismatch ({:?} vs {:?}) - K/V target key routing error",
-                                src_dtype,
-                                dst_data.dtype()
-                            )
-                        }
-                    }
-                    _ => candle::bail!("copy_chunk_data: mismatched arena types"),
-                }
-            }
-            None => candle::bail!("copy_chunk_data: src arena {} not found", src_arena),
-        }
-    }
-
-    /// Static helper to convert chunk data between different arena types.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_chunk_data_static(
-        arenas: &mut ahash::AHashMap<usize, Arena>,
-        src_arena: usize,
-        src_chunk: usize,
-        src_key: ArenaKey,
-        dst_arena: usize,
-        dst_chunk: usize,
-        dst_key: ArenaKey,
-        _n_kv_head: usize,
-        chunk_size: usize,
-        head_dim: usize,
-    ) -> Result<()> {
-        use ArenaLocation::*;
-
-        // Flat arena: each chunk = chunk_size * sub_head_dim (one head, one palette sub-band).
-        // Arenas are allocated with shape (arena_chunks, CHUNK_SIZE, sub_head_dim) where
-        // sub_head_dim = head_dim / N_PALETTE.  Using head_dim here produces a 4× offset
-        // overrun on typical models (head_dim=128, N_PALETTE=4 → sub_head_dim=32).
-        let sub_head_dim = (head_dim / N_PALETTE).max(1);
-        let elems_per_chunk = chunk_size * sub_head_dim;
-
-        // Helper to get device from an arena
-        let get_device = |arena: &Arena| -> Device {
-            match arena {
-                Arena::Float { data, .. } => data.device().clone(),
-                Arena::Quantized { data, .. } => data.device().clone(),
-            }
+        // Read the source slot out first: it releases the immutable borrow
+        // before the destination's mutable one, and it is also what carries the
+        // bytes across a device boundary when the tiers differ.
+        let (bytes, src_stride) = {
+            let src = arenas.get(&src_arena).ok_or_else(|| {
+                candle::Error::Msg(format!("copy_slot_bytes: src arena {src_arena} not found"))
+            })?;
+            let stride = src.slot_stride();
+            (src.slot_bytes(src_chunk, stride)?.copy()?, stride)
         };
-
-        let _src_device = arenas
-            .get(&src_arena)
-            .map(get_device)
-            .unwrap_or(Device::Cpu);
-        let dst_device = arenas
-            .get(&dst_arena)
-            .map(get_device)
-            .unwrap_or(Device::Cpu);
-
-        match (
-            src_key.location,
-            &src_key.format,
-            dst_key.location,
-            &dst_key.format,
-        ) {
-            // GPU Float → GPU Quant (quantization)
-            // IMPORTANT: Kernel expects token-oriented layout for quantized data:
-            //   Each 32-element block contains 32 tokens for a single dimension.
-            //   Float layout: [token, dim] — flat arena, one head one side
-            //   Quant layout: [dim, token] — token-oriented for quantized
-            //
-            // For Q4_0/Q8_0 with chunk_size=32, we use a fused transpose+quantize kernel
-            // that reads from [T, D] and writes to [D, T] quantized layout in one pass.
-            #[cfg(feature = "cuda")]
-            (Gpu, KvFormat::Float(_), Gpu, KvFormat::Quantized(_)) => {
-                // Extract src data first to release immutable borrow before mutably borrowing dst.
-                let chunk_3d = {
-                    let src_data = arenas
-                        .get(&src_arena)
-                        .ok_or_else(|| {
-                            candle::Error::Msg(format!("src arena {src_arena} not found"))
-                        })?
-                        .float_data()?;
-                    // Flat arena: shape (arena_chunks, chunk_size, head_dim)
-                    let chunk_float = src_data.narrow(0, src_chunk, 1)?.squeeze(0)?; // (chunk_size, head_dim)
-                    chunk_float.unsqueeze(0)? // (1, chunk_size, head_dim) for kernel
-                };
-
-                let dst_elem_offset = dst_chunk * elems_per_chunk;
-                let dst_data = arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .quantized_data_mut()?;
-
-                fn can_fuse(fmt: &KvFormat, cs: usize) -> bool {
-                    matches!(
-                        fmt,
-                        KvFormat::Quantized(
-                            crate::kv_cache::QuantFormat::Q4_0
-                                | crate::kv_cache::QuantFormat::Q4_1
-                                | crate::kv_cache::QuantFormat::Q8_0
-                                | crate::kv_cache::QuantFormat::Q8_1
-                        )
-                    ) && cs == 32
-                }
-
-                if can_fuse(&dst_key.format, chunk_size) {
-                    dst_data.quantize_transposed_into(&chunk_3d, dst_elem_offset)?;
-                } else {
-                    let transposed = chunk_3d.transpose(1, 2)?.contiguous()?;
-                    dst_data.quantize_into(&transposed, dst_elem_offset)?;
-                }
-                Ok(())
-            }
-
-            #[cfg(not(feature = "cuda"))]
-            (Gpu, KvFormat::Float(_), Gpu, KvFormat::Quantized(_)) => {
-                candle::bail!("GPU quantization requires CUDA feature")
-            }
-
-            // GPU Quant → GPU Float (dequantization) - efficient per-chunk conversion
-            // IMPORTANT: Quantized data is in token-oriented layout [head, dim, token]
-            // but float arenas use channel-oriented layout [head, token, dim].
-            // We dequantize to a temp buffer and transpose back.
-            #[cfg(feature = "cuda")]
-            (Gpu, KvFormat::Quantized(_), Gpu, KvFormat::Float(dtype)) => {
-                // Clone src QTensor first to avoid borrow conflicts.
-                let src_data_clone = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .quantized_data()?
-                    .clone();
-
-                // Flat arena: each chunk = elems_per_chunk
-                let src_elem_offset = src_chunk * elems_per_chunk;
-
-                let device = arenas
-                    .get(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data()?
-                    .device()
-                    .clone();
-
-                // Temp buffer for token-oriented layout: (1, sub_head_dim, chunk_size)
-                let temp_shape = (1, sub_head_dim, chunk_size);
-                let mut temp = Tensor::zeros(temp_shape, DType::F16, &device)?;
-
-                src_data_clone.dequantize_into(&mut temp, src_elem_offset, 0, elems_per_chunk)?;
-
-                // Transpose from [1, D/P, T] to [1, T, D/P] = (1, chunk_size, sub_head_dim)
-                let transposed = temp.transpose(1, 2)?.contiguous()?;
-
-                let final_data = if *dtype != DType::F16 {
-                    transposed.to_dtype(*dtype)?
-                } else {
-                    transposed
-                };
-
-                // slice_set into flat arena at (dst_chunk, :, :)
-                arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data_mut()?
-                    .slice_set(&final_data, 0, dst_chunk)?;
-
-                Ok(())
-            }
-
-            #[cfg(not(feature = "cuda"))]
-            (Gpu, KvFormat::Quantized(_), Gpu, KvFormat::Float(_)) => {
-                candle::bail!("GPU dequantization requires CUDA feature")
-            }
-
-            // GPU Float → CPU Float (D2H copy)
-            (Gpu, KvFormat::Float(_), Cpu, KvFormat::Float(_)) => {
-                let chunk = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .float_data()?
-                    .narrow(0, src_chunk, 1)?
-                    .to_device(&Device::Cpu)?;
-                arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data_mut()?
-                    .slice_set(&chunk, 0, dst_chunk)?;
-                Ok(())
-            }
-
-            // CPU Float → GPU Float (H2D copy)
-            (Cpu, KvFormat::Float(_), Gpu, KvFormat::Float(_)) => {
-                let chunk = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .float_data()?
-                    .narrow(0, src_chunk, 1)?
-                    .to_device(&dst_device)?;
-                arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data_mut()?
-                    .slice_set(&chunk, 0, dst_chunk)?;
-                Ok(())
-            }
-
-            // GPU Float → CPU Quant
-            (Gpu, KvFormat::Float(_), Cpu, KvFormat::Quantized(_)) => {
-                let chunk_float = {
-                    let src_data = arenas
-                        .get(&src_arena)
-                        .ok_or_else(|| {
-                            candle::Error::Msg(format!("src arena {src_arena} not found"))
-                        })?
-                        .float_data()?;
-                    // Flat arena: chunk = (chunk_size, head_dim)
-                    src_data
-                        .narrow(0, src_chunk, 1)?
-                        .squeeze(0)?
-                        .to_device(&Device::Cpu)?
-                        .contiguous()?
-                };
-
-                let ggml = dst_key.format.as_quant().unwrap().to_ggml_dtype();
-                let chunk_quant = QTensor::quantize(&chunk_float, ggml)?;
-
-                let dst_elem_offset = dst_chunk * elems_per_chunk;
-                let dst_data = arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .quantized_data_mut()?;
-                dst_data.slice_scatter(&chunk_quant, dst_elem_offset)?;
-                Ok(())
-            }
-
-            // CPU Quant → GPU Float
-            (Cpu, KvFormat::Quantized(_), Gpu, KvFormat::Float(dtype)) => {
-                let src_data_clone = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .quantized_data()?
-                    .clone();
-
-                let dequant = src_data_clone.dequantize(&Device::Cpu)?;
-                let total_chunks = dequant.elem_count() / elems_per_chunk;
-                let reshaped = dequant.reshape((total_chunks, chunk_size, sub_head_dim))?;
-                let chunk_data = reshaped
-                    .narrow(0, src_chunk, 1)?
-                    .to_device(&dst_device)?
-                    .to_dtype(*dtype)?;
-                arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data_mut()?
-                    .slice_set(&chunk_data, 0, dst_chunk)?;
-                Ok(())
-            }
-
-            // CPU Float → CPU Quant
-            (Cpu, KvFormat::Float(_), Cpu, KvFormat::Quantized(_)) => {
-                let chunk_float = {
-                    let src_data = arenas
-                        .get(&src_arena)
-                        .ok_or_else(|| {
-                            candle::Error::Msg(format!("src arena {src_arena} not found"))
-                        })?
-                        .float_data()?;
-                    src_data.narrow(0, src_chunk, 1)?.squeeze(0)?.contiguous()?
-                };
-
-                let ggml = dst_key.format.as_quant().unwrap().to_ggml_dtype();
-                let chunk_quant = QTensor::quantize(&chunk_float, ggml)?;
-
-                let dst_elem_offset = dst_chunk * elems_per_chunk;
-                let dst_data = arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .quantized_data_mut()?;
-                dst_data.slice_scatter(&chunk_quant, dst_elem_offset)?;
-                Ok(())
-            }
-
-            // CPU Quant → CPU Float
-            (Cpu, KvFormat::Quantized(_), Cpu, KvFormat::Float(dtype)) => {
-                let src_data_clone = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .quantized_data()?
-                    .clone();
-
-                let dequant = src_data_clone.dequantize(&Device::Cpu)?;
-                let total_chunks = dequant.elem_count() / elems_per_chunk;
-                let reshaped = dequant.reshape((total_chunks, chunk_size, sub_head_dim))?;
-
-                let chunk_data = reshaped.narrow(0, src_chunk, 1)?.to_dtype(*dtype)?;
-                arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .float_data_mut()?
-                    .slice_set(&chunk_data, 0, dst_chunk)?;
-                Ok(())
-            }
-
-            // GPU Quant(R16) → GPU Quant(non-R16): R16 stores raw F16 data in
-            // token-oriented [D, T] layout. Dequantize to float, then quantize
-            // to the target format via the same path as Float→Quant.
-            #[cfg(feature = "cuda")]
-            (Gpu, KvFormat::Quantized(QuantFormat::R16), Gpu, KvFormat::Quantized(_)) => {
-                let src_data_clone = arenas
-                    .get(&src_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("src arena {src_arena} not found")))?
-                    .quantized_data()?
-                    .clone();
-                let src_elem_offset = src_chunk * elems_per_chunk;
-                let device = dst_device;
-
-                // Dequant R16 → F16 in token-oriented layout: (1, sub_head_dim, chunk_size)
-                let temp_shape = (1, sub_head_dim, chunk_size);
-                let mut temp = Tensor::zeros(temp_shape, DType::F16, &device)?;
-                src_data_clone.dequantize_into(&mut temp, src_elem_offset, 0, elems_per_chunk)?;
-
-                // Transpose [1, D/P, T] → [1, T, D/P] for quantize_transposed_into
-                let chunk_3d = temp.transpose(1, 2)?.contiguous()?;
-
-                let dst_elem_offset = dst_chunk * elems_per_chunk;
-                let dst_data = arenas
-                    .get_mut(&dst_arena)
-                    .ok_or_else(|| candle::Error::Msg(format!("dst arena {dst_arena} not found")))?
-                    .quantized_data_mut()?;
-                dst_data.quantize_transposed_into(&chunk_3d, dst_elem_offset)?;
-                Ok(())
-            }
-
-            // Quant → Quant same format (direct byte copy)
-            (_, KvFormat::Quantized(_), _, KvFormat::Quantized(_)) => Self::copy_chunk_data_static(
-                arenas, src_arena, src_chunk, dst_arena, dst_chunk, _n_kv_head, chunk_size,
-                head_dim,
-            ),
-
-            _ => candle::bail!(
-                "convert_chunk_data: unsupported conversion from {:?} to {:?}",
-                src_key,
-                dst_key
-            ),
+        let dst = arenas.get_mut(&dst_arena).ok_or_else(|| {
+            candle::Error::Msg(format!("copy_slot_bytes: dst arena {dst_arena} not found"))
+        })?;
+        if dst.slot_stride() != src_stride {
+            candle::bail!(
+                "copy_slot_bytes: {src_stride} B source slot into a {} B destination slot",
+                dst.slot_stride()
+            );
         }
-    }
-
-    /// Get raw GPU pointer for a tensor at a given element offset.
-    #[cfg(feature = "cuda")]
-    pub(super) fn tensor_ptr_at_offset(tensor: &Tensor, elem_offset: usize) -> Result<u64> {
-        use candle::backend::BackendStorage;
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use half::{bf16, f16};
-
-        let (storage, layout) = tensor.storage_and_layout();
-        let cuda_storage = match &*storage {
-            candle::Storage::Cuda(c) => c,
-            _ => candle::bail!("tensor_ptr_at_offset: expected CUDA storage"),
+        let bytes = if bytes.device().location() != dst.byte_data().device().location() {
+            bytes.to_device(dst.byte_data().device())?
+        } else {
+            bytes
         };
-
-        // Get the CudaDevice to access the stream
-        let cuda_device = cuda_storage.device();
-        let stream = cuda_device.cuda_stream();
-
-        // Account for both the layout offset and the requested element offset
-        let total_offset = layout.start_offset() + elem_offset;
-
-        // Handle different dtypes - extract pointer with stream for proper synchronization
-        let ptr = match tensor.dtype() {
-            candle::DType::F32 => {
-                let slice = cuda_storage.as_cuda_slice::<f32>()?;
-                let slice = slice.slice(total_offset..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            candle::DType::F16 => {
-                let slice = cuda_storage.as_cuda_slice::<f16>()?;
-                let slice = slice.slice(total_offset..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            candle::DType::BF16 => {
-                let slice = cuda_storage.as_cuda_slice::<bf16>()?;
-                let slice = slice.slice(total_offset..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            candle::DType::F8E4M3 => {
-                let slice = cuda_storage.as_cuda_slice::<float8::F8E4M3>()?;
-                let slice = slice.slice(total_offset..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            _ => candle::bail!(
-                "tensor_ptr_at_offset: unsupported dtype {:?}",
-                tensor.dtype()
-            ),
-        };
-        Ok(ptr)
-    }
-
-    /// Get raw GPU pointer for a QTensor at a given byte offset.
-    #[cfg(feature = "cuda")]
-    pub(super) fn qtensor_ptr_at_byte_offset(qtensor: &QTensor, byte_offset: usize) -> Result<u64> {
-        // Use the public cuda_data_ptr() method
-        let base_ptr = qtensor
-            .cuda_data_ptr()
-            .ok_or_else(|| candle::Error::Msg("QTensor is not on CUDA device".to_string()))?;
-        Ok(base_ptr + byte_offset as u64)
+        dst.write_slot_bytes(dst_chunk, &bytes)
     }
 
     /// Aggregate per-block format tags into a single per-chunk format.
@@ -911,7 +428,6 @@ impl ChunkedKvBacking {
         let n_kv_head = self.inner.n_kv_head;
         let chunk_size = CHUNK_SIZE;
         let head_dim = self.inner.head_dim;
-        let device = self.inner.device.clone();
 
         let k_format = self.inner.storage.k_format();
         let v_format = self.inner.storage.v_format();
@@ -972,7 +488,25 @@ impl ChunkedKvBacking {
             v_scale,
         )?;
 
-        // Upload per-(head, palette) byte slices and scatter into flat arena chunks.
+        // Upload each `(head, palette, side)` byte slice into its own slot.
+        //
+        // One byte write per slot, whatever the format. The bytes arriving here
+        // are already the format's own image — that is what "raw" means in this
+        // function's name — and a slot is a run of bytes, so there is nothing to
+        // decode, transpose, or re-quantize on the way in. The former per-dtype
+        // ladder (R16 memcpy / ggml re-wrap / one arm per float width) existed
+        // only because the destination was a typed tensor.
+        let upload =
+            |s: &mut ArenaStorageState, gid: &ChunkGid, slice: &[u8], side: &str| -> Result<()> {
+                let ai = gid.arena_idx();
+                let arena = s
+                    .arenas_mut()
+                    .get_mut(&ai)
+                    .ok_or_else(|| candle::Error::Msg(format!("{side} arena {ai} not found")))?;
+                let host = Tensor::from_slice(slice, slice.len(), arena.byte_data().device())?;
+                arena.write_slot_bytes(gid.chunk_idx(), &host)
+            };
+
         for h in 0..n_kv_head {
             for p in 0..N_PALETTE {
                 let slot_idx = h * N_PALETTE + p;
@@ -986,255 +520,8 @@ impl ChunkedKvBacking {
                 let v_gid = &gids.0[gid_offset + 1];
 
                 self.inner.storage.try_write(|s| {
-                    let k_ai = k_gid.arena_idx();
-                    let v_ai = v_gid.arena_idx();
-                    match k_format {
-                        KvFormat::Quantized(crate::kv_cache::QuantFormat::R16) => {
-                            let k_dst = s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .quantized_data_mut()?;
-                            let k_offset = k_gid.chunk_idx() * k_head_bytes;
-                            #[cfg(feature = "cuda")]
-                            {
-                                let dst_ptr = Self::qtensor_ptr_at_byte_offset(k_dst, k_offset)?;
-                                unsafe {
-                                    candle::cuda_backend::cudarc::driver::result::memcpy_htod_sync(
-                                        dst_ptr,
-                                        k_slice,
-                                    )
-                                }
-                                .map_err(|e| {
-                                    candle::Error::Msg(format!(
-                                        "write_raw_sealed_chunk: failed to upload R16 K bytes: {e}"
-                                    ))
-                                })?;
-                            }
-                            #[cfg(not(feature = "cuda"))]
-                            {
-                                // CPU path: raw byte copy into the QStorage backing buffer.
-                                // Same unsafe pattern as QStorage::slice_scatter on CPU.
-                                match k_dst.storage() {
-                                    candle::quantized::QStorage::Cpu(cpu_storage) => {
-                                        let dst_ptr = cpu_storage.as_ptr() as *mut u8;
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(k_slice.as_ptr(), dst_ptr.add(k_offset), k_head_bytes);
-                                        }
-                                    }
-                                    _ => candle::bail!("write_raw_sealed_chunk: R16 CPU path requires CPU QStorage"),
-                                }
-                            }
-                        }
-                        KvFormat::Quantized(k_qformat) => {
-                            let k_qtensor = candle::quantized::ggml_file::qtensor_from_ggml(
-                                k_qformat.to_ggml_dtype(),
-                                k_slice,
-                                vec![elems_per_head],
-                                &device,
-                            )?;
-                            let k_dst = s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .quantized_data_mut()?;
-                            let k_offset = k_gid.chunk_idx() * elems_per_head;
-                            k_dst.slice_scatter(&k_qtensor, k_offset)?;
-                        }
-                        KvFormat::Float(DType::F16) => {
-                            let values: Vec<half::f16> = k_slice
-                                .chunks_exact(std::mem::size_of::<half::f16>())
-                                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]))
-                                .collect();
-                            let k_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::BF16) => {
-                            let values: Vec<half::bf16> = k_slice
-                                .chunks_exact(std::mem::size_of::<half::bf16>())
-                                .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]))
-                                .collect();
-                            let k_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::F32) => {
-                            let values: Vec<f32> = k_slice
-                                .chunks_exact(std::mem::size_of::<f32>())
-                                .map(|chunk| {
-                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                })
-                                .collect();
-                            let k_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::F8E4M3) => {
-                            let values: Vec<float8::F8E4M3> = k_slice
-                                .iter()
-                                .map(|&b| float8::F8E4M3::from_bits(b))
-                                .collect();
-                            let k_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&k_ai)
-                                .ok_or_else(|| candle::Error::Msg("k arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&k_tensor, 0, k_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(other) => {
-                            candle::bail!(
-                                "write_raw_sealed_chunk: unsupported float K dtype {other:?}"
-                            )
-                        }
-                    }
-
-                    match v_format {
-                        KvFormat::Quantized(crate::kv_cache::QuantFormat::R16) => {
-                            let v_dst = s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .quantized_data_mut()?;
-                            let v_offset = v_gid.chunk_idx() * v_head_bytes;
-                            #[cfg(feature = "cuda")]
-                            {
-                                let dst_ptr = Self::qtensor_ptr_at_byte_offset(v_dst, v_offset)?;
-                                unsafe {
-                                    candle::cuda_backend::cudarc::driver::result::memcpy_htod_sync(
-                                        dst_ptr,
-                                        v_slice,
-                                    )
-                                }
-                                .map_err(|e| {
-                                    candle::Error::Msg(format!(
-                                        "write_raw_sealed_chunk: failed to upload R16 V bytes: {e}"
-                                    ))
-                                })?;
-                            }
-                            #[cfg(not(feature = "cuda"))]
-                            {
-                                // CPU path: raw byte copy into the QStorage backing buffer.
-                                match v_dst.storage() {
-                                    candle::quantized::QStorage::Cpu(cpu_storage) => {
-                                        let dst_ptr = cpu_storage.as_ptr() as *mut u8;
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(v_slice.as_ptr(), dst_ptr.add(v_offset), v_head_bytes);
-                                        }
-                                    }
-                                    _ => candle::bail!("write_raw_sealed_chunk: R16 CPU path requires CPU QStorage"),
-                                }
-                            }
-                        }
-                        KvFormat::Quantized(v_qformat) => {
-                            let v_qtensor = candle::quantized::ggml_file::qtensor_from_ggml(
-                                v_qformat.to_ggml_dtype(),
-                                v_slice,
-                                vec![elems_per_head],
-                                &device,
-                            )?;
-                            let v_dst = s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .quantized_data_mut()?;
-                            let v_offset = v_gid.chunk_idx() * elems_per_head;
-                            v_dst.slice_scatter(&v_qtensor, v_offset)?;
-                        }
-                        KvFormat::Float(DType::F16) => {
-                            let values: Vec<half::f16> = v_slice
-                                .chunks_exact(std::mem::size_of::<half::f16>())
-                                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]))
-                                .collect();
-                            let v_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&v_tensor, 0, v_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::BF16) => {
-                            let values: Vec<half::bf16> = v_slice
-                                .chunks_exact(std::mem::size_of::<half::bf16>())
-                                .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]))
-                                .collect();
-                            let v_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&v_tensor, 0, v_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::F32) => {
-                            let values: Vec<f32> = v_slice
-                                .chunks_exact(std::mem::size_of::<f32>())
-                                .map(|chunk| {
-                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                })
-                                .collect();
-                            let v_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&v_tensor, 0, v_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(DType::F8E4M3) => {
-                            let values: Vec<float8::F8E4M3> = v_slice
-                                .iter()
-                                .map(|&b| float8::F8E4M3::from_bits(b))
-                                .collect();
-                            let v_tensor = Tensor::from_vec(
-                                values,
-                                (1, chunk_size, sub_head_dim),
-                                &device,
-                            )?;
-                            s.arenas_mut()
-                                .get_mut(&v_ai)
-                                .ok_or_else(|| candle::Error::Msg("v arena not found".into()))?
-                                .float_data_mut()?
-                                .slice_set(&v_tensor, 0, v_gid.chunk_idx())?;
-                        }
-                        KvFormat::Float(other) => {
-                            candle::bail!(
-                                "write_raw_sealed_chunk: unsupported float V dtype {other:?}"
-                            )
-                        }
-                    }
-                    Ok(())
+                    upload(s, k_gid, k_slice, "k")?;
+                    upload(s, v_gid, v_slice, "v")
                 })?;
             }
         }
@@ -1298,16 +585,19 @@ impl ChunkedKvBacking {
             // layout); mixed groups allocate per band.
             for h in 0..n_kv_head {
                 let base = h * N_PALETTE;
-                let alloc_side = |fmts: &[crate::kv_cache::KvFormat]| -> Result<Vec<ChunkGid>> {
-                    let band = &fmts[base..base + N_PALETTE];
-                    if band.iter().all(|f| *f == band[0]) {
-                        self.alloc_chunk_run_for_key(
-                            ArenaKey::uniform(band[0], location),
-                            N_PALETTE,
-                        )
+                let alloc_side = |fmts: &[KvFormat]| -> Result<Vec<ChunkGid>> {
+                    // Eligibility is a question about *keys*, not formats: four
+                    // bands in different formats that share a size class share
+                    // an arena, so they can still be one contiguous run. Under
+                    // per-format arenas this test could only pass for identical
+                    // formats; classes are coarser, so it now fires strictly
+                    // more often.
+                    let keys = band_keys(&fmts[base..base + N_PALETTE], self, location)?;
+                    if keys.iter().all(|k| *k == keys[0]) {
+                        self.alloc_chunk_run_for_key(keys[0], N_PALETTE)
                     } else {
-                        band.iter()
-                            .map(|f| self.alloc_chunk_for_key(ArenaKey::uniform(*f, location)))
+                        keys.into_iter()
+                            .map(|k| self.alloc_chunk_for_key(k))
                             .collect()
                     }
                 };
@@ -1320,8 +610,11 @@ impl ChunkedKvBacking {
             }
         }
 
-        // Register per-head GIDs, palette maps, and outer scales on the block
-        // table, then refresh the live decode slot.
+        // Register per-head GIDs, palette maps, outer scales and the band
+        // format tags on the block table, then refresh the live decode slot.
+        // The tags are the *destination* formats — this window is being
+        // re-pointed at sealed chunks whose layout is whatever was persisted,
+        // not the active R16/F16 a fresh writer window carries.
         let gids = HeadGids::from_vec(gid_vec);
         let arena_info = self.resolve_arena_info()?;
         self.set_block_gids_sharded_and_update_gpu(
@@ -1332,6 +625,8 @@ impl ChunkedKvBacking {
             v_pal,
             k_scale,
             v_scale,
+            std::sync::Arc::new(k_formats.iter().map(|f| f.to_tag()).collect()),
+            std::sync::Arc::new(v_formats.iter().map(|f| f.to_tag()).collect()),
             &arena_info,
         )?;
         Ok(gids)
@@ -1465,26 +760,20 @@ impl ChunkedKvBacking {
         for (s_idx, spec) in specs.iter().enumerate() {
             for h in 0..n_kv_head {
                 let base = h * N_PALETTE;
-                let kf = &spec.k_formats[base..base + N_PALETTE];
-                if kf.iter().all(|f| *f == kf[0]) {
-                    run_groups.push((s_idx, base, false, ArenaKey::uniform(kf[0], location)));
-                } else {
-                    for p in 0..N_PALETTE {
-                        positions_per_key
-                            .entry(ArenaKey::uniform(kf[p], location))
-                            .or_default()
-                            .push((s_idx, (base + p) * 2));
-                    }
-                }
-                let vf = &spec.v_formats[base..base + N_PALETTE];
-                if vf.iter().all(|f| *f == vf[0]) {
-                    run_groups.push((s_idx, base, true, ArenaKey::uniform(vf[0], location)));
-                } else {
-                    for p in 0..N_PALETTE {
-                        positions_per_key
-                            .entry(ArenaKey::uniform(vf[p], location))
-                            .or_default()
-                            .push((s_idx, (base + p) * 2 + 1));
+                // Same key-not-format eligibility test as `alloc_sealed_block`:
+                // bands that share a size class share an arena and can form one
+                // contiguous run whatever their formats.
+                for (is_v, fmts) in [(false, &spec.k_formats), (true, &spec.v_formats)] {
+                    let keys = band_keys(&fmts[base..base + N_PALETTE], self, location)?;
+                    if keys.iter().all(|k| *k == keys[0]) {
+                        run_groups.push((s_idx, base, is_v, keys[0]));
+                    } else {
+                        for (p, k) in keys.into_iter().enumerate() {
+                            positions_per_key
+                                .entry(k)
+                                .or_default()
+                                .push((s_idx, (base + p) * 2 + usize::from(is_v)));
+                        }
                     }
                 }
             }
@@ -1545,6 +834,9 @@ impl ChunkedKvBacking {
         // Per-block snapshots (blk + frozen fields) for the resident-record build,
         // captured under the state lock but built/uploaded AFTER it is released so
         // the device upload never serializes the per-forward readers.
+        // `(block, gids, k_pal, v_pal, k_scale, v_scale, k_fmt, v_fmt)` — the
+        // owning form of `ChunkRecordSrc`, since the borrow cannot outlive the
+        // state lock the snapshot is taken under.
         type RecordSrc = (
             usize,
             HeadGids,
@@ -1552,6 +844,8 @@ impl ChunkedKvBacking {
             std::sync::Arc<Vec<u8>>,
             std::sync::Arc<Vec<f32>>,
             std::sync::Arc<Vec<f32>>,
+            std::sync::Arc<Vec<u8>>,
+            std::sync::Arc<Vec<u8>>,
         );
         let mut record_srcs: Vec<RecordSrc> = Vec::new();
         let mut per_spec_iter = per_spec_gids.into_iter();
@@ -1580,6 +874,12 @@ impl ChunkedKvBacking {
                         std::sync::Arc::clone(&spec.v_pal),
                         std::sync::Arc::clone(&spec.k_scale),
                         std::sync::Arc::clone(&spec.v_scale),
+                        // The spec's per-band formats ARE the persisted tag
+                        // bytes (`KvFormat::to_tag` is the `ArenaFormatTag`
+                        // discriminant), so this closes the loop from disk back
+                        // to the window that describes the loaded chunks.
+                        std::sync::Arc::new(spec.k_formats.iter().map(|f| f.to_tag()).collect()),
+                        std::sync::Arc::new(spec.v_formats.iter().map(|f| f.to_tag()).collect()),
                     );
                     if let Some(cw) = slot.chunk_at_mut(spec.block_idx) {
                         cw.offset = spec.offset;
@@ -1617,6 +917,8 @@ impl ChunkedKvBacking {
                             cw.v_pal.clone(),
                             cw.k_scale.clone(),
                             cw.v_scale.clone(),
+                            cw.k_fmt.clone(),
+                            cw.v_fmt.clone(),
                         ));
                     }
                 }
@@ -1630,16 +932,16 @@ impl ChunkedKvBacking {
         // `kvheads_ptr` instead of rebuilding heads per layer. Done OFF the state
         // lock and as a single coalesced upload.
         if !record_srcs.is_empty() {
-            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = record_srcs
+            let refs: Vec<ChunkRecordSrc<'_>> = record_srcs
                 .iter()
-                .map(|(_, g, kp, vp, ks, vs)| {
-                    (
-                        g,
-                        kp.as_slice(),
-                        vp.as_slice(),
-                        ks.as_slice(),
-                        vs.as_slice(),
-                    )
+                .map(|(_, g, kp, vp, ks, vs, kf, vf)| ChunkRecordSrc {
+                    gids: g,
+                    k_pal: kp.as_slice(),
+                    v_pal: vp.as_slice(),
+                    k_scale: ks.as_slice(),
+                    v_scale: vs.as_slice(),
+                    k_fmt: kf.as_slice(),
+                    v_fmt: vf.as_slice(),
                 })
                 .collect();
             let metas = self.build_meta_records(&refs, &arena_info)?;
@@ -1656,42 +958,6 @@ impl ChunkedKvBacking {
             }
         }
         Ok((hgids_per_block, arena_info))
-    }
-
-    /// Walk a [`HeadGids`] and produce the per-`(head, palette)` K/V
-    /// format pair — `(k_formats, v_formats)`, each `n_kv_head × N_PALETTE`
-    /// entries in `[h*N_PALETTE + p]` order.
-    ///
-    /// Adaptive quantization picks a format independently per sub-band, so
-    /// persistence must record the whole map (not just head-0) to reallocate
-    /// the chunk's arenas faithfully. This is called at seal time to
-    /// populate the `k_formats` / `v_formats` snapshot stored on
-    /// [`SealedChunk`] — the persist path then reads those directly rather
-    /// than re-walking arena state.
-    pub fn kv_formats_for_gids(
-        &self,
-        gids: &super::head_gids::HeadGids,
-    ) -> candle::Result<(
-        Vec<crate::kv_cache::KvFormat>,
-        Vec<crate::kv_cache::KvFormat>,
-    )> {
-        let n_kv_head = self.inner.n_kv_head;
-        self.inner.storage.read(|s| {
-            let fmt = |arena_idx: usize, side: &str| {
-                s.arena_key(arena_idx).map(|key| key.format).ok_or_else(|| {
-                    candle::Error::Msg(format!("{side} arena {arena_idx} not found"))
-                })
-            };
-            let mut k_formats = Vec::with_capacity(n_kv_head * N_PALETTE);
-            let mut v_formats = Vec::with_capacity(n_kv_head * N_PALETTE);
-            for h in 0..n_kv_head {
-                for p in 0..N_PALETTE {
-                    k_formats.push(fmt(gids.k_gid_pal(h, p).arena_idx(), "k")?);
-                    v_formats.push(fmt(gids.v_gid_pal(h, p).arena_idx(), "v")?);
-                }
-            }
-            Ok((k_formats, v_formats))
-        })?
     }
 
     // ── Tiered-storage sealed-sequence migration ──────────────────────────────
@@ -1723,7 +989,7 @@ impl ChunkedKvBacking {
                     let cpu_key = self.inner.storage.read(|s| {
                         s.arena_key(gid.arena_idx())
                             .map(|k| ArenaKey {
-                                format: k.format,
+                                class: k.class,
                                 location: ArenaLocation::Cpu,
                             })
                             .ok_or_else(|| {
@@ -1801,7 +1067,7 @@ impl ChunkedKvBacking {
             }
         }
 
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
 
         // Phase 1: one `state.write()` for the batch — resolve every
         // source's arena key (the CPU dest just swaps location) and
@@ -1827,7 +1093,7 @@ impl ChunkedKvBacking {
                         ))
                     })?;
                 let cpu_key = ArenaKey {
-                    format: key.format,
+                    class: key.class,
                     location: ArenaLocation::Cpu,
                 };
                 src_keys.insert(raw, key);
@@ -1837,8 +1103,6 @@ impl ChunkedKvBacking {
 
         // Phase 2: one `storage.try_write()` for the batch — every
         // per-chunk data copy runs back-to-back with no relock.
-        let n_kv_head = self.inner.n_kv_head;
-        let head_dim = self.inner.head_dim;
         self.inner.storage.try_write(|s| -> candle::Result<()> {
             for &raw in &unique_raws {
                 let src_arena_idx = (raw as usize) / arena_chunks;
@@ -1860,35 +1124,20 @@ impl ChunkedKvBacking {
                 }
                 let src_key = src_keys[&raw].clone();
                 let cpu_key = ArenaKey {
-                    format: src_key.format,
+                    class: src_key.class,
                     location: ArenaLocation::Cpu,
                 };
                 let new_gid = new_gids[&raw].clone();
-                if src_key == cpu_key {
-                    Self::copy_chunk_data_static(
-                        s.arenas_mut(),
-                        src_arena_idx,
-                        src_chunk_idx,
-                        new_gid.arena_idx(),
-                        new_gid.chunk_idx(),
-                        n_kv_head,
-                        CHUNK_SIZE,
-                        head_dim,
-                    )?;
-                } else {
-                    Self::convert_chunk_data_static(
-                        s.arenas_mut(),
-                        src_arena_idx,
-                        src_chunk_idx,
-                        src_key,
-                        new_gid.arena_idx(),
-                        new_gid.chunk_idx(),
-                        cpu_key,
-                        n_kv_head,
-                        CHUNK_SIZE,
-                        head_dim,
-                    )?;
-                }
+                // Same class either side — the destination key only swaps the
+                // location — so this is a byte-verbatim slot relocation.
+                debug_assert_eq!(src_key.class, cpu_key.class);
+                Self::copy_slot_bytes(
+                    s.arenas_mut(),
+                    src_arena_idx,
+                    src_chunk_idx,
+                    new_gid.arena_idx(),
+                    new_gid.chunk_idx(),
+                )?;
             }
             Ok(())
         })?;
@@ -1974,7 +1223,6 @@ impl ChunkedKvBacking {
         pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
         sequences: &[&SealedSequence],
     ) -> candle::Result<Vec<SealedSequence>> {
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::WrapErr;
         use candle::quantized::pinned_staging::PinnedBuf;
 
@@ -1994,7 +1242,7 @@ impl ChunkedKvBacking {
         let _ = cuda_dev; // referenced only when allocating the staging slice below.
 
         // ── Resolve sources + dedup ─────────────────────────────────────
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
         let arena_info = self.resolve_arena_info()?;
         let mut unique_raws: Vec<i64> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -2005,9 +1253,10 @@ impl ChunkedKvBacking {
             std::collections::HashMap::new();
         let mut total_bytes: usize = 0;
 
+        let elems = self.inner.elems_per_chunk();
         for seq in sequences {
             for chunk in &seq.chunks {
-                for gid in chunk.gids.0.iter() {
+                for (gid, tag) in chunk.bands() {
                     let raw = gid.raw();
                     if !seen.insert(raw) {
                         continue;
@@ -2025,9 +1274,17 @@ impl ChunkedKvBacking {
                                 .into(),
                         ));
                     }
-                    let len = info.chunk_byte_stride as usize;
+                    // Copy length is the BAND's payload, read from the chunk's
+                    // own tag; the address step is the arena's class stride.
+                    // The arena cannot supply the first — it holds whatever
+                    // fits its slots (`docs/archived/arena_unification.md` invariant 8).
+                    let len = payload_bytes_for_tag(tag, elems).ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "migrate_sealed_to_cpu_batch_async: band tag {tag:?} names no                              storage format, so its byte length is unknown"
+                        ))
+                    })?;
                     let ptr = info.base_ptr as i64 + chunk_idx as i64 * info.chunk_byte_stride;
-                    src_ptrs.push((ptr, info.chunk_byte_stride));
+                    src_ptrs.push((ptr, len as i64));
                     gid_byte_range.insert(raw, (total_bytes, len));
                     total_bytes += len;
                     unique_raws.push(raw);
@@ -2070,30 +1327,61 @@ impl ChunkedKvBacking {
             *pinned_scratch = Some(PinnedBuf::alloc_default_or_host_fallible(total_bytes)?);
         }
 
-        // ── Phase 1: device-side gather on the copy stream ─────────────
-        let staging: candle::cuda_backend::cudarc::driver::CudaSlice<u8> =
-            unsafe { copy_stream.alloc::<u8>(total_bytes).w()? };
-        let staging_base = {
-            let (p, _g) = staging.device_ptr(copy_stream);
-            p as i64
-        };
-        let mut plan = MigrationPlan::new();
-        let mut off = 0i64;
-        for &(ptr, len) in &src_ptrs {
-            plan.push(ptr, staging_base + off, len);
-            off += len;
+        // ── Phases 1/2: gather → DtoH, in batches the domain can hold ──
+        //
+        // Staging comes from the persistence domain's transient span rather
+        // than the allocator: it is wave-scoped by construction, which is what
+        // the bump side is for. **Batched against
+        // `MIGRATION_STAGING_CAP_BYTES`, the domain's whole span** — this was a
+        // single `bump.alloc(total_bytes)`, so a pass wider than the span failed
+        // outright and the constant was a hard ceiling here rather than the
+        // batch size its name and doc claimed.
+        //
+        // One generation per group: dropping it fences the copy stream and
+        // rewinds the cursor, so the next group reuses the same bytes safely —
+        // the DtoH below has already completed by then (it synchronises).
+        let bump = bump_arena::persistence_domain(copy_stream)?;
+        let lens: Vec<usize> = src_ptrs.iter().map(|(_, l)| *l as usize).collect();
+        let mut group_start = 0usize;
+        for (i, j, group_bytes) in staging_groups(&lens, MIGRATION_STAGING_CAP_BYTES) {
+            // Allocated through the guard, so `staging` borrows it: the group's
+            // range cannot outlive the generation whose drop fences the copy
+            // stream and rewinds the cursor under it.
+            // No planned layout on the persistence path: its staging is sized per batch
+            // rather than by the wave plan, so the whole span stays cursor-managed.
+            let group_gen = bump.generation(NOT_A_WAVE, NOT_A_WAVE)?;
+            let staging = group_gen.alloc(group_bytes, 256)?;
+            let staging_base = staging.ptr as i64;
+            let mut plan = MigrationPlan::new();
+            let mut off = 0i64;
+            for &(ptr, len) in &src_ptrs[i..j] {
+                plan.push(ptr, staging_base + off, len);
+                off += len;
+            }
+            kv_migrate_on(device, &plan, Some(copy_stream))?;
+
+            {
+                let scratch = pinned_scratch
+                    .as_mut()
+                    .expect("pinned scratch allocated above");
+                let dst = &mut scratch.as_mut_slice()[group_start..group_start + group_bytes];
+                // SAFETY: `staging_base` addresses `group_bytes` of the domain's
+                // span, held by `_gen` for this scope; `dst` is this group's
+                // slice of the pinned host scratch; the sync below completes the
+                // copy before either is touched again.
+                unsafe {
+                    candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async(
+                        dst,
+                        staging_base as u64,
+                        copy_stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| candle::Error::Msg(format!("hot->warm staging readback: {e}")))?;
+                copy_stream.synchronize().w()?;
+            }
+
+            group_start += group_bytes;
         }
-        kv_migrate_on(device, &plan, Some(copy_stream))?;
-        // ── Phase 2: single DtoH staging → pinned host scratch ─────────
-        {
-            let scratch = pinned_scratch
-                .as_mut()
-                .expect("pinned scratch allocated above");
-            let dst = &mut scratch.as_mut_slice()[..total_bytes];
-            copy_stream.memcpy_dtoh(&staging, dst).w()?;
-            copy_stream.synchronize().w()?;
-        }
-        drop(staging);
 
         // ── Phase 3: allocate dest CPU GIDs (one state.write) ──────────
         let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
@@ -2106,7 +1394,7 @@ impl ChunkedKvBacking {
             for &raw in &unique_raws {
                 let src_key = &src_keys[&raw];
                 let cpu_key = ArenaKey {
-                    format: src_key.format,
+                    class: src_key.class,
                     location: ArenaLocation::Cpu,
                 };
                 new_gids.insert(raw, self.alloc_chunk_for_key(cpu_key)?);
@@ -2181,7 +1469,6 @@ impl ChunkedKvBacking {
         pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
         per_layer_seqs: &[Vec<&SealedSequence>],
     ) -> candle::Result<Vec<Vec<SealedSequence>>> {
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::WrapErr;
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::collections::{HashMap, HashSet};
@@ -2214,7 +1501,7 @@ impl ChunkedKvBacking {
         }
 
         // ── Resolve every layer's sources (device ptr + len per gid) ────
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
         let mut layers: Vec<LayerResolve> = Vec::with_capacity(backings.len());
         let mut grand_total: usize = 0;
         for (li, backing) in backings.iter().enumerate() {
@@ -2224,9 +1511,10 @@ impl ChunkedKvBacking {
             let mut src: HashMap<i64, (i64, usize)> = HashMap::new();
             let mut src_keys: HashMap<i64, ArenaKey> = HashMap::new();
             let mut layer_bytes = 0usize;
+            let elems = backing.inner.elems_per_chunk();
             for seq in &per_layer_seqs[li] {
                 for chunk in &seq.chunks {
-                    for gid in chunk.gids.0.iter() {
+                    for (gid, tag) in chunk.bands() {
                         let raw = gid.raw();
                         if !seen.insert(raw) {
                             continue;
@@ -2244,7 +1532,12 @@ impl ChunkedKvBacking {
                                     .into(),
                             ));
                         }
-                        let len = info.chunk_byte_stride as usize;
+                        // Payload from the band's tag, stride from the arena.
+                        let len = payload_bytes_for_tag(tag, elems).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "migrate_sealed_layers_to_cpu_batch: band tag {tag:?} names no                                  storage format, so its byte length is unknown"
+                            ))
+                        })?;
                         let ptr = info.base_ptr as i64 + chunk_idx as i64 * info.chunk_byte_stride;
                         src.insert(raw, (ptr, len));
                         unique_raws.push(raw);
@@ -2320,7 +1613,15 @@ impl ChunkedKvBacking {
             // progress even when host RAM is fragmented or VRAM is tight, instead
             // of aborting. Only when a lone layer still won't fit do we propagate
             // the error (the turn stays hot-float + consistent, retried next pass).
-            let (staging, batch_bytes) = loop {
+            // The generation opens *before* the bisect, not on success inside
+            // it: the range allocated below borrows it, so the two cannot be
+            // produced as a pair. Retries need no fresh guard — a failed
+            // `alloc` bails before it advances the cursor — and a
+            // domain-creation failure is not memory pressure on this batch, so
+            // shrinking would not have helped it anyway.
+            let staging_gen =
+                bump_arena::persistence_domain(copy_stream)?.generation(NOT_A_WAVE, NOT_A_WAVE)?;
+            let staging = loop {
                 let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
                 // Host scratch (fallible — see the per-layer variant's note).
                 let host_res = {
@@ -2335,11 +1636,13 @@ impl ChunkedKvBacking {
                         Ok(())
                     }
                 };
-                // GPU staging (only once the host scratch is in place).
-                let alloc_res =
-                    host_res.and_then(|_| unsafe { copy_stream.alloc::<u8>(batch_bytes) }.w());
+                // GPU staging (only once the host scratch is in place). The
+                // bisect now shrinks against the domain's *declared* budget
+                // rather than against the driver refusing an allocation —
+                // same loop, a bound that is ours.
+                let alloc_res = host_res.and_then(|_| staging_gen.alloc(batch_bytes, 256));
                 match alloc_res {
-                    Ok(s) => break (s, batch_bytes),
+                    Ok(range) => break range,
                     Err(e) if lj > li + 1 => {
                         lj = li + ((lj - li) / 2).max(1);
                         tracing::warn!(
@@ -2356,10 +1659,7 @@ impl ChunkedKvBacking {
             };
 
             // ── ONE gather + ONE DtoH + ONE sync for this batch ─────────────
-            let staging_base = {
-                let (p, _g) = staging.device_ptr(copy_stream);
-                p as i64
-            };
+            let staging_base = staging.ptr as i64;
             let mut plan = MigrationPlan::new();
             // Batch-local byte offset per unique gid, per layer, for the scatter.
             let mut batch_ranges: Vec<HashMap<i64, (usize, usize)>> = Vec::with_capacity(lj - li);
@@ -2379,11 +1679,26 @@ impl ChunkedKvBacking {
                 let scratch = pinned_scratch
                     .as_mut()
                     .expect("pinned scratch allocated above");
-                let dst = &mut scratch.as_mut_slice()[..batch_bytes];
-                copy_stream.memcpy_dtoh(&staging, dst).w()?;
+                let dst = &mut scratch.as_mut_slice()[..staging.len];
+                // SAFETY: as the hot->warm site — a range of this domain's span
+                // held by `staging_gen`, which `staging` borrows, so it is
+                // still open here by construction; copied into pinned host
+                // scratch, synced here.
+                unsafe {
+                    candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async(
+                        dst,
+                        staging_base as u64,
+                        copy_stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| candle::Error::Msg(format!("layer staging readback: {e}")))?;
                 copy_stream.synchronize().w()?;
             }
-            drop(staging);
+            // The generation drops at the end of this batch iteration, fencing
+            // the stream and rewinding the cursor for the next batch. Dropping
+            // it earlier is no longer expressible: `staging` borrows it, and
+            // the last read of `staging` is the readback just above.
+            drop(staging_gen);
 
             // ── Per-layer scatter into fresh CPU arenas ─────────────────────
             for (k, backing) in backings[li..lj].iter().enumerate() {
@@ -2399,7 +1714,7 @@ impl ChunkedKvBacking {
                     for &raw in &resolve.unique_raws {
                         let src_key = &resolve.src_keys[&raw];
                         let cpu_key = ArenaKey {
-                            format: src_key.format,
+                            class: src_key.class,
                             location: ArenaLocation::Cpu,
                         };
                         new_gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
@@ -2464,6 +1779,10 @@ impl ChunkedKvBacking {
     /// `Arena::Quantized` is not supported here — see the module-level
     /// caveat on [`Self::migrate_sealed_to_cpu_batch_async`].
     ///
+    /// `bytes` is the chunk's **payload**; `slot_stride` is the arena's
+    /// **address step** (see [`Self::read_chunk_into_bytes`] for why they must
+    /// be passed separately).
+    ///
     /// Gated behind the cuda feature to match the only caller
     /// (`migrate_sealed_to_cpu_batch_async`).
     #[cfg(feature = "cuda")]
@@ -2478,79 +1797,11 @@ impl ChunkedKvBacking {
                 "write_chunk_from_pinned_bytes: arena {arena_idx} missing"
             ))
         })?;
-        match arena {
-            Arena::Float { data, dtype, .. } => {
-                let dims = data.dims();
-                if dims.is_empty() {
-                    return Err(candle::Error::Msg(
-                        "write_chunk_from_pinned_bytes: arena tensor has zero dims".into(),
-                    ));
-                }
-                // Per-chunk shape = (1, ...remaining dims of the arena tensor)
-                let per_chunk: Vec<usize> = std::iter::once(1usize)
-                    .chain(dims[1..].iter().copied())
-                    .collect();
-                let n_elems: usize = dims[1..].iter().product();
-                let expected_bytes = n_elems * dtype.size_in_bytes();
-                if bytes.len() != expected_bytes {
-                    return Err(candle::Error::Msg(format!(
-                        "write_chunk_from_pinned_bytes: arena {arena_idx} expects {expected_bytes} \
-                         bytes per chunk, got {}",
-                        bytes.len()
-                    )));
-                }
-                let temp = match dtype {
-                    DType::BF16 => {
-                        // SAFETY: bytes is at least 2-byte aligned (pinned host pages
-                        // are page-aligned), length validated above.
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(bytes.as_ptr() as *const half::bf16, n_elems)
-                        };
-                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
-                    }
-                    DType::F16 => {
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(bytes.as_ptr() as *const half::f16, n_elems)
-                        };
-                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
-                    }
-                    DType::F32 => {
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elems)
-                        };
-                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
-                    }
-                    DType::F8E4M3 => {
-                        // SAFETY: F8E4M3 is 1-byte POD; length validated above.
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                bytes.as_ptr() as *const float8::F8E4M3,
-                                n_elems,
-                            )
-                        };
-                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
-                    }
-                    other => {
-                        return Err(candle::Error::Msg(format!(
-                            "write_chunk_from_pinned_bytes: unsupported Float dtype {other:?}"
-                        )));
-                    }
-                };
-                data.slice_set(&temp, 0, chunk_idx)?;
-                Ok(())
-            }
-            Arena::Quantized { data, .. } => {
-                // Quantized arenas are a flat byte slab — `slice_scatter`
-                // / `slice_range_copy` already do `ptr::copy_nonoverlapping`
-                // under the hood, parameterised on byte offsets. The
-                // gather pulled exactly one `chunk_byte_stride` of bytes
-                // per chunk slot into pinned scratch, so the destination
-                // offset is simply `chunk_idx * bytes.len()`.
-                let byte_offset = chunk_idx * bytes.len();
-                data.write_bytes_at(byte_offset, bytes)?;
-                Ok(())
-            }
-        }
+        // The gather pulled exactly one PAYLOAD per slot into pinned scratch,
+        // and slot `n` starts at `n * slot_stride` — `write_slot_bytes` keeps
+        // those two lengths apart (invariant 8).
+        let host = Tensor::from_slice(bytes, bytes.len(), &Device::Cpu)?;
+        arena.write_slot_bytes(chunk_idx, &host)
     }
 
     /// **Fully-batched** RAM→VRAM migration — the symmetric inverse of
@@ -2588,8 +1839,6 @@ impl ChunkedKvBacking {
         pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
         sequences: &[&SealedSequence],
     ) -> candle::Result<Vec<SealedSequence>> {
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::WrapErr;
         use candle::quantized::pinned_staging::PinnedBuf;
 
         use super::migrate::{kv_migrate_on, MigrationPlan};
@@ -2610,7 +1859,7 @@ impl ChunkedKvBacking {
         // ── Resolve sources + dedup ─────────────────────────────────────
         // Source arenas live on CPU; we record each unique source GID's
         // byte size by reading the arena's per-chunk shape × element size.
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
         let mut unique_raws: Vec<i64> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut src_keys: std::collections::HashMap<i64, ArenaKey> =
@@ -2619,10 +1868,11 @@ impl ChunkedKvBacking {
             std::collections::HashMap::new();
         let mut total_bytes: usize = 0;
 
+        let elems = self.inner.elems_per_chunk();
         self.inner.storage.read(|s| -> candle::Result<()> {
             for seq in sequences {
                 for chunk in &seq.chunks {
-                    for gid in chunk.gids.0.iter() {
+                    for (gid, tag) in chunk.bands() {
                         let raw = gid.raw();
                         if !seen.insert(raw) {
                             continue;
@@ -2640,12 +1890,15 @@ impl ChunkedKvBacking {
                                     .into(),
                             ));
                         }
-                        let arena = s.arenas().get(&arena_idx).ok_or_else(|| {
+                        // How many bytes this band occupies comes from its own
+                        // tag; the warm arena is a class-strided byte slab and
+                        // has no format to ask.
+                        let len = payload_bytes_for_tag(tag, elems).ok_or_else(|| {
                             candle::Error::Msg(format!(
-                                "migrate_sealed_to_gpu_batch_async: arena {arena_idx} missing"
+                                "migrate_sealed_to_gpu_batch_async: band tag {tag:?} names no \
+                                 storage format, so its byte length is unknown"
                             ))
                         })?;
-                        let len = chunk_byte_size_of(arena)?;
                         src_keys.insert(raw, key);
                         gid_byte_range.insert(raw, (total_bytes, len));
                         total_bytes += len;
@@ -2697,16 +1950,6 @@ impl ChunkedKvBacking {
             Ok(())
         })??;
 
-        // ── Phase 2: HtoD pinned → device staging on the copy stream ───
-        let src_bytes = &scratch.as_slice()[..total_bytes];
-        let mut staging: candle::cuda_backend::cudarc::driver::CudaSlice<u8> =
-            unsafe { copy_stream.alloc::<u8>(total_bytes).w()? };
-        copy_stream.memcpy_htod(src_bytes, &mut staging).w()?;
-        let staging_base = {
-            let (p, _g) = staging.device_ptr(copy_stream);
-            p as i64
-        };
-
         // ── Phase 3: allocate dest GPU GIDs (one state.write) ──────────
         // Palette-band runs first: for every (chunk, head, side) whose
         // N_PALETTE band gids are distinct and share one format, allocate the
@@ -2745,13 +1988,14 @@ impl ChunkedKvBacking {
                             let Some(first_key) = src_keys.get(&raws[0]) else {
                                 continue;
                             };
-                            if raws[1..].iter().any(|r| {
-                                src_keys.get(r).map(|k| k.format) != Some(first_key.format)
-                            }) {
+                            if raws[1..]
+                                .iter()
+                                .any(|r| src_keys.get(r).map(|k| k.class) != Some(first_key.class))
+                            {
                                 continue;
                             }
                             let gpu_key = ArenaKey {
-                                format: first_key.format,
+                                class: first_key.class,
                                 location: ArenaLocation::Gpu,
                             };
                             let run = self.alloc_chunk_run_for_key(gpu_key, raws.len())?;
@@ -2768,7 +2012,7 @@ impl ChunkedKvBacking {
                 }
                 let src_key = &src_keys[&raw];
                 let gpu_key = ArenaKey {
-                    format: src_key.format,
+                    class: src_key.class,
                     location: ArenaLocation::Gpu,
                 };
                 new_gids.insert(raw, self.alloc_chunk_for_key(gpu_key)?);
@@ -2786,31 +2030,77 @@ impl ChunkedKvBacking {
         // copy-stream use.
         device.synchronize()?;
 
-        // ── Phase 4: build scatter plan staging → dest GPU arenas ──────
+        // ── Phases 4/5: stage → scatter, in batches the domain can hold ─
+        //
+        // **Batched against `MIGRATION_STAGING_CAP_BYTES`, which is the
+        // persistence domain's whole span.** This used to be one
+        // `bump.alloc(total_bytes)` — and `persistence/elevate.rs` issues this
+        // call once per layer across *every* warm item, so `total_bytes` is
+        // bounded by nothing here. A deep elevate therefore exhausted the
+        // transient span and failed the forward, and the cap could never be
+        // lowered because for this site it was a hard ceiling rather than a
+        // batch size. Now it bisects like `migrate_sealed_layers_to_cpu_batch`
+        // always did, so the span bounds a *batch* and peak transient use is one
+        // group rather than the sum.
+        //
+        // One generation per group: dropping it fences the copy stream and
+        // rewinds the cursor, so the next group reuses the same bytes. That
+        // fence is what makes reuse safe — the scatter reading a group's staging
+        // has completed before the next group overwrites it.
+        //
+        // Offsets are contiguous in `unique_raws` order (`total_bytes += len` as
+        // each was pushed), so a group is one contiguous slice of the pinned
+        // scratch and `off - group_start` re-bases it onto the group's staging.
         let gpu_arena_info = self.resolve_arena_info()?;
-        let mut plan = MigrationPlan::new();
-        for &raw in &unique_raws {
-            let new_gid = new_gids[&raw].clone();
-            let dst_arena_idx = new_gid.arena_idx();
-            let dst_chunk_idx = new_gid.chunk_idx();
-            let info = gpu_arena_info.get(dst_arena_idx).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "migrate_sealed_to_gpu_batch_async: dest arena {dst_arena_idx} out of range"
-                ))
-            })?;
-            if info.base_ptr == 0 {
-                return Err(candle::Error::Msg(
-                    "migrate_sealed_to_gpu_batch_async: dest arena not GPU-resident".into(),
-                ));
+        let bump = bump_arena::persistence_domain(copy_stream)?;
+        let lens: Vec<usize> = unique_raws.iter().map(|r| gid_byte_range[r].1).collect();
+        for (i, j, group_bytes) in staging_groups(&lens, MIGRATION_STAGING_CAP_BYTES) {
+            let group_start = gid_byte_range[&unique_raws[i]].0;
+            // Allocated through the guard, so `staging` borrows it: the group's
+            // range cannot outlive the generation whose drop fences the copy
+            // stream and rewinds the cursor under it.
+            let group_gen = bump.generation(NOT_A_WAVE, NOT_A_WAVE)?;
+            let staging = group_gen.alloc(group_bytes, 256)?;
+            let staging_base = staging.ptr as i64;
+            let src_bytes = &scratch.as_slice()[group_start..group_start + group_bytes];
+            // SAFETY: the range is `staging.len` of the domain's span, held by
+            // the generation guard for this scope; `src_bytes` is the pinned
+            // host scratch, alive across the copy; both sides are on
+            // `copy_stream`.
+            unsafe {
+                candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
+                    staging_base as u64,
+                    src_bytes,
+                    copy_stream.cu_stream(),
+                )
             }
-            let dst_ptr = info.base_ptr as i64 + dst_chunk_idx as i64 * info.chunk_byte_stride;
-            let (off, len) = gid_byte_range[&raw];
-            plan.push(staging_base + off as i64, dst_ptr, len as i64);
-        }
+            .map_err(|e| candle::Error::Msg(format!("warm->hot staging upload: {e}")))?;
 
-        // ── Phase 5: device-side scatter on the copy stream ────────────
-        kv_migrate_on(device, &plan, Some(copy_stream))?;
-        drop(staging);
+            let mut plan = MigrationPlan::new();
+            for &raw in &unique_raws[i..j] {
+                let new_gid = new_gids[&raw].clone();
+                let dst_arena_idx = new_gid.arena_idx();
+                let dst_chunk_idx = new_gid.chunk_idx();
+                let info = gpu_arena_info.get(dst_arena_idx).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "migrate_sealed_to_gpu_batch_async: dest arena {dst_arena_idx} out of range"
+                    ))
+                })?;
+                if info.base_ptr == 0 {
+                    return Err(candle::Error::Msg(
+                        "migrate_sealed_to_gpu_batch_async: dest arena not GPU-resident".into(),
+                    ));
+                }
+                let dst_ptr = info.base_ptr as i64 + dst_chunk_idx as i64 * info.chunk_byte_stride;
+                let (off, len) = gid_byte_range[&raw];
+                plan.push(
+                    staging_base + (off - group_start) as i64,
+                    dst_ptr,
+                    len as i64,
+                );
+            }
+            kv_migrate_on(device, &plan, Some(copy_stream))?;
+        }
 
         // ── Phase 6: rebuild SealedSequences with mapped GIDs ──────────
         // Warm→hot elevate rebuilds each chunk's resident KV-head record at its
@@ -2828,18 +2118,21 @@ impl ChunkedKvBacking {
                             .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))
                     })
                     .collect::<candle::Result<_>>()?;
-                let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = seq
+                // Gids are remapped to the new GPU placement; every other field
+                // — formats included — travels with the chunk unchanged, since
+                // an elevate copies bytes verbatim into a same-format slot.
+                let refs: Vec<ChunkRecordSrc<'_>> = seq
                     .chunks
                     .iter()
                     .zip(&mapped)
-                    .map(|(chunk, m)| {
-                        (
-                            m,
-                            chunk.k_pal.as_slice(),
-                            chunk.v_pal.as_slice(),
-                            chunk.k_scale.as_slice(),
-                            chunk.v_scale.as_slice(),
-                        )
+                    .map(|(chunk, m)| ChunkRecordSrc {
+                        gids: m,
+                        k_pal: chunk.k_pal.as_slice(),
+                        v_pal: chunk.v_pal.as_slice(),
+                        k_scale: chunk.k_scale.as_slice(),
+                        v_scale: chunk.v_scale.as_slice(),
+                        k_fmt: chunk.k_fmt.as_slice(),
+                        v_fmt: chunk.v_fmt.as_slice(),
                     })
                     .collect();
                 let metas = self.build_meta_records(&refs, &gpu_arena_info)?;
@@ -2864,11 +2157,18 @@ impl ChunkedKvBacking {
             .collect()
     }
 
-    /// Migrate one sealed sequence from the CPU (warm) tier back to the GPU (hot) tier.
+    /// Migrate one sealed sequence from the warm tier back to the hot tier.
     ///
     /// Symmetric inverse of [`migrate_sealed_to_cpu`].  Sharing structure is
     /// preserved by [`HeadGids::map_unique`].
+    ///
+    /// The hot tier is the *backing's own device*, not `Gpu` unconditionally: on
+    /// a CPU-only backing there is no second tier to lift into, and naming one
+    /// used to produce an arena tagged `Gpu` whose bytes were on the host —
+    /// harmless while an arena was an ordinary allocation, a contradiction now
+    /// that a `Gpu` arena means a region of the device reservation.
     pub fn migrate_sealed_to_gpu(&self, sealed: &SealedSequence) -> candle::Result<SealedSequence> {
+        let hot = self.inner.hot_location();
         let gpu_chunks: candle::Result<Vec<SealedChunk>> = sealed
             .chunks
             .iter()
@@ -2877,8 +2177,8 @@ impl ChunkedKvBacking {
                     let gpu_key = self.inner.storage.read(|s| {
                         s.arena_key(gid.arena_idx())
                             .map(|k| ArenaKey {
-                                format: k.format,
-                                location: ArenaLocation::Gpu,
+                                class: k.class,
+                                location: hot,
                             })
                             .ok_or_else(|| {
                                 candle::Error::Msg(format!(
@@ -2904,7 +2204,7 @@ impl ChunkedKvBacking {
             chunks: gpu_chunks?,
             token_count: sealed.token_count,
             chunk_size: sealed.chunk_size,
-            location: ArenaLocation::Gpu,
+            location: hot,
         })
     }
 }
@@ -2915,6 +2215,47 @@ impl ChunkedKvBacking {
 mod tests {
     use super::*;
     use crate::kv_cache::chunked::ChunkedKvBacking;
+    use crate::kv_cache::QuantFormat;
+
+    /// The staging batcher must never hand a group larger than the persistence
+    /// domain's span — that span is a hard allocation limit, and exceeding it
+    /// fails the migrate outright rather than degrading.
+    #[test]
+    fn staging_groups_respect_the_cap() {
+        // Exact fit, then a boundary crossing.
+        let g = staging_groups(&[4, 4, 4, 4], 8);
+        assert_eq!(g, vec![(0, 2, 8), (2, 4, 8)]);
+
+        // Uneven: a group stops before it would exceed, never at exactly the
+        // element that breaks it.
+        let g = staging_groups(&[5, 5, 1], 8);
+        assert_eq!(g, vec![(0, 1, 5), (1, 3, 6)]);
+
+        // Empty input yields no groups (the callers skip the loop entirely).
+        assert!(staging_groups(&[], 8).is_empty());
+
+        // **A single element wider than the cap forms its own group.** Without
+        // the `j > i` escape this loops forever, and the alternative — refusing
+        // it — would strand a band that has nowhere smaller to go.
+        let g = staging_groups(&[99, 3], 8);
+        assert_eq!(g, vec![(0, 1, 99), (1, 2, 3)]);
+
+        // Every group is contiguous, covers the whole input exactly once, and
+        // its reported byte total matches its slice.
+        let lens: Vec<usize> = (1..=40).map(|i| (i * 7) % 13 + 1).collect();
+        let groups = staging_groups(&lens, 16);
+        let mut expect_start = 0usize;
+        for &(i, j, bytes) in &groups {
+            assert_eq!(i, expect_start, "groups must be contiguous");
+            assert!(j > i, "a group must make progress");
+            assert_eq!(bytes, lens[i..j].iter().sum::<usize>());
+            if j - i > 1 {
+                assert!(bytes <= 16, "multi-element group {i}..{j} exceeded the cap");
+            }
+            expect_start = j;
+        }
+        assert_eq!(expect_start, lens.len(), "groups must cover every element");
+    }
     use candle::{DType, Device, Tensor};
 
     /// Build a CPU-backed `ChunkedKvBacking` with a single float BF16 arena.
@@ -3145,105 +2486,100 @@ mod tests {
         assert_eq!(gpu.chunks.len(), 0);
     }
 
-    // ── Quantized offset correctness ─────────────────────────────────────────
-    //
-    // These tests exercise the `elems_per_chunk = chunk_size * sub_head_dim`
-    // calculation in `copy_chunk_data_static` and `convert_chunk_data_static`.
-    //
-    // Arenas are allocated with shape (arena_chunks, CHUNK_SIZE, sub_head_dim)
-    // where sub_head_dim = head_dim / N_PALETTE.  Using `head_dim` instead of
-    // `sub_head_dim` produces a 4× offset overrun on N_PALETTE=4 models.
-    //
-    // The CPU tests exercise this without requiring CUDA by migrating Float→Q8_0
-    // and Q8_0→Float.  When `elems_per_chunk` is wrong the reverse reshape gives
-    // inner dimension `head_dim` (e.g. 32) instead of `sub_head_dim` (e.g. 8),
-    // causing `slice_set` to fail with a shape mismatch.
+    use crate::kv_cache::chunked::size_class::SizeClass;
 
-    fn cpu_quant_key() -> ArenaKey {
-        ArenaKey::uniform(
-            crate::kv_cache::KvFormat::Quantized(crate::kv_cache::QuantFormat::Q8_0),
-            ArenaLocation::Cpu,
-        )
-    }
+    // ── Slot relocation ──────────────────────────────────────────────────────
+    //
+    // `migrate_chunk` moves a slot between tiers; it does not convert formats.
+    // Every production caller (hot->warm demote, warm->hot elevate, fork) is
+    // format-preserving, and an arena has no format to convert *to* — it is a
+    // run of untyped byte slots (`docs/archived/arena_unification.md` principle 8).
 
-    fn cpu_float_key() -> ArenaKey {
-        ArenaKey::uniform(
-            crate::kv_cache::KvFormat::Float(candle::DType::BF16),
-            ArenaLocation::Cpu,
-        )
-    }
-
-    /// Float → Q8_0 → Float round-trip must preserve chunk shapes.
-    ///
-    /// head_dim=128 → sub_head_dim=32 (= CHUNK_SIZE, exact Q8_0 block fit).
-    /// With wrong `elems_per_chunk = chunk_size * head_dim`, the Q8_0 → Float
-    /// dequantize + reshape produces inner dimension `head_dim` (128) instead of
-    /// `sub_head_dim` (32), causing `slice_set` to fail with a shape mismatch.
-    /// This directly detects the N_PALETTE offset bug without needing CUDA.
+    /// A relocation is byte-verbatim, including a slot whose class stride is
+    /// wider than the band that occupies it.
     #[test]
-    fn float_to_quant_roundtrip_sub_head_dim() {
+    fn migrate_chunk_copies_a_slot_verbatim() {
         let n_kv_head = 2;
-        let head_dim = 128; // sub_head_dim = head_dim / N_PALETTE = 32 (= CHUNK_SIZE)
-        let n_tokens = 64; // two full chunks
+        let head_dim = 128;
         let backing = cpu_backing(n_kv_head, head_dim);
-        let sealed = seed_and_seal(&backing, n_kv_head, head_dim, n_tokens);
-        assert_eq!(sealed.chunks.len(), 2);
+        let sealed = seed_and_seal(&backing, n_kv_head, head_dim, 32);
+        let src = sealed.chunks[0].gids.k_gid(0);
 
-        let qkey = cpu_quant_key();
-        let fkey = cpu_float_key();
+        let key = backing
+            .inner
+            .storage
+            .read(|s| s.arena_key(src.arena_idx()))
+            .unwrap()
+            .expect("source arena exists");
+        let stride = key.slot_stride();
 
-        for chunk in &sealed.chunks {
-            let k_gid = chunk.gids.k_gid(0);
-            let qgid = backing
-                .migrate_chunk(k_gid.raw(), qkey.clone())
-                .expect("Float → Q8_0 must succeed");
-            backing
-                .migrate_chunk(qgid.raw(), fkey.clone())
-                .expect("Q8_0 → Float round-trip failed (shape mismatch = wrong sub_head_dim)");
-        }
-    }
-
-    /// Quant → Quant copy with a non-zero source chunk index exercises
-    /// `copy_chunk_data_static` with `src_chunk > 0`.
-    ///
-    /// Populates 3 Q8_0 slots from three sequential chunks, then copies
-    /// the third slot (chunk_idx ≥ 2) to a fresh slot.  A wrong
-    /// `elems_per_chunk = chunk_size * head_dim` puts data at the wrong byte
-    /// offset; the subsequent Q8_0 → Float reshape then fails with a shape mismatch
-    /// (inner dim head_dim=128 vs expected sub_head_dim=32).
-    #[test]
-    fn quant_to_quant_copy_nonzero_chunk_index() {
-        let n_kv_head = 2;
-        let head_dim = 128; // sub_head_dim = 32 (= CHUNK_SIZE, exact Q8_0 block fit)
-        let n_tokens = 96; // three full chunks
-        let backing = cpu_backing(n_kv_head, head_dim);
-        let sealed = seed_and_seal(&backing, n_kv_head, head_dim, n_tokens);
-        assert_eq!(sealed.chunks.len(), 3);
-
-        let qkey = cpu_quant_key();
-        let fkey = cpu_float_key();
-
-        // Populate Q8_0 arena slots 0, 1, 2 from three sequential float chunks.
-        let mut quant_gids: Vec<_> = sealed
-            .chunks
-            .iter()
-            .map(|chunk| {
-                backing
-                    .migrate_chunk(chunk.gids.k_gid(0).raw(), qkey.clone())
-                    .expect("Float → Q8_0 for chunk seeding")
+        let before = backing
+            .inner
+            .storage
+            .read(|s| {
+                s.arena(src.arena_idx())
+                    .unwrap()
+                    .slot_bytes(src.chunk_idx(), stride)
+                    .unwrap()
+                    .to_vec1::<u8>()
+                    .unwrap()
             })
-            .collect();
+            .unwrap();
 
-        // Copy the 3rd Q8_0 slot (chunk_idx ≥ 2) to a new slot.
-        let src_gid = quant_gids.pop().unwrap();
-        let copy_gid = backing
-            .migrate_chunk(src_gid.raw(), qkey.clone())
-            .expect("Q8_0 → Q8_0 copy with non-zero chunk_idx must succeed");
+        let dst = backing.migrate_chunk(src.raw(), key).expect("relocation");
+        let after = backing
+            .inner
+            .storage
+            .read(|s| {
+                s.arena(dst.arena_idx())
+                    .unwrap()
+                    .slot_bytes(dst.chunk_idx(), stride)
+                    .unwrap()
+                    .to_vec1::<u8>()
+                    .unwrap()
+            })
+            .unwrap();
 
-        // Verify the copy can be dequantized back without shape errors.
-        backing
-            .migrate_chunk(copy_gid.raw(), fkey.clone())
-            .expect("Q8_0 → Float after copy must succeed (shape error = wrong sub_head_dim)");
+        assert_eq!(before, after, "a relocation must not alter a single byte");
+    }
+
+    /// **The guard that makes the verbatim copy safe.** Relocating into a
+    /// different class would either truncate the band or spill it into a
+    /// neighbour, so it is refused rather than attempted.
+    #[test]
+    fn migrate_chunk_refuses_a_class_change() {
+        let n_kv_head = 2;
+        let head_dim = 128;
+        let backing = cpu_backing(n_kv_head, head_dim);
+        let sealed = seed_and_seal(&backing, n_kv_head, head_dim, 32);
+        let src = sealed.chunks[0].gids.k_gid(0);
+
+        let key = backing
+            .inner
+            .storage
+            .read(|s| s.arena_key(src.arena_idx()))
+            .unwrap()
+            .unwrap();
+        // Any other rung of the ladder.
+        let other = if key.class.index() == 0 {
+            SizeClass::at(1)
+        } else {
+            SizeClass::at(0)
+        };
+        let wrong = ArenaKey::new(other, key.location);
+
+        let err = backing.migrate_chunk(src.raw(), wrong);
+        assert!(
+            err.is_err(),
+            "a slot move across classes must be refused, not silently truncated"
+        );
+    }
+
+    #[test]
+    fn test_migrate_chunk_invalid_id() {
+        let backing = cpu_backing(2, 128);
+        let key = ArenaKey::new(SizeClass::at(0), ArenaLocation::Cpu);
+        assert!(backing.migrate_chunk(-1, key).is_err());
     }
 
     // ── Batched-async migrate tests (GPU-only) ──────────────────────────────
@@ -3258,10 +2594,23 @@ mod tests {
     // GPU, migrated to RAM, then back to VRAM, and the round-tripped
     // bytes must equal the original.
 
+    /// A CUDA device **and** the crate-wide GPU serialisation guard, or `None`
+    /// when there is no device.
+    ///
+    /// The guard is returned alongside the device rather than taken separately
+    /// so it cannot be forgotten. These tests build `ChunkedKvBacking`s, and a
+    /// backing is not an independent value: it draws on one process-global
+    /// region pool carved from a single reservation
+    /// (`crate::kv_cache::chunked::gpu_test_lock`). A test holding a device
+    /// without the lock races every other GPU test in the crate, and the way
+    /// that surfaces is `CUDA_ERROR_ILLEGAL_ADDRESS` from whichever one loses —
+    /// which then poisons the context for every test scheduled after it, so the
+    /// reported failure is rarely the guilty one.
     #[cfg(feature = "cuda")]
-    fn cuda_device_or_skip() -> Option<Device> {
+    fn cuda_device_or_skip() -> Option<(Device, std::sync::MutexGuard<'static, ()>)> {
+        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         match Device::cuda_if_available(0) {
-            Ok(d @ Device::Cuda(_)) => Some(d),
+            Ok(d @ Device::Cuda(_)) => Some((d, guard)),
             _ => None,
         }
     }
@@ -3313,7 +2662,8 @@ mod tests {
     /// before/after a round-trip.
     #[cfg(feature = "cuda")]
     fn bytes_of_cpu_sealed(backing: &ChunkedKvBacking, sealed: &SealedSequence) -> Vec<u8> {
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
+        let elems = backing.inner.elems_per_chunk();
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         backing
@@ -3321,7 +2671,11 @@ mod tests {
             .storage
             .read(|s| -> candle::Result<()> {
                 for chunk in &sealed.chunks {
-                    for gid in chunk.gids.0.iter() {
+                    // The band's own tag gives the payload length. Reading the
+                    // arena's slot stride instead would compare pad bytes too,
+                    // which is exactly the symmetric error a round-trip test
+                    // cannot otherwise detect (audit A7).
+                    for (gid, tag) in chunk.bands() {
                         let raw = gid.raw();
                         if !seen.insert(raw) {
                             continue;
@@ -3329,7 +2683,7 @@ mod tests {
                         let arena_idx = (raw as usize) / arena_chunks;
                         let chunk_idx = (raw as usize) % arena_chunks;
                         let arena = s.arenas().get(&arena_idx).unwrap();
-                        let len = chunk_byte_size_of(arena).unwrap();
+                        let len = payload_bytes_for_tag(tag, elems).unwrap();
                         let mut buf = vec![0u8; len];
                         read_chunk_into_pinned_bytes(arena, chunk_idx, &mut buf).unwrap();
                         out.extend(buf);
@@ -3352,7 +2706,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -3397,7 +2751,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 2;
@@ -3449,7 +2803,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -3500,7 +2854,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -3562,7 +2916,7 @@ mod tests {
         use half::f16;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let n_kv_head = 4;
@@ -3615,83 +2969,68 @@ mod tests {
         );
     }
 
-    /// **R16 end-to-end byte identity.** R16 is the production-default
-    /// KV format on Qwen3 (per `CLAUDE.md` — "R16 throughout"). It's
-    /// classified as `KvFormat::Quantized(QuantFormat::R16)` in the
-    /// type system, so it goes through the same `QTensor::write_bytes_at`
-    /// / `read_bytes_at` route as Q8_0 — but with a much simpler
-    /// internal byte layout (essentially `f16` storage in
-    /// token-oriented `[D, T]` order).
+    /// **The hazard size classes introduce, and the one the old round-trips
+    /// structurally could not catch.**
     ///
-    /// Seeds via an F16 backing (R16's storage element type), migrates
-    /// each chunk to a GPU R16 arena via the existing per-chunk
-    /// `migrate_chunk` (which routes through `quantize_into` for
-    /// non-fused formats), then runs the batched-async round-trip.
+    /// A `Q8_0` band is 1088 B and lives in a 1152 B slot, so payload and
+    /// stride now differ by 64 B. Every copy length must be the payload while
+    /// every address step must be the stride; confusing them either moves pad
+    /// over PCIe and grows the persisted image, or addresses slot `n` at
+    /// `n * payload` and reads into a neighbour.
+    ///
+    /// The two tests this replaces read the same arena-derived length on both
+    /// sides of the trip, so a symmetric error compared equal (audit A7). This
+    /// one seeds a known pattern through `write_raw_sealed_chunk` — the
+    /// production cold-load path, which takes explicit format bytes — and then
+    /// asserts on the payload alone.
     #[cfg(feature = "cuda")]
     #[test]
-    fn gpu_cpu_gpu_round_trip_r16_is_byte_identical() {
+    fn a_band_narrower_than_its_slot_round_trips_its_payload() {
         use candle::cuda_backend::cudarc::driver::CudaStream;
         use candle::quantized::pinned_staging::PinnedBuf;
-        use half::f16;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
-        // R16's storage element is F16, and the transpose-then-quantize
-        // path in `convert_chunk_data_static` expects matching dtypes.
-        // head_dim = 128 → sub_head_dim = 32, n_tokens = 64 → two full
-        // chunks (no partial-block padding to reason about).
         let n_kv_head = 2;
         let head_dim = 128;
-        let n_tokens = 64;
+        let sub_head_dim = head_dim / N_PALETTE;
+        let elems_per_band = CHUNK_SIZE * sub_head_dim;
+
+        // A Q8_0 backing. Its 1088 B payload lands on its own rung, so the
+        // band fills its slot exactly — the interesting case for this test is
+        // still a band NARROWER than its slot, which the palette split below
+        // produces regardless of the class.
+        let q8 = KvFormat::Quantized(QuantFormat::Q8_0);
         let backing =
-            ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::F16, &device, 256).unwrap();
+            ChunkedKvBacking::new_with_format(4, n_kv_head, head_dim, q8, q8, &device, 256)
+                .unwrap();
+        let ggml = QuantFormat::Q8_0.to_ggml_dtype();
+        let band_bytes = (elems_per_band / ggml.block_size()) * ggml.type_size();
+        assert_eq!(band_bytes, 1088, "Q8_0 payload for one band");
+        let class =
+            crate::kv_cache::chunked::size_class::class_for_format(q8, elems_per_band).unwrap();
+        assert_eq!(class.bytes(), 1088, "and it sits on its own rung");
 
         let slot = backing.alloc_sequence().unwrap();
-        backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
-        let total = n_kv_head * n_tokens * head_dim;
-        let data: Vec<f16> = (0..total)
-            .map(|i| f16::from_f32(((54321 + i) as f32) * 0.0001))
-            .collect();
-        let k = Tensor::from_vec(data, (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
-            .unwrap()
-            .to_device(&device)
+        let n_bands = n_kv_head * N_PALETTE;
+        // Distinct value per byte so any swap, shift, or truncation shows up.
+        let pattern: Vec<u8> = (0..n_bands * band_bytes).map(|i| (i % 251) as u8).collect();
+        backing
+            .write_raw_sealed_chunk(
+                slot,
+                0,
+                &pattern,
+                &pattern,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            )
             .unwrap();
-        let v = k.clone();
-        backing.write_contiguous(slot, 0, &k, &v).unwrap();
-        backing.set_len(slot, n_tokens);
-        let float_sealed = backing.record_turn(slot).unwrap();
-
-        // Re-route every chunk's GIDs into a GPU R16 arena. R16 isn't
-        // in the fused `can_fuse` set in `convert_chunk_data_static`,
-        // so this goes through `transpose → quantize_into` — the same
-        // path the production code uses for R16 (modulo the production
-        // path going through `write_raw_sealed_chunk` rather than
-        // `migrate_chunk`).
-        let gpu_r16_key = ArenaKey::uniform(
-            crate::kv_cache::KvFormat::Quantized(crate::kv_cache::QuantFormat::R16),
-            ArenaLocation::Gpu,
-        );
-        let mut r16_chunks: Vec<SealedChunk> = Vec::with_capacity(float_sealed.chunks.len());
-        for chunk in &float_sealed.chunks {
-            let new_gids = chunk
-                .gids
-                .map_unique(|gid| backing.migrate_chunk(gid.raw(), gpu_r16_key.clone()))
-                .expect("F16 → GPU R16 migrate must succeed");
-            r16_chunks.push(SealedChunk {
-                gids: new_gids,
-                // Re-placed bytes → drop the resident record (scratch fallback).
-                meta: None,
-                ..chunk.clone()
-            });
-        }
-        let r16_sealed = SealedSequence {
-            chunks: r16_chunks,
-            token_count: float_sealed.token_count,
-            chunk_size: float_sealed.chunk_size,
-            location: ArenaLocation::Gpu,
-        };
+        backing.set_len(slot, CHUNK_SIZE);
+        let hot = backing.record_turn(slot).unwrap();
 
         let cuda_dev = match &device {
             Device::Cuda(d) => d,
@@ -3700,141 +3039,34 @@ mod tests {
         let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
         let mut pinned: Option<PinnedBuf> = None;
 
-        // GPU R16 → CPU R16 (exercises QTensor::write_bytes_at).
-        let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&r16_sealed])
+        // hot -> warm.
+        let warm = backing
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&hot])
             .unwrap();
-        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
-        assert!(!first_bytes.is_empty(), "CPU R16 sealed must have bytes");
-        assert_eq!(cpu_first[0].location, ArenaLocation::Cpu);
-
-        // CPU R16 → GPU R16 (exercises QTensor::read_bytes_at).
-        let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
-            .unwrap();
-        assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
-
-        // GPU R16 → CPU R16 again, compare bytes.
-        let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
-            .unwrap();
-        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
-
+        let first = bytes_of_cpu_sealed(&backing, &warm[0]);
         assert_eq!(
-            first_bytes.len(),
-            second_bytes.len(),
-            "R16 round-trip must preserve byte length"
+            first.len(),
+            2 * n_bands * band_bytes,
+            "the gather must move payloads, not 1152 B slots"
         );
+        assert_eq!(&first[..band_bytes], &pattern[..band_bytes], "K band 0");
+
+        // warm -> hot -> warm again.
+        let back = backing
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&warm[0]])
+            .unwrap();
+        let warm2 = backing
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&back[0]])
+            .unwrap();
+        let second = bytes_of_cpu_sealed(&backing, &warm2[0]);
+
         assert_eq!(
-            first_bytes, second_bytes,
-            "R16 round-trip must be byte-identical — this is the production hot↔warm \
-             path's exact byte-level guarantee"
+            first, second,
+            "a full hot->warm->hot->warm cycle must be byte-identical when the \
+             slot is wider than the band"
         );
     }
 
-    /// **Quantized end-to-end byte identity.** Same shape as
-    /// `gpu_cpu_gpu_round_trip_is_byte_identical` but the SealedSequence
-    /// points into a GPU **Q8_0** arena instead of a Float arena, so
-    /// the batched-async path goes through `write_bytes_at` /
-    /// `read_bytes_at` on `QTensor` rather than through the
-    /// `Tensor::from_slice` + `slice_set` route.
-    ///
-    /// Seeds Float bytes, migrates each chunk to a GPU Q8_0 arena via
-    /// `migrate_chunk` (the existing per-chunk fused-quantize kernel),
-    /// then runs the batched-async migrate GPU→CPU→GPU→CPU. The two
-    /// CPU byte vectors must be identical — any difference means the
-    /// Quantized branch of `write_chunk_from_pinned_bytes` or
-    /// `read_chunk_into_pinned_bytes` corrupted, swapped, or dropped a
-    /// chunk.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn gpu_cpu_gpu_round_trip_quantized_is_byte_identical() {
-        use candle::cuda_backend::cudarc::driver::CudaStream;
-        use candle::quantized::pinned_staging::PinnedBuf;
-        use std::sync::Arc;
-
-        let Some(device) = cuda_device_or_skip() else {
-            return;
-        };
-        // head_dim = 128 → sub_head_dim = 32 → matches the Q8_0
-        // fused-quantize fast path in convert_chunk_data_static. Two
-        // full chunks (n_tokens = 64) keeps every chunk's element
-        // count a multiple of Q8_0's block_size (32).
-        let n_kv_head = 2;
-        let head_dim = 128;
-        let n_tokens = 64;
-        let backing = cuda_backing(&device, n_kv_head, head_dim);
-        let float_sealed =
-            seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 4242);
-
-        // Re-route every chunk's GIDs through a GPU Q8_0 arena via
-        // the existing fused Float→Quant migrate_chunk path.
-        let gpu_q8_key = ArenaKey::uniform(
-            crate::kv_cache::KvFormat::Quantized(crate::kv_cache::QuantFormat::Q8_0),
-            ArenaLocation::Gpu,
-        );
-        let mut quant_chunks: Vec<SealedChunk> = Vec::with_capacity(float_sealed.chunks.len());
-        for chunk in &float_sealed.chunks {
-            let new_gids = chunk
-                .gids
-                .map_unique(|gid| backing.migrate_chunk(gid.raw(), gpu_q8_key.clone()))
-                .expect("Float → GPU Q8_0 migrate must succeed for fused path");
-            quant_chunks.push(SealedChunk {
-                gids: new_gids,
-                // Re-placed bytes → drop the resident record (scratch fallback).
-                meta: None,
-                ..chunk.clone()
-            });
-        }
-        let quant_sealed = SealedSequence {
-            chunks: quant_chunks,
-            token_count: float_sealed.token_count,
-            chunk_size: float_sealed.chunk_size,
-            location: ArenaLocation::Gpu,
-        };
-
-        let cuda_dev = match &device {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
-        };
-        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
-        let mut pinned: Option<PinnedBuf> = None;
-
-        // GPU Q8_0 → CPU Q8_0 (write_bytes_at path on the dest side).
-        let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&quant_sealed])
-            .unwrap();
-        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
-        assert!(!first_bytes.is_empty(), "CPU Q8_0 sealed must have bytes");
-        assert_eq!(cpu_first[0].location, ArenaLocation::Cpu);
-
-        // CPU Q8_0 → GPU Q8_0 (read_bytes_at path on the source side).
-        let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
-            .unwrap();
-        assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
-
-        // GPU Q8_0 → CPU Q8_0 again so we can compare bytes.
-        let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
-            .unwrap();
-        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
-
-        assert_eq!(
-            first_bytes.len(),
-            second_bytes.len(),
-            "Q8_0 round-trip must preserve byte length"
-        );
-        assert_eq!(
-            first_bytes, second_bytes,
-            "Q8_0 round-trip must be byte-identical — any difference means the \
-             Quantized branch of write_bytes_at / read_bytes_at corrupted, swapped, \
-             or dropped a chunk"
-        );
-    }
-
-    /// Empty input to the batched-async paths is a no-op: returns an
-    /// empty Vec without touching the device or the pinned scratch.
     #[cfg(feature = "cuda")]
     #[test]
     fn batched_async_empty_input_is_noop() {
@@ -3842,7 +3074,7 @@ mod tests {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
-        let Some(device) = cuda_device_or_skip() else {
+        let Some((device, _gpu)) = cuda_device_or_skip() else {
             return;
         };
         let backing = cuda_backing(&device, 2, 16);

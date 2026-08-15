@@ -1,3 +1,11 @@
+//! Hiera (hierarchical ViT) image classification example.
+//!
+//! Loads `hiera::hiera` with a `Config` selected by `--which`
+//! (Tiny/Small/Base/BasePlus/Large/Huge), fetching `model.safetensors` from
+//! `timm/hiera_<variant>_224.mae_in1k_ft_in1k` on the HF hub (or `--model` for
+//! a local file). Classifies a `--image` against 1000 ImageNet classes,
+//! printing the top-5 predictions.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

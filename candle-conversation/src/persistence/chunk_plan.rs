@@ -34,7 +34,7 @@ use super::manifest::ChunkLoc;
 use super::segment::SegmentId;
 
 /// Identifies which log file a record's bytes live in. The orchestrator
-/// uses this to pick the correct [`super::direct_io::DirectFile`]
+/// uses this to pick the correct [`candle::direct_io::DirectFile`]
 /// handle when reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceLog {

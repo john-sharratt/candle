@@ -1,3 +1,14 @@
+//! Reference implementation of a custom Candle op: RMS normalization as a `CustomOp1`.
+//!
+//! No model or dataset — builds a tiny `2x7` `arange` tensor and applies
+//! `LayerNorm { eps }` (really an RMSNorm despite the struct name) via
+//! `Tensor::apply_op1`. Defines both `cpu_fwd` (plain f32 slice loop) and, when
+//! built with `--features cuda`, `cuda_fwd`, which loads a hand-written PTX
+//! kernel (`rms_f32` in `cuda_kernels::LAYERNORM_KERNELS`, compiled from this
+//! example's own `build.rs`) via `get_or_load_custom_func` and launches it
+//! with one block per row. Demonstrates the CustomOp1 trait shape that any
+//! new op (forward-only here; no backward pass) must implement.
+
 // This example illustrates how to implement custom operations. These operations can provide their
 // own forward pass (CPU and GPU versions) as well as their backward pass.
 //

@@ -1,5 +1,5 @@
 //! Implement conversion traits for tensors
-use crate::{DType, Device, Error, Tensor, WithDType};
+use crate::{DType, Device, Error, LiveTensor, Tensor, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use std::convert::TryFrom;
@@ -97,7 +97,7 @@ from_tensor!(i64);
 from_tensor!(u32);
 from_tensor!(u8);
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     pub fn write_bytes<W: std::io::Write>(&self, f: &mut W) -> crate::Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 

@@ -1,3 +1,12 @@
+//! Code generation with CodeGeeX4-All-9B (`candle_transformers::models::codegeex4_9b`,
+//! ChatGLM-family architecture).
+//!
+//! Defaults to `THUDM/codegeex4-all-9b` weights/tokenizer/config (`--model-id`,
+//! `--revision`, `--weight-path` for a local safetensors dir, `--cache` for a
+//! custom HF cache dir). Runs in BF16 on GPU / F32 on CPU. `--verbose` prints
+//! per-token decode detail. Temperature/top-p/repeat-penalty sampling loop over
+//! `--prompt`, stopping at `<|endoftext|>`.
+
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;

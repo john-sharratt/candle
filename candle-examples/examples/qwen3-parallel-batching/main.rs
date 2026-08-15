@@ -1,3 +1,14 @@
+//! Demonstrates GPU continuous-batching decode for GGUF-quantized Qwen3
+//! (unsloth 0.6B Q4_K_M) via `BatchedInference`/`SequenceContext` from
+//! `candle_transformers::models::batched_{model,layer}`, deliberately using
+//! two sequences at *misaligned* KV positions (seq2 offset by one extra
+//! decode step ahead of seq1) to validate that batched forward handles
+//! per-sequence position offsets correctly, not just equal-length batches.
+//!
+//! Runs prefill for two different-length prompts, forces the offset
+//! misalignment, then compares 100 decode steps sequential vs. batched
+//! (`forward_batch`) timing. No CLI arguments.
+
 /// Demonstrates parallel continuous batching with Qwen3.
 ///
 /// This example shows how to process multiple sequences at different generation stages

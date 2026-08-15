@@ -1,3 +1,12 @@
+//! MobileNetV4 ImageNet-1k image classification.
+//!
+//! `Which` selects one of five timm checkpoints (`Small`/`Medium`/`Large`,
+//! plus the attention-hybrid `HybridMedium`/`HybridLarge`), each with its
+//! own required input resolution (224/256/256/384/384) baked into
+//! `Which::resolution`/`Which::config`. Loads F32 safetensors from
+//! `timm/mobilenetv4_<variant>_in1k`, runs a single forward pass, and
+//! prints the top-5 `imagenet::CLASSES` predictions.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

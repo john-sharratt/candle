@@ -7,6 +7,22 @@ fn ctx() -> ToolContext {
     ToolContext::new()
 }
 
+/// Source lines out of a rendered `file_read` excerpt — header, fence and
+/// `cat -n` numbering stripped. The format itself is pinned in `file_overlay.rs`.
+fn excerpt_source(resp: &serde_json::Value) -> String {
+    let text = resp.as_str().expect("file_read returns a rendered string");
+    let body = text
+        .split_once("```")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .and_then(|(_, rest)| rest.rsplit_once("```"))
+        .map(|(body, _)| body)
+        .unwrap_or("");
+    body.lines()
+        .map(|l| l.split_once("  ").map(|(_, t)| t).unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn file_write_unicode() {
     let ctx = ctx();
@@ -21,7 +37,7 @@ fn file_write_unicode() {
         json!({"path": "uni.txt"}),
         &ctx,
     ));
-    assert_eq!(resp["content"].as_str().unwrap(), content);
+    assert_eq!(excerpt_source(&resp), content);
 }
 
 #[test]
@@ -92,7 +108,7 @@ fn file_write_overwrite_created_false() {
         json!({"path": "ow.txt"}),
         &ctx,
     ));
-    assert_eq!(rd["content"], "v2");
+    assert_eq!(excerpt_source(&rd), "v2");
 }
 
 #[test]
@@ -113,7 +129,7 @@ fn file_edit_round_trip() {
         json!({"path": "rt.txt"}),
         &ctx,
     ));
-    assert_eq!(rd["content"], "hello Rust");
+    assert_eq!(excerpt_source(&rd), "hello Rust");
 }
 
 #[test]
@@ -129,8 +145,7 @@ fn file_write_read_roundtrip() {
         json!({"path": "hello.txt"}),
         &ctx,
     ));
-    assert_eq!(resp["content"], "hello world");
-    assert_eq!(resp["lines"].as_u64().unwrap(), 1);
+    assert_eq!(excerpt_source(&resp), "hello world");
 }
 
 #[test]
@@ -179,7 +194,7 @@ fn file_edit_success() {
         json!({"path": "edit.txt"}),
         &ctx,
     ));
-    assert_eq!(read["content"], "foo qux baz");
+    assert_eq!(excerpt_source(&read), "foo qux baz");
 }
 
 #[test]
@@ -214,6 +229,92 @@ fn file_list() {
     ));
     let files = resp["files"].as_array().unwrap();
     assert_eq!(files.len(), 2);
+}
+
+/// A context that has written nothing lists nothing, whatever the prefix — the
+/// VFS is scratch space, never seeded from the real filesystem. This is the
+/// exact response a model gets when it reaches for `file_list` expecting a
+/// project directory listing: `{"files":[],"total_bytes":0}`.
+#[test]
+fn file_list_is_empty_until_something_is_written() {
+    let ctx = ctx();
+    for prefix in ["", "/", "/workspace/", "/workspace/src", "candle-examples/"] {
+        let resp = harness::expect_success(harness::invoke_with_ctx(
+            "file_list",
+            json!({ "prefix": prefix }),
+            &ctx,
+        ));
+        assert_eq!(
+            resp["files"].as_array().unwrap().len(),
+            0,
+            "prefix {prefix:?} listed files from an unwritten VFS",
+        );
+        assert_eq!(resp["total_bytes"], 0);
+    }
+}
+
+/// `/` normalizes to the empty prefix, so it lists the whole VFS rather than
+/// erroring or resolving to a real filesystem root.
+#[test]
+fn file_list_root_prefix_lists_everything() {
+    let ctx = ctx();
+    harness::invoke_with_ctx("write", json!({"path": "a.txt", "content": "1"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"path": "nested/deep/b.txt", "content": "22"}),
+        &ctx,
+    );
+    for prefix in ["/", ""] {
+        let resp = harness::expect_success(harness::invoke_with_ctx(
+            "file_list",
+            json!({ "prefix": prefix }),
+            &ctx,
+        ));
+        assert_eq!(
+            resp["files"].as_array().unwrap().len(),
+            2,
+            "prefix {prefix:?}"
+        );
+        assert_eq!(resp["total_bytes"], 3);
+    }
+}
+
+/// `/workspace` is the mount point of the working directory, so it normalises
+/// away: a path written as `/workspace/src/main.rs` and one written as
+/// `src/main.rs` are the same entry, and either spelling of the prefix selects
+/// it. This is what lets the tool definitions' `/workspace/...` examples address
+/// the same files as the bare repo-relative paths a model infers from a repo map.
+#[test]
+fn workspace_mount_prefix_normalises_to_the_same_entry() {
+    let ctx = ctx();
+    harness::invoke_with_ctx(
+        "write",
+        json!({"path": "/workspace/src/main.rs", "content": "fn main() {}\n"}),
+        &ctx,
+    );
+    harness::invoke_with_ctx(
+        "write",
+        json!({"path": "README.md", "content": "# hi\n"}),
+        &ctx,
+    );
+    for prefix in ["/workspace/src", "src/", "/src"] {
+        let resp = harness::expect_success(harness::invoke_with_ctx(
+            "file_list",
+            json!({ "prefix": prefix }),
+            &ctx,
+        ));
+        let files = resp["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "prefix {prefix:?}");
+        assert_eq!(files[0]["path"], "src/main.rs");
+        assert_eq!(files[0]["lines"], 1);
+    }
+    // The same file resolves under either spelling.
+    let bare = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs"}),
+        &ctx,
+    ));
+    assert_eq!(excerpt_source(&bare), "fn main() {}");
 }
 
 #[test]

@@ -19,59 +19,15 @@ pub const CHUNK_SIZE: usize = 32;
 /// Target size for one arena allocation: 16 MiB.
 pub const TARGET_ARENA_BYTES: usize = 16 * 1024 * 1024;
 
-fn arena_bytes_per_chunk(format: crate::kv_cache::KvFormat) -> usize {
-    let elems_per_chunk = CHUNK_SIZE * CHUNK_SIZE;
-    match format {
-        crate::kv_cache::KvFormat::Float(dtype) => elems_per_chunk * dtype.size_in_bytes(),
-        crate::kv_cache::KvFormat::Quantized(qf) => {
-            let ggml = qf.to_ggml_dtype();
-            debug_assert_eq!(elems_per_chunk % ggml.block_size(), 0);
-            (elems_per_chunk / ggml.block_size()) * ggml.type_size()
-        }
-    }
-}
-
-/// Compute the number of physical chunks that fit in a target-size arena for
-/// the provided format.
-///
-/// The current palette4 CUDA layout stores one palette sub-band per chunk, and
-/// that sub-band is `CHUNK_SIZE × CHUNK_SIZE` elements in the standard 128-dim
-/// head layout. Integer division is used so the returned chunk count always
-/// lands at the target size or just under it.
-pub fn arena_chunks_for_format(format: crate::kv_cache::KvFormat) -> usize {
-    (TARGET_ARENA_BYTES / arena_bytes_per_chunk(format)).max(1)
-}
-
-/// Global raw-GID stride used to map a raw chunk id to `(arena_idx, chunk_idx)`.
-///
-/// Physical arenas can now have format-specific capacities, but the raw GID
-/// namespace still uses a single stride large enough to cover the densest arena
-/// layout. This preserves stable routing while allowing per-format 16 MiB slabs.
-pub fn arena_gid_stride() -> usize {
-    use strum::IntoEnumIterator;
-
-    let mut stride = arena_chunks_for_format(crate::kv_cache::KvFormat::Float(candle::DType::F16))
-        .max(arena_chunks_for_format(crate::kv_cache::KvFormat::Float(
-            candle::DType::BF16,
-        )))
-        .max(arena_chunks_for_format(crate::kv_cache::KvFormat::Float(
-            candle::DType::F32,
-        )));
-
-    for qf in crate::kv_cache::QuantFormat::iter() {
-        stride = stride.max(arena_chunks_for_format(
-            crate::kv_cache::KvFormat::Quantized(qf),
-        ));
-    }
-
-    stride
-}
+/// Re-exported so arena sizing and gid decode read the same constant. The
+/// stride lives with the size-class ladder because that is what bounds it.
+pub use super::size_class::GID_STRIDE;
 
 use super::gid_pool::ChunkGid;
 use super::gpu_chunks::GpuChunks;
-use super::head_gids::HeadGids;
+use super::head_gids::{band_tags, HeadGids};
 use super::meta_pool::MetaGid;
-use crate::kv_cache::arena_table::ResolvedArenaInfo;
+use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use std::sync::Arc;
@@ -208,6 +164,11 @@ pub struct LiveChunkRef<'a> {
     pub v_pal: &'a [u8],
     pub k_scale: &'a [f32],
     pub v_scale: &'a [f32],
+    /// Per-`(head, palette)` K/V band format tags ([`ArenaFormatTag::as_u8`]),
+    /// `n_kv_head × N_PALETTE` entries each. See [`SealedChunk::k_fmt`] for why
+    /// the format travels with the chunk rather than with the arena.
+    pub k_fmt: &'a [u8],
+    pub v_fmt: &'a [u8],
     /// Device-resident KvHead record handle, when the chunk has one.
     pub meta: Option<&'a MetaGid>,
 }
@@ -232,6 +193,19 @@ pub struct SealedChunk {
     pub k_scale: Arc<Vec<f32>>,
     /// Outer V scales, `n_kv_head × N_PALETTE` f32 values. Same convention as k_scale.
     pub v_scale: Arc<Vec<f32>>,
+    /// Per-`(head, palette)` K-side storage format, as
+    /// [`ArenaFormatTag::as_u8`], `n_kv_head × N_PALETTE` entries in
+    /// `[h * N_PALETTE + p]` order. Empty ⇒ not yet recorded.
+    ///
+    /// **The format travels with the chunk, not with the arena.** Historically
+    /// a band's format was recovered by looking up the arena its gid pointed
+    /// into, which made "format ⇒ arena" a load-bearing invariant and forced
+    /// one arena pool per format. Under size classes an arena holds whatever
+    /// fits its stride, so the arena can no longer answer the question and the
+    /// chunk must. See `docs/archived/arena_unification.md` §2 and principle 8.
+    pub k_fmt: Arc<Vec<u8>>,
+    /// Per-`(head, palette)` V-side storage format. Same layout as `k_fmt`.
+    pub v_fmt: Arc<Vec<u8>>,
     /// Total bytes occupied by all unique physical chunks referenced by `gids`.
     /// Sum of `chunk_byte_stride` over each distinct arena index in the GID set.
     /// Preserved unchanged through CPU↔GPU migration (format is identical, only
@@ -247,6 +221,51 @@ pub struct SealedChunk {
 }
 
 impl SealedChunk {
+    /// The chunk's per-`(head, palette)` K and V format tags, in the
+    /// `[h * N_PALETTE + p]` order [`ChunkPayload`] persists and the cold-load
+    /// path decodes.
+    ///
+    /// These bytes *are* the persisted format tags — [`crate::kv_cache::KvFormat::to_tag`]
+    /// is defined as `ArenaFormatTag::from_kv_format(..).as_u8()`, the same
+    /// encoding recorded here — so the persist path copies them rather than
+    /// re-deriving formats from arena state.
+    ///
+    /// Errors when the tags were never recorded. A chunk that cannot say what
+    /// format its bands are in cannot be persisted or migrated, and an empty
+    /// format vector would produce an image the cold-load path silently
+    /// reconstructs as zero bands.
+    ///
+    /// [`ChunkPayload`]: https://docs.rs/candle-conversation
+    pub fn format_tags(&self) -> candle::Result<(&[u8], &[u8])> {
+        let want = self.gids.n_kv_head() * crate::kv_cache::arena_table::N_PALETTE;
+        if self.k_fmt.len() != want || self.v_fmt.len() != want {
+            return Err(candle::Error::Msg(format!(
+                "sealed chunk has no recorded format tags (k {}, v {}, expected {want}) — \
+                 every construction site must propagate them",
+                self.k_fmt.len(),
+                self.v_fmt.len(),
+            )));
+        }
+        Ok((self.k_fmt.as_slice(), self.v_fmt.as_slice()))
+    }
+
+    /// Iterate `(gid, format tag)` for every band slot, in the interleaved
+    /// K,V order of [`HeadGids::as_slice`].
+    ///
+    /// The gid says *where* the band's bytes are; the tag says *how to read
+    /// them*. Under size classes only the chunk can answer the second question
+    /// (`docs/archived/arena_unification.md` principle 8), so predicates over a chunk's
+    /// formats walk this rather than the arenas its gids point into.
+    pub fn bands(&self) -> impl Iterator<Item = (&ChunkGid, ArenaFormatTag)> + '_ {
+        band_tags(&self.gids, &self.k_fmt, &self.v_fmt)
+    }
+
+    /// Total bytes this chunk's bands occupy, each from its own format tag.
+    pub fn byte_size(&self, elems_per_chunk: usize) -> u64 {
+        self.gids
+            .arena_byte_size(&self.k_fmt, &self.v_fmt, elems_per_chunk)
+    }
+
     /// Construct a minimal `SealedChunk` for use in tests.
     ///
     /// Creates a single-element `gids` vec (n_kv_head=1), with `offset`
@@ -260,6 +279,8 @@ impl SealedChunk {
             v_pal: Arc::new(Vec::new()),
             k_scale: Arc::new(Vec::new()),
             v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(Vec::new()),
+            v_fmt: Arc::new(Vec::new()),
             byte_size: 0,
             meta: None,
         }
@@ -368,6 +389,14 @@ pub(crate) struct ChunkWindow {
     pub(crate) k_scale: Arc<Vec<f32>>,
     /// Outer V scales: `n_kv_head × N_PALETTE` f32 values. Same convention as k_scale.
     pub(crate) v_scale: Arc<Vec<f32>>,
+    /// Per-`(head, palette)` K-side storage format ([`ArenaFormatTag::as_u8`]),
+    /// `n_kv_head × N_PALETTE` entries. See [`SealedChunk::k_fmt`] for why the
+    /// format lives on the chunk rather than on the arena.
+    ///
+    /// [`ArenaFormatTag::as_u8`]: crate::kv_cache::ArenaFormatTag::as_u8
+    pub(crate) k_fmt: Arc<Vec<u8>>,
+    /// Per-`(head, palette)` V-side storage format. Same layout as `k_fmt`.
+    pub(crate) v_fmt: Arc<Vec<u8>>,
     /// Co-resident KV-head metadata record handle, propagated from the
     /// `SealedChunk` this window was injected from (`Some`) or `None` for a
     /// freshly-allocated float writer chunk. Cloned with the window so every
@@ -375,7 +404,40 @@ pub(crate) struct ChunkWindow {
     pub(crate) meta: Option<MetaGid>,
 }
 
-impl ChunkWindow {}
+impl ChunkWindow {
+    /// Iterate `(gid, format tag)` for every band slot, in the interleaved
+    /// K,V order of [`HeadGids::as_slice`].
+    ///
+    /// The live-chunk twin of [`SealedChunk::bands`], sharing its indexing so
+    /// a chunk answers the same way before and after it is sealed.
+    pub(crate) fn bands(&self) -> impl Iterator<Item = (&ChunkGid, ArenaFormatTag)> + '_ {
+        band_tags(&self.gids, &self.k_fmt, &self.v_fmt)
+    }
+
+    /// Total bytes this chunk's bands occupy, each from its own format tag.
+    pub(crate) fn byte_size(&self, elems_per_chunk: usize) -> u64 {
+        self.gids
+            .arena_byte_size(&self.k_fmt, &self.v_fmt, elems_per_chunk)
+    }
+}
+
+/// One layer's view of a sequence's block structure, reduced to the parts the
+/// shared decode position map is built from.
+///
+/// Two layers whose `DecodeLayout` agree produce identical maps and can share
+/// one; two that disagree cannot. Produced by
+/// [`SequenceState::decode_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DecodeLayout {
+    /// Fold over every chunk's `(offset, usage)` window, in chunk order.
+    pub(super) digest: u64,
+    /// Number of allocated chunks — the slice count the map indexes into.
+    pub(super) blocks: usize,
+    /// Index of the chunk the write slot resolves to. This is the one field
+    /// the map records for a token that does not exist yet, and the one the
+    /// per-layer `write_slice` in the slot header must match.
+    pub(super) writer: usize,
+}
 
 /// Opaque snapshot of a slot's writer-owned chunks, taken by
 /// [`super::ChunkedKvBacking::split_off_writer_tail`] and restored by
@@ -559,6 +621,7 @@ impl SequenceState {
     /// the bytes stored at `gids`, so they have to track every gid mutation.
     /// Callers that want to preserve existing semantics should read the chunk's
     /// current values first and pass them through.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn set_block_gids(
         &mut self,
         blk: usize,
@@ -567,6 +630,8 @@ impl SequenceState {
         v_pal: Arc<Vec<u8>>,
         k_scale: Arc<Vec<f32>>,
         v_scale: Arc<Vec<f32>>,
+        k_fmt: Arc<Vec<u8>>,
+        v_fmt: Arc<Vec<u8>>,
     ) {
         if blk < self.chunks.len() {
             let cw = &mut self.chunks[blk];
@@ -575,6 +640,15 @@ impl SequenceState {
             cw.v_pal = v_pal;
             cw.k_scale = k_scale;
             cw.v_scale = v_scale;
+            // The format tags travel with the gids and MUST be replaced with
+            // them. A cold-load or elevate re-points this window at chunks in
+            // whatever formats were persisted; leaving the window's previous
+            // tags in place (the active R16/F16 a freshly-allocated writer
+            // window carries) would make every reader decode those chunks as
+            // raw floats. The pal/scale fields above have the same lifecycle
+            // for the same reason.
+            cw.k_fmt = k_fmt;
+            cw.v_fmt = v_fmt;
             // Any GID mutation (defrag remap, cold-load reinjection) invalidates
             // the resident record's per-palette pointers. Drop it so the host
             // serializer falls back to per-forward scratch heads rather than
@@ -974,6 +1048,36 @@ impl SequenceState {
         n - 1
     }
 
+    /// Everything the shared decode position map is derived from, reduced to a
+    /// comparable value.
+    ///
+    /// The decode metadata builder constructs ONE position map per sequence — a
+    /// `(slice_idx, in_blk)` entry per logical token, plus a final entry naming
+    /// the write slot — from layer 0's block table, and hands it to all 48
+    /// layers. That is only sound while every layer's block table agrees, and
+    /// block structure is not unconditionally layer-uniform: a windowed creep
+    /// prefill leaves resumed layers holding an empty writer chunk the layers
+    /// still pending resume do not have. Comparing this value across layers is
+    /// how the decode entry point establishes the invariant instead of assuming
+    /// it. See [`super::ChunkedKvBacking::ensure_for_batch_entries_all`].
+    pub(super) fn decode_layout(&self) -> DecodeLayout {
+        // FNV-1a over each chunk's window. Order matters and the windows are the
+        // whole of what the map encodes, so a fold over `(offset, usage)` in
+        // chunk order captures exactly as much as the map does and no more.
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for c in &self.chunks {
+            for field in [c.offset as u64, c.usage as u64] {
+                digest ^= field;
+                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        DecodeLayout {
+            digest,
+            blocks: self.chunks.len(),
+            writer: self.decode_write_chunk_idx(),
+        }
+    }
+
     /// Per-chunk `(offset, len, cum_before)` window using the SAME derivation the
     /// decode GPU buffer does ([`rebuild_decode`]): the writer chunk gets the
     /// `seq_offset`-derived length, every other chunk keeps its stored `usage`, and
@@ -1089,6 +1193,239 @@ impl SequenceState {
         let write_len = seq_offset.saturating_sub(rope_base) as u16;
         self.gpu_chunks
             .snapshot_into_generation(generation, wi, write_len)
+    }
+}
+
+#[cfg(test)]
+mod band_iteration_tests {
+    use super::*;
+    use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+
+    /// One head, all bands sharing a gid, with the given K/V tags.
+    fn window(k_tag: u8, v_tag: u8) -> ChunkWindow {
+        ChunkWindow {
+            gids: HeadGids::uniform(ChunkGid::detached(0), 1),
+            usage: 32,
+            offset: 0,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(vec![k_tag; N_PALETTE]),
+            v_fmt: Arc::new(vec![v_tag; N_PALETTE]),
+            meta: None,
+        }
+    }
+
+    /// **The K/V interleave.** `bands()` walks slots in `HeadGids` order —
+    /// K,V alternating — and each slot must get the tag from its own side.
+    /// Getting this backwards would decode every V band as a K format, which
+    /// is exactly the class of bug the per-band tags exist to prevent.
+    #[test]
+    fn bands_alternate_k_and_v_tags() {
+        let w = window(ArenaFormatTag::R16.as_u8(), ArenaFormatTag::F16.as_u8());
+        let tags: Vec<ArenaFormatTag> = w.bands().map(|(_, t)| t).collect();
+
+        assert_eq!(tags.len(), N_PALETTE * 2, "one slot per band, K and V");
+        for (i, tag) in tags.iter().enumerate() {
+            let want = if i % 2 == 0 {
+                ArenaFormatTag::R16
+            } else {
+                ArenaFormatTag::F16
+            };
+            assert_eq!(*tag, want, "slot {i} took the wrong side's tag");
+        }
+    }
+
+    /// A chunk that never recorded its tags reports `Invalid` rather than a
+    /// plausible default. A guessed format would be decoded as real.
+    #[test]
+    fn unrecorded_tags_report_invalid() {
+        let mut w = window(0, 0);
+        w.k_fmt = Arc::new(Vec::new());
+        w.v_fmt = Arc::new(Vec::new());
+
+        assert!(
+            w.bands().all(|(_, t)| t == ArenaFormatTag::Invalid),
+            "absent tags must not decode to a real format"
+        );
+    }
+
+    /// A live chunk and the sealed chunk it becomes must agree band-for-band —
+    /// they share one indexing helper precisely so they cannot drift.
+    #[test]
+    fn a_window_and_its_sealed_form_agree() {
+        let w = window(ArenaFormatTag::Q8_0.as_u8(), ArenaFormatTag::Q4_KS.as_u8());
+        let sealed = SealedChunk {
+            gids: w.gids.clone(),
+            offset: w.offset,
+            token_count: w.usage as u16,
+            k_pal: w.k_pal.clone(),
+            v_pal: w.v_pal.clone(),
+            k_scale: w.k_scale.clone(),
+            v_scale: w.v_scale.clone(),
+            k_fmt: w.k_fmt.clone(),
+            v_fmt: w.v_fmt.clone(),
+            byte_size: 0,
+            meta: None,
+        };
+        let from_window: Vec<ArenaFormatTag> = w.bands().map(|(_, t)| t).collect();
+        let from_sealed: Vec<ArenaFormatTag> = sealed.bands().map(|(_, t)| t).collect();
+        assert_eq!(from_window, from_sealed);
+    }
+}
+
+/// Tests for the chunk-owned format tags as a *source of truth* — the accessors
+/// every inverted reader now goes through.
+#[cfg(test)]
+mod band_tag_tests {
+    use super::*;
+    use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+    use crate::kv_cache::{KvFormat, QuantFormat};
+    use candle::DType;
+
+    /// A two-head chunk whose every band carries a *distinct* tag, so any
+    /// index arithmetic error in `bands()` shows up as a mismatched pair
+    /// rather than an accidentally-correct uniform answer.
+    fn distinct_band_chunk(n_kv_head: usize) -> SealedChunk {
+        let n = n_kv_head * N_PALETTE;
+        let mut sc = SealedChunk::for_test(0, 32);
+        sc.gids = HeadGids::uniform(ChunkGid::detached(0), n_kv_head);
+        // Tag values are arbitrary but unique per band, and the K and V ranges
+        // are disjoint so a K/V swap is detectable.
+        sc.k_fmt = Arc::new((0..n).map(|i| i as u8).collect());
+        sc.v_fmt = Arc::new((0..n).map(|i| (100 + i) as u8).collect());
+        sc
+    }
+
+    #[test]
+    fn bands_pairs_every_slot_with_its_own_tag() {
+        let n_kv_head = 2;
+        let sc = distinct_band_chunk(n_kv_head);
+        let got: Vec<u8> = sc.bands().map(|(_, tag)| tag.as_u8()).collect();
+
+        // `HeadGids::as_slice` is K,V interleaved per (head, palette); tags are
+        // indexed [h * N_PALETTE + p] per side. Rebuild that expectation by
+        // hand rather than from the same helper being tested.
+        let mut want: Vec<u8> = Vec::new();
+        for h in 0..n_kv_head {
+            for p in 0..N_PALETTE {
+                want.push(ArenaFormatTag::from_u8((h * N_PALETTE + p) as u8).as_u8());
+                want.push(ArenaFormatTag::from_u8((100 + h * N_PALETTE + p) as u8).as_u8());
+            }
+        }
+        assert_eq!(
+            got, want,
+            "bands() must walk K,V interleaved per (head, palette)"
+        );
+        assert_eq!(got.len(), n_kv_head * N_PALETTE * 2);
+    }
+
+    #[test]
+    fn bands_yields_the_gid_at_each_slot() {
+        let sc = distinct_band_chunk(2);
+        let gids: Vec<i64> = sc.bands().map(|(g, _)| g.raw()).collect();
+        let want: Vec<i64> = sc.gids.as_slice().iter().map(|g| g.raw()).collect();
+        assert_eq!(gids, want);
+    }
+
+    /// An unrecorded band reports `Invalid`, which fails every format
+    /// predicate — a chunk that cannot say what it holds is never treated as
+    /// eligible for a kernel that would misread it.
+    #[test]
+    fn unrecorded_bands_report_invalid() {
+        let sc = SealedChunk::for_test(0, 32); // empty k_fmt / v_fmt
+        assert!(sc.bands().all(|(_, t)| t == ArenaFormatTag::Invalid));
+        assert!(
+            sc.bands().all(|(_, t)| t.is_quantized()),
+            "Invalid must not pass as a float"
+        );
+    }
+
+    #[test]
+    fn format_tags_rejects_an_unrecorded_chunk() {
+        let sc = SealedChunk::for_test(0, 32);
+        let err = sc.format_tags().unwrap_err().to_string();
+        assert!(
+            err.contains("no recorded format tags"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn format_tags_returns_both_sides_verbatim() {
+        let sc = distinct_band_chunk(2);
+        let (k, v) = sc.format_tags().unwrap();
+        assert_eq!(k, sc.k_fmt.as_slice());
+        assert_eq!(v, sc.v_fmt.as_slice());
+    }
+
+    /// **The load-bearing assertion for the persist path.** `ChunkPayload`'s
+    /// `k_formats`/`v_formats` were built by mapping arena formats through
+    /// [`KvFormat::to_tag`]; they are now the chunk's own tag bytes, copied.
+    /// That substitution is byte-identical only because the two encodings are
+    /// the same one — asserted here against raw byte values, per repo policy on
+    /// serialization tests, rather than trusted from the type names.
+    #[test]
+    fn chunk_tag_bytes_are_the_persisted_format_encoding() {
+        for (fmt, tag) in [
+            (KvFormat::Float(DType::F32), ArenaFormatTag::F32),
+            (KvFormat::Float(DType::F16), ArenaFormatTag::F16),
+            (KvFormat::Float(DType::BF16), ArenaFormatTag::BF16),
+            (KvFormat::Quantized(QuantFormat::R16), ArenaFormatTag::R16),
+            (KvFormat::Quantized(QuantFormat::Q8_0), ArenaFormatTag::Q8_0),
+            (
+                KvFormat::Quantized(QuantFormat::Q4_KS),
+                ArenaFormatTag::Q4_KS,
+            ),
+            (KvFormat::Quantized(QuantFormat::Q2_0), ArenaFormatTag::Q2_0),
+            (KvFormat::Quantized(QuantFormat::Q0), ArenaFormatTag::Q0),
+        ] {
+            assert_eq!(
+                fmt.to_tag(),
+                tag.as_u8(),
+                "persisted tag for {fmt:?} must equal the chunk's recorded byte"
+            );
+            assert_eq!(
+                KvFormat::from_tag(tag.as_u8()),
+                Some(fmt),
+                "cold load must decode {tag:?} back to {fmt:?}"
+            );
+        }
+    }
+
+    /// Raw-byte goldens for the discriminants the substrate has already
+    /// written to disk. These bytes are on-disk data: changing one silently
+    /// re-interprets every persisted chunk.
+    #[test]
+    fn persisted_tag_discriminants_are_frozen() {
+        assert_eq!(ArenaFormatTag::F32.as_u8(), 0);
+        assert_eq!(ArenaFormatTag::F16.as_u8(), 1);
+        assert_eq!(ArenaFormatTag::BF16.as_u8(), 2);
+        assert_eq!(ArenaFormatTag::R16.as_u8(), 3);
+        assert_eq!(ArenaFormatTag::Q8_0.as_u8(), 7);
+        assert_eq!(ArenaFormatTag::Q8_KS.as_u8(), 10);
+        assert_eq!(ArenaFormatTag::Q4_0.as_u8(), 15);
+        assert_eq!(ArenaFormatTag::Q4_KS.as_u8(), 18);
+        assert_eq!(ArenaFormatTag::Q2_0.as_u8(), 22);
+        assert_eq!(ArenaFormatTag::Q0.as_u8(), 33);
+        assert_eq!(ArenaFormatTag::Invalid.as_u8(), 255);
+    }
+
+    /// `from_u8` is the exact inverse of `as_u8` across the whole tag space,
+    /// and unknown bytes degrade to `Invalid` rather than aliasing a format.
+    #[test]
+    fn tag_byte_round_trip_is_total() {
+        for byte in 0u8..=255 {
+            let tag = ArenaFormatTag::from_u8(byte);
+            if tag == ArenaFormatTag::Invalid && byte != 255 {
+                assert!(byte > 35, "byte {byte} should decode to a real tag");
+            } else {
+                assert_eq!(tag.as_u8(), byte, "round trip broken at byte {byte}");
+            }
+        }
     }
 }
 

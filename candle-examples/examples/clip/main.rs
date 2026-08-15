@@ -1,3 +1,12 @@
+//! OpenAI CLIP image/text similarity (`candle_transformers::models::clip::ClipModel`,
+//! `ClipConfig::vit_base_patch32`).
+//!
+//! `--images` and `--sequences` take comma-delimited lists (defaults: two
+//! sample images from other examples' assets vs. three English captions);
+//! weights/tokenizer default to `openai/clip-vit-base-patch32`. Computes
+//! image/text logits, softmaxes over images, and prints per-image match
+//! probabilities for each caption.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

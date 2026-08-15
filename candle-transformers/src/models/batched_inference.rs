@@ -33,8 +33,8 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, GpuArenaFormatStats, HeadGids, KvCache, KvFormat,
-    QuantFormat,
+    ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
+    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -45,7 +45,6 @@ use super::batched_model::{BatchedInference, BatchedModelCore, WavePhase};
 use super::tensor_cat::TensorCat;
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
-use crate::models::profile::{pipeline_record, profile_now};
 
 /// Inference mode specifying both compute dtype and KV cache storage format.
 ///
@@ -865,20 +864,35 @@ impl BatchedInferenceSession {
         // Entry at index state.offset is the write slot for the new token.
         let mut pm_flat: Vec<u32> = Vec::new();
         let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
-        // Ensure backings are sized for the upcoming decode write so the
-        // slot's chunks reflect the post-write layout when we read them.
-        // Only for sequences that actually decode-write — see `non_writer`.
+        // `(slice count, write slice)` the map was built against, per sequence.
+        // Both are read from layer 0 while the map is one buffer every layer's
+        // slot header points at, so every layer's own answer is checked against
+        // them below rather than assumed equal.
+        let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
+        // Ensure backings are sized for the upcoming decode write so the slot's
+        // chunks reflect the post-write layout when we read them, and reconcile
+        // any block-structure skew between layers — the map built below is one
+        // buffer describing all of them.
+        //
+        // ALL layers at once, and once per decode step rather than once per
+        // layer: only the layers that need an allocation take the write guard,
+        // which is what the per-layer form cost 48 times per decoded token in a
+        // steady state where the answer is "nothing to allocate".
+        //
+        // Only for sequences that actually decode-write — a speculative-verify
+        // slot replays already-written positions and must not have a write
+        // chunk pre-allocated (see `non_writer`).
         let writer_offsets: Vec<(usize, usize)> = seq_offsets
             .iter()
             .copied()
             .filter(|(s, _)| !non_writer.contains(s))
             .collect();
-        self.backings[0].ensure_for_batch_entries(&writer_offsets, 1)?;
+        ChunkedKvBacking::ensure_for_batch_entries_all(&self.backings, &writer_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
             let entry_start = pm_flat.len();
             pm_seq_byte_offsets.push(entry_start * 4);
             let chunks = self.backings[0]
-                .live_chunks_as_sealed(seq_idx, &[])
+                .live_chunks_as_sealed(seq_idx)
                 .unwrap_or_default();
             for (sidx, c) in chunks.iter().enumerate() {
                 let base = (sidx as u32) << 16;
@@ -915,6 +929,7 @@ impl BatchedInferenceSession {
                 .get(wi)
                 .map_or(0, |c| c.offset as u32 + c.token_count as u32);
             pm_flat.push(((wi as u32) << 16) | wi_within);
+            pm_slot_shape.push((n_ch as u32, wi as u32));
         }
 
         // Upload position_map via the pinned stager — zero-copy PCIe read,
@@ -938,12 +953,8 @@ impl BatchedInferenceSession {
         let mut saw_slot_reuse = false;
 
         for layer_idx in 0..self.num_layers {
-            // Ensure the write chunk for each sequence is allocated before reading
-            // metadata. At chunk boundaries the write chunk does not exist yet
-            // (it is allocated lazily inside paged_decode_attention), so we must
-            // pre-allocate it here so the GPU buffer reflects the correct
-            // new write chunk rather than the previous sealed tail.
-            self.backings[layer_idx].ensure_for_batch_entries(&writer_offsets, 1)?;
+            // Capacity for the upcoming write is ensured for EVERY layer above,
+            // before this loop — see `ensure_for_batch_entries_all`.
 
             let arena_info = self.backings[layer_idx].resolve_arena_info()?;
 
@@ -972,6 +983,24 @@ impl BatchedInferenceSession {
 
             // Append this layer's headers (24 bytes × n_active).
             for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
+                // The kernel SCATTERS the new token through this layer's own
+                // `write_slice` and READS it back through the shared map's write
+                // slot. A layer whose block table disagrees with the one the map
+                // was built from writes the token into one chunk and attends to
+                // another — silently, with no fault and no wrong-looking number
+                // anywhere. `ensure_for_batch_entries_all` reconciles the layers
+                // before this point; this is where that is worth confirming,
+                // because both values are already in hand.
+                let (exp_slices, exp_write) = pm_slot_shape[i];
+                if (n_slices, write_slice) != (exp_slices, exp_write) {
+                    candle::bail!(
+                        "decode metadata: layer {layer_idx} describes sequence {} as \
+                         {n_slices} slices writing slice {write_slice}, but the position map \
+                         every layer shares was built from layer 0 as {exp_slices} slices \
+                         writing slice {exp_write}",
+                        seq_offsets[i].0
+                    )
+                }
                 let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
                 all_headers.extend_from_slice(&n_slices.to_le_bytes());
                 all_headers.extend_from_slice(&write_slice.to_le_bytes());
@@ -1365,7 +1394,7 @@ impl BatchedInferenceSession {
                 self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
             }
             // Uncompressed (F16/BF16) modes keep their float chunks in place — the
-            // prefill's `truncate_caches_to_offset` already collapses phantom
+            // wave's admit phase (`wave_admit`) already collapses phantom
             // chunks from repeated re-prefill, so the record_turn/truncate/re-inject
             // round-trip is unnecessary (and re-injecting Arc-shared chunks under a
             // lone sequence corrupted the decode read). Just open a fresh writer.
@@ -1376,126 +1405,49 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
-    /// Cheap session-level compaction check.
+    /// Sweep fully-empty KV arenas across all backings, returning their regions
+    /// to the free list. Returns arenas freed.
     ///
-    /// This only inspects backing state and does not move or free anything.
-    pub fn compact_check(&self) -> Result<bool> {
-        let t_check = profile_now();
-        let mut should_run = false;
-        for backing in &self.backings {
-            should_run |= backing.needs_compaction()?;
-        }
-        pipeline_record("session:kv_compact_check", t_check);
-        Ok(should_run)
-    }
-
-    /// Compact all arena backings to release unused tail arenas.
+    /// Runs per-wave, and it is cheap: an arena release is a free-list push and
+    /// nothing more. It used to be neither. Releasing an arena unmapped its
+    /// slab, so this took the process-global arena-topology write lock — the
+    /// migrate's per-head table captured raw base pointers of every arena and
+    /// dereferenced them from a kernel with no lock held — and then paid a full
+    /// `device.synchronize()` to retire trailing kernels before the unmap.
+    /// A whole-device sync, every wave, on the sweep path.
     ///
-    /// Call this after freeing sequences to reclaim GPU memory.
-    /// Returns the total number of arenas freed across all layers.
-    pub fn compact(&self) -> Result<usize> {
-        // Exclude pointer captures (hot→warm migrate / warm→hot elevate) for the
-        // WHOLE compaction: relocating/freeing an arena a capture's kernel is
-        // mid-read (cross-thread, unfenced) → CUDA_ERROR_ILLEGAL_ADDRESS. The
-        // guard is a held write lock, not an advisory check — a capture starting
-        // mid-compaction blocks until the compaction finishes. On contention we
-        // skip; relief resumes next wave (captures run in ~hundreds of ms).
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        if !self.compact_check()? {
-            return Ok(0);
-        }
-        // Quiesce in-flight kernels before unmapping: wave kernels don't take
-        // the topology lock — their uploaded tables pin chunks host-side only —
-        // so a trailing (deep-queued) kernel may still be reading arenas that
-        // emptied after its launch. One bounded sync per relief pass, at the
-        // only chokepoint where device memory actually unmaps.
-        self.device.synchronize()?;
-        let t_compact = profile_now();
-        let mut total_freed = 0;
-        for backing in &self.backings {
-            total_freed += backing.compact()?;
-        }
-        pipeline_record("session:kv_compact_run", t_compact);
-        Ok(total_freed)
-    }
-
-    /// Force compaction across all backings (defrag threshold 0) and release
-    /// reclaimed arenas. Used by the scheduler's VRAM-pressure backpressure
-    /// path, where reclaiming any arena is worth it. Returns arenas freed.
-    pub fn compact_forced(&self) -> Result<usize> {
-        // See `compact` — held for the whole forced pass, quiesced before it.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        self.device.synchronize()?;
-        let mut total_freed = 0;
-        for backing in &self.backings {
-            total_freed += backing.compact_forced()?;
-        }
-        Ok(total_freed)
-    }
-
-    /// Bounded forced defragment across backings: relocate at most `max_moves`
-    /// chunks total (the budget is threaded across layers so a large fragmented
-    /// gap consolidates over several bounded passes instead of one long blocking
-    /// compaction). Does NOT release the emptied arenas — pair with
-    /// [`release_empty_arenas`](Self::release_empty_arenas). Returns chunks moved.
-    pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
-        // See `compact` — relocation reindexes arenas a capture's frozen gids
-        // address, so the exclusion covers the whole bounded pass.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        let n = self.backings.len();
-        if n == 0 {
-            return Ok(0);
-        }
-        // See `compact` — quiesce before relocating (a move frees the source).
-        self.device.synchronize()?;
-        let mut remaining = max_moves;
-        let mut moved = 0;
-        for (i, backing) in self.backings.iter().enumerate() {
-            if remaining == 0 {
-                break;
-            }
-            // Fair share of the remaining budget for the backings still to
-            // visit, so an early fragmented layer can't consume the whole
-            // budget and starve the rest (which would leave later layers'
-            // reserved gaps un-compacted). Layers that use less than their
-            // share leave the remainder for later ones (the divisor shrinks),
-            // so the full budget is still spent when work exists.
-            let share = remaining.div_ceil(n - i);
-            let m = backing.defragment_bounded(share)?;
-            remaining = remaining.saturating_sub(m);
-            moved += m;
-        }
-        Ok(moved)
-    }
-
-    /// Release fully-empty KV arenas across all backings **without** the
-    /// chunk-moving defrag — cheap VRAM relief for the scheduler's pressure
-    /// path (the costly speculative defrag is left to the allocation-time OOM
-    /// retry). Returns arenas freed.
+    /// Under the reservation nothing unmaps: the region stays mapped at the
+    /// same address forever and only changes which list names it. The wait that
+    /// genuinely is needed moved to where re-tenanting happens, in
+    /// `region_pool::claim_region`, where it is paid once per claim instead of
+    /// once per wave.
     pub fn release_empty_arenas(&self) -> Result<usize> {
-        // See `compact`. The migrate's dense per-head table addresses EVERY
-        // arena — including fully-empty ones — so even this "only frees what
-        // nothing uses" sweep is a pointer invalidator: the capture's own source
-        // arenas are Arc-pinned (never `live==0`), but empty neighbour arenas in
-        // the table are exactly what this sweep unmaps. Held for the whole sweep
-        // so a capture starting mid-sweep waits instead of racing it.
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return Ok(0);
-        };
-        // See `compact` — quiesce before unmapping. An arena that emptied this
-        // wave may still be addressed by that wave's in-flight trailing kernels.
-        self.device.synchronize()?;
         let mut total_freed = 0;
         for backing in &self.backings {
             total_freed += backing.release_empty_arenas()?;
         }
         Ok(total_freed)
+    }
+
+    /// Create the arenas that mid-wave refusals recorded, and answer with how
+    /// many were made.
+    ///
+    /// **Call this from the wave loop, between forwards.** The sealing thread is
+    /// what gets refused, but it is the wrong party to satisfy the demand: it has
+    /// to *find* a gap, and on this engine the gap between one wave and the next
+    /// is narrower than a sealing pass, so it never won one — the `1088 B` class
+    /// stayed frozen at 49 arenas with 75 regions free while the hot→warm drain
+    /// sat at 634 MiB and never moved.
+    ///
+    /// The wave loop does not have to find the gap; it *is* the gap. Running here
+    /// makes the demand converge in one wave instead of never.
+    #[cfg(feature = "cuda")]
+    pub fn create_deferred_arenas(&self) -> Result<usize> {
+        let mut made = 0;
+        for backing in &self.backings {
+            made += backing.create_deferred_arenas()?;
+        }
+        Ok(made)
     }
 
     /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
@@ -1510,13 +1462,9 @@ impl BatchedInferenceSession {
         None
     }
 
-    /// Pool-aware KV-VRAM budget headroom in bytes (`init_free - pool_used -
-    /// reserve`), or `None` on non-CUDA / query failure. Unlike
-    /// [`Self::vram_free_total`] (the volatile driver `cuMemGetInfo` free, which
-    /// our stream-ordered pool's reserved-but-free memory hides from and which
-    /// WDDM pollutes with other processes' resident memory), this counts only
-    /// *our* live footprint — so KV freed back into the pool registers as
-    /// headroom. This is the number the per-arena budget gate already uses.
+    /// Bytes of KV the reservation can still hold — free regions × the region
+    /// size, an exact count. `None` on non-CUDA, or before this device has a
+    /// reservation. See [`candle_nn::kv_cache::vram_budget_available`].
     pub fn vram_budget_available(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         return candle_nn::kv_cache::vram_budget_available(&self.device);
@@ -1535,19 +1483,23 @@ impl BatchedInferenceSession {
         None
     }
 
-    /// True when a forced compaction could free at least one whole arena from
-    /// any KV backing. When false, the cache is packed to within a single arena
-    /// of free space and compaction would reclaim nothing — the scheduler uses
-    /// this to skip a futile compaction pass under VRAM pressure.
-    pub fn can_reclaim_arena(&self) -> bool {
-        self.backings.iter().any(|b| b.can_reclaim_arena())
-    }
-
     /// Our CUDA memory pool's `(used, reserved)` bytes — what our allocations
     /// actually occupy (model weights + KV + activations) vs the high-water
     /// bytes the pool has reserved from the OS. `reserved - used` is held but
     /// reusable; `reserved` is why the driver's `free` reads near zero. The
     /// real diagnostic for "what's using VRAM". `None` on non-CUDA / failure.
+    /// The formats live (unsealed) KV chunks occupy — see
+    /// [`candle_nn::kv_cache::active_kv_formats`]. Admission prices candidates
+    /// in THESE, not the configured sealed formats.
+    pub fn active_kv_formats(
+        &self,
+    ) -> (candle_nn::kv_cache::KvFormat, candle_nn::kv_cache::KvFormat) {
+        candle_nn::kv_cache::active_kv_formats(
+            self.config.k_format,
+            matches!(self.device, Device::Cuda(_)),
+        )
+    }
+
     pub fn vram_pool_stats(&self) -> Option<(usize, usize)> {
         #[cfg(feature = "cuda")]
         {
@@ -1560,46 +1512,11 @@ impl BatchedInferenceSession {
         None
     }
 
-    /// GPU KV arena occupancy split float vs quant. Reads the shared GID pool
+    /// GPU KV arena occupancy per size class. Reads the shared GID pool
     /// via layer 0's backing (arenas pool globally across same-config layers, so
     /// one backing is the whole model). `None` when there are no backings.
-    pub fn kv_gpu_format_stats(&self) -> Option<GpuArenaFormatStats> {
-        self.backings.first().map(|b| b.gpu_arena_format_stats())
-    }
-
-    /// Release reserved-but-free CUDA pool memory back to the OS, keeping at
-    /// least `keep_bytes` reserved. Returns the `(reserved_before,
-    /// reserved_after)` bytes on success so callers can log what was reclaimed,
-    /// or `None` on non-CUDA / when the pool allocator is unavailable.
-    ///
-    /// The async pool only returns freed blocks to the OS when the stream idles,
-    /// which never happens under continuous inference — so `pool_reserved`
-    /// climbs to its fragmentation high-water and oversubscribes the card while
-    /// `pool_used` (the budget's denominator) reads far lower. Trimming keeps
-    /// `pool_reserved` tracking `pool_used` so the VRAM budget stays physically
-    /// accurate. Only releases memory nothing is using; never touches live KV.
-    pub fn trim_kv_pool(&self, keep_bytes: usize) -> Option<(usize, usize)> {
-        // `cuMemPoolTrimTo` SYNCHRONOUSLY unmaps freed pool memory (not
-        // stream-ordered) — the sharpest form of the free-under-read crash — so
-        // the exclusion is held across the trim itself (see `compact`).
-        let Some(_topology) = candle_nn::kv_cache::try_enter_relief() else {
-            return None;
-        };
-        // See `compact` — quiesce before the (synchronous, non-stream-ordered)
-        // pool unmap.
-        self.device.synchronize().ok()?;
-        #[cfg(feature = "cuda")]
-        {
-            if let Device::Cuda(d) = &self.device {
-                let before = d.pool_reserved_bytes().ok()?;
-                d.trim_pool(keep_bytes).ok()?;
-                let after = d.pool_reserved_bytes().unwrap_or(before);
-                return Some((before, after));
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        let _ = keep_bytes;
-        None
+    pub fn kv_gpu_class_stats(&self) -> Option<GpuArenaClassStats> {
+        self.backings.first().map(|b| b.gpu_arena_class_stats())
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.
@@ -1867,6 +1784,22 @@ impl BatchedInferenceSession {
         self.config.k_format.dtype().unwrap_or(DType::BF16)
     }
 
+    /// The dtype activations arrive in for this session — what a model's norm
+    /// weights must be materialised in before it runs a forward.
+    ///
+    /// Deliberately **not** [`Self::dtype`], and the difference is not cosmetic.
+    /// `dtype` describes *sealed storage* and falls back to BF16 for a quantized
+    /// format, which is right for the accounting it feeds. The forward instead
+    /// derives its activation dtype from the sequence's live caches, and
+    /// [`candle_nn::kv_cache::KvCache::dtype`] reports **F16** for a quantized
+    /// backing — that is the dtype the norms will actually see. Reading `dtype`
+    /// here yields BF16 weights for an F16 forward, which the norm refuses.
+    pub fn activation_dtype(&self) -> DType {
+        crate::models::batched_model::activation_dtype(
+            self.config.k_format.dtype().unwrap_or(DType::F16),
+        )
+    }
+
     /// Get the number of layers.
     pub fn num_layers(&self) -> usize {
         self.num_layers
@@ -2102,14 +2035,7 @@ impl BatchedInferenceSession {
             }
         };
 
-        let arena_infos = match backing.resolve_arena_info() {
-            Ok(a) => a,
-            Err(e) => {
-                println!("[pal4] seq={seq_idx}: resolve_arena_info failed: {e}");
-                return;
-            }
-        };
-        let chunks = match backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
+        let chunks = match backing.live_chunks_as_sealed(seq_idx) {
             Some(c) => c,
             None => {
                 println!("[pal4] seq={seq_idx}: not allocated");
@@ -2124,30 +2050,18 @@ impl BatchedInferenceSession {
         let n_kv_head = backing.n_kv_head();
         let head_dim = backing.head_dim();
 
-        // Snapshot arena format info once. Kept strongly typed — string
-        // conversion happens only at the point where a label is needed
-        // (tally display or grid short-label).
-        let fmt_map: Vec<Option<KvFormat>> = backing
-            .with_arenas(|arenas| {
-                let max_idx = arenas.keys().max().copied().unwrap_or(0);
-                let mut v = vec![None; max_idx + 1];
-                for (&idx, arena) in arenas.iter() {
-                    v[idx] = Some(arena.format());
-                }
-                v
-            })
-            .unwrap_or_default();
-
-        let gid_fmt = |gid: &candle_nn::kv_cache::ChunkGid| -> Option<KvFormat> {
-            if gid.is_empty() {
-                None
-            } else {
-                fmt_map.get(gid.arena_idx()).copied().flatten()
-            }
+        // Band formats come from the chunk's own tags. A grid built from arena
+        // state would report every band of a shared size-class region
+        // identically, which is exactly the mixed-format variety this grid
+        // exists to display. Kept strongly typed — string conversion happens
+        // only where a label is needed (tally display or grid short-label).
+        let band_fmt = |tags: &[u8], h: usize, p: usize| -> Option<KvFormat> {
+            tags.get(h * N_PALETTE + p)
+                .copied()
+                .and_then(KvFormat::from_tag)
         };
-        let gid_is_quant = |gid: &candle_nn::kv_cache::ChunkGid| -> bool {
-            !gid.is_empty()
-                && matches!(gid_fmt(gid), Some(KvFormat::Quantized(qf)) if qf != QuantFormat::R16)
+        let is_real_quant = |fmt: Option<KvFormat>| -> bool {
+            matches!(fmt, Some(KvFormat::Quantized(qf)) if qf != QuantFormat::R16)
         };
 
         // Full label for tally/headline output (e.g. "Q8_0", "F16", "NULL").
@@ -2249,11 +2163,9 @@ impl BatchedInferenceSession {
                 let mut hk_row = Vec::with_capacity(N_PALETTE);
                 let mut hv_row = Vec::with_capacity(N_PALETTE);
                 for p in 0..N_PALETTE {
-                    let k_gid = chunk.gids.k_gid_pal(h, p);
-                    let v_gid = chunk.gids.v_gid_pal(h, p);
-                    let kf = gid_fmt(k_gid);
-                    let vf = gid_fmt(v_gid);
-                    has_quant |= gid_is_quant(k_gid) || gid_is_quant(v_gid);
+                    let kf = band_fmt(&chunk.k_fmt, h, p);
+                    let vf = band_fmt(&chunk.v_fmt, h, p);
+                    has_quant |= is_real_quant(kf) || is_real_quant(vf);
                     hk_row.push(fmt_grid_label(kf));
                     hv_row.push(fmt_grid_label(vf));
                     *k_counts.entry(kf).or_insert(0) += 1;
@@ -2633,6 +2545,29 @@ impl BatchedInferenceSession {
         Ok(out)
     }
 
+    /// [`Self::snapshot_sequence_per_layer`] restricted to the block-index range
+    /// `[start_block, end_block)` on every layer. Cost scales with the range —
+    /// the glue-island capture snapshots a couple of chunks out of a
+    /// multi-hundred-block slot. The caller guarantees the layers' block tables
+    /// are aligned over the range (the projection walk builds them uniformly;
+    /// same contract as `slice_per_layer_sealed` over a full snapshot).
+    pub fn snapshot_sequence_blocks(
+        &self,
+        idx: usize,
+        start_block: usize,
+        end_block: usize,
+    ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
+        let mut out = Vec::with_capacity(self.backings.len());
+        for backing in &self.backings {
+            out.push(
+                backing
+                    .record_turn_blocks(idx, start_block, end_block)
+                    .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_blocks: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
     /// Migrate a per-layer sealed snapshot from the GPU (hot) tier to the CPU (warm) tier.
     ///
     /// `sealed` must have one entry per layer (same length as `self.backings()`).
@@ -2968,10 +2903,178 @@ pub struct WaveStep {
     pub logits: Option<Vec<Tensor>>,
 }
 
+/// A [`WaveStep`] together with what keeps it valid.
+///
+/// The head's outputs are carved from the forward-scoped span, which is
+/// reclaimed when its generation drops. Returning the step alone would hand the
+/// caller tensors whose memory is reusable the moment the callee returns — sound
+/// only by the convention that everyone samples before the next forward, which
+/// nothing checks.
+///
+/// So the guard travels **with** the result. The span cannot be reclaimed while
+/// this value is alive, and [`Deref`](std::ops::Deref) is what makes that
+/// checkable rather than merely true: reading through it borrows `self`, so a
+/// reference to the logits keeps the guard alive, while *moving* the logits out
+/// is rejected — you cannot move out of a `Deref`. Every site that only reads
+/// compiles unchanged; every site that would have taken the tensors away from
+/// their guard is a compile error, which is exactly the set worth looking at.
+pub struct WaveResult {
+    step: WaveStep,
+    /// Held, never read. `None` off-CUDA and for waves that never opened a
+    /// forward span.
+    #[cfg(feature = "cuda")]
+    _forward: Option<candle_nn::kv_cache::WaveGeneration>,
+}
+
+impl WaveResult {
+    /// Wrap a step whose outputs do not sit on a forward span.
+    pub fn owned(step: WaveStep) -> Self {
+        Self {
+            step,
+            #[cfg(feature = "cuda")]
+            _forward: None,
+        }
+    }
+
+    /// Wrap a step whose outputs were carved from `forward`'s span.
+    #[cfg(feature = "cuda")]
+    pub fn on_span(step: WaveStep, forward: Option<candle_nn::kv_cache::WaveGeneration>) -> Self {
+        Self {
+            step,
+            _forward: forward,
+        }
+    }
+
+    /// The logits, copied off the span so they outlive this result.
+    ///
+    /// The sanctioned escape, and it really copies. Prefer reading through
+    /// [`Deref`](std::ops::Deref) — `result.logits` — which costs nothing and
+    /// keeps the guard doing its job. This exists for callers that genuinely
+    /// need the values after the span is reclaimed: a caller that returns them
+    /// upward, or one that accumulates across several forwards.
+    ///
+    /// Empty when the wave paused before the head: a glue-only wave carries no
+    /// logits and that is not a failure. A *failed copy* is a different thing and
+    /// propagates — the two used to collapse into the same empty `Vec`, which the
+    /// scheduler reads as "this wave produced nothing" and turns into a silently
+    /// token-less turn.
+    pub fn logits_owned(&self) -> Result<Vec<Tensor>> {
+        match self.step.logits.as_ref() {
+            None => Ok(Vec::new()),
+            Some(ls) => ls.iter().map(|t| t.to_owned_tensor()).collect(),
+        }
+    }
+
+    /// Take the residual stream, which is pool-backed and outlives the span.
+    ///
+    /// Deliberately available by value where the logits are not: a paused wave's
+    /// residual is persisted and resumed on a *later* forward, so it cannot live
+    /// on a span that resets at the end of this one — and does not.
+    pub fn into_residual(mut self) -> Option<Tensor> {
+        self.step.residual.take()
+    }
+}
+
+impl std::ops::Deref for WaveResult {
+    type Target = WaveStep;
+
+    fn deref(&self) -> &WaveStep {
+        &self.step
+    }
+}
+
 /// **You don't need to implement this trait manually.** Any type that implements
 /// [`BatchedModel`] automatically gets a `ManagedBatchedModel` implementation
 /// via the blanket impl.
 pub trait ManagedBatchedModel {
+    /// The geometry [`candle_nn::kv_cache::WavePlan`] prices a wave from.
+    ///
+    /// Exposed here as well as on [`BatchedModelCore`] because the scheduler
+    /// holds the model behind this trait object, and admission has to price a
+    /// wave's transient buffers before it decides what to admit into it.
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry;
+
+    /// Widest prefill this model will run in one forward, in tokens.
+    ///
+    /// The smallest of three unrelated ceilings
+    /// (`docs/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
+    /// KV-fits)`):
+    ///
+    /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider
+    ///   forward costs the same per token, so slicing is free.
+    /// * [`candle_nn::kv_cache::WavePlan::max_rows_within`] — how many rows the
+    ///   FFN span actually holds, computed from this model's geometry. On a MoE
+    ///   model the expert chain sees `rows × experts_per_tok`, so the same token
+    ///   count needs several times the span a dense model would.
+    /// * **What the KV side can still hold.** The admit phase claims every chunk
+    ///   the wave will write before it computes anything, so a wave admitted
+    ///   wider than the free regions can back is one that fails partway through
+    ///   claiming — with some layers extended and some not. Capping here turns
+    ///   that into a narrower wave, which is the outcome the whole partition is
+    ///   for: under pressure the engine slows down instead of failing.
+    ///
+    /// Taking the min is what stops a wave being sized by a constant that has
+    /// never seen the model. Each term falls back to permissive when it cannot
+    /// answer — no reservation yet, or a plan that cannot price a single row —
+    /// because a zero-width wave makes no progress, and refusing here would abort
+    /// a forward that can still run.
+    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        let mut cap = MAX_PREFILL_TOKENS;
+        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
+        if fits > 0 {
+            cap = cap.min(fits);
+        }
+        if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
+            cap = cap.min(kv_fits);
+        }
+        cap
+    }
+
+    /// Rows the KV side has room to admit, or `None` when it cannot say.
+    ///
+    /// Every token writes one K and one V element per KV head per layer, so the
+    /// per-row cost is fixed by geometry and the only variable is how many free
+    /// regions remain. Deliberately measured against `free + blocked` rather
+    /// than against the elastic floor: the boundary moves at the expert
+    /// pipeline's end of pass, so ground the *weight side* is holding is not
+    /// available to this wave however willing it might be to give it up later —
+    /// but ground the previous forward's transient tier has blocked is. This
+    /// cap is read at the top of `forward_wave`, when that tier is still
+    /// standing; the forward it sizes releases the tier in its own phase 0,
+    /// before any claim priced here runs. Counting only `free` made every wide
+    /// prefill's own tier throttle the next one: the tier's ground read as
+    /// gone, the cap collapsed to a few hundred tokens, and a ten-context
+    /// prefill fragmented into a dozen narrow waves that each re-loaded the
+    /// expert working set — bulk prefill fell from ~2.1K t/s to ~700.
+    ///
+    /// One region of margin, because a sequence's chunks do not pack a region
+    /// exactly and the last one is partly wasted.
+    fn kv_width_cap(&self, act_dtype: DType) -> Option<usize> {
+        let stats = candle_nn::kv_cache::region_stats(0)?;
+        let free = (stats.free + stats.blocked).saturating_sub(1);
+        let per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
+        let per_row_all_layers = per_row.checked_mul(self.num_layers())?;
+        if per_row_all_layers == 0 {
+            return None;
+        }
+        let rows = free.saturating_mul(candle_nn::kv_cache::REGION_BYTES) / per_row_all_layers;
+        // **Never zero.** A width cap of nought is not a narrow wave, it is no
+        // wave — and once the KV side is full it would be permanent: no forward
+        // runs, so nothing completes, so nothing is freed, so the cap stays at
+        // nought. The partition's answer to genuine exhaustion is a refused
+        // claim and the relief pass behind it, both of which need a forward to
+        // have been attempted.
+        Some(rows.max(1))
+    }
+
+    /// Re-materialise every norm weight in the activation dtype — see
+    /// [`crate::models::batched_model::BatchedModelCore::maybe_change_dtype`].
+    ///
+    /// On this trait too because the scheduler holds the model behind it, and
+    /// the activation dtype is chosen where the KV cache is configured rather
+    /// than at load.
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()>;
+
     /// Number of transformer layers.
     fn num_layers(&self) -> usize;
     /// Number of KV heads per layer.
@@ -3045,7 +3148,7 @@ pub trait ManagedBatchedModel {
         layer_start: usize,
         layer_end: usize,
         residual_in: Option<Tensor>,
-    ) -> Result<WaveStep>;
+    ) -> Result<WaveResult>;
 
     // ── Speculative decoding (model-agnostic hook) ──────────────────────────────
     //
@@ -3281,13 +3384,21 @@ pub trait ManagedBatchedModel {
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
-        BatchedInferenceSession::new(
+        let session = BatchedInferenceSession::new(
             props.num_layers,
             props.n_kv_heads,
             props.head_dim,
             self.device(),
             config,
-        )
+        )?;
+        // Materialise the norm weights for this session's activation dtype, here
+        // rather than at each call site. A session is where the dtype is decided,
+        // it is created outside any wave, and the forward *refuses* a mismatch —
+        // so leaving the call to callers would mean every one of them has to
+        // remember, and the one that forgets fails at its first forward instead
+        // of at the line that was wrong.
+        self.maybe_change_dtype(session.activation_dtype())?;
+        Ok(session)
     }
 
     /// Create a sibling session that shares the KV arena pool with `source`.
@@ -3313,11 +3424,12 @@ pub trait ManagedBatchedModel {
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let backings = source.backings().iter().cloned().collect();
-        Ok(BatchedInferenceSession::new_with_backings(
-            backings,
-            config,
-            source.device(),
-        ))
+        let session = BatchedInferenceSession::new_with_backings(backings, config, source.device());
+        // The other way a session comes into being, and it decides an activation
+        // dtype just as `create_batched_session` does — so it materialises the
+        // norm weights the same way.
+        self.maybe_change_dtype(session.activation_dtype())?;
+        Ok(session)
     }
 
     /// Prunes excess memory usage.
@@ -3326,6 +3438,14 @@ pub trait ManagedBatchedModel {
     /// Snapshot expert pipeline telemetry counters (if the model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
         None
+    }
+
+    /// Buy `regions` of weight-side ground for the KV side, answering with the
+    /// bytes conceded. See `BatchedModel::request_kv_ground` — this is the path a
+    /// stalled scheduler uses to break a wave that cannot allocate.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        let _ = regions;
+        0
     }
 
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
@@ -3343,18 +3463,33 @@ pub trait ManagedBatchedModel {
     }
 }
 
-/// Maximum total tokens (batch_size × seq_len) for a single prefill forward pass.
-/// Larger prefills are automatically sliced into smaller batches to keep GPU memory
-/// bounded. GPU compute saturates around this point for typical models, so slicing
-/// costs virtually nothing in throughput. The value is a multiple of 32 for optimal
-/// CUDA kernel utilization.
-const MAX_PREFILL_TOKENS: usize = 4096;
+/// Compute-side ceiling on the tokens one prefill forward carries.
+///
+/// This is a *throughput* limit, not a memory one: beyond roughly this width the
+/// prefill kernels are compute-bound, so a wider forward costs the same per token
+/// and slicing above it is free. A multiple of 32, for kernel utilisation.
+///
+/// **It reserves nothing.** The transient tier is
+/// `WAVE_ATTN_BYTES + WAVE_FFN_BYTES + MIGRATION_STAGING_CAP_BYTES`, carved once
+/// at first use whatever this value is. Raising it does not cost VRAM; it permits
+/// a wider wave, and whether that wave *fits* is the separate question
+/// [`ManagedBatchedModel::prefill_width_cap`] asks the wave plan. The narrower of
+/// the two wins, so this can lead the span rather than having to trail it.
+const MAX_PREFILL_TOKENS: usize = 8192;
 
 /// Blanket implementation of `ManagedBatchedModel` for `BatchedInference<M>`.
 ///
 /// This allows models using the new `BatchedModelCore` + `BatchedInference` pattern
 /// to work with `BatchedInferenceSession` without implementing `BatchedModel`.
 impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
+        self.model().wave_geometry(act_dtype)
+    }
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        self.model().maybe_change_dtype(dtype)
+    }
+
     fn num_layers(&self) -> usize {
         self.model().num_layers()
     }
@@ -3420,7 +3555,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         layer_start: usize,
         layer_end: usize,
         residual_in: Option<Tensor>,
-    ) -> Result<WaveStep> {
+    ) -> Result<WaveResult> {
         if decode_inputs.len() != decode_seqs.len()
             || prefill_inputs.len() != prefill_seqs.len()
             || glue_inputs.len() != glue_seqs.len()
@@ -3447,12 +3582,22 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 .collect();
             let total: usize = lens.iter().sum();
             let max_len = lens.iter().copied().max().unwrap_or(1);
-            // Only slice ACROSS sequences: a single sequence over the budget can't
-            // be split (you can't slice within a sequence) and must run whole — as
-            // the old `forward_batched` did. Requiring `> 1` sequence also makes the
-            // recursion terminate: a one-sequence slice re-enters here, fails this
-            // guard, and runs whole instead of re-slicing itself forever.
-            if total > MAX_PREFILL_TOKENS && max_len > 1 && prefill_seqs.len() > 1 {
+            // Two ceilings, for unrelated reasons, so the narrower one wins.
+            //
+            // `MAX_PREFILL_TOKENS` is where the kernels stop caring: compute
+            // saturates around it, so a wider forward buys no throughput. The
+            // plan's bound is what the FFN span can physically hold, which is a
+            // correctness limit — exceed it and the expert chain spills to the
+            // pool, silently, one allocation at a time.
+            //
+            // They were previously decided apart, and the arena was the one that
+            // lost: it ran at ~100% of its span while the slicer sized waves
+            // against a constant that knows nothing about model geometry. A
+            // dense model and a MoE model at the same token count need wildly
+            // different spans — `expert_rows` multiplies by `experts_per_tok` —
+            // so only the plan can answer this.
+            let width_cap = self.prefill_width_cap(session.activation_dtype());
+            if total > width_cap && max_len > 1 && prefill_seqs.len() > 1 {
                 let mut all_logits: Vec<Tensor> = Vec::with_capacity(prefill_seqs.len());
                 let mut start = 0usize;
                 while start < prefill_seqs.len() {
@@ -3460,7 +3605,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                     let mut end = start;
                     while end < prefill_seqs.len() {
                         let l = lens[end];
-                        if end > start && toks + l > MAX_PREFILL_TOKENS {
+                        if end > start && toks + l > width_cap {
                             break;
                         }
                         toks += l;
@@ -3478,15 +3623,29 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                         num_layers,
                         None,
                     )?;
-                    all_logits.extend(step.logits.ok_or_else(|| {
+                    let lg = step.logits.as_ref().ok_or_else(|| {
                         candle::Error::Msg("forward_wave slice: no logits".into())
-                    })?);
+                    })?;
+                    // Copied off the span, not moved off it. Each slice is a
+                    // whole forward and reclaims its own forward span when
+                    // `step` drops at the end of this iteration — so a borrowed
+                    // logits row would be reading recycled bytes by the time the
+                    // next slice ran. (It could not even get that far: the span
+                    // refuses a second live generation, so slice two would fail
+                    // to open one while slice one still held it.)
+                    //
+                    // This is the sanctioned escape and it really copies. It is
+                    // confined to the slicing path, which is already paying for N
+                    // forwards, and it is why the value returned below is owned.
+                    for t in lg {
+                        all_logits.push(t.to_owned_tensor()?);
+                    }
                     start = end;
                 }
-                return Ok(WaveStep {
+                return Ok(WaveResult::owned(WaveStep {
                     residual: None,
                     logits: Some(all_logits),
-                });
+                }));
             }
         }
 
@@ -3609,8 +3768,25 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(&pre_off, &pre_lens, dev)?);
 
         let mut glue_meta = BatchedPrefillMeta::new_ragged(&glue_off, &glue_lens, dev)?;
+        // Staged glue is consumed only by a wave that carries glue rows. The
+        // descriptors are staged immediately before the gap-fill forward they
+        // describe — but that forward can die before reaching this point (its
+        // decode metadata refuses first), and the staging then sits on the
+        // session for whatever wave comes next. A glue-less wave that takes it
+        // fails `build_glue_meta` with "N glue descriptors vs 0 input_lens",
+        // which is how a dead wave's leftovers killed the titler twice. Stale
+        // staging is dropped, loudly: the reproject that staged it re-stages
+        // when its own retry runs.
         #[cfg(feature = "cuda")]
-        if let Some(pending) = session.take_pending_glue() {
+        if glue_lens.is_empty() {
+            if let Some(stale) = session.take_pending_glue() {
+                tracing::warn!(
+                    n = stale.len(),
+                    "dropping glue descriptors staged by a wave that never ran its \
+                     gap-fill forward — this wave carries no glue rows"
+                );
+            }
+        } else if let Some(pending) = session.take_pending_glue() {
             glue_meta.glue = build_glue_meta(pending, &glue_lens, dev)?;
         }
         let glue_headers = DecodeHeaders::Prefill(glue_meta);
@@ -3650,6 +3826,28 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             .collect();
 
         let mut caches_data = session.caches_for_sequences_mut(&all_seqs);
+        // `caches_for_sequences_mut` SILENTLY skips slots that are `None`, so a
+        // sequence released between wave-group formation and this forward yields a
+        // short `contexts`. That used to surface ~100 lines later as
+        // `group bounds exceed batch` — a `checked_sub` underflow of
+        // `contexts.len() - (n_decode + n_prefill)` — which names neither the real
+        // fault nor the sequence responsible. Fail here instead, where the missing
+        // slots are still known. (A duplicate index in `all_seqs` collapses the
+        // same way, since the lookup is set-based; this catches that too.)
+        if caches_data.len() != all_seqs.len() {
+            let live: std::collections::HashSet<usize> =
+                caches_data.iter().map(|(i, _, _)| *i).collect();
+            let missing: Vec<usize> = all_seqs
+                .iter()
+                .copied()
+                .filter(|s| !live.contains(s))
+                .collect();
+            candle::bail!(
+                "forward_wave: {} sequences requested but only {} have live slots                  (missing/duplicated: {missing:?}) — the wave group named a sequence                  the scheduler has since released",
+                all_seqs.len(),
+                caches_data.len(),
+            );
+        }
         let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(all_seqs.len());
         for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
             contexts.push(SequenceContext {
@@ -3723,7 +3921,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
             (None, _) => None,
         };
-        let phase = self.forward_wave_contexts(
+        let wave = self.forward_wave_contexts(
             &mut contexts,
             n_decode,
             n_prefill,
@@ -3734,7 +3932,33 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             layer_start,
             layer_end,
             x_in,
-        )?;
+        );
+        // **A failed wave leaves no trace.** The layer sweep advances each
+        // layer's usage as that layer completes, so an error anywhere in it —
+        // and the relief design treats failing a wave as routine — leaves the
+        // early layers one token ahead of the rest. The rollback restores every
+        // row to its entry length on every layer of the range, which is what
+        // makes the retry a retry rather than a decode against per-layer token
+        // windows. This is the single choke point every wave goes through; the
+        // sweep itself stays free to advance eagerly, because whatever it did
+        // is undone here on the way out.
+        let (phase, head_span) = match wave {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rb) = super::wave_admit::rollback_wave_kv(
+                    &mut contexts,
+                    layer_start,
+                    layer_end,
+                ) {
+                    candle::bail!(
+                        "wave failed ({e}) and the KV rollback that keeps that failure \
+                         recoverable also failed ({rb}) — the affected sequences may hold \
+                         per-layer token windows"
+                    )
+                }
+                return Err(e);
+            }
+        };
         // Output ordering. The single-token prefills were folded into the decode
         // group, so the internal row order is
         // `[orig-decode | single-prefills | multi-prefills | glue]`.
@@ -3748,7 +3972,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         //   A co-batched caller can then split the residual by contiguous group
         //   (decode | section | cohort | glue) to hold a creeping cohort whole while
         //   the full-sweep members continue.
-        Ok(match phase {
+        let step = match phase {
             WavePhase::Residual(x) => {
                 // Internal order → caller order. Tokens are dim 1.
                 let res = match token_perm.as_ref() {
@@ -3761,7 +3985,67 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 }
             }
             WavePhase::Logits(l) => {
+                // **The decode rows' usage advances here — once per step, every
+                // layer at once — and nowhere else.** The per-layer advance used
+                // to live inside the decode attention, which meant a step split
+                // across creep segments held layers on both sides of the segment
+                // boundary at different lengths; each later segment's metadata
+                // rebuild then read its own step's half-done bookkeeping as
+                // per-layer corruption, and the repair for *real* corruption
+                // truncated the freshly-written token off the swept layers —
+                // token duplication in the visible text was the symptom.
+                //
+                // The head having run is the definition of "the step completed":
+                // logits exist only when the final segment reached layer N, so
+                // this fires exactly once per delivered token — and never for a
+                // failed wave, which leaves nothing for the rollback to undo on
+                // these rows. In-step attention never needed the advance; it
+                // reads the new token through the position map's write slot,
+                // built against the pre-step usage.
+                //
+                // `n_decode` is the internal group — caller decode rows plus the
+                // folded single-token prefills, which advance by their one token
+                // the same way. Glue rows must not advance and are past
+                // `n_decode + n_prefill`; multi-token prefills advance per layer
+                // inside their own sweep because a creep cohort's layers are
+                // *legitimately* at different lengths across waves.
+                //
+                // **The logits copy comes FIRST.** `into_vec` is the last
+                // fallible step of the arm — an async CUDA fault surfaces on
+                // this sync — and it sits outside the wave-error rollback (the
+                // `match wave` above already resolved Ok). Advancing before it
+                // would leave every layer advanced for a token the caller never
+                // receives; the retry then writes into offset+1 with a stale KV
+                // row at offset. Copy first, advance after, and nothing is
+                // advanced for an undelivered token.
                 let lg = l.into_vec()?;
+                // The advance itself is per layer with no transaction, so a
+                // failure at layer k is unwound here — truncating the advanced
+                // layers back to their entry length, the same idempotent
+                // operation admit performs — before the error propagates. Left
+                // as-is, layers 0..k at offset+1 against the rest at offset is
+                // exactly the per-layer divergence this consolidation exists to
+                // prevent, and the wave rollback cannot reach it.
+                for i in 0..n_decode {
+                    let offset = contexts[i].offset;
+                    let mut advance = || -> Result<()> {
+                        for cache in contexts[i].kv_caches.caches.iter_mut() {
+                            cache.set_current_seq_len(offset + 1)?;
+                        }
+                        Ok(())
+                    };
+                    if let Err(e) = advance() {
+                        for c in contexts[..=i].iter_mut() {
+                            let off = c.offset;
+                            let _ = c
+                                .kv_caches
+                                .caches
+                                .iter_mut()
+                                .try_for_each(|cache| cache.truncate_to_offset(off));
+                        }
+                        return Err(e);
+                    }
+                }
                 let out = if single.is_empty() {
                     lg
                 } else {
@@ -3785,7 +4069,19 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                     logits: Some(out),
                 }
             }
-        })
+        };
+        // The head's outputs sit on the forward span, so the guard goes back with
+        // them: `WaveResult` is what stops the span being reclaimed while the
+        // caller still holds the logits.
+        #[cfg(feature = "cuda")]
+        {
+            Ok(WaveResult::on_span(step, head_span))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = head_span;
+            Ok(WaveResult::owned(step))
+        }
     }
 
     fn prune(&self) -> Result<()> {
@@ -3794,6 +4090,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.model().request_kv_ground(regions)
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {

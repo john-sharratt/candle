@@ -1,37 +1,47 @@
 //! Arena storage types and management for ChunkedKvBacking.
 //!
 //! This module contains:
-//! - `ArenaKey` - Key identifying an arena by format and location
+//! - `ArenaKey` - Key identifying an arena by size class and location
 //! - `StoragePolicy` - How sealed chunks should be stored
 //! - `ChunkStatus` - Status of a chunk (Unallocated/Sealed/Active)
-//! - `Arena` - A single arena holding K and V cache tensors
-//! - `ArenaStorage` - Collection of arenas with heterogeneous formats
+//! - `Arena` - A run of fixed-stride byte slots on one device
+//! - `ArenaStorage` - Collection of arenas across classes and locations
 
-use crate::kv_cache::{
-    arena_table::{ArenaEntry, ArenaFormatTag, ArenaLocation},
-    KvFormat, QuantFormat,
-};
+use crate::kv_cache::{arena_table::ArenaLocation, KvFormat, QuantFormat};
 use ahash::AHashMap;
-use candle::quantized::QTensor;
+use candle::cuda_backend::wave_provenance::LeaseOrigin;
+#[cfg(feature = "cuda")]
+use candle::quantized::LiveQTensor;
+use candle::LiveTensor;
 use candle::{DType, Result, Tensor};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
-use crate::kv_cache::chunked::types::arena_chunks_for_format;
+#[cfg(feature = "cuda")]
+use crate::kv_cache::chunked::region_pool::RegionHandle;
+use crate::kv_cache::chunked::size_class::{class_for_format, SizeClass};
 
 // ==================== Arena Key ====================
 
-/// Key identifying an arena type by its format and location.
-/// Exactly two fields. K and V always share the same format within an arena.
-#[derive(Debug, Clone)]
+/// Key identifying an arena by its **size class** and location.
+///
+/// Not by format. An arena is a run of fixed-stride byte slots; a chunk of
+/// format F occupies one slot of the smallest class that fits its bytes, and
+/// the trailing pad is never read. Formats that share a class share a pool,
+/// which is what makes free slots fungible across formats — the property the
+/// whole initiative exists to obtain (`docs/archived/arena_unification.md` §3.4).
+///
+/// What a slot *holds* is recorded on the chunk (`SealedChunk::k_fmt`), never
+/// here.
+#[derive(Debug, Clone, Copy)]
 pub struct ArenaKey {
-    pub format: KvFormat,
+    pub class: SizeClass,
     pub location: ArenaLocation,
 }
 
 impl PartialEq for ArenaKey {
     fn eq(&self, other: &Self) -> bool {
-        self.format == other.format && self.location == other.location
+        self.class == other.class && self.location == other.location
     }
 }
 
@@ -39,86 +49,47 @@ impl Eq for ArenaKey {}
 
 impl Hash for ArenaKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.format.hash(state);
+        self.class.hash(state);
         self.location.hash(state);
     }
 }
 
 impl ArenaKey {
-    pub fn new(format: KvFormat, location: ArenaLocation) -> Self {
-        Self { format, location }
+    pub fn new(class: SizeClass, location: ArenaLocation) -> Self {
+        Self { class, location }
     }
 
-    /// Create a key where K and V share the same format.
-    pub fn uniform(format: KvFormat, location: ArenaLocation) -> Self {
-        Self { format, location }
-    }
-
-    pub fn gpu_float(dtype: DType) -> Self {
-        Self {
-            format: KvFormat::Float(dtype),
-            location: ArenaLocation::Gpu,
-        }
-    }
-
-    /// GPU quantized arena key (unified K+V, same format).
-    pub fn gpu_quant(fmt: QuantFormat) -> Self {
-        Self {
-            format: KvFormat::Quantized(fmt),
-            location: ArenaLocation::Gpu,
-        }
-    }
-
-    /// GPU quantized arena key with separate K and V formats.
-    /// ⚠️ VESTIGIAL: when k_fmt != v_fmt this SILENTLY DROPS v_fmt.
-    /// This constructor exists as dead code from a prior incorrect session.
-    /// DO NOT add logic here to encode both formats — delete this and use
-    /// two separate arenas instead. See docs/kv_cache_unification.md §7.5, §11.3.
-    pub fn gpu_quant_kv(k_fmt: QuantFormat, v_fmt: QuantFormat) -> Self {
-        if k_fmt == v_fmt {
-            Self::gpu_quant(k_fmt)
-        } else {
-            Self {
-                format: KvFormat::Quantized(k_fmt),
-                location: ArenaLocation::Gpu,
-            }
-        }
-    }
-
-    pub fn cpu_float(dtype: DType) -> Self {
-        Self {
-            format: KvFormat::Float(dtype),
-            location: ArenaLocation::Cpu,
-        }
+    /// The key a chunk of `format` allocates from, given the chunk geometry.
+    ///
+    /// Errors only if the format maps to no class, which
+    /// `every_kv_format_maps_to_a_class` proves cannot happen for any
+    /// `KvFormat` at the production geometry — so a failure here means the
+    /// ladder and the format space have drifted apart.
+    pub fn for_format(
+        format: KvFormat,
+        elems_per_chunk: usize,
+        location: ArenaLocation,
+    ) -> Result<Self> {
+        let class = class_for_format(format, elems_per_chunk).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "no size class covers {format:?} at {elems_per_chunk} elems/chunk"
+            ))
+        })?;
+        Ok(Self { class, location })
     }
 
     pub fn is_gpu(&self) -> bool {
         self.location == ArenaLocation::Gpu
     }
 
-    pub fn is_quantized(&self) -> bool {
-        self.format.is_quantized()
+    /// Byte stride between consecutive chunk slots in an arena with this key.
+    pub fn slot_stride(&self) -> usize {
+        self.class.bytes()
     }
 
-    /// Check if this format is readable by the paged attention kernel without conversion.
-    ///
-    /// The kernel supports:
-    /// - GPU float formats (F32, F16, BF16, F8E4M3) - native reads
-    /// - GPU quantized formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1) - dequant on read
-    ///
-    /// CPU formats always require migration to GPU first.
-    /// K-quant formats (Q2K-Q6K) are not supported for paged attention.
-    pub fn is_kernel_readable(&self) -> bool {
-        // CPU formats always need migration
-        if self.location != ArenaLocation::Gpu {
-            return false;
-        }
-
-        let ok = match &self.format {
-            KvFormat::Float(_) => true,
-            KvFormat::Quantized(qf) => qf.is_kernel_supported(),
-        };
-        ok
+    /// How many chunk slots an arena with this key holds.
+    pub fn chunks(&self) -> usize {
+        self.class.chunks_per_region()
     }
 }
 
@@ -139,15 +110,25 @@ pub enum StoragePolicy {
 }
 
 impl StoragePolicy {
-    /// Convert to ArenaKey for sealed chunks.
-    #[allow(clippy::wrong_self_convention)]
-    pub fn to_arena_key(&self) -> ArenaKey {
+    /// The format sealed chunks are stored in under this policy.
+    pub fn target_format(&self) -> KvFormat {
         match self {
-            Self::GpuFloat(dt) => ArenaKey::gpu_float(*dt),
-            Self::GpuQuant(fmt) => ArenaKey::gpu_quant(*fmt),
-            Self::CpuFloat(dt) => ArenaKey::cpu_float(*dt),
-            Self::CpuQuant(fmt) => ArenaKey::new(KvFormat::Quantized(*fmt), ArenaLocation::Cpu),
+            Self::GpuFloat(dt) | Self::CpuFloat(dt) => KvFormat::Float(*dt),
+            Self::GpuQuant(fmt) | Self::CpuQuant(fmt) => KvFormat::Quantized(*fmt),
         }
+    }
+
+    /// Where sealed chunks live under this policy.
+    pub fn location(&self) -> ArenaLocation {
+        match self {
+            Self::GpuFloat(_) | Self::GpuQuant(_) => ArenaLocation::Gpu,
+            Self::CpuFloat(_) | Self::CpuQuant(_) => ArenaLocation::Cpu,
+        }
+    }
+
+    /// Whether sealed chunks are block-quantized under this policy.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::GpuQuant(_) | Self::CpuQuant(_))
     }
 
     /// Get the dtype used for active (GPU float) chunks.
@@ -220,197 +201,303 @@ impl ChunkStatus {
 
 // ==================== Arena ====================
 
-/// A single arena holding K and V cache data as a flat combined buffer.
-/// Each arena tracks its own format, location, and index.
-/// K and V are stored contiguously in `data`; external strides/offsets
-/// handled by the attention kernel.
+/// A run of fixed-stride byte slots.
+///
+/// One arena is `chunks × class.bytes()` raw bytes on one device. Slot `i`
+/// starts at `base + i * class.bytes()`, and what lives there is whatever the
+/// owning chunk says it is — the arena does not know, and does not need to.
+/// That is the point: under size classes a slot's tenant can be any format
+/// whose payload fits, so free slots are fungible across formats
+/// (`docs/archived/arena_unification.md` §3.4, principle 8).
+///
+/// The trailing pad between a chunk's payload and the slot stride is never
+/// read as data: kernels derive their read extent from the *format's* block
+/// size, never from the stride (audit A6).
+/// The slab is **one-dimensional** — `chunks * class.bytes()` bytes, not a
+/// `(chunks, stride)` matrix. A band's payload is generally shorter than the
+/// slot it lives in, so every read and write is a byte *range* rather than a
+/// whole row; on a 1-D slab `narrow(0, off, len)` and `slice_set(src, 0, off)`
+/// express exactly that, contiguously, on either device. A 2-D slab would force
+/// every partial write to either pad up to the full stride (moving pad over
+/// PCIe, which invariant 8 forbids) or go through raw pointer writes.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum Arena {
-    /// Standard float arena with dtype
-    Float {
-        data: Tensor,
-        dtype: DType,
-        location: ArenaLocation,
-        /// Index of this arena in the storage vector
-        index: usize,
-    },
-    /// Block-quantized arena (K format; V may use different format for tighter packing)
-    Quantized {
-        data: QTensor,
-        format: QuantFormat,
-        location: ArenaLocation,
-        /// Index of this arena in the storage vector
-        index: usize,
-    },
+pub struct Arena {
+    /// The slab: `U8`, shape `(chunks * class.bytes(),)`.
+    data: Tensor,
+    class: SizeClass,
+    location: ArenaLocation,
+    /// Index of this arena in the storage map.
+    index: usize,
+    /// The reservation region this arena's bytes are carved from — `None` for a
+    /// CPU arena, whose slab is an ordinary host allocation.
+    ///
+    /// Owning the handle is what keeps the region out of the free list, so
+    /// every path that drops an arena returns its region: release, truncate, or
+    /// the whole backing going away. There is no "free the arena" step to
+    /// forget, and nothing here calls the CUDA allocator in either direction.
+    #[cfg(feature = "cuda")]
+    region: Option<RegionHandle>,
 }
 
 impl Arena {
-    /// Get the KvFormat for this arena's K cache (primary format).
-    pub fn format(&self) -> KvFormat {
-        match self {
-            Self::Float { dtype, .. } => KvFormat::Float(*dtype),
-            Self::Quantized { format, .. } => KvFormat::Quantized(*format),
+    /// Wrap a byte slab that owns its own storage — a CPU arena.
+    ///
+    /// A GPU arena is carved instead: [`Self::in_region`].
+    pub(super) fn new(
+        data: Tensor,
+        class: SizeClass,
+        location: ArenaLocation,
+        index: usize,
+    ) -> Self {
+        debug_assert_eq!(data.dtype(), DType::U8, "an arena slab is raw bytes");
+        debug_assert_eq!(data.rank(), 1, "an arena slab is flat");
+        Self {
+            data,
+            class,
+            location,
+            index,
+            #[cfg(feature = "cuda")]
+            region: None,
         }
     }
 
-    /// Check if this arena can have new chunks allocated into it.
-    /// Returns true for any live float arena (GPU or CPU).
-    pub(super) fn is_allocatable(&self) -> bool {
-        matches!(self, Self::Float { .. })
+    /// Attach the reservation region this arena's bytes are carved from.
+    ///
+    /// The slab tensor is a lease over the region, so the handle is the only
+    /// thing keeping those bytes claimed — and dropping the arena is what
+    /// returns them.
+    #[cfg(feature = "cuda")]
+    pub(super) fn in_region(mut self, region: RegionHandle) -> Self {
+        self.region = Some(region);
+        self
     }
 
-    /// Get the index of this arena in the storage vector.
+    /// This arena's size class.
+    pub fn class(&self) -> SizeClass {
+        self.class
+    }
+
+    /// Byte stride between consecutive chunk slots.
+    #[inline]
+    pub fn slot_stride(&self) -> usize {
+        self.class.bytes()
+    }
+
+    /// Number of chunk slots.
+    #[inline]
+    pub fn chunks(&self) -> usize {
+        self.class.chunks_per_region()
+    }
+
+    /// The raw byte slab.
+    pub(super) fn byte_data(&self) -> &Tensor {
+        &self.data
+    }
+
+    /// Index of this arena in the storage map.
     pub fn index(&self) -> usize {
-        match self {
-            Self::Float { index, .. } => *index,
-            Self::Quantized { index, .. } => *index,
-        }
+        self.index
     }
 
-    /// Get the location of this arena.
-    #[allow(dead_code)] // Used by kernels for heterogeneous arena handling
+    /// Where this arena's bytes live.
     pub(super) fn location(&self) -> ArenaLocation {
-        match self {
-            Self::Float { location, .. } => *location,
-            Self::Quantized { location, .. } => *location,
+        self.location
+    }
+
+    /// Every arena can accept new chunks: a slot is a slot.
+    ///
+    /// Under the old Float/Quantized duality only float arenas were
+    /// allocatable, because a quantized arena's slots were written by the
+    /// convert kernel rather than claimed by the allocator. Classes remove the
+    /// distinction.
+    pub(super) fn is_allocatable(&self) -> bool {
+        true
+    }
+
+    /// Device pointer to slot 0, or `None` for a CPU arena.
+    pub(super) fn base_ptr(&self) -> Option<u64> {
+        if self.location != ArenaLocation::Gpu {
+            return None;
+        }
+        Self::extract_tensor_ptr(&self.data)
+    }
+
+    /// Device pointer to slot `chunk_idx`.
+    pub(super) fn slot_ptr(&self, chunk_idx: usize) -> Option<u64> {
+        let base = self.base_ptr()?;
+        Some(base + (chunk_idx * self.slot_stride()) as u64)
+    }
+
+    /// A typed tensor **view** over `chunk_idx`'s slot, shaped `shape`.
+    ///
+    /// The view is a lease: it aliases the arena's bytes and its drop never
+    /// frees them (`Backing::Lease`, `docs/archived/arena_unification.md` §3.7). This is
+    /// how the contiguous read/write facade still sees a slot as a typed
+    /// tensor now that the arena itself is untyped.
+    ///
+    /// Errors if the requested view would run past the slot stride, so a wrong
+    /// shape is a named host error rather than a read into the next tenant.
+    #[cfg(feature = "cuda")]
+    pub(super) fn slot_view<'a, S: Into<candle::Shape>>(
+        &'a self,
+        chunk_idx: usize,
+        dtype: DType,
+        shape: S,
+    ) -> Result<LiveTensor<'a>> {
+        let shape = shape.into();
+        let want = shape.elem_count() * dtype.size_in_bytes();
+        let stride = self.slot_stride();
+        if want > stride {
+            candle::bail!(
+                "slot_view: {:?} of {dtype:?} needs {want} B but the slot stride is {stride}",
+                shape
+            );
+        }
+        if chunk_idx >= self.chunks() {
+            candle::bail!(
+                "slot_view: chunk {chunk_idx} out of range (arena holds {})",
+                self.chunks()
+            );
+        }
+        let ptr = self.slot_ptr(chunk_idx).ok_or_else(|| {
+            candle::Error::Msg("slot_view: arena is not GPU-resident".to_string())
+        })?;
+        // SAFETY: the bounds check above keeps the view inside slot
+        // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
+        // always a legal bit pattern. That the slab outlives the view is no
+        // longer an obligation here: `'a` ties it to this borrow of the arena,
+        // exactly as for `qslot_view`.
+        unsafe {
+            LiveTensor::from_leased_cuda_ptr(
+                ptr,
+                dtype,
+                shape,
+                self.data.device(),
+                LeaseOrigin::Foreign,
+            )
         }
     }
 
-    /// Get the float data tensor. Returns Err if not a float arena.
-    pub(super) fn float_data(&self) -> Result<&Tensor> {
-        match self {
-            Self::Float { data, .. } => Ok(data),
-            Self::Quantized { .. } => candle::bail!("expected float arena"),
+    /// Byte offset of slot `chunk_idx`, bounds-checked against `len`.
+    ///
+    /// `len` is the band's **payload**, not the stride: the pad between them is
+    /// not part of the chunk and must not be copied (invariant 8). The offset,
+    /// by contrast, always steps by the stride — deriving it from `len` would
+    /// address slot `n` at `n * payload` and walk into a neighbour.
+    fn slot_offset(&self, chunk_idx: usize, len: usize) -> Result<usize> {
+        let stride = self.slot_stride();
+        if len > stride {
+            candle::bail!("arena slot: {len} B requested from a {stride} B slot (class {stride})");
         }
+        if chunk_idx >= self.chunks() {
+            candle::bail!(
+                "arena slot: chunk {chunk_idx} out of range (arena holds {})",
+                self.chunks()
+            );
+        }
+        Ok(chunk_idx * stride)
     }
 
-    /// Get mutable float data tensor. Returns Err if not a float arena.
-    #[allow(dead_code)]
-    pub(super) fn float_data_mut(&mut self) -> Result<&mut Tensor> {
-        match self {
-            Self::Float { data, .. } => Ok(data),
-            Self::Quantized { .. } => candle::bail!("expected float arena"),
-        }
+    /// A read-only byte view of `len` bytes at the head of slot `chunk_idx`.
+    ///
+    /// Works on either device — the slab is a plain `U8` tensor, so this is a
+    /// contiguous `narrow` rather than a device-pointer lease.
+    pub(crate) fn slot_bytes(&self, chunk_idx: usize, len: usize) -> Result<Tensor> {
+        let off = self.slot_offset(chunk_idx, len)?;
+        self.data.narrow(0, off, len)
     }
 
-    /// Get the quantized data tensor. Returns Err if not a quantized arena.
-    pub(super) fn quantized_data(&self) -> Result<&QTensor> {
-        match self {
-            Self::Float { .. } => candle::bail!("expected quantized arena"),
-            Self::Quantized { data, .. } => Ok(data),
-        }
+    /// Write `src` (a 1-D `U8` tensor on this arena's device) into the head of
+    /// slot `chunk_idx`.
+    pub(crate) fn write_slot_bytes(&mut self, chunk_idx: usize, src: &Tensor) -> Result<()> {
+        self.write_slot_bytes_at(chunk_idx, 0, src)
     }
 
-    /// Get mutable quantized data tensor. Returns Err if not a quantized arena.
-    pub(super) fn quantized_data_mut(&mut self) -> Result<&mut QTensor> {
-        match self {
-            Self::Float { .. } => candle::bail!("expected quantized arena"),
-            Self::Quantized { data, .. } => Ok(data),
+    /// Write `src` into slot `chunk_idx` starting `byte_offset` bytes in.
+    pub(super) fn write_slot_bytes_at(
+        &mut self,
+        chunk_idx: usize,
+        byte_offset: usize,
+        src: &Tensor,
+    ) -> Result<()> {
+        if src.dtype() != DType::U8 || src.rank() != 1 {
+            candle::bail!(
+                "write_slot_bytes: expected a 1-D U8 tensor, got {:?} {:?}",
+                src.dtype(),
+                src.shape()
+            );
         }
+        let off = self.slot_offset(chunk_idx, byte_offset + src.elem_count())? + byte_offset;
+        self.data.slice_set(src, 0, off)
     }
 
-    /// Get data tensor if this is a float arena, None otherwise.
-    pub(super) fn as_float_data(&self) -> Option<&Tensor> {
-        match self {
-            Self::Float { data, .. } => Some(data),
-            Self::Quantized { .. } => None,
+    /// A typed tensor over `elems` elements at the head of slot `chunk_idx`,
+    /// shaped `shape`.
+    ///
+    /// On a GPU arena this is a zero-copy lease over the slab's own bytes, so a
+    /// write into the returned tensor lands in the arena. On a CPU arena the
+    /// bytes are decoded on the host into a fresh tensor — a *copy*, so use
+    /// [`Self::write_slot_typed`] rather than mutating the result.
+    pub(crate) fn read_slot_typed<'a, S: Into<candle::Shape>>(
+        &'a self,
+        chunk_idx: usize,
+        dtype: DType,
+        shape: S,
+    ) -> Result<LiveTensor<'a>> {
+        let shape = shape.into();
+        #[cfg(feature = "cuda")]
+        if self.location == ArenaLocation::Gpu {
+            return self.slot_view(chunk_idx, dtype, shape);
         }
+        let bytes = self
+            .slot_bytes(chunk_idx, shape.elem_count() * dtype.size_in_bytes())?
+            .to_vec1::<u8>()?;
+        decode_bytes(&bytes, dtype, shape, self.data.device())
     }
 
-    /// Get data tensor if this is a quantized arena, None otherwise.
-    pub(super) fn as_quantized_data(&self) -> Option<&QTensor> {
-        match self {
-            Self::Float { .. } => None,
-            Self::Quantized { data, .. } => Some(data),
+    /// Write a typed tensor into slot `chunk_idx`, `elem_offset` elements in.
+    ///
+    /// The GPU path writes straight into a lease over the slab; the CPU path
+    /// encodes `src` to bytes on the host and splices them into the slot. Both
+    /// keep the arena itself untyped — the caller's dtype comes from the band's
+    /// tag, never from the arena.
+    /// `src` may live on an inference wave: the write copies its bytes into the
+    /// slot rather than retaining a view, so nothing in the arena outlives the
+    /// generation `src` came from.
+    pub(crate) fn write_slot_typed(
+        &mut self,
+        chunk_idx: usize,
+        elem_offset: usize,
+        src: &candle::LiveTensor<'_>,
+    ) -> Result<()> {
+        let dtype = src.dtype();
+        #[cfg(feature = "cuda")]
+        if self.location == ArenaLocation::Gpu {
+            let slot_elems = self.slot_stride() / dtype.size_in_bytes();
+            let view = self.slot_view(chunk_idx, dtype, slot_elems)?;
+            return view.slice_set(&src.flatten_all()?, 0, elem_offset);
         }
+        let bytes = encode_bytes(&src.flatten_all()?)?;
+        let host = Tensor::from_slice(&bytes, bytes.len(), self.data.device())?;
+        self.write_slot_bytes_at(chunk_idx, elem_offset * dtype.size_in_bytes(), &host)
     }
 
-    /// Create an ArenaEntry for this arena, extracting device pointers if on GPU.
-    /// For CPU arenas, pointers will be 0.
-    pub(super) fn to_arena_entry(&self) -> ArenaEntry {
-        // CP3 COLLAPSE POINT: Both k_tag and v_tag are set to the same format_tag.
-        // This is correct for uniform (K==V format) arenas but wrong for K≠V format
-        // arenas. Fix by accepting per-head k_tags/v_tags arrays and populating
-        // each head's entry independently. See docs/kv_cache_unification.md §7.6.
-        let format_tag = ArenaFormatTag::from_kv_format(self.format());
-        let location = self.location();
-
-        match self {
-            Self::Float { data, .. } => {
-                if location == ArenaLocation::Cpu {
-                    ArenaEntry::new_cpu(format_tag, format_tag)
-                } else {
-                    let ptr = Self::extract_tensor_ptr(data).unwrap_or(0);
-                    ArenaEntry::new_gpu(ptr, ptr, format_tag, format_tag)
-                }
-            }
-            Self::Quantized { data: _data, .. } => {
-                if location == ArenaLocation::Cpu {
-                    ArenaEntry::new_cpu(format_tag, format_tag)
-                } else {
-                    #[cfg(feature = "cuda")]
-                    let ptr = _data.cuda_data_ptr().unwrap_or(0);
-                    #[cfg(not(feature = "cuda"))]
-                    let ptr = 0u64;
-                    ArenaEntry::new_gpu(ptr, ptr, format_tag, format_tag)
-                }
-            }
-        }
-    }
-
-    /// Helper to extract the raw device pointer from a tensor.
+    /// Helper to extract the raw device pointer from a byte slab.
     /// Returns None if the tensor is not on CUDA.
     #[cfg(feature = "cuda")]
     fn extract_tensor_ptr(t: &Tensor) -> Option<u64> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use half::{bf16, f16};
 
         let (storage, layout) = t.storage_and_layout();
         let cuda_storage = match &*storage {
             candle::Storage::Cuda(c) => c,
             _ => return None,
         };
-
-        // Get the CudaDevice to access the stream
-        let cuda_device = cuda_storage.device();
-        let stream = cuda_device.cuda_stream();
-
-        // Handle different dtypes - extract pointer with stream for proper synchronization
-        let ptr = match t.dtype() {
-            DType::F32 => {
-                let slice = cuda_storage.as_cuda_slice::<f32>().ok()?;
-                let slice = slice.slice(layout.start_offset()..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            DType::F16 => {
-                let slice = cuda_storage.as_cuda_slice::<f16>().ok()?;
-                let slice = slice.slice(layout.start_offset()..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            DType::BF16 => {
-                let slice = cuda_storage.as_cuda_slice::<bf16>().ok()?;
-                let slice = slice.slice(layout.start_offset()..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            DType::F8E4M3 => {
-                let slice = cuda_storage.as_cuda_slice::<float8::F8E4M3>().ok()?;
-                let slice = slice.slice(layout.start_offset()..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            DType::U8 => {
-                let slice = cuda_storage.as_cuda_slice::<u8>().ok()?;
-                let slice = slice.slice(layout.start_offset()..);
-                let (ptr, _guard) = slice.device_ptr(&stream);
-                ptr
-            }
-            _ => return None,
-        };
+        let stream = cuda_storage.device().cuda_stream();
+        let slice = cuda_storage.as_cuda_slice::<u8>().ok()?;
+        let slice = slice.slice(layout.start_offset()..);
+        let (ptr, _guard) = slice.device_ptr(&stream);
         Some(ptr)
     }
 
@@ -419,194 +506,193 @@ impl Arena {
         None
     }
 
-    /// Get the ArenaKey (K/V formats + location) for this arena.
-    pub fn arena_key(&self) -> ArenaKey {
-        ArenaKey::new(self.format(), self.location())
+    /// A `QTensor` **view** over slot `chunk_idx`, covering exactly the
+    /// `elems`-element band that lives there.
+    ///
+    /// The quantized twin of [`Self::slot_view`], and the way the block
+    /// quantize / dequantize kernels reach a slot now that the arena carries no
+    /// format. Like `slot_view` it is a lease: writes through it land in the
+    /// arena, and dropping it frees nothing.
+    ///
+    /// The view spans the band's **payload**, never the class stride — a
+    /// stride is not generally a whole number of blocks, and the bytes past the
+    /// payload belong to no chunk. That also makes every offset into the
+    /// returned tensor *slot-local*, which is what retires the arena-global
+    /// `chunk_idx * elems_per_chunk + ...` arithmetic invariant 8 is about.
+    ///
+    /// The returned view borrows the arena, so it cannot outlive the slab it
+    /// addresses: `LiveQTensor<'a>` is not `QTensor`, and the difference is
+    /// what the borrow checker enforces here in place of a comment.
+    #[cfg(feature = "cuda")]
+    pub(super) fn qslot_view<'a>(
+        &'a self,
+        chunk_idx: usize,
+        format: QuantFormat,
+        elems: usize,
+    ) -> Result<LiveQTensor<'a>> {
+        let ggml = format.to_ggml_dtype();
+        let payload = (elems / ggml.block_size()) * ggml.type_size();
+        let off = self.slot_offset(chunk_idx, payload)?;
+        let base = self.base_ptr().ok_or_else(|| {
+            candle::Error::Msg("qslot_view: arena is not GPU-resident".to_string())
+        })?;
+        let candle::Device::Cuda(dev) = self.data.device() else {
+            candle::bail!("qslot_view: arena slab is not on a CUDA device");
+        };
+        // SAFETY: the bounds check in `slot_offset` keeps the view inside slot
+        // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
+        // always a legal bit pattern for the format. That the slab is still
+        // live is no longer an obligation here: `'a` ties the view to this
+        // borrow of the arena.
+        unsafe {
+            LiveQTensor::from_leased_cuda_ptr(
+                base + off as u64,
+                ggml,
+                elems,
+                dev,
+                LeaseOrigin::Foreign,
+            )
+        }
     }
 
-    /// Zero the chunk at `chunk_idx`. Called on the alloc-from-free-list path
-    /// so the chunk's bytes are clean before the new tenant writes only the
-    /// slots it cares about — the persist quantize pass then sees zero past
-    /// `token_count` instead of stale garbage from the prior tenant.
+    /// Quantize `src` into slot `chunk_idx`, `elem_offset` elements in.
     ///
-    /// Asynchronous when `stream` is supplied: the work is enqueued on that
-    /// stream and the call returns once queued. Same-stream FIFO ordering
-    /// then guarantees any subsequent kernel reading this chunk sees zeros
-    /// without an explicit fence. When `stream` is `None` (CPU arena or a
-    /// CPU device under a `cuda`-built binary) the work runs synchronously.
-    pub(super) fn zero_chunk_at(
+    /// CUDA-only, and deliberately so: the block quantize kernels are, and the
+    /// only quantized *writer* chunks are GPU-resident (on CPU
+    /// `active_kv_formats` keeps the writer float precisely so partial-token
+    /// appends need no block-aligned quantization).
+    pub(super) fn quantize_into_slot(
         &mut self,
         chunk_idx: usize,
-        #[cfg(feature = "cuda")] stream: Option<
-            &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
-        >,
+        format: QuantFormat,
+        elems: usize,
+        elem_offset: usize,
+        src: &candle::LiveTensor<'_>,
     ) -> Result<()> {
-        match self {
-            Self::Float { data, dtype, .. } => {
-                let dims = data.dims();
-                if dims.len() != 3 {
-                    candle::bail!(
-                        "zero_chunk_at: expected (arena_chunks, chunk_size, sub_head_dim), got {:?}",
-                        dims
-                    );
-                }
-                if chunk_idx >= dims[0] {
-                    candle::bail!(
-                        "zero_chunk_at: chunk {chunk_idx} out of range (arena holds {})",
-                        dims[0]
-                    );
-                }
-                // Tensor::zeros + slice_set are kernel-launch ops; on CUDA
-                // they enqueue on the tensor's stream and return without
-                // blocking. On CPU they run inline.
-                let zeros = Tensor::zeros((1, dims[1], dims[2]), *dtype, data.device())?;
-                data.slice_set(&zeros, 0, chunk_idx)?;
-                Ok(())
-            }
-            Self::Quantized { data, format, .. } => {
-                let (byte_offset, chunk_byte_stride) =
-                    quant_chunk_byte_range(data, *format, chunk_idx)?;
-                let zeros = vec![0u8; chunk_byte_stride];
-                #[cfg(feature = "cuda")]
-                {
-                    if let Some(s) = stream {
-                        data.write_bytes_at_async(s, byte_offset, &zeros)?;
-                        return Ok(());
-                    }
-                }
-                data.write_bytes_at(byte_offset, &zeros)?;
-                Ok(())
-            }
+        #[cfg(feature = "cuda")]
+        {
+            let mut view = self.qslot_view(chunk_idx, format, elems)?;
+            return view.quantize_into(src, elem_offset);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (chunk_idx, format, elems, elem_offset, src);
+            candle::bail!("quantized chunk writes require the cuda feature")
         }
     }
 
-    /// Estimate the GPU memory usage of this arena in bytes.
+    /// Get the [`ArenaKey`] for this arena.
+    pub fn arena_key(&self) -> ArenaKey {
+        ArenaKey::new(self.class, self.location)
+    }
+
+    /// Zero the chunk at `chunk_idx`, to the **full class stride**.
     ///
-    /// Returns the total bytes for both K and V tensors.
-    /// For float arenas, this is `2 × elem_count × dtype_size`.
-    /// For quantized arenas, this uses the QTensor's storage size.
+    /// The stride, not the payload: the next tenant may be any format whose
+    /// bytes fit, so leaving the tail of a recycled slot dirty would let the
+    /// persist quantize pass read a prior tenant's bytes past `token_count`
+    /// (invariant 4).
+    ///
+    /// On CUDA this is a kernel launch enqueued on the slab's own stream and
+    /// returns once queued; same-stream FIFO ordering then guarantees the next
+    /// reader sees zeros without an explicit fence. On CPU it runs inline.
+    pub(super) fn zero_chunk_at(&mut self, chunk_idx: usize) -> Result<()> {
+        let stride = self.slot_stride();
+        let zeros = Tensor::zeros(stride, DType::U8, self.data.device())?;
+        self.write_slot_bytes(chunk_idx, &zeros)
+    }
+
+    /// GPU bytes this arena occupies. Zero for CPU arenas.
     pub fn gpu_memory_bytes(&self) -> usize {
-        match self {
-            Self::Float {
-                data,
-                dtype,
-                location,
-                ..
-            } => {
-                if *location != ArenaLocation::Gpu {
-                    return 0;
-                }
-                let elem_count = data.elem_count();
-                let bytes_per_elem = dtype.size_in_bytes();
-                elem_count * bytes_per_elem
-            }
-            Self::Quantized { data, location, .. } => {
-                if *location != ArenaLocation::Gpu {
-                    return 0;
-                }
-                data.storage_size_in_bytes()
-            }
+        if self.location != ArenaLocation::Gpu {
+            return 0;
         }
+        self.data.elem_count()
     }
 
-    /// Return a label describing this arena's format.
+    /// Label describing this arena's size class and, on the GPU, which region
+    /// of the reservation its bytes are.
+    ///
+    /// The region index is what ties an arena in a table dump to an address:
+    /// arena indices are recycled and say nothing about position, while the
+    /// region says exactly where in the span the bytes sit — which is the
+    /// question when reading an occupancy dump, since the KV side packs
+    /// lowest-first and the high end is what a reclaim reaches for.
     pub fn format_label(&self) -> String {
-        match self {
-            Self::Float { dtype, .. } => format!("{:?}", dtype),
-            Self::Quantized { format, .. } => format!("{:?}", format),
+        #[cfg(feature = "cuda")]
+        if let Some(region) = self.region.as_ref().map(RegionHandle::index) {
+            return format!("class{} r{region}", self.class.bytes());
         }
+        format!("class{}", self.class.bytes())
     }
-}
 
-/// Resolve `(byte_offset, chunk_byte_stride)` for a Quantized arena chunk.
-/// Used by [`Arena::zero_chunk_at`] to address one logical chunk's bytes.
-fn quant_chunk_byte_range(
-    data: &QTensor,
-    format: QuantFormat,
-    chunk_idx: usize,
-) -> Result<(usize, usize)> {
-    let q_ggml = format.to_ggml_dtype();
-    let total_elems = data.shape().elem_count();
-    if total_elems % q_ggml.block_size() != 0 {
-        candle::bail!(
-            "quant_chunk_byte_range: total elems {total_elems} not divisible by block_size {}",
-            q_ggml.block_size()
-        );
-    }
-    let total_bytes = (total_elems / q_ggml.block_size()) * q_ggml.type_size();
-    let arena_chunks = arena_chunks_for_format(KvFormat::Quantized(format));
-    if arena_chunks == 0 {
-        candle::bail!(
-            "quant_chunk_byte_range: arena_chunks_for_format returned 0 for {:?}",
-            format
-        );
-    }
-    let chunk_byte_stride = total_bytes / arena_chunks;
-    if chunk_idx >= arena_chunks {
-        candle::bail!(
-            "quant_chunk_byte_range: chunk {chunk_idx} out of range (arena holds {arena_chunks})"
-        );
-    }
-    Ok((chunk_idx * chunk_byte_stride, chunk_byte_stride))
-}
-
-#[allow(dead_code)]
-struct _ArenaImplContinues; // syntactic anchor: more `impl Arena` items follow below.
-
-impl Arena {
-    /// Return the raw device pointer and byte stride for one logical chunk in
-    /// this arena. Returns `None` for CPU-backed or tombstoned arenas.
+    /// Raw device pointer and byte stride for one slot. `None` for CPU arenas.
     #[allow(dead_code)]
     pub(super) fn chunk_copy_span(&self, chunk_idx: usize) -> Option<(u64, u32)> {
-        match self {
-            Self::Float {
-                data,
-                dtype,
-                location,
-                ..
-            } => {
-                if *location != ArenaLocation::Gpu {
-                    return None;
-                }
-                let base = Self::extract_tensor_ptr(data)?;
-                let total_bytes = data.elem_count().checked_mul(dtype.size_in_bytes())?;
-                let arena_chunks = arena_chunks_for_format(KvFormat::Float(*dtype));
-                if total_bytes == 0 || total_bytes % arena_chunks != 0 {
-                    return None;
-                }
-                let stride = total_bytes / arena_chunks;
-                let offset = chunk_idx.checked_mul(stride)?;
-                Some((base + offset as u64, stride as u32))
-            }
-            Self::Quantized {
-                data,
-                format,
-                location,
-                ..
-            } => {
-                if *location != ArenaLocation::Gpu {
-                    return None;
-                }
-                #[cfg(feature = "cuda")]
-                {
-                    let base = data.cuda_data_ptr()?;
-                    let total_bytes = data.storage_size_in_bytes();
-                    let arena_chunks = arena_chunks_for_format(KvFormat::Quantized(*format));
-                    if total_bytes == 0 || total_bytes % arena_chunks != 0 {
-                        return None;
-                    }
-                    let stride = total_bytes / arena_chunks;
-                    let offset = chunk_idx.checked_mul(stride)?;
-                    Some((base + offset as u64, stride as u32))
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = (data, format, chunk_idx);
-                    None
-                }
-            }
-        }
+        let ptr = self.slot_ptr(chunk_idx)?;
+        Some((ptr, self.slot_stride() as u32))
     }
+}
+
+/// Host-side widening of a slot's raw bytes into a typed tensor.
+///
+/// The CPU counterpart of the GPU lease: with the slab untyped there is no
+/// way to reinterpret its storage in place on the host, so the bytes are
+/// decoded explicitly. Only the four dtypes the KV cache stores are accepted —
+/// anything else is a caller error, not a runtime condition.
+fn decode_bytes(
+    bytes: &[u8],
+    dtype: DType,
+    shape: candle::Shape,
+    device: &candle::Device,
+) -> Result<Tensor> {
+    match dtype {
+        DType::F16 => Tensor::from_iter(
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]])),
+            device,
+        )?
+        .reshape(shape),
+        DType::BF16 => Tensor::from_iter(
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]])),
+            device,
+        )?
+        .reshape(shape),
+        DType::F32 => Tensor::from_iter(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            device,
+        )?
+        .reshape(shape),
+        DType::F8E4M3 => {
+            Tensor::from_iter(bytes.iter().map(|b| float8::F8E4M3::from_bits(*b)), device)?
+                .reshape(shape)
+        }
+        other => candle::bail!("an arena slot cannot be viewed as {other:?}"),
+    }
+}
+
+/// The inverse of [`decode_bytes`]: a typed tensor's little-endian image.
+fn encode_bytes(src: &candle::LiveTensor<'_>) -> Result<Vec<u8>> {
+    fn flatten<T: Copy, const N: usize>(v: Vec<T>, le: impl Fn(T) -> [u8; N]) -> Vec<u8> {
+        v.into_iter().flat_map(le).collect()
+    }
+    let out = match src.dtype() {
+        DType::F16 => flatten(src.to_vec1::<half::f16>()?, half::f16::to_le_bytes),
+        DType::BF16 => flatten(src.to_vec1::<half::bf16>()?, half::bf16::to_le_bytes),
+        DType::F32 => flatten(src.to_vec1::<f32>()?, f32::to_le_bytes),
+        DType::F8E4M3 => src
+            .to_vec1::<float8::F8E4M3>()?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect(),
+        other => candle::bail!("an arena slot cannot be written from {other:?}"),
+    };
+    Ok(out)
 }
 
 // ==================== Arena Storage State ====================
@@ -630,7 +716,7 @@ impl ArenaStorageState {
     /// Create new empty state.
     fn new() -> Self {
         // Sized to typical steady-state working set: ~30-60 live arenas across
-        // all formats (production runs peak around 28). Pre-sizing avoids a
+        // all classes (production runs peak around 28). Pre-sizing avoids a
         // chain of ~6 rehash/grow cycles during warmup.
         Self {
             arenas: AHashMap::with_capacity(64),
@@ -681,9 +767,7 @@ impl ArenaStorageState {
 
     /// Insert a freshly created arena into storage. Slot-level allocation
     /// state lives in the [`ChunkGidPool`]; storage only owns the tensor.
-    /// `_arena_chunks` is kept for call-site parity with the legacy
-    /// alloc-state path but is no longer consulted here.
-    pub(super) fn push_arena(&mut self, arena: Arena, arena_idx: usize, _arena_chunks: usize) {
+    pub(super) fn push_arena(&mut self, arena: Arena, arena_idx: usize) {
         self.arenas.insert(arena_idx, arena);
     }
 
@@ -709,7 +793,7 @@ impl ArenaStorageState {
 pub(crate) struct ArenaRow {
     /// Arena slot index in the storage vector.
     pub arena_idx: usize,
-    /// Human-readable type label, e.g. "Float BF16 Gpu" or "Quant Q8_0 Gpu".
+    /// Human-readable type label, e.g. "class1152 Gpu".
     pub type_label: String,
     /// True if this slot has been tombstoned (GPU tensors freed, not allocatable).
     pub is_tombstone: bool,
@@ -746,10 +830,10 @@ impl ArenaRow {
 impl ArenaStorageState {
     /// Build a per-arena diagnostic row for every slot, sorted by index.
     ///
-    /// `capacity` is derived directly from the arena's format. `active`,
-    /// `free_list`, and `hwm` are placeholders here — `backing.rs`
-    /// patches them in from the [`ChunkGidPool`] (the authoritative
-    /// per-slot owner) before exposing rows to callers.
+    /// `capacity` is the class's slot count. `active`, `free_list`, and `hwm`
+    /// are placeholders here — `backing.rs` patches them in from the
+    /// [`ChunkGidPool`] (the authoritative per-slot owner) before exposing rows
+    /// to callers.
     pub(super) fn arena_rows(&self) -> Vec<ArenaRow> {
         let mut indices: Vec<usize> = self.arenas.keys().copied().collect();
         indices.sort_unstable();
@@ -757,29 +841,15 @@ impl ArenaStorageState {
             .iter()
             .map(|&idx| {
                 let arena = &self.arenas[&idx];
-                let capacity = arena_chunks_for_format(arena.arena_key().format);
-                let gpu_bytes = arena.gpu_memory_bytes();
-                let type_label = match arena {
-                    Arena::Float {
-                        dtype, location, ..
-                    } => {
-                        format!("Float {:?} {:?}", dtype, location)
-                    }
-                    Arena::Quantized {
-                        format, location, ..
-                    } => {
-                        format!("Quant {:?} {:?}", format, location)
-                    }
-                };
                 ArenaRow {
                     arena_idx: idx,
-                    type_label,
+                    type_label: format!("{} {:?}", arena.format_label(), arena.location()),
                     is_tombstone: false,
-                    capacity,
+                    capacity: arena.chunks(),
                     hwm: 0,
                     active: 0,
                     free_list: 0,
-                    gpu_bytes,
+                    gpu_bytes: arena.gpu_memory_bytes(),
                 }
             })
             .collect()
@@ -788,7 +858,7 @@ impl ArenaStorageState {
 
 // ==================== Arena Storage ====================
 
-/// Storage for KV arenas - supports heterogeneous formats and locations.
+/// Storage for KV arenas - supports heterogeneous classes and locations.
 ///
 /// # Deadlock Prevention
 ///
@@ -803,9 +873,9 @@ impl ArenaStorageState {
 pub(crate) struct ArenaStorage {
     /// All mutable state behind a single lock.
     state: RwLock<ArenaStorageState>,
-    /// Default K format for new arenas (immutable, lock-free access).
+    /// Default K format for new sealed chunks (immutable, lock-free access).
     default_format: KvFormat,
-    /// Default V format for new arenas (immutable, lock-free access).
+    /// Default V format for new sealed chunks (immutable, lock-free access).
     default_v_format: KvFormat,
     /// Default location for new arenas (immutable, lock-free access).
     default_location: ArenaLocation,
@@ -827,12 +897,12 @@ impl ArenaStorage {
         self.default_format.is_quantized()
     }
 
-    /// Get the default KvFormat for new arenas (lock-free).
+    /// Get the default KvFormat for new sealed chunks (lock-free).
     pub(super) fn k_format(&self) -> KvFormat {
         self.default_format
     }
 
-    /// Get the default V KvFormat for new arenas (lock-free).
+    /// Get the default V KvFormat for new sealed chunks (lock-free).
     pub(super) fn v_format(&self) -> KvFormat {
         self.default_v_format
     }
@@ -908,38 +978,6 @@ impl ArenaStorage {
     #[allow(dead_code)]
     pub(super) fn is_allocatable(&self, arena_idx: usize) -> Result<bool> {
         self.read(|s| s.is_allocatable(arena_idx))
-    }
-
-    /// Returns the actual K/V format tags from the first live arena.
-    ///
-    /// Falls back to the backing's configured default formats if no arenas exist yet.
-    /// Use this for kernel dispatch — the backing default may be a quantized target
-    /// while actual arenas are still float (e.g. pre-reconcile).
-    pub(super) fn actual_kv_format_tags(
-        &self,
-    ) -> (
-        crate::kv_cache::ArenaFormatTag,
-        crate::kv_cache::ArenaFormatTag,
-    ) {
-        use crate::kv_cache::ArenaFormatTag;
-        let from_format = |f: KvFormat| ArenaFormatTag::from_kv_format(f);
-        self.read(|s| {
-            if let Some(arena) = s.arenas().values().next() {
-                let entry = arena.to_arena_entry();
-                (entry.k_format_tag, entry.v_format_tag)
-            } else {
-                (
-                    from_format(self.default_format),
-                    from_format(self.default_v_format),
-                )
-            }
-        })
-        .unwrap_or_else(|_| {
-            (
-                from_format(self.default_format),
-                from_format(self.default_v_format),
-            )
-        })
     }
 
     /// Release an empty arena, freeing its GPU tensors.

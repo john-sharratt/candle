@@ -1,3 +1,14 @@
+//! DeBERTaV2 token/sequence classification: NER or text classification
+//! (`candle_transformers::models::debertav2::{DebertaV2NERModel, DebertaV2SeqClassificationModel}`).
+//!
+//! `--task` selects `ner` (default) or `text-classification`; `--sentence` may
+//! repeat to batch multiple inputs. Model source is either `--model-id`
+//! (+`--revision`, HF Hub) or `--model-path` (local directory) — one is
+//! required via a clap `ArgGroup`. `--id2label` supplies the label map as
+//! inline JSON when the model config omits it. `--use-pth` loads PyTorch
+//! weights instead of safetensors. `--benchmark-iters` runs a min/avg/max
+//! timing loop instead of printing predictions.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

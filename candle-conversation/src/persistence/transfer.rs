@@ -212,14 +212,14 @@ mod cuda_impl {
             }
             let kv_bytes = blob[cursor..cursor + n].to_vec();
             cursor += n;
-            let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
+            let (k_formats, v_formats) = sc.format_tags()?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
                 golden: goldens[i],
                 payload: ChunkPayload {
                     offset: sc.offset,
-                    k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
-                    v_formats: v_formats.iter().map(|f| f.to_tag()).collect(),
+                    k_formats: k_formats.to_vec(),
+                    v_formats: v_formats.to_vec(),
                     k_pal: (*sc.k_pal).clone(),
                     v_pal: (*sc.v_pal).clone(),
                     k_scale: (*sc.k_scale).clone(),
@@ -240,12 +240,13 @@ mod cuda_impl {
         backing: &ChunkedKvBacking,
         seq: &SealedSequence,
     ) -> Result<Vec<ChunkImage>> {
-        use candle_nn::kv_cache::arena_gid_stride;
+        use candle_nn::kv_cache::{payload_bytes_for_tag, GID_STRIDE};
 
         use crate::persistence::record::ChunkPayload;
 
-        let arena_chunks = arena_gid_stride();
+        let arena_chunks = GID_STRIDE;
         let arena_info = backing.resolve_arena_info()?;
+        let elems_per_chunk = backing.elems_per_chunk();
         // Pull each unique (arena, chunk) slot's bytes into a single
         // blob, then split per `sc.byte_size` like the GPU path. This
         // preserves the SealedChunk's per-chunk byte_size accounting
@@ -254,25 +255,39 @@ mod cuda_impl {
         let mut seen = std::collections::HashSet::new();
         let mut blob: Vec<u8> = Vec::new();
         for chunk in &seq.chunks {
-            for gid in chunk.gids.as_slice() {
+            for (gid, tag) in chunk.bands() {
                 let raw = gid.raw();
                 if !seen.insert(raw) {
                     continue;
                 }
                 let arena_idx = (raw as usize) / arena_chunks;
                 let chunk_idx = (raw as usize) % arena_chunks;
-                let info = arena_info.get(arena_idx).ok_or_else(|| {
-                    candle::Error::Msg(format!(
+                if arena_info.get(arena_idx).is_none() {
+                    return Err(candle::Error::Msg(format!(
                         "seal_to_chunk_images_cpu: arena_idx {arena_idx} out of range"
+                    )));
+                }
+                // Reserve the band's PAYLOAD, not its slot stride: the blob is
+                // split below by `sc.byte_size`, which sums payloads. Reserving
+                // the stride would desynchronise the two the moment a class
+                // slot exceeds the format's bytes — `blob underrun` at best,
+                // silently shifted chunk boundaries in persisted data at worst.
+                //
+                // The payload comes from the band's own tag, because the arena
+                // is a run of untyped byte slots and has no format to report
+                // (`docs/archived/arena_unification.md` invariant 8).
+                let payload = payload_bytes_for_tag(tag, elems_per_chunk).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "seal_to_chunk_images_cpu: band tag {tag:?} names no storage format, \
+                         so its byte length is unknown"
                     ))
                 })?;
-                let stride = info.chunk_byte_stride as usize;
                 let start = blob.len();
-                blob.resize(start + stride, 0);
+                blob.resize(start + payload, 0);
                 backing.read_chunk_into_bytes(
                     arena_idx,
                     chunk_idx,
-                    &mut blob[start..start + stride],
+                    &mut blob[start..start + payload],
                 )?;
             }
         }
@@ -292,14 +307,14 @@ mod cuda_impl {
             // round trip), so a host-side Fletcher is itself the ground truth —
             // there is no DtoH copy between the read and this checksum.
             let golden = candle::fletcher::fletcher32(&kv_bytes);
-            let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
+            let (k_formats, v_formats) = sc.format_tags()?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
                 golden,
                 payload: ChunkPayload {
                     offset: sc.offset,
-                    k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
-                    v_formats: v_formats.iter().map(|f| f.to_tag()).collect(),
+                    k_formats: k_formats.to_vec(),
+                    v_formats: v_formats.to_vec(),
                     k_pal: (*sc.k_pal).clone(),
                     v_pal: (*sc.v_pal).clone(),
                     k_scale: (*sc.k_scale).clone(),
@@ -457,7 +472,7 @@ mod cuda_impl {
         // duration so the pipeline's reader threads can borrow them by id.
         let mut sealed_handles: std::collections::HashMap<
             crate::persistence::segment::SegmentId,
-            crate::persistence::direct_io::DirectFile,
+            candle::direct_io::DirectFile,
         > = std::collections::HashMap::new();
         for batch in &plan.chunks {
             if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {
@@ -559,7 +574,7 @@ mod cuda_impl {
         use candle::quantized::{GgmlDType, QStorage, QTensor};
         use candle::{DType, Tensor};
         use candle_nn::kv_cache::{
-            arena_gid_stride, quantize_sealed_in_place, CompressionPolicy, KvFormat, QuantFormat,
+            quantize_sealed_in_place, CompressionPolicy, KvFormat, QuantFormat, GID_STRIDE,
             N_PALETTE,
         };
         use half::f16;
@@ -879,7 +894,7 @@ mod cuda_impl {
             // sequence is CPU-resident (the recall persist path). If warm
             // stayed on GPU, migrate it to CPU so we exercise the CPU gather
             // (the suspected corrupting step).
-            let _stride = arena_gid_stride();
+            let _stride = GID_STRIDE;
             let cpu_seq;
             let seq_ref: &SealedSequence = if warm.location == ArenaLocation::Cpu {
                 warm

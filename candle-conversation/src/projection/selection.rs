@@ -159,9 +159,19 @@ fn select_top_k(
     budget_tokens: Option<usize>,
     token_counts: &dyn Fn(TurnKey) -> usize,
 ) -> Vec<TurnKey> {
+    // **No evidence, no seat.** A zero score means no probe has ever matched
+    // the turn — the pre-belief path (fork/startup) scores everything 0 — and
+    // ranking all-zero candidates is decided by the tie-break alone: ascending
+    // key, i.e. ingestion order. That seeded the same arbitrary
+    // earliest-ingested repo_map folders into every conversation ever forked,
+    // which the model then adopted as its own dialogue history (proven with a
+    // conversation whose only content was "hello"). Content that must appear
+    // without evidence has two sanctioned homes — the group's `default:`
+    // re-injection and the `AlwaysVisible` rule. An evidence-ranked rule
+    // admits evidence, whatever its configured threshold.
     let mut eligible: Vec<(TurnKey, f32)> = turns
         .iter()
-        .filter(|(_, s)| *s >= threshold)
+        .filter(|(_, s)| *s >= threshold && *s > 0.0)
         .copied()
         .collect();
 
@@ -190,9 +200,12 @@ fn select_single(
     budget_tokens: Option<usize>,
     token_counts: &dyn Fn(TurnKey) -> usize,
 ) -> Vec<TurnKey> {
+    // Same zero-score exclusion as `select_top_k`, same reasoning: `Single` is
+    // an evidence-ranked rule, and with no evidence its winner is an artifact
+    // of the tie-break, not a selection.
     let best = turns
         .iter()
-        .filter(|(_, s)| *s >= threshold)
+        .filter(|(_, s)| *s >= threshold && *s > 0.0)
         .max_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -226,10 +239,14 @@ fn select_conversation(
     let split_at = turns.len().saturating_sub(recent);
     let (older, inviolate) = turns.split_at(split_at);
 
-    // Historical: threshold-filtered, top-k by score.
+    // Historical: threshold-filtered, top-k by score — with the same zero-score
+    // exclusion as `select_top_k`. The recent window below earns its seats by
+    // recency, which *is* its evidence; the historical seats are evidence-ranked
+    // like any TopK, and an all-zero field decided by the ascending-key
+    // tie-break would seed the earliest-ingested turns into every fork.
     let mut historical: Vec<(TurnKey, f32)> = older
         .iter()
-        .filter(|(_, s)| *s >= threshold)
+        .filter(|(_, s)| *s >= threshold && *s > 0.0)
         .copied()
         .collect();
     historical.sort_by(|a, b| {
@@ -316,6 +333,46 @@ mod tests {
         // 3 * 10 = 30; budget 20 → drop lowest-scored (t(2))
         let r = apply_selection(&SelectionRule::AlwaysVisible, 0.0, &turns, Some(20), &tc);
         assert_eq!(r, vec![t(0), t(1)]);
+    }
+
+    /// **Evidence-ranked rules never seat zero-score members**, whatever the
+    /// configured threshold. With every candidate at 0 (the pre-belief path:
+    /// fork and startup, before any probe exists) the "ranking" is the
+    /// tie-break alone — ingestion order — which is how the same arbitrary
+    /// repo_map folders ended up in every conversation's history. Must-show
+    /// content goes through `default:` or `AlwaysVisible`, not through an
+    /// evidence rule with no evidence.
+    #[test]
+    fn zero_score_is_never_selectable_by_evidence_rules() {
+        let turns = vec![(t(0), 0.0), (t(1), 0.0), (t(2), 0.0)];
+        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc);
+        assert!(r.is_empty(), "TopK over all-zero scores must select nothing");
+        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc);
+        assert!(r.is_empty(), "Single over all-zero scores must select nothing");
+
+        // Mixed: only the evidenced member seats.
+        let turns = vec![(t(0), 0.0), (t(1), 0.4), (t(2), 0.0)];
+        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc);
+        assert_eq!(r, vec![t(1)]);
+
+        // Sequence: the historical seats are evidence-ranked too — all-zero
+        // older turns must select nothing beyond the recent window...
+        let turns = vec![(t(0), 0.0), (t(1), 0.0), (t(2), 0.0), (t(3), 0.0)];
+        let rule = SelectionRule::Sequence {
+            recent: 1,
+            historical_top_k: 2,
+        };
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc);
+        assert_eq!(
+            r,
+            vec![t(3)],
+            "only the recent window seats; recency is its evidence, zero-score history has none"
+        );
+
+        // ...while an evidenced older turn still earns a historical seat.
+        let turns = vec![(t(0), 0.0), (t(1), 0.4), (t(2), 0.0), (t(3), 0.0)];
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc);
+        assert_eq!(r, vec![t(1), t(3)]);
     }
 
     #[test]

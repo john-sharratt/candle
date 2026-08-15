@@ -1,3 +1,18 @@
+//! Adaptive KV-quantization format selection: for a 32-token block, sample
+//! reconstruction error for each candidate [`SampleFormat`] and pick the
+//! smallest one whose error stays under the production threshold.
+//!
+//! This is the engine behind [`compression_policy`](crate::kv_cache::chunked::compression_policy)'s
+//! C0–C9 levels — `compress.rs` and `cpu_selection.rs` call [`KvSampler`] (or
+//! the free [`sample_error_surface`] function) once per block, per side
+//! (K is channel-sensitive, V is token-sensitive, hence `SampleSide`). `cpu`
+//! and `gpu` hold parallel implementations of the same error formula (CPU
+//! mirrors the GPU `sample_quant_errors_paged` kernel bit-for-bit); `ops`
+//! holds shared reduction/quantization helpers; `params` holds the
+//! `PRODUCTION_*` threshold tables (model-specific, re-derived per model);
+//! `sampler` is the backend-dispatching [`KvSampler`]; `workflow` composes a
+//! full sweep across a paged arena; `profile` and `types` are support.
+
 #![allow(dead_code)]
 
 mod cpu; // CPU sampling kernel — mirrors GPU algorithm

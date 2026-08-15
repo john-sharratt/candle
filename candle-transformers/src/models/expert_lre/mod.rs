@@ -140,7 +140,8 @@
 //! | [`cache`]      | `ExpertCacheInner` — slot management and eviction policy |
 //! | [`compute`]    | SwiGLU expert computation and `QMatMul` re-export |
 //! | [`transition`] | `TransitionMatrix` — online-learned routing predictor |
-//! | [`pinned`]     | `PinnedPool` — pinned host memory warm tier |
+//! | [`pack`]       | `ExpertPack` — the authoritative cold tier on disk |
+//! | [`pinned`]     | `WarmPool` — pinned host memory warm tier, and its draw |
 //! | [`pipeline`]   | `PipelineState`, background thread, DMA loading |
 //! | [`handle`]     | `ExpertCache` public API and `PipelineMode` |
 
@@ -153,6 +154,7 @@ mod gpu_dispatch;
 mod handle;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
+mod pack;
 mod pinned;
 mod pipeline;
 mod transition;
@@ -161,8 +163,21 @@ mod types;
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
+pub use cache::minimum_resident_slots;
+#[cfg(feature = "cuda")]
 pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
+#[cfg(feature = "cuda")]
+pub use handle::ExpertCacheSetup;
+/// What the weight zone must be carved into to hold one expert.
+///
+/// The model loader needs this **before** the cache exists: the zone's slot size
+/// decides its capacity, its capacity decides where the weight boundary sits,
+/// and the boundary has to be placed before a single expert is uploaded into it.
+#[cfg(feature = "cuda")]
+pub(crate) use pinned::layer_geometries;
+#[cfg(feature = "cuda")]
+pub(crate) use pipeline::slot_bytes_for;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
 };

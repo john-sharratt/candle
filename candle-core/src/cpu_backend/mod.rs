@@ -1,4 +1,19 @@
-//! Implementation of Backend Fns for CPU
+//! `BackendStorage`/`BackendDevice` implementation for the CPU backend — the
+//! default device, always compiled in (no feature flag required).
+//!
+//! `CpuStorage` is an enum of one `Vec<T>` per dtype (`U8`/`U32`/`I64`/`BF16`/
+//! `F16`/`F32`/`F64`/`F8E4M3`); `CpuStorageRef` is the borrowed equivalent and
+//! `CpuDevice` is a zero-sized marker (there is no device handle to hold).
+//! Every op is a small unit struct (`Affine`, `Conv2D`, `MatMul`, `Gather`, ...)
+//! implementing `Map1`/`Map2`/`Map1Any`/`Map2InPlace`/`Map2U8` from the sibling
+//! `utils` module; those traits monomorphize over `WithDType` and drive the
+//! `unary_map`/`binary_map` element loops, which call into the SIMD `vec_dot`/
+//! `vec_sum` kernels in `candle-core/src/cpu/mod.rs` (AVX2/NEON/simd128) when
+//! available. `rayon` parallelizes across rows. Matmul dispatches to the `gemm`
+//! crate by default, or to `crate::mkl`/`crate::accelerate` when those features
+//! are enabled. The trait impls themselves (`BackendStorage for CpuStorage`,
+//! `BackendDevice for CpuDevice`) sit at the bottom of the file and fan out into
+//! the op structs above.
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{DType, Error, IntDType, Layout, Result, Shape, WithDType};

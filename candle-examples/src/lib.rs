@@ -1,3 +1,24 @@
+//! Shared support library consumed by every binary under
+//! `candle-examples/examples/*` — device selection, image/audio I/O, and
+//! streaming-decode helpers, kept out of each example's `main.rs` so model
+//! code stays the focus there.
+//!
+//! - [`device`] picks CUDA, then Metal, then falls back to CPU (or forces
+//!   CPU with `cpu: true`); almost every example's `--cpu` flag routes here.
+//! - `load_image`/`load_image_and_resize`/`save_image`/`save_image_resize`
+//!   convert between files and `(C, H, W)` `u8`/`f32` tensors for
+//!   vision examples (classification, detection, diffusion).
+//! - [`hub_load_safetensors`] / `hub_load_local_safetensors` resolve a
+//!   sharded checkpoint's file list from a `model.safetensors.index.json`
+//!   weight map, for models too large for a single safetensors file.
+//! - `token_output_stream` (`TokenOutputStream`) buffers decode-in-progress
+//!   BPE tokens so partial UTF-8 sequences aren't printed until complete;
+//!   used by every streaming text-generation example.
+//! - `imagenet`/`coco_classes` hold the fixed class-label tables and
+//!   ImageNet preprocessing (`load_image224`) for classification/detection
+//!   examples; `audio`/`bs1770`/`wav` provide PCM decode/resample/loudness
+//!   normalization and WAV I/O for the speech/audio examples.
+
 pub mod audio;
 pub mod bs1770;
 pub mod coco_classes;

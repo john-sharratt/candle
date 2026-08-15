@@ -1,3 +1,14 @@
+//! Text generation with RWKV, a linear-attention/recurrent transformer variant
+//! (not standard KV-cache attention): explicit `State` object threaded through
+//! `forward(&self, xs, state)` instead of a growable KV cache. Supports RWKV
+//! v5 (Eagle-7B, World-1B5, World-3B) and v6 (World-1B6), each in float
+//! (`rwkv_v5`/`rwkv_v6::Model`) or GGUF-quantized (`quantized_rwkv_v5`/`_v6`,
+//! `--quantized`) form.
+//!
+//! `--which` picks the model+revision; tokenizer defaults to
+//! `lmz/candle-rwkv`'s `rwkv_vocab_v20230424.json` (custom trie tokenizer, not
+//! HF `tokenizers`). EOS is token 261 or 0.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

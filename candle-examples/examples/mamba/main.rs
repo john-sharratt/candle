@@ -1,3 +1,12 @@
+//! Mamba (selective state-space model) text generation with recurrent decode.
+//!
+//! Uses `candle_transformers::models::mamba`, which carries an explicit
+//! `State` across steps for O(1)-per-token recurrent decoding (contrast
+//! `../mamba-minimal/main.rs`, which recomputes the full sequence each step).
+//! `Which` selects among the `state-spaces/mamba-{130m,370m,790m,1.4b,2.8b,
+//! 2.8b-slimpj}` checkpoints; `--dtype` chooses f32/f16/bf16 for the mmapped
+//! safetensors weights.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

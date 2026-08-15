@@ -1,3 +1,15 @@
+//! Whisper speech-to-text transcription from a wav file (batch size 1).
+//!
+//! `--model` selects the size/variant (`tiny`..`large-v3-turbo`, `.en` or
+//! multilingual, distil variants); `--quantized` loads a GGUF checkpoint
+//! from `lmz/candle-whisper` (tiny/tiny.en only). `--input` is a wav path,
+//! or `sample:<name>` to fetch a demo clip from the `Narsil/candle-examples`
+//! HF dataset (defaults to `jfk.wav`); input must already be at Whisper's
+//! native sample rate. `--task` (transcribe/translate), `--language`
+//! (overrides auto-detection via the local `multilingual` module),
+//! `--timestamps` (drives the segment-level `apply_timestamp_rules`
+//! decoding constraints), and `--max-initial-timestamp-index` tune decoding.
+
 // https://github.com/openai/whisper/blob/main/whisper/model.py/rgs
 // TODO:
 // - Batch size greater than 1.

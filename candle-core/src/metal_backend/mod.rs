@@ -1,5 +1,16 @@
-//! Implementation of Backend traits for Metal
+//! `BackendStorage`/`BackendDevice` implementation for the Metal backend
+//! (`feature = "metal"`), the Apple-GPU device — not part of this fork's
+//! primary CUDA production path.
 //!
+//! `MetalStorage` holds an `Arc<Buffer>` plus the owning `MetalDevice`
+//! (defined in the sibling `device.rs`), an element `count`, and a `DType` tag
+//! since Metal buffers themselves are untyped. `impl BackendStorage for
+//! MetalStorage` dispatches each op — affine, unary/binary elementwise, cast,
+//! reduce, convolution, indexing, sdpa, sort — to a `candle_metal_kernels::
+//! call_*` function, which compiles and caches the corresponding `.metal`
+//! source (see `candle-metal-kernels`) via a `Kernels` cache rather than an
+//! AOT-embedded binary. `MetalError` wraps kernel and lock-poisoning failures
+//! into `candle_core::Error`.
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};

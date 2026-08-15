@@ -1,3 +1,4 @@
+use crate::forbidden_alloc;
 use crate::WithDType;
 use cudarc;
 use cudarc::cudnn::safe::{ConvForward, Cudnn};
@@ -109,6 +110,7 @@ pub(crate) fn launch_conv2d<
         Some(CandleAlgo::Count) => A::CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
     };
     let workspace_size = conv2d.get_workspace_size(alg)?;
+    forbidden_alloc::record("cudnn::conv_workspace", workspace_size);
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {
         conv2d.launch::<CudaSlice<u8>, _, _, _>(
@@ -210,6 +212,7 @@ pub(crate) fn launch_conv1d<
         Some(CandleAlgo::Count) => A::CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
     };
     let workspace_size = conv1d.get_workspace_size(alg)?;
+    forbidden_alloc::record("cudnn::conv_workspace", workspace_size);
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {
         conv1d.launch::<CudaSlice<u8>, _, _, _>(

@@ -1,7 +1,17 @@
-//! Shared test infrastructure for batched sampling kernel tests.
+//! Shared test infrastructure validating `candle_kernels::sampling::
+//! run_batched_sampling` (the batched logit-processing/sampling CUDA kernel)
+//! against a bit-mirrored CPU reference.
 //!
-//! Provides CPU reference implementation, GPU test harness, `SamplingParams`,
-//! multi-dtype helpers, and utility functions used by all sampling test files.
+//! `cpu_apply_penalties`/`cpu_compute_dry_penalties`/`cpu_sample_argmax` mirror
+//! the kernel's branchless logic exactly — repeat/frequency/presence/DRY/
+//! cross-turn penalties, EOS and per-segment-close boost ramps, banned-token
+//! and stencil masking, top-k/top-p, seeded RNG — so `run_cpu` can be diffed
+//! token-for-token against `run_gpu`/`run_gpu_typed` (which upload, launch,
+//! and download via `cudarc`). `SamplingParams` is the single struct
+//! configuring one test invocation; `assert_gpu_cpu_match`/
+//! `assert_typed_gpu_cpu_match` are the entry points every sampling test file
+//! calls, with `f32_to_f16`/`f32_to_bf16`/`f32_to_fp8` covering the non-f32
+//! dtypes the kernel also supports.
 
 #![allow(dead_code)]
 

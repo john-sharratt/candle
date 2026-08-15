@@ -1,3 +1,13 @@
+//! Text generation with `based`, Hazy Research's hybrid linear-attention/sliding-window
+//! architecture (`candle_transformers::models::based::Model`).
+//!
+//! `--which` selects the checkpoint size (`360m`, `1b`, `1b-50b`, default `360m`),
+//! fetched from `hazyresearch/based-<size>` on the HF Hub; the GPT-2 tokenizer is
+//! always pulled from `openai-community/gpt2`. `--prompt` is required; temperature,
+//! top-p, seed, sample length, and repeat-penalty are the usual generation knobs.
+//! Runs greedy autoregressive decode with an incrementally-updated KV position and
+//! prints tokens as they stream.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

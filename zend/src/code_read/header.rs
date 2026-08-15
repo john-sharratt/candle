@@ -98,49 +98,20 @@ pub fn render_tool_call(path: &str, scope: &Scope) -> String {
 /// returns in a user turn.  `body` is the verbatim source slice for
 /// `scope.start_line..=scope.end_line`.
 pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body: &str) -> String {
-    let max_line = scope.end_line;
-    let width = digit_width(max_line);
-    let mut numbered = String::with_capacity(body.len() + (max_line as usize) * (width + 4));
-    let mut lines = body.split('\n').peekable();
-    let mut idx: u32 = 0;
-    while let Some(line) = lines.next() {
-        // A trailing newline on `body` produces a final empty
-        // element in the split — skip it so we don't emit a phantom
-        // numbered line past `end_line`.
-        if line.is_empty() && lines.peek().is_none() && body.ends_with('\n') {
-            break;
-        }
-        let line_no = scope.start_line + idx;
-        numbered.push_str(&format!("{line_no:width$}  {line}\n", width = width));
-        idx += 1;
-    }
-
-    let tag = language.fence_tag();
-    let fence_open = if tag.is_empty() {
-        String::from("```\n")
-    } else {
-        format!("```{tag}\n")
-    };
-    format!(
-        "<tool_response>\n{path} (lines {start}-{end}):\n\n{fence_open}{numbered}```\n</tool_response>",
-        path = path,
-        start = scope.start_line,
-        end = scope.end_line,
-        fence_open = fence_open,
-        numbered = numbered,
-    )
-}
-
-fn digit_width(mut n: u32) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut w = 0;
-    while n > 0 {
-        n /= 10;
-        w += 1;
-    }
-    w
+    // One renderer, shared with the live `file_read` tool
+    // (`zend_tools::tools::file::render`), so an ingested response and a runtime
+    // one are the same bytes. `total_lines` is the scope's own end: an ingest
+    // excerpt is a complete scope, so the header takes the plain `(lines a-b)`
+    // form rather than the truncated `(lines a-b of N)` one.
+    let excerpt = zend_tools::tools::file::render::numbered_excerpt(
+        path,
+        scope.start_line,
+        scope.end_line,
+        scope.end_line,
+        language.fence_tag(),
+        body,
+    );
+    format!("<tool_response>{excerpt}</tool_response>")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -294,16 +265,24 @@ mod tests {
         assert!(!r.contains("```text"));
     }
 
-    // ── digit_width ──────────────────────────────────────────────────────────
-
+    /// The live `file_read` tool derives its fence tag from the path while the
+    /// ingest derives it from a parsed [`Language`]; the two tables must agree or
+    /// a runtime read renders under a different tag than the corpus that taught
+    /// the model to read it. This is the only crate that can see both.
     #[test]
-    fn digit_width_matches_decimal_digits() {
-        assert_eq!(digit_width(0), 1);
-        assert_eq!(digit_width(1), 1);
-        assert_eq!(digit_width(9), 1);
-        assert_eq!(digit_width(10), 2);
-        assert_eq!(digit_width(99), 2);
-        assert_eq!(digit_width(100), 3);
-        assert_eq!(digit_width(9_999_999), 7);
+    fn fence_tags_agree_between_the_ingest_and_the_live_tool() {
+        for ext in [
+            "rs", "py", "pyi", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cc", "cpp",
+            "cxx", "hpp", "hxx", "hh", "java", "rb", "rake", "ru", "gemspec", "php", "phtml", "sh",
+            "bash", "zsh", "html", "htm", "css", "scss", "sass", "less", "md", "markdown", "mdx",
+            "yaml", "yml", "toml", "json", "json5", "jsonc", "txt", "rst", "adoc", "asciidoc",
+        ] {
+            let from_ingest = Language::from_extension(ext)
+                .expect("allowlisted extension")
+                .fence_tag();
+            let from_tool =
+                zend_tools::tools::file::render::fence_tag_for_path(&format!("a/b.{ext}"));
+            assert_eq!(from_ingest, from_tool, "extension {ext:?} disagrees");
+        }
     }
 }

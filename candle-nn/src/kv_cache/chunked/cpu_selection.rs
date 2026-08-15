@@ -1359,7 +1359,7 @@ mod tests {
         // spread ≈ 0.5 * 2 * 1.4427 ≈ 1.4427. Bin resolution = 1/63 ≈ 0.016.
         // f16 quantization adds a few % on top — slack 0.05 captures both.
         assert!((median - 0.5).abs() < 0.05, "median {median} not near 0.5");
-        let expected_spread = 0.5f32 * 2.0 * 1.4426950408889634;
+        let expected_spread = 0.5f32 * 2.0 * std::f32::consts::LOG2_E;
         assert!(
             (spread - expected_spread).abs() < 0.1,
             "spread {spread} not near {expected_spread}"
@@ -1391,7 +1391,8 @@ mod tests {
         // be a strong outlier vs the other 31 tokens (which dot to 0).
         let mut k = vec![0.0f32; HEAD_DIM * CHUNK_SIZE];
         let spike_t = 5;
-        k[0 * CHUNK_SIZE + spike_t] = 100.0;
+        // Dim 0, token `spike_t` — the row-major offset is just the token index.
+        k[spike_t] = 100.0;
         let mut q_mean = [0.0f32; HEAD_DIM];
         q_mean[0] = 1.0;
         let lo = 0.05f32;

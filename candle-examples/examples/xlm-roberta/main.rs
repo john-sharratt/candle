@@ -1,3 +1,15 @@
+//! XLM-RoBERTa multi-task example: fill-mask, cross-encoder reranking, or
+//! sequence classification, sharing one `XLMRobertaForMaskedLM`/
+//! `XLMRobertaForSequenceClassification` backbone.
+//!
+//! `--task` selects `fill-mask` (masked-token prediction demo sentences),
+//! `reranker` (BGE cross-encoder query/document relevance scoring, output
+//! sorted by score), or `text-classification` (BGE formality classifier).
+//! `--model` picks the matching checkpoint (`xlm-roberta-base/large`,
+//! `bge-reranker-base/large/base-v2`, `xlmr_formality_classifier`) and must
+//! agree with `--task` or the run bails. Weights load as F16, from
+//! safetensors or `pytorch_model.bin` fallback.
+
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};

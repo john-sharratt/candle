@@ -1,3 +1,11 @@
+//! FastViT image classification example.
+//!
+//! Loads `fastvit::fastvit` with a `Config` selected by `--which`
+//! (T8/T12/S12/SA12/SA24/SA36/MA36), fetching `model.safetensors` from
+//! `timm/fastvit_<variant>.apple_in1k` on the HF hub (or `--model` for a local
+//! file). Classifies a `--image` against 1000 ImageNet classes, printing the
+//! top-5 predictions.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

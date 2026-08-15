@@ -421,6 +421,31 @@ impl Device {
         }
     }
 
+    /// [`Self::alloc_uninit`], but the CUDA buffer comes from the arena `ticket`
+    /// names when there is one.
+    ///
+    /// This is how the generic tensor ops — `cat`, `contiguous`, the copying
+    /// reshapes — inherit their operand's arena without every one of them
+    /// learning about waves. CPU and Metal have no arenas, so they ignore it.
+    pub(crate) unsafe fn alloc_uninit_from(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        ticket: Option<crate::wave_provenance::WaveTicket>,
+    ) -> Result<Storage> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(device) => {
+                let storage = device.alloc_uninit_from(shape, dtype, ticket)?;
+                Ok(Storage::Cuda(storage))
+            }
+            _ => {
+                let _ = ticket;
+                self.alloc_uninit(shape, dtype)
+            }
+        }
+    }
+
     pub(crate) unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
         match self {
             Device::Cpu => {

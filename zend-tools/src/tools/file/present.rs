@@ -9,7 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PresentRequest {
-    /// VFS paths to surface to the user (1–10 entries, session-relative). Required.
+    /// Paths to surface to the user (1–10 entries; project or session files). Required.
     #[validate(length(min = 1, max = 10))]
     pub paths: Vec<String>,
     /// Optional short heading shown above the presented files. Defaults to none.
@@ -42,10 +42,12 @@ impl Tool for FilePresent {
         let mut presented = Vec::new();
         let mut missing = Vec::new();
         for path in &req.paths {
-            if ctx.vfs.read(path).is_some() {
-                presented.push(path.clone());
-            } else {
-                missing.push(path.clone());
+            // An unreadable workspace file (oversize / not UTF-8) counts as
+            // missing rather than failing the whole call — the other paths in the
+            // batch are still worth surfacing.
+            match ctx.vfs.read(path) {
+                Ok(Some(_)) => presented.push(path.clone()),
+                Ok(None) | Err(_) => missing.push(path.clone()),
             }
         }
         if presented.is_empty() {

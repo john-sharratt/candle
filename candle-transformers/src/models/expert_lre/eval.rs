@@ -567,6 +567,7 @@ fn per_layer_token_sequences(trace: &Trace, decode_max: usize) -> Vec<Vec<Vec<us
 /// layer on the next token).  Reports how predictable "needed next token" is
 /// from the current/recent active sets, versus the base rate and versus LRU.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn recurrence() {
     let Some(records) = load_fixture() else {
         println!("\n[recurrence] no fixture; capture first (see eval::report).");
@@ -875,6 +876,7 @@ fn simulate(trace: &Trace, budget: usize, policy: Evict, prefetch_pmi_k: usize, 
 }
 
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn cache_sim() {
     let Some(records) = load_fixture() else {
         println!("\n[cache_sim] no fixture; capture first (see eval::report).");
@@ -948,6 +950,7 @@ fn cache_sim() {
 /// Per-config (per-prompt) breakdown: proves the harness distinguishes test
 /// cases and shows how predictability varies by prompt.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn per_config() {
     let Some(records) = load_fixture() else {
         println!("\n[per_config] no fixture; capture first (see eval::report).");
@@ -1001,6 +1004,7 @@ fn train_predictor<P: Predictor>(p: &mut P, trace: &Trace, epochs: usize) {
 /// are identical across scorings, so training is not repeated).  Run with
 /// `--release` for fast iteration.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_prefetch() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_prefetch] no fixture; capture first (see eval::report).");
@@ -1475,6 +1479,7 @@ impl Predictor for Velocity {
 /// §7.7 — final combined model: SessionPrior (β=0.02, α=0.5) + arrival-
 /// specialised training + velocity boost.  Reports the best vs the §5 winner.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_final() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_final] no fixture.");
@@ -1590,6 +1595,7 @@ impl Predictor for TwoStage {
 /// §8 — two-stage base + session-fork architecture: sweep fork weight and fork
 /// formula (base fixed at pmi(0.5)).  Compares to the §6 SessionPrior champion.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_twostage() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_twostage] no fixture.");
@@ -1673,6 +1679,7 @@ fn champion(
 
 /// §9.2 — velocity tuning at β=0.01, α=0.5 (arrivals): γ × (fast,slow) decays.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn tune_vel() {
     let Some(records) = load_fixture() else {
         println!("\n[tune_vel] no fixture.");
@@ -1727,6 +1734,7 @@ fn tune_vel() {
 
 /// §9.3 — base-prior training amount (train_epochs) at the champion config.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn tune_epochs() {
     let Some(records) = load_fixture() else {
         println!("\n[tune_epochs] no fixture.");
@@ -1763,6 +1771,7 @@ fn tune_epochs() {
 
 /// §9.4 — locked champion: coverage vs fan-out k (deployment knob).
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn champion_kcurve() {
     let Some(records) = load_fixture() else {
         println!("\n[champion_kcurve] no fixture.");
@@ -1802,6 +1811,7 @@ fn champion_kcurve() {
 
 /// §9.5 — demote LFRU frequency-bonus scale tuning vs LRU.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn tune_demote() {
     let Some(records) = load_fixture() else {
         println!("\n[tune_demote] no fixture.");
@@ -2001,6 +2011,7 @@ fn cache_outcome(
 
 /// §10 — modelled cache outcome at 60% VRAM budget, 5% eviction, our models.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn cache_model_60() {
     let Some(records) = load_fixture() else {
         println!("\n[cache_model_60] no fixture.");
@@ -2097,6 +2108,7 @@ fn cache_model_60() {
 /// soft misses are overlapped.  Bandwidth (demand + prefetch transfers) is the
 /// second dimension.  Sweeps forced churn × K (preloads per layer) at 60% VRAM.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn cost_optimize() {
     let Some(records) = load_fixture() else {
         println!("\n[cost_optimize] no fixture.");
@@ -2227,6 +2239,7 @@ fn cost_optimize() {
 /// §9.1 — champion fine-tune: fine β×α grid on the full stack (arrival-
 /// specialised prior+session).  Trains once per fold, scores all (β,α).
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn tune_champion() {
     let Some(records) = load_fixture() else {
         println!("\n[tune_champion] no fixture.");
@@ -2305,6 +2318,7 @@ fn tune_champion() {
 /// warm-start) that then fast-adapts via per-token decay and may re-score with a
 /// different α.  Sweeps λ (adaptation speed) × α.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_fork() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_fork] no fixture.");
@@ -2361,6 +2375,7 @@ fn loocv_fork() {
 /// §8c — SessionPrior (count-level blend) with a fast-learning session fork:
 /// give the session matrix its own decay so it tracks the most recent tokens.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_sessiondecay() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_sessiondecay] no fixture.");
@@ -2400,6 +2415,7 @@ fn loocv_sessiondecay() {
 
 /// §7.6 — velocity (rising-trend) boost on top of SessionPrior.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_velocity() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_velocity] no fixture.");
@@ -2469,6 +2485,7 @@ fn top_k_excluding(scores: &[f64], active: &[usize], k: usize) -> Vec<usize> {
 
 /// §7.2 — Bayesian prior+session interpolation: sweep β (prior weight) at α=0.5.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_sessionprior() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_sessionprior] no fixture.");
@@ -2540,6 +2557,7 @@ fn train_mass(p: &mut MatrixPredictor, trace: &Trace, epochs: usize, mass: bool)
 /// §7.3 — mass-weighted observations (routing-weight P7).  Best base config
 /// (SessionPrior β=0.02, α=0.5); compares uniform vs mass-weighted counts.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_mass() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_mass] no fixture.");
@@ -2608,6 +2626,7 @@ fn loocv_mass() {
 
 /// §7.4 — arrival-specialised training (only learn cold transitions).
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_arrivals() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_arrivals] no fixture.");
@@ -2722,6 +2741,7 @@ impl Predictor for Recency {
 
 /// §7.5 — recency-fusion: add a same-layer recency channel to SessionPrior.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_combo() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_combo] no fixture.");
@@ -2771,6 +2791,7 @@ fn loocv_combo() {
 /// only during the held-out generation, not training).  Trains one full matrix
 /// per fold, clones per λ.  Prints the k=4 held-out coverage grid (λ × α).
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_tune() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_tune] no fixture.");
@@ -2843,6 +2864,7 @@ fn loocv_tune() {
 
 /// §5.3 — promote input-signal ablation (channels), pmi(0.5), +online.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_inputs() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_inputs] no fixture.");
@@ -2942,6 +2964,7 @@ fn loocv_metric<P: Predictor>(
 
 /// §5.2 — promote matrix size (layer resolution) ablation, pmi(0.5), +online.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_size() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_size] no fixture.");
@@ -2984,6 +3007,7 @@ fn loocv_size() {
 /// §5.4 — promote scoring-formula sweep.  Transform rules share one trained
 /// matrix per fold (counts identical); momentum re-trains with a decay.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_formula() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_formula] no fixture.");
@@ -3236,6 +3260,7 @@ fn demote_sim(
 
 /// §5.5 — demote group-eviction evaluation via 21-fold LOOCV.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn loocv_demote() {
     let Some(records) = load_fixture() else {
         println!("\n[loocv_demote] no fixture.");
@@ -3571,6 +3596,7 @@ fn wave_sim(
 /// §12 — wave simulation: estimate token rate vs prefetch depth × prefetch
 /// amount at 60% VRAM, 8 GB/s PCIe, 30 t/s compute budget.
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn wave_optimize() {
     let Some(records) = load_fixture() else {
         println!("\n[wave_optimize] no fixture.");
@@ -3734,6 +3760,7 @@ fn load_fixture() -> Option<Vec<RoutingRecord>> {
 }
 
 #[test]
+#[ignore = "offline predictor-tuning sweep, not a correctness test: minutes per run. `cargo test -- --ignored expert_lre::eval` to run them."]
 fn report() {
     let Some(records) = load_fixture() else {
         println!(

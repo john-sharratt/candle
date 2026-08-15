@@ -40,13 +40,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use sha2::{Digest, Sha256};
 
+use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{
@@ -236,6 +237,9 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 /// transient resource pressure); a cascade signals something
 /// systemic.
 pub const MAX_DECODE_FAILURES: usize = 16;
+
+/// Key this pass reports completeness under (see [`crate::ingest_report`]).
+pub const PASS_NAME: &str = "code_read";
 
 /// Number of files ingested concurrently by the worker pool. Each worker owns
 /// one file conversation and drives it through [`process_one_file`], ingesting
@@ -616,9 +620,12 @@ fn run_file_pool(
     // `Arc` so per-file `process_one_file` can hand a clone to the scheduler's
     // per-scope progress callback (which must be `'static`).
     let done = Arc::new(AtomicUsize::new(0));
-    let decode_failures = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
-    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    // Per-file failures are RECORDED, never propagated: the file keeps its prior
+    // generation live and the pass carries on, so a bad file (or a systemic VRAM
+    // squeeze) degrades the map instead of killing the daemon. The cap still
+    // stops a flood, as reported state rather than a fatal error. See
+    // `crate::ingest_report`.
+    let failures = Failures::new();
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(n_workers);
@@ -627,7 +634,7 @@ fn run_file_pool(
                 // Stop pulling new files on first-error abort OR a shutdown cancel.
                 // The current file finishes (the scheduler is still live), so no
                 // half-ingested file; the loader thread then drains the engine.
-                if abort.load(Ordering::Relaxed) || candle_conversation::ingest_cancelled() {
+                if failures.aborted() || candle_conversation::ingest_cancelled() {
                     return;
                 }
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
@@ -649,15 +656,22 @@ fn run_file_pool(
                     present_hashes,
                     total,
                     &done,
-                    &decode_failures,
+                    &failures,
                     progress,
                 ) {
-                    let mut slot = first_error.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(e);
+                    // An error escaping `process_one_file` is an unexpected one
+                    // (its own failure mode records and returns Ok). Record it
+                    // so it reaches the report instead of vanishing, and let the
+                    // cap decide whether to stop the pass.
+                    let n = failures.record(&file.path, format!("{e:#}"));
+                    tracing::warn!(
+                        target: "zend::code_read::ingest",
+                        file = %file.path,
+                        "file ingest failed (will retry next run): {e:#}",
+                    );
+                    if n > MAX_DECODE_FAILURES {
+                        failures.set_abort();
                     }
-                    abort.store(true, Ordering::Relaxed);
-                    return;
                 }
             }));
         }
@@ -666,20 +680,34 @@ fn run_file_pool(
         }
     });
 
-    if let Some(e) = first_error.into_inner().unwrap() {
-        return Err(e);
-    }
     // Reconcile the final progress to exactly `total`. Workers store
     // `set_step_progress` from their own `done` snapshot without a max, so
     // under the pool the last stored value can settle a step short even though
     // every unit ran; pin it to 100% now that the pool has fully drained.
     progress.set_step_progress(total as u64, total as u64);
-    let n_failed = decode_failures.load(Ordering::Relaxed);
-    tracing::info!(
-        n_files = per_file.len(),
-        n_decode_failures = n_failed,
-        "code_read per-file ingest complete",
-    );
+    let report = failures.into_report(per_file.len());
+    let n_failed = report.n_failed;
+    // Say "incomplete" when it is incomplete, and carry the CAUSE — the old
+    // line said "complete" with the count as a field, so a partial pass read as
+    // success and every diagnosis started by scrolling back through warnings.
+    if report.is_incomplete() {
+        tracing::error!(
+            target: "zend::code_read::ingest",
+            n_files = per_file.len(),
+            n_failed,
+            aborted = report.aborted,
+            first_failure = report.failures.first().map(|f| f.error.as_str()).unwrap_or("-"),
+            first_failure_file = report.failures.first().map(|f| f.unit.as_str()).unwrap_or("-"),
+            "code_read per-file ingest INCOMPLETE — affected files keep their prior \
+             generation and retry next pass (GET /v1/repo_map)",
+        );
+    } else {
+        tracing::info!(
+            n_files = per_file.len(),
+            "code_read per-file ingest complete",
+        );
+    }
+    crate::ingest_report::publish(PASS_NAME, report);
     Ok(n_failed)
 }
 
@@ -705,7 +733,7 @@ fn process_one_file(
     present_hashes: &HashSet<String>,
     total: usize,
     done: &Arc<AtomicUsize>,
-    decode_failures: &AtomicUsize,
+    failures: &Failures,
     progress: &Arc<LoadProgress>,
 ) -> anyhow::Result<()> {
     // Resume cache: this content hash was already in the (live, non-
@@ -857,7 +885,7 @@ fn process_one_file(
         // interruptible decode-wait unwinding (`wait_cancellable` →
         // `IngestCancelled`), not a genuine decode failure — the anyhow layer has
         // erased the variant, so the global flag is the source of truth. Don't
-        // count it toward the failure cap (that would risk tripping the abort at
+        // record it against the failure cap (that would risk tripping the abort at
         // shutdown); the partial was just tombstoned, so the file re-ingests next
         // run exactly like the mid-file cooperative-stop path below.
         if candle_conversation::ingest_cancelled() {
@@ -868,7 +896,7 @@ fn process_one_file(
             );
             return Ok(());
         }
-        let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = failures.record(&file.path, format!("{e:#}"));
         tracing::warn!(
             target: "zend::code_read::ingest",
             file = %file.path,
@@ -876,10 +904,13 @@ fn process_one_file(
             "file ingest failed (will retry next run; prior generation kept live): {e:#}",
         );
         if n > MAX_DECODE_FAILURES {
-            return Err(anyhow::anyhow!(
-                "code_read ingest: {n} file ingests failed \
-                 (cap = {MAX_DECODE_FAILURES}); aborting",
-            ));
+            // Carry the CAUSE, not just the count.
+            tracing::error!(
+                target: "zend::code_read::ingest",
+                n, cap = MAX_DECODE_FAILURES,
+                "code_read ingest stopping early: failure cap reached (last: {e:#})",
+            );
+            failures.set_abort();
         }
         return Ok(()); // conv drops → slot freed; superseded generation still live.
     }
@@ -1082,7 +1113,7 @@ fn layer_system_prompt(builder: &Builder, layer_name: &str, config: &SequenceCon
 
 /// Byte offset of the start of each line.  `offsets[i]` is the start
 /// of line `i + 1` (1-indexed).  Final entry is the source length.
-fn compute_line_offsets(bytes: &[u8]) -> Vec<usize> {
+pub(crate) fn compute_line_offsets(bytes: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(bytes.len() / 40 + 1);
     offsets.push(0);
     for (i, &b) in bytes.iter().enumerate() {
@@ -1096,7 +1127,12 @@ fn compute_line_offsets(bytes: &[u8]) -> Vec<usize> {
     offsets
 }
 
-fn slice_lines(bytes: &[u8], offsets: &[usize], start_line: u32, end_line: u32) -> String {
+pub(crate) fn slice_lines(
+    bytes: &[u8],
+    offsets: &[usize],
+    start_line: u32,
+    end_line: u32,
+) -> String {
     // 1-indexed inclusive.  Last entry of `offsets` is bytes.len().
     let lines_total = offsets.len().saturating_sub(1) as u32;
     if lines_total == 0 || start_line > lines_total {

@@ -1404,6 +1404,15 @@ impl Default for SchedulerConfig {
             // coupon-collector bound — instead of stalling on a 4096-token
             // target that the reduced-scope scope KV rarely reaches. ≤ the
             // model's `MAX_PREFILL_TOKENS` ceiling.
+            //
+            // Raising it to that 4096 ceiling is a measured dead end on a 16 GiB
+            // card, and the reason is not the one the ceiling suggests. A bigger
+            // forward IS faster in isolation — 4036 tokens ran at 1223 tok/s and
+            // 7322 at 1464, against ~900 at 3000 — but its KV is allocated
+            // BEFORE admission measures what is left, so ~576 MiB more in flight
+            // dropped availability from 1470 to 966 MiB and narrowed admission
+            // from 4.6 sequences per pass to 1.9. The wide forwards still
+            // happened; they became too rare to pay for the ones they starved.
             large_prefill_max_tokens: 2048,
         }
     }

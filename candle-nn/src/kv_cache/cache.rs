@@ -3,7 +3,7 @@
 //! This module provides `Cache` for single-tensor caches and `KvCache` for
 //! paired key-value caches, supporting both contiguous and chunked backing.
 
-use super::chunked::{arena_gid_stride, ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE};
+use super::chunked::{ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE, GID_STRIDE};
 use ahash::HashMap;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
@@ -43,14 +43,6 @@ impl ChunkedCache {
     /// Get the max_blocks for this cache.
     pub(crate) fn max_blocks(&self) -> usize {
         self.backing.max_blocks()
-    }
-
-    pub(crate) fn k_arenas(&self) -> Vec<Tensor> {
-        self.backing.k_arenas()
-    }
-
-    pub(crate) fn v_arenas(&self) -> Vec<Tensor> {
-        self.backing.v_arenas()
     }
 
     /// Execute a read operation on the arena storage.
@@ -113,7 +105,12 @@ impl ChunkedCache {
 
     /// Write contiguous K/V data to the chunked backing.
     /// Expects tensors shaped (1, n_kv_head, len, head_dim).
-    pub(crate) fn write_contiguous(&self, offset: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+    pub(crate) fn write_contiguous(
+        &self,
+        offset: usize,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
+    ) -> Result<()> {
         self.backing.write_contiguous(self.batch_idx, offset, k, v)
     }
 
@@ -177,26 +174,10 @@ impl Cache {
         }
     }
 
-    /// Get the K arenas for chunked caches.
-    pub fn chunked_k_arenas(&self) -> Option<Vec<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.k_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
-    /// Get the V arenas for chunked caches.
-    pub fn chunked_v_arenas(&self) -> Option<Vec<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.v_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Get the number of chunks per arena for chunked caches.
     pub fn chunked_arena_chunks(&self) -> Option<usize> {
         match &self.storage {
-            CacheStorage::Chunked(_) => Some(arena_gid_stride()),
+            CacheStorage::Chunked(_) => Some(GID_STRIDE),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -286,17 +267,6 @@ impl Cache {
         }
     }
 
-    /// Count the number of quantized arenas.
-    ///
-    /// Returns (quantized_count, total_count) tuple.
-    /// Useful for validating that quantization is actually occurring.
-    pub fn count_quantized_arenas(&self) -> Option<candle::Result<(usize, usize)>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.backing.count_quantized_arenas()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Calculate the percentage of a sequence's tokens stored in quantized arenas.
     ///
     /// Returns (quantized_tokens, total_tokens) based on which ChunkRefs point to quantized arenas.
@@ -356,28 +326,13 @@ impl Cache {
         }
     }
 
-    /// Get the per-head table tensor for decode kernel consumption.
-    ///
-    /// Returns the GPU tensor of shape `(num_arenas * n_kv_head, 7)` i64,
-    /// synced to GPU. Each row is a `PerHeadTableEntry` with pre-resolved
-    /// pointers, byte offsets, byte strides, and format metadata per head.
-    pub fn chunked_per_head_table_and_sync(&self) -> Option<candle::Result<Tensor>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => Some(c.backing.per_head_table_sync()),
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
     /// Get sealed chunk descriptors for this cache slot's live sequence.
     ///
     /// Returns `None` for contiguous caches or if the backing has no live sequence
     /// for this slot's batch index.
     pub fn chunked_live_chunks_as_sealed(&self) -> Option<Vec<super::SealedChunk>> {
         match &self.storage {
-            CacheStorage::Chunked(c) => {
-                let arena_infos = c.backing.resolve_arena_info().ok()?;
-                c.backing.live_chunks_as_sealed(c.batch_idx, &arena_infos)
-            }
+            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -393,26 +348,9 @@ impl Cache {
     ) -> Option<candle::Result<Vec<super::HostSealedChunk>>> {
         match &self.storage {
             CacheStorage::Chunked(c) => {
-                let arena_info = match c.backing.resolve_arena_info() {
-                    Ok(a) => a,
-                    Err(e) => return Some(Err(e)),
-                };
-                let chunks = c.backing.live_chunks_as_sealed(c.batch_idx, &arena_info)?;
+                let chunks = c.backing.live_chunks_as_sealed(c.batch_idx)?;
                 Some(c.backing.dump_sealed_to_host(&chunks, device))
             }
-            CacheStorage::Contiguous { .. } => None,
-        }
-    }
-
-    /// Like [`Self::chunked_live_chunks_as_sealed`] but reuses an already-resolved
-    /// `arena_info` instead of resolving it again — the caller (e.g.
-    /// `build_slot_headers`) resolves it once per forward and passes it per cache.
-    pub fn chunked_live_chunks_as_sealed_with(
-        &self,
-        arena_info: &[super::ResolvedArenaInfo],
-    ) -> Option<Vec<super::SealedChunk>> {
-        match &self.storage {
-            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx, arena_info),
             CacheStorage::Contiguous { .. } => None,
         }
     }
@@ -742,11 +680,25 @@ impl Cache {
     /// This makes an offset-`N` re-prefill idempotent — re-running a prefill at the
     /// same offset must not stack stale tail chunks. Unlike `reset`, it keeps the
     /// backing slot allocated. No-op when already ≤ `offset` tokens.
-    pub(crate) fn truncate_chunked_to_tokens(&mut self, offset: usize) {
-        self.current_seq_len = offset;
+    /// Cut this layer's chunked storage back to `offset` cum-tokens.
+    ///
+    /// **Fallible, and the failure must reach the caller.** This is called once
+    /// per layer with a common offset (`admit_wave_kv`), so a failure that is
+    /// swallowed here does not truncate one layer while the other forty-seven
+    /// truncate — and the host-side `current_seq_len` is updated either way, so
+    /// nothing downstream can tell. The layers then hold different token windows
+    /// for the same sequence, which no single decode position map can describe;
+    /// it surfaced as `chunked decode layout diverged across layers … First
+    /// difference at chunk 67: (offset 0, usage 26) … (offset 0, usage 25)` on
+    /// the first decode after a fork.
+    ///
+    /// The length is set only once the storage agrees with it, for the same
+    /// reason: a length that describes a truncation that did not happen is worse
+    /// than no truncation, because it is not detectable.
+    pub(crate) fn truncate_chunked_to_tokens(&mut self, offset: usize) -> Result<()> {
         match &mut self.storage {
             CacheStorage::Chunked(c) => {
-                let _ = c.backing.truncate_sequence_to_tokens(c.batch_idx, offset);
+                c.backing.truncate_sequence_to_tokens(c.batch_idx, offset)?;
             }
             CacheStorage::Contiguous { all_data } => {
                 if offset == 0 {
@@ -754,6 +706,8 @@ impl Cache {
                 }
             }
         }
+        self.current_seq_len = offset;
+        Ok(())
     }
 
     /// Fork this cache, creating a new cache that shares data via copy-on-write.
@@ -1091,7 +1045,15 @@ impl KvCache {
     ///
     /// Expects tensors shaped (1, n_kv_head, len, head_dim).
     /// For quantized storage, data is quantized on write.
-    pub fn chunked_write_kv(&self, offset: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+    /// `k`/`v` may live on an inference wave: this copies their bytes into the
+    /// arena rather than retaining a view, so nothing here outlives the
+    /// generation they came from.
+    pub fn chunked_write_kv(
+        &self,
+        offset: usize,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
+    ) -> Result<()> {
         match (&self.k.storage, &self.v.storage) {
             (CacheStorage::Chunked(k_c), CacheStorage::Chunked(_v_c)) => {
                 // Both K and V share the same backing
@@ -1109,14 +1071,6 @@ impl KvCache {
             CacheStorage::Chunked(c) => c.read_contiguous(offset, len),
             _ => candle::bail!("chunked_read_kv requires chunked backing"),
         }
-    }
-
-    /// Count the number of quantized arenas.
-    ///
-    /// Returns (quantized_count, total_count) tuple, or None if not chunked.
-    /// Useful for validating that quantization is actually occurring.
-    pub fn count_quantized_arenas(&self) -> Option<candle::Result<(usize, usize)>> {
-        self.k.count_quantized_arenas()
     }
 
     /// Calculate the percentage of a sequence's tokens stored in quantized arenas.
@@ -1305,9 +1259,15 @@ impl KvCache {
     /// Truncate both K and V to exactly `offset` cum-tokens, freeing any chunks
     /// beyond it. Makes an offset-`N` (re)prefill idempotent (see
     /// [`Cache::truncate_chunked_to_tokens`]).
-    pub fn truncate_to_offset(&mut self, offset: usize) {
-        self.k.truncate_chunked_to_tokens(offset);
-        self.v.truncate_chunked_to_tokens(offset);
+    ///
+    /// Both sides run even when the first fails: K and V must land at the same
+    /// length or every later read pairs a key with the wrong value, so a K
+    /// failure must not leave V untried. The first error is still reported —
+    /// after both truncations have executed.
+    pub fn truncate_to_offset(&mut self, offset: usize) -> Result<()> {
+        let k = self.k.truncate_chunked_to_tokens(offset);
+        let v = self.v.truncate_chunked_to_tokens(offset);
+        k.and(v)
     }
 
     /// Fork this KV cache, creating a new cache that shares data via copy-on-write.

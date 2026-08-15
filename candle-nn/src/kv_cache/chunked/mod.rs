@@ -22,6 +22,8 @@
 mod alloc;
 mod arena;
 mod backing;
+#[cfg(feature = "cuda")]
+pub(crate) mod bump_arena;
 mod chunk_ops;
 mod compress;
 mod compression_policy;
@@ -33,14 +35,31 @@ mod gpu_chunks;
 #[cfg(not(feature = "cuda"))]
 #[path = "gpu_chunks_dummy.rs"]
 mod gpu_chunks;
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_test_lock;
+#[cfg(feature = "cuda")]
+pub mod guard;
 mod head_gids;
 mod io;
 mod meta_pool;
 pub mod migrate;
-pub mod migrate_guard;
+pub mod migrate_flight;
+#[cfg(feature = "cuda")]
+pub(crate) mod region_pool;
+#[cfg(feature = "cuda")]
+pub(crate) mod reservation;
 pub mod sampled_selection;
 mod sequence_ops;
+mod size_class;
+#[cfg(feature = "cuda")]
+pub(crate) mod slot_state_arena;
 mod types;
+mod wave_census;
+pub mod wave_plan;
+/// Unconditional: the zone is pure arithmetic over addresses and slot indices,
+/// so its invariants — the ones a mis-set boundary would violate — are provable
+/// on a machine with no GPU.
+pub mod weight_zone;
 
 #[cfg(test)]
 mod tests;
@@ -62,14 +81,19 @@ pub use compression_policy::{
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
-pub use gid_pool::{ChunkGid, ChunkGidPool, GpuArenaFormatStats};
+pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
-pub use migrate_guard::{
-    enter_migrate, migrate_in_flight, try_enter_relief, MigrateGuard, ReliefGuard,
+pub use migrate_flight::{migrate_flight, migrate_in_flight, MigrateFlight};
+pub use size_class::{
+    all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
+    payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
-pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};
+pub use types::{ChunkMeta, CHUNK_SIZE};
 pub use types::{LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
+pub use weight_zone::{
+    RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+};
 
 // Re-export for use within submodules and tests
 pub use arena::ArenaKey;
@@ -83,10 +107,24 @@ pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 // `location` field is the coarse-grained tier tag).
 pub use super::arena_table::ArenaLocation;
 
+pub use alloc::class_promotion_count;
+#[cfg(feature = "cuda")]
+pub use bump_arena::{
+    begin_forward, begin_wave, end_wave_transient, persistence_domain_stats, plan_wave_transient,
+    wave_domain_stats, BumpRange, ForwardOpen, Generation as WaveGeneration, KV_ARENA_MID_WAVE,
+    WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES,
+};
+#[cfg(feature = "cuda")]
+pub use guard::expect_kv_range;
+#[cfg(feature = "cuda")]
+pub use region_pool::{
+    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
+    weight_capacity_bytes, weight_floor_after,
+};
+#[cfg(feature = "cuda")]
+pub use region_pool::{region_stats, span_layout, RegionStats, SpanLayout, REGION_BYTES};
+#[cfg(feature = "cuda")]
+pub use slot_state_arena::stats as slot_state_stats;
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 #[cfg(feature = "cuda")]
 pub use alloc::vram_budget_available;
-// Engine-installed KV VRAM reserve (replaces the card-scaled default with the
-// engine's own measured budget).
-#[cfg(feature = "cuda")]
-pub use alloc::set_vram_reserve_bytes;

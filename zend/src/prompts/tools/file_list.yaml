@@ -1,11 +1,18 @@
 name: file_list
 category: Files
-description: Enumerate the files currently in the session virtual filesystem, optionally narrowed to a path prefix. Returns names and sizes, not file contents.
+description: 'List the files visible to this session: the project''s working directory plus anything written or edited during the session, which shadows the file of the same path on disk. Optionally narrowed to a path prefix — omit it to list from the project root. Ignored paths (per .gitignore and friends) never appear, and hidden dotfiles are omitted the way `ls` omits them though they still read fine by exact path. Results are paged: the response''s `paging` reports the total and, when more remain, a `next_page` to pass back as `page`. Returns names, sizes, and line counts, not file contents; an entry carries `modified: true` when this session has changed it. Use file_read to get a file''s contents.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    page:
+      description: Zero-based page of results to return. Defaults to 0. When the response's `paging.next_page` is set, pass it here to read the following page.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
     prefix:
-      description: VFS path prefix to filter results (e.g. `src/`). Defaults to "" (lists all files).
+      description: 'Path prefix to filter results (e.g. `src/`). Defaults to "" — the project root.'
       type:
       - string
       - 'null'
@@ -103,4 +110,48 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/scripts"}}
+  </tool_call><|projection|>
+- |-
+  use a tool to read the root directory of the project<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to see the root directory of the project. Looking at the available tools, file_list is the one that lists files — it enumerates the project's working directory plus anything written or edited during this<|projection|> session. The prefix parameter narrows the results to a path, and omitting it lists from the project root, which is exactly what is being asked for.
+
+  So I call file_list with an empty prefix and get the file names, sizes,<|projection|> and line counts at the top of the project.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": ""}}
+  </tool_call><|projection|>
+- |-
+  what files are in this project?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user is asking what files the project contains. That is a directory listing, and file_list is the tool for it — it enumerates the working directory and skips anything ignored by .gitignore,<|projection|> so what comes back is the meaningful file set rather than build output.
+
+  No subdirectory was named, so the prefix should be empty to list from the project root.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": ""}}
+  </tool_call><|projection|>
+- |-
+  run the file_list tool on the root directory now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user has named the tool explicitly: file_list, on the root directory. It takes a single optional prefix parameter, and an empty prefix means the project root.<|projection|> There is nothing to disambiguate — I just issue the call with the prefix set to the empty string.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": ""}}
+  </tool_call><|projection|>
+- |-
+  list the files under candle-core/src<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants a listing beneath candle-core/src. That is a path prefix, which is what file_list's prefix parameter takes, so I pass "candle-core/src" and only files under<|projection|> that directory come back. Each entry carries its path, byte size, and line count, plus a modified flag if this session has changed it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_list", "arguments": {"prefix": "candle-core/src"}}
   </tool_call><|projection|>

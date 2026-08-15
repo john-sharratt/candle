@@ -1,3 +1,13 @@
+//! Mixtral-8x7B (sparse mixture-of-experts) text generation.
+//!
+//! Fixed to the `mistralai/Mixtral-8x7B-v0.1` checkpoint (`--model-id`
+//! overrides), loaded via `candle_transformers::models::mixtral::Model`
+//! from sharded safetensors (`hub_load_safetensors` on the HF index file).
+//! Weights load as BF16 when the device supports it. `--use-flash-attn`
+//! is supported; sampling is a plain temperature/top-p `LogitsProcessor`
+//! with repeat penalty, same shape as the other dense-LM examples in this
+//! crate.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

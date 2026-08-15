@@ -1,3 +1,14 @@
+//! Instruct-tuned text generation with GGUF-quantized Qwen2/Qwen2.5/Qwen3-8B/
+//! DeepSeek-R1-Distill-Qwen models (`quantized_qwen2::ModelWeights`).
+//!
+//! `--which` selects one of many named size/quant variants (0.5b through 72b,
+//! several Q4/Q5/Q6/F16 GGUF builds, `deepseekr1-qwen7b`) and resolves the
+//! matching HF repo/filename/tokenizer. Prompts are wrapped in ChatML
+//! (`<|im_start|>`) or the DeepSeek `<｜User｜>` template. `--split-prompt`
+//! exercises chunked prefill plus a `KvCaches` partial/full truncate self-test
+//! (batches of 100 tokens, truncate to 300, then full reset) with per-batch
+//! CUDA-synchronized timing.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

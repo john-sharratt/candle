@@ -1,3 +1,13 @@
+//! Text generation with Google's RecurrentGemma (Griffin architecture: local
+//! attention + linear recurrent blocks, not standard transformer attention),
+//! base 2B or 2b-it instruct, in either float (`recurrent_gemma::Model`) or
+//! GGUF-quantized (`quantized_recurrent_gemma::Model`, `--quantized`, weights
+//! from `lmz/candle-gemma`) form.
+//!
+//! `--which` picks `google/recurrentgemma-2b` or `-2b-it`. Sampling defaults
+//! to top-k=250, switching to ArgMax/TopK/TopKThenTopP based on
+//! `--temperature`/`--top-p`. BF16 on CUDA, F32 elsewhere.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

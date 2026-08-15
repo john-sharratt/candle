@@ -15,6 +15,8 @@ use super::types::ExpertSlot;
 use super::types::MoeInput;
 #[cfg(feature = "cuda")]
 use crate::models::profile::{profile_now, ProfileAccumulator};
+use candle::cuda_backend::wave_provenance::{LeaseOrigin, WaveTicket};
+use candle::cuda_backend::Backing;
 use candle::{Result, Tensor};
 #[cfg(not(feature = "cuda"))]
 use candle_nn::Module;
@@ -105,12 +107,17 @@ pub(crate) fn extract_weight_info(
 /// Each expert has 1–N tokens from potentially different sessions.
 /// The `token_ids` index into `xs` and `ys`; `weight_ids` index into `weights_flat`.
 #[cfg(feature = "cuda")]
+/// `wave` seeds this phase's inheritance chain. The gather is the first
+/// allocation made inside the FFN generation, so it takes the ticket directly;
+/// the gate/up/SwiGLU/down GEMMs after it inherit from their operands and need
+/// no further mention of the wave.
 pub fn compute_experts_grouped(
     input: &MoeInput,
     ys: &mut Tensor,
     experts: &[(&ExpertSlot, &[u32], &[u32])],
     weights_flat: &Tensor,
     profile: &mut ProfileAccumulator,
+    wave: Option<WaveTicket>,
 ) -> Result<()> {
     if experts.is_empty() {
         return Ok(());
@@ -148,8 +155,51 @@ pub fn compute_experts_grouped(
         return Ok(());
     }
 
+    // **Both id tables are device indices, so they are checked here — before the
+    // gather — rather than where they happen to be used on the host.**
+    //
+    // `token_ids` index `xs`/`ys` and `weight_ids` index `weights_flat`, and
+    // both are handed to kernels that dereference them with no bound of their
+    // own. The one host-side index that would notice a bad `token_id` is the
+    // `token_starts[token_id + 1]` accumulation in the scatter setup below, and
+    // that runs *after* the gather and all three grouped GEMMs — so an
+    // out-of-range id reaches `fused_moe_gather_q8a128` as a device offset
+    // first and reads off the end of the activation arena. The Rust bounds
+    // check never gets the chance, and the result is a
+    // CUDA_ERROR_ILLEGAL_ADDRESS attributed to whichever thread next
+    // synchronises.
+    //
+    // Refusing here costs one pass over a few thousand `u32`s against a kernel
+    // launch that cannot be undone (`docs/elastic_vram_partition.md`
+    // principle 7). The ids come from routing, and this engine has already had
+    // one degenerate-routing fault — `moe_route` leaking a `bi = n_experts`
+    // sentinel on `-inf`/NaN logits — whose clamp fixed the symptom while the
+    // NaN-logit source stayed open. This is where that would surface next.
+    let n_tokens_in = ys.dim(0)?;
+    let n_weights = weights_flat.elem_count();
+    for (e, &(_slot, toks, wids)) in experts.iter().enumerate() {
+        if let Some(&bad) = toks.iter().find(|&&t| t as usize >= n_tokens_in) {
+            candle::bail!(
+                "grouped expert compute: expert {e} routes token id {bad}, but this \
+                 forward has only {n_tokens_in} tokens. The gather would read past \
+                 the activation arena and fault inside the kernel."
+            );
+        }
+        if let Some(&bad) = wids.iter().find(|&&w| w as usize >= n_weights) {
+            candle::bail!(
+                "grouped expert compute: expert {e} names routing-weight id {bad}, \
+                 but `weights_flat` holds {n_weights}. The scatter would read past \
+                 it and fault inside the kernel."
+            );
+        }
+    }
+
     // ── Upload token_ids once (shared by gather + scatter) ──
-    let tok_ids_dev = cuda_dev.memcpy_stod(&all_token_ids)?;
+    // Host-built tables have no device operand to inherit from, so they name
+    // the submitting layer's span directly — the same span the gather and
+    // scatter operands they index into were carved from.
+    let upload_root = Backing::from_ticket(wave);
+    let tok_ids_dev = cuda_dev.memcpy_stod_from(&all_token_ids, upload_root)?;
 
     // ── Extract weight pointers for each projection ──
     let mut gate_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
@@ -167,11 +217,52 @@ pub fn compute_experts_grouped(
         gate_ptrs.push(gp);
         up_ptrs.push(up);
         down_ptrs.push(dp);
-        if gate_shape.is_none() {
-            gate_shape = Some(gs);
-            down_shape = Some(ds);
-            gate_dtype = Some(gd);
-            down_dtype = Some(dd);
+        match (&gate_shape, &down_shape) {
+            (None, None) => {
+                gate_shape = Some(gs);
+                down_shape = Some(ds);
+                gate_dtype = Some(gd);
+                down_dtype = Some(dd);
+            }
+            // **Every expert must match the first, because only the first is
+            // read.** `grouped_qmatmul` takes ONE `nrows` and ONE dtype and
+            // applies them to the whole pointer array, so an expert whose
+            // weights disagree is walked at another expert's stride. Reading
+            // long runs off the end of that slot, and a slot near the top of
+            // the weight zone is adjacent to `span_end` — past which the
+            // reservation is reserved but never mapped, so the over-read is a
+            // genuine CUDA_ERROR_ILLEGAL_ADDRESS rather than merely wrong data.
+            // That is the fault this drained to `grouped_qmatmul(gate)`.
+            //
+            // The GPU-native path already refuses a mixed set for exactly this
+            // reason (`GpuDispatchTables::build` returns `None` on a dims
+            // mismatch and keeps the host path). The host path had no such
+            // check, so the mismatch it was falling back to was unguarded.
+            (Some(g0), Some(d0)) => {
+                if gs.dims() != g0.dims()
+                    || ds.dims() != d0.dims()
+                    || Some(gd) != gate_dtype
+                    || Some(dd) != down_dtype
+                {
+                    candle::bail!(
+                        "grouped expert compute: expert {} has gate {:?}/{:?} down {:?}/{:?}, \
+                         but the batch was sized from the first expert's gate {:?}/{:?} down \
+                         {:?}/{:?}. The grouped GEMM applies one stride to every weight \
+                         pointer, so this expert would be read at the wrong length and walk \
+                         off its slot.",
+                        gate_ptrs.len() - 1,
+                        gs.dims(),
+                        gd,
+                        ds.dims(),
+                        dd,
+                        g0.dims(),
+                        gate_dtype,
+                        d0.dims(),
+                        down_dtype,
+                    );
+                }
+            }
+            _ => unreachable!("gate_shape and down_shape are set together"),
         }
     }
 
@@ -185,6 +276,117 @@ pub fn compute_experts_grouped(
     // Down shape: [hidden_dim, intermediate_dim] → nrows=hidden_dim, ncols=intermediate_dim
     let (down_nrows, down_ncols) = down_shape.dims2()?;
 
+    // **Does every weight pointer still name an expert slot?**
+    //
+    // The uniformity check above catches a *mismatched* expert. This catches the
+    // consequence directly, and so covers any other way a pointer goes wrong —
+    // a slot stale from relocation, an eviction that reused the address, an
+    // arithmetic slip in `slot_base`. It is the check that caught the residency
+    // table `truncate_tables` could not reach: two experts resolving to one
+    // slot, and slots an exact multiple of `slot_bytes` below the floor.
+    //
+    // The pointer is checked, not its extent. A slot's byte length here would
+    // have to be derived a second time — `slot_offsets` sizes one from
+    // `geom.*_repacked_size`, the GEMX/KO packing the kernel walks, which is
+    // not the GGML `elems/block × type_size` this file can compute — and a
+    // guard that invents a size reports its own arithmetic as an overrun.
+    if let Some(layout) = candle_nn::kv_cache::span_layout(0) {
+        let check = |ptrs: &[u64], side: &str| -> Result<()> {
+            for (e, &p) in ptrs.iter().enumerate() {
+                if p == 0 {
+                    candle::bail!("grouped expert compute: {side} pointer for expert {e} is null");
+                }
+                // Expert slots live at or above `weight_floor`, KV below it. A
+                // weight pointer that has fallen below the floor is naming
+                // ground the KV side now owns — which is what a slot relocation
+                // or eviction the tables did not follow looks like from here.
+                //
+                // `weight_floor` is read from the live layout, not assumed; it
+                // moves whenever the weight side concedes ground.
+                if p >= layout.span_base && p < layout.weight_floor {
+                    candle::bail!(
+                        "grouped expert compute: {side} weights for expert {e} are at {p:#x}, \
+                         below the weight floor {:#x} — that is KV ground, not an expert \
+                         slot. The pointer outlived the slot it named (relocation or \
+                         eviction), and the GEMM would read whatever the KV side put there.",
+                        layout.weight_floor,
+                    );
+                }
+                // **Outside the reservation is the case that actually faults.**
+                //
+                // Everything *inside* the span is mapped end to end, so a wrong
+                // pointer there reads garbage and raises nothing. The addresses
+                // that genuinely fault are below `span_base` and at or past
+                // `span_end`, where the reservation is reserved but never
+                // backed. An expert weight pointer should be neither: the whole
+                // weight zone lives in `[weight_floor, span_end)`.
+                //
+                // `slot_base(i) = span_end − (i+1)·slot_bytes` walks *down* as
+                // the index rises, so a slot index past what the span can hold
+                // produces an address below `span_base` — outside, unmapped,
+                // and fatal on first touch.
+                if p < layout.span_base || p >= layout.span_end {
+                    candle::bail!(
+                        "grouped expert compute: {side} weights for expert {e} are at {p:#x}, \
+                         outside the reservation [{:#x},{:#x}). That address is not backed by \
+                         any mapping, so the GEMM faults on first touch — this is the \
+                         CUDA_ERROR_ILLEGAL_ADDRESS, caught at the descriptor.",
+                        layout.span_base,
+                        layout.span_end,
+                    );
+                }
+            }
+            Ok(())
+        };
+        check(&gate_ptrs, "gate")?;
+        check(&up_ptrs, "up")?;
+        check(&down_ptrs, "down")?;
+    }
+
+    // **The GEMM's other operand: the row ranges it hands each expert.**
+    //
+    // `grouped_qmatmul` gives expert `e` the rows
+    // `[expert_offsets[e], expert_offsets[e+1])` of the gathered activations, so
+    // these offsets are the kernel's only bound on a buffer holding exactly
+    // `total_batch` rows. An offset past the end walks off the gather output,
+    // and the kernel has no way to notice.
+    //
+    // Every quantity compared here is one the surrounding code already computed
+    // — `expert_offsets` is the prefix sum built above, `total_batch` is
+    // `all_token_ids.len()`. A guard that derives a bound independently is
+    // testing its own arithmetic, not the code.
+    if expert_offsets.len() != num_experts + 1 {
+        candle::bail!(
+            "grouped expert compute: {} expert offsets for {num_experts} experts (want {})",
+            expert_offsets.len(),
+            num_experts + 1
+        );
+    }
+    if expert_offsets[0] != 0 {
+        candle::bail!(
+            "grouped expert compute: expert offsets start at {}, not 0",
+            expert_offsets[0]
+        );
+    }
+    for w in expert_offsets.windows(2) {
+        if w[1] < w[0] {
+            candle::bail!(
+                "grouped expert compute: expert offsets go backwards ({} then {}), so one \
+                 expert would be given a negative row count",
+                w[0],
+                w[1]
+            );
+        }
+    }
+    let last = *expert_offsets.last().expect("checked non-empty above");
+    if last as usize != total_batch {
+        candle::bail!(
+            "grouped expert compute: expert offsets end at {last} but the gather produced \
+             {total_batch} rows. The GEMM would read rows past the end of the gathered \
+             activations."
+        );
+    }
+
     // ── Gather + grouped gate/up/down → down_out. B3 int8: byte-gather the already-quantized
     // q8a1024 router input (no gather-then-quantize); Off: float-gather then FP gemx. ──
     let down_out = match input {
@@ -193,7 +395,13 @@ pub fn compute_experts_grouped(
                 fused_moe_gather_q8a128, grouped_qmatmul, silu_mul_q8a128, DynamicTensor,
             };
             let t = profile_now();
-            let stacked_q8 = fused_moe_gather_q8a128(op, &tok_ids_dev, total_batch, cuda_dev)?;
+            let stacked_q8 = fused_moe_gather_q8a128(
+                op,
+                &tok_ids_dev,
+                total_batch,
+                cuda_dev,
+                wave.map_or(Backing::Owned, |t| Backing::Lease(LeaseOrigin::Wave(t))),
+            )?;
             profile.record("gemm_gather", t);
             let t = profile_now();
             let gate_out = grouped_qmatmul(
@@ -203,6 +411,7 @@ pub fn compute_experts_grouped(
                 gate_nrows,
                 &expert_offsets,
                 cuda_dev,
+                stacked_q8.backing(),
             )?;
             profile.record("gemm_gate", t);
             let t = profile_now();
@@ -213,11 +422,13 @@ pub fn compute_experts_grouped(
                 gate_nrows,
                 &expert_offsets,
                 cuda_dev,
+                stacked_q8.backing(),
             )?;
             profile.record("gemm_up", t);
             // B4: fused SwiGLU → q8a128 (silu(gate)·up quantized in one kernel), feeds the down GEMM.
             let t = profile_now();
-            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, cuda_dev)?;
+            let inter_acts =
+                silu_mul_q8a128(&gate_out, &up_out, cuda_dev, gate_out.cuda_backing())?;
             profile.record("gemm_silu_mul", t);
             let t = profile_now();
             let down_out = grouped_qmatmul(
@@ -227,6 +438,7 @@ pub fn compute_experts_grouped(
                 down_nrows,
                 &expert_offsets,
                 cuda_dev,
+                inter_acts.backing(),
             )?;
             profile.record("gemm_down", t);
             // The int8 matmul emits F32; the fused scatter requires the compute dtype (= ys).
@@ -329,14 +541,14 @@ pub fn compute_experts_grouped(
     for i in 1..=num_tokens {
         token_starts[i] += token_starts[i - 1];
     }
-    let token_starts_dev = cuda_dev.memcpy_stod(&token_starts)?;
+    let token_starts_dev = cuda_dev.memcpy_stod_from(&token_starts, upload_root)?;
 
     // Reorder weight_ids to token-major using the same permutation.
     let reordered_weight_ids: Vec<u32> = perm.iter().map(|&i| all_weight_ids[i as usize]).collect();
-    let reordered_wt_ids_dev = cuda_dev.memcpy_stod(&reordered_weight_ids)?;
+    let reordered_wt_ids_dev = cuda_dev.memcpy_stod_from(&reordered_weight_ids, upload_root)?;
 
     // Upload perm so the kernel can gather from down_out directly — no index_select needed.
-    let perm_dev = cuda_dev.memcpy_stod(&perm)?;
+    let perm_dev = cuda_dev.memcpy_stod_from(&perm, upload_root)?;
 
     let t = profile_now();
     candle::quantized::cuda::fused_deterministic_scatter(

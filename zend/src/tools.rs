@@ -25,6 +25,7 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use candle_conversation::models::Dialect;
@@ -462,10 +463,20 @@ pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult
 pub fn format_tool_responses(results: &[ToolResult]) -> String {
     let mut out = String::new();
     for r in results {
-        let body = serde_json::to_string(&r.response)
-            .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string());
         out.push_str("<tool_response>");
-        out.push_str(&body);
+        match &r.response {
+            // A string result is already rendered for the model — placed in the
+            // block verbatim rather than JSON-encoded. `file_read` returns a
+            // numbered, fenced excerpt this way, so a live response is
+            // byte-identical to the `code_reading` ingest's prefilled ones;
+            // encoding it would collapse the source to one line of `\n` escapes.
+            Value::String(rendered) => out.push_str(rendered),
+            other => {
+                let body = serde_json::to_string(other)
+                    .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string());
+                out.push_str(&body);
+            }
+        }
         out.push_str("</tool_response>\n");
     }
     out
@@ -473,26 +484,26 @@ pub fn format_tool_responses(results: &[ToolResult]) -> String {
 
 // ── Public helper bundle ─────────────────────────────────────────────────────
 
-/// Per-session tool execution context.  Holds the [`ToolContext`] and
+/// Tool execution context for the daemon.  Holds the [`ToolContext`] and
 /// the optional [`zend_tools::SubagentRunner`] (currently always `None`
 /// — subagent loops aren't wired yet).  Cloned cheaply (Arc-shared
 /// stores).
+///
+/// One host serves the whole daemon, so the `file_*` overlay's session layer is
+/// shared across conversations: a file written in one chat is visible in the
+/// next. The lower layer is the daemon's working directory, read-only.
 #[derive(Clone)]
 pub struct ToolHost {
     pub ctx: Arc<ToolContext>,
 }
 
 impl ToolHost {
-    pub fn new() -> Self {
+    /// Build a host whose file tools overlay `workspace` — the daemon's working
+    /// directory, which reads fall through to when the session layer has no entry.
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
-            ctx: Arc::new(ToolContext::default()),
+            ctx: Arc::new(ToolContext::with_workspace(workspace)),
         }
-    }
-}
-
-impl Default for ToolHost {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

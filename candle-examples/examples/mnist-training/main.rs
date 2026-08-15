@@ -1,4 +1,13 @@
-// This should reach 91.5% accuracy.
+//! MNIST digit classification: trains from scratch (not an inference demo).
+//!
+//! `WhichModel` selects a `Linear` softmax classifier, an `Mlp` (784-100-10
+//! with ReLU), or a `ConvNet` (two conv+maxpool blocks, dropout, ~91.5%
+//! accuracy target). `Linear`/`Mlp` train via plain `candle_nn::SGD`;
+//! `ConvNet` trains via `AdamW` in its own loop (`training_loop_cnn`).
+//! Dataset comes from `candle_datasets::vision::mnist` (downloaded, or
+//! `--local-mnist <dir>` for ubyte files already on disk). Weights can be
+//! checkpointed with `--save`/`--load` (safetensors via `VarMap`).
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

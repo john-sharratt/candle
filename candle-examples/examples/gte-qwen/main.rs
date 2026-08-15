@@ -1,3 +1,11 @@
+//! gte-Qwen embedding example: sentence-pair relevance scoring.
+//!
+//! Loads `qwen2::Model` (default `Alibaba-NLP/gte-Qwen1.5-7B-instruct`) from
+//! the HF hub or `--local-repo`, batch-encodes an instruct-formatted query
+//! against two documents with EOS-token left padding, mean-pools the last
+//! hidden state as the embedding, L2-normalizes, and prints the cosine
+//! similarity matrix between query and document embeddings.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

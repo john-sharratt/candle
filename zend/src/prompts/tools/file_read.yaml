@@ -1,13 +1,27 @@
 name: file_read
 category: Files
-description: 'Read a file''s content from the session virtual filesystem (VFS). Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns path, full content, and line count. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file''s content. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. At most 200 lines come back per call: when the header reads `(lines 1-200 of 900)` there is more, and the next call asks for start_line 201. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    end_line:
+      description: Last line to return, 1-based and inclusive. Defaults to the end of the file, capped so one call returns at most 200 lines.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
     path:
-      description: VFS path of the file to read (session-relative, e.g. `src/main.rs`). Required.
+      description: Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
       minLength: 1
       type: string
+    start_line:
+      description: First line to return, 1-based. Defaults to 1 (the start of the file).
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
   required:
   - path
   title: ReadRequest
@@ -126,4 +140,64 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/LICENSE"}}
+  </tool_call><|projection|>
+- |-
+  read src/main.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file from the project. The only parameter is the path, which the user gave directly.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs"}}
+  </tool_call><|projection|>
+- |-
+  show me the Cargo.toml at the project root<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A request for the project's root Cargo.toml. file_read takes a path; the root manifest is just "Cargo.toml" relative to the working directory.<|projection|> No prefix or listing is needed here — the user named one specific file, so file_read rather than file_list.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "Cargo.toml"}}
+  </tool_call><|projection|>
+- |-
+  what does the README say<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read with the path "README.md".<|projection|> It returns the path, full content, and line count, which is what I need to answer.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "README.md"}}
+  </tool_call><|projection|>
+- |-
+  read lines 47 to 93 of src/auth/handler.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user named an exact range, which is what file_read's start_line and end_line take. Path is src/auth/handler.rs, start_line 47, end_line 93.<|projection|> The excerpt comes back as numbered source in a fenced block, headed with the path and range, so I can refer to specific line numbers when I answer.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 47, "end_line": 93}}
+  </tool_call><|projection|>
+- |-
+  show me the rest of that file<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The previous excerpt's header ended at line 200 and reported a larger total, so there is more to read. file_read caps a call at 200 lines,<|projection|> and the continuation is simply the next range: start_line 201. I leave end_line off and let the cap decide where this page stops.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 201}}
+  </tool_call><|projection|>
+- |-
+  read zend/src/tools.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  No range was given, so this reads from the top. file_read returns at most 200 lines per call — if the header comes back saying `(lines 1-200 of N)` there is more, and I can ask for<|projection|> start_line 201 next. Just the path for now.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/tools.rs"}}
   </tool_call><|projection|>

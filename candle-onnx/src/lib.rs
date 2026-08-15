@@ -1,3 +1,10 @@
+//! ONNX model loading and evaluation on Candle tensors.
+//!
+//! [`onnx`] is the prost-generated protobuf schema for `ModelProto` (built
+//! from the `.proto` definitions at build time via `OUT_DIR`). [`eval`]
+//! interprets a parsed `ModelProto` graph node-by-node against Candle
+//! tensors, mapping ONNX ops and dtypes to their Candle equivalents; use
+//! [`read_file`] to load a `.onnx` file and [`simple_eval`] to run it.
 use candle::Result;
 use prost::Message;
 

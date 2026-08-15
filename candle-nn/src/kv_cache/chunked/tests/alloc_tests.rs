@@ -23,6 +23,123 @@ fn k_gid_snapshot(backing: &ChunkedKvBacking) -> Vec<Vec<i64>> {
         .collect()
 }
 
+/// The refusal→hint→creation round trip, on a real device.
+///
+/// A sealing pass turned away mid-wave is only useful if the refusal *says what
+/// it wanted*: without that, the next pass rediscovers the same need at the same
+/// depth, after redoing the work that led there, and is refused again if a wave
+/// happens to be running. With it, the gap between forwards creates the arena
+/// and the next pass only ever fills it — which is legal at any point in a wave.
+#[cfg(all(test, feature = "cuda"))]
+mod deferred_arena_tests {
+    use crate::kv_cache::arena_table::ArenaLocation;
+    use crate::kv_cache::chunked::arena::ArenaKey;
+    use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
+    use crate::kv_cache::chunked::size_class::SizeClass;
+    use crate::kv_cache::chunked::{begin_wave, ChunkedKvBacking, KV_ARENA_MID_WAVE};
+    use crate::kv_cache::LayerPhase;
+    use candle::{DType, Device, Result};
+
+    #[test]
+    fn a_refused_arena_is_remembered_and_made_in_the_gap() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let Device::Cuda(cd) = &device else {
+            unreachable!()
+        };
+        let stream = cd.cuda_stream();
+
+        // A class the backing has no arena for yet, so serving it needs a
+        // creation rather than a free slot.
+        let key = ArenaKey::new(SizeClass::at(SizeClass::COUNT - 1), ArenaLocation::Gpu);
+
+        // Inside a wave, that creation is refused — and the refusal is marked
+        // retryable so the sealing pass knows to come back.
+        let guard = begin_wave(&stream, LayerPhase::Attention)?;
+        let err = backing
+            .alloc_chunk_for_key(key)
+            .err()
+            .expect("a class with no arena cannot be served mid-wave")
+            .to_string();
+        assert!(
+            err.contains(KV_ARENA_MID_WAVE),
+            "the refusal must be marked retryable: {err}"
+        );
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "the demand must not be satisfied while the wave is still running"
+        );
+        drop(guard);
+
+        // In the gap it is created — from the record, with nothing having to
+        // rediscover the need.
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            1,
+            "the refusal recorded the class it wanted; the gap must act on it"
+        );
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "the record is drained, not replayed — a second gap must not \
+             create a second arena for the same class"
+        );
+
+        // And the allocation the wave refused now succeeds against the arena
+        // that already exists, which is the point: filling is always legal.
+        backing
+            .alloc_chunk_for_key(key)
+            .expect("the class has an arena now, so no creation is needed");
+        Ok(())
+    }
+
+    /// **A deferral must never be laundered into scarcity.**
+    ///
+    /// `alloc_chunk_run_for_key` answers a failed stamp by promoting to a wider
+    /// class and retrying four times, then reports `VRAM exhaustion on arena
+    /// creation`. That is the right answer when no region can be had and the
+    /// wrong one when a region can be had *next wave* — and the wrong one is
+    /// what shipped: the `1088 B` class froze at 49 arenas with 75 regions
+    /// claimable, the hot→warm drain stalled at 634 MiB, and the log blamed VRAM
+    /// while a fifth of the reservation stood free.
+    #[test]
+    fn a_run_refused_mid_wave_reports_the_deferral_not_exhaustion() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let Device::Cuda(cd) = &device else {
+            unreachable!()
+        };
+        let stream = cd.cuda_stream();
+        let key = ArenaKey::new(SizeClass::at(SizeClass::COUNT - 2), ArenaLocation::Gpu);
+
+        let guard = begin_wave(&stream, LayerPhase::Attention)?;
+        let err = backing
+            .alloc_chunk_run_for_key(key, 4)
+            .err()
+            .expect("a run needing a new arena cannot be served mid-wave")
+            .to_string();
+        drop(guard);
+
+        assert!(
+            err.contains(KV_ARENA_MID_WAVE),
+            "the run allocator must hand the deferral back as itself: {err}"
+        );
+        assert!(
+            !err.contains("VRAM exhaustion"),
+            "a deferral reported as exhaustion sends the next investigation \
+             looking for a KV leak that is not there: {err}"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,29 +262,33 @@ mod tests {
             assert!(arena_count_after_8 >= arena_count_after_4);
         }
 
+        /// Writing a sequence materialises arenas, and each band's slot is a
+        /// run of the class's bytes. There is no "float arena" to ask for any
+        /// more — an arena holds whatever fits its stride.
         #[test]
-        fn test_float_arena_kv_access() {
+        fn writing_a_sequence_materialises_class_arenas() {
             let backing = create_test_backing();
 
             backing.ensure_for_offset(0, 0, 32).unwrap();
 
-            let k_arenas = backing.k_arenas();
-            let v_arenas = backing.v_arenas();
+            let (count, strides) = backing
+                .with_arenas(|arenas| {
+                    let mut strides: Vec<usize> =
+                        arenas.values().map(|a| a.slot_stride()).collect();
+                    strides.sort_unstable();
+                    strides.dedup();
+                    (arenas.len(), strides)
+                })
+                .unwrap();
 
-            assert_eq!(k_arenas.len(), 1);
-            assert_eq!(v_arenas.len(), 1);
-
-            // Palette-split arenas store one head, one side, one palette band.
-            // With head_dim=32 and N_PALETTE=4 this becomes (8192, 32, 8).
-            assert_eq!(k_arenas[0].dims(), &[8192, 32, 8]);
-            assert_eq!(v_arenas[0].dims(), &[8192, 32, 8]);
+            assert!(count > 0, "a written sequence must have arenas behind it");
+            for stride in strides {
+                assert!(
+                    crate::kv_cache::chunked::LADDER.contains(&stride),
+                    "every arena's stride must be a rung of the ladder, got {stride}"
+                );
+            }
         }
-    }
-
-    // ==================== Chunk Allocation Tests ====================
-
-    mod chunk_allocation_tests {
-        use super::*;
 
         #[test]
         fn test_sequential_chunk_allocation() {
@@ -399,16 +520,123 @@ mod tests {
             );
         }
 
+        // ── Scarcity-only class promotion ────────────────────────────────
+        //
+        // A chunk may occupy a slot of the next class up when its own class
+        // has no free slot AND no region can be had for it. Strictly
+        // scarcity-gated: under any region availability a class gets its own
+        // (`docs/archived/arena_unification.md` §3.4).
+
+        /// **The gate.** Under normal conditions — regions freely available —
+        /// nothing promotes, however many chunks are claimed. If this ever
+        /// fails, promotion has become a background mixing vector and the
+        /// per-class occupancy numbers stop meaning anything.
+        #[test]
+        fn ordinary_allocation_never_promotes() {
+            use crate::kv_cache::chunked::class_promotion_count;
+
+            let before = class_promotion_count();
+            let backing = create_test_backing();
+            for i in 0..3 {
+                backing.alloc_sequence().unwrap();
+                let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+                let v = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+                backing.write_contiguous(i, 0, &k, &v).unwrap();
+            }
+            assert_eq!(
+                class_promotion_count(),
+                before,
+                "a well-fed allocator must never widen a chunk's class"
+            );
+        }
+
+        /// A promoted chunk is still addressed correctly, because reads take
+        /// their extent from the band's *format* bytes and never from the
+        /// slot stride. The wider slot changes only the pad.
+        #[test]
+        fn a_wider_slot_still_round_trips_its_band() {
+            use crate::kv_cache::chunked::size_class::SizeClass;
+
+            // Write a BF16 band's worth of bytes into a slot two rungs above
+            // the one it would normally take, and read exactly its payload
+            // back out.
+            let class = SizeClass::at(6);
+            let bytes = class.chunks_per_region() * class.bytes();
+            let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
+            let mut arena = crate::kv_cache::chunked::Arena::new(
+                data,
+                class,
+                crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                0,
+            );
+
+            let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+            let src = Tensor::from_slice(&payload, payload.len(), &Device::Cpu).unwrap();
+            arena.write_slot_bytes(3, &src).unwrap();
+
+            let back = arena
+                .slot_bytes(3, payload.len())
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap();
+            assert_eq!(back, payload, "the band reads back exactly");
+
+            // And the pad past it is untouched — it belongs to no chunk.
+            let pad = arena
+                .slot_bytes(3, class.bytes())
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap();
+            assert!(
+                pad[payload.len()..].iter().all(|&b| b == 0),
+                "the pad past the payload must stay zero"
+            );
+        }
+
+        /// Promotion walks **one rung at a time** and gives up at the top
+        /// rather than wrapping. The top class failing is the honest answer:
+        /// there is nowhere wider to go.
+        #[test]
+        fn promotion_walks_the_ladder_and_stops() {
+            use crate::kv_cache::chunked::size_class::SizeClass;
+
+            let mut class = SizeClass::at(0);
+            let mut widths = vec![class.bytes()];
+            while let Some(next) = class.promote() {
+                assert!(
+                    next.bytes() > class.bytes(),
+                    "a promotion must always widen"
+                );
+                class = next;
+                widths.push(class.bytes());
+            }
+            assert_eq!(widths.len(), SizeClass::COUNT);
+            assert!(
+                class.promote().is_none(),
+                "the top class has nowhere to promote to"
+            );
+        }
+
         /// GIDs encode arena_idx and chunk_idx. Verify the encoding is correct
         /// for the first two arenas.
         #[test]
         fn test_gid_encodes_arena_and_chunk_indices_correctly() {
-            let arena_chunks =
-                crate::arena_chunks_for_format(crate::kv_cache::KvFormat::Float(DType::BF16));
-            let gid_stride = crate::arena_gid_stride();
+            // Capacity is the SIZE CLASS's slot count, not a per-format one.
+            // This backing's BF16 band is 32 tokens x 8 dims x 2 B = 512 B,
+            // which lands on the 640 B rung.
+            let class = crate::kv_cache::chunked::class_for_format(
+                crate::kv_cache::KvFormat::Float(DType::BF16),
+                crate::CHUNK_SIZE * (32 / crate::kv_cache::arena_table::N_PALETTE),
+            )
+            .expect("BF16 is covered by the ladder");
+            let arena_chunks = class.chunks_per_region();
+            let gid_stride = crate::GID_STRIDE;
             // Each block uses GIDS_PER_HEAD*n_kv_head = 8*4 = 32 GIDs.
             // To spill into arena 1 we need more than one arena worth of K-head slots.
-            let seqs_per_arena = arena_chunks / 32;
+            // Enough sequences that the pool must register a second arena:
+            // each block claims GIDS_PER_HEAD * n_kv_head = 32 slots, and a run
+            // never straddles an arena, so round UP before adding one.
+            let seqs_per_arena = arena_chunks.div_ceil(32);
             let n_seqs = seqs_per_arena + 1;
             let backing =
                 ChunkedKvBacking::new(n_seqs + 1, 4, 32, DType::BF16, &Device::Cpu, 32).unwrap();
@@ -420,16 +648,20 @@ mod tests {
                 backing.write_contiguous(i, 0, &k, &v).unwrap();
             }
 
-            // The last sequence's K head-0 GID should be in arena 1
-            let last_gid = k_gid_snapshot(&backing)[seqs_per_arena][0];
+            // The last sequence's K head-0 GID must have spilled into arena 1,
+            // and must decode as `(raw / GID_STRIDE, raw % GID_STRIDE)` — the
+            // shift/mask split the CUDA side performs.
+            let last_gid = k_gid_snapshot(&backing)[seqs_per_arena][0] as usize;
 
             assert_eq!(
-                last_gid as usize, gid_stride,
-                "GID {} should be the base of arena 1 = {}",
-                last_gid, gid_stride
+                last_gid / gid_stride,
+                1,
+                "GID {last_gid} should have spilled into arena 1                  (arena 0 holds {arena_chunks} slots)"
             );
-            assert_eq!(last_gid as usize / gid_stride, 1, "arena_idx should be 1");
-            assert_eq!(last_gid as usize % gid_stride, 0, "chunk_idx should be 0");
+            assert!(
+                last_gid % gid_stride < arena_chunks,
+                "the chunk index must be inside the arena's capacity"
+            );
         }
 
         /// Allocate multiple blocks per sequence. Verify all GIDs are unique
@@ -496,9 +728,20 @@ mod tests {
 
         /// migrate_chunk must return a GID from the pool (not a raw mint), and
         /// the returned GID must be distinct from the source.
+        /// The CPU key a gid's slot relocates into: same size class, warm tier.
+        fn cpu_key_of(backing: &ChunkedKvBacking, raw: i64) -> crate::kv_cache::chunked::ArenaKey {
+            use crate::kv_cache::arena_table::ArenaLocation;
+            use crate::kv_cache::chunked::{ArenaKey, GID_STRIDE};
+            let arena_idx = (raw as usize) / GID_STRIDE;
+            let key = backing
+                .with_arenas(|a| a.get(&arena_idx).map(|a| a.arena_key()))
+                .unwrap()
+                .expect("source arena exists");
+            ArenaKey::new(key.class, ArenaLocation::Cpu)
+        }
+
         #[test]
         fn test_migrate_chunk_gid_comes_from_pool_not_stolen() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = create_test_backing();
             backing.alloc_sequence().unwrap();
             let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
@@ -507,8 +750,9 @@ mod tests {
 
             let src_gid = k_gid_snapshot(&backing)[0][0];
 
-            // Migrate to CPU (same dtype, different location — triggers alloc_chunk_for_key)
-            let target = ArenaKey::cpu_float(DType::BF16);
+            // Relocate to CPU: same class, different location — the shape
+            // every production migrate has (a slot move never converts).
+            let target = cpu_key_of(&backing, src_gid);
             let new_gid = backing.migrate_chunk(src_gid, target).unwrap();
 
             // The new GID must be distinct from the source
@@ -520,7 +764,6 @@ mod tests {
         /// and is placed in the same arena format (no new arena needed if one exists).
         #[test]
         fn test_migrate_chunk_same_format_stays_in_same_arena_pool() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = ChunkedKvBacking::new(4, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
 
             // Allocate 2 sequences
@@ -534,8 +777,8 @@ mod tests {
             let before = backing.arena_count().unwrap();
 
             let src = k_gid_snapshot(&backing)[0][0];
-            // Migrate to same format (cpu-float BF16 → cpu-float BF16 copy)
-            let target = ArenaKey::cpu_float(DType::BF16);
+            // Relocate within the same class — the copy path.
+            let target = cpu_key_of(&backing, src);
             let new_gid = backing.migrate_chunk(src, target).unwrap();
 
             let after = backing.arena_count().unwrap();
@@ -552,7 +795,6 @@ mod tests {
         /// all N GIDs come from pool allocations, none are double-allocated.
         #[test]
         fn test_migrate_multiple_chunks_unique_gids() {
-            use crate::kv_cache::chunked::ArenaKey;
             let backing = create_test_backing();
 
             // Allocate 3 sequences
@@ -563,8 +805,6 @@ mod tests {
                 backing.write_contiguous(i, 0, &k, &v).unwrap();
             }
 
-            let target = ArenaKey::cpu_float(DType::BF16);
-
             let src_gids: Vec<i64> = {
                 let snap = k_gid_snapshot(&backing);
                 (0..3).map(|i| snap[i][0]).collect()
@@ -572,7 +812,10 @@ mod tests {
             // Keep the returned ChunkGids alive so RAII doesn't immediately return them
             let held_gids: Vec<_> = src_gids
                 .iter()
-                .map(|src| backing.migrate_chunk(*src, target.clone()).unwrap())
+                .map(|src| {
+                    let target = cpu_key_of(&backing, *src);
+                    backing.migrate_chunk(*src, target).unwrap()
+                })
                 .collect();
             let new_gids: Vec<i64> = held_gids.iter().map(|g| g.raw()).collect();
 
@@ -739,6 +982,205 @@ mod tests {
             let backing = create_test_backing();
             backing.alloc_sequence().unwrap();
             assert!(backing.reserve_glue_gap_chunk(999, 4).is_err());
+        }
+    }
+
+    // ==================== Cross-Layer Capacity Tests ====================
+
+    /// `ensure_for_batch_entries_all` speaks for every layer, so a layer whose
+    /// block structure has drifted from layer 0's must still be asked.
+    mod layer_capacity_tests {
+        use super::*;
+        use crate::kv_cache::chunked::CHUNK_SIZE;
+
+        /// One layer's backing holding a single sequence of exactly 32 tokens —
+        /// a tail chunk that is precisely full, with nothing writable behind it.
+        fn layer_with_full_tail() -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let k = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+            let v = Tensor::ones((1, 4, 32, 32), DType::BF16, &Device::Cpu).unwrap();
+            backing.write_contiguous(0, 0, &k, &v).unwrap();
+            // `write_contiguous` places bytes; the window's valid token count is
+            // the writer's to advance, exactly as the prefill path does.
+            backing.set_len(0, 32);
+            backing
+        }
+
+        #[test]
+        fn every_layer_is_asked_not_only_layer_zero() {
+            // The skew a windowed creep prefill leaves behind: the resumed layer
+            // already carries an empty writer chunk for the next window, the
+            // layers still pending resume carry the exactly-full tail. Asking
+            // layer 0 alone reads "writable tail, nothing to allocate" and
+            // suppresses the allocation every other layer needs.
+            let layers = vec![layer_with_full_tail(), layer_with_full_tail()];
+            layers[0].push_empty_writer_chunk(0).unwrap();
+
+            let entries = [(0usize, 32usize)];
+            assert!(
+                layers[0].validate_decode_batch_state(&entries).is_ok(),
+                "precondition: the skewed layer already has a writable tail"
+            );
+            assert!(
+                layers[1].validate_decode_batch_state(&entries).is_err(),
+                "precondition: the lagging layer's tail is exactly full"
+            );
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
+        }
+
+        /// One layer's backing holding a single sequence of `tokens` tokens.
+        fn layer_with(tokens: usize) -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let k = Tensor::ones((1, 4, tokens, 32), DType::BF16, &Device::Cpu).unwrap();
+            let v = Tensor::ones((1, 4, tokens, 32), DType::BF16, &Device::Cpu).unwrap();
+            backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, tokens);
+            backing
+        }
+
+        /// `(block count, index of the chunk the write slot resolves to,
+        /// total tokens)` — the part of a layer's structure the shared decode
+        /// position map is built from, read the way the metadata builder reads
+        /// it.
+        fn observed_layout(backing: &ChunkedKvBacking) -> (usize, usize, usize) {
+            let state = backing.state.read().expect("lock");
+            let slot = state.sequences[0].as_ref().expect("slot");
+            let chunks = slot.chunks_slice();
+            let start = slot.writer_start_idx().min(chunks.len().saturating_sub(1));
+            let writer = (start..chunks.len())
+                .find(|&i| {
+                    (chunks[i].offset as usize + chunks[i].usage as usize) < CHUNK_SIZE
+                })
+                .unwrap_or(chunks.len().saturating_sub(1));
+            let tokens = chunks.iter().map(|c| c.usage as usize).sum();
+            (chunks.len(), writer, tokens)
+        }
+
+        #[test]
+        fn diverged_writer_index_is_reconciled() {
+            // The hazard the reconciliation exists for: both layers have a
+            // WRITABLE tail, so neither needs an allocation, but they resolve
+            // the write slot to different chunks. The kernel scatters through
+            // the per-layer slice while attention reads through the one shared
+            // position map, so this divergence corrupts silently — there is no
+            // fault and no wrong-looking number to notice.
+            let layers = vec![layer_with(20), layer_with(20)];
+            layers[0].push_empty_writer_chunk(0).unwrap();
+
+            assert_eq!(observed_layout(&layers[0]), (2, 1, 20));
+            assert_eq!(
+                observed_layout(&layers[1]),
+                (1, 0, 20),
+                "precondition: the layers disagree on the write slot"
+            );
+
+            let entries = [(0usize, 20usize)];
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            let unified = observed_layout(&layers[0]);
+            assert_eq!(
+                observed_layout(&layers[1]),
+                unified,
+                "every layer must resolve the write slot to the same chunk"
+            );
+            assert_eq!(unified.2, 20, "reconciliation must not shift any position");
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
+        }
+
+        #[test]
+        fn diverged_token_windows_are_an_error_not_a_repair() {
+            // Appending a common writer chunk equalises trailing structure, and
+            // the tail heal may drop up to one chunk's worth of undelivered
+            // tokens. A spread wider than a chunk is more than any single
+            // failed operation leaves behind, so no repair may claim it.
+            let layers = vec![layer_with(20), layer_with(2 * CHUNK_SIZE)];
+            let entries = [(0usize, 20usize)];
+
+            let err = ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1)
+                .expect_err("a spread past one chunk cannot share one position map");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("could not be reconciled or healed"),
+                "the error must name both repairs it outlived, got: {msg}"
+            );
+        }
+
+        /// **A failed wave's skew heals instead of bricking the sequence.**
+        ///
+        /// The decode sweep advances each layer's usage as that layer completes,
+        /// so a wave that dies mid-sweep leaves the early layers one token ahead
+        /// — undelivered tokens, since the wave never retired. The forward path
+        /// now rolls that back at the failure; this covers the same state
+        /// arriving from before the rollback existed, or through a substrate
+        /// reload of a sealed turn that captured it. The next decode truncates
+        /// every layer to the shortest, reconciles the trailing structure, and
+        /// proceeds — the alternative was refusing this sequence forever.
+        #[test]
+        fn a_failed_waves_tail_skew_is_healed_not_refused() {
+            // Layer 0 one token ahead of layer 1: the exact signature of a wave
+            // that died between layer 0's advance and layer 1's.
+            let layers = vec![layer_with(33), layer_with(32)];
+            let entries = [(0usize, 32usize)];
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1)
+                .expect("a one-token tail skew is healable and must not refuse the decode");
+
+            // Both layers agree on every data window afterwards, and both are
+            // writable — the healed sequence decodes like any other.
+            let layouts: Vec<_> = layers.iter().map(observed_layout).collect();
+            assert_eq!(
+                layouts[0], layouts[1],
+                "healing must leave the layers identical, got {layouts:?}"
+            );
+            assert_eq!(
+                layouts[0].2, 32,
+                "the undelivered token is dropped, the delivered ones stay"
+            );
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| panic!("layer {li} not decodable after heal: {e}"));
+            }
+        }
+
+        #[test]
+        fn uniform_layers_still_allocate_once_each() {
+            // The common case must be unchanged: every layer's tail is full, so
+            // every layer takes the allocation path and ends up writable.
+            let layers = vec![layer_with_full_tail(), layer_with_full_tail()];
+            let entries = [(0usize, 32usize)];
+
+            ChunkedKvBacking::ensure_for_batch_entries_all(&layers, &entries, 1).unwrap();
+
+            let counts: Vec<usize> = layers
+                .iter()
+                .map(|b| b.sequence_block_count(0).expect("slot"))
+                .collect();
+            assert_eq!(counts, vec![2, 2], "one fresh writer chunk per layer");
+            for (li, backing) in layers.iter().enumerate() {
+                backing
+                    .validate_decode_batch_state(&entries)
+                    .unwrap_or_else(|e| {
+                        panic!("layer {li} was left without a writable tail: {e}")
+                    });
+            }
         }
     }
 }

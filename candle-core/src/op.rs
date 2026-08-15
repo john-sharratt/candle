@@ -1,7 +1,7 @@
 //! Tensor Operation Enums and Traits
 //!
 #![allow(clippy::redundant_closure_call)]
-use crate::Tensor;
+use crate::LiveTensor;
 use float8::F8E4M3;
 use half::{bf16, f16};
 use num_traits::float::Float;
@@ -83,25 +83,33 @@ pub enum UnaryOp {
     Sign,
 }
 
+/// The graph edge a tensor records to its inputs, parameterised by how long
+/// those inputs' memory is valid.
+///
+/// A tensor derived from a `'w` input keeps that input alive here, so the
+/// parameter has to travel with the op — otherwise a wave-scoped operand could
+/// be stored in a `'static` graph node and outlive its buffer. The `dyn`
+/// custom-op payloads stay `'static`: those are the user's op objects, not
+/// tensors.
 #[derive(Clone)]
-pub enum Op {
-    Binary(Tensor, Tensor, BinaryOp),
-    Unary(Tensor, UnaryOp),
-    Cmp(Tensor, CmpOp),
+pub enum Op<'w> {
+    Binary(LiveTensor<'w>, LiveTensor<'w>, BinaryOp),
+    Unary(LiveTensor<'w>, UnaryOp),
+    Cmp(LiveTensor<'w>, CmpOp),
     // The third argument is the reduced shape with `keepdim=true`.
-    Reduce(Tensor, ReduceOp, Vec<usize>),
-    Matmul(Tensor, Tensor),
-    Gather(Tensor, Tensor, usize),
-    Scatter(Tensor, Tensor, Tensor, usize),
-    ScatterAdd(Tensor, Tensor, Tensor, usize),
-    IndexSelect(Tensor, Tensor, usize),
-    IndexAdd(Tensor, Tensor, Tensor, usize),
-    WhereCond(Tensor, Tensor, Tensor),
+    Reduce(LiveTensor<'w>, ReduceOp, Vec<usize>),
+    Matmul(LiveTensor<'w>, LiveTensor<'w>),
+    Gather(LiveTensor<'w>, LiveTensor<'w>, usize),
+    Scatter(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>, usize),
+    ScatterAdd(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>, usize),
+    IndexSelect(LiveTensor<'w>, LiveTensor<'w>, usize),
+    IndexAdd(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>, usize),
+    WhereCond(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>),
 
     #[allow(dead_code)]
     Conv1D {
-        arg: Tensor,
-        kernel: Tensor,
+        arg: LiveTensor<'w>,
+        kernel: LiveTensor<'w>,
         padding: usize,
         stride: usize,
         dilation: usize,
@@ -109,8 +117,8 @@ pub enum Op {
 
     #[allow(dead_code)]
     ConvTranspose1D {
-        arg: Tensor,
-        kernel: Tensor,
+        arg: LiveTensor<'w>,
+        kernel: LiveTensor<'w>,
         padding: usize,
         output_padding: usize,
         stride: usize,
@@ -119,8 +127,8 @@ pub enum Op {
 
     #[allow(dead_code)]
     Conv2D {
-        arg: Tensor,
-        kernel: Tensor,
+        arg: LiveTensor<'w>,
+        kernel: LiveTensor<'w>,
         padding: usize,
         stride: usize,
         dilation: usize,
@@ -128,8 +136,8 @@ pub enum Op {
 
     #[allow(dead_code)]
     ConvTranspose2D {
-        arg: Tensor,
-        kernel: Tensor,
+        arg: LiveTensor<'w>,
+        kernel: LiveTensor<'w>,
         padding: usize,
         output_padding: usize,
         stride: usize,
@@ -137,59 +145,59 @@ pub enum Op {
     },
 
     AvgPool2D {
-        arg: Tensor,
+        arg: LiveTensor<'w>,
         kernel_size: (usize, usize),
         stride: (usize, usize),
     },
 
     MaxPool2D {
-        arg: Tensor,
+        arg: LiveTensor<'w>,
         kernel_size: (usize, usize),
         stride: (usize, usize),
     },
 
     UpsampleNearest1D {
-        arg: Tensor,
+        arg: LiveTensor<'w>,
         target_size: usize,
     },
     UpsampleNearest2D {
-        arg: Tensor,
+        arg: LiveTensor<'w>,
         target_h: usize,
         target_w: usize,
     },
 
-    Cat(Vec<Tensor>, usize),
+    Cat(Vec<LiveTensor<'w>>, usize),
 
     #[allow(dead_code)] // add is currently unused.
     Affine {
-        arg: Tensor,
+        arg: LiveTensor<'w>,
         mul: f64,
         add: f64,
     },
-    ToDType(Tensor),
-    Copy(Tensor),
-    Broadcast(Tensor),
-    Narrow(Tensor, usize, usize, usize),
-    SliceScatter0(Tensor, Tensor, usize),
-    Reshape(Tensor),
-    ToDevice(Tensor),
-    Transpose(Tensor, usize, usize),
-    Permute(Tensor, Vec<usize>),
-    Elu(Tensor, f64),
-    Powf(Tensor, f64),
+    ToDType(LiveTensor<'w>),
+    Copy(LiveTensor<'w>),
+    Broadcast(LiveTensor<'w>),
+    Narrow(LiveTensor<'w>, usize, usize, usize),
+    SliceScatter0(LiveTensor<'w>, LiveTensor<'w>, usize),
+    Reshape(LiveTensor<'w>),
+    ToDevice(LiveTensor<'w>),
+    Transpose(LiveTensor<'w>, usize, usize),
+    Permute(LiveTensor<'w>, Vec<usize>),
+    Elu(LiveTensor<'w>, f64),
+    Powf(LiveTensor<'w>, f64),
     CustomOp1(
-        Tensor,
+        LiveTensor<'w>,
         std::sync::Arc<Box<dyn crate::CustomOp1 + Send + Sync>>,
     ),
     CustomOp2(
-        Tensor,
-        Tensor,
+        LiveTensor<'w>,
+        LiveTensor<'w>,
         std::sync::Arc<Box<dyn crate::CustomOp2 + Send + Sync>>,
     ),
     CustomOp3(
-        Tensor,
-        Tensor,
-        Tensor,
+        LiveTensor<'w>,
+        LiveTensor<'w>,
+        LiveTensor<'w>,
         std::sync::Arc<Box<dyn crate::CustomOp3 + Send + Sync>>,
     ),
 }
@@ -942,15 +950,18 @@ impl UnaryOpT for Relu {
 
 /// `BackpropOp` is a wrapper around `Option<Op>`. The main goal is to ensure that dependencies are
 /// properly checked when creating a new value
+///
+/// It carries `'w` for the reason [`Op`] does: the recorded inputs are tensors,
+/// and a graph node must not outlive the memory its operands address.
 #[derive(Clone)]
-pub struct BackpropOp(Option<Op>);
+pub struct BackpropOp<'w>(Option<Op<'w>>);
 
-impl BackpropOp {
+impl<'w> BackpropOp<'w> {
     pub(crate) fn none() -> Self {
         BackpropOp(None)
     }
 
-    pub(crate) fn new1(arg: &Tensor, f: impl Fn(Tensor) -> Op) -> Self {
+    pub(crate) fn new1(arg: &LiveTensor<'w>, f: impl Fn(LiveTensor<'w>) -> Op<'w>) -> Self {
         let op = if arg.track_op() {
             Some(f(arg.clone()))
         } else {
@@ -959,7 +970,11 @@ impl BackpropOp {
         Self(op)
     }
 
-    pub(crate) fn new2(arg1: &Tensor, arg2: &Tensor, f: impl Fn(Tensor, Tensor) -> Op) -> Self {
+    pub(crate) fn new2(
+        arg1: &LiveTensor<'w>,
+        arg2: &LiveTensor<'w>,
+        f: impl Fn(LiveTensor<'w>, LiveTensor<'w>) -> Op<'w>,
+    ) -> Self {
         let op = if arg1.track_op() || arg2.track_op() {
             Some(f(arg1.clone(), arg2.clone()))
         } else {
@@ -969,10 +984,10 @@ impl BackpropOp {
     }
 
     pub(crate) fn new3(
-        arg1: &Tensor,
-        arg2: &Tensor,
-        arg3: &Tensor,
-        f: impl Fn(Tensor, Tensor, Tensor) -> Op,
+        arg1: &LiveTensor<'w>,
+        arg2: &LiveTensor<'w>,
+        arg3: &LiveTensor<'w>,
+        f: impl Fn(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>) -> Op<'w>,
     ) -> Self {
         let op = if arg1.track_op() || arg2.track_op() || arg3.track_op() {
             Some(f(arg1.clone(), arg2.clone(), arg3.clone()))
@@ -982,9 +997,12 @@ impl BackpropOp {
         Self(op)
     }
 
-    pub(crate) fn new<A: AsRef<Tensor>>(args: &[A], f: impl Fn(Vec<Tensor>) -> Op) -> Self {
+    pub(crate) fn new<A: AsRef<LiveTensor<'w>>>(
+        args: &[A],
+        f: impl Fn(Vec<LiveTensor<'w>>) -> Op<'w>,
+    ) -> Self {
         let op = if args.iter().any(|arg| arg.as_ref().track_op()) {
-            let args: Vec<Tensor> = args.iter().map(|arg| arg.as_ref().clone()).collect();
+            let args: Vec<LiveTensor<'w>> = args.iter().map(|arg| arg.as_ref().clone()).collect();
             Some(f(args))
         } else {
             None
@@ -997,8 +1015,8 @@ impl BackpropOp {
     }
 }
 
-impl std::ops::Deref for BackpropOp {
-    type Target = Option<Op>;
+impl<'w> std::ops::Deref for BackpropOp<'w> {
+    type Target = Option<Op<'w>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

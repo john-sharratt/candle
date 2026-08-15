@@ -91,6 +91,64 @@ pub enum YType {
     Q8A128 = 3,
 }
 
+/// Store width for the int8 dense matmul's output.
+///
+/// The MMA accumulator is F32 in registers whichever variant runs; this only picks
+/// the width of the final store, so the narrow variants are bit-identical to the
+/// F32 one followed by a cast — with the cast's launch and its second buffer gone.
+/// MUST match the dispatcher's table ordering: 0=F16, 1=BF16, 2=F32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OutDType {
+    F16 = 0,
+    BF16 = 1,
+    F32 = 2,
+}
+
+/// Status returned by the quantized-matmul launchers.
+///
+/// Mirrors `QMM_*` in `candle-kernels/src/quantized/matmul_status.cuh`. A kernel
+/// table miss returns [`MatmulStatus::NoKernel`] rather than leaving the output
+/// buffer untouched, which is the difference between an error and silently wrong
+/// numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatmulStatus {
+    Ok,
+    BadQType,
+    NoSegments,
+    BadYType,
+    NoKernel,
+    BadOutDType,
+    Unknown(i32),
+}
+
+impl MatmulStatus {
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::Ok,
+            1 => Self::BadQType,
+            2 => Self::NoSegments,
+            3 => Self::BadYType,
+            4 => Self::NoKernel,
+            5 => Self::BadOutDType,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Human-readable reason a launch did not happen, or `None` when it did.
+    pub fn failure(self) -> Option<&'static str> {
+        match self {
+            Self::Ok => None,
+            Self::BadQType => Some("quantization format has no matmul kernel"),
+            Self::NoSegments => Some("no weight segments"),
+            Self::BadYType => Some("unsupported activation type"),
+            Self::NoKernel => Some("no kernel for this (format, output dtype) pair"),
+            Self::BadOutDType => Some("unsupported output dtype"),
+            Self::Unknown(_) => Some("unrecognised launcher status"),
+        }
+    }
+}
+
 extern "C" {
     /// Dispatches to the appropriate quantized matmul kernel.
     ///
@@ -98,7 +156,7 @@ extern "C" {
     /// - `segments`: Host array of segment descriptors (one per expert or single for non-MoE)
     /// - `num_segments`: Length of segments array
     /// - `vy`: Y vector (activations), type determined by `ytype`
-    /// - `dst`: Output buffer, same type as Y
+    /// - `dst`: Output buffer — same type as Y on the FP path, `out_dtype` on the int8 path
     /// - `ncols_x`: Number of columns in X (input features)
     /// - `nrows_x`: Number of rows in X (output features)
     /// - `nrows_y`: Number of rows in Y
@@ -108,6 +166,10 @@ extern "C" {
     /// - `weight_bytes`: Weight tensor size in bytes (for L2 cache dispatch decision, FP path)
     /// - `force_mode2`: int8 dense tiling select — 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32
     ///   weight-reuse). Decided in Rust by [`q8a128_dense_use_mode2`]; ignored by the FP path.
+    /// - `out_dtype`: int8 dense store width (see [`OutDType`]); ignored by the FP path, where
+    ///   the output dtype is the activation dtype.
+    ///
+    /// Returns a [`MatmulStatus`] code — non-zero means no kernel ran and `dst` is untouched.
     pub fn run_quantized_matmul(
         segments: *const VxSegment,
         num_segments: i32,
@@ -121,15 +183,19 @@ extern "C" {
         ytype: i32,
         weight_bytes: usize,
         force_mode2: i32,
-    );
+        out_dtype: i32,
+    ) -> i32;
 
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
-    /// weights of possibly-different formats, writing the concatenated `[M, N_total]` F32 output.
+    /// weights of possibly-different formats, writing the concatenated `[M, N_total]` output.
     /// - `h_segs`: HOST pointer to a `num_segs`-long (≤3) `qkv_seg_t` array (24 bytes each); the
     ///   launcher copies it into by-value kernel params, so there is no per-call device upload.
     /// - `act`: device pointer to the shared q8a128 activation.
     /// - `total_n_tiles`: Σ ceil(seg_n/32) (= grid.y); `dst_stride` = N_total.
     /// - `mode2`: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32).
+    /// - `out_dtype`: store width for `dst` (see [`OutDType`]).
+    ///
+    /// Returns a [`MatmulStatus`] code — non-zero means no kernel ran and `dst` is untouched.
     pub fn run_qkv_segmented_matmul(
         h_segs: *const c_void,
         num_segs: i32,
@@ -140,7 +206,8 @@ extern "C" {
         total_batch: i32,
         dst_stride: i32,
         mode2: i32,
-    );
+        out_dtype: i32,
+    ) -> i32;
 
     /// Single-launch grouped matmul over all MoE expert tiles.
     ///

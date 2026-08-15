@@ -59,12 +59,14 @@ pub mod cpu_backend;
 pub mod cuda_backend;
 mod custom_op;
 mod device;
+pub mod direct_io;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
 pub mod fletcher;
+pub mod forbidden_alloc;
 #[cfg(feature = "cuda")]
 pub mod gpu_keepalive;
 pub mod gpu_memory;
@@ -94,6 +96,7 @@ pub mod test_utils;
 pub mod utils;
 mod variable;
 pub mod vram;
+pub mod wave_provenance;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
@@ -109,7 +112,7 @@ pub use shape::{Shape, D};
 pub use storage::Storage;
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
-pub use tensor::{Tensor, TensorId};
+pub use tensor::{LiveTensor, Tensor, TensorId, TensorInner};
 pub use variable::Var;
 
 #[cfg(feature = "cuda")]

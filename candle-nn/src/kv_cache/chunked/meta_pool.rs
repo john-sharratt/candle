@@ -15,7 +15,7 @@
 //!
 //! A [`MetaGid`] is an `i64` id plus an `Arc` to its slab's refcount table. The
 //! id packs `(slab_idx, record_idx)` against [`META_SLAB_STRIDE`] exactly as a
-//! `ChunkGid` packs `(arena_idx, chunk_idx)` against `arena_gid_stride()`, so the
+//! `ChunkGid` packs `(arena_idx, chunk_idx)` against `GID_STRIDE`, so the
 //! record's device address resolves as `slab_base_ptr + record_idx * record_bytes`.
 //! Clone bumps the slot refcount (every slot that references the chunk shares one
 //! record); drop releases it; the record's slot frees when the last holder drops.
@@ -46,7 +46,7 @@ pub(crate) const META_SLAB_RECORDS: usize = 4096;
 /// Stride that packs `(slab_idx, record_idx)` into one `i64` id:
 /// `id = slab_idx * META_SLAB_STRIDE + record_idx`. Must exceed
 /// [`META_SLAB_RECORDS`] so record indices never collide across slabs. Mirrors
-/// the role of `arena_gid_stride()` for the chunk-gid namespace.
+/// the role of `GID_STRIDE` for the chunk-gid namespace.
 pub(crate) const META_SLAB_STRIDE: usize = 1 << 20;
 
 const _: () = assert!(
@@ -73,28 +73,66 @@ pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize, n_palette: u
     n_kv_head * kv_head_record_bytes(head_dim, n_palette)
 }
 
+/// One chunk's contribution to a `KvHead[n_kv_head]` record, borrowed from the
+/// chunk that owns it.
+///
+/// Everything here travels **with the chunk**. In particular `k_fmt`/`v_fmt`
+/// are the band format tags: an arena under size classes holds whatever fits
+/// its stride, so it can no longer say how to decode a slot and the chunk must
+/// (`docs/archived/arena_unification.md` principle 8). The arena is consulted only for
+/// the band's *address*.
+#[derive(Clone, Copy)]
+pub(crate) struct ChunkRecordSrc<'a> {
+    /// The chunk's `(head, palette, K/V)` gid grid.
+    pub gids: &'a HeadGids,
+    /// Packed K palette maps, `n_kv_head·(head_dim/4)` bytes. Empty ⇒ identity routing.
+    pub k_pal: &'a [u8],
+    /// Packed V palette maps, same layout as `k_pal`.
+    pub v_pal: &'a [u8],
+    /// Outer K scales, `n_kv_head·N_PALETTE` f32s. Empty ⇒ unity.
+    pub k_scale: &'a [f32],
+    /// Outer V scales, same layout as `k_scale`.
+    pub v_scale: &'a [f32],
+    /// K band format tags ([`ArenaFormatTag::as_u8`]), `n_kv_head·N_PALETTE`
+    /// entries in `[h·N_PALETTE + p]` order.
+    pub k_fmt: &'a [u8],
+    /// V band format tags, same layout as `k_fmt`.
+    pub v_fmt: &'a [u8],
+}
+
 /// Serialize a chunk's `KvHead[n_kv_head]` record into `dst` (length must equal
 /// [`chunk_record_bytes`]). This is the resident-record body — identical
 /// byte-for-byte to the per-head portion of the decode/prefill inline-head
 /// serialization, just lifted out of the per-slice `TokenSlice` header.
 ///
-/// `k_pal`/`v_pal` are `n_kv_head·(head_dim/4)` bytes (empty ⇒ identity routing);
-/// `k_scale`/`v_scale` are `n_kv_head·N_PALETTE` f32s (empty ⇒ unity). The 8
-/// pointers per head resolve each `(head, palette, K/V)` GID against `arena_info`
-/// as `base_ptr + chunk_idx·chunk_byte_stride` — the location-dependent bytes a
-/// migration/defrag re-patches.
+/// The 8 pointers per head resolve each `(head, palette, K/V)` GID against
+/// `arena_info` as `base_ptr + chunk_idx·chunk_byte_stride` — the
+/// location-dependent bytes a migration/defrag re-patches. The format tags
+/// beside them come from `src`, not from `arena_info`.
 pub(crate) fn serialize_kv_heads(
     dst: &mut [u8],
-    gids: &HeadGids,
-    k_pal: &[u8],
-    v_pal: &[u8],
-    k_scale: &[f32],
-    v_scale: &[f32],
+    src: &ChunkRecordSrc<'_>,
     n_kv_head: usize,
     head_dim: usize,
     n_palette: usize,
     arena_info: &[ResolvedArenaInfo],
 ) {
+    let ChunkRecordSrc {
+        gids,
+        k_pal,
+        v_pal,
+        k_scale,
+        v_scale,
+        k_fmt,
+        v_fmt,
+    } = *src;
+    debug_assert!(
+        k_fmt.len() >= n_kv_head * n_palette && v_fmt.len() >= n_kv_head * n_palette,
+        "band format tags must cover every (head, palette): got k {} v {}, need {}",
+        k_fmt.len(),
+        v_fmt.len(),
+        n_kv_head * n_palette
+    );
     debug_assert!(
         head_dim >= 4,
         "head_dim must be >= 4 for 2-bit pal_map packing"
@@ -154,8 +192,18 @@ pub(crate) fn serialize_kv_heads(
 
         let mut k_ptr = vec![0u64; n_palette];
         let mut v_ptr = vec![0u64; n_palette];
-        let mut k_fmt = vec![ArenaFormatTag::BF16.as_u8(); n_palette];
-        let mut v_fmt = vec![ArenaFormatTag::BF16.as_u8(); n_palette];
+        // `Invalid`, never a real format. A band whose tag was not recorded has
+        // no known layout, and every other unrecorded-tag path in the cache
+        // resolves to `Invalid` precisely so the kernel's format check refuses
+        // it. Defaulting to a *float* tag instead would hand quantized bytes to
+        // the dispatch as BF16 and decode them as floats — silently wrong
+        // output rather than a failure. Producers always fill these
+        // (`n_kv_head * n_palette` entries at every call site), so this is the
+        // unreachable branch, which is exactly why it must fail loudly if it
+        // ever becomes reachable.
+        let mut k_tag = vec![ArenaFormatTag::Invalid.as_u8(); n_palette];
+        let mut v_tag = vec![ArenaFormatTag::Invalid.as_u8(); n_palette];
+        let tag_base = h * n_palette;
         // Index the flat GID slice at the record's own stride (n_palette*2), so
         // an 8-band single-latent head reads its 16 GIDs correctly regardless of
         // the global GIDS_PER_HEAD (which stays 4-palette for GQA).
@@ -164,11 +212,15 @@ pub(crate) fn serialize_kv_heads(
             let v_gid = &gids.as_slice()[h * stride + p * 2 + 1];
             if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
                 k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                k_fmt[p] = ai.k_format_tag.as_u8();
             }
             if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
                 v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                v_fmt[p] = ai.v_format_tag.as_u8();
+            }
+            if let Some(&t) = k_fmt.get(tag_base + p) {
+                k_tag[p] = t;
+            }
+            if let Some(&t) = v_fmt.get(tag_base + p) {
+                v_tag[p] = t;
             }
         }
         for &ptr in &k_ptr {
@@ -177,8 +229,8 @@ pub(crate) fn serialize_kv_heads(
         for &ptr in &v_ptr {
             put!(&ptr.to_le_bytes());
         }
-        put!(&k_fmt);
-        put!(&v_fmt);
+        put!(&k_tag);
+        put!(&v_tag);
         let scale_base = h * n_palette;
         for p in 0..n_palette {
             let s = k_scale.get(scale_base + p).copied().unwrap_or(1.0);
@@ -560,12 +612,19 @@ impl MetaPool {
                     .or_default()
                     .push((gid.record_idx(), bytes.as_slice()));
             }
-            let mut s = self.slabs.lock().expect("meta pool lock poisoned");
+            // Build every run's staging buffer BEFORE taking the lock. Coalescing
+            // records into runs, allocating the staging vec and gathering the
+            // bytes into it is pure host-side CPU work that needs no exclusion —
+            // only reaching `s.device[slab_idx]` does. The lock previously
+            // covered all of it, so every concurrent meta-record write serialised
+            // behind another writer's memcpy *and* its buffer construction.
+            struct Run {
+                slab_idx: usize,
+                off: usize,
+                staging: Vec<u8>,
+            }
+            let mut runs: Vec<Run> = Vec::new();
             for (slab_idx, mut recs) in by_slab {
-                let dev = match s.device.get_mut(slab_idx) {
-                    Some(d) => d,
-                    None => continue,
-                };
                 recs.sort_unstable_by_key(|(i, _)| *i);
                 let mut i = 0;
                 while i < recs.len() {
@@ -579,12 +638,31 @@ impl MetaPool {
                     for (k, (_, bytes)) in recs[i..=j].iter().enumerate() {
                         staging[k * rb..(k + 1) * rb].copy_from_slice(bytes);
                     }
-                    let off = run_start * rb;
-                    stream
-                        .memcpy_htod(&staging, &mut dev.gpu.slice_mut(off..off + run_len * rb))
-                        .w()?;
+                    runs.push(Run {
+                        slab_idx,
+                        off: run_start * rb,
+                        staging,
+                    });
                     i = j + 1;
                 }
+            }
+
+            // The copies themselves stay under the lock: issuing one needs
+            // `&mut` on the destination slab. Their ORDER and stream are
+            // unchanged — this moves host work out of the critical section, it
+            // does not reorder or defer any GPU operation. Each `staging` now
+            // outlives its copy by construction (it lives in `runs` until the
+            // function returns), which is strictly safer than the previous
+            // per-iteration temporary.
+            let mut s = self.slabs.lock().expect("meta pool lock poisoned");
+            for run in &runs {
+                let Some(dev) = s.device.get_mut(run.slab_idx) else {
+                    continue;
+                };
+                let len = run.staging.len();
+                stream
+                    .memcpy_htod(&run.staging, &mut dev.gpu.slice_mut(run.off..run.off + len))
+                    .w()?;
             }
         }
         Ok(())
@@ -713,8 +791,13 @@ mod tests {
     /// Byte-exact golden for the record body. HD=4, n_kv_head=1, single arena
     /// (one base_ptr/stride), identity palette (empty ⇒ identity), unity scales.
     /// Asserts the exact 168-bytes-at-HD4 = `4/2 + 104 = 106`-byte layout.
+    ///
+    /// **The arena is deliberately stamped with the wrong formats.** Its tags
+    /// say BF16 on both sides while the chunk says Q8_0/Q4_0, and the golden
+    /// demands the chunk's answer. That makes this test the direct regression
+    /// for format ownership: a record built from arena state fails it.
     #[test]
-    fn serialize_kv_heads_golden_single_palette() {
+    fn serialize_kv_heads_golden_takes_formats_from_the_chunk() {
         let head_dim = 4usize;
         let n_kv_head = 1usize;
         let rec = chunk_record_bytes(n_kv_head, head_dim, N_PALETTE);
@@ -726,19 +809,23 @@ mod tests {
         let arena_info = vec![ResolvedArenaInfo {
             base_ptr: 0x1000,
             chunk_byte_stride: 512,
-            k_format_tag: ArenaFormatTag::Q8_0,
-            v_format_tag: ArenaFormatTag::Q4_0,
             chunk_capacity: u32::MAX,
         }];
+        let k_fmt = vec![ArenaFormatTag::Q8_0.as_u8(); N_PALETTE];
+        let v_fmt = vec![ArenaFormatTag::Q4_0.as_u8(); N_PALETTE];
 
         let mut dst = vec![0u8; rec];
         serialize_kv_heads(
             &mut dst,
-            &gids,
-            &[],
-            &[],
-            &[],
-            &[],
+            &ChunkRecordSrc {
+                gids: &gids,
+                k_pal: &[],
+                v_pal: &[],
+                k_scale: &[],
+                v_scale: &[],
+                k_fmt: &k_fmt,
+                v_fmt: &v_fmt,
+            },
             n_kv_head,
             head_dim,
             N_PALETTE,
@@ -788,36 +875,38 @@ mod tests {
         // GID layout per head: slot = palette*2 + is_value, over N_PALETTE=4.
         // Put K-palette-0 in arena 0 chunk 1, K-palette-1 in arena 1 chunk 2.
         use crate::kv_cache::chunked::head_gids::GIDS_PER_HEAD;
-        let stride = crate::kv_cache::chunked::types::arena_gid_stride() as i64;
+        let stride = crate::kv_cache::chunked::types::GID_STRIDE as i64;
         let mut raw = vec![0i64; GIDS_PER_HEAD * n_kv_head];
         // k_gid_pal(0,0) is slot 0; k_gid_pal(0,1) is slot 2 (palette*2+0).
-        raw[0] = stride * 0 + 1; // arena 0, chunk 1
-        raw[2] = stride * 1 + 2; // arena 1, chunk 2
+        raw[0] = 1; // arena 0 (base 0), chunk 1
+        raw[2] = stride + 2; // arena 1, chunk 2
         let gids = HeadGids::from_vec(raw.iter().map(|&r| ChunkGid::detached(r)).collect());
         let arena_info = vec![
             ResolvedArenaInfo {
                 base_ptr: 0x1000,
                 chunk_byte_stride: 256,
-                k_format_tag: ArenaFormatTag::Q8_0,
-                v_format_tag: ArenaFormatTag::Q8_0,
                 chunk_capacity: u32::MAX,
             },
             ResolvedArenaInfo {
                 base_ptr: 0x9000,
                 chunk_byte_stride: 128,
-                k_format_tag: ArenaFormatTag::Q4_0,
-                v_format_tag: ArenaFormatTag::Q4_0,
                 chunk_capacity: u32::MAX,
             },
         ];
+        let k_fmt = vec![ArenaFormatTag::Q8_0.as_u8(); N_PALETTE];
+        let v_fmt = vec![ArenaFormatTag::Q8_0.as_u8(); N_PALETTE];
         let mut dst = vec![0u8; rec];
         serialize_kv_heads(
             &mut dst,
-            &gids,
-            &[],
-            &[],
-            &[],
-            &[],
+            &ChunkRecordSrc {
+                gids: &gids,
+                k_pal: &[],
+                v_pal: &[],
+                k_scale: &[],
+                v_scale: &[],
+                k_fmt: &k_fmt,
+                v_fmt: &v_fmt,
+            },
             n_kv_head,
             head_dim,
             N_PALETTE,

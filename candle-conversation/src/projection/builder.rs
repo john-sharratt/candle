@@ -105,10 +105,10 @@ fn validate(schema: &Schema) -> Result<(), ConstructionError> {
             validate_budget_bounds(&group.name, &group.budget)?;
             validate_selection(&group.name, &group.selection)?;
 
-            if group.score_threshold < 0.0 {
+            if group.score_threshold.unwrap_or(0.0) < 0.0 {
                 return Err(ConstructionError::NegativeScoreThreshold {
                     name: group.name.clone(),
-                    value: group.score_threshold,
+                    value: group.score_threshold.unwrap_or(0.0),
                 });
             }
         }
@@ -1163,7 +1163,8 @@ impl Builder {
                     id: group_id,
                     name: "primary_conversation".to_string(),
                     selection: SelectionRule::AlwaysVisible,
-                    score_threshold: 0.0,
+                    score_threshold: None,
+                    policy_band_declared: false,
                     policy: SelectionPolicy::default_policy(),
                     budget: Budget {
                         priority: 100.0,

@@ -5,6 +5,7 @@
 
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
@@ -30,12 +31,24 @@ pub struct PipelineStats {
     pub expert_hits: usize,
     /// Expert cache misses (loaded from pinned or mmap).
     pub expert_misses: usize,
-    /// Experts evicted from VRAM (drip + end-of-pass).
+    /// Experts evicted from VRAM (drip + end-of-pass). A drop, not a copy —
+    /// the cold tier already holds every expert, so there is no matching
+    /// device-to-host transfer to count.
     pub evictions: usize,
-    /// H2D DMA transfers (pinned → VRAM).
+    /// H2D DMA transfers into VRAM, from either host tier.
     pub dma_loads: usize,
-    /// D2H DMA transfers (VRAM → pinned).
-    pub dma_evicts: usize,
+    /// Loads served by the warm tier (H2D from pinned host memory).
+    pub warm_loads: usize,
+    /// Loads that missed both resident tiers and read the pack file.
+    pub cold_loads: usize,
+    /// **Gauge**, not a tally: experts the warm tier holds, of the model's
+    /// total. Reported beside the load counts because the two only make sense
+    /// together — a cold-load count is a verdict on this number, and reading
+    /// them in different places is how a warm tier sized at a third of the model
+    /// went unnoticed while it sent two thirds of every miss to disk.
+    pub warm_slots: usize,
+    /// Experts in the model, so `warm_slots` reads as a fraction.
+    pub total_experts: usize,
     /// Speculative prefetch loads that landed in VRAM.
     pub prefetch_loads: usize,
     /// Hint-driven speculative loads.
@@ -72,14 +85,16 @@ impl PipelineStats {
             .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
-    /// Reset all counters to zero. `resident_vram_bytes` is a live gauge, not a
-    /// per-interval tally, so it survives the reset (otherwise an inline-mode
-    /// cache — which never re-seeds it via a classify — would read 0 forever).
+    /// Reset the per-interval tallies. The three **gauges** —
+    /// `resident_vram_bytes`, `warm_slots`, `total_experts` — survive it: they
+    /// describe the cache's shape rather than what it did since the last reset,
+    /// and an inline-mode cache (which never re-seeds them via a classify) would
+    /// otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
-            let resident = s.resident_vram_bytes;
+            let gauges = (s.resident_vram_bytes, s.warm_slots, s.total_experts);
             *s = Self::default();
-            s.resident_vram_bytes = resident;
+            (s.resident_vram_bytes, s.warm_slots, s.total_experts) = gauges;
         }
     }
 
@@ -221,7 +236,7 @@ pub struct ClassifiedExperts {
 pub enum MoeInput {
     Float(Tensor),
     #[cfg(feature = "cuda")]
-    Q8(candle::quantized::cuda::Q8a128Operand),
+    Q8(candle::quantized::cuda::Q8a128Operand<'static>),
 }
 
 impl MoeInput {
@@ -250,6 +265,17 @@ pub struct MoeWorkRequest {
     /// Flat assignment array sorted by expert ID.
     /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
     pub assignments: Vec<(u32, u32, u32)>,
+    /// The wave generation the submitting layer has open, if any.
+    ///
+    /// A [`WaveTicket`] is a `Copy` coordinate rather than a borrow, which is
+    /// the whole reason it can be here: the expert chain runs on the pipeline
+    /// thread, and no `&WaveGeneration` could cross this channel. The forward
+    /// thread blocks on the response for the entire request (`submit_moe_work`
+    /// sends and immediately `recv`s), so the generation is open throughout, and
+    /// both threads issue on the same stream — so the arena's stream-ordered
+    /// reclaim still holds. A ticket from a closed generation resolves to
+    /// nothing, so the worst case is a pool allocation, never a stale range.
+    pub wave: Option<WaveTicket>,
     /// Timestamp captured by the forward thread just before `send` — lets the worker measure the
     /// inbound handoff latency (`submit_inbound` = pickup − submit). Zero-sized off-`profile`.
     pub submitted_at: ProfileMark,
@@ -284,5 +310,33 @@ pub enum PipelineMessage {
     SnapshotProfile {
         /// Oneshot channel for returning the snapshot.
         response_tx: mpsc::SyncSender<ProfileSnapshot>,
+    },
+    /// Move the boundary: sell `regions` of weight-side ground to the KV side,
+    /// or — with `regions` zero — take back whatever the KV side is holding
+    /// spare.
+    ///
+    /// **Both directions arrive here, and both come from outside a wave.** The
+    /// give-back is what an arena claim that has run out asks for, on the spot;
+    /// the take-back is asked once per forward, from the wave loop's
+    /// inter-forward gap. Neither may run under a live wave generation, and a
+    /// stalled wave is exactly why the give-back cannot wait for a forward to
+    /// complete — the wave that cannot allocate is the one that would have to.
+    ///
+    /// This is that reader, and it is how an arena claim buys the ground it
+    /// needs: the eviction still happens here, on the pipeline thread, where the
+    /// cache state lives and no expert GEMM of this thread's is in flight, while
+    /// the *quantity* comes from the claim that knows it. The KV side used to
+    /// record demand in a counter for this to drain, and a counter of refused
+    /// attempts is not a count of regions — one drain read 4,436 against a
+    /// twenty-eight-region shortfall.
+    ///
+    /// Answers with the bytes conceded — zero if the boundary could not move,
+    /// which includes the zone already sitting at its floor, and the case where a
+    /// wave generation is still open and `set_weight_floor` refuses.
+    RenegotiateBoundary {
+        /// Regions the KV side is asking for.
+        regions: usize,
+        /// Oneshot channel for the bytes handed to the KV side.
+        response_tx: mpsc::SyncSender<u64>,
     },
 }

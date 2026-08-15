@@ -1,3 +1,11 @@
+//! Granite (IBM) causal-LM text generation example.
+//!
+//! Loads `Granite` (`GraniteModel::Granite7bInstruct` ->
+//! `ibm-granite/granite-7b-instruct`) with a manual autoregressive decode loop
+//! (temperature/top-k/top-p sampling via `Sampling`, repeat penalty over
+//! `--repeat-last-n`). `--no-kv-cache` disables the `model::Cache`; `--dtype`
+//! selects f16/bf16/f32 (default f16).
+
 // An implementation of different Granite models https://www.ibm.com/granite
 
 #[cfg(feature = "accelerate")]

@@ -1,3 +1,4 @@
+use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use std::time::Duration;
@@ -585,6 +586,9 @@ impl TestParams {
             compression_level: config.mode.compression_level(),
             ..Default::default()
         };
+        // One loaded model serves every config in the sweep and the configs
+        // differ in KV dtype, so the norm weights are re-materialised per config.
+        // `create_batched_session` does that itself — see `maybe_change_dtype`.
         let mut session = model.create_batched_session(batch_config)?;
 
         // RAII diagnostic guard — MUST be declared AFTER `session`.
@@ -663,8 +667,7 @@ impl TestParams {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
 
             // Store logits and advance sequences
             for (&seq_idx, logits) in seq_idxs.iter().zip(logits_vec.into_iter()) {
@@ -783,8 +786,7 @@ impl TestParams {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
 
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
@@ -796,7 +798,6 @@ impl TestParams {
         }
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
-        let _ = session.compact_check()?;
         let prompt_duration = prompt_start.elapsed();
         let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
@@ -827,10 +828,31 @@ impl TestParams {
             !self.stop_on_eos.is_empty() && toks.iter().all(|t| self.stop_on_eos.contains(t))
         };
 
+        // Warmup step (step 0) — skipped for the speculative phase, which runs
+        // its own driver over the whole generate window.
+        let mut stopped = false;
+        if self.speculative_max_draft.is_none() && remaining_steps > 0 {
+            let toks =
+                self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
+            self.device.synchronize()?;
+            remaining_steps -= 1;
+            stopped = all_stopped(&toks);
+        }
+
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
         let mut steps_run = 0usize;
+        // The steady-state decode loop is the hot loop the transient tier
+        // exists for, so it is the window worth measuring: every device
+        // allocation inside it is one the wave path should have taken from a
+        // bump range instead. The warmup step above is deliberately outside —
+        // its first-touch allocations are unavoidable and would drown the
+        // per-step traffic that matters.
+        //
+        // Arming is scoped to this block so an early `?` cannot leave the
+        // detector on for the sealing and reporting that follow.
+        let detector = forbidden_alloc::armed();
         if let Some(max_draft) = self.speculative_max_draft {
             // Lossless speculative decode (model-agnostic), per session.
             steps_run = self.speculative_decode_phase(
@@ -840,34 +862,41 @@ impl TestParams {
                 model,
                 max_draft,
             )?;
-        } else {
-            // Warmup step (step 0)
-            let mut stopped = false;
-            if remaining_steps > 0 {
+        } else if !stopped {
+            for _step_num in 0..remaining_steps {
                 let toks =
                     self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
-                self.device.synchronize()?;
-                remaining_steps -= 1;
-                stopped = all_stopped(&toks);
-            }
-            if !stopped {
-                for _step_num in 0..remaining_steps {
-                    let toks = self.decode_step_batched(
-                        &mut session,
-                        &sequence_indices,
-                        &mut runs,
-                        model,
-                    )?;
-                    steps_run += 1;
-                    if all_stopped(&toks) {
-                        break;
-                    }
+                steps_run += 1;
+                if all_stopped(&toks) {
+                    break;
                 }
             }
         }
         self.device.synchronize()?;
+        drop(detector);
+        let forbidden = forbidden_alloc::take_report();
+        if !forbidden.is_clean() {
+            eprintln!("[{:?}] {}", config.mode, forbidden);
+        }
+        // The other half of the picture: the detector says what did NOT come
+        // from an arena, this says how much did. A phase whose peak is zero has
+        // a chain that never started, which reads identically in the detector to
+        // a chain that started and was never converted.
+        #[cfg(feature = "cuda")]
+        if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+            if let Some([attn, ffn, fwd]) = candle_nn::kv_cache::wave_domain_stats(gpu_id) {
+                // `peak` is a process-lifetime high-water mark, so once one
+                // config saturates a span every later config reports the same
+                // number. Read it as "the worst this process ever saw", not as a
+                // per-config figure.
+                eprintln!(
+                    "[{:?}] wave arenas (peak is process-wide): attention {} B of {} B, \
+                     ffn {} B of {} B, forward {} B of {} B",
+                    config.mode, attn.1, attn.2, ffn.1, ffn.2, fwd.1, fwd.2
+                );
+            }
+        }
         pipeline_record("bench:decode_total", t_decode_total);
-        let _ = session.compact_check()?;
 
         let generate_duration = generate_start.elapsed();
         let generate_tokens = steps_run * config.num_contexts;
@@ -932,8 +961,7 @@ impl TestParams {
         // Note: empty k_pal / v_pal is valid and means "use the shared identity palette".
         for &seq_idx in &sequence_indices {
             if let Some(backing) = session.backings().first() {
-                let arena_infos = backing.resolve_arena_info().expect("resolve_arena_info");
-                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
+                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx) {
                     for (ci, chunk) in chunks.iter().enumerate() {
                         if !chunk.k_pal.is_empty() && chunk.k_pal.iter().all(|&b| b == 0) {
                             panic!(
@@ -956,9 +984,11 @@ impl TestParams {
         for &seq_idx in &sequence_indices {
             session.free_sequence(seq_idx)?;
         }
-        let t_cleanup_compact = profile_now();
-        let _ = session.compact(); // Ignore errors, just trying to free memory
-        pipeline_record("bench:cleanup_compact", t_cleanup_compact);
+        let t_cleanup_sweep = profile_now();
+        // Return the freed sequences' regions to the pool before the next
+        // config claims them.
+        let _ = session.release_empty_arenas();
+        pipeline_record("bench:cleanup_sweep", t_cleanup_sweep);
         drop(session);
         self.device.synchronize()?;
 
@@ -1183,8 +1213,7 @@ impl TestParams {
                 nl,
                 None,
             )?
-            .logits
-            .unwrap_or_default();
+            .logits_owned()?;
         pipeline_record("bench:decode_forward_call", t_forward);
 
         for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
@@ -1754,8 +1783,26 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.dma_loads)),
             ),
             (
-                "DMA evicts (D2H)",
-                Box::new(|s: &PipelineStats| format!("{}", s.dma_evicts)),
+                "Warm tier slots",
+                Box::new(|s: &PipelineStats| {
+                    if s.total_experts == 0 {
+                        format!("{}", s.warm_slots)
+                    } else {
+                        format!(
+                            "{} ({:.0}%)",
+                            s.warm_slots,
+                            100.0 * s.warm_slots as f64 / s.total_experts as f64
+                        )
+                    }
+                }),
+            ),
+            (
+                "Warm loads (RAM)",
+                Box::new(|s: &PipelineStats| format!("{}", s.warm_loads)),
+            ),
+            (
+                "Cold loads (pack)",
+                Box::new(|s: &PipelineStats| format!("{}", s.cold_loads)),
             ),
             (
                 "Evictions",

@@ -1,3 +1,16 @@
+//! Parler-TTS text-to-speech with natural-language voice control.
+//!
+//! `--prompt` is the text to speak; `--description` is a separate
+//! natural-language string describing the desired voice/delivery (e.g.
+//! "a female speaker ... moderate speed and pitch"), both tokenized and fed
+//! to `Model::generate` to autoregressively produce DAC-style audio codes.
+//! `Which` selects `large-v1` (sharded safetensors) or `mini-v1`
+//! (single-file). Codes are also dumped to `out.safetensors` before being
+//! decoded by `model.audio_encoder` and written as a wav (`--out-file`,
+//! sample rate from `config.audio_encoder.sampling_rate`). `--quantized`
+//! and `--f16` are accepted on `Args` but not read by the current
+//! load path, which always mmaps F32 safetensors.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,6 +1,10 @@
-//! EfficientNet implementation.
+//! EfficientNet (B0-B7) image classification example.
 //!
-//! https://arxiv.org/abs/1905.11946
+//! https://arxiv.org/abs/1905.11946 — loads `EfficientNet` with `MBConvConfig`
+//! selected by `--which` (B0..B7), fetching `efficientnet-bN.safetensors` from
+//! `lmz/candle-efficientnet` on the HF hub (or `--model` for a local file).
+//! Classifies a `--image` against the 1000 ImageNet classes and prints the
+//! top-5 predictions.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

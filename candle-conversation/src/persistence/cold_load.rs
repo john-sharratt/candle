@@ -47,7 +47,7 @@ use candle::quantized::pinned_staging::PinnedBuf;
 use candle::CudaDevice;
 use candle::Result;
 
-use super::direct_io::AlignedScratch;
+use candle::direct_io::AlignedScratch;
 
 /// The cold-load scratch's backing storage — always 4 KiB-aligned so
 /// the chunked direct-I/O reads land safely. The `Pinned` arm is the

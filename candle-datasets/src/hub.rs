@@ -79,6 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "downloads a dataset from HuggingFace. Run with: cargo test -p candle-datasets -- --ignored test_dataset"]
     fn test_dataset() {
         let api = Api::new().unwrap();
         let files = from_hub(

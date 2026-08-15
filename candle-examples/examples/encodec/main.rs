@@ -1,3 +1,11 @@
+//! EnCodec neural audio codec example: audio<->code round-trip.
+//!
+//! `--action` selects `audio-to-audio` (encode then decode), `audio-to-code`
+//! (encode to a safetensors token file), or `code-to-audio` (decode saved
+//! codes). Reads/writes WAV via `audio_io`; `in_file`/`out_file` of `-` streams
+//! from/to the system microphone/speaker. Weights default to
+//! `facebook/encodec_24khz`; resamples non-24kHz input automatically.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

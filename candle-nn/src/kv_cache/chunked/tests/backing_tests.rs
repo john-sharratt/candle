@@ -162,38 +162,49 @@ mod tests {
     mod arena_tests {
         use super::*;
 
+        /// **Audit A12's decision input.** The histogram must count every live
+        /// band into the class its *format* maps to, and separately count the
+        /// ones narrower than the smallest rung — those are the only slots a
+        /// {64, 160, 320} split would save anything on.
         #[test]
-        fn test_k_arenas_empty_initially() {
-            let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
+        fn class_histogram_counts_bands_by_their_format() {
+            use candle::Tensor;
 
-            let k_arenas = backing.k_arenas();
-            assert!(k_arenas.is_empty());
+            let backing = ChunkedKvBacking::new(2, 4, 128, DType::BF16, &Device::Cpu, 64).unwrap();
+            backing.alloc_sequence().unwrap();
+            let k = Tensor::ones((1, 4, 32, 128), DType::BF16, &Device::Cpu).unwrap();
+            let v = k.clone();
+            backing.write_contiguous(0, 0, &k, &v).unwrap();
+
+            let (per_class, narrow) = backing.class_histogram(0);
+            let total: usize = per_class.iter().sum();
+            assert_eq!(
+                total,
+                4 * crate::kv_cache::arena_table::N_PALETTE * 2,
+                "every band of the written chunk must be counted exactly once"
+            );
+            // A CPU backing writes float bands: BF16 is 2048 B at this
+            // geometry, so everything lands on the 2048 rung and nothing is
+            // narrower than the 320 B floor. The rung is looked up rather than
+            // written as an index, so a ladder edit moves it automatically.
+            // head_dim 128 / N_PALETTE 4 = 32 dims per band, x CHUNK_SIZE 32.
+            let bf16 = crate::kv_cache::chunked::size_class::class_for_format(
+                KvFormat::Float(DType::BF16),
+                32 * 32,
+            )
+            .unwrap();
+            assert_eq!(bf16.bytes(), 2048);
+            assert_eq!(per_class[bf16.index()], total);
+            assert_eq!(narrow, 0, "float bands are never sub-320");
         }
 
+        /// An unallocated slot has no bands, and asking is not an error.
         #[test]
-        fn test_v_arenas_empty_initially() {
-            let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
-
-            let v_arenas = backing.v_arenas();
-            assert!(v_arenas.is_empty());
-        }
-
-        #[test]
-        fn test_float_arenas_empty_initially() {
-            let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
-
-            let float_arenas = backing.float_arenas();
-            assert!(float_arenas.is_some());
-            let (k, v) = float_arenas.unwrap();
-            assert!(k.is_empty());
-            assert!(v.is_empty());
-        }
-
-        #[test]
-        fn test_quantized_arenas_returns_none_for_float() {
-            let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
-
-            assert!(backing.quantized_arenas().is_none());
+        fn class_histogram_of_an_empty_slot_is_empty() {
+            let backing = ChunkedKvBacking::new(2, 4, 128, DType::BF16, &Device::Cpu, 64).unwrap();
+            let (per_class, narrow) = backing.class_histogram(0);
+            assert_eq!(per_class.iter().sum::<usize>(), 0);
+            assert_eq!(narrow, 0);
         }
 
         #[test]
@@ -241,17 +252,16 @@ mod tests {
         }
     }
 
-    // ==================== Compact Tests ====================
+    // ==================== Arena Sweep Tests ====================
 
-    mod compact_tests {
+    mod sweep_tests {
         use super::*;
 
         #[test]
-        fn test_compact_empty() {
+        fn sweeping_an_empty_backing_releases_nothing() {
             let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &Device::Cpu, 64).unwrap();
 
-            // Compacting when empty should free 0
-            let freed = backing.compact().unwrap();
+            let freed = backing.release_empty_arenas().unwrap();
             assert_eq!(freed, 0);
         }
     }
@@ -346,6 +356,77 @@ mod tests {
 
             let offsets = vec![0, 0, 0, 0]; // Correct: 4 offsets for batch=4
             backing.ensure_for_offsets(&offsets, &[0, 0, 0, 0]).unwrap();
+        }
+    }
+    // ============ Band-format tag propagation through window mutation ========
+
+    /// A `ChunkWindow`'s `k_fmt`/`v_fmt` describe how to read the bytes its
+    /// gids point at, so any mutation that re-points the gids must replace the
+    /// tags with them.
+    ///
+    /// This is the cold-load / warm-elevate hazard: a window created by
+    /// `alloc_block_chunks` carries the *active* formats (R16 K, F16 V on GPU),
+    /// and `set_block_gids` then re-points it at sealed chunks in whatever
+    /// formats were persisted. Leaving the old tags in place makes every reader
+    /// decode those chunks as raw floats. The model gate cannot catch it —
+    /// audit A2 lists cold load as one of its blind spots.
+    mod band_tag_propagation_tests {
+        use super::*;
+        use crate::kv_cache::arena_table::N_PALETTE;
+        use crate::kv_cache::QuantFormat;
+
+        #[test]
+        fn alloc_sealed_block_stamps_the_destination_formats_on_the_window() {
+            let backing = ChunkedKvBacking::new(1, 2, 32, DType::BF16, &Device::Cpu, 64).unwrap();
+            backing.alloc_sequence().unwrap();
+            let n_kv_head = backing.n_kv_head();
+            let want = n_kv_head * N_PALETTE;
+
+            // Deliberately NOT the active format: if the window keeps what
+            // `alloc_block_chunks` stamped, these assertions fail.
+            let k_formats: Vec<KvFormat> = (0..want)
+                .map(|i| {
+                    KvFormat::Quantized(if i % 2 == 0 {
+                        QuantFormat::Q8_0
+                    } else {
+                        QuantFormat::Q4_0
+                    })
+                })
+                .collect();
+            let v_formats: Vec<KvFormat> = (0..want)
+                .map(|_| KvFormat::Quantized(QuantFormat::Q4_0))
+                .collect();
+
+            backing
+                .alloc_sealed_block(
+                    0,
+                    0,
+                    &k_formats,
+                    &v_formats,
+                    std::sync::Arc::new(Vec::new()),
+                    std::sync::Arc::new(Vec::new()),
+                    std::sync::Arc::new(Vec::new()),
+                    std::sync::Arc::new(Vec::new()),
+                )
+                .unwrap();
+
+            let sealed = backing
+                .live_chunks_as_sealed(0)
+                .expect("slot should hold the sealed block");
+            let chunk = sealed.first().expect("one block");
+            let want_k: Vec<u8> = k_formats.iter().map(|f| f.to_tag()).collect();
+            let want_v: Vec<u8> = v_formats.iter().map(|f| f.to_tag()).collect();
+            assert_eq!(
+                chunk.k_fmt.as_slice(),
+                want_k.as_slice(),
+                "K tags must be the destination formats, not the active ones"
+            );
+            assert_eq!(chunk.v_fmt.as_slice(), want_v.as_slice());
+
+            // And the tags are exactly what the persist path will write.
+            let (k, v) = chunk.format_tags().expect("tags recorded");
+            assert_eq!(k, want_k.as_slice());
+            assert_eq!(v, want_v.as_slice());
         }
     }
 }

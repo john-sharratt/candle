@@ -8,7 +8,7 @@
 //!
 //! | Field | Type | Purpose |
 //! |-------|------|---------|
-//! | `vfs` | [`state::VfsStore`] | In-memory virtual filesystem for `file_*` tools |
+//! | `vfs` | [`state::VfsStore`] | Overlay filesystem for `file_*` tools — session writes over the workspace |
 //! | `credentials` | [`state::CredentialStore`] | Named auth material for session opens |
 //! | `notes` | [`state::NotesStore`] | Cross-conversation persistent key-value store |
 //! | `sessions` | [`state::SessionRegistry`] | All open protocol sessions (SSH, TCP, …) |
@@ -18,10 +18,13 @@
 //!
 //! # Construction
 //!
-//! In production the daemon calls `ToolContext::new()` once at startup.
-//! In tests each test case typically calls `ToolContext::new()` for isolation,
-//! or shares a context explicitly for lifecycle tests (open → use → close).
+//! In production the daemon calls [`ToolContext::with_workspace`] once at startup,
+//! passing its working directory so the `file_*` tools resolve real project files
+//! through the VFS overlay. [`ToolContext::new`] leaves the overlay upper-only,
+//! which is what most tests want; a test needing the lower layer points
+//! `with_workspace` at a temp dir.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::state::{CredentialStore, HashStateStore, NotesStore, SessionRegistry, VfsStore};
@@ -40,11 +43,22 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    /// Construct a context with default-initialized stores.
-    /// Suitable for tests and for one-shot daemon startup.
+    /// Construct a context with default-initialized stores and no workspace
+    /// layer — `file_*` tools see only what this session writes.
     pub fn new() -> Self {
+        Self::build(VfsStore::new())
+    }
+
+    /// Construct a context whose VFS overlays `workspace`, the daemon's working
+    /// directory: `file_*` reads fall through to real project files, writes and
+    /// edits stay in memory.
+    pub fn with_workspace(workspace: impl Into<PathBuf>) -> Self {
+        Self::build(VfsStore::with_workspace(workspace))
+    }
+
+    fn build(vfs: VfsStore) -> Self {
         Self {
-            vfs: Arc::new(VfsStore::new()),
+            vfs: Arc::new(vfs),
             credentials: Arc::new(CredentialStore::new()),
             notes: Arc::new(NotesStore::new()),
             sessions: Arc::new(SessionRegistry::new()),

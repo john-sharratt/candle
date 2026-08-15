@@ -1,6 +1,6 @@
 //! 1D and 2D Convolutions
 //!
-use crate::{op::BackpropOp, op::Op, Error, Result, Tensor};
+use crate::{op::BackpropOp, op::Op, Error, LiveTensor, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv1D {
@@ -128,7 +128,7 @@ impl ParamsConvTranspose2D {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
         let storage =
             self.storage()
@@ -200,7 +200,7 @@ impl Tensor {
                 .zip(&kernel)
                 .map(|(block, kernel)| block.conv1d_single_group(kernel, &params))
                 .collect::<Result<Vec<_>>>()?;
-            Tensor::cat(&blocks, 1)
+            Self::cat(&blocks, 1)
         }
     }
 
@@ -266,7 +266,7 @@ impl Tensor {
                 .zip(&kernel)
                 .map(|(block, kernel)| block.conv_transpose1d_single_group(kernel, &params))
                 .collect::<Result<Vec<_>>>()?;
-            Tensor::cat(&blocks, 1)
+            Self::cat(&blocks, 1)
         }
     }
 
@@ -336,7 +336,7 @@ impl Tensor {
                 .zip(&kernel)
                 .map(|(block, kernel)| block.conv2d_single_group(kernel, &params))
                 .collect::<Result<Vec<_>>>()?;
-            Tensor::cat(&blocks, 1)
+            Self::cat(&blocks, 1)
         }
     }
 

@@ -1,3 +1,13 @@
+//! Text generation with DeepSeek-V2 (`candle_transformers::models::deepseek2::DeepSeekV2`),
+//! a large MoE model with multi-head latent attention.
+//!
+//! `--which` selects among `lite`, `lite-chat`, `coder-lite-chat`, `v2`,
+//! `v2-chat` (default `lite`), each mapping to a `deepseek-ai/DeepSeek-*` HF
+//! repo; `--model-id`/`--revision` override. Runs BF16 on GPU / F16 on CPU.
+//! `--use-flash-attn` toggles flash attention (requires the `flash-attn`
+//! feature). Temperature/top-k/top-p/repeat-penalty sampling loop over
+//! `--prompt`, stopping at the DeepSeek end-of-sentence token.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

@@ -1,9 +1,9 @@
-use crate::{Error, Tensor};
+use crate::{Error, LiveTensor, Tensor};
 use std::ops::{
     Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
 };
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// Intended to be use by the trait `.i()`
     ///
     /// ```

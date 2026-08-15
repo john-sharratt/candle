@@ -1,3 +1,11 @@
+//! Granite 4.0 Micro (GraniteMoeHybrid) causal-LM text generation example.
+//!
+//! Loads `GraniteMoeHybrid` (default `ibm-granite/granite-4.0-micro`) from the
+//! HF hub or a local directory (`--model-id` as a path). Prompts are wrapped
+//! in the `<|start_of_role|>user...assistant<|end_of_role|>` chat template.
+//! Manual decode loop with temperature/top-k/top-p `Sampling` and a repeat
+//! penalty; `--dtype` defaults to bf16 on CUDA/Metal, f32 on CPU.
+
 // Granite 4.0 Micro text generation example (GraniteMoeHybrid).
 
 #[cfg(feature = "accelerate")]

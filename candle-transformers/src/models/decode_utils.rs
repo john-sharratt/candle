@@ -32,6 +32,24 @@ pub fn chunk_rope_positions_to_i32_tensor(
     Tensor::from_vec(as_u32, (batch_size, max_blocks), device)
 }
 
+/// Zero-row `(cos, sin)` shaped like a gather's result, allocating nothing.
+///
+/// A wave assembles decode, prefill and glue attention params on every step,
+/// but usually only one of the three groups is populated — so two empty
+/// gathers per token is the normal case, not an edge case. Gathering zero rows
+/// is *not* free: `index_select` uploads an index blob, allocates a
+/// zero-length output and launches a kernel, all to produce nothing.
+///
+/// A zero-row `narrow` is a view over the tables the caller already holds, so
+/// this touches the device not at all.
+pub fn empty_rope_cos_sin(cos_all: &Tensor, sin_all: &Tensor) -> Result<(Tensor, Tensor)> {
+    let rotary = cos_all.dim(1)?;
+    Ok((
+        cos_all.narrow(0, 0, 0)?.reshape((0, 1, rotary))?,
+        sin_all.narrow(0, 0, 0)?.reshape((0, 1, rotary))?,
+    ))
+}
+
 /// Gather per-batch RoPE (cos, sin) rows by `offsets_t` and reshape to (B, 1, D).
 ///
 /// Expects `cos_all` and `sin_all` shaped like (max_seq, D).
@@ -41,6 +59,9 @@ pub fn gather_rope_cos_sin(
     offsets_t: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     let b = offsets_t.dim(0)?;
+    if b == 0 {
+        return empty_rope_cos_sin(cos_all, sin_all);
+    }
 
     let mut cos = cos_all.index_select(offsets_t, 0)?;
     let mut sin = sin_all.index_select(offsets_t, 0)?;
@@ -113,12 +134,12 @@ mod tests {
         let max_blocks = 4;
         // batch 0: 3 blocks allocated, batch 1: 1 block, batch 2: 4 blocks
         let mut positions = vec![0i32; batch_size * max_blocks];
-        // batch 0: blocks 0,1,2
+        // batch 0: blocks 0,1,2 — batch 0's row starts at offset 0
         for i in 0..3 {
-            positions[0 * max_blocks + i] = (i as i32) * chunk_size;
+            positions[i] = (i as i32) * chunk_size;
         }
         // batch 1: block 0 only
-        positions[1 * max_blocks + 0] = 0;
+        positions[max_blocks] = 0;
         // batch 2: all 4 blocks
         for i in 0..4 {
             positions[2 * max_blocks + i] = (i as i32) * chunk_size;
@@ -172,6 +193,75 @@ mod cuda_tests {
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
+
+    /// Every test here builds real paged-KV arenas on the shared device, drawing
+    /// from the process-global chunk pool and pinned stager — so they cannot run
+    /// concurrently, and the harness runs tests in parallel by default. Two
+    /// overlapping decodes corrupt each other's arenas and attention comes back
+    /// simply wrong: `[MHA hd64] BF16 decode no-history mean error too large:
+    /// 0.529` is a wrong result, not a loose tolerance. Each test passed alone
+    /// and under `--test-threads=1`, which is exactly what made an ordinary
+    /// shared-state race read as GPU flakiness. Poison-tolerant so one failure
+    /// does not cascade into the rest.
+    /// Serialise against every GPU test in the crate, not just this module.
+    ///
+    /// A module-scoped lock let a `prefill_utils` test run concurrently with a
+    /// decode test over the same process-global region pool, which is what made
+    /// `correctness_decode_seal_gap` flaky. See [`crate::models::gpu_test_lock`].
+    use crate::models::gpu_test_lock::gpu_serial as gpu_guard;
+
+    /// A wave builds decode, prefill and glue params every step and usually
+    /// only one group is populated, so the empty gather runs twice per token.
+    /// It must not reach the driver at all.
+    ///
+    /// Needs `forbidden_allocations`: without it the detector reports every run
+    /// clean and both halves of this test would pass for the wrong reason.
+    #[cfg(feature = "forbidden_allocations")]
+    #[test]
+    fn empty_rope_gather_touches_no_device_memory() -> Result<()> {
+        let _gpu = gpu_guard();
+        let device = Device::new_cuda(0)?;
+        let cos_all = Tensor::randn(0f32, 1f32, (2048, 64), &device)?;
+        let sin_all = Tensor::randn(0f32, 1f32, (2048, 64), &device)?;
+        let populated = Tensor::new(&[3u32, 9, 17, 31], &device)?;
+        let empty = Tensor::from_vec(Vec::<u32>::new(), 0usize, &device)?;
+
+        // Build both index tensors and take the first-touch traffic (module
+        // load, kernel cache) before arming — it is unavoidable and would
+        // otherwise be attributed to the calls under test.
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &populated)?;
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &empty)?;
+        let _ = candle::forbidden_alloc::take_report();
+
+        let armed = candle::forbidden_alloc::armed();
+        let (cos, sin) = super::gather_rope_cos_sin(&cos_all, &sin_all, &empty)?;
+        drop(armed);
+        let empty_report = candle::forbidden_alloc::take_report();
+
+        // Positive control: the populated gather *does* allocate. Without it a
+        // disarmed detector, or one wired to the wrong build, would report the
+        // empty case clean no matter what it did.
+        let armed = candle::forbidden_alloc::armed();
+        let _ = super::gather_rope_cos_sin(&cos_all, &sin_all, &populated)?;
+        drop(armed);
+        let populated_report = candle::forbidden_alloc::take_report();
+
+        assert_eq!(
+            cos.dims(),
+            &[0, 1, 64],
+            "shape must match the gathered form"
+        );
+        assert_eq!(sin.dims(), &[0, 1, 64]);
+        assert!(
+            !populated_report.is_clean(),
+            "control: a real gather must allocate, else the detector is not armed"
+        );
+        assert!(
+            empty_report.is_clean(),
+            "empty gather reached the driver: {empty_report}"
+        );
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // RoPE table helpers (same theta=10000 convention as prefill_utils)
@@ -364,6 +454,7 @@ mod cuda_tests {
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
 
         let result = paged_decode_attn(
+            None,
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -462,6 +553,7 @@ mod cuda_tests {
         let rope_cs = make_zero_rope_cs(head_dim, 16, device)?;
 
         let result = paged_decode_attn(
+            None,
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -483,6 +575,7 @@ mod cuda_tests {
     // and warp=head (hpg>8) paths must match it once gap-fixed.
     #[test]
     fn correctness_decode_seal_gap() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         // Small sealed chunk (p) + large writer (w): a gap-blind chunk_div drops
@@ -608,6 +701,7 @@ mod cuda_tests {
 
     #[test]
     fn paged_decode_bf16_smoke() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
@@ -646,6 +740,7 @@ mod cuda_tests {
 
     #[test]
     fn test_fp8_hd128_paged_decode() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 128);
         let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
@@ -683,6 +778,7 @@ mod cuda_tests {
 
     #[test]
     fn test_fp8_hd64_paged_decode() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 64);
         let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
@@ -726,6 +822,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_no_history_bf16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         for &(n_head, n_kv_head, head_dim, label) in &[
@@ -782,6 +879,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_no_history_f16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
         for &(n_head, n_kv_head, head_dim, label) in &[
@@ -840,6 +938,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_with_history_bf16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         for &(n_head, n_kv_head, head_dim, history_len, label) in &[
@@ -888,6 +987,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_with_history_f16() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
         for &(n_head, n_kv_head, head_dim, history_len, label) in &[
@@ -934,6 +1034,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_gqa_head_mapping_regression() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let history_len = 10usize;
@@ -981,6 +1082,7 @@ mod cuda_tests {
 
     #[test]
     fn correctness_decode_diagnostic_per_head() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim, history_len) = (40, 8, 64, 10);
@@ -1041,6 +1143,7 @@ mod cuda_tests {
 
     #[test]
     fn rope_offset_decode_none_succeeds() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
@@ -1083,6 +1186,7 @@ mod cuda_tests {
     /// history keys.
     #[test]
     fn rope_offset_decode_real_vs_zero_differs() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim, history_len) = (8, 8, 64, 16);
@@ -1152,6 +1256,7 @@ mod cuda_tests {
     /// see the same effective Q and K — a tight tolerance is expected.
     #[test]
     fn rope_offset_decode_functional() -> Result<()> {
+        let _gpu = gpu_guard();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (4, 4, 64);

@@ -616,8 +616,7 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             for (&seq_idx, logits) in group_seqs.iter().zip(logits_vec.into_iter()) {
                 let orig_i = seq_indices
                     .iter()
@@ -684,8 +683,7 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
                 nl,
                 None,
             )?
-            .logits
-            .unwrap_or_default();
+            .logits_owned()?;
         for &seq_idx in &active_seqs {
             session.advance_sequence(seq_idx, 1)?;
         }
@@ -703,7 +701,7 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
     for &idx in &seq_indices {
         session.free_sequence(idx)?;
     }
-    session.compact()?;
+    session.release_empty_arenas()?;
 
     // Decode token IDs to strings.
     prompt_tokens

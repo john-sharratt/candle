@@ -114,15 +114,14 @@ pub fn elevate_to_hot(
     sections: &[SectionId],
     turns: &[TurnKey],
 ) -> Result<ElevationReport> {
-    // Hold the migration-in-flight guard for the WHOLE elevate GPU window: the
-    // warm→hot lift allocates fresh hot arenas and scatters into them
-    // (`kv_migrate` on the shared stream) from the persistence thread, exactly
-    // like the hot→warm migrate — and with the same hazard: scheduler-side
-    // arena free / defrag / release / `cuMemPoolTrimTo` relief unmapping an
-    // arena a lift kernel is mid-read/write (the decode-onset illegal-address
-    // under bulk ingest, where lifts and waves overlap constantly). The guard
-    // defers that relief until the lift's kernels have retired.
-    let _migrate_guard = candle_nn::kv_cache::enter_migrate();
+    // No topology guard here. The lift used to hold the arena-topology read
+    // lock across its whole GPU window, because scheduler-side relief could
+    // unmap an arena a `kv_migrate` kernel was mid-write to — the decode-onset
+    // illegal address under bulk ingest, where lifts and waves overlap
+    // constantly. The lift's destination arenas are freshly allocated and hold
+    // live gids, so nothing can reclaim them while it writes; and a region that
+    // IS reclaimed stays mapped at the same address, with the re-tenanting wait
+    // paid in `region_pool::claim_region`.
     // ── Phase 1: classify ───────────────────────────────────────────────
     let plan: PromotionPlan = conversation
         .read()
@@ -167,12 +166,12 @@ pub fn elevate_to_hot(
         if incoming_bytes > 0 {
             let mut sys = System::new();
             sys.refresh_memory();
-            let total_ram = sys.total_memory();
-            let available_ram = sys.available_memory();
-            let purged: PurgeReport =
-                conversation
-                    .write()
-                    .purge_warm_to_target(incoming_bytes, available_ram, total_ram);
+            // Make room for the incoming recall within the warm tier's host-RAM
+            // budget (see `purge_warm_to_budget`).
+            let budget = candle::vram::host_ram_budget(sys.total_memory());
+            let purged: PurgeReport = conversation
+                .write()
+                .purge_warm_to_budget(budget.kv_warm_budget_bytes, incoming_bytes);
             report.warm_purged = purged.count;
             report.bytes_warm_purged = purged.bytes;
         }

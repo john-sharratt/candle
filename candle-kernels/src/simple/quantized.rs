@@ -1894,43 +1894,6 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     );
 
-    // -------------------------------------------------------------------------
-    // Arena compaction kernels
-    // -------------------------------------------------------------------------
-
-    /// Copy kernel: one block per move, copies stride_bytes via uint4 loads.
-    ///
-    /// # Parameters
-    /// - `moves`: Device array of CompactMove structs (dst, src, stride_bytes, _pad)
-    /// - `num_moves`: Number of moves
-    /// - `block_dim`: Threads per block (128 recommended)
-    pub fn run_arena_compact_copy(
-        moves: *const c_void,
-        num_moves: c_int,
-        block_dim: c_int,
-        stream: *mut std::ffi::c_void,
-    );
-
-    /// Patch kernel: binary-search rewrite of GPU block table entries.
-    ///
-    /// src_gids must be sorted ascending on the host before upload.
-    ///
-    /// # Parameters
-    /// - `block_table`: Device i32 array to patch in-place
-    /// - `num_entries`: Length of block_table
-    /// - `src_gids`: Sorted source GIDs (device)
-    /// - `dst_gids`: Corresponding destination GIDs (device)
-    /// - `num_moves`: Length of src_gids/dst_gids
-    /// - `stream`: CUDA stream to use for the kernel launch
-    pub fn run_arena_compact_patch(
-        block_table: *mut c_int,
-        num_entries: c_int,
-        src_gids: *const c_int,
-        dst_gids: *const c_int,
-        num_moves: c_int,
-        stream: *mut std::ffi::c_void,
-    );
-
     /// GPU winner summarization kernel — reduces a full `[n_thresholds × n_cells]` u8 winner
     /// array (output of `run_select_winners_kv_paged`) to `[n_thresholds × 3]` f32 accumulators
     /// (ideal_bits, head_bits, pal4_bits) without a round-trip to host.

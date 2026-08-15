@@ -1,3 +1,13 @@
+//! Vision-language generation with Mistral's Pixtral-12B: encodes an input image
+//! through the Pixtral vision tower, splices the resulting patch embeddings
+//! between `[IMG_BREAK]`/`[IMG_END]` markers and the text prompt, then
+//! autoregressively decodes a caption/description with the language model.
+//!
+//! `--image` accepts a standard image file or a `.safetensors` tensor named
+//! `"img"`. `--vision-only` runs just the vision tower and prints the raw
+//! image embeddings instead of generating text. Defaults to BF16 on
+//! BF16-capable devices.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

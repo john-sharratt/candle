@@ -43,9 +43,6 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
-use super::alloc::EvictionScope;
-#[cfg(feature = "cuda")]
-use super::arena::ArenaKey;
 #[cfg(feature = "cuda")]
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
@@ -56,15 +53,54 @@ use super::compression_policy::{
 #[cfg(feature = "cuda")]
 use super::gid_pool::ChunkGid;
 #[cfg(feature = "cuda")]
-use super::head_gids::{HeadGids, GIDS_PER_HEAD};
+use super::head_gids::{ChunkBands, HeadGids, GIDS_PER_HEAD};
+#[cfg(feature = "cuda")]
+use super::meta_pool::ChunkRecordSrc;
 #[cfg(feature = "cuda")]
 use super::sampled_selection::{PagedSelectionGpuInputs, SampleFormat};
 #[cfg(feature = "cuda")]
 use super::types::{SealedChunk, SealedSequence, CHUNK_SIZE};
 #[cfg(feature = "cuda")]
-use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
+use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, N_PALETTE};
 #[cfg(feature = "cuda")]
 use crate::kv_cache::{KvFormat, QuantFormat};
+
+/// Device pointer of one band's chunk slot.
+///
+/// Every pointer the convert kernels take is this: a slot *is* one
+/// `(head, palette, side)` band, so its address is the arena's base plus
+/// `chunk_idx * class_stride` and nothing else. Under per-format arenas this
+/// had to be spelled two ways — `tensor_ptr_at_offset` scaled an element
+/// offset by a dtype width, `qtensor_ptr_at_byte_offset` took a byte offset
+/// computed from a ggml block layout — and both were reconstructing an address
+/// the arena can hand over directly.
+#[cfg(feature = "cuda")]
+fn band_ptr(storage: &super::arena::ArenaStorageState, gid: &ChunkGid, what: &str) -> Result<u64> {
+    let ai = gid.arena_idx();
+    let arena = storage
+        .arenas()
+        .get(&ai)
+        .ok_or_else(|| candle::Error::Msg(format!("{what} arena {ai} not found")))?;
+    arena
+        .slot_ptr(gid.chunk_idx())
+        .ok_or_else(|| candle::Error::Msg(format!("{what} arena {ai} is not GPU-resident")))
+}
+
+/// The GGML layout a band's bytes are in, from the band's own tag.
+///
+/// The arena cannot answer this — it holds whatever fits its slots
+/// (`docs/archived/arena_unification.md` principle 8) — so the tag is the only source,
+/// and it is the same byte the substrate persisted.
+#[cfg(feature = "cuda")]
+fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {
+    let format = KvFormat::from_tag(tag).ok_or_else(|| {
+        candle::Error::Msg(format!("chunk band carries unrecognised format tag {tag}"))
+    })?;
+    match format {
+        KvFormat::Quantized(qf) => Ok(qf.to_ggml_dtype()),
+        KvFormat::Float(dt) => dtype_to_ggml_float(dt),
+    }
+}
 
 /// Pack per-dim palette assignments (one byte per dim, value in `{0..3}`)
 /// into the 32-byte packed map the decode/prefill kernels read.
@@ -243,9 +279,6 @@ pub fn quantize_layers_deferred(
         Device::Cuda(d) => d,
         _ => candle::bail!("quantize_layers_deferred: requires a CUDA device"),
     };
-    // Covers the shared selection's transient allocations (staging + table
-    // tensor); the per-layer `_impl` calls nest their own scope (re-entrant).
-    let _evict = EvictionScope::enter();
     let n_kv_head = backings[0].n_kv_head();
     let head_dim = backings[0].head_dim();
 
@@ -260,7 +293,7 @@ pub fn quantize_layers_deferred(
     // entries stay in place so arena offsets and the per-layer split align with
     // `backings` indices.
     let backings_inner: Vec<_> = backings.iter().map(|b| b.inner.clone()).collect();
-    let chunk_gids_per_layer: Vec<Vec<HeadGids>> = buckets
+    let chunk_gids_per_layer: Vec<Vec<ChunkBands>> = buckets
         .iter()
         .map(|b| b.as_ref().map(|q| q.chunk_jobs.clone()).unwrap_or_default())
         .collect();
@@ -381,16 +414,23 @@ pub fn quantize_layers_deferred(
 /// and can be threaded through a cross-layer selection.
 #[cfg(feature = "cuda")]
 struct QuantBucket {
-    chunk_jobs: Vec<HeadGids>,
+    /// One entry per kernel-eligible chunk: its band gids **and** the band
+    /// format tags that say how to read them. The selection table and the
+    /// convert-descriptor build both need the pair; the arena a gid points into
+    /// can only answer the first half.
+    chunk_jobs: Vec<ChunkBands>,
     chunk_valid_ranges: Vec<i32>,
     seq_chunk_map: Vec<(usize, usize)>,
     preserve_per_seq: Vec<Vec<(usize, SealedChunk)>>,
 }
 
 /// Partition `sequences`' chunks into kernel-eligible jobs vs the preserve
-/// bucket. A chunk is eligible when every `(h, p)` source GID lives in a GPU
-/// `Float` or `Quantized(R16)` arena — the formats the selection + convert
-/// kernels read directly. Full and partial chunks both qualify (partial dead
+/// bucket. A chunk is eligible when every `(h, p)` source band is GPU-resident
+/// and recorded as `Float` or `Quantized(R16)` — the formats the selection +
+/// convert kernels read directly. Location comes from the arena (it is arena
+/// identity); the format comes from the chunk's own band tags, because under
+/// size classes an arena holds whatever fits its stride and cannot answer the
+/// question. Full and partial chunks both qualify (partial dead
 /// slots are zero — arenas are zeroed at creation/recycle — and the packed
 /// valid range corrects the count-normalized metrics). Ineligible chunks (e.g. a
 /// view borrowing cold-loaded mixed-Q chunks) go to `preserve` and merge back
@@ -401,7 +441,7 @@ fn bucket_quant_chunks(
     backing: &ChunkedKvBacking,
     sequences: &[&SealedSequence],
 ) -> Result<Option<QuantBucket>> {
-    let mut chunk_jobs: Vec<HeadGids> = Vec::new();
+    let mut chunk_jobs: Vec<ChunkBands> = Vec::new();
     let mut chunk_valid_ranges: Vec<i32> = Vec::new();
     let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
     let mut preserve_per_seq: Vec<Vec<(usize, SealedChunk)>> =
@@ -410,19 +450,19 @@ fn bucket_quant_chunks(
         for (seq_idx, seq) in sequences.iter().enumerate() {
             for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
                 let mut all_gids_kernel_eligible = true;
-                for gid in chunk.gids.as_slice() {
-                    let ok = matches!(
-                        storage.arena_key(gid.arena_idx()),
-                        Some(k) if k.location == ArenaLocation::Gpu
-                            && super::chunk_ops::needs_reconcile_source_format(k.format)
-                    );
+                for (gid, tag) in chunk.bands() {
+                    let ok = super::chunk_ops::needs_reconcile_source_tag(tag)
+                        && matches!(
+                            storage.arena_key(gid.arena_idx()),
+                            Some(k) if k.location == ArenaLocation::Gpu
+                        );
                     if !ok {
                         all_gids_kernel_eligible = false;
                         break;
                     }
                 }
                 if all_gids_kernel_eligible {
-                    chunk_jobs.push(chunk.gids.clone());
+                    chunk_jobs.push(ChunkBands::from_sealed(chunk));
                     let len = usize::from(chunk.token_count).clamp(1, CHUNK_SIZE) as i32;
                     chunk_valid_ranges.push(((chunk.offset as i32) << 8) | len);
                     seq_chunk_map.push((seq_idx, chunk_idx));
@@ -535,12 +575,14 @@ fn quantize_sealed_in_place_impl(
         return Ok(Vec::new());
     }
 
-    // This is a compress-to-free op: it allocates small transient quantized
-    // arenas, then frees the much larger float source. Enter the eviction scope
-    // so those arenas may draw from the dedicated eviction reserve even when the
-    // normal KV budget is exhausted — otherwise, under extreme pressure, the
-    // allocation fails and the cache can never reclaim VRAM (freeing needs VRAM).
-    let _evict = EvictionScope::enter();
+    // This is a compress-to-free op: it writes small quantized chunks, then
+    // frees the much larger float source. That used to need a byte reserve only
+    // it could draw on, or under extreme pressure the compress would fail for
+    // want of memory and the cache could never reclaim any (freeing needs
+    // memory). Scarcity-only class promotion is the answer now: with no free
+    // region, the small chunks take free slots in a wider class's existing
+    // region, and the float regions they release come back whole
+    // (`docs/archived/arena_unification.md` §3.4).
 
     let cuda_dev = match device {
         Device::Cuda(d) => d,
@@ -726,12 +768,24 @@ fn quantize_sealed_in_place_impl(
                         .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p])
                 })
                 .collect();
+            // Eligibility for one contiguous run is a question about *keys*:
+            // four bands in four different formats that share a size class
+            // share an arena, so they can still be a run. Under per-format
+            // arenas this could only pass for identical formats.
             let alloc_side = |fmts: &[crate::kv_cache::QuantFormat]| -> Result<Vec<ChunkGid>> {
-                if fmts.iter().all(|f| *f == fmts[0]) {
-                    backing.alloc_chunk_run_for_key(ArenaKey::gpu_quant(fmts[0]), N_PALETTE)
+                let keys = fmts
+                    .iter()
+                    .map(|f| {
+                        backing
+                            .inner
+                            .arena_key_for(KvFormat::Quantized(*f), ArenaLocation::Gpu)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if keys.iter().all(|k| *k == keys[0]) {
+                    backing.alloc_chunk_run_for_key(keys[0], N_PALETTE)
                 } else {
-                    fmts.iter()
-                        .map(|f| backing.alloc_chunk_for_key(ArenaKey::gpu_quant(*f)))
+                    keys.into_iter()
+                        .map(|k| backing.alloc_chunk_for_key(k))
                         .collect()
                 }
             };
@@ -752,13 +806,16 @@ fn quantize_sealed_in_place_impl(
     }
 
     // ── Build PalHeadDesc structs + launch kernel ─────────────────────
-    let r16_bytes_per_head = (elems_per_head / 32) * 128; // R16 block = 32 elems × 4 bytes
-
     let mut descs: Vec<PalHeadDesc> = Vec::with_capacity(n_chunks * n_kv_head);
 
     backing.inner.storage.try_write(|storage| {
-        for (chunk_i, src_gids) in chunk_jobs.iter().enumerate() {
+        for (chunk_i, src_bands) in chunk_jobs.iter().enumerate() {
+            let src_gids = &src_bands.gids;
             let ident = identity_pal_map_128();
+            // The source chunk's own band tags. `bucket_quant_chunks` already
+            // proved every band is Float or R16, so the only question left per
+            // band is *which* of the two.
+            let src_bands = &chunk_jobs[chunk_i];
             for h in 0..n_kv_head {
                 let mut k_src_ptrs = [0u64; N_PALETTE];
                 let mut k_dst_ptrs = [0u64; N_PALETTE];
@@ -772,31 +829,12 @@ fn quantize_sealed_in_place_impl(
                 for p in 0..N_PALETTE {
                     let gid_slot = h * GIDS_PER_HEAD + p * 2;
 
-                    // K source.
+                    // K source — layout from the chunk's tag, address from the
+                    // arena. `bucket_quant_chunks` already proved every band is
+                    // Float or R16.
                     let k_src = src_gids.k_gid_pal(h, p);
-                    let k_src_ai = k_src.arena_idx();
-                    let k_src_arena = storage.arenas().get(&k_src_ai).ok_or_else(|| {
-                        candle::Error::Msg(format!("k src arena {k_src_ai} not found"))
-                    })?;
-                    let k_is_r16 =
-                        matches!(k_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
-                    k_src_fmts[p] = if k_is_r16 {
-                        GgmlDType::R16
-                    } else {
-                        dtype_to_ggml_float(k_src_arena.float_data()?.dtype())?
-                    };
-                    k_src_ptrs[p] = if k_is_r16 {
-                        let qt = k_src_arena.quantized_data()?;
-                        ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                            qt,
-                            k_src.chunk_idx() * r16_bytes_per_head,
-                        )?
-                    } else {
-                        ChunkedKvBacking::tensor_ptr_at_offset(
-                            k_src_arena.float_data()?,
-                            k_src.chunk_idx() * elems_per_head,
-                        )?
-                    };
+                    k_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).0)?;
+                    k_src_ptrs[p] = band_ptr(storage, &k_src, "k src")?;
 
                     // K destination — `policy.override_k_quant` decides
                     // between uniform override format and selection's
@@ -807,46 +845,13 @@ fn quantize_sealed_in_place_impl(
                         .override_k_quant
                         .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p]);
                     let k_qdtype = k_qfmt.to_ggml_dtype();
-                    let k_dst_bpc = (elems_per_head / k_qdtype.block_size()) * k_qdtype.type_size();
-                    let k_dst_arena =
-                        storage.arenas().get(&k_dst.arena_idx()).ok_or_else(|| {
-                            candle::Error::Msg(format!(
-                                "k dst arena {} not found",
-                                k_dst.arena_idx()
-                            ))
-                        })?;
-                    let k_dst_qt = k_dst_arena.quantized_data()?;
                     k_dst_fmts[p] = k_qdtype;
-                    k_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                        k_dst_qt,
-                        k_dst.chunk_idx() * k_dst_bpc,
-                    )?;
+                    k_dst_ptrs[p] = band_ptr(storage, k_dst, "k dst")?;
 
-                    // V source.
+                    // V source — same shape as the K side above.
                     let v_src = src_gids.v_gid_pal(h, p);
-                    let v_src_ai = v_src.arena_idx();
-                    let v_src_arena = storage.arenas().get(&v_src_ai).ok_or_else(|| {
-                        candle::Error::Msg(format!("v src arena {v_src_ai} not found"))
-                    })?;
-                    let v_is_r16 =
-                        matches!(v_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
-                    v_src_fmts[p] = if v_is_r16 {
-                        GgmlDType::R16
-                    } else {
-                        dtype_to_ggml_float(v_src_arena.float_data()?.dtype())?
-                    };
-                    v_src_ptrs[p] = if v_is_r16 {
-                        let qt = v_src_arena.quantized_data()?;
-                        ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                            qt,
-                            v_src.chunk_idx() * r16_bytes_per_head,
-                        )?
-                    } else {
-                        ChunkedKvBacking::tensor_ptr_at_offset(
-                            v_src_arena.float_data()?,
-                            v_src.chunk_idx() * elems_per_head,
-                        )?
-                    };
+                    v_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).1)?;
+                    v_src_ptrs[p] = band_ptr(storage, &v_src, "v src")?;
 
                     // V destination — `policy.override_v_quant` decides
                     // between uniform override format and selection's
@@ -857,20 +862,8 @@ fn quantize_sealed_in_place_impl(
                         .override_v_quant
                         .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p]);
                     let v_qdtype = v_qfmt.to_ggml_dtype();
-                    let v_dst_bpc = (elems_per_head / v_qdtype.block_size()) * v_qdtype.type_size();
-                    let v_dst_arena =
-                        storage.arenas().get(&v_dst.arena_idx()).ok_or_else(|| {
-                            candle::Error::Msg(format!(
-                                "v dst arena {} not found",
-                                v_dst.arena_idx()
-                            ))
-                        })?;
-                    let v_dst_qt = v_dst_arena.quantized_data()?;
                     v_dst_fmts[p] = v_qdtype;
-                    v_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                        v_dst_qt,
-                        v_dst.chunk_idx() * v_dst_bpc,
-                    )?;
+                    v_dst_ptrs[p] = band_ptr(storage, v_dst, "v dst")?;
                 }
 
                 let pal_bytes = ident.len();
@@ -999,7 +992,6 @@ fn quantize_sealed_in_place_impl(
     let mut quant_keys: Vec<(usize, usize)> = Vec::with_capacity(seq_chunk_map.len());
     for (job_idx, &(seq_idx, chunk_idx)) in seq_chunk_map.iter().enumerate() {
         let new_gids = HeadGids::from_vec(new_gids_per_chunk[job_idx].clone());
-        let byte_size = new_gids.arena_byte_size(&arena_infos);
         let (src_seq_idx, src_chunk_idx) = seq_chunk_map[job_idx];
         let src = &sequences[src_seq_idx].chunks[src_chunk_idx];
         // K and V pal_map / scale match what convert-1 wrote per side:
@@ -1040,6 +1032,40 @@ fn quantize_sealed_in_place_impl(
                 Arc::new(v_palette_scales[job_idx].clone()),
             )
         };
+        // Per-band format tags. This is the site where the chunk's formats are
+        // DECIDED rather than inherited: the selection kernel picked one format
+        // per (head, palette), and `alloc_side` above allocated each band's
+        // destination from exactly this expression. The two must not drift —
+        // the tag is what every reader will use to interpret those bytes once
+        // the arena stops carrying a format (§1.5).
+        let band_tag =
+            |q: QuantFormat| ArenaFormatTag::from_kv_format(KvFormat::Quantized(q)).as_u8();
+        let k_fmt: Arc<Vec<u8>> = Arc::new(
+            (0..n_kv_head * N_PALETTE)
+                .map(|i| {
+                    band_tag(
+                        policy
+                            .override_k_quant
+                            .unwrap_or(k_palette_formats[job_idx][i]),
+                    )
+                })
+                .collect(),
+        );
+        let v_fmt: Arc<Vec<u8>> = Arc::new(
+            (0..n_kv_head * N_PALETTE)
+                .map(|i| {
+                    band_tag(
+                        policy
+                            .override_v_quant
+                            .unwrap_or(v_palette_formats[job_idx][i]),
+                    )
+                })
+                .collect(),
+        );
+        // Byte size is summed from the tags just built, not from the arenas:
+        // a size-class arena's slot is an upper bound on a band's bytes, never
+        // the bytes themselves (`docs/archived/arena_unification.md` invariant 8).
+        let byte_size = new_gids.arena_byte_size(&k_fmt, &v_fmt, elems_per_head);
         // The co-resident KV-head record is built in one batched pass after the
         // loop (below), so all quantized placements are known and the device
         // upload coalesces into a single transfer.
@@ -1053,6 +1079,8 @@ fn quantize_sealed_in_place_impl(
                 v_pal,
                 k_scale,
                 v_scale,
+                k_fmt,
+                v_fmt,
                 byte_size,
                 meta: None,
             },
@@ -1065,17 +1093,19 @@ fn quantize_sealed_in_place_impl(
     // arenas — in one batched, coalesced upload.
     {
         let metas = {
-            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = quant_keys
+            let refs: Vec<ChunkRecordSrc<'_>> = quant_keys
                 .iter()
                 .map(|key| {
                     let c = &full_quant_chunks[key];
-                    (
-                        &c.gids,
-                        c.k_pal.as_slice(),
-                        c.v_pal.as_slice(),
-                        c.k_scale.as_slice(),
-                        c.v_scale.as_slice(),
-                    )
+                    ChunkRecordSrc {
+                        gids: &c.gids,
+                        k_pal: c.k_pal.as_slice(),
+                        v_pal: c.v_pal.as_slice(),
+                        k_scale: c.k_scale.as_slice(),
+                        v_scale: c.v_scale.as_slice(),
+                        k_fmt: c.k_fmt.as_slice(),
+                        v_fmt: c.v_fmt.as_slice(),
+                    }
                 })
                 .collect();
             backing.build_meta_records(&refs, &arena_infos)?
@@ -1240,14 +1270,14 @@ pub fn dequantize_sealed_in_place(
     }
     let sub_head_dim = head_dim / N_PALETTE;
     let elems_per_head = CHUNK_SIZE * sub_head_dim;
-    let r16_bytes_per_head = (elems_per_head / 32) * 128;
     let pal_bytes_per_head = head_dim / 4;
 
     // ── Bucket each source chunk: decompress vs preserve ────────────
-    // A chunk is eligible for the reverse kernel when it is full and every
-    // (h, p) source GID lives in a GPU `Quantized` arena (R16 included — the
+    // A chunk is eligible for the reverse kernel when it is full, GPU-resident,
+    // and every (h, p) band is recorded as `Quantized` (R16 included — the
     // kernel's issue_load handles R16 raw). Partial tails (already GPU Float)
-    // and any non-GPU chunk go to the preserve bucket unchanged.
+    // and any non-GPU chunk go to the preserve bucket unchanged. As elsewhere,
+    // location comes from the arena and format from the chunk's band tags.
     let mut chunk_jobs: Vec<&SealedChunk> = Vec::new();
     let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
     let mut preserve_per_seq: Vec<Vec<(usize, SealedChunk)>> =
@@ -1258,12 +1288,16 @@ pub fn dequantize_sealed_in_place(
                 let is_full = usize::from(chunk.token_count) >= CHUNK_SIZE;
                 let mut all_gids_quant = is_full;
                 if all_gids_quant {
-                    for gid in chunk.gids.as_slice() {
-                        let ok = matches!(
-                            storage.arena_key(gid.arena_idx()),
-                            Some(k) if k.location == ArenaLocation::Gpu
-                                && matches!(k.format, KvFormat::Quantized(_))
-                        );
+                    for (gid, tag) in chunk.bands() {
+                        // `Invalid` reports as quantized, so an unrecorded band
+                        // must be rejected explicitly — the reverse kernel would
+                        // otherwise be handed bytes it cannot interpret.
+                        let ok = tag != ArenaFormatTag::Invalid
+                            && tag.is_quantized()
+                            && matches!(
+                                storage.arena_key(gid.arena_idx()),
+                                Some(k) if k.location == ArenaLocation::Gpu
+                            );
                         if !ok {
                             all_gids_quant = false;
                             break;
@@ -1294,8 +1328,11 @@ pub fn dequantize_sealed_in_place(
         let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
         for _h in 0..n_kv_head {
             for _p in 0..N_PALETTE {
-                let k_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_float(DType::F16))?;
-                let v_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_float(DType::F16))?;
+                let f16_key = backing
+                    .inner
+                    .arena_key_for(KvFormat::Float(DType::F16), ArenaLocation::Gpu)?;
+                let k_gid = backing.alloc_chunk_for_key(f16_key)?;
+                let v_gid = backing.alloc_chunk_for_key(f16_key)?;
                 chunk_gids.push(k_gid);
                 chunk_gids.push(v_gid);
             }
@@ -1320,75 +1357,44 @@ pub fn dequantize_sealed_in_place(
                 let mut v_dst_ptrs = [0u64; N_PALETTE];
 
                 // Resolve one side's source pointer/format for palette `p`.
+                //
+                // The layout comes from the chunk's own band tag; the arena
+                // supplies only the base pointer it is addressed against. The
+                // tag byte round-trips through `KvFormat::from_tag`, the same
+                // inverse the substrate uses, so there is no second byte→format
+                // table to drift from `ArenaFormatTag::from_kv_format`.
                 let resolve_src = |storage: &super::arena::ArenaStorageState,
-                                   gid: &ChunkGid|
+                                   gid: &ChunkGid,
+                                   tag: u8|
                  -> Result<(u64, GgmlDType)> {
-                    let ai = gid.arena_idx();
-                    let arena = storage
-                        .arenas()
-                        .get(&ai)
-                        .ok_or_else(|| candle::Error::Msg(format!("src arena {ai} not found")))?;
-                    match arena.format() {
-                        KvFormat::Quantized(QuantFormat::R16) => {
-                            let qt = arena.quantized_data()?;
-                            let ptr = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                                qt,
-                                gid.chunk_idx() * r16_bytes_per_head,
-                            )?;
-                            Ok((ptr, GgmlDType::R16))
-                        }
-                        KvFormat::Quantized(qf) => {
-                            let qt = arena.quantized_data()?;
-                            let d = qf.to_ggml_dtype();
-                            let bpc = (elems_per_head / d.block_size()) * d.type_size();
-                            let ptr = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                                qt,
-                                gid.chunk_idx() * bpc,
-                            )?;
-                            Ok((ptr, d))
-                        }
-                        KvFormat::Float(dt) => {
-                            let ptr = ChunkedKvBacking::tensor_ptr_at_offset(
-                                arena.float_data()?,
-                                gid.chunk_idx() * elems_per_head,
-                            )?;
-                            Ok((ptr, dtype_to_ggml_float(dt)?))
-                        }
-                    }
+                    Ok((band_ptr(storage, gid, "src")?, band_ggml_dtype(tag)?))
                 };
 
                 for p in 0..N_PALETTE {
-                    let (kp, kf) = resolve_src(&*storage, &src_gids.k_gid_pal(h, p))?;
+                    let bidx = h * N_PALETTE + p;
+                    let k_tag = src_chunk.k_fmt.get(bidx).copied().ok_or_else(|| {
+                        candle::Error::Msg(format!("src chunk has no K format tag for band {bidx}"))
+                    })?;
+                    let v_tag = src_chunk.v_fmt.get(bidx).copied().ok_or_else(|| {
+                        candle::Error::Msg(format!("src chunk has no V format tag for band {bidx}"))
+                    })?;
+                    let (kp, kf) = resolve_src(&*storage, &src_gids.k_gid_pal(h, p), k_tag)?;
                     k_src_ptrs[p] = kp;
                     k_src_fmts[p] = kf;
-                    let (vp, vf) = resolve_src(&*storage, &src_gids.v_gid_pal(h, p))?;
+                    let (vp, vf) = resolve_src(&*storage, &src_gids.v_gid_pal(h, p), v_tag)?;
                     v_src_ptrs[p] = vp;
                     v_src_fmts[p] = vf;
 
                     // Stored per-(h, p) outer scale (empty scale vec ⇒ unit).
-                    let sidx = h * N_PALETTE + p;
+                    let sidx = bidx;
                     k_src_scales[p] = src_chunk.k_scale.get(sidx).copied().unwrap_or(1.0);
                     v_src_scales[p] = src_chunk.v_scale.get(sidx).copied().unwrap_or(1.0);
 
                     // F16 dst pointers.
                     let k_dst = &new_gids_per_chunk[chunk_i][h * GIDS_PER_HEAD + p * 2];
                     let v_dst = &new_gids_per_chunk[chunk_i][h * GIDS_PER_HEAD + p * 2 + 1];
-                    let k_dst_arena = storage
-                        .arenas()
-                        .get(&k_dst.arena_idx())
-                        .ok_or_else(|| candle::Error::Msg("k dst arena not found".into()))?;
-                    k_dst_ptrs[p] = ChunkedKvBacking::tensor_ptr_at_offset(
-                        k_dst_arena.float_data()?,
-                        k_dst.chunk_idx() * elems_per_head,
-                    )?;
-                    let v_dst_arena = storage
-                        .arenas()
-                        .get(&v_dst.arena_idx())
-                        .ok_or_else(|| candle::Error::Msg("v dst arena not found".into()))?;
-                    v_dst_ptrs[p] = ChunkedKvBacking::tensor_ptr_at_offset(
-                        v_dst_arena.float_data()?,
-                        v_dst.chunk_idx() * elems_per_head,
-                    )?;
+                    k_dst_ptrs[p] = band_ptr(storage, k_dst, "k dst")?;
+                    v_dst_ptrs[p] = band_ptr(storage, v_dst, "v dst")?;
                 }
 
                 // Source palette maps: the chunk's stored per-head slice (fall
@@ -1463,13 +1469,23 @@ pub fn dequantize_sealed_in_place(
     }
     let identity_head_bytes = Arc::new(identity_head_bytes);
     let empty_scale: Arc<Vec<f32>> = Arc::new(Vec::new());
+    // Dequantize writes every band as F16 (see the `ArenaKey::gpu_float(F16)`
+    // destination allocation above), so every band's tag is F16 — shared once
+    // rather than rebuilt per chunk.
+    let f16_fmt: Arc<Vec<u8>> = Arc::new(vec![
+        ArenaFormatTag::from_kv_format(KvFormat::Float(
+            DType::F16
+        ))
+        .as_u8();
+        n_kv_head * N_PALETTE
+    ]);
 
     let mut float_chunks: std::collections::HashMap<(usize, usize), SealedChunk> =
         std::collections::HashMap::with_capacity(seq_chunk_map.len());
     let mut float_keys: Vec<(usize, usize)> = Vec::with_capacity(seq_chunk_map.len());
     for (job_idx, &(seq_idx, chunk_idx)) in seq_chunk_map.iter().enumerate() {
         let new_gids = HeadGids::from_vec(new_gids_per_chunk[job_idx].clone());
-        let byte_size = new_gids.arena_byte_size(&arena_infos);
+        let byte_size = new_gids.arena_byte_size(&f16_fmt, &f16_fmt, elems_per_head);
         let src = chunk_jobs[job_idx];
         float_chunks.insert(
             (seq_idx, chunk_idx),
@@ -1481,6 +1497,8 @@ pub fn dequantize_sealed_in_place(
                 v_pal: identity_head_bytes.clone(),
                 k_scale: empty_scale.clone(),
                 v_scale: empty_scale.clone(),
+                k_fmt: f16_fmt.clone(),
+                v_fmt: f16_fmt.clone(),
                 byte_size,
                 meta: None,
             },
@@ -1492,17 +1510,19 @@ pub fn dequantize_sealed_in_place(
     // scale, F16 pointers — in one batched, coalesced upload.
     {
         let metas = {
-            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = float_keys
+            let refs: Vec<ChunkRecordSrc<'_>> = float_keys
                 .iter()
                 .map(|key| {
                     let c = &float_chunks[key];
-                    (
-                        &c.gids,
-                        c.k_pal.as_slice(),
-                        c.v_pal.as_slice(),
-                        c.k_scale.as_slice(),
-                        c.v_scale.as_slice(),
-                    )
+                    ChunkRecordSrc {
+                        gids: &c.gids,
+                        k_pal: c.k_pal.as_slice(),
+                        v_pal: c.v_pal.as_slice(),
+                        k_scale: c.k_scale.as_slice(),
+                        v_scale: c.v_scale.as_slice(),
+                        k_fmt: c.k_fmt.as_slice(),
+                        v_fmt: c.v_fmt.as_slice(),
+                    }
                 })
                 .collect();
             backing.build_meta_records(&refs, &arena_infos)?

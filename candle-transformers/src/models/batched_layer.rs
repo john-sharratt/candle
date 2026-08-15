@@ -13,6 +13,8 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
@@ -27,6 +29,20 @@ use crate::utils::repeat_kv;
 use candle_kernels::CHUNK_SIZE;
 
 use super::tensor_cat::TensorCat;
+use candle::LiveTensor;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
+
+/// A borrow of the attention generation, threaded from the layer down to the
+/// kernels that allocate inside it.
+///
+/// There is no wave domain without CUDA, so the non-CUDA arm carries a unit
+/// borrow: the plumbing keeps one shape across both configurations, and `'w`
+/// still bounds every result the way it does on the CUDA path.
+#[cfg(feature = "cuda")]
+pub(crate) type WaveRef<'w> = Option<&'w WaveGeneration>;
+#[cfg(not(feature = "cuda"))]
+pub(crate) type WaveRef<'w> = Option<&'w ()>;
 
 // ============================================================================
 // Batched Attention Parameters
@@ -215,10 +231,15 @@ impl BatchedPrefillMeta {
 /// Q/K/V tensors after projection but before RoPE.
 ///
 /// Shape: (batch, seq_len, hidden_dim) for each tensor.
-pub struct QkvProjection {
-    pub q: Tensor,
-    pub k: Tensor,
-    pub v: Tensor,
+///
+/// `'w` is the generation the projections were allocated from — inherited from
+/// the activation operand, since a matmul writes its output into whichever arena
+/// its input came from. For a pool-backed activation `'w` is `'static` and this
+/// is an ordinary owned triple.
+pub struct QkvProjection<'w> {
+    pub q: LiveTensor<'w>,
+    pub k: LiveTensor<'w>,
+    pub v: LiveTensor<'w>,
 }
 
 /// Trait for transformer layers that support batched attention processing.
@@ -242,16 +263,46 @@ pub trait BatchedAttentionLayer {
     /// Attention layer norm (ln1) as a producer epilogue (B1): returns the matmul-ready
     /// `DynamicActs` — q8a128 for an int8 `mode` (fused RMSNorm→quant in one kernel), `Float` for
     /// `Off`. Every layer fuses its own ln1.
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
+    /// Seeds the attention phase. This is the first allocation made *inside* the
+    /// scope that holds the generation, so it names the wave directly; the
+    /// projections, the context and o_proj after it all inherit from their
+    /// operands. `'w` comes from the guard, which is what stops the activation
+    /// outliving the span it was carved from.
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>>;
 
     /// FFN layer norm (ln2) as a producer epilogue (B3): q8a128 for an int8 `mode`, `Float` for
     /// `Off`.
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
+    /// Seeds the FFN phase, exactly as [`Self::attention_norm`] seeds attention:
+    /// it is the first allocation made inside the scope holding the FFN
+    /// generation, so it names the wave directly and the router, the gather, the
+    /// expert GEMMs and the combine all inherit from their operands. `'w` comes
+    /// from the guard, which is what stops the activation outliving the span it
+    /// was carved from.
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>>;
 
     /// FFN/MoE module consuming the producer-prepared `DynamicActs` (the fused `ffn_norm`): the
     /// router + expert gather take the q8a128 directly (no standalone quantize). `mlp_dtype` is the
     /// FP-stable accumulation dtype for the `Float` path.
-    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor>;
+    /// `'w` bounds the *result*, not the input: the FFN activations always come
+    /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
+    /// taken from the wave. A dense MLP hands its activations to a `Module` and
+    /// so could not accept a wave-scoped operand anyway.
+    fn ffn_forward<'w>(
+        &self,
+        acts: DynamicActs<'w>,
+        mlp_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>>;
 
     /// Project Q/K/V over the producer-prepared `DynamicActs` (the fused `attention_norm`), folding
     /// in any Q/K/V bias and q/k-norm. q/k/v share the single quantize (B1).
@@ -261,7 +312,11 @@ pub trait BatchedAttentionLayer {
     /// - Q shape: (batch, seq_len, n_head * head_dim)
     /// - K shape: (batch, seq_len, n_kv_head * head_dim)
     /// - V shape: (batch, seq_len, n_kv_head * head_dim)
-    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection>;
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>>;
 
     /// The output-projection weight (`attention_wo` / `self_attn.o_proj`). Backs the generalized
     /// `int8mode` + `output_projection` defaults so any KO-loaded model gets B2 + the mode for free
@@ -280,7 +335,17 @@ pub trait BatchedAttentionLayer {
     /// `forward_dynamic` off the o_proj weight: an `Int8` operand (decode) goes straight to the KO
     /// matmul; a `Float` operand is the FP path (or quantized at the matmul for a KO weight).
     /// Generic across all models.
-    fn output_projection(&self, attn: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+    /// Generic over `'w` so the decode context — which lives on the wave's
+    /// transient half — can be projected without being copied off it first.
+    /// The result inherits `'w` from the context: the matmul writes into the
+    /// arena its operand came from, so a wave-scoped context yields a
+    /// wave-scoped projection, and the guard that reclaims the context also
+    /// bounds the result.
+    fn output_projection<'w>(
+        &self,
+        attn: DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
         self.o_proj().forward_dynamic(attn.as_dynamic(), out_dtype)
     }
 }
@@ -343,38 +408,69 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // not by tensor shape, so a 1-token prefill or a multi-token decode is safe.
     let hidden = x.dim(2)?;
     let xt = x.to_tensor();
-    let mut parts: Vec<Tensor> = Vec::with_capacity(groups.len());
-    let mut row0 = 0usize;
-    for g in groups.iter_mut() {
-        if g.rows == 0 {
-            continue;
-        }
-        let slice = xt.narrow(1, row0, g.rows)?;
-        let x_g = if g.decode_layout {
-            TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
-        } else {
-            TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+    // The attention generation spans every group's attention, the concatenation
+    // of their contexts, o_proj, and the residual add that consumes the result —
+    // the same shape as the FFN scope below. Opening it inside
+    // `forward_attn_batched` instead would close it one step before the value
+    // dies, which is the difference between o_proj's output living on the wave
+    // and having to be allocated off it.
+    //
+    // Scoped to one layer, not the forward: consumption stays at a single
+    // layer's working set rather than accumulating with depth
+    // (`docs/archived/arena_unification.md` §3.6). Halves alternate per layer, so
+    // layer N's reads are separated from layer N+2's writes by a whole layer of
+    // same-stream work.
+    {
+        #[cfg(feature = "cuda")]
+        let attn_wave = match xt.device() {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+            _ => None,
         };
-        let h = forward_attn_batched(layer, g.caches, &x_g, g.offsets, g.params, layer_idx)?
-            .to_tensor();
-        let h = if g.decode_layout {
-            h.reshape((1, g.rows, hidden))?
-        } else {
-            h
-        };
-        parts.push(h);
-        row0 += g.rows;
-    }
-    let h_attn = if parts.len() == 1 {
-        parts.pop().unwrap()
-    } else {
-        Tensor::cat(&parts, 1)?
-    };
+        #[cfg(not(feature = "cuda"))]
+        let attn_wave: Option<()> = None;
 
-    // First residual: x = x + attn(h).
-    x.to_dtype_mut(h_attn.dtype())?;
-    x.add_mut(&h_attn)?;
-    drop(h_attn);
+        let mut parts: Vec<LiveTensor<'_>> = Vec::with_capacity(groups.len());
+        let mut row0 = 0usize;
+        for g in groups.iter_mut() {
+            if g.rows == 0 {
+                continue;
+            }
+            let slice = xt.narrow(1, row0, g.rows)?;
+            let x_g = if g.decode_layout {
+                TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
+            } else {
+                TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+            };
+            let h = forward_attn_batched(
+                layer,
+                g.caches,
+                &x_g,
+                g.offsets,
+                g.params,
+                layer_idx,
+                attn_wave.as_ref(),
+            )?;
+            let h = if g.decode_layout {
+                h.reshape((1, g.rows, hidden))?
+            } else {
+                h
+            };
+            parts.push(h);
+            row0 += g.rows;
+        }
+        let h_attn = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            LiveTensor::cat(&parts, 1)?
+        };
+
+        // First residual: x = x + attn(h). `add_mut` reads `h_attn` in place, so
+        // the residual stream never takes a wave allocation and never escapes.
+        x.to_dtype_mut(h_attn.dtype())?;
+        x.add_mut(&h_attn)?;
+        // No `drop(h_attn)` / `drop(attn_wave)`: `h_attn` borrows the guard, so
+        // the compiler refuses any order but this one. Both die at the brace.
+    }
 
     // ── Shared FFN/MoE over the WHOLE combined buffer — one grouped GEMM whose
     // per-layer expert load serves every row-type at once. ──
@@ -383,27 +479,45 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     } else {
         act_dtype
     };
+    // The layer's other transient scope, and the same shape as the attention
+    // one: it spans the FFN through the residual add that consumes its result,
+    // after which nothing the expert forward produced is live. The MoE combine
+    // target is what this bounds — it is returned from `ffn_forward`, so no
+    // scope inside the MoE code could have bounded it (§3.6, and see
+    // `wave_buffers`).
+    #[cfg(feature = "cuda")]
+    let ffn_wave = match x.as_cat_tensor().device() {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Ffn)?),
+        _ => None,
+    };
+    #[cfg(not(feature = "cuda"))]
+    let ffn_wave: Option<()> = None;
     let mut h2 = {
-        let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode())?;
-        layer.ffn_forward(acts, mlp_dtype)?
+        let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
+        layer.ffn_forward(acts, mlp_dtype, ffn_wave.as_ref())?
     };
     h2.to_dtype_mut(orig_dtype)?;
     x.to_dtype_mut(orig_dtype)?;
     x.add_mut(&h2)?;
+    // No `drop(h2)` / `drop(ffn_wave)` here: `h2` borrows `ffn_wave`, so the
+    // compiler already refuses any order but this one. The guard falls out of
+    // scope at the end of the function, fencing the stream and rewinding the
+    // half — which is exactly where the hand-written drops used to put it.
     Ok(())
 }
 
 /// Compute batched attention for a layer.
 ///
 /// Dispatches to single-token decode or multi-token prefill paths.
-pub fn forward_attn_batched<L: BatchedAttentionLayer>(
+pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
     x: &TensorCat,
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
     layer_idx: usize,
-) -> Result<TensorCat> {
+    wave: WaveRef<'w>,
+) -> Result<LiveTensor<'w>> {
     // Route by the batch's DECLARED flavour (its headers), not tensor shape: a
     // mixed-wave group hands each type its own kernel, and a single-token prefill
     // ([1,1,h]) or a multi-token decode group ([D,1,h]) must still take the
@@ -428,6 +542,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
                 } => b.dev_ptr() + layer_idx as u64 * stride,
                 _ => 0,
             },
+            wave,
         )?;
         Ok(ret)
     } else {
@@ -453,6 +568,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             params.rope_cs,
             params.generation,
             params.shared_prefill_pm,
+            wave,
         )?;
         Ok(ret)
     }
@@ -460,7 +576,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
 
 /// Single-token batched attention (decode path).
 #[allow(clippy::too_many_arguments)]
-fn forward_attn_batched_single<L: BatchedAttentionLayer>(
+fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
     x: &TensorCat,
@@ -472,7 +588,8 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     #[allow(unused_variables)] rope_cs: &Tensor,
     #[allow(unused_variables)] generation: &Generation,
     #[allow(unused_variables)] decode_headers_ptr: u64,
-) -> Result<TensorCat> {
+    wave: WaveRef<'w>,
+) -> Result<LiveTensor<'w>> {
     validate_batch_sizes(caches.len(), offsets.len(), x.len())?;
 
     // `x` is the PRE-norm activation; B1 fuses ln1 → q/k/v here. Shapes are norm-invariant.
@@ -484,7 +601,7 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
     let t_qkv = profile_now();
     let QkvProjection { q, k, v } = {
-        let acts = layer.attention_norm(x_tensor, layer.int8mode())?;
+        let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
     };
 
@@ -554,8 +671,15 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     // with no standalone quantize. Only on the paged CUDA decode path; false → FP context.
     let want_q8 = layer.int8mode().is_int8() && use_paged && seq_len == 1 && head_dim == 128;
 
+    // Both the attention context and o_proj's result live on the wave's
+    // transient half — o_proj allocates from whichever arena its operand came
+    // from, so the projection is wave-backed too. `wave` is the caller's
+    // generation, opened in `forward_layer_batched_mixed` around every group's
+    // attention *and* the residual add that consumes it. Opening it here instead
+    // would end the scope one step before the value dies.
     let outputs = if use_paged && seq_len == 1 {
         paged_decode_attention(
+            wave,
             caches,
             offsets,
             &q,
@@ -590,12 +714,15 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     profile_sync(attn_out.device());
     pipeline_record("decode:out_proj", t_out_proj);
 
-    TensorCat::from_tensors(0, std::iter::once(attn_out))
+    // Bounded by the caller's generation, not wrapped and copied off it: the
+    // layer consumes this into the residual add while that generation is still
+    // open, so `'w` is what keeps the two in step.
+    Ok(attn_out)
 }
 
 /// Multi-token batched attention (prefill path).
 #[allow(clippy::too_many_arguments)]
-fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
+fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
     x: &TensorCat,
@@ -609,7 +736,8 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     rope_cs: &Tensor,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
-) -> Result<TensorCat> {
+    wave: WaveRef<'w>,
+) -> Result<LiveTensor<'w>> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
     // against the sequence count carried by q_lens instead.
     validate_batch_sizes(caches.len(), offsets.len(), q_lens.len())?;
@@ -626,7 +754,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     // the fused ln1→q8a128 still saves a launch; the per-matmul cost dominates.
     let t_qkv = profile_now();
     let QkvProjection { q, k, v } = {
-        let acts = layer.attention_norm(x_tensor, layer.int8mode())?;
+        let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
         layer.project_qkv(&acts, x_tensor.dtype())?
     };
 
@@ -683,12 +811,10 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         (ensure_contiguous(&q)?, ensure_contiguous(&k)?)
     };
 
-    // Truncate each sequence to its prefill offset first: a fresh sequence is
-    // untouched, but a re-prefill at the same offset (the bench harness's repeat
-    // loop) discards the stale tail chunks the previous run left — otherwise they
-    // stack up and push the decode writer past a gap of empty chunks.
-    truncate_caches_to_offset(caches, offsets);
-
+    // The cache is already sized and truncated for this wave: `wave_admit` did
+    // both, for every layer, before the forward began. Nothing on this path may
+    // claim a chunk — the transient tier is placed against the arena frontier
+    // and a claim here would move it (`docs/elastic_vram_partition.md` §7).
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
@@ -696,8 +822,15 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     // positioning every column by its chunk `rope_base` (`slice_rope`) and
     // masking each glue token by `cpos > row_pos + fwd_ahead[t]`. Everything else
     // (ordinary prefill, non-128 head dims) stays on the plain prefill kernel.
+    // Both the attention context and o_proj's result live on the wave's
+    // transient half — o_proj allocates from whichever arena its operand came
+    // from, so the projection is wave-backed too. `wave` is the caller's
+    // generation, opened in `forward_layer_batched_mixed` around every group's
+    // attention *and* the residual add that consumes it. Opening it here instead
+    // would end the scope one step before the value dies.
     let out_packed = match glue_meta {
         Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
+            wave,
             caches,
             offsets,
             &q,
@@ -715,6 +848,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             rope_cs,
             rope_interleaved,
             generation,
+            shared_pm,
         )?,
         // Ordinary prefill (fresh or over an existing prefix): the INT8
         // prefix-attention kernel (docs/archived/prefill_optimization.md) —
@@ -723,6 +857,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         // Head dims outside {64, 128} and interleaved RoPE fail loudly in
         // paged_prefill_attn_varlen_chunks.
         _ => paged_prefill_batched(
+            wave,
             caches,
             offsets,
             &q,
@@ -758,8 +893,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
     let hidden_out = output.dim(1)?;
-    let output = output.reshape((1, total_q, hidden_out))?;
-    TensorCat::from_cat_tensor(output, 1)
+    Ok(output.reshape((1, total_q, hidden_out))?)
 }
 
 /// Simple per-sequence prefill attention fallback.
@@ -772,13 +906,21 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
 fn prefill_attention_simple(
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     head_dim: usize,
     n_head: usize,
     n_kv_head: usize,
 ) -> Result<Tensor> {
+    // The non-paged fallback keeps its operands in the ordinary pool: it feeds
+    // `KvCache::append` and `standard_attention_prefill`, neither of which is
+    // wave-aware, and it runs only where the paged kernels do not apply. The
+    // copy is explicit rather than a lifetime launder — the alternative would be
+    // claiming `'static` over memory the layer is about to reclaim.
+    let q = &q.to_owned_tensor()?;
+    let k = &k.to_owned_tensor()?;
+    let v = &v.to_owned_tensor()?;
     let b_sz = q.dim(0)?;
     let seq_len = q.dim(2)?; // Q is (B, H, L, D)
     let mut all_outputs = Vec::with_capacity(b_sz);
@@ -885,12 +1027,13 @@ fn standard_attention_prefill(
 /// Paged decode attention using chunked KV cache.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn paged_decode_attention(
+fn paged_decode_attention<'w>(
+    wave: Option<&'w WaveGeneration>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -901,7 +1044,7 @@ fn paged_decode_attention(
     // B2: emit the attention context as q8a1024 (returns a flat U8 tensor) instead of an FP
     // context, so o_proj runs int8 with no standalone quantize. Head_dim 128 only.
     emit_q8: bool,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     let t_alloc = profile_now();
     KvCache::validate_chunked_decode_batch(caches, offsets)?;
     profile_sync(q.device());
@@ -1003,6 +1146,7 @@ fn paged_decode_attention(
         // bytes are the operand for o_proj's int8 matmul — never dtype-converted.
         let raw_out = if emit_q8 {
             paged_decode_attn_q8(
+                wave,
                 &q_kernel,
                 decode_headers_ptr,
                 arena_dtype,
@@ -1017,6 +1161,7 @@ fn paged_decode_attention(
             )?
         } else {
             paged_decode_attn(
+                wave,
                 &q_kernel,
                 decode_headers_ptr,
                 arena_dtype,
@@ -1039,24 +1184,36 @@ fn paged_decode_attention(
             raw_out
         }
     };
-    for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
-        cache.set_current_seq_len(offset + 1)?;
-    }
-
-    // After writing each decode token, eagerly quantize any newly-sealed chunk.
+    // The token's usage advance does NOT happen here, and must not. This runs
+    // once per layer as the sweep passes through, but a decode step with a
+    // creep group active is split across several `forward_wave` segment calls —
+    // and each of those rebuilds the decode metadata from the caches. A
+    // per-layer advance makes the layers between two segments genuinely
+    // disagree (swept layers one token ahead), which the layer-invariance
+    // guard then reads as corruption. In-step attention never needs the
+    // advance: the new token is read through the position map's write-slot
+    // entry, built against the pre-step usage. The advance is bookkeeping for
+    // the NEXT step, and `forward_wave_contexts` performs it once, for every
+    // layer at once, when the step's head completes.
     Ok(out)
 }
 
 /// Standard (non-paged) batched attention fallback.
 fn standard_batched_attention(
     caches: &mut [&mut KvCache],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     head_dim: usize,
     n_head: usize,
     n_kv_head: usize,
 ) -> Result<Tensor> {
+    // As in `prefill_attention_simple`: this fallback hands its operands to
+    // `KvCache::append` and the non-paged attention helpers, none of which are
+    // wave-aware, so it copies off the wave rather than laundering the lifetime.
+    let q = &q.to_owned_tensor()?;
+    let k = &k.to_owned_tensor()?;
+    let v = &v.to_owned_tensor()?;
     let b_sz = q.dim(0)?;
     let mut all_outputs = Vec::with_capacity(b_sz);
 
@@ -1099,18 +1256,6 @@ pub fn reset_caches_at_zero(caches: &mut [&mut KvCache], offsets: &[usize]) {
     }
 }
 
-/// Prefill idempotency: truncate each sequence's KV to exactly its `offset`
-/// cum-tokens before the prefill writes its tokens. A fresh sequence (or offset
-/// 0) is a no-op / full clear; a re-prefill at the same offset (e.g. the bench
-/// harness's repeat loop) discards the stale tail chunks the previous run left,
-/// so the prefill never stacks duplicate chunks (which would push the decode
-/// writer past a gap of empty chunks and corrupt attention).
-pub fn truncate_caches_to_offset(caches: &mut [&mut KvCache], offsets: &[usize]) {
-    for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
-        cache.truncate_to_offset(offset);
-    }
-}
-
 /// Validate that cache and offset counts match the batch size.
 pub fn validate_batch_sizes(
     caches_len: usize,
@@ -1135,7 +1280,7 @@ pub fn validate_batch_sizes(
 }
 
 /// Ensure tensor is contiguous.
-fn ensure_contiguous(t: &Tensor) -> Result<Tensor> {
+fn ensure_contiguous<'w>(t: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
     if t.is_contiguous() {
         Ok(t.clone())
     } else {

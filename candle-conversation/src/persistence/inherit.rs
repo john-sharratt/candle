@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::direct_io::DirectFile;
 use super::log_file::LogSource;
 use super::log_file::{read_record_at, LogFile};
 use super::manifest::Manifest;
@@ -21,6 +20,7 @@ use super::segment::FIRST_SEGMENT;
 use super::streams::StreamId;
 use super::Result;
 use crate::substrate::Substrate;
+use candle::direct_io::DirectFile;
 
 /// A loaded, read-only inherited substrate log.
 pub struct InheritedSubstrate {

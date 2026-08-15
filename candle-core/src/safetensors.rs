@@ -9,7 +9,7 @@
 //! Tensors can also be serialized to safetensor format using the `save` function or
 //! `Tensor::save_safetensors` method.
 //!
-use crate::{DType, Device, Error, Result, Tensor, WithDType};
+use crate::{DType, Device, Error, LiveTensor, Result, Tensor, WithDType};
 use float8::F8E4M3;
 use safetensors::tensor as st;
 use safetensors::tensor::SafeTensors;
@@ -91,6 +91,9 @@ impl st::View for &Tensor {
     }
 }
 
+/// Serialisation takes ownership for the duration of the write, so it is
+/// available on owned tensors only. A view into a KV arena or an in-flight
+/// wave has no business being written to a checkpoint; copy it off first.
 impl Tensor {
     pub fn save_safetensors<P: AsRef<Path>>(&self, name: &str, filename: P) -> Result<()> {
         let data = [(name, self.clone())];
@@ -191,7 +194,7 @@ impl Load for st::TensorView<'_> {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     pub fn from_raw_buffer(
         data: &[u8],
         dtype: DType,

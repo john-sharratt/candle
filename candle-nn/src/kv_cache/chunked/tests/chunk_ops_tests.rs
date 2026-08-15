@@ -3,8 +3,7 @@
 use candle::{DType, Device, Tensor};
 
 use crate::kv_cache::arena_table::ArenaLocation;
-use crate::kv_cache::chunked::{ArenaKey, ChunkedKvBacking, StoragePolicy};
-use crate::kv_cache::KvFormat;
+use crate::kv_cache::chunked::{ArenaKey, ChunkedKvBacking};
 
 /// Test helper: snapshot K-side GIDs as `[batch][block]` with -1 for unallocated.
 fn k_gid_snapshot(backing: &ChunkedKvBacking) -> Vec<Vec<i64>> {
@@ -53,16 +52,30 @@ mod tests {
     mod migrate_chunk_tests {
         use super::*;
 
+        /// The CPU key a gid's slot relocates into: same size class, warm tier.
+        ///
+        /// A relocation never changes a chunk's class — that is what makes the
+        /// byte-verbatim copy safe — so the target is always derived from the
+        /// source rather than named by a format.
+        pub(super) fn cpu_key_of(backing: &ChunkedKvBacking, raw: i64) -> ArenaKey {
+            use crate::kv_cache::chunked::GID_STRIDE;
+            let key = backing
+                .with_arenas(|a| a.get(&((raw as usize) / GID_STRIDE)).map(|a| a.arena_key()))
+                .unwrap()
+                .expect("source arena exists");
+            ArenaKey::new(key.class, ArenaLocation::Cpu)
+        }
+
         #[test]
-        fn test_migrate_chunk_same_format() {
+        fn test_migrate_chunk_relocates_within_its_class() {
             let backing = create_test_backing();
             setup_sequence_with_data(&backing, 8);
 
             // Get chunk ID from block table
             let source_gid = k_gid_snapshot(&backing)[0][0];
 
-            // Migrate to same format (should copy)
-            let target_key = ArenaKey::cpu_float(DType::BF16);
+            // Relocate to the warm tier — same class, so a byte copy.
+            let target_key = cpu_key_of(&backing, source_gid);
             let new_gid = backing.migrate_chunk(source_gid, target_key).unwrap();
 
             // Should be a different chunk
@@ -73,7 +86,11 @@ mod tests {
         fn test_migrate_chunk_invalid_id() {
             let backing = create_test_backing();
 
-            let result = backing.migrate_chunk(-1, ArenaKey::cpu_float(DType::BF16));
+            let any = ArenaKey::new(
+                crate::kv_cache::chunked::SizeClass::at(0),
+                ArenaLocation::Cpu,
+            );
+            let result = backing.migrate_chunk(-1, any);
             assert!(result.is_err());
         }
 
@@ -83,84 +100,12 @@ mod tests {
             setup_sequence_with_data(&backing, 8);
 
             // Try to migrate non-existent chunk
-            let result = backing.migrate_chunk(9999, ArenaKey::cpu_float(DType::BF16));
+            let any = ArenaKey::new(
+                crate::kv_cache::chunked::SizeClass::at(0),
+                ArenaLocation::Cpu,
+            );
+            let result = backing.migrate_chunk(9999, any);
             assert!(result.is_err());
-        }
-    }
-
-    // ==================== StoragePolicy Tests ====================
-
-    mod storage_policy_tests {
-        use super::*;
-
-        #[test]
-        fn test_storage_policy_to_arena_key_gpu_float() {
-            let policy = StoragePolicy::GpuFloat(DType::BF16);
-            let key = policy.to_arena_key();
-
-            assert_eq!(key.format, KvFormat::Float(DType::BF16));
-            assert_eq!(key.location, ArenaLocation::Gpu);
-        }
-
-        #[test]
-        fn test_storage_policy_to_arena_key_cpu_float() {
-            let policy = StoragePolicy::CpuFloat(DType::F32);
-            let key = policy.to_arena_key();
-
-            assert_eq!(key.format, KvFormat::Float(DType::F32));
-            assert_eq!(key.location, ArenaLocation::Cpu);
-        }
-
-        #[test]
-        fn test_storage_policy_active_dtype() {
-            // Float policies return their dtype
-            assert_eq!(
-                StoragePolicy::GpuFloat(DType::BF16).active_dtype(),
-                DType::BF16
-            );
-            assert_eq!(
-                StoragePolicy::CpuFloat(DType::F32).active_dtype(),
-                DType::F32
-            );
-        }
-    }
-
-    // ==================== reconcile Tests ====================
-
-    // ==================== ArenaKey Tests ====================
-
-    mod arena_key_tests {
-        use super::*;
-
-        #[test]
-        fn test_arena_key_constructors() {
-            let gpu_float = ArenaKey::gpu_float(DType::BF16);
-            assert!(gpu_float.is_gpu());
-            assert!(!gpu_float.is_quantized());
-
-            let cpu_float = ArenaKey::cpu_float(DType::F32);
-            assert!(!cpu_float.is_gpu());
-            assert!(!cpu_float.is_quantized());
-        }
-
-        #[test]
-        fn test_arena_key_equality() {
-            let key1 = ArenaKey::cpu_float(DType::BF16);
-            let key2 = ArenaKey::cpu_float(DType::BF16);
-            let key3 = ArenaKey::cpu_float(DType::F32);
-            let key4 = ArenaKey::gpu_float(DType::BF16);
-
-            assert_eq!(key1, key2);
-            assert_ne!(key1, key3); // Different dtype
-            assert_ne!(key1, key4); // Different location
-        }
-
-        #[test]
-        fn test_arena_key_new() {
-            let key = ArenaKey::uniform(KvFormat::Float(DType::F16), ArenaLocation::Gpu);
-
-            assert_eq!(key.format, KvFormat::Float(DType::F16));
-            assert_eq!(key.location, ArenaLocation::Gpu);
         }
     }
 
@@ -198,9 +143,8 @@ mod tests {
             let source_gid = k_gid_snapshot(&backing)[0][0];
 
             // Migrate (same format, should copy)
-            let _new_gid = backing
-                .migrate_chunk(source_gid, ArenaKey::cpu_float(DType::BF16))
-                .unwrap();
+            let target = migrate_chunk_tests::cpu_key_of(&backing, source_gid);
+            let _new_gid = backing.migrate_chunk(source_gid, target).unwrap();
 
             // Data from original chunk should still be readable
             let (k_after, _v_after) = backing.read_contiguous(0, 0, 8).unwrap();

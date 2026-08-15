@@ -45,6 +45,7 @@ impl Tool for RemoteFsSessionPut {
         let content = ctx
             .vfs
             .read(&req.local_vfs_path)
+            .map_err(|e| RemoteFsError::VfsError(e.to_string()))?
             .ok_or_else(|| RemoteFsError::VfsError(format!("{} not in VFS", req.local_vfs_path)))?;
         let bytes = content.len();
         let entry = ctx

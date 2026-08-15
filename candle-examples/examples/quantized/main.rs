@@ -1,3 +1,17 @@
+//! Text generation over the full llama.cpp-compatible GGML/GGUF model zoo:
+//! Llama 2 (7b/13b/70b, chat/code variants), CodeLlama, LeoLM, Mistral 7B
+//! (base/instruct v0.1/v0.2), Zephyr, OpenChat 3.5, Starling, Mixtral (incl.
+//! MoE), Llama 3 8B, Phi-3, SmolLM2, and DeepSeek-R1-Distill-Llama-8B, all via
+//! `quantized_llama::ModelWeights`.
+//!
+//! `--which` picks the variant and its HF repo/filename/tokenizer/prompt
+//! template (Mistral `[INST]`, Zephyr `<|system|>`, OpenChat `GPT4 Correct
+//! User:`, DeepSeek `<｜User｜>`, or raw). Accepts legacy `.bin`/`.ggml` (via
+//! `ggml_file`) as well as `.gguf`; `--gqa` overrides the default
+//! grouped-query-attention head-group size for 70B/Mixtral models.
+//! `--force-dmmv` (cuda feature) forces the slower dequantize-matmul-vec CUDA
+//! kernel path.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

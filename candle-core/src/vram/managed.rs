@@ -1,12 +1,24 @@
-//! Managed allocation, the pressure-retry path, and the concurrency forecast.
+//! The capacity arithmetic the startup partition is sized from.
 //!
-//! The gate is always the live measurement, never a running tally. `reserve` is
-//! for permanent classes (weights, and the fixed part of scratch/experts) that
-//! just need a class tag; `allocate` is for the variable/expert path that must
-//! survive transient exhaustion by relieving and retrying (see
-//! `docs/vram_governor_design.md` §9).
+//! There is one claim now, not two. [`VramGovernor::usable`] is what the device
+//! reservation is sized from, and the reservation holds the KV side, the
+//! transient tier and the expert cache between them — so there is no second
+//! budget to keep in step with the first.
+//!
+//! `expert_budget()` was that second budget: `usable − kv_floor −
+//! scratch_margin`, divided by `max_expert_size` to pick a resident-expert
+//! count. It went with `kv_floor`. The count is now the weight zone's capacity,
+//! `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, computed once against a span
+//! whose extent is a fact (`docs/elastic_vram_partition.md` §6).
+//!
+//! This file also held the managed-allocation path: `reserve` for permanent
+//! class-tagged allocations, and `allocate`, which retried an out-of-memory
+//! allocation while escalating one relief rung per round up to `Critical`. Both
+//! are gone with the ladder — nothing called them, because the allocation that
+//! actually needed to survive transient exhaustion was KV, and KV no longer
+//! allocates at all.
 
-use super::{AllocClass, Criticality, VramGovernor};
+use super::VramGovernor;
 use crate::{Error, Result};
 
 /// True if `err` looks like a device out-of-memory (raw driver OOM, or the KV
@@ -22,76 +34,35 @@ pub fn is_oom(err: &Error) -> bool {
 }
 
 impl VramGovernor {
-    /// Record a permanent allocation of `bytes` under `class` and run `alloc`.
-    /// No prediction, no gate — the class tag drives evictability/reporting only;
-    /// the bytes update the loose per-class tally. If `alloc` fails it is
-    /// surfaced verbatim (a permanent allocation that won't fit is a
-    /// configuration error, not a runtime pressure event).
-    pub fn reserve<T>(
-        &self,
-        class: AllocClass,
-        bytes: u64,
-        alloc: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let v = alloc()?;
-        self.credit_class(class, bytes);
-        Ok(v)
-    }
-
-    /// Allocate `bytes` under `class`, retrying through the relief ladder on
-    /// out-of-memory. On success credits the per-class tally. On repeated OOM it
-    /// escalates one rung per round up to `Critical`, then surfaces a typed OOM
-    /// (the circuit breaker — it never spins). Non-OOM errors propagate at once.
-    pub fn allocate<T>(
-        &self,
-        class: AllocClass,
-        bytes: u64,
-        mut alloc: impl FnMut() -> Result<T>,
-    ) -> Result<T> {
-        // First attempt.
-        match alloc() {
-            Ok(v) => {
-                self.credit_class(class, bytes);
-                return Ok(v);
-            }
-            Err(e) if !is_oom(&e) => return Err(e),
-            Err(_) => {}
-        }
-        // Escalate: relieve one rung deeper each round, retry after each.
-        for tier in Criticality::ALL {
-            self.run_tier_with_sync(class, tier, bytes);
-            match alloc() {
-                Ok(v) => {
-                    self.credit_class(class, bytes);
-                    return Ok(v);
-                }
-                Err(e) if !is_oom(&e) => return Err(e),
-                Err(_) => {}
-            }
-        }
-        Err(Error::Msg(format!(
-            "vram governor: out of memory allocating {bytes} B for {class:?} after full relief ladder"
-        )))
-    }
-
-    /// How many concurrent units of `per_unit_kv_bytes` fit right now, counting
-    /// live headroom **plus** the KV that can be reversibly evicted (up to
-    /// `Moderate` — never lossy/critical, so it never plans on damaging the
-    /// cache). The scheduler uses this as the ceiling for its admission window.
-    pub fn forecast_units(&self, per_unit_kv_bytes: u64) -> usize {
-        let headroom = self.probe.read().map(|r| r.headroom).unwrap_or(0);
-        let evictable = self.evictable_estimate(Criticality::Moderate);
-        (headroom.saturating_add(evictable) / per_unit_kv_bytes.max(1)) as usize
-    }
-
-    /// The bytes available to hold MoE experts resident, computed *now* from the
-    /// live measurement (mandatory weights already loaded), leaving the KV floor
-    /// and the scratch cushion free. The expert loader divides this by
-    /// `max_expert_size` to pick how many slots to keep resident (§11).
-    pub fn expert_budget(&self) -> Result<u64> {
-        let headroom = self.probe.read()?.headroom;
-        Ok(headroom
-            .saturating_sub(self.kv_floor())
-            .saturating_sub(self.scratch_margin()))
+    /// What is left of the measured capacity `C` right now: live headroom,
+    /// bounded by `C` less what we have already spent of it.
+    ///
+    /// Both permanent claims a model load makes — the expert cache and the KV
+    /// reservation — are sized from here, so the accounting lives once.
+    ///
+    /// What we have spent of `C` is the **drop in headroom since `C` was
+    /// measured**, not `total - headroom`. DXGI reports
+    /// `headroom = Budget - CurrentUsage`, so `total - headroom` is
+    /// `(total - Budget) + CurrentUsage` — and the first term is the OS reserve,
+    /// which the balloon already discovered and excluded from `C`. Subtracting
+    /// it again double-books it and costs ~1 GiB on a 16 GiB card. Differencing
+    /// two headroom readings cancels the reserve: it is present in both.
+    ///
+    /// The `Weights` tally can't serve as the spend either — the dense weights
+    /// finish loading *after* the expert cache is sized, so it reads zero there.
+    ///
+    /// Falls back to headroom alone when `C` was never measured, or when the
+    /// baseline is missing/stale (headroom above the baseline means memory came
+    /// back, so nothing of `C` is spent).
+    pub fn usable(&self) -> Result<u64> {
+        let reading = self.probe.read()?;
+        let capacity = self.capacity();
+        let baseline = self.headroom_at_capacity();
+        Ok(if capacity == 0 || baseline == 0 {
+            reading.headroom
+        } else {
+            let spent_by_us = baseline.saturating_sub(reading.headroom);
+            reading.headroom.min(capacity.saturating_sub(spent_by_us))
+        })
     }
 }

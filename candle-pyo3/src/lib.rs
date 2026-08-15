@@ -1,3 +1,16 @@
+//! Python bindings for Candle (`pyo3`), exposed as the `candle` extension
+//! module.
+//!
+//! Wraps core Candle types as `#[pyclass]`es: [`PyTensor`] (`Tensor`),
+//! `PyQTensor` (quantized tensor), and `PyDType`, plus `shape`-module helpers
+//! (`PyShape`, `PyShapeWithHole`) and `utils::wrap_err` for converting
+//! `candle::Error` into `PyErr`. The `#[pymodule] fn candle` at the bottom of
+//! this file assembles the package: top-level tensor constructors
+//! (`tensor`, `zeros`, `ones`, `rand`, `randn`, `cat`, `stack`, ...), a
+//! `utils` submodule (device/threading queries, GGML/GGUF/safetensors
+//! load-save), a `functional` submodule (`silu`, `softmax`, `gelu`, `relu`,
+//! `tanh`, pooling), and — behind the `onnx` feature — an `onnx` submodule
+//! wrapping [`onnx::PyONNXModel`].
 #![allow(clippy::redundant_closure_call)]
 #![allow(clippy::useless_conversion)]
 use float8::F8E4M3;

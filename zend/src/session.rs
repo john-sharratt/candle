@@ -553,6 +553,10 @@ impl InferenceState {
         // expanded by `preemptive_prefill` itself.
         let before_text: String = pre_collection_prelude(&proj_builder);
 
+        // The expert pack lives beside the checkpoint, so it is shared by every
+        // workspace on this model, survives `--wipe-substrate`, and turns the
+        // ~42 s expert repack into a read on every restart after the first.
+        let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
         let mut builder = qwen30()
             .builder()
             .system_prompt(&before_text)
@@ -581,6 +585,9 @@ impl InferenceState {
                     .map(|l| (l.id, l.on_corrupt_turn))
                     .collect(),
             );
+        if let Some(dir) = expert_pack_dir {
+            builder = builder.expert_pack_dir(dir);
+        }
         let conv_config = builder.conversation_config();
 
         // Per-layer progress callback — the library reports
@@ -857,14 +864,45 @@ impl InferenceState {
             // calibration trajectory from the tool's definition file — prompt +
             // `<|im_end|><|im_start|>assistant` + think→call with projection markers.
             // The prefill path splits it on the assistant header (below).
-            let cases: Vec<(&str, &str)> = defs
+            // Each case carries its content marker, computed once here from the
+            // tool's whole projected definition plus the example.
+            let cases: Vec<(&str, &str, String)> = defs
                 .iter()
                 .flat_map(|d| {
                     d.examples
                         .iter()
-                        .map(move |ex| (d.name.as_str(), ex.as_str()))
+                        .map(move |ex| (d.name.as_str(), ex.as_str(), d.calibration_marker(ex)))
                 })
                 .collect();
+
+            // Retire exemplars that no longer match any current case. A tool whose
+            // description, parameters, or example changed keeps its old
+            // conversation ARCHIVED under the *previous* marker, where the
+            // by-marker lookup below can never find it — so without this sweep it
+            // stays tagged `["tool", name]` and keeps answering the belief scan
+            // with signatures captured against wording that no longer exists,
+            // alongside the freshly calibrated ones. Tombstoning drops it from the
+            // gather (`resolver.rs` skips tombstoned timelines), leaving exactly
+            // the current corpus.
+            let current: HashSet<&str> = cases.iter().map(|(_, _, m)| m.as_str()).collect();
+            let mut retired = 0usize;
+            for (timeline, marker) in engine.conversations_with_metadata_key(CALIB_MARKER_KEY) {
+                if current.contains(marker.as_str()) {
+                    continue;
+                }
+                match engine.tombstone_timeline(timeline) {
+                    Ok(()) => retired += 1,
+                    Err(e) => {
+                        tracing::warn!(%marker, "retiring stale calibration exemplar failed: {e}")
+                    }
+                }
+            }
+            if retired > 0 {
+                tracing::info!(
+                    retired,
+                    "calibration: retired stale exemplars whose tool definition or example changed",
+                );
+            }
 
             // A calibration case is "done" only once its conversation is
             // ARCHIVED — the atomic commit. Each conversation is tagged with its
@@ -883,18 +921,20 @@ impl InferenceState {
             // is created lazily as the window refills (below), bounding the live
             // slot count to `CALIBRATION_BATCH` — the concurrency the decode/prefill
             // window can actually keep busy.
-            // A case's resume marker: the tool name plus a content hash of its
-            // ChatML example, so editing an example (in its tool file) changes the
-            // marker and the case regenerates automatically.
-            let calib_marker = |name: &str, example: &str| -> String {
-                use sha2::{Digest, Sha256};
-                format!("{name}|{:x}", Sha256::digest(example.as_bytes()))
-            };
+            // A case's resume marker is `ToolDef::calibration_marker` — the tool
+            // name plus a hash of its projected definition and this example — so
+            // rewording a description or a parameter, or editing the example,
+            // changes the marker and the case regenerates against the current text.
             let mut done = 0usize;
-            let mut to_run: Vec<(&str, &str)> = Vec::new();
-            for (name, example) in cases.iter() {
-                let marker = calib_marker(name, example);
-                let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, &marker);
+            let mut to_run: Vec<(&str, &str, &str)> = Vec::new();
+            for (name, example, marker) in cases.iter() {
+                // Distill-inclusive: a finished exemplar's designed end state is
+                // archived + distilled(`ProvenanceOnly`) + tombstoned, and the
+                // live-only lookup cannot see it — every such case read as
+                // "never ran" and regenerated. Ordinary tombstones stay excluded,
+                // so a genuinely retired conversation is still ignored here.
+                let prior = engine
+                    .find_conversations_by_metadata_including_distilled(CALIB_MARKER_KEY, marker);
                 // Done iff a prior conversation for this case is archived.
                 if prior.iter().any(|t| engine.is_conversation_archived(*t)) {
                     // The completed corpus only needs its wide-Q sigs, so mark the
@@ -919,8 +959,20 @@ impl InferenceState {
                         tracing::warn!(tool = name, "tombstone partial calibration failed: {e}");
                     }
                 }
-                to_run.push((*name, *example));
+                to_run.push((*name, *example, marker.as_str()));
             }
+            // Say up front how much of the corpus is being regenerated and why the
+            // step will take as long as it does. A case resumes only when a prior
+            // conversation carrying its marker is ARCHIVED; anything else — a
+            // reworded tool description, an edited example, or an archive record
+            // that did not survive — regenerates. Without this split a partial
+            // recalibration is indistinguishable from a full one at a glance.
+            tracing::info!(
+                cases = total,
+                resumed = done,
+                to_run = to_run.len(),
+                "calibration resume filter"
+            );
 
             // Non-blocking sweep: archive + retire every case finished since the
             // last sweep. Archives only complete trajectories (`</tool_call>`); an
@@ -1027,7 +1079,7 @@ impl InferenceState {
                 } else {
                     1
                 };
-                let batch: Vec<(&str, &str)> =
+                let batch: Vec<(&str, &str, &str)> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
                 let convs = if created_any {
@@ -1042,7 +1094,7 @@ impl InferenceState {
                 } else {
                     Vec::new()
                 };
-                for ((name, example), conv_res) in batch.into_iter().zip(convs) {
+                for ((name, example, marker), conv_res) in batch.into_iter().zip(convs) {
                     let mut conv = match conv_res {
                         Ok(conv) => conv,
                         Err(e) => {
@@ -1053,11 +1105,10 @@ impl InferenceState {
                         }
                     };
                     // Tag at creation so a half-finished case is findable next load.
-                    let marker = calib_marker(name, example);
                     if let Err(e) = engine.set_conversation_metadata(
                         conv.timeline_id(),
                         CALIB_MARKER_KEY,
-                        &marker,
+                        marker,
                     ) {
                         tracing::warn!(tool = name, "calibration tag failed: {e}");
                     }
@@ -1210,6 +1261,8 @@ impl InferenceState {
             progress.set_step_progress(total as u64, total as u64);
             tracing::info!(
                 cases = total,
+                resumed = total.saturating_sub(calib_timelines.len()),
+                ran = calib_timelines.len(),
                 demoted_timelines = calib_timelines.len(),
                 "calibrating sections complete"
             );
@@ -1270,10 +1323,21 @@ impl InferenceState {
             // (mode-defaulted in `ingest_layers`), so it stays a config item.
             progress.set_step_unit(&il.unit);
             let content_root = workspace.join(&il.folder);
+            // Mark the layer append-only BEFORE any branch below runs — fresh
+            // ingest and resume alike. The in-memory flag (lost on restart)
+            // drives belief self-locality, the normalization warm-up's
+            // ingest-layer recognition (without it the warm-up skips the layer
+            // and every query collapses onto the promiscuous low-entropy files
+            // at an un-normalized cold score), and the summariser's
+            // append-only exclusion (an unmarked fresh ingest storms the
+            // summariser with per-listing decodes as turns seal).
+            if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
+                engine.lock().unwrap().mark_layer_append_only(layer_id);
+            }
             tracing::info!(layer = %il.name, mode = ?il.mode, folder = %il.folder, "ingest pass starting");
             match il.mode {
                 IngestMode::Folders => {
-                    let (sequence, walked, state) = crate::repo_scan::ingest_repo_map(
+                    let (walked, state, report) = crate::repo_scan::ingest_repo_map(
                         &engine,
                         proj_builder_refresh.clone(),
                         &content_root,
@@ -1282,9 +1346,14 @@ impl InferenceState {
                         &il.name,
                         &il.group,
                     )?;
+                    // An incomplete map is reported, not fatal: affected
+                    // directories keep their prior generation live and retry on
+                    // the next pass, so the daemon comes up serving a partial
+                    // map rather than not coming up at all.
+                    crate::ingest_report::publish(crate::repo_scan::PASS_NAME, report);
                     // Cache this folder's walk for a co-located per-file layer.
                     walk_cache.insert(il.folder.clone(), walked);
-                    ingest_convs.insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                    ingest_convs.insert(il.name.clone(), IngestConv::Folders { state });
                 }
                 IngestMode::Files => {
                     // The blocking critical-path ingest runs on the first load AND
@@ -1341,17 +1410,9 @@ impl InferenceState {
                             &il.group,
                         )?
                     } else {
-                        // Complete prior ingest: skip the blocking ingest, but its
-                        // per-load layer setup must still run: mark the layer
-                        // append-only (in-memory flag, lost on restart) so belief
-                        // scoring stays self-local and the normalization warm-up
-                        // recognises it as an ingest layer and learns each file's hit
-                        // level. Without this the warm-up skips the layer and every
-                        // query collapses onto the promiscuous low-entropy files at an
-                        // un-normalized (cold) score.
-                        if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
-                            engine.lock().unwrap().mark_layer_append_only(layer_id);
-                        }
+                        // The blocking ingest is skipped; the layer's append-only
+                        // mark already ran above the mode match (it covers both the
+                        // fresh-ingest and resume branches).
                         tracing::info!(
                             layer = %il.name,
                             files = prior.file_hashes.len(),
@@ -1438,10 +1499,10 @@ impl InferenceState {
             refresh_config: conv_config.clone(),
             mode_builders,
             identity_builders,
-            workspace,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::new(),
+            tool_host: ToolHost::new(&workspace),
+            workspace,
             tool_stencil,
             think_steering,
         });
@@ -1468,8 +1529,8 @@ impl InferenceState {
     ///
     /// Iterates the live [`IngestConv`] registry and dispatches each layer to its
     /// loading mode's atomic refresh:
-    ///  * **folder-scan** — re-cluster the walk; on a cluster-hash change mint a
-    ///    fresh timeline, prefill the new clusters, tombstone the old timeline,
+    ///  * **folder-scan** — re-derive the directory units; each whose content
+    ///    hash moved re-ingests into a fresh conversation that supersedes the old,
     ///    and swap the new `Sequence` into the registry entry.
     ///  * **per-file** — reconcile deleted files, then re-ingest the changed
     ///    ones (each into a fresh per-file conversation that tombstones its
@@ -1503,18 +1564,14 @@ impl InferenceState {
             let content_root = self.workspace.join(&il.folder);
             match il.mode {
                 IngestMode::Folders => {
-                    // Snapshot the prior timeline + cluster state, then refresh
-                    // lock-free, then swap the replacement in — all keyed by name.
-                    let snapshot = {
+                    let prior_state = {
                         let convs = self.ingest_convs.lock().unwrap();
                         match convs.get(&il.name) {
-                            Some(IngestConv::Folders { sequence, state }) => {
-                                Some((sequence.timeline_id(), state.clone()))
-                            }
+                            Some(IngestConv::Folders { state }) => Some(state.clone()),
                             _ => None,
                         }
                     };
-                    let Some((old_timeline, prior_state)) = snapshot else {
+                    let Some(prior_state) = prior_state else {
                         continue;
                     };
                     let map = walk_cache
@@ -1523,19 +1580,18 @@ impl InferenceState {
                     let ctx = self.refresh_ctx();
                     let outcome = crate::repo_scan::refresh_repo_map(
                         &ctx,
+                        &content_root,
                         map,
                         &prior_state,
-                        old_timeline,
                         &progress,
                         &il.name,
                         &il.group,
                     )?;
-                    if let crate::repo_scan::RefreshOutcome::Replaced { sequence, state } = outcome
-                    {
+                    if let crate::repo_scan::RefreshOutcome::Replaced { state } = outcome {
                         self.ingest_convs
                             .lock()
                             .unwrap()
-                            .insert(il.name.clone(), IngestConv::Folders { sequence, state });
+                            .insert(il.name.clone(), IngestConv::Folders { state });
                         any = true;
                         tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
                     }
@@ -3967,7 +4023,7 @@ impl ZendSession {
                         // Arm the workspace watcher. A filesystem-event burst
                         // debounces into a single refresh covering every
                         // populated ingest layer: name-relevant events (create /
-                        // remove / rename) can move a folder-scan layer's cluster
+                        // remove / rename) can move a folder-scan layer's directory
                         // hashes, content edits can move a per-file layer's
                         // content hashes. Each layer short-circuits internally
                         // when its hash record is unchanged, and a layer that was
@@ -4855,7 +4911,7 @@ mod projection_schema_tests {
 
     /// The shipped `projection.yaml` parses, and the reconstructed repo map is
     /// capped and floored: `structure` is a `top_k(3)` group with a `"."`
-    /// default so the workspace-root cluster always survives selection.
+    /// default so the workspace-root folder always survives selection.
     #[test]
     fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
         let builder = build_projection_builder(Path::new("demo-project"));
@@ -4865,13 +4921,13 @@ mod projection_schema_tests {
         let group = builder.group(structure).expect("group schema present");
 
         match &group.selection {
-            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 clusters"),
+            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 folders"),
             other => panic!("structure should be top_k(3), got {other:?}"),
         }
         assert_eq!(
             group.default.as_ref().map(|d| d.tag.as_str()),
             Some("."),
-            "repo_map default floor is the workspace-root cluster",
+            "repo_map default floor is the workspace-root folder",
         );
     }
 }

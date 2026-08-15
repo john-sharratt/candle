@@ -1,5 +1,11 @@
-//! SAM: Segment Anything Model
-//! https://github.com/facebookresearch/segment-anything
+//! SAM: Segment Anything Model (https://github.com/facebookresearch/segment-anything),
+//! promptable image segmentation. Two modes: point-prompted single-mask
+//! generation (`sam.forward`, driven by `--point`/`--neg-point` normalized
+//! x,y coordinates and `--threshold`) or full-image automatic mask proposal
+//! (`--generate-masks`, grid of 32x32 points per side, writes one PNG per
+//! mask). `--use-tiny` swaps the ViT-B backbone for MobileSAM's TinyViT,
+//! defaulting to weights from `lmz/candle-sam`. Point mode composites the
+//! mask and prompt markers onto the source image as `sam_merged.jpg`.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

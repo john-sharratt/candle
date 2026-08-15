@@ -7,27 +7,26 @@
 use ahash::{HashMap, HashMapExt};
 use candle::quantized::GgmlDType;
 use std::cmp;
-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use candle::quantized::pinned_staging::{Generation, PinnedStager};
-use candle::quantized::QTensor;
 #[cfg(feature = "cuda")]
-use candle::quantized::{arena_compact_copy_async, CompactMove};
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Device, Result};
 
+use super::head_gids::ChunkBands;
 use super::{
     Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    GpuArenaFormatStats, LiveChunkRef, SealedChunk, StoragePolicy,
+    GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
+use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
-use crate::kv_cache::arena_table::{ArenaLocation, PerHeadEntry};
-use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo, N_PALETTE};
-use crate::{arena_gid_stride, CHUNK_SIZE};
+use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
+use crate::kv_cache::{HeadGids, KvFormat, QuantFormat, ResolvedArenaInfo, N_PALETTE};
+use crate::{CHUNK_SIZE, GID_STRIDE};
 
 /// Default fraction of reclaimable arenas that triggers pack-down.
-const DEFAULT_DEFRAG_THRESHOLD: f32 = 0.20;
 
 /// Substring embedded in the error returned when a GPU KV arena cannot be
 /// allocated within the VRAM budget (even after a forced compaction). The
@@ -51,7 +50,6 @@ pub fn is_device_oom(err: &candle::Error) -> bool {
 /// When one backing needs to grow arenas but fails (OOM), it can ask others to compact.
 static BACKING_REGISTRY: Mutex<Vec<Weak<BackingInner>>> = Mutex::new(Vec::new());
 
-/// Register a backing for cooperative compaction.
 pub(super) fn register_backing(inner: &Arc<BackingInner>) {
     if let Ok(mut registry) = BACKING_REGISTRY.lock() {
         // Clean up dead entries while we're here
@@ -60,51 +58,55 @@ pub(super) fn register_backing(inner: &Arc<BackingInner>) {
     }
 }
 
+/// Decode one band's slot into `f32`, for the offline dump paths.
+///
+/// `None` unless the band's tag names a **float** format: these dumps
+/// reconstruct raw activations, and a quantized band would need the
+/// dequantize path rather than a widening cast. The tag is the only record of
+/// how to read the slot — the arena is a run of untyped bytes.
+///
+/// The decode is done on the host from the slot's raw bytes rather than by
+/// viewing the slab as a typed tensor, so it works identically for a hot GPU
+/// arena and a warm CPU one, and needs no device-side reinterpretation.
+fn read_float_band(
+    arena: &Arena,
+    chunk_idx: usize,
+    tag: ArenaFormatTag,
+    elems: usize,
+) -> Option<Vec<f32>> {
+    let dtype = tag.to_dtype()?;
+    let bytes = arena
+        .slot_bytes(chunk_idx, elems * dtype.size_in_bytes())
+        .ok()?
+        .to_vec1::<u8>()
+        .ok()?;
+    let out = match dtype {
+        DType::F16 => bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        DType::BF16 => bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        DType::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        DType::F8E4M3 => bytes
+            .iter()
+            .map(|b| float8::F8E4M3::from_bits(*b).to_f32())
+            .collect(),
+        _ => return None,
+    };
+    Some(out)
+}
+
 fn register_state(inner: &Arc<BackingInner>, state: &Arc<RwLock<BlockTableState>>) {
     if let Ok(mut registry) = inner.state_registry.write() {
         registry.retain(|_, w| w.strong_count() > 0);
         registry.insert(state.read().unwrap().layer_idx, Arc::downgrade(state));
     }
-}
-
-/// Ask all registered backings to compact and return total arenas freed.
-///
-/// Called from the arena-alloc OOM/budget path, so it compacts **forced**
-/// (defrag threshold 0): under VRAM pressure we want to reclaim every
-/// arena we can, not wait for the steady-state fragmentation threshold.
-///
-/// Excluded from pointer-capture windows like every other topology mutator:
-/// compacting relocates/frees arenas whose base pointers an in-flight
-/// hot→warm migrate or warm→hot elevate has captured. `try_enter_relief`
-/// never blocks, so when the OOM happens ON a capturing thread (which holds
-/// the read side) this degrades to `0` freed and a clean propagated
-/// allocation error — recoverable, unlike a free-under-read corruption.
-pub(super) fn request_global_compact() -> usize {
-    let Some(_topology) = super::migrate_guard::try_enter_relief() else {
-        return 0;
-    };
-    let mut freed = 0;
-    let mut quiesced = false;
-    if let Ok(registry) = BACKING_REGISTRY.lock() {
-        for weak in registry.iter() {
-            if let Some(backing) = weak.upgrade() {
-                // Quiesce in-flight kernels once before the first free: wave
-                // kernels don't take the topology lock, so a trailing
-                // (deep-queued) kernel may still read arenas that emptied after
-                // its launch (see `BatchedInferenceSession::compact`).
-                if !quiesced {
-                    if backing.device.synchronize().is_err() {
-                        return 0;
-                    }
-                    quiesced = true;
-                }
-                if let Ok(n) = backing.compact_arenas_forced() {
-                    freed += n;
-                }
-            }
-        }
-    }
-    freed
 }
 
 /// Inner state of ChunkedKvBacking, wrapped in Arc for registry tracking.
@@ -131,6 +133,17 @@ pub(crate) struct BackingInner {
     /// Size: `n_kv_head * N_PALETTE` f32 values, every entry 1.0. Cloning the
     /// `Arc` is cheap — no per-chunk heap allocation.
     pub(crate) identity_scale: Arc<Vec<f32>>,
+    /// Per-`(head, palette)` K-side format tag for a **freshly allocated writer
+    /// chunk** — the active format, not the configured sealed one. On GPU that
+    /// is `R16`; a chunk does not reach its configured format until its turn
+    /// seals and quantizes (see [`active_kv_formats`]). Shared `Arc` so
+    /// `alloc_block_chunks` pays no per-chunk allocation, exactly like
+    /// `identity_pal`.
+    ///
+    /// [`active_kv_formats`]: crate::kv_cache::active_kv_formats
+    pub(crate) active_k_fmt: Arc<Vec<u8>>,
+    /// V-side counterpart of [`Self::active_k_fmt`] (`F16` on GPU).
+    pub(crate) active_v_fmt: Arc<Vec<u8>>,
     /// Reusable pinned-memory stager for async H2D metadata uploads.
     pub(crate) pinned_stager: PinnedStager,
     /// Device-resident per-chunk KV-head metadata records. Built at quantize,
@@ -158,6 +171,21 @@ pub(crate) struct BackingInner {
     /// band compressor regrouped it) — attention launches must use the
     /// MAPPED kernel instantiation.
     pub(crate) mapped_sealed: std::sync::atomic::AtomicBool,
+
+    /// Size classes a mid-wave refusal wanted an arena for.
+    ///
+    /// **The refusal's only useful output.** A sealing pass discovers it needs a
+    /// new arena at the leaf of the allocator, several frames deep and with
+    /// locks held, and is told to come back later — but "come back later" on its
+    /// own means rediscovering the same need at the same depth on the next pass,
+    /// after redoing the selection work that led there. Recording the class
+    /// turns the refusal into an instruction: create *this*, in the gap, and the
+    /// next pass will find it and only ever fill it, which is allowed at any
+    /// time (`BackingInner::create_deferred_arenas`).
+    ///
+    /// A `Vec` rather than a set because `ArenaKey` is two small enums and the
+    /// ladder has eight classes — membership is a linear scan over single digits.
+    pub(crate) deferred_arenas: Mutex<Vec<super::arena::ArenaKey>>,
 }
 
 /// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
@@ -195,20 +223,6 @@ impl BackingInner {
         }
     }
 
-    fn needs_compaction(&self, fragmentation_threshold: f32) -> Result<bool> {
-        if self.pool.has_reclaimable() || self.pool.needs_defragmentation(fragmentation_threshold) {
-            return Ok(true);
-        }
-
-        let max_used_chunk = self.pool.max_gid().unwrap_or(-1);
-        let needed_arenas = if max_used_chunk < 0 {
-            0
-        } else {
-            ((max_used_chunk as usize) / arena_gid_stride()) + 1
-        };
-        Ok(needed_arenas < self.storage.arena_count()?)
-    }
-
     #[allow(dead_code)]
     fn registered_states(&self) -> Vec<Arc<RwLock<BlockTableState>>> {
         if let Ok(mut registry) = self.state_registry.write() {
@@ -243,63 +257,6 @@ impl BackingInner {
         }
     }
 
-    #[allow(dead_code)]
-    fn apply_gid_remap(
-        states: &mut [RwLockWriteGuard<'_, BlockTableState>],
-        remap: &HashMap<i64, super::gid_pool::ChunkGid>,
-    ) -> Result<()> {
-        if remap.is_empty() {
-            return Ok(());
-        }
-
-        for state in states.iter_mut() {
-            for seq in state.sequences.iter_mut().flatten() {
-                let mut changed_seq = false;
-                let block_count = seq.block_count();
-                for blk in 0..block_count {
-                    // GID remap during arena compaction: only the raw GID values
-                    // change (chunks moved to different physical slots within the
-                    // same arena format). The encoded byte semantics are
-                    // unchanged, so pal/scale must be preserved verbatim.
-                    let replacement = seq.chunk_at(blk).and_then(|cw| {
-                        // HeadGids' inner Vec sits behind an Arc — scan
-                        // first and only allocate a remapped copy when
-                        // a change is actually needed. The unchanged
-                        // path is the common case and is now zero-cost.
-                        if !cw.gids.iter().any(|gid| remap.contains_key(&gid.raw())) {
-                            return None;
-                        }
-                        let new_inner: Vec<super::gid_pool::ChunkGid> = cw
-                            .gids
-                            .iter()
-                            .map(|gid| {
-                                remap
-                                    .get(&gid.raw())
-                                    .cloned()
-                                    .unwrap_or_else(|| gid.clone())
-                            })
-                            .collect();
-                        Some((
-                            super::head_gids::HeadGids::from_vec(new_inner),
-                            cw.k_pal.clone(),
-                            cw.v_pal.clone(),
-                            cw.k_scale.clone(),
-                            cw.v_scale.clone(),
-                        ))
-                    });
-                    if let Some((new_gids, k_pal, v_pal, k_scale, v_scale)) = replacement {
-                        seq.set_block_gids(blk, new_gids, k_pal, v_pal, k_scale, v_scale);
-                        changed_seq = true;
-                    }
-                }
-                if changed_seq {
-                    seq.invalidate_gpu_chunks();
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn release_empty_arenas(&self) -> Result<usize> {
         let mut freed = 0;
 
@@ -329,7 +286,7 @@ impl BackingInner {
         let needed_arenas = if max_used_chunk < 0 {
             0
         } else {
-            ((max_used_chunk as usize) / arena_gid_stride()) + 1
+            ((max_used_chunk as usize) / GID_STRIDE) + 1
         };
 
         let current_arenas = self.storage.arena_count()?;
@@ -347,264 +304,17 @@ impl BackingInner {
         }
 
         self.pool.resync_counters();
-        Ok(freed)
-    }
-
-    /// Defragment GPU arenas by greedily draining the least-occupied arenas for
-    /// each format key into free slots elsewhere, then patching all host-side
-    /// GID references in one batched pass.
-    ///
-    /// Only chunks that must leave an arena being freed are ever touched —
-    /// holes inside kept arenas are left in place.
-    ///
-    /// All moves across all keys are batched into a single GPU copy + sync +
-    /// remap so the expensive per-call overhead (device sync, state lock walk)
-    /// is paid once regardless of how many arenas are drained.
-    ///
-    /// Every failure mode degrades gracefully: allocated destination GIDs are
-    /// dropped (auto-returned to the pool) and the batch carries on without
-    /// them.  The only unrecoverable path is a successful GPU copy followed by
-    /// a remap failure, which would leave host and device state diverged.
-    ///
-    /// `max_moves` bounds how many chunk relocations one call performs (whole
-    /// arenas are always fully drained, so the bound is honoured at the arena
-    /// boundary). A bounded call defrags the emptiest arenas first and stops —
-    /// the caller escalates the budget across relief rungs so a large fragmented
-    /// gap consolidates over several bounded passes instead of one long blocking
-    /// compaction. `usize::MAX` = unbounded (the allocation-time OOM path). Logs a
-    /// per-phase timing breakdown (build / GPU copy / remap) so a slow compaction
-    /// is attributable.
-    pub(crate) fn defragment_arenas(
-        &self,
-        fragmentation_threshold: f32,
-        max_moves: usize,
-    ) -> Result<usize> {
-        // Single-slot relocation is safe: every kernel addresses each palette
-        // band through that band's own gid (see `resolve_band_source` in
-        // select_kv_format.cuh and the KvHead per-palette record pointers), so
-        // scattering a (chunk, head, side)'s band slots across arenas never
-        // changes what a kernel reads. The run allocator still mints bands as
-        // contiguous runs for locality, but nothing depends on it.
-        if !self.pool.needs_defragmentation(fragmentation_threshold) {
-            return Ok(0);
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = (fragmentation_threshold, max_moves);
-            return Ok(0);
-        }
-
-        #[cfg(feature = "cuda")]
-        {
-            let Device::Cuda(cuda_dev) = &self.device else {
-                return Ok(0);
-            };
-            let t_build = std::time::Instant::now();
-
-            // Phase 1 — build the full move batch across all keys.
-            //
-            // `all_dst_gids` keeps destination ChunkGids alive until after
-            // apply_gid_remap stores them in sequences; entries are parallel to
-            // the `remap` values (remap holds clones, all_dst_gids the originals).
-            let mut all_moves: Vec<CompactMove> = Vec::new();
-            let mut all_dst_gids: Vec<super::gid_pool::ChunkGid> = Vec::new();
-            let mut remap: HashMap<i64, super::gid_pool::ChunkGid> = HashMap::new();
-
-            // Hold a single storage read lock across the entire batch build.
-            // Inside, every (base_ptr, stride) per arena is resolved at most once
-            // and reused — chunk_copy_span is a fixed (base + chunk_idx * stride),
-            // so a per-arena cache lets the inner loop be pure pointer math.
-            self.storage.read(|state| {
-                let mut arena_span: ahash::HashMap<usize, (u64, u32)> = ahash::HashMap::new();
-                let resolve_span = |ai: usize,
-                                    cache: &mut ahash::HashMap<usize, (u64, u32)>|
-                 -> Option<(u64, u32)> {
-                    if let Some(&v) = cache.get(&ai) {
-                        return Some(v);
-                    }
-                    let span = state.arena(ai).and_then(|a| a.chunk_copy_span(0))?;
-                    cache.insert(ai, span);
-                    Some(span)
-                };
-
-                'build: for key in self.pool.format_keys() {
-                    if self.pool.defragmentable_ratio_for(&key) <= fragmentation_threshold {
-                        continue;
-                    }
-
-                    // Arenas sorted emptiest-first: process in that order so we
-                    // drain the cheapest targets and stop when no space remains.
-                    let arenas = self.pool.arenas_sorted_by_live_for_key(&key);
-                    if arenas.len() < 2 {
-                        continue;
-                    }
-
-                    for &(target_arena, live_count) in &arenas {
-                        if live_count == 0 {
-                            // Already empty; release_empty_arenas handles it.
-                            continue;
-                        }
-
-                        // Live GIDs come from pool state — no sequence scan needed.
-                        let live_gids = self.pool.live_gids_for_arena(target_arena);
-                        if live_gids.is_empty() {
-                            continue;
-                        }
-
-                        // Allocate replacement GIDs, strictly excluding target_arena.
-                        let slice_start = all_dst_gids.len();
-                        let mut alloc_ok = true;
-                        for _ in 0..live_gids.len() {
-                            match self.pool.allocate_for_excluding(key.clone(), target_arena) {
-                                Some(gid) => all_dst_gids.push(gid),
-                                None => {
-                                    alloc_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if !alloc_ok {
-                            all_dst_gids.truncate(slice_start);
-                            break;
-                        }
-
-                        // Resolve the src arena once — every live_gid lives in target_arena.
-                        let Some((src_base, src_stride)) =
-                            resolve_span(target_arena, &mut arena_span)
-                        else {
-                            all_dst_gids.truncate(slice_start);
-                            break;
-                        };
-                        if src_stride % 16 != 0 {
-                            all_dst_gids.truncate(slice_start);
-                            break;
-                        }
-
-                        // Build CUDA copy descriptors from cached pointer arithmetic.
-                        let moves_start = all_moves.len();
-                        let mut build_ok = true;
-                        for (src_raw, dst_gid) in
-                            live_gids.iter().zip(all_dst_gids[slice_start..].iter())
-                        {
-                            let src_ci = (*src_raw as usize) % arena_gid_stride();
-                            let dst_ai = dst_gid.arena_idx();
-                            let Some((dst_base, dst_stride)) =
-                                resolve_span(dst_ai, &mut arena_span)
-                            else {
-                                build_ok = false;
-                                break;
-                            };
-                            if dst_stride != src_stride {
-                                build_ok = false;
-                                break;
-                            }
-                            all_moves.push(CompactMove {
-                                dst: dst_base + dst_gid.chunk_idx() as u64 * dst_stride as u64,
-                                src: src_base + src_ci as u64 * src_stride as u64,
-                                stride_bytes: src_stride,
-                                _pad: 0,
-                            });
-                        }
-                        if !build_ok {
-                            all_moves.truncate(moves_start);
-                            all_dst_gids.truncate(slice_start);
-                            break;
-                        }
-
-                        // Commit this arena's moves into the remap.
-                        for (&src_raw, dst_gid) in
-                            live_gids.iter().zip(all_dst_gids[slice_start..].iter())
-                        {
-                            remap.insert(src_raw, dst_gid.clone());
-                        }
-
-                        // Budget honoured at the arena boundary — this arena is
-                        // fully drained, so stopping here leaves a clean state.
-                        if all_moves.len() >= max_moves {
-                            break 'build;
-                        }
-                    }
-                }
-            })?;
-
-            let build_ms = t_build.elapsed().as_millis() as u64;
-            if all_moves.is_empty() {
-                return Ok(0);
-            }
-            let n_moves = all_moves.len();
-
-            // Phase 2 — one lock, one GPU copy, one sync, one remap.
-            let t_copy = std::time::Instant::now();
-            let state_arcs = self.registered_states();
-            let mut locked_states: Vec<RwLockWriteGuard<'_, BlockTableState>> =
-                Vec::with_capacity(state_arcs.len());
-            let mut lock_ok = true;
-            for sa in &state_arcs {
-                match sa.write() {
-                    Ok(g) => locked_states.push(g),
-                    Err(_) => {
-                        lock_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !lock_ok {
-                // remap + all_dst_gids auto-freed on drop.
-                return Ok(0);
-            }
-
-            // On copy failure the source data is still intact (remap not yet
-            // applied), so all sequence references remain valid.
-            // remap + all_dst_gids are freed by drop.
-            // No device sync needed: the CUDA stream serialises the copy before
-            // any subsequent kernel that touches the same slots.
-            let _generation = self.pinned_stager.begin_generation();
-            let primary_stream = cuda_dev.cuda_stream();
-            if arena_compact_copy_async(&all_moves, 128, &primary_stream, &self.pinned_stager)
-                .is_err()
-            {
-                return Ok(0);
-            }
-            let copy_ms = t_copy.elapsed().as_millis() as u64;
-
-            // Replaced source ChunkGids are dropped by set_block_gids,
-            // auto-returning them to the pool and emptying the drained arenas.
-            // After this point GPU data has moved; a remap failure would leave
-            // host references stale — propagate it upward.
-            let t_remap = std::time::Instant::now();
-            if let Err(e) = Self::apply_gid_remap(&mut locked_states, &remap) {
-                return Err(e);
-            }
-            self.pool.resync_counters();
-            let remap_ms = t_remap.elapsed().as_millis() as u64;
+        // A sweep that frees nothing while the pool still reports recoverable
+        // arenas is the wedge signature: relief keeps being asked for memory
+        // the pool believes it has and cannot hand over. Say so rather than
+        // leaving `arenas_released=0` unexplained.
+        if freed == 0 && self.pool.can_reclaim_arena() {
             tracing::debug!(
-                target: "candle_nn::kv_cache::compact",
-                moves = n_moves,
-                bounded = max_moves != usize::MAX,
-                build_ms,
-                copy_ms,
-                remap_ms,
-                "arena defragment"
+                target: "candle_nn::kv_cache::gid_pool",
+                "empty sweep freed nothing though the pool reports a recoverable arena"
             );
-            Ok(remap.len())
         }
-    }
-
-    /// Compact arenas by first pack-down defragmenting when worthwhile, then
-    /// tombstoning any empty middle arenas and truncating unused tails.
-    pub(crate) fn compact_arenas(&self) -> Result<usize> {
-        let _ = self.defragment_arenas(DEFAULT_DEFRAG_THRESHOLD, usize::MAX)?;
-        self.release_empty_arenas()
-    }
-
-    /// Like [`Self::compact_arenas`] but forces defragmentation regardless of
-    /// the steady-state fragmentation threshold. Used by the VRAM-pressure /
-    /// OOM path ([`request_global_compact`]) where reclaiming any arena beats
-    /// leaving it resident.
-    pub(crate) fn compact_arenas_forced(&self) -> Result<usize> {
-        let _ = self.defragment_arenas(0.0, usize::MAX)?;
-        self.release_empty_arenas()
+        Ok(freed)
     }
 }
 
@@ -652,6 +362,8 @@ impl BackingInner {
         v_pal: std::sync::Arc<Vec<u8>>,
         k_scale: std::sync::Arc<Vec<f32>>,
         v_scale: std::sync::Arc<Vec<f32>>,
+        k_fmt: std::sync::Arc<Vec<u8>>,
+        v_fmt: std::sync::Arc<Vec<u8>>,
         arena_info: &[ResolvedArenaInfo],
     ) -> Result<()> {
         let state = self.layer_ref(layer_idx).ok_or_else(|| {
@@ -664,7 +376,9 @@ impl BackingInner {
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
         if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
-            slot.set_block_gids(block_idx, gids, k_pal, v_pal, k_scale, v_scale);
+            slot.set_block_gids(
+                block_idx, gids, k_pal, v_pal, k_scale, v_scale, k_fmt, v_fmt,
+            );
             slot.update_gpu_chunk(block_idx, self.n_kv_head, self.head_dim, arena_info)?;
         }
         Ok(())
@@ -681,6 +395,8 @@ impl ChunkedKvBacking {
         v_pal: std::sync::Arc<Vec<u8>>,
         k_scale: std::sync::Arc<Vec<f32>>,
         v_scale: std::sync::Arc<Vec<f32>>,
+        k_fmt: std::sync::Arc<Vec<u8>>,
+        v_fmt: std::sync::Arc<Vec<u8>>,
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> Result<()> {
         self.inner.set_block_gids_sharded_and_update_gpu(
@@ -692,6 +408,8 @@ impl ChunkedKvBacking {
             v_pal,
             k_scale,
             v_scale,
+            k_fmt,
+            v_fmt,
             arena_info,
         )
     }
@@ -856,6 +574,16 @@ impl ChunkedKvBacking {
             ArenaLocation::Gpu
         };
 
+        // Claim the device reservation here rather than on the first arena.
+        // It is a startup cost (the balloon touches every granule it takes) and
+        // this is the last moment before the scheduler starts asking how much
+        // room there is — a question the free-region count answers, and which
+        // has no answer at all until the reservation exists.
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = device {
+            super::region_pool::ensure(&cuda.cuda_stream())?;
+        }
+
         let storage = ArenaStorage::new(k_format, v_format, default_location);
 
         let pool = super::gid_pool::ChunkGidPool::new();
@@ -891,6 +619,24 @@ impl ChunkedKvBacking {
                 use crate::kv_cache::arena_table::N_PALETTE;
                 Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
             },
+            active_k_fmt: {
+                use crate::kv_cache::arena_table::N_PALETTE;
+                let on_gpu = default_location == ArenaLocation::Gpu;
+                let (k, _) = crate::kv_cache::active_kv_formats(k_format, on_gpu);
+                Arc::new(vec![
+                    ArenaFormatTag::from_kv_format(k).as_u8();
+                    n_kv_head * N_PALETTE
+                ])
+            },
+            active_v_fmt: {
+                use crate::kv_cache::arena_table::N_PALETTE;
+                let on_gpu = default_location == ArenaLocation::Gpu;
+                let (_, v) = crate::kv_cache::active_kv_formats(k_format, on_gpu);
+                Arc::new(vec![
+                    ArenaFormatTag::from_kv_format(v).as_u8();
+                    n_kv_head * N_PALETTE
+                ])
+            },
             pinned_stager,
             meta_pool: super::meta_pool::MetaPool::new(
                 // GQA record stride (4-band); single-latent backings resize this
@@ -906,6 +652,7 @@ impl ChunkedKvBacking {
             prov_sign_scratch: Mutex::new(None),
             single_latent: std::sync::atomic::AtomicBool::new(false),
             mapped_sealed: std::sync::atomic::AtomicBool::new(false),
+            deferred_arenas: Mutex::new(Vec::new()),
         });
 
         // Register for cooperative compaction
@@ -983,7 +730,7 @@ impl ChunkedKvBacking {
     #[allow(dead_code)] // callers are cuda-gated; a pure-CPU build sees none
     pub(crate) fn build_meta_records(
         &self,
-        chunks: &[(&super::head_gids::HeadGids, &[u8], &[u8], &[f32], &[f32])],
+        chunks: &[super::meta_pool::ChunkRecordSrc<'_>],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> Result<Vec<Option<super::meta_pool::MetaGid>>> {
         if !self.inner.meta_pool.is_device_resident() {
@@ -994,63 +741,21 @@ impl ChunkedKvBacking {
         let n_palette = self.inner.n_palette();
         let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
         let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::with_capacity(chunks.len());
-        for (gids, k_pal, v_pal, k_scale, v_scale) in chunks {
+        for src in chunks {
             let handle = self.inner.meta_pool.allocate()?;
             let mut bytes = vec![0u8; rb];
             super::meta_pool::serialize_kv_heads(
-                &mut bytes, gids, k_pal, v_pal, k_scale, v_scale, n_kv_head, head_dim, n_palette,
+                &mut bytes,
+                src,
+                n_kv_head,
+                head_dim,
+                n_palette,
                 arena_info,
             );
             items.push((handle, bytes));
         }
         self.inner.meta_pool.write_records_batched(&items)?;
         Ok(items.into_iter().map(|(h, _)| Some(h)).collect())
-    }
-
-    /// Returns true if this backing has enough reclaimable/tombstoned work to
-    /// justify a compaction pass.
-    pub fn needs_compaction(&self) -> Result<bool> {
-        self.inner.needs_compaction(DEFAULT_DEFRAG_THRESHOLD)
-    }
-
-    /// True when a forced compaction of this backing could free at least one
-    /// whole arena. When false, the backing is packed to within a single arena
-    /// of free space and a compaction pass would reclaim nothing.
-    pub fn can_reclaim_arena(&self) -> bool {
-        self.inner.pool.can_reclaim_arena()
-    }
-
-    /// Defragment and compact the backing when the reclaimable-arena ratio for
-    /// any key exceeds `fragmentation_threshold`.
-    pub fn defragment(&self, fragmentation_threshold: f32) -> Result<usize> {
-        let _ = self
-            .inner
-            .defragment_arenas(fragmentation_threshold, usize::MAX)?;
-        self.inner.release_empty_arenas()
-    }
-
-    /// Compact arenas by using the default defrag threshold, then releasing
-    /// unused middle and tail arenas.
-    /// Returns the number of arenas freed.
-    pub fn compact(&self) -> Result<usize> {
-        self.inner.compact_arenas()
-    }
-
-    /// Force compaction (defrag threshold 0) then release — for the
-    /// VRAM-pressure / backpressure path where reclaiming any arena beats
-    /// waiting for the steady-state fragmentation threshold.
-    pub fn compact_forced(&self) -> Result<usize> {
-        self.inner.compact_arenas_forced()
-    }
-
-    /// Bounded forced defragment: relocate at most `max_moves` chunks (whole
-    /// arenas drained, so honoured at the arena boundary), consolidating the
-    /// emptiest arenas first. Returns the number of chunks moved so a caller can
-    /// thread a budget across layers / relief rungs. Does NOT release the emptied
-    /// arenas — the caller pairs this with `release_empty_arenas` (so a bounded
-    /// pass + release is one escalating step). See `defragment_arenas`.
-    pub fn defragment_bounded(&self, max_moves: usize) -> Result<usize> {
-        self.inner.defragment_arenas(0.0, max_moves)
     }
 
     /// Release any fully-empty arenas back to the pool **without** the
@@ -1100,6 +805,16 @@ impl ChunkedKvBacking {
     /// Dimension of each head.
     pub fn head_dim(&self) -> usize {
         self.inner.head_dim
+    }
+
+    /// Elements one chunk slot holds at this backing's geometry — one
+    /// `(head, palette-band, side)` of `CHUNK_SIZE` tokens.
+    ///
+    /// The number every size-class and payload-length question is asked with,
+    /// exposed because callers outside this crate (the persistence gather)
+    /// need it to turn a band's format tag into a byte length.
+    pub fn elems_per_chunk(&self) -> usize {
+        self.inner.elems_per_chunk()
     }
 
     /// Begin a stager generation guard.
@@ -1181,6 +896,8 @@ impl ChunkedKvBacking {
             v_pal: cw.v_pal.as_slice(),
             k_scale: cw.k_scale.as_slice(),
             v_scale: cw.v_scale.as_slice(),
+            k_fmt: cw.k_fmt.as_slice(),
+            v_fmt: cw.v_fmt.as_slice(),
             meta: cw.meta.as_ref(),
         });
         Some(f(&mut it))
@@ -1202,18 +919,15 @@ impl ChunkedKvBacking {
         }
     }
 
-    pub fn live_chunks_as_sealed(
-        &self,
-        batch_idx: usize,
-        arena_infos: &[ResolvedArenaInfo],
-    ) -> Option<Vec<SealedChunk>> {
+    pub fn live_chunks_as_sealed(&self, batch_idx: usize) -> Option<Vec<SealedChunk>> {
+        let elems = self.inner.elems_per_chunk();
         let state = self.state.read().ok()?;
         let seq = state.sequences.get(batch_idx)?.as_ref()?;
         let chunks: Vec<SealedChunk> = seq
             .chunks_slice()
             .iter()
             .map(|cw| {
-                let byte_size = cw.gids.arena_byte_size(arena_infos);
+                let byte_size = cw.byte_size(elems);
                 SealedChunk {
                     gids: cw.gids.clone(),
                     offset: cw.offset,
@@ -1222,6 +936,8 @@ impl ChunkedKvBacking {
                     v_pal: cw.v_pal.clone(),
                     k_scale: cw.k_scale.clone(),
                     v_scale: cw.v_scale.clone(),
+                    k_fmt: cw.k_fmt.clone(),
+                    v_fmt: cw.v_fmt.clone(),
                     byte_size,
                     // Live snapshot shares the chunk's GIDs — propagate the
                     // resident record handle so the prefill/glue serializer can
@@ -1344,7 +1060,7 @@ impl ChunkedKvBacking {
                              is_k: bool,
                              seen: &mut HashMap<i64, (usize, usize, usize, usize, bool)>,
                              violations: &mut Vec<String>| {
-                                let stride = arena_gid_stride();
+                                let stride = GID_STRIDE;
                                 let ptr = arena_info
                                     .get(raw as usize / stride)
                                     .map(|ai| {
@@ -1535,20 +1251,6 @@ impl ChunkedKvBacking {
         self.inner.storage.v_format()
     }
 
-    /// Returns the actual K/V format tags from the first live arena.
-    ///
-    /// Falls back to the backing's configured defaults if no arenas exist.
-    /// Use this for kernel dispatch rather than `k_format()`/`v_format()` — the
-    /// backing default may be a quantized target while arenas are still float.
-    pub fn actual_kv_format_tags(
-        &self,
-    ) -> (
-        crate::kv_cache::ArenaFormatTag,
-        crate::kv_cache::ArenaFormatTag,
-    ) {
-        self.inner.storage.actual_kv_format_tags()
-    }
-
     /// Get the DType for this backing's default format, or None if quantized.
     ///
     /// For quantized storage, this returns None. Use `kv_format()` to get
@@ -1561,40 +1263,9 @@ impl ChunkedKvBacking {
     pub fn is_quantized(&self) -> bool {
         self.inner.storage.is_quantized()
     }
-
-    /// Build the per-head table tensor fresh from current arena storage.
-    pub fn per_head_table_sync(&self) -> Result<Tensor> {
-        self.inner.per_head_table_sync()
-    }
 }
 
 impl BackingInner {
-    /// Build the per-head table tensor fresh from current arena storage.
-    ///
-    /// Returns shape `(num_arenas * n_kv_head, 7)` i64.
-    /// Built on every attention call by scanning the active sequence block table —
-    /// no persistent state to keep in sync.
-    ///
-    /// For each arena referenced by any active block across all sequences, one
-    /// `PerHeadEntry` row is emitted per KV head.  Byte offsets and strides are
-    /// computed from first principles for the combined K+V buffer layout:
-    ///
-    ///   chunk slot = [K_head_0 … K_head_{N-1}, V_head_0 … V_head_{N-1}]
-    ///
-    /// When per-head quantization is active and different heads use different
-    /// arenas, the GID scan automatically covers all referenced arenas.
-    pub fn per_head_table_sync(&self) -> Result<Tensor> {
-        let (data, num_arenas) = self.per_head_table_host()?;
-        if num_arenas == 0 {
-            return Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, &self.device);
-        }
-        Tensor::from_vec(
-            data,
-            (num_arenas * self.n_kv_head, PerHeadEntry::COLS),
-            &self.device,
-        )
-    }
-
     /// Validate a selection batch's gids against the CURRENT storage arenas
     /// before any per-head table is uploaded and the selection kernel launched.
     ///
@@ -1610,11 +1281,11 @@ impl BackingInner {
     ///     confirmed read at exactly slab end).
     /// Failing here converts the corrupt launch into a named, recoverable
     /// error carrying both sides of the mismatch.
-    pub fn validate_selection_gids(&self, gids: &[HeadGids], label: &str) -> Result<()> {
-        let stride = arena_gid_stride();
+    pub fn validate_selection_gids(&self, chunks: &[ChunkBands], label: &str) -> Result<()> {
+        let stride = GID_STRIDE;
         let n_kv_head = self.n_kv_head;
         self.storage.read(|s| -> Result<()> {
-            for (ci, hg) in gids.iter().enumerate() {
+            for (ci, hg) in chunks.iter().map(|c| &c.gids).enumerate() {
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         for (side, raw) in [
@@ -1634,16 +1305,22 @@ impl BackingInner {
                                      a live gid"
                                 );
                             };
-                            let cap = super::types::arena_chunks_for_format(arena.format());
+                            // Capacity is a property of the arena's SIZE CLASS,
+                            // and a region re-stamped to a different class has a
+                            // different stride and a different slot count. This
+                            // reads like format bookkeeping and is actually a
+                            // memory-safety net: it caught a sanitizer-confirmed
+                            // OOB read at slab end (audit A14).
+                            let cap = arena.chunks();
                             if chunk_idx >= cap {
                                 candle::bail!(
                                     "selection gid validation ({label}): chunk {ci} head {h} \
-                                     palette {p} {side}-gid {raw} → arena {arena_idx} is {:?} \
-                                     (capacity {cap}) but chunk_idx is {chunk_idx} — \
-                                     pool/storage format mismatch: the gid was minted under a \
-                                     different-capacity format (arena index re-tenanted under \
+                                     palette {p} {side}-gid {raw} → arena {arena_idx} is class \
+                                     {} B (capacity {cap}) but chunk_idx is {chunk_idx} — \
+                                     pool/storage class mismatch: the gid was minted under a \
+                                     different-capacity class (arena index re-tenanted under \
                                      a live gid)",
-                                    arena.format()
+                                    arena.slot_stride()
                                 );
                             }
                         }
@@ -1654,119 +1331,107 @@ impl BackingInner {
         })?
     }
 
-    /// Host-side build of the per-head arena table: the flat `i64` row data
-    /// (`arena_idx * n_kv_head + head`, each `PerHeadEntry::COLS` wide) plus the
-    /// arena count. Exposed so the cross-layer persist selection can concatenate
-    /// every layer's table into ONE device upload — with per-layer `arena_idx`
-    /// offsets applied to the gids — instead of building and syncing 48 separate
-    /// tables. `num_arenas == 0` ⇒ `(empty, 0)`.
-    pub fn per_head_table_host(&self) -> Result<(Vec<i64>, usize)> {
-        // ⚠️  CP3 COLLAPSE POINT — READ docs/kv_cache_unification.md §7.6, §11.4 FIRST  ⚠️
-        //
-        // With palette4, this table uses N_PALETTE=4 sub-entries per (arena, head) row.
-        // GPU tensor shape: (num_arenas * n_kv_head, 28).
-        // Indexed by pal0_arena_idx * n_kv_head + head_idx.
-        //
-        // All N_PALETTE sub-entries in a row are IDENTICAL for now (same arena, same fmt),
-        // since all palette GIDs for a given (head, block) land in the same physical arena.
-        // The per-palette chunk_idx varies and is carried separately in head_gids.
-        //
-        // chunk_byte_stride uses head_dim/N_PALETTE (each chunk is one palette sub-band).
-        //
-        // ⚠️  DO NOT add fields to BackingInner to solve this — fix arena allocation  ⚠️
+    /// Host-side build of the selection table: one [`PerHeadEntry`] row per
+    /// `(chunk, head)` of `chunks`, in that order, each `PerHeadEntry::COLS`
+    /// wide. The kernel indexes it as `chunk_idx * n_kv_head + head_idx`.
+    ///
+    /// **Every palette sub-entry is populated from that band's own gid** — its
+    /// arena's base pointer and slot stride, and the *chunk's* own format tag.
+    /// This is what lets bands of one head live in different arenas and
+    /// different formats: the address and the layout both travel per band,
+    /// so nothing about the row depends on the bands sharing an arena.
+    ///
+    /// Sizing follows the job list rather than storage, which is also what
+    /// makes the cross-layer persist selection cheap: layers concatenate with
+    /// no arena-index rebasing, and the table grows with chunks actually being
+    /// selected instead of with the arena count (`docs/archived/arena_unification.md`
+    /// E5). An empty job list yields an empty table.
+    ///
+    /// The whole build happens under ONE storage read — never two. A split read
+    /// (bound under one lock, pointers under another) lets the scheduler
+    /// free or relocate an arena in between, so the rows no longer describe the
+    /// arenas the caller's frozen gids address, and the select kernel
+    /// dereferences a stale base pointer
+    /// (`run_select_kv_format_palette4_paged` → `CUDA_ERROR_ILLEGAL_ADDRESS`).
+    /// **The single-lock capture is now the whole of that guarantee.** This
+    /// used to credit a migrate-in-flight guard with blocking arena
+    /// free/relocate/trim across the build→launch→readback window;
+    /// `migrate_flight` is an advisory counter with no mutual exclusion, so it
+    /// blocks nothing. What actually holds is that every pointer here comes from
+    /// a pinned gid — the gid keeps its chunk's arena alive for the window — and
+    /// the reservation makes an arena base permanently valid for the process,
+    /// so there is no relocation to race with in the first place.
+    pub fn per_head_table_host(&self, chunks: &[ChunkBands]) -> Result<Vec<i64>> {
         use crate::kv_cache::arena_table::{PaletteSubEntry, N_PALETTE};
 
         let n_kv_head = self.n_kv_head;
-        let chunk_size = CHUNK_SIZE;
-        let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // Size the table to cover every arena in storage, not just those
-        // referenced by live slots. The kernel indexes the table as
-        // `table[arena_idx * n_kv_head + h]`, so the table must be dense
-        // over [0, num_arenas) for every arena_idx that any caller's
-        // input gid might reference.
-        //
-        // Previously this used the state_registry scan (max arena_idx
-        // among live slots), which is incorrect for the persist path:
-        // the persist thread feeds in gids from substrate-pinned
-        // SealedSequences whose arenas may not be referenced by any
-        // active slot (especially after a post-turn slot truncate
-        // drops the slot's Arc refs). The substrate residence still
-        // keeps those arenas alive via Arc refs, but the live-slot
-        // scan misses them → table too small → kernel reads OOB →
-        // CUDA_ERROR_ILLEGAL_ADDRESS in `run_select_kv_format_palette4_paged`.
-        //
-        // Sizing from `storage.arenas()` directly covers every arena
-        // that physically exists in this backing, which is the right
-        // invariant: any gid valid against this backing has
-        // `arena_idx ∈ [0, max_arena_idx]`.
-        // Capture `num_arenas` AND the base pointers under ONE storage read —
-        // never two. A split read (bound under one lock, pointers under another)
-        // lets the scheduler free/relocate an arena between the two, so the dense
-        // table's rows no longer correspond to the arenas the caller's frozen gids
-        // address — the persist select kernel then dereferences a stale/zero base
-        // pointer (`run_select_kv_format_palette4_paged` → CUDA_ERROR_ILLEGAL_ADDRESS).
-        // The migrate-in-flight guard (see `migrate_in_flight`) additionally blocks
-        // arena free/relocate/trim for the whole build→launch→readback window; this
-        // single-lock capture is the belt-and-suspenders half of that fix.
         self.storage.read(|s| {
             let arenas = s.arenas();
-            let num_arenas = arenas.keys().max().copied().map(|m| m + 1).unwrap_or(0);
-            if num_arenas == 0 {
-                return Ok((Vec::new(), 0));
+
+            // Base pointer + slot stride per referenced arena, resolved once
+            // up front. A chunk's eight bands usually hit one or two arenas,
+            // but a whole job list hits each repeatedly — and resolving here
+            // rather than inside the row loop is what lets a stride error
+            // propagate instead of being swallowed into a zero.
+            //
+            // An arena that is absent from storage resolves to `(0, 0)`, the
+            // same all-zero row the dense-over-storage build produced for a
+            // hole. `validate_selection_gids` rejects that case before the
+            // launch; this keeps the failure a named host error rather than a
+            // near-null device deref if it ever slips through.
+            let mut resolved: HashMap<usize, (u64, i64)> = HashMap::new();
+            for chunk in chunks {
+                for gid in chunk.gids.as_slice() {
+                    let ai = gid.arena_idx();
+                    if let std::collections::hash_map::Entry::Vacant(e) = resolved.entry(ai) {
+                        let v = match arenas.get(&ai) {
+                            // k_ptr == v_ptr: one combined K+V buffer per arena.
+                            Some(a) => (a.base_ptr().unwrap_or(0), a.slot_stride() as i64),
+                            None => (0, 0),
+                        };
+                        e.insert(v);
+                    }
+                }
             }
-            let mut data: Vec<i64> = vec![0i64; num_arenas * n_kv_head * PerHeadEntry::COLS];
+            let addr = |arena_idx: usize| -> (u64, i64) {
+                resolved.get(&arena_idx).copied().unwrap_or((0, 0))
+            };
 
-            for arena_idx in 0..num_arenas {
-                let arena = match arenas.get(&arena_idx) {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                // Base pointer (0 for CPU arenas) — to_arena_entry handles cfg(cuda).
-                let ae = arena.to_arena_entry();
-                let base_ptr = ae.k_ptr; // k_ptr == v_ptr for the combined K+V buffer
-                let k_tag = ae.k_format_tag;
-                let v_tag = ae.v_format_tag;
-
-                // Per-palette chunk byte stride: each chunk covers CHUNK_SIZE × sub_head_dim.
-                // sub_head_dim = head_dim / N_PALETTE for palette4 sub-arenas.
-                let chunk_byte_stride = match arena.format() {
-                    KvFormat::Float(dtype) => {
-                        (chunk_size * sub_head_dim) as i64 * dtype.size_in_bytes() as i64
-                    }
-                    KvFormat::Quantized(qfmt) => {
-                        let q_ggml = qfmt.to_ggml_dtype();
-                        (chunk_size * sub_head_dim / q_ggml.block_size()) as i64
-                            * q_ggml.type_size() as i64
-                    }
-                };
-
-                // Build one PaletteSubEntry; all N_PALETTE slots are identical
-                // since every palette GID for this (arena, head) references the same arena.
-                let sub = PaletteSubEntry {
-                    k_ptr: base_ptr,
-                    v_ptr: base_ptr,
-                    k_byte_offset: 0,
-                    v_byte_offset: 0,
-                    k_chunk_byte_stride: chunk_byte_stride,
-                    v_chunk_byte_stride: chunk_byte_stride,
-                    k_format_tag: k_tag,
-                    v_format_tag: v_tag,
-                    k_outer_scale: 1.0,
-                    v_outer_scale: 1.0,
-                };
-                let entry = PerHeadEntry::uniform(sub);
-                let cols = entry.to_tensor_row();
-
-                let row_base = arena_idx * n_kv_head;
+            let mut data: Vec<i64> = vec![0i64; chunks.len() * n_kv_head * PerHeadEntry::COLS];
+            for (ci, chunk) in chunks.iter().enumerate() {
                 for h in 0..n_kv_head {
-                    let offset = (row_base + h) * PerHeadEntry::COLS;
-                    data[offset..offset + PerHeadEntry::COLS].copy_from_slice(&cols);
+                    let palette: [PaletteSubEntry; N_PALETTE] = std::array::from_fn(|p| {
+                        let (k_base, k_stride) = addr(chunk.gids.k_gid_pal(h, p).arena_idx());
+                        let (v_base, v_stride) = addr(chunk.gids.v_gid_pal(h, p).arena_idx());
+                        let (k_tag, v_tag) = chunk.band_tags(h, p);
+                        PaletteSubEntry {
+                            k_ptr: k_base,
+                            v_ptr: v_base,
+                            // The band's chunk index is applied kernel-side from
+                            // its own gid, so the row carries only the base and
+                            // the step. Offsets stay zero: a chunk slot *is* one
+                            // (head, palette, side) band.
+                            k_byte_offset: 0,
+                            v_byte_offset: 0,
+                            k_chunk_byte_stride: k_stride,
+                            v_chunk_byte_stride: v_stride,
+                            k_format_tag: ArenaFormatTag::from_u8(k_tag),
+                            v_format_tag: ArenaFormatTag::from_u8(v_tag),
+                            k_outer_scale: 1.0,
+                            v_outer_scale: 1.0,
+                        }
+                    });
+                    let off = (ci * n_kv_head + h) * PerHeadEntry::COLS;
+                    data[off..off + PerHeadEntry::COLS]
+                        .copy_from_slice(&PerHeadEntry { palette }.to_tensor_row());
                 }
             }
 
-            Ok((data, num_arenas))
+            Ok(data)
         })?
     }
 
@@ -1795,17 +1460,7 @@ impl BackingInner {
         &self,
         needed: Option<&std::collections::HashSet<usize>>,
     ) -> Result<Vec<ResolvedArenaInfo>> {
-        use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
-        use crate::kv_cache::chunked::arena_chunks_for_format;
-
-        let chunk_size = CHUNK_SIZE;
-        // Per-band arena width tracks the backing's band count: `head_dim /
-        // n_palette()` = 32 for the single latent (16 bands over 512) and 128
-        // for GQA (4 palettes over 512). It MUST match the width the arenas are
-        // physically created at (`ensure_arena_exists` / `alloc_chunk_with_arenas`
-        // both use `n_palette()`); a mismatch strides the per-band pointers off
-        // the stored bytes. GQA is byte-identical (`n_palette()` == `N_PALETTE`).
-        let sub_head_dim = (self.head_dim / self.n_palette()).max(1);
+        use crate::kv_cache::arena_table::ResolvedArenaInfo;
 
         self.storage.read(|s| {
             let arenas = s.arenas();
@@ -1817,8 +1472,6 @@ impl BackingInner {
                 ResolvedArenaInfo {
                     base_ptr: 0,
                     chunk_byte_stride: 0,
-                    k_format_tag: ArenaFormatTag::BF16,
-                    v_format_tag: ArenaFormatTag::BF16,
                     chunk_capacity: 0,
                 };
                 num_arenas
@@ -1830,28 +1483,13 @@ impl BackingInner {
                         continue;
                     }
                 }
-                let ae = arena.to_arena_entry();
-                let base_ptr = ae.k_ptr;
-                let k_tag = ae.k_format_tag;
-                let v_tag = ae.v_format_tag;
-
-                let chunk_byte_stride = match arena.format() {
-                    KvFormat::Float(dtype) => {
-                        (chunk_size * sub_head_dim) as i64 * dtype.size_in_bytes() as i64
-                    }
-                    KvFormat::Quantized(qfmt) => {
-                        let q_ggml = qfmt.to_ggml_dtype();
-                        (chunk_size * sub_head_dim / q_ggml.block_size()) as i64
-                            * q_ggml.type_size() as i64
-                    }
-                };
-
+                // Address stride and capacity only. A band's payload length is
+                // the chunk's business, not the arena's — see
+                // `ResolvedArenaInfo`'s "what is deliberately absent".
                 info[arena_idx] = ResolvedArenaInfo {
-                    base_ptr,
-                    chunk_byte_stride,
-                    k_format_tag: k_tag,
-                    v_format_tag: v_tag,
-                    chunk_capacity: arena_chunks_for_format(arena.format()) as u32,
+                    base_ptr: arena.base_ptr().unwrap_or(0),
+                    chunk_byte_stride: arena.slot_stride() as i64,
+                    chunk_capacity: arena.chunks() as u32,
                 };
             }
 
@@ -1884,35 +1522,13 @@ impl ChunkedKvBacking {
         self.inner.storage.arena_count()
     }
 
-    /// Count the number of quantized arenas (excluding R16 raw storage).
-    ///
-    /// Returns (quantized_count, total_count) tuple.
-    /// Useful for validating that quantization is actually occurring.
-    /// R16 arenas are excluded since they are a raw K+Q capture format, not compression.
-    pub fn count_quantized_arenas(&self) -> Result<(usize, usize)> {
-        self.inner.storage.read(|s| {
-            let arenas = s.arenas();
-            let total = arenas.len();
-            let quantized = arenas
-                .values()
-                .filter(|a| match a {
-                    super::Arena::Quantized { format, .. } => {
-                        *format != crate::kv_cache::QuantFormat::R16
-                    }
-                    _ => false,
-                })
-                .count();
-            (quantized, total)
-        })
-    }
-
     /// GPU arena occupancy split float vs quant across the pool this backing
     /// shares (arenas are pooled globally across layers with the same head
     /// config, so one backing's view is the whole model's). Feeds the per-wave
     /// `kv-pool` diagnostic that validates the compress-to-free rung shrinks the
-    /// float side. See [`GpuArenaFormatStats`].
-    pub fn gpu_arena_format_stats(&self) -> GpuArenaFormatStats {
-        self.inner.pool.gpu_format_stats()
+    /// float side. See [`GpuArenaClassStats`].
+    pub fn gpu_arena_class_stats(&self) -> GpuArenaClassStats {
+        self.inner.pool.gpu_class_stats()
     }
 
     /// True when at least one of `seq`'s chunks is still wholly in a GPU float /
@@ -1920,23 +1536,28 @@ impl ChunkedKvBacking {
     /// work on this sequence rather than pass it through unchanged.
     ///
     /// Mirrors the per-chunk eligibility test in `compress.rs`: a chunk is
-    /// compressible when every one of its `(h, p)` source GIDs lives in a GPU
-    /// `Float` or `Quantized(R16)` arena. Used by the scheduler's compress-to-
-    /// free relief rung to skip turns whose hot is already quantized (a prior
-    /// relief pass, or the persistence thread, beat it to them), so an
-    /// undrained `snapshot_pending_warm` backlog doesn't re-walk finished turns.
+    /// compressible when every one of its `(h, p)` source bands is GPU-resident
+    /// and recorded as `Float` or `Quantized(R16)`. Used by the scheduler's
+    /// compress-to-free relief rung to skip turns whose hot is already
+    /// quantized (a prior relief pass, or the persistence thread, beat it to
+    /// them), so an undrained `snapshot_pending_warm` backlog doesn't re-walk
+    /// finished turns.
+    ///
+    /// The two halves of the test come from different owners: **location** is
+    /// arena identity and is read from storage, **format** travels with the
+    /// chunk and is read from its own band tags.
     #[cfg(feature = "cuda")]
     pub fn sealed_has_compressible_chunk(&self, seq: &SealedSequence) -> bool {
         self.inner
             .storage
             .read(|storage| {
                 seq.chunks.iter().any(|chunk| {
-                    chunk.gids.as_slice().iter().all(|gid| {
-                        matches!(
-                            storage.arena_key(gid.arena_idx()),
-                            Some(k) if k.location == ArenaLocation::Gpu
-                                && super::chunk_ops::needs_reconcile_source_format(k.format)
-                        )
+                    chunk.bands().all(|(gid, tag)| {
+                        super::chunk_ops::needs_reconcile_source_tag(tag)
+                            && matches!(
+                                storage.arena_key(gid.arena_idx()),
+                                Some(k) if k.location == ArenaLocation::Gpu
+                            )
                     })
                 })
             })
@@ -1961,36 +1582,68 @@ impl ChunkedKvBacking {
             None => return Ok((0, 0)), // No sequence at this slot
         };
 
-        // Check all unique arenas referenced by each block's GID slots.
-        // A block is counted as "quantized" if ANY of its arenas is quantized.
-        self.inner.storage.read(|s| {
-            let arenas = s.arenas();
-            let mut quantized_tokens = 0usize;
-            let total_tokens = slot.block_count() * CHUNK_SIZE;
-
-            for cw in slot.chunks_slice() {
-                // A block is "quantized" only if it has a non-R16 quantized arena.
-                // R16 is a raw storage format (K+Q capture), not a compression format.
-                let any_quant =
-                    cw.gids
-                        .unique_arena_indices()
-                        .iter()
-                        .any(|&ai| match arenas.get(&ai) {
-                            Some(super::Arena::Quantized { format, .. }) => {
-                                *format != crate::kv_cache::QuantFormat::R16
-                            }
-                            _ => false,
-                        });
-                if any_quant {
-                    quantized_tokens += CHUNK_SIZE;
-                }
+        // A block counts as "quantized" if ANY of its bands is recorded in a
+        // non-R16 quantized format. R16 is a raw storage format (K+Q capture),
+        // not compression. The question is asked of the chunk's own tags — a
+        // size-class arena has no format to report.
+        let mut quantized_tokens = 0usize;
+        let total_tokens = slot.block_count() * CHUNK_SIZE;
+        for cw in slot.chunks_slice() {
+            let any_quant = cw
+                .bands()
+                .any(|(_, tag)| tag.is_quantized() && tag != ArenaFormatTag::R16);
+            if any_quant {
+                quantized_tokens += CHUNK_SIZE;
             }
-
-            (quantized_tokens, total_tokens)
-        })
+        }
+        Ok((quantized_tokens, total_tokens))
     }
 
     /// Compute byte-level compression statistics for a sequence.
+    /// Live band slots per size class for one sequence, plus how many of them
+    /// are in formats **narrower than the smallest class**.
+    ///
+    /// This is audit A12's instrumentation. Splitting the 320 B rung into
+    /// {64, 160, 320} would save 256 B/slot on `Q0`/`Q0_V`/`Q0_X` and
+    /// 160 B/slot on `Q0_M2`/`Q1_S`, at the cost of two more classes whose
+    /// steady-state partial tails run about half a region each — ≈16 MiB.
+    /// Break-even is therefore ≈16 MiB ÷ ~200 B ≈ 65–84 K live slots in
+    /// sub-320 formats, roughly **2 % of a ~4.8 M-slot pool** on this card.
+    ///
+    /// **Decision rule: split the low end only if sub-320 formats exceed ~2 %
+    /// of live slots.** That fails at the C4/C5 production default, which never
+    /// selects them, and is worth re-checking at C9/C10. This is what makes the
+    /// rule answerable rather than a guess.
+    ///
+    /// Returns `(per-class live slots, sub-320 live slots)`.
+    pub fn class_histogram(&self, batch_idx: usize) -> ([usize; SizeClass::COUNT], usize) {
+        let mut per_class = [0usize; SizeClass::COUNT];
+        let mut narrow = 0usize;
+        let elems = self.inner.elems_per_chunk();
+        let smallest = SizeClass::at(0).bytes();
+
+        let Ok(state) = self.state.read() else {
+            return (per_class, narrow);
+        };
+        let Some(slot) = state.sequences.get(batch_idx).and_then(|s| s.as_ref()) else {
+            return (per_class, narrow);
+        };
+        for cw in slot.chunks_slice() {
+            for (_, tag) in cw.bands() {
+                let Some(payload) = payload_bytes_for_tag(tag, elems) else {
+                    continue;
+                };
+                if let Some(class) = class_for_payload(payload) {
+                    per_class[class.index()] += 1;
+                }
+                if payload < smallest {
+                    narrow += 1;
+                }
+            }
+        }
+        (per_class, narrow)
+    }
+
     pub fn compression_bpe(&self, batch_idx: usize) -> candle::Result<(f64, usize)> {
         let state = self
             .state
@@ -2006,37 +1659,25 @@ impl ChunkedKvBacking {
             return Ok((0.0f64, 0));
         }
 
-        self.inner.storage.read(|s| {
-            let arenas = s.arenas();
-            // Walk every (head, palette, K/V) slot individually.
-            // Each slot covers CHUNK_SIZE × (head_dim / N_PALETTE) elements.
-            // Float and R16 slots are excluded from both numerator and denominator
-            // so the ratio is CR = 16 / effective_bpe for compressed-only slots.
-            let mut actual = 0f64;
-            let mut n_quant = 0usize;
-
-            for cw in slot.chunks_slice() {
-                for gid in cw.gids.as_slice() {
-                    let ai = gid.arena_idx();
-                    match arenas.get(&ai) {
-                        Some(super::Arena::Float { .. }) => {
-                            continue;
-                        }
-                        Some(super::Arena::Quantized { format, .. })
-                            if *format == crate::kv_cache::QuantFormat::R16 =>
-                        {
-                            continue;
-                        }
-                        Some(super::Arena::Quantized { format, .. }) => {
-                            actual += format.bits_per_elem() as f64 * cw.usage as f64;
-                            n_quant += cw.usage as usize;
-                        }
-                        None => continue,
-                    }
+        // Walk every (head, palette, K/V) band individually. Each covers
+        // CHUNK_SIZE × (head_dim / N_PALETTE) elements. Float and R16 bands are
+        // excluded from both numerator and denominator so the ratio is
+        // CR = 16 / effective_bpe over compressed bands only.
+        let mut actual = 0f64;
+        let mut n_quant = 0usize;
+        for cw in slot.chunks_slice() {
+            for (_, tag) in cw.bands() {
+                let Some(KvFormat::Quantized(qf)) = tag.to_kv_format() else {
+                    continue;
+                };
+                if qf == QuantFormat::R16 {
+                    continue;
                 }
+                actual += qf.bits_per_elem() as f64 * cw.usage as f64;
+                n_quant += cw.usage as usize;
             }
-            (actual as f64, n_quant)
-        })
+        }
+        Ok((actual, n_quant))
     }
 
     pub fn compression_dist(
@@ -2051,34 +1692,24 @@ impl ChunkedKvBacking {
             None => return,
         };
 
-        self.inner
-            .storage
-            .read(|s| {
-                let arenas = s.arenas();
-                // gids are interleaved: [K_head0, V_head0, K_head1, V_head1, ...]
-                // stride by 2 starting at 0 (K) or 1 (V) to avoid counting both sides.
-                let start = usize::from(is_value);
-                for cw in slot.chunks_slice() {
-                    let all = cw.gids.as_slice();
-                    let mut i = start;
-                    while i < all.len() {
-                        let ai = all[i].arena_idx();
-                        let dtype = match arenas.get(&ai) {
-                            Some(Arena::Float { dtype, .. }) => dtype.to_ggml_dtype(),
-                            Some(Arena::Quantized { format, .. }) => format.to_ggml_dtype(),
-                            None => {
-                                i += 2;
-                                continue;
-                            }
-                        };
-                        // Count palette sub-band slots: one per GID (matches per-block diagnostics
-                        // where each block shows N_PALETTE × n_kv_head slot counts per format).
-                        *(ret.entry(dtype).or_default()) += 1;
-                        i += 2;
-                    }
-                }
-            })
-            .unwrap();
+        // Bands are interleaved [K_head0_pal0, V_head0_pal0, ...]; stride by 2
+        // from 0 (K) or 1 (V) so only one side is counted. Each band reports the
+        // format its own tag records.
+        let start = usize::from(is_value);
+        for cw in slot.chunks_slice() {
+            for (_, tag) in cw.bands().skip(start).step_by(2) {
+                let Some(fmt) = tag.to_kv_format() else {
+                    continue;
+                };
+                let dtype = match fmt {
+                    KvFormat::Float(dt) => dt.to_ggml_dtype(),
+                    KvFormat::Quantized(qf) => qf.to_ggml_dtype(),
+                };
+                // One count per band slot, matching the per-block diagnostics
+                // that show N_PALETTE × n_kv_head slots per format.
+                *(ret.entry(dtype).or_default()) += 1;
+            }
+        }
     }
 
     /// Dump float K and V data for all chunks in a sequence.
@@ -2093,17 +1724,18 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
     ) -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>> {
-        let n_kv_head = self.inner.n_kv_head;
+        let elems = self.inner.elems_per_chunk();
 
-        // Collect per-block GID snapshots while holding the state lock briefly.
-        // Each entry is one (head, palette) sub-band:
-        // (k_arena_idx, k_chunk_idx, v_arena_idx, v_chunk_idx).
+        // Snapshot every band as `(arena_idx, chunk_idx, tag)` while holding the
+        // state lock briefly. The tag travels with the gid because it is the
+        // only thing that says how to decode the slot's bytes — a size-class
+        // arena is untyped (`docs/archived/arena_unification.md` principle 8).
         //
-        // IMPORTANT: `k_gid(h)` / `v_gid(h)` are backward-compat palette-0 aliases.
-        // For palette4 layouts we must dump ALL palette sub-bands to reconstruct the
-        // full logical head_dim, otherwise the binary dump only contains 1/4 of the
-        // head and the offline selection analysis becomes invalid.
-        let block_gids: Vec<Vec<(usize, usize, usize, usize)>> = {
+        // IMPORTANT: all N_PALETTE sub-bands are dumped, not just palette 0.
+        // Dumping one palette would emit a quarter of each head and quietly
+        // invalidate the offline selection analysis this feeds.
+        type Band = (usize, usize, ArenaFormatTag);
+        let block_bands: Vec<Vec<(Band, Band)>> = {
             let state = self
                 .state
                 .read()
@@ -2115,76 +1747,31 @@ impl ChunkedKvBacking {
             slot.chunks_slice()
                 .iter()
                 .map(|cw| {
-                    (0..n_kv_head)
-                        .flat_map(|h| {
-                            (0..crate::kv_cache::arena_table::N_PALETTE).map(move |p| {
-                                let kg = cw.gids.k_gid_pal(h, p);
-                                let vg = cw.gids.v_gid_pal(h, p);
-                                (
-                                    kg.arena_idx(),
-                                    kg.chunk_idx(),
-                                    vg.arena_idx(),
-                                    vg.chunk_idx(),
-                                )
-                            })
-                        })
-                        .collect()
+                    // `bands()` yields K,V interleaved in slot order, which is
+                    // head-major then palette-major — the layout this dump
+                    // reconstructs.
+                    let flat: Vec<Band> = cw
+                        .bands()
+                        .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
+                        .collect();
+                    flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect()
                 })
                 .collect()
         };
-        if block_gids.is_empty() {
+        if block_bands.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut result = Vec::with_capacity(block_gids.len());
-        for (block_idx, head_gids) in block_gids.iter().enumerate() {
+        let mut result = Vec::with_capacity(block_bands.len());
+        for (block_idx, bands) in block_bands.iter().enumerate() {
             let maybe_kv: Option<(Vec<f32>, Vec<f32>)> = self.inner.storage.read(|s| {
                 let arenas = s.arenas();
-                let mut k_all = Vec::with_capacity(n_kv_head * CHUNK_SIZE * self.inner.head_dim);
-                let mut v_all = Vec::with_capacity(n_kv_head * CHUNK_SIZE * self.inner.head_dim);
-
-                for &(k_ai, k_ci, v_ai, v_ci) in head_gids.iter() {
-                    // Each flat arena chunk stores one head × one palette sub-band × one side.
-                    // Concatenating palette order p=0..N_PALETTE reconstructs the full logical head.
-                    let k_arena = arenas.get(&k_ai)?;
-                    match k_arena {
-                        super::Arena::Float { data, .. } => {
-                            let head_data = data
-                                .narrow(0, k_ci, 1)
-                                .ok()?
-                                .squeeze(0)
-                                .ok()?
-                                .to_dtype(DType::F32)
-                                .ok()?
-                                .flatten_all()
-                                .ok()?
-                                .to_vec1::<f32>()
-                                .ok()?;
-                            k_all.extend(head_data);
-                        }
-                        super::Arena::Quantized { .. } => return None,
-                    }
-
-                    let v_arena = arenas.get(&v_ai)?;
-                    match v_arena {
-                        super::Arena::Float { data, .. } => {
-                            let head_data = data
-                                .narrow(0, v_ci, 1)
-                                .ok()?
-                                .squeeze(0)
-                                .ok()?
-                                .to_dtype(DType::F32)
-                                .ok()?
-                                .flatten_all()
-                                .ok()?
-                                .to_vec1::<f32>()
-                                .ok()?;
-                            v_all.extend(head_data);
-                        }
-                        super::Arena::Quantized { .. } => return None,
-                    }
+                let mut k_all = Vec::with_capacity(elems * bands.len());
+                let mut v_all = Vec::with_capacity(elems * bands.len());
+                for &((k_ai, k_ci, k_tag), (v_ai, v_ci, v_tag)) in bands.iter() {
+                    k_all.extend(read_float_band(arenas.get(&k_ai)?, k_ci, k_tag, elems)?);
+                    v_all.extend(read_float_band(arenas.get(&v_ai)?, v_ci, v_tag, elems)?);
                 }
-
                 Some((k_all, v_all))
             })?;
 
@@ -2228,7 +1815,8 @@ impl ChunkedKvBacking {
         // Resolve (absolute_block_idx, head_gids) for the requested block
         // range.  `block_range = None` walks every chunk in the sequence;
         // `Some((lo, hi))` walks only chunks in `[lo, hi)`.
-        let block_gids: Vec<(usize, Vec<(usize, usize, usize, usize)>)> = {
+        type Band = (usize, usize, ArenaFormatTag);
+        let block_gids: Vec<(usize, Vec<(Band, Band)>)> = {
             let state = self
                 .state
                 .read()
@@ -2249,22 +1837,17 @@ impl ChunkedKvBacking {
                 .iter()
                 .enumerate()
                 .map(|(i, cw)| {
-                    let absolute_idx = lo + i;
-                    let gids: Vec<(usize, usize, usize, usize)> = (0..n_kv_head)
-                        .flat_map(|h| {
-                            (0..N_PALETTE).map(move |p| {
-                                let kg = cw.gids.k_gid_pal(h, p);
-                                let vg = cw.gids.v_gid_pal(h, p);
-                                (
-                                    kg.arena_idx(),
-                                    kg.chunk_idx(),
-                                    vg.arena_idx(),
-                                    vg.chunk_idx(),
-                                )
-                            })
-                        })
+                    // Each band carries its own tag: the arena it points into is
+                    // an untyped byte slab and cannot say whether the slot holds
+                    // R16 or a float.
+                    let flat: Vec<Band> = cw
+                        .bands()
+                        .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                         .collect();
-                    (absolute_idx, gids)
+                    (
+                        lo + i,
+                        flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect(),
+                    )
                 })
                 .collect()
         };
@@ -2287,64 +1870,46 @@ impl ChunkedKvBacking {
 
             let _ = self.inner.storage.read(|s| {
                 let arenas = s.arenas();
-                for &(k_ai, k_ci, v_ai, v_ci) in head_gids.iter() {
-                    // K + Q from R16 quantized arena.
+                for &((k_ai, k_ci, k_tag), (v_ai, v_ci, v_tag)) in head_gids.iter() {
+                    // K + Q come from an R16 band; the band's own tag says so.
                     let Some(k_arena) = arenas.get(&k_ai) else {
                         ok = false;
                         return Ok::<(), candle::Error>(());
                     };
-                    match k_arena {
-                        super::Arena::Quantized { data, format, .. }
-                            if *format == crate::kv_cache::QuantFormat::R16 =>
-                        {
-                            let chunk_off = k_ci * r16_bytes_per_chunk;
-                            if chunk_off + r16_bytes_per_chunk > data.storage_size_in_bytes() {
-                                ok = false;
-                                return Ok(());
-                            }
-                            // Ranged DtoH: copy ONLY this chunk's bytes from
-                            // VRAM, not the whole arena.
-                            let chunk_owned =
-                                data.data_range(chunk_off..chunk_off + r16_bytes_per_chunk)?;
-                            let chunk_bytes: &[u8] = &chunk_owned;
-                            // Token-major append into the (head, palette) sub-band.
-                            // R16 storage is dim-major: block[d][t]. Reorder to [t][d].
-                            for t in 0..CHUNK_SIZE {
-                                for d in 0..sub_head_dim {
-                                    let blk_off = d * 128;
-                                    let k_lo = chunk_bytes[blk_off + t * 2];
-                                    let k_hi = chunk_bytes[blk_off + t * 2 + 1];
-                                    let k_h = half::f16::from_le_bytes([k_lo, k_hi]);
-                                    let q_lo = chunk_bytes[blk_off + 64 + t * 2];
-                                    let q_hi = chunk_bytes[blk_off + 64 + t * 2 + 1];
-                                    let q_h = half::f16::from_le_bytes([q_lo, q_hi]);
-                                    k_all.push(k_h.to_f32());
-                                    q_all.push(q_h.to_f32());
-                                }
-                            }
-                        }
-                        _ => {
-                            ok = false;
-                            return Ok(());
+                    if k_tag != ArenaFormatTag::R16 {
+                        ok = false;
+                        return Ok(());
+                    }
+                    // Ranged read: only this slot's bytes leave VRAM.
+                    let Ok(view) = k_arena.slot_bytes(k_ci, r16_bytes_per_chunk) else {
+                        ok = false;
+                        return Ok(());
+                    };
+                    let chunk_bytes = view.to_vec1::<u8>()?;
+                    // Token-major append into the (head, palette) sub-band.
+                    // R16 storage is dim-major: block[d][t]. Reorder to [t][d].
+                    for t in 0..CHUNK_SIZE {
+                        for d in 0..sub_head_dim {
+                            let blk_off = d * 128;
+                            let k_lo = chunk_bytes[blk_off + t * 2];
+                            let k_hi = chunk_bytes[blk_off + t * 2 + 1];
+                            let k_h = half::f16::from_le_bytes([k_lo, k_hi]);
+                            let q_lo = chunk_bytes[blk_off + 64 + t * 2];
+                            let q_hi = chunk_bytes[blk_off + 64 + t * 2 + 1];
+                            let q_h = half::f16::from_le_bytes([q_lo, q_hi]);
+                            k_all.push(k_h.to_f32());
+                            q_all.push(q_h.to_f32());
                         }
                     }
 
-                    // V from float arena (always float in R16 mode).
+                    // V is float in R16 mode.
                     let Some(v_arena) = arenas.get(&v_ai) else {
                         ok = false;
                         return Ok(());
                     };
-                    match v_arena {
-                        super::Arena::Float { data, .. } => {
-                            let head_data = data
-                                .narrow(0, v_ci, 1)?
-                                .squeeze(0)?
-                                .to_dtype(DType::F32)?
-                                .flatten_all()?
-                                .to_vec1::<f32>()?;
-                            v_all.extend(head_data);
-                        }
-                        _ => {
+                    match read_float_band(v_arena, v_ci, v_tag, elems_per_subband) {
+                        Some(head_data) => v_all.extend(head_data),
+                        None => {
                             ok = false;
                             return Ok(());
                         }
@@ -2393,7 +1958,8 @@ impl ChunkedKvBacking {
         };
 
         // Step 1: collect (absolute_block_idx, [(k_ai, k_ci, v_ai, v_ci)]) for the range.
-        let block_gids: Vec<(usize, Vec<(usize, usize, usize, usize)>)> = {
+        type ProbeBand = (usize, usize, ArenaFormatTag);
+        let block_gids: Vec<(usize, Vec<(ProbeBand, ProbeBand)>)> = {
             let state = self
                 .state
                 .read()
@@ -2414,22 +1980,19 @@ impl ChunkedKvBacking {
                 .iter()
                 .enumerate()
                 .map(|(i, cw)| {
-                    let absolute_idx = lo + i;
-                    let gids: Vec<(usize, usize, usize, usize)> = (0..n_kv_head)
-                        .flat_map(|h| {
-                            (0..N_PALETTE).map(move |p| {
-                                let kg = cw.gids.k_gid_pal(h, p);
-                                let vg = cw.gids.v_gid_pal(h, p);
-                                (
-                                    kg.arena_idx(),
-                                    kg.chunk_idx(),
-                                    vg.arena_idx(),
-                                    vg.chunk_idx(),
-                                )
-                            })
-                        })
+                    // The tag rides along with the gid: whether a band is R16 or
+                    // F16 is recorded on the chunk, and the arena it points into
+                    // is an untyped byte slab that cannot answer.
+                    let flat: Vec<(usize, usize, ArenaFormatTag)> = cw
+                        .bands()
+                        .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                         .collect();
-                    (absolute_idx, gids)
+                    (
+                        lo + i,
+                        flat.chunks_exact(2)
+                            .map(|kv| (kv[0], kv[1]))
+                            .collect::<Vec<_>>(),
+                    )
                 })
                 .collect()
         };
@@ -2446,20 +2009,10 @@ impl ChunkedKvBacking {
         let mut r16_block_indices: Vec<usize> = Vec::new();
 
         for (block_idx, head_gids) in &block_gids {
-            let is_r16 = head_gids.iter().all(|&(k_ai, _, _, _)| {
-                arena_info
-                    .get(k_ai)
-                    .map_or(false, |a| a.k_format_tag == ArenaFormatTag::R16)
+            let is_r16_f16 = head_gids.iter().all(|&((_, _, k_tag), (_, _, v_tag))| {
+                k_tag == ArenaFormatTag::R16 && v_tag == ArenaFormatTag::F16
             });
-            if !is_r16 {
-                continue;
-            }
-            let is_v_f16 = head_gids.iter().all(|&(_, _, v_ai, _)| {
-                arena_info
-                    .get(v_ai)
-                    .map_or(false, |a| a.v_format_tag == ArenaFormatTag::F16)
-            });
-            if !is_v_f16 {
+            if !is_r16_f16 {
                 continue;
             }
 
@@ -2467,9 +2020,9 @@ impl ChunkedKvBacking {
             // CPU-backed arenas have base_ptr=0; passing 0+ci*stride to the kernel
             // produces a small non-zero address that CUDA maps to unallocated memory
             // → ILLEGAL_ADDRESS fault on the GPU stream.
-            let all_ptrs_nonzero = head_gids.iter().all(|&(k_ai, _, v_ai, _)| {
-                arena_info.get(k_ai).map_or(false, |a| a.base_ptr != 0)
-                    && arena_info.get(v_ai).map_or(false, |a| a.base_ptr != 0)
+            let all_ptrs_nonzero = head_gids.iter().all(|&((k_ai, ..), (v_ai, ..))| {
+                arena_info.get(k_ai).is_some_and(|a| a.base_ptr != 0)
+                    && arena_info.get(v_ai).is_some_and(|a| a.base_ptr != 0)
             });
             if !all_ptrs_nonzero {
                 tracing::error!(
@@ -2481,7 +2034,7 @@ impl ChunkedKvBacking {
             }
 
             r16_block_indices.push(*block_idx);
-            for &(k_ai, k_ci, v_ai, v_ci) in head_gids.iter() {
+            for &((k_ai, k_ci, _), (v_ai, v_ci, _)) in head_gids.iter() {
                 let k_arena = &arena_info[k_ai];
                 let v_arena = &arena_info[v_ai];
                 k_ptrs.push(k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride);
@@ -2573,15 +2126,14 @@ impl ChunkedKvBacking {
         batch_idx: usize,
         block_range: Option<(usize, usize)>,
     ) -> Result<(Vec<i64>, Vec<usize>)> {
-        use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+        use crate::kv_cache::arena_table::ArenaFormatTag;
 
-        let n_kv_head = self.inner.n_kv_head;
         let Device::Cuda(_) = &self.inner.device else {
             return Ok((Vec::new(), Vec::new()));
         };
 
         // (absolute_block_idx, [(k_ai, k_ci)]) — Q side only (co-located with K).
-        let block_gids: Vec<(usize, Vec<(usize, usize)>)> = {
+        let block_gids: Vec<(usize, Vec<(usize, usize, ArenaFormatTag)>)> = {
             let state = self
                 .state
                 .read()
@@ -2602,16 +2154,13 @@ impl ChunkedKvBacking {
                 .iter()
                 .enumerate()
                 .map(|(i, cw)| {
-                    let absolute_idx = lo + i;
-                    let gids: Vec<(usize, usize)> = (0..n_kv_head)
-                        .flat_map(|h| {
-                            (0..N_PALETTE).map(move |p| {
-                                let kg = cw.gids.k_gid_pal(h, p);
-                                (kg.arena_idx(), kg.chunk_idx())
-                            })
-                        })
+                    // K side only (Q is co-located), each band with its own tag.
+                    let gids: Vec<(usize, usize, ArenaFormatTag)> = cw
+                        .bands()
+                        .step_by(2)
+                        .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                         .collect();
-                    (absolute_idx, gids)
+                    (lo + i, gids)
                 })
                 .collect()
         };
@@ -2623,24 +2172,24 @@ impl ChunkedKvBacking {
         // not the whole arena table — the bulk of this path's per-scope cost.
         let needed: std::collections::HashSet<usize> = block_gids
             .iter()
-            .flat_map(|(_, gids)| gids.iter().map(|&(k_ai, _)| k_ai))
+            .flat_map(|(_, gids)| gids.iter().map(|&(k_ai, ..)| k_ai))
             .collect();
         let arena_info = self.inner.resolve_arena_info_for(&needed)?;
         let mut q_ptrs: Vec<i64> = Vec::new();
         let mut block_indices: Vec<usize> = Vec::new();
         for (block_idx, head_gids) in &block_gids {
             // Keep a block only when every (h,p) K side is R16 and GPU-backed —
-            // same filter as `gather_r16_kv_probe`, so layers stay aligned.
-            let ok = head_gids.iter().all(|&(k_ai, _)| {
-                arena_info
-                    .get(k_ai)
-                    .is_some_and(|a| a.k_format_tag == ArenaFormatTag::R16 && a.base_ptr != 0)
+            // same filter as `gather_r16_kv_probe`, so layers stay aligned. The
+            // R16-ness is the chunk answering; the residency is the arena.
+            let ok = head_gids.iter().all(|&(k_ai, _, k_tag)| {
+                k_tag == ArenaFormatTag::R16
+                    && arena_info.get(k_ai).is_some_and(|a| a.base_ptr != 0)
             });
             if !ok {
                 continue;
             }
             block_indices.push(*block_idx);
-            for &(k_ai, k_ci) in head_gids.iter() {
+            for &(k_ai, k_ci, _) in head_gids.iter() {
                 let k_arena = &arena_info[k_ai];
                 q_ptrs.push(k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride);
             }
@@ -2731,79 +2280,6 @@ impl ChunkedKvBacking {
         _sub_head_dim: usize,
     ) -> Result<Vec<u32>> {
         Ok(Vec::new())
-    }
-
-    /// Get K arenas as float tensors.
-    ///
-    /// With flat arenas, each chunk stores one head's one side.
-    /// K data is addressed by chunk index via HeadGids — no narrowing needed.
-    /// Returns the full arena tensor (each chunk is a single head's single side).
-    pub fn k_arenas(&self) -> Vec<Tensor> {
-        self.inner
-            .storage
-            .read(|s| {
-                s.arenas()
-                    .values()
-                    .filter_map(|a| a.as_float_data().cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Get V arenas as float tensors.
-    ///
-    /// With flat arenas, K and V share the same arena format (each chunk is
-    /// one head's one side).  V data is addressed by chunk index via HeadGids.
-    pub fn v_arenas(&self) -> Vec<Tensor> {
-        self.inner
-            .storage
-            .read(|s| {
-                s.arenas()
-                    .values()
-                    .filter_map(|a| a.as_float_data().cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Get float arenas (K, V). Returns None if default format is quantized.
-    /// With flat arenas, K and V are the same tensor — chunks are distinguished
-    /// by GID, not by position within the arena.
-    pub fn float_arenas(&self) -> Option<(Vec<Tensor>, Vec<Tensor>)> {
-        if self.inner.storage.is_quantized() {
-            return None;
-        }
-        self.inner
-            .storage
-            .read(|s| {
-                let all: Vec<_> = s
-                    .arenas()
-                    .values()
-                    .filter_map(|a| a.as_float_data().cloned())
-                    .collect();
-                (all.clone(), all)
-            })
-            .ok()
-    }
-
-    /// Get quantized arenas (K, V). Returns None if default format is float.
-    /// Note: With heterogeneous storage, some arenas may be float even if this returns Some.
-    pub fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)> {
-        if !self.inner.storage.is_quantized() {
-            return None;
-        }
-        self.inner
-            .storage
-            .read(|s| {
-                let k: Vec<_> = s
-                    .arenas()
-                    .values()
-                    .filter_map(|a| a.as_quantized_data().cloned())
-                    .collect();
-                let v: Vec<_> = k.clone();
-                (k, v)
-            })
-            .ok()
     }
 
     /// Execute a read operation on the arena storage.
@@ -3154,32 +2630,4 @@ pub fn global_print_arena_table() {
         tombstone_count, full_count, empty_count, total_gpu_mib
     ));
     eprintln!("╚{}╝", sep);
-}
-
-// ==================== PagedKvArenas Trait Implementation ====================
-
-impl crate::kv_cache::PagedKvArenas for ChunkedKvBacking {
-    fn n_kv_head(&self) -> usize {
-        self.inner.n_kv_head
-    }
-
-    fn head_dim(&self) -> usize {
-        self.inner.head_dim
-    }
-
-    fn k_format(&self) -> KvFormat {
-        ChunkedKvBacking::k_format(self)
-    }
-
-    fn v_format(&self) -> KvFormat {
-        ChunkedKvBacking::v_format(self)
-    }
-
-    fn float_arenas(&self) -> Option<(Vec<Tensor>, Vec<Tensor>)> {
-        ChunkedKvBacking::float_arenas(self)
-    }
-
-    fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)> {
-        ChunkedKvBacking::quantized_arenas(self)
-    }
 }

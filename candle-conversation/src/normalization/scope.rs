@@ -1,5 +1,5 @@
 //! One scope's normalization state: a hit level per child, plus the read
-//! (`normalize`) and write (`observe`) operations over them.
+//! (`normalize_with_floors`) and write (`observe`) operations over them.
 
 use std::collections::HashMap;
 
@@ -14,17 +14,10 @@ pub(super) struct ScopeState {
 
 impl ScopeState {
     /// Normalize each child's raw score to the 0–1000 band:
-    /// `scale × raw / max(hit_level, floor)`. A child never observed in this scope
-    /// normalizes against the cold-start prior. Pure — does not mutate.
-    pub(super) fn normalize(
-        &self,
-        raw: &[(ChildKey, f32)],
-        cfg: &NormConfig,
-    ) -> Vec<(ChildKey, f32)> {
-        self.normalize_with_floors(raw, &[], cfg)
-    }
-
-    /// [`Self::normalize`] with a caller-supplied per-child denominator floor —
+    /// `scale × raw / max(hit_level, floor)`. A child never observed in this
+    /// scope normalizes against the cold-start prior. Pure — does not mutate.
+    ///
+    /// `floors` is a caller-supplied per-child denominator floor —
     /// the Concept A.4 size-aware level prior
     /// (`docs/provenance_adaptive_projection.md` §3). A positive `floors[i]`
     /// switches child `i` to **traffic-peak normalization**: its denominator is

@@ -1,3 +1,10 @@
+//! Code-completion text generation with Replit's replit-code-v1.5-3B (MPT
+//! architecture), in float (`mpt::Model`) or GGUF-quantized (`quantized_mpt::
+//! Model`, `--quantized`) form, defaulting to weights from `lmz/candle-replit-code`.
+//!
+//! No model-size variant selection (single fixed `Config::replit_code_v1_5_3b()`);
+//! `--weight-file`/`--tokenizer`/`--model-id` override the defaults. F32 only.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

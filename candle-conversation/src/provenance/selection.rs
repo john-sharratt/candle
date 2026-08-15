@@ -58,6 +58,14 @@ pub struct SectionSelector {
     /// Indexed by `SectionPolicy::group`.
     budgets: Vec<GroupBudget>,
     selected: Vec<bool>,
+    /// Whether each slot has ever been selected **on its own evidence** — i.e.
+    /// its belief reached the selection threshold, rather than the min-budget
+    /// force-fill putting it in scope. Sticky for the turn (carried across
+    /// reprojections via [`Self::seed`]). Only a qualified slot is eligible for
+    /// the early-decode carry floor: the floor exists to protect a real pick
+    /// whose decode-Q is still accruing, and applying it to a force-filled slot
+    /// would manufacture a lock-on out of a slot that never showed evidence.
+    qualified: Vec<bool>,
 }
 
 impl SectionSelector {
@@ -71,6 +79,7 @@ impl SectionSelector {
             policy,
             budgets,
             selected: vec![false; n],
+            qualified: vec![false; n],
         }
     }
 
@@ -95,11 +104,17 @@ impl SectionSelector {
     /// across a turn's reprojections without the scheduler holding state — the
     /// prior [`super::super::projection::ProjectionEvent`] carries the scores and
     /// selected flags.
-    pub fn seed(&mut self, scores: &[f32], selected: &[bool]) {
+    pub fn seed(&mut self, scores: &[f32], selected: &[bool], qualified: &[bool]) {
         self.belief.set_scores(scores);
         for i in 0..self.selected.len() {
             self.selected[i] = selected.get(i).copied().unwrap_or(false);
+            self.qualified[i] = qualified.get(i).copied().unwrap_or(false);
         }
+    }
+
+    /// Whether slot `i` has ever been selected on its own evidence this turn.
+    pub fn is_qualified(&self, i: usize) -> bool {
+        self.qualified[i]
     }
 
     /// Apply one projection's per-section scores, then re-evaluate selection.
@@ -121,7 +136,7 @@ impl SectionSelector {
         if let Some(floor) = floor {
             let mut s = self.belief.scores().to_vec();
             for (i, sc) in s.iter_mut().enumerate() {
-                if self.selected[i] && *sc < floor {
+                if self.selected[i] && self.qualified[i] && *sc < floor {
                     *sc = floor;
                 }
             }
@@ -177,16 +192,32 @@ impl SectionSelector {
             eligible.sort_by(|&a, &c| s[c].partial_cmp(&s[a]).unwrap_or(std::cmp::Ordering::Equal));
             let mut keep: Vec<usize> = eligible.iter().copied().take(b.max).collect();
             // MIN budget: force-fill from the strongest remaining members even if they
-            // never reached `min_score`.
+            // never reached `min_score` — a weak-but-real signal still beats an empty
+            // scope. A slot with **no** evidence is not a weak signal, though: when
+            // every belief is zero the ordering below is arbitrary (a stable sort over
+            // equal keys keeps catalog order), so force-filling there selects whichever
+            // member happens to sort first and presents it as a choice. Requiring a
+            // positive belief leaves the scope empty instead, which is the honest
+            // reading of "nothing matched".
             if keep.len() < b.min {
                 let mut rest: Vec<usize> = members
                     .iter()
                     .copied()
-                    .filter(|&i| !keep.contains(&i))
+                    .filter(|&i| !keep.contains(&i) && s[i] > 0.0)
                     .collect();
                 rest.sort_by(|&a, &c| s[c].partial_cmp(&s[a]).unwrap_or(std::cmp::Ordering::Equal));
                 let need = b.min - keep.len();
                 keep.extend(rest.into_iter().take(need));
+            }
+            // Qualification is "reached the selection threshold on its own
+            // belief", recorded stickily so the early-decode floor may protect it.
+            // Deliberately NOT the `eligible` set: that admits an already-selected
+            // member on the lower `evict_score`, which would let a force-filled
+            // slot qualify without ever crossing the real bar.
+            for &i in &members {
+                if s[i] >= self.policy[i].min_score {
+                    self.qualified[i] = true;
+                }
             }
             for &i in &members {
                 self.selected[i] = keep.contains(&i);

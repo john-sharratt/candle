@@ -269,6 +269,22 @@ fn summarize_examples_optional_carries_stuffed_turns() {
         content.contains("Jitter returns"),
         "stuffed content must carry the sample summaries",
     );
+    // The `repo_map` ingest reuses these examples for a FOLDER chain (list, then
+    // read the anchor, then summarise), which is a different shape from the
+    // code_reading scope read. Without a worked example of it the model imitates
+    // the file shape and describes the anchor file instead of the folder.
+    assert!(
+        content.contains("Summarize the `worker/scheduling/` folder"),
+        "stuffed content must carry a folder-shaped example for repo_map",
+    );
+    assert!(
+        content.contains("\"name\":\"file_list\""),
+        "the folder example must show the listing call the repo_map chain prefills",
+    );
+    assert!(
+        content.contains("This folder decides which tenant's jobs run next"),
+        "the folder example must end in a folder summary, not a file summary",
+    );
 }
 
 // ── extract_tool_calls ───────────────────────────────────────────────────────
@@ -462,4 +478,61 @@ fn format_tool_responses_escapes_nested_json_correctly() {
     assert!(formatted.starts_with("<tool_response>"));
     assert!(formatted.contains("</tool_response>"));
     assert!(formatted.contains("\"nested\""));
+}
+
+/// The bundled schema's belief gates, resolved the way projection does it.
+/// `repo_map/structure` declares a `policy:` band and no `score_threshold`; the
+/// gate must be that band (600/400), not the `0.0` default that previously
+/// overwrote it and made every cluster eligible at zero evidence. Every other
+/// group declares a `score_threshold` and must keep it verbatim.
+#[test]
+fn bundled_schema_belief_gates_resolve_from_the_right_source() {
+    use candle_conversation::models::Dialect;
+    use candle_conversation::projection::Builder;
+    const YAML: &str = include_str!("../src/prompts/projection.yaml");
+    let dialect = Dialect::chat_ml();
+    let builder =
+        Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "proj")], Some(&dialect))
+            .expect("bundled projection.yaml parses");
+    let schema = builder.schema();
+    let mut seen = std::collections::BTreeMap::new();
+    for layer in &schema.layers {
+        for group in &layer.groups {
+            let cfg = group.belief_config(32);
+            seen.insert(
+                format!("{}/{}", layer.name, group.name),
+                (cfg.min_score, cfg.evict_score),
+            );
+        }
+    }
+    assert_eq!(
+        seen.get("repo_map/structure"),
+        Some(&(250.0, 250.0)),
+        "repo_map must use its declared policy band, not the 0.0 default; got {seen:?}",
+    );
+    assert_eq!(seen.get("bug_analysis/bugs"), Some(&(250.0, 250.0)));
+    assert_eq!(seen.get("dream_log/dreams"), Some(&(100.0, 100.0)));
+    assert_eq!(seen.get("code_reading/scopes"), Some(&(100.0, 100.0)));
+
+    // The early band is a GRACE window: it must never sit above the steady one,
+    // or the opening tokens of a turn are gated harder than the rest. Only
+    // repo_map currently enables an early window (`early_window_tokens: 24`);
+    // the rest inherit `early_window_tokens: 0`, which makes their early band
+    // inert — so this guards repo_map today and any group that turns one on.
+    for layer in &schema.layers {
+        for group in &layer.groups {
+            let cfg = group.belief_config(32);
+            if cfg.early_window_tokens == 0 {
+                continue;
+            }
+            assert!(
+                cfg.early_min_score <= cfg.min_score,
+                "{}/{}: early_min_score {} > min_score {}",
+                layer.name,
+                group.name,
+                cfg.early_min_score,
+                cfg.min_score,
+            );
+        }
+    }
 }

@@ -1,3 +1,10 @@
+//! ConvMixer ImageNet-1k classification (`candle_transformers::models::convmixer::c1024_20`).
+//!
+//! Loads a single `--image` (224x224 ImageNet preprocessing), runs the fixed
+//! 1024-dim/20-depth/kernel-9/patch-14 ConvMixer variant, and prints the top-5
+//! class probabilities. `--model` overrides the default weights fetched from
+//! `lmz/candle-convmixer` on the HF Hub.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

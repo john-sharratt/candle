@@ -1,3 +1,14 @@
+//! Text generation from a HF-exported ONNX causal LM graph (not a native
+//! candle model).
+//!
+//! Loads `onnx/model.onnx` for `HuggingFaceTB/SmolLM-135M` via
+//! `candle_onnx::read_file` and drives it with `candle_onnx::simple_eval`,
+//! manually threading KV cache state as named tensor inputs/outputs
+//! (`past_key_values.<i>.{key,value}` in, `present.<i>.{key,value}` out)
+//! since the ONNX graph has no candle-side cache object. Token ids and
+//! position ids are passed as `i64` tensors. Sampling is
+//! temperature/top-k/top-p via `generation::Sampling`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

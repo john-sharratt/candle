@@ -59,10 +59,14 @@ pub mod gemma3;
 pub mod glm4;
 pub mod glm4_new;
 pub mod gpu_backed;
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_test_lock;
 pub mod granite;
 pub mod granitemoehybrid;
 pub mod helium;
 pub mod hiera;
+#[cfg(feature = "cuda")]
+pub mod host_embedding;
 pub mod jina_bert;
 pub mod kv_cache_utils;
 pub mod kv_collect_utils;
@@ -151,6 +155,9 @@ pub mod trocr;
 pub mod vgg;
 pub mod vit;
 pub mod voxtral;
+mod wave_admit;
+#[cfg(feature = "cuda")]
+pub mod wave_buffers;
 pub mod whisper;
 pub mod with_tracing;
 pub mod wuerstchen;

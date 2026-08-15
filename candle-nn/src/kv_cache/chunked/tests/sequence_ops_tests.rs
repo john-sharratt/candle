@@ -417,6 +417,74 @@ mod tests {
 
     // ==================== fork_sequence Tests ====================
 
+    /// `truncate_sequence_to_tokens` owns the writer tail and nothing else.
+    ///
+    /// A slot with a deferred glue fire counts its reserved gap tokens in the
+    /// chunk windows but not in the scheduler's offset, so the idempotency
+    /// truncation arrives with a target short of the sealed cum by exactly the
+    /// pending glue. That must clamp to the sealed boundary — cutting only the
+    /// writable tail — not error, and not touch the reservation the fire needs.
+    mod truncate_sealed_boundary_tests {
+        use super::*;
+
+        /// Sealed prefix of two chunks (32 + 13 reserved glue), writer at 2,
+        /// one stale writable chunk of 5 behind it.
+        fn deferred_glue_slot() -> ChunkedKvBacking {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(0, 0, 96).unwrap();
+            backing.set_block_window(0, 0, 0, 32).unwrap();
+            backing.set_block_window(0, 1, 0, 13).unwrap();
+            backing.set_block_window(0, 2, 0, 5).unwrap();
+            backing.test_set_writer_start(0, 2).unwrap();
+            backing
+        }
+
+        fn windows(backing: &ChunkedKvBacking) -> Vec<(u16, u32)> {
+            let state = backing.state.read().expect("lock");
+            let slot = state.sequences[0].as_ref().expect("slot");
+            slot.chunks_slice()
+                .iter()
+                .map(|c| (c.offset, c.usage))
+                .collect()
+        }
+
+        #[test]
+        fn a_target_inside_sealed_ground_clamps_and_cuts_only_the_writable_tail() {
+            let backing = deferred_glue_slot();
+            // The scheduler's offset: everything except the 13 reserved glue
+            // tokens. The old contract bailed here ("target 32 cuts into the
+            // Arc-shared prefix"), and the one caller that discarded the error
+            // was accidentally providing the correct behaviour.
+            backing.truncate_sequence_to_tokens(0, 32).unwrap();
+            assert_eq!(
+                windows(&backing),
+                vec![(0, 32), (0, 13)],
+                "sealed chunks (including the glue reservation) survive intact; \
+                 the stale writable chunk is gone"
+            );
+        }
+
+        #[test]
+        fn a_target_in_the_writable_tail_still_trims_it() {
+            let backing = deferred_glue_slot();
+            // 45 sealed + 3 of the writable chunk's 5.
+            backing.truncate_sequence_to_tokens(0, 48).unwrap();
+            assert_eq!(
+                windows(&backing),
+                vec![(0, 32), (0, 13), (0, 3)],
+                "a target past the sealed boundary trims the writer tail exactly"
+            );
+        }
+
+        #[test]
+        fn a_covering_target_is_a_no_op() {
+            let backing = deferred_glue_slot();
+            backing.truncate_sequence_to_tokens(0, 50).unwrap();
+            assert_eq!(windows(&backing), vec![(0, 32), (0, 13), (0, 5)]);
+        }
+    }
+
     mod fork_sequence_tests {
         use super::*;
 

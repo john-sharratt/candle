@@ -608,8 +608,11 @@ struct YamlGroup {
     id: String,
     #[serde(default)]
     selection: YamlSelection,
+    /// Belief/selection gate. Absent is NOT the same as `0.0`: an absent
+    /// threshold leaves the group's `policy:` score band in force, while an
+    /// explicit `0.0` means "no gate" and overrides it.
     #[serde(default)]
-    score_threshold: f32,
+    score_threshold: Option<f32>,
     #[serde(default)]
     budget: YamlBudget,
     /// Selection policy override; inherits the enclosing layer's when absent.
@@ -961,6 +964,8 @@ fn build(
 
         let layer_budget = parse_budget(&yl.name, &yl.budget)?;
         let layer_policy = parse_policy(&yl.name, yl.policy.as_ref(), &schema_default)?;
+        // A band is "declared" once any level in the chain names a `min_score`.
+        let layer_band_declared = yl.policy.as_ref().and_then(|p| p.min_score).is_some();
 
         // Per-layer dial overrides for the shared system prompt (applied when
         // this layer is the projection target). Empty inherits the section-tree
@@ -982,16 +987,20 @@ fn build(
             let gid = GroupId::new(global_group_counter);
             maps.group_names.insert(yg.id.clone(), gid);
 
-            if yg.score_threshold < 0.0 {
-                return Err(ConstructionError::NegativeScoreThreshold {
-                    name: yg.id.clone(),
-                    value: yg.score_threshold,
-                });
+            if let Some(t) = yg.score_threshold {
+                if t < 0.0 {
+                    return Err(ConstructionError::NegativeScoreThreshold {
+                        name: yg.id.clone(),
+                        value: t,
+                    });
+                }
             }
 
             let selection = parse_selection(&yg.id, &yg.selection)?;
             let group_budget = parse_budget(&yg.id, &yg.budget)?;
             let group_policy = parse_policy(&yg.id, yg.policy.as_ref(), &layer_policy)?;
+            let policy_band_declared =
+                layer_band_declared || yg.policy.as_ref().and_then(|p| p.min_score).is_some();
 
             groups.push(GroupSchema {
                 id: gid,
@@ -999,6 +1008,7 @@ fn build(
                 selection,
                 score_threshold: yg.score_threshold,
                 policy: group_policy,
+                policy_band_declared,
                 budget: group_budget,
                 default: parse_default(yg.default.as_ref()),
                 budget_adaptive: parse_member_budget_adaptive(&yg.id, yg.budget_adaptive.as_ref())?,

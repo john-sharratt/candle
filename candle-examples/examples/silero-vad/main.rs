@@ -1,3 +1,12 @@
+//! Silero VAD (voice activity detection) run through `candle-onnx`.
+//!
+//! Loads the `onnx-community/silero-vad` ONNX graph and streams little-endian
+//! i16 PCM frames from stdin, framed at 256 samples (8 kHz) or 512 samples
+//! (16 kHz) per `--sample-rate`, carrying the recurrent `state`/`context`
+//! tensors between chunks. Prints a per-chunk speech probability and the
+//! run's average at the end. `--which silero` selects the only supported
+//! variant; `--model-id`/`--config-file` override the hub download.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

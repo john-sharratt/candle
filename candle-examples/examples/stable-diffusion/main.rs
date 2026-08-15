@@ -1,3 +1,14 @@
+//! Stable Diffusion 1.5 / 2.1 / XL / Turbo text-to-image generation, plus
+//! their inpainting variants (UNet + CLIP + VAE).
+//!
+//! `--sd-version` selects the checkpoint family (`ModelFile`/
+//! `StableDiffusionVersion` resolve the per-version HF repo and weight
+//! filenames, including SDXL's dual CLIP text encoders); `--use-f16` picks
+//! fp16 weights where published. Supports `--img2img` (with
+//! `--img2img-strength`) and `--mask-path`/`--only-update-masked` inpainting
+//! for the `*-inpaint`/`turbo` variants, `--num-samples`/`--bsize` batching,
+//! and `--use-flash-attn`. Writes PNG output via `candle_examples::save_image`.
+
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 

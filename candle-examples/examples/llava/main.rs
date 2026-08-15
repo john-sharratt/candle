@@ -1,3 +1,12 @@
+//! LLaVA (v1.5/v1.6) vision-language chat example: image + text -> generated text.
+//!
+//! Loads `LLaVA` plus a CLIP vision tower from `--model-path` (HF hub, default
+//! `llava-hf/llava-v1.6-vicuna-7b-hf`); `--hf` switches between native LLaVA
+//! config JSON and the HF-format config/generation/preprocessor JSON trio.
+//! Selects a conversation template (`llava_v0/v1`, `llava_llama_2`,
+//! `mistral_instruct`, `chatml_direct`) from the model name, embeds the image
+//! via `prepare_inputs_labels_for_multimodal`, and decodes with `llama::Cache`.
+
 pub mod constants;
 pub mod conversation;
 pub mod image_processor;

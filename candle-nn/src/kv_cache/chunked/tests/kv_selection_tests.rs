@@ -2018,7 +2018,10 @@ fn test_cuda_selection_matches_cpu() {
         .flat_map(|cg| {
             let (k_ptr, _) = cg.k_gpu.device_ptr(&stream);
             let (v_ptr, _) = cg.v_gpu.device_ptr(&stream);
-            let mut row = vec![
+            // All four palette sub-entries describe the same buffer here, but
+            // each must be populated: the kernel resolves a band through its
+            // own sub-entry, not through palette 0.
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -2029,10 +2032,9 @@ fn test_cuda_selection_matches_cpu() {
                 outer_one_bits,
                 outer_one_bits,
             ];
-            row.extend_from_slice(&[0i64; 27]);
-            row
+            sub.repeat(N_PALETTE)
         })
-        .collect();
+            .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
@@ -2565,6 +2567,11 @@ fn test_cuda_per_head_matches_cpu() {
         .all(|cg| cg.num_blocks == blocks_per_chunk));
     let chunk_byte_stride = (blocks_per_chunk * 32 * 4) as i64; // F32: 4 bytes/elem
 
+    // Unity outer scale, and one `Palette4PerHeadEntry` row per (chunk, head):
+    // four 9-value sub-entries. Every band of this fixture shares one buffer,
+    // so the four are identical — but each must be present, because the kernel
+    // resolves a band through its own sub-entry, not through palette 0.
+    let outer_one_bits = 1.0_f32.to_bits() as i64;
     let per_head_table_host: Vec<i64> = chunk_gpus
         .iter()
         .map(|cg| {
@@ -2573,7 +2580,7 @@ fn test_cuda_per_head_matches_cpu() {
             // [k_ptr, v_ptr, k_byte_offset, v_byte_offset,
             //  k_chunk_byte_stride, v_chunk_byte_stride, metadata]
             // metadata=0 → F32 format, GPU location
-            [
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -2581,10 +2588,13 @@ fn test_cuda_per_head_matches_cpu() {
                 chunk_byte_stride,
                 chunk_byte_stride,
                 0i64,
-            ]
+                outer_one_bits,
+                outer_one_bits,
+            ];
+            sub.repeat(N_PALETTE)
         })
-        .flatten()
-        .collect();
+            .flatten()
+            .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");
@@ -3189,7 +3199,9 @@ fn test_cuda_r16_qproj_matches_cpu() {
             // metadata: (k_format_tag << 16) | (v_format_tag << 8) | location
             // ArenaFormat::R16 = 3, ArenaFormat::F16 = 1
             let metadata = (3i64 << 16) | (1i64 << 8) | 0i64;
-            let mut row = vec![
+            // All four palette sub-entries, populated identically — see the
+            // note on the other fixture in this file.
+            let sub = [
                 k_ptr as i64,
                 v_ptr as i64,
                 0i64,
@@ -3200,10 +3212,9 @@ fn test_cuda_r16_qproj_matches_cpu() {
                 outer_one_bits,
                 outer_one_bits,
             ];
-            row.extend_from_slice(&[0i64; 27]);
-            row
+            sub.repeat(N_PALETTE)
         })
-        .collect();
+            .collect();
     let per_head_table_gpu = cuda_dev
         .memcpy_stod(&per_head_table_host)
         .expect("per-head table upload");

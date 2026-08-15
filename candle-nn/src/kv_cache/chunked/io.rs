@@ -7,9 +7,83 @@
 
 use std::cmp;
 
-use super::{arena_chunks_for_format, Arena, ChunkedKvBacking};
+use ahash::AHashMap;
+
+use super::gid_pool::ChunkGid;
+use super::head_gids::GIDS_PER_HEAD;
+use super::{Arena, ChunkedKvBacking};
+use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+use crate::kv_cache::KvFormat;
 use crate::CHUNK_SIZE;
-use candle::{Result, Tensor};
+use candle::quantized::ggml_file::qtensor_from_ggml;
+use candle::{Device, LiveTensor, Result, Tensor};
+
+/// Read one band's whole chunk slot as floats, shaped `(chunk_size, sub_head_dim)`.
+///
+/// The band's tag decides how: a float tag is a direct typed view of the slot,
+/// a quantized tag is dequantized from the slot's raw bytes. Only the chunk
+/// knows which — the arena is a run of untyped byte slots.
+pub(super) fn read_band_chunk<'a>(
+    arenas: &'a AHashMap<usize, Arena>,
+    gid: &ChunkGid,
+    tag: ArenaFormatTag,
+    chunk_size: usize,
+    sub_head_dim: usize,
+    device: &Device,
+) -> Result<LiveTensor<'a>> {
+    let ai = gid.arena_idx();
+    let arena = arenas
+        .get(&ai)
+        .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
+    let elems = chunk_size * sub_head_dim;
+    match tag.to_kv_format() {
+        Some(KvFormat::Float(dtype)) => {
+            arena.read_slot_typed(gid.chunk_idx(), dtype, (chunk_size, sub_head_dim))
+        }
+        Some(KvFormat::Quantized(qf)) => {
+            let ggml = qf.to_ggml_dtype();
+            let bytes = arena
+                .slot_bytes(
+                    gid.chunk_idx(),
+                    (elems / ggml.block_size()) * ggml.type_size(),
+                )?
+                .to_vec1::<u8>()?;
+            let qt = qtensor_from_ggml(ggml, &bytes, vec![elems], device)?;
+            qt.dequantize(device)?.reshape((chunk_size, sub_head_dim))
+        }
+        None => candle::bail!("band tag {tag:?} names no storage format, so it cannot be read"),
+    }
+}
+
+/// Write `band` (shaped `(1, seg, sub_head_dim)`) into one band's chunk slot at
+/// `elem_offset` elements from the slot head.
+///
+/// Quantized bands go through `quantize_into` over a `QTensor` view of the
+/// slot; float bands are a direct typed write.
+fn write_band_chunk(
+    arenas: &mut AHashMap<usize, Arena>,
+    gid: &ChunkGid,
+    tag: ArenaFormatTag,
+    elems: usize,
+    elem_offset: usize,
+    band: &candle::LiveTensor<'_>,
+) -> Result<()> {
+    let ai = gid.arena_idx();
+    let arena = arenas
+        .get_mut(&ai)
+        .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
+    match tag.to_kv_format() {
+        Some(KvFormat::Float(_)) => arena.write_slot_typed(gid.chunk_idx(), elem_offset, band),
+        Some(KvFormat::Quantized(qf)) => arena.quantize_into_slot(
+            gid.chunk_idx(),
+            qf,
+            elems,
+            elem_offset,
+            &band.flatten_all()?,
+        ),
+        None => candle::bail!("band tag {tag:?} names no storage format, so it cannot be written"),
+    }
+}
 
 impl ChunkedKvBacking {
     /// Read K/V data from the backing, dequantizing if necessary.
@@ -109,76 +183,78 @@ impl ChunkedKvBacking {
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let mut k_head_slices = Vec::with_capacity(n_kv_head);
                     let mut v_head_slices = Vec::with_capacity(n_kv_head);
+                    // Each band names its own storage format; the arena its gid
+                    // points into is a run of untyped bytes and cannot
+                    // (`docs/archived/arena_unification.md` principle 8).
+                    let bands: Vec<_> = cw.bands().collect();
                     for h in 0..n_kv_head {
                         let mut k_pal_slices = Vec::with_capacity(np);
                         let mut v_pal_slices = Vec::with_capacity(np);
                         for p in 0..np {
-                            let k_gid = cw.gids.k_gid_pal(h, p);
-                            let v_gid = cw.gids.v_gid_pal(h, p);
+                            let base = (h * np + p) * 2;
+                            let (k_gid, k_tag) = bands[base];
+                            let (v_gid, v_tag) = bands[base + 1];
 
-                            let k_ai = k_gid.arena_idx();
-                            let k_ci = k_gid.chunk_idx();
-                            let k_arena = arenas.get(&k_ai).ok_or_else(|| {
-                                candle::Error::Msg(format!("arena {} not found", k_ai))
-                            })?;
-                            let k_data = match k_arena {
-                                Arena::Float { data, .. } => data.clone(),
-                                Arena::Quantized { data, format, .. } => {
-                                    let kv_full = data.dequantize(device)?;
-                                    let arena_chunks = arena_chunks_for_format(
-                                        crate::kv_cache::KvFormat::Quantized(*format),
-                                    );
-                                    kv_full.reshape((arena_chunks, chunk_size, sub_head_dim))?
-                                }
-                            };
-                            let k_slice = k_data
-                                .narrow(0, k_ci, 1)?
-                                .narrow(1, in_blk, 1)?
-                                .unsqueeze(1)?;
-                            let k_slice = if single_latent {
-                                k_slice.to_dtype(candle::DType::F32)?
+                            let k_data = read_band_chunk(
+                                arenas,
+                                k_gid,
+                                k_tag,
+                                chunk_size,
+                                sub_head_dim,
+                                device,
+                            )?;
+                            // Single-latent bands mix storage dtypes (FP8 nope ‖
+                            // BF16 rope) — widen to F32 so the cats below join.
+                            let k_data = if single_latent {
+                                k_data.to_dtype(candle::DType::F32)?
                             } else {
-                                k_slice
+                                k_data
                             };
-                            k_pal_slices.push(k_slice);
+                            // `read_band_chunk` returns (chunk_size, sub_head_dim),
+                            // so the token is dim 0. The two unsqueezes rebuild
+                            // the (1, head, token, sub_dim) shape the cats below
+                            // join on.
+                            k_pal_slices
+                                .push(k_data.narrow(0, in_blk, 1)?.unsqueeze(0)?.unsqueeze(0)?);
 
-                            let v_ai = v_gid.arena_idx();
-                            let v_ci = v_gid.chunk_idx();
-                            let v_arena = arenas.get(&v_ai).ok_or_else(|| {
-                                candle::Error::Msg(format!("arena {} not found", v_ai))
-                            })?;
-                            let v_data = match v_arena {
-                                Arena::Float { data, .. } => data.clone(),
-                                Arena::Quantized { data, format, .. } => {
-                                    let kv_full = data.dequantize(device)?;
-                                    let arena_chunks = arena_chunks_for_format(
-                                        crate::kv_cache::KvFormat::Quantized(*format),
-                                    );
-                                    kv_full.reshape((arena_chunks, chunk_size, sub_head_dim))?
-                                }
-                            };
-                            let v_slice = v_data
-                                .narrow(0, v_ci, 1)?
-                                .narrow(1, in_blk, 1)?
-                                .unsqueeze(1)?;
-                            let v_slice = if single_latent {
-                                v_slice.to_dtype(candle::DType::F32)?
+                            let v_data = read_band_chunk(
+                                arenas,
+                                v_gid,
+                                v_tag,
+                                chunk_size,
+                                sub_head_dim,
+                                device,
+                            )?;
+                            let v_data = if single_latent {
+                                v_data.to_dtype(candle::DType::F32)?
                             } else {
-                                v_slice
+                                v_data
                             };
-                            v_pal_slices.push(v_slice);
+                            v_pal_slices
+                                .push(v_data.narrow(0, in_blk, 1)?.unsqueeze(0)?.unsqueeze(0)?);
                         }
-                        k_head_slices.push(Tensor::cat(&k_pal_slices, 3)?);
-                        v_head_slices.push(Tensor::cat(&v_pal_slices, 3)?);
+                        k_head_slices.push(LiveTensor::cat(&k_pal_slices, 3)?);
+                        v_head_slices.push(LiveTensor::cat(&v_pal_slices, 3)?);
                     }
-                    k_slices.push(Tensor::cat(&k_head_slices, 1)?);
-                    v_slices.push(Tensor::cat(&v_head_slices, 1)?);
+                    k_slices.push(LiveTensor::cat(&k_head_slices, 1)?);
+                    v_slices.push(LiveTensor::cat(&v_head_slices, 1)?);
                 }
             }
 
-            // Concatenate along sequence dimension (dim 2)
-            let k_out = Tensor::cat(&k_slices, 2)?;
-            let v_out = Tensor::cat(&v_slices, 2)?;
+            // Concatenate along sequence dimension (dim 2), then take the
+            // result off the arena.
+            //
+            // Every tensor above is a *lease* over arena bytes, and the arena
+            // read-lock ends with this closure — after which another thread may
+            // evict the slot and hand its bytes to a new tenant. `cat` copies
+            // whenever it joins two or more pieces, but it short-circuits to
+            // `arg0.clone()` for a single one, so on a one-chunk single-head
+            // read the value that escapes here would be a lease over freed
+            // storage. `to_owned_tensor` makes the copy unconditional, which is
+            // what the `'static` in this function's return type has always
+            // claimed.
+            let k_out = LiveTensor::cat(&k_slices, 2)?.to_owned_tensor()?;
+            let v_out = LiveTensor::cat(&v_slices, 2)?.to_owned_tensor()?;
 
             Ok((k_out, v_out))
         })?
@@ -194,8 +270,8 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
         offset: usize,
-        k: &Tensor,
-        v: &Tensor,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         let batch = self.batch_capacity();
         if batch_idx >= batch {
@@ -240,8 +316,8 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
         offset: usize,
-        k: &Tensor,
-        v: &Tensor,
+        k: &candle::LiveTensor<'_>,
+        v: &candle::LiveTensor<'_>,
     ) -> Result<()> {
         let (_, _, len, _) = k.dims4()?;
 
@@ -261,15 +337,16 @@ impl ChunkedKvBacking {
         // at the slice_set below.
         let storage_dtype = self.inner.storage.dtype().unwrap_or(candle::DType::F16);
 
-        let cast = |t: &Tensor| -> Result<Tensor> {
-            if single_latent || t.dtype() == storage_dtype {
-                Ok(t.clone())
-            } else {
-                t.to_dtype(storage_dtype)
-            }
+        let k = if single_latent || k.dtype() == storage_dtype {
+            k.clone()
+        } else {
+            k.to_dtype(storage_dtype)?
         };
-        let k = cast(k)?;
-        let v = cast(v)?;
+        let v = if single_latent || v.dtype() == storage_dtype {
+            v.clone()
+        } else {
+            v.to_dtype(storage_dtype)?
+        };
 
         self.ensure_for_offset(batch_idx, offset, len)?;
 
@@ -330,9 +407,13 @@ impl ChunkedKvBacking {
                 // single latent). Quantized K arenas (e.g. active R16) are
                 // written via QTensor::quantize_into at the proper flat element offset.
                 {
-                    let arenas = arena_state.arenas();
                     let np = self.inner.n_palette();
                     let sub_head_dim = (self.inner.head_dim / np).max(1);
+                    // Snapshot the bands (gid + tag) before taking the mutable
+                    // arena borrow the writes need.
+                    let bands: Vec<(super::gid_pool::ChunkGid, ArenaFormatTag)> =
+                        cw.bands().map(|(g, tag)| (g.clone(), tag)).collect();
+                    let arenas = arena_state.arenas_mut();
                     for h in 0..n_kv_head {
                         let k_head = k_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
                         let v_head = match &v_seg {
@@ -344,40 +425,24 @@ impl ChunkedKvBacking {
                             let d_start = p * sub_head_dim;
                             let k_band = k_head.narrow(2, d_start, sub_head_dim)?.contiguous()?;
 
-                            let k_gid = cw.gids.k_gid_pal(h, p);
+                            let base = (h * np + p) * 2;
+                            let (k_gid, k_tag) = &bands[base];
+                            let elem_offset = in_blk * sub_head_dim;
+                            let elems = CHUNK_SIZE * sub_head_dim;
 
-                            let k_ai = k_gid.arena_idx();
-                            let k_ci = k_gid.chunk_idx();
-                            let k_arena = arenas.get(&k_ai).ok_or_else(|| {
-                                candle::Error::Msg(format!("arena {} not found", k_ai))
-                            })?;
-                            match k_arena {
-                                Arena::Float { data, dtype, .. } => {
-                                    // Cast this band to its own arena's dtype:
-                                    // the single latent's nope bands are FP8 and
-                                    // its rope bands BF16, so the band width
-                                    // alone doesn't fix the element type. A
-                                    // no-op for uniform-format (GQA) backings.
-                                    let k_band = if k_band.dtype() != *dtype {
-                                        k_band.to_dtype(*dtype)?
-                                    } else {
-                                        k_band
-                                    };
-                                    let k_target = data.narrow(0, k_ci, 1)?;
-                                    k_target.slice_set(&k_band, 1, in_blk)?;
+                            // Cast this band to its tag's storage dtype: the
+                            // single latent's nope bands are FP8 and its rope
+                            // bands BF16, so the band width alone doesn't fix
+                            // the element type. A no-op for uniform-format
+                            // (GQA) backings; quantized tags quantize from the
+                            // float band inside `write_band_chunk`.
+                            let k_band = match k_tag.to_kv_format() {
+                                Some(KvFormat::Float(dt)) if k_band.dtype() != dt => {
+                                    k_band.to_dtype(dt)?
                                 }
-                                #[cfg(feature = "cuda")]
-                                Arena::Quantized { data, .. } => {
-                                    let elem_offset =
-                                        k_ci * chunk_size * sub_head_dim + in_blk * sub_head_dim;
-                                    let mut qt = data.clone();
-                                    qt.quantize_into(&k_band.flatten_all()?, elem_offset)?;
-                                }
-                                #[cfg(not(feature = "cuda"))]
-                                Arena::Quantized { .. } => {
-                                    candle::bail!("quantized chunk writes require the cuda feature")
-                                }
-                            }
+                                _ => k_band,
+                            };
+                            write_band_chunk(arenas, k_gid, *k_tag, elems, elem_offset, &k_band)?;
 
                             if single_latent {
                                 // K≡V: the V band aliases the K band just
@@ -392,29 +457,14 @@ impl ChunkedKvBacking {
                                 .expect("v_head present for a real K/V backing")
                                 .narrow(2, d_start, sub_head_dim)?
                                 .contiguous()?;
-                            let v_gid = cw.gids.v_gid_pal(h, p);
-                            let v_ai = v_gid.arena_idx();
-                            let v_ci = v_gid.chunk_idx();
-                            let v_arena = arenas.get(&v_ai).ok_or_else(|| {
-                                candle::Error::Msg(format!("arena {} not found", v_ai))
-                            })?;
-                            match v_arena {
-                                Arena::Float { data, .. } => {
-                                    let v_target = data.narrow(0, v_ci, 1)?;
-                                    v_target.slice_set(&v_band, 1, in_blk)?;
+                            let (v_gid, v_tag) = &bands[base + 1];
+                            let v_band = match v_tag.to_kv_format() {
+                                Some(KvFormat::Float(dt)) if v_band.dtype() != dt => {
+                                    v_band.to_dtype(dt)?
                                 }
-                                #[cfg(feature = "cuda")]
-                                Arena::Quantized { data, .. } => {
-                                    let elem_offset =
-                                        v_ci * chunk_size * sub_head_dim + in_blk * sub_head_dim;
-                                    let mut qt = data.clone();
-                                    qt.quantize_into(&v_band.flatten_all()?, elem_offset)?;
-                                }
-                                #[cfg(not(feature = "cuda"))]
-                                Arena::Quantized { .. } => {
-                                    candle::bail!("quantized chunk writes require the cuda feature")
-                                }
-                            }
+                                _ => v_band,
+                            };
+                            write_band_chunk(arenas, v_gid, *v_tag, elems, elem_offset, &v_band)?;
                         }
                     }
                 }
@@ -459,62 +509,59 @@ impl ChunkedKvBacking {
                     batch_idx, block_idx
                 ))
             })?;
-        // Flat arena: each chunk = chunk_size * head_dim (one head, one side)
-        let elems_per_head = chunk_size * head_dim;
+        // A slot holds ONE palette band — `chunk_size * (head_dim / N_PALETTE)`
+        // elements — so a head's bytes are the concatenation of its four bands.
+        //
+        // This function used to size its read as `chunk_size * head_dim` and
+        // issue it against palette 0's slot alone, reaching the other three
+        // only because `alloc_chunk_run_for_key` *usually* lays a head's
+        // palettes out contiguously. It does not always: a mixed-format band
+        // group falls back to per-band allocation, and the read then walked
+        // into unrelated chunks. Reading each band from its own gid removes the
+        // dependency on the run layout — the same correction `resolve_band_source`
+        // already made kernel-side. The slot bounds check is what surfaced it.
+        let sub_head_dim = head_dim / N_PALETTE;
+        let elems_per_band = chunk_size * sub_head_dim;
+        // The bands' own tags say how many bytes each slot holds and whether it
+        // is quantized at all. Palette 0 stands for the head, matching the
+        // `k_gid(h)` / `v_gid(h)` aliases this function has always used.
+        let bands: Vec<_> = cw.bands().map(|(g, tag)| (g.clone(), tag)).collect();
 
         self.inner.storage.read(|arena_state| {
             let arenas = arena_state.arenas();
             let mut k_bytes = Vec::new();
             let mut v_bytes = Vec::new();
 
+            let read_band = |gid: &ChunkGid,
+                             tag: ArenaFormatTag,
+                             side: &str,
+                             h: usize,
+                             out: &mut Vec<u8>|
+             -> Result<()> {
+                let Some(KvFormat::Quantized(qf)) = tag.to_kv_format() else {
+                    candle::bail!(
+                        "read_raw_sealed_chunk: head {h} {side} is recorded as {tag:?}, not a \
+                         quantized format (not yet reconciled); call reconcile before evicting"
+                    )
+                };
+                let ggml = qf.to_ggml_dtype();
+                let bytes = (elems_per_band / ggml.block_size()) * ggml.type_size();
+                let arena = arenas.get(&gid.arena_idx()).ok_or_else(|| {
+                    candle::Error::Msg(format!("arena {} not found", gid.arena_idx()))
+                })?;
+                out.extend_from_slice(&arena.slot_bytes(gid.chunk_idx(), bytes)?.to_vec1::<u8>()?);
+                Ok(())
+            };
+
+            // Palette-major within each head — the order the four contiguous
+            // bands used to produce, so the byte stream is unchanged.
             for h in 0..n_kv_head {
-                let k_gid = cw.gids.k_gid(h);
-                let v_gid = cw.gids.v_gid(h);
-
-                // Read K bytes for head h
-                let k_arena = arenas.get(&k_gid.arena_idx()).ok_or_else(|| {
-                    candle::Error::Msg(format!("arena {} not found", k_gid.arena_idx()))
-                })?;
-                match k_arena {
-                    Arena::Quantized { data, .. } => {
-                        let ggml_dtype = data.dtype();
-                        let blocks_per_head = elems_per_head / ggml_dtype.block_size();
-                        let bytes_per_head = blocks_per_head * ggml_dtype.type_size();
-                        // Flat: chunk k_ci stores exactly one head's data
-                        let k_offset = k_gid.chunk_idx() * bytes_per_head;
-                        let raw = data.data_range(k_offset..k_offset + bytes_per_head)?;
-                        k_bytes.extend_from_slice(&raw);
-                    }
-                    Arena::Float { .. } => {
-                        candle::bail!(
-                            "read_raw_sealed_chunk: head {} K is in a float arena \
-                             (not yet reconciled); call reconcile before evicting",
-                            h
-                        )
-                    }
-                }
-
-                // Read V bytes for head h
-                let v_arena = arenas.get(&v_gid.arena_idx()).ok_or_else(|| {
-                    candle::Error::Msg(format!("arena {} not found", v_gid.arena_idx()))
-                })?;
-                match v_arena {
-                    Arena::Quantized { data, .. } => {
-                        let ggml_dtype = data.dtype();
-                        let blocks_per_head = elems_per_head / ggml_dtype.block_size();
-                        let bytes_per_head = blocks_per_head * ggml_dtype.type_size();
-                        // Flat: chunk v_ci stores exactly one head's data
-                        let v_offset = v_gid.chunk_idx() * bytes_per_head;
-                        let raw = data.data_range(v_offset..v_offset + bytes_per_head)?;
-                        v_bytes.extend_from_slice(&raw);
-                    }
-                    Arena::Float { .. } => {
-                        candle::bail!(
-                            "read_raw_sealed_chunk: head {} V is in a float arena \
-                             (not yet reconciled); call reconcile before evicting",
-                            h
-                        )
-                    }
+                for p in 0..N_PALETTE {
+                    let base = h * GIDS_PER_HEAD + p * 2;
+                    let (k_gid, k_tag) = &bands[base];
+                    let (v_gid, v_tag) = &bands[base + 1];
+                    read_band(k_gid, *k_tag, "K", h, &mut k_bytes)?;
+                    read_band(v_gid, *v_tag, "V", h, &mut v_bytes)?;
                 }
             }
 
@@ -548,9 +595,10 @@ impl ChunkedKvBacking {
         let np = self.inner.n_palette();
         let sub_head_dim = head_dim / np;
 
-        // Snapshot (k_arena_idx, k_chunk_idx, v_arena_idx, v_chunk_idx) for every
-        // (head, palette) pair while holding the state lock.
-        let head_gids: Vec<(usize, usize, usize, usize)> = {
+        // Snapshot each (head, palette) band — gid plus the tag that says how to
+        // read it — while holding the state lock.
+        type Band = (usize, usize, ArenaFormatTag);
+        let head_gids: Vec<(Band, Band)> = {
             let state = self
                 .state
                 .read()
@@ -569,82 +617,55 @@ impl ChunkedKvBacking {
                     "read_f32_sampler_chunk: no block {block_idx} for batch {batch_idx}"
                 ))
             })?;
-            (0..n_kv_head)
-                .flat_map(|h| {
-                    (0..np).map(move |p| {
-                        let kg = cw.gids.k_gid_pal(h, p);
-                        let vg = cw.gids.v_gid_pal(h, p);
-                        (
-                            kg.arena_idx(),
-                            kg.chunk_idx(),
-                            vg.arena_idx(),
-                            vg.chunk_idx(),
-                        )
-                    })
-                })
-                .collect()
+            let flat: Vec<Band> = cw
+                .bands()
+                .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
+                .collect();
+            flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect()
         };
 
-        // Read raw band data from Float arenas under the storage lock.
-        // Arena shape per sub-band: (arena_chunks, chunk_size, sub_head_dim).
-        // After narrow + squeeze: (chunk_size, sub_head_dim), i.e. [t][pd] order.
+        // Read each band under the storage lock, in `[t][pd]` (token-major)
+        // order — what the interleave below expects.
         let bands: Vec<(Vec<f32>, Vec<f32>)> = self.inner.storage.read(|s| {
             let arenas = s.arenas();
             let mut bands = Vec::with_capacity(head_gids.len());
-            for (idx, &(k_ai, k_ci, v_ai, v_ci)) in head_gids.iter().enumerate() {
-                let _h = idx / np;
-                let _p = idx % np;
-
-                // Quant/R16 arenas store each chunk DIM-major: block `pd` holds
-                // 32 tokens of dim `pd`, so the dequant flat is `[pd][t]`. The
-                // interleave below (line `k_flat[t*sub_head_dim+pd]`) expects
-                // token-major `[t][pd]`, so transpose the quant read. Float
-                // arenas are already `[t][pd]` and pass through untouched.
-                let k_flat = match arenas.get(&k_ai) {
-                    None => candle::bail!("arena {k_ai} not found"),
-                    Some(Arena::Quantized { data, .. }) => {
-                        let arena_chunks = data.shape().elem_count() / (chunk_size * sub_head_dim);
-                        data.dequantize(&candle::Device::Cpu)?
-                            .reshape((arena_chunks, sub_head_dim, chunk_size))?
-                            .narrow(0, k_ci, 1)?
-                            .squeeze(0)?
-                            .transpose(0, 1)?
-                            .contiguous()?
+            for &((k_ai, k_ci, k_tag), (v_ai, v_ci, v_tag)) in head_gids.iter() {
+                let read = |ai: usize, ci: usize, tag: ArenaFormatTag| -> Result<Vec<f32>> {
+                    let arena = arenas
+                        .get(&ai)
+                        .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
+                    // Quantized bands (including R16) store each chunk
+                    // DIM-major — block `pd` holds 32 tokens of dim `pd` — so
+                    // the dequantized flat is `[pd][t]` and has to be
+                    // transposed. Float bands are already `[t][pd]`.
+                    let elems = chunk_size * sub_head_dim;
+                    match tag.to_kv_format() {
+                        Some(KvFormat::Quantized(qf)) => {
+                            let ggml = qf.to_ggml_dtype();
+                            let bytes = arena
+                                .slot_bytes(ci, (elems / ggml.block_size()) * ggml.type_size())?
+                                .to_vec1::<u8>()?;
+                            qtensor_from_ggml(ggml, &bytes, vec![elems], &Device::Cpu)?
+                                .dequantize(&Device::Cpu)?
+                                .reshape((sub_head_dim, chunk_size))?
+                                .transpose(0, 1)?
+                                .contiguous()?
+                                .flatten_all()?
+                                .to_vec1::<f32>()
+                        }
+                        Some(KvFormat::Float(dtype)) => arena
+                            .read_slot_typed(ci, dtype, (chunk_size, sub_head_dim))?
+                            .to_dtype(candle::DType::F32)?
                             .flatten_all()?
-                            .to_vec1::<f32>()?
+                            .to_vec1::<f32>(),
+                        None => candle::bail!(
+                            "read_f32_sampler_chunk: band tag {tag:?} names no storage format"
+                        ),
                     }
-                    Some(Arena::Float { data, .. }) => data
-                        .narrow(0, k_ci, 1)?
-                        .squeeze(0)?
-                        .to_dtype(candle::DType::F32)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
                 };
-
-                let v_flat = match arenas.get(&v_ai) {
-                    None => candle::bail!("arena {v_ai} not found"),
-                    Some(Arena::Quantized { data, .. }) => {
-                        let arena_chunks = data.shape().elem_count() / (chunk_size * sub_head_dim);
-                        data.dequantize(&candle::Device::Cpu)?
-                            .reshape((arena_chunks, sub_head_dim, chunk_size))?
-                            .narrow(0, v_ci, 1)?
-                            .squeeze(0)?
-                            .transpose(0, 1)?
-                            .contiguous()?
-                            .flatten_all()?
-                            .to_vec1::<f32>()?
-                    }
-                    Some(Arena::Float { data, .. }) => data
-                        .narrow(0, v_ci, 1)?
-                        .squeeze(0)?
-                        .to_dtype(candle::DType::F32)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
-                };
-
-                bands.push((k_flat, v_flat));
+                bands.push((read(k_ai, k_ci, k_tag)?, read(v_ai, v_ci, v_tag)?));
             }
-            Ok(bands)
+            Ok::<_, candle::Error>(bands)
         })??;
 
         // Transpose each sub-band from [t][pd] → [pd][t] and interleave into

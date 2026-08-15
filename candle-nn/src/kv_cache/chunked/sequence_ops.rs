@@ -14,13 +14,15 @@ use std::sync::Arc;
 use candle::Result;
 
 use super::head_gids::GIDS_PER_HEAD;
-use crate::kv_cache::arena_table::N_PALETTE;
 use crate::CHUNK_SIZE;
 
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
+use super::io::read_band_chunk;
 use super::types::{ChunkWindow, SealedChunk, SealedSequence};
-use super::{Arena, BlockTableState, ChunkedKvBacking, SequenceState};
+use super::{BlockTableState, ChunkedKvBacking, SequenceState};
+use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+use crate::kv_cache::{active_kv_formats, KvFormat};
 
 impl ChunkedKvBacking {
     /// Create a new [`SequenceState`] bound to this backing's device stream.
@@ -476,6 +478,8 @@ impl ChunkedKvBacking {
             v_pal: Arc<Vec<u8>>,
             k_scale: Arc<Vec<f32>>,
             v_scale: Arc<Vec<f32>>,
+            k_fmt: Arc<Vec<u8>>,
+            v_fmt: Arc<Vec<u8>>,
         }
         let donors: Vec<DonorMeta> = chunk_ids
             .iter()
@@ -490,6 +494,8 @@ impl ChunkedKvBacking {
                                 v_pal: cw.v_pal.clone(),
                                 k_scale: cw.k_scale.clone(),
                                 v_scale: cw.v_scale.clone(),
+                                k_fmt: cw.k_fmt.clone(),
+                                v_fmt: cw.v_fmt.clone(),
                             });
                             break 'search;
                         }
@@ -500,6 +506,12 @@ impl ChunkedKvBacking {
                     v_pal: self.inner.identity_pal.clone(),
                     k_scale: self.inner.identity_scale.clone(),
                     v_scale: self.inner.identity_scale.clone(),
+                    // No donor found: the block is being borrowed without a
+                    // live chunk describing it, so fall back to the active
+                    // formats — the same default the identity pal/scale
+                    // represent for their fields.
+                    k_fmt: self.inner.active_k_fmt.clone(),
+                    v_fmt: self.inner.active_v_fmt.clone(),
                 })
             })
             .collect();
@@ -519,6 +531,8 @@ impl ChunkedKvBacking {
                 v_pal: donors[i].v_pal.clone(),
                 k_scale: donors[i].k_scale.clone(),
                 v_scale: donors[i].v_scale.clone(),
+                k_fmt: donors[i].k_fmt.clone(),
+                v_fmt: donors[i].v_fmt.clone(),
                 meta: None,
             });
         }
@@ -531,6 +545,8 @@ impl ChunkedKvBacking {
                 v_pal: donors[n - 1].v_pal.clone(),
                 k_scale: donors[n - 1].k_scale.clone(),
                 v_scale: donors[n - 1].v_scale.clone(),
+                k_fmt: donors[n - 1].k_fmt.clone(),
+                v_fmt: donors[n - 1].v_fmt.clone(),
                 meta: None,
             });
         }
@@ -710,6 +726,8 @@ impl ChunkedKvBacking {
             v_pal: Arc<Vec<u8>>,
             k_scale: Arc<Vec<f32>>,
             v_scale: Arc<Vec<f32>>,
+            k_fmt: Arc<Vec<u8>>,
+            v_fmt: Arc<Vec<u8>>,
         }
         let mut resolved_blocks: Vec<ResolvedBlock> = Vec::with_capacity(need_blocks);
         for block_ids in chunk_ids.iter() {
@@ -721,6 +739,8 @@ impl ChunkedKvBacking {
             let mut donor_v_pal: Option<Arc<Vec<u8>>> = None;
             let mut donor_k_scale: Option<Arc<Vec<f32>>> = None;
             let mut donor_v_scale: Option<Arc<Vec<f32>>> = None;
+            let mut donor_k_fmt: Option<Arc<Vec<u8>>> = None;
+            let mut donor_v_fmt: Option<Arc<Vec<u8>>> = None;
             for (idx, chunk_id) in block_ids.iter().enumerate() {
                 let raw = chunk_id.raw();
                 // Walk every live slot's chunks once to find the donor
@@ -736,6 +756,8 @@ impl ChunkedKvBacking {
                                 donor_v_pal = Some(cw.v_pal.clone());
                                 donor_k_scale = Some(cw.k_scale.clone());
                                 donor_v_scale = Some(cw.v_scale.clone());
+                                donor_k_fmt = Some(cw.k_fmt.clone());
+                                donor_v_fmt = Some(cw.v_fmt.clone());
                             }
                             break 'search;
                         }
@@ -755,6 +777,8 @@ impl ChunkedKvBacking {
                 v_pal: donor_v_pal.unwrap_or_else(|| self.inner.identity_pal.clone()),
                 k_scale: donor_k_scale.unwrap_or_else(|| self.inner.identity_scale.clone()),
                 v_scale: donor_v_scale.unwrap_or_else(|| self.inner.identity_scale.clone()),
+                k_fmt: donor_k_fmt.unwrap_or_else(|| self.inner.active_k_fmt.clone()),
+                v_fmt: donor_v_fmt.unwrap_or_else(|| self.inner.active_v_fmt.clone()),
             });
         }
 
@@ -775,6 +799,8 @@ impl ChunkedKvBacking {
                 v_pal: rb.v_pal.clone(),
                 k_scale: rb.k_scale.clone(),
                 v_scale: rb.v_scale.clone(),
+                k_fmt: rb.k_fmt.clone(),
+                v_fmt: rb.v_fmt.clone(),
                 meta: None,
             });
         }
@@ -789,6 +815,8 @@ impl ChunkedKvBacking {
                 v_pal: rb.v_pal.clone(),
                 k_scale: rb.k_scale.clone(),
                 v_scale: rb.v_scale.clone(),
+                k_fmt: rb.k_fmt.clone(),
+                v_fmt: rb.v_fmt.clone(),
                 meta: None,
             });
         }
@@ -898,6 +926,8 @@ impl ChunkedKvBacking {
                         v_pal: cw.v_pal.clone(),
                         k_scale: cw.k_scale.clone(),
                         v_scale: cw.v_scale.clone(),
+                        k_fmt: cw.k_fmt.clone(),
+                        v_fmt: cw.v_fmt.clone(),
                         // Fork shares the source chunk's GIDs (Arc bump), so its
                         // resident record's pointers stay valid — share it too.
                         meta: cw.meta.clone(),
@@ -1029,6 +1059,8 @@ impl ChunkedKvBacking {
                         v_pal: cw.v_pal.clone(),
                         k_scale: cw.k_scale.clone(),
                         v_scale: cw.v_scale.clone(),
+                        k_fmt: cw.k_fmt.clone(),
+                        v_fmt: cw.v_fmt.clone(),
                         // Fork shares the source chunk's GIDs (Arc bump), so its
                         // resident record's pointers stay valid — share it too.
                         meta: cw.meta.clone(),
@@ -1044,18 +1076,27 @@ impl ChunkedKvBacking {
         if remainder > 0 {
             let last_blk = full_blocks;
             let n_kv_head = self.inner.n_kv_head;
-            let sub_head_dim = self.inner.head_dim / N_PALETTE;
 
             // Clone the source block's full per-head GID vector AND its
             // pal_map / outer-scale state — the partial-block copy below
             // preserves the source's encoded byte semantics, so the new
             // chunk needs the same metadata to decode correctly.
-            let (source_gids, source_k_pal, source_v_pal, source_k_scale, source_v_scale): (
+            let (
+                source_gids,
+                source_k_pal,
+                source_v_pal,
+                source_k_scale,
+                source_v_scale,
+                source_k_fmt,
+                source_v_fmt,
+            ): (
                 HeadGids,
                 Arc<Vec<u8>>,
                 Arc<Vec<u8>>,
                 Arc<Vec<f32>>,
                 Arc<Vec<f32>>,
+                Arc<Vec<u8>>,
+                Arc<Vec<u8>>,
             ) = {
                 let cw = state.sequences[source_batch]
                     .as_ref()
@@ -1068,128 +1109,150 @@ impl ChunkedKvBacking {
                     cw.v_pal.clone(),
                     cw.k_scale.clone(),
                     cw.v_scale.clone(),
+                    cw.k_fmt.clone(),
+                    cw.v_fmt.clone(),
                 )
             };
 
             // Allocate new chunks using active_k_arena_key (R16 on GPU, Float on CPU)
             // so the active decode kernel can write directly into them.
-            let k_key = self.active_k_arena_key();
-            let v_key = self.active_v_arena_key();
+            let k_key = self.active_k_arena_key()?;
+            let v_key = self.active_v_arena_key()?;
+            // Per-band tags for the forked block. They start as the source's and
+            // are rewritten for any band the loop below has to re-encode, since
+            // the tag is the only record of how a band's bytes decode.
+            let mut k_fmt_out: Vec<u8> = source_k_fmt.as_ref().clone();
+            let mut v_fmt_out: Vec<u8> = source_v_fmt.as_ref().clone();
+            let head_dim = self.inner.head_dim;
+            let device = self.inner.device.clone();
+            let on_gpu = matches!(
+                self.inner.storage.default_location(),
+                crate::kv_cache::ArenaLocation::Gpu
+            );
+            let (active_k_fmt, active_v_fmt) =
+                active_kv_formats(self.inner.storage.k_format(), on_gpu);
+            // The fork's destination chunks can need an arena that does not
+            // exist, and `alloc_chunk_with_arenas` creates it under the storage
+            // write lock — so the window is taken here, above that lock.
+            //
+            // **Uninterruptible**, because a fork is per layer and the caller
+            // loops over all of them with no transaction: refusing here forks
+            // some layers and not others, and a sequence whose token windows
+            // differ by layer is exactly what the decode position map cannot
+            // describe. Proceeding past a wave-in-flight refusal claims at
+            // worst one region mid-wave, which the `in-wave-arenas` tripwire
+            // reports; refusing corrupts the sequence silently. A genuine
+            // error still propagates — the `?` fires only for failures that
+            // are not the deferral, and those mean the gate itself is broken.
+            #[cfg(feature = "cuda")]
+            let _window = self.inner.arena_window_uninterruptible(k_key)?;
             let target_gids = self.inner.storage.write(|arena_state| {
                 let mut gid_vec: Vec<ChunkGid> = Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
 
                 for i in 0..(GIDS_PER_HEAD * n_kv_head) {
-                    let key = if i % 2 == 0 {
-                        k_key.clone()
-                    } else {
-                        v_key.clone()
-                    };
+                    let key = if i % 2 == 0 { k_key } else { v_key };
                     let gid = self.alloc_chunk_with_arenas(arena_state, key)?;
                     gid_vec.push(gid);
                 }
 
-                // Pass 1 (immutable): clone Quantized source arenas once per unique
-                // arena index.  This frees the immutable borrow so pass 2 can call
-                // arenas_mut() even when src and dst land in the same arena.
-                let quant_clones: std::collections::HashMap<usize, candle::quantized::QTensor> = {
-                    let arenas = arena_state.arenas();
-                    let mut map = std::collections::HashMap::new();
-                    for src_gid in source_gids.iter() {
-                        let ai = src_gid.arena_idx();
-                        if let Some(Arena::Quantized { data, .. }) = arenas.get(&ai) {
-                            map.entry(ai).or_insert_with(|| data.clone());
+                // Copy each source slot to its destination, byte-verbatim: the
+                // band's tag travels with the chunk, so a slot's bytes mean the
+                // same thing at the destination as at the source.
+                //
+                // **This requires source and destination to share a size
+                // class**, and that is not guaranteed. Destinations come from
+                // the *active* key above (R16, the 4096 B class) so decode can
+                // append to the forked tail, while the source is whatever the
+                // boundary block is in — and a sealed partial tail is quantized
+                // like any other chunk, so it can be sitting in the 1088 B
+                // `Q8_0` class. `copy_slot_bytes` refuses that, correctly.
+                //
+                // An earlier comment here claimed size classes made the formats
+                // agree and that the old `Quantized→Float` dequantize arm was
+                // therefore dead. They do not: the class follows the *format*,
+                // and fork deliberately changes the format of the tail. Closing
+                // this needs that arm rebuilt against tag-driven band reads
+                // (`io.rs`), including the dim-major→token-major transpose the
+                // old one did. Until then the mismatch is named where it can be
+                // acted on rather than surfacing as a bare stride error.
+                let arenas = arena_state.arenas_mut();
+                let sub_head_dim = (head_dim / N_PALETTE).max(1);
+                let band_elems = CHUNK_SIZE * sub_head_dim;
+                for (i, src_gid) in source_gids.iter().enumerate() {
+                    let dst_gid = &gid_vec[i];
+                    let is_v = i % 2 == 1;
+                    let band = i / 2;
+                    let src_stride = arenas
+                        .get(&src_gid.arena_idx())
+                        .map(|a| a.slot_stride())
+                        .unwrap_or(0);
+                    let dst_stride = arenas
+                        .get(&dst_gid.arena_idx())
+                        .map(|a| a.slot_stride())
+                        .unwrap_or(0);
+                    if src_stride == dst_stride {
+                        ChunkedKvBacking::copy_slot_bytes(
+                            arenas,
+                            src_gid.arena_idx(),
+                            src_gid.chunk_idx(),
+                            dst_gid.arena_idx(),
+                            dst_gid.chunk_idx(),
+                        )?;
+                        continue;
+                    }
+                    // Classes differ, so this band changes format and its bytes
+                    // cannot travel verbatim. Read it as floats through its own
+                    // tag and re-encode into the active format.
+                    // `read_band_chunk` yields the canonical
+                    // `(CHUNK_SIZE, sub_head_dim)` token-major tensor for a
+                    // float *or* a quantized tag, so the dim-major/token-major
+                    // transpose the deleted arm did by hand is already handled.
+                    let src_tag = ArenaFormatTag::from_u8(if is_v {
+                        source_v_fmt[band]
+                    } else {
+                        source_k_fmt[band]
+                    });
+                    // Taken off the source arena before the destination is
+                    // borrowed mutably below: `read_band_chunk` yields a lease
+                    // over `arenas`, and re-encoding writes through the same
+                    // map. The copy is what lets the two coexist, and it is the
+                    // reason this arm is the slow path — a same-class band
+                    // takes the verbatim byte copy above instead.
+                    let floats = read_band_chunk(
+                        arenas,
+                        src_gid,
+                        src_tag,
+                        CHUNK_SIZE,
+                        sub_head_dim,
+                        &device,
+                    )?
+                    .to_owned_tensor()?;
+                    let dst_fmt = if is_v { active_v_fmt } else { active_k_fmt };
+                    let dst = arenas.get_mut(&dst_gid.arena_idx()).ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "fork: dest arena {} not found",
+                            dst_gid.arena_idx()
+                        ))
+                    })?;
+                    match dst_fmt {
+                        KvFormat::Float(dtype) => {
+                            dst.write_slot_typed(dst_gid.chunk_idx(), 0, &floats.to_dtype(dtype)?)?
+                        }
+                        KvFormat::Quantized(qf) => {
+                            dst.quantize_into_slot(dst_gid.chunk_idx(), qf, band_elems, 0, &floats)?
                         }
                     }
-                    map
-                };
-
-                // Pass 2 (mutable): copy each GID's chunk to its destination.
-                let elems_per_chunk = CHUNK_SIZE * sub_head_dim;
-                let arenas = arena_state.arenas_mut();
-                for (i, src_gid) in source_gids.iter().enumerate() {
-                    let src_arena_idx = src_gid.arena_idx();
-                    let src_chunk_idx = src_gid.chunk_idx();
-                    let dst_gid = &gid_vec[i];
-                    let dst_arena_idx = dst_gid.arena_idx();
-                    let dst_chunk_idx = dst_gid.chunk_idx();
-
-                    if let Some(src_clone) = quant_clones.get(&src_arena_idx) {
-                        // Quantized source (R16 on GPU): byte-level copy to same-format
-                        // dst, or dequantize if dst is Float (CPU / format-transition).
-                        let src_dtype = src_clone.dtype();
-                        let src_off = src_chunk_idx * elems_per_chunk;
-                        let dst_off = dst_chunk_idx * elems_per_chunk;
-                        match arenas.get_mut(&dst_arena_idx) {
-                            Some(Arena::Quantized { data: dst_q, .. }) => {
-                                if src_dtype == dst_q.dtype() {
-                                    dst_q.slice_range_copy(
-                                        src_clone,
-                                        src_off,
-                                        dst_off,
-                                        elems_per_chunk,
-                                    )?;
-                                } else {
-                                    candle::bail!(
-                                        "fork_sequence: quant dtype mismatch ({:?} vs {:?})",
-                                        src_dtype,
-                                        dst_q.dtype()
-                                    );
-                                }
-                            }
-                            Some(Arena::Float { data: dst_data, .. }) => {
-                                // Quantized source → Float dst: layouts differ.
-                                // Quant/R16 arenas store blocks in DIM-MAJOR
-                                // order within each chunk (block `d` holds
-                                // 32 tokens of dim `d`); `dequantize_f16`
-                                // walks blocks in storage order so its flat
-                                // output per chunk is (dim, token). Float
-                                // arenas expect (chunk, token, dim). Reshape
-                                // in the native (chunk, dim, token) order,
-                                // then transpose dim↔token before writing.
-                                let device = dst_data.device().clone();
-                                let dst_dtype = dst_data.dtype();
-                                let kv_float = src_clone.dequantize_f16(&device)?;
-                                let s_hdim = dst_data.dim(2)?;
-                                let t = kv_float.elem_count() / (CHUNK_SIZE * s_hdim);
-                                let kv_r = kv_float.reshape((t, s_hdim, CHUNK_SIZE))?;
-                                let hd = kv_r
-                                    .narrow(0, src_chunk_idx, 1)?
-                                    .transpose(1, 2)?
-                                    .contiguous()?
-                                    .to_dtype(dst_dtype)?;
-                                dst_data.slice_set(&hd, 0, dst_chunk_idx)?;
-                            }
-                            None => candle::bail!(
-                                "fork_sequence: dst arena {} not found",
-                                dst_arena_idx
-                            ),
-                        }
+                    // The tag is the only record of how a band's bytes decode,
+                    // so it has to move with the format.
+                    let new_tag = ArenaFormatTag::from_kv_format(dst_fmt).as_u8();
+                    if is_v {
+                        v_fmt_out[band] = new_tag;
                     } else {
-                        // Float source: extract owned slice (NLL ends the immutable
-                        // arenas borrow), then mutably access the destination.
-                        let head_data = match arenas.get(&src_arena_idx) {
-                            Some(Arena::Float { data, .. }) => {
-                                data.narrow(0, src_chunk_idx, 1)?.copy()?
-                            }
-                            None => candle::bail!(
-                                "fork_sequence: src arena {} not found",
-                                src_arena_idx
-                            ),
-                            _ => candle::bail!(
-                                "fork_sequence: unexpected arena type at {}",
-                                src_arena_idx
-                            ),
-                        };
-                        match arenas.get_mut(&dst_arena_idx) {
-                            Some(Arena::Float { data, .. }) => {
-                                data.slice_set(&head_data, 0, dst_chunk_idx)?
-                            }
-                            _ => candle::bail!("fork_sequence: Float src but non-Float dst"),
-                        }
+                        k_fmt_out[band] = new_tag;
                     }
                 }
 
-                Ok(gid_vec)
+                Ok::<_, candle::Error>(gid_vec)
             })??;
 
             // Push remainder block with per-head GIDs. The arenas are freshly
@@ -1208,6 +1271,11 @@ impl ChunkedKvBacking {
                     v_pal: source_v_pal,
                     k_scale: source_k_scale,
                     v_scale: source_v_scale,
+                    // Per-band: verbatim where the class matched, re-encoded to
+                    // the active format where it did not — `k_fmt_out`/`v_fmt_out`
+                    // record whichever happened.
+                    k_fmt: Arc::new(k_fmt_out),
+                    v_fmt: Arc::new(v_fmt_out),
                     // CoW partial: freshly-allocated GIDs (copied data) → no
                     // resident record; falls back to per-forward scratch heads.
                     meta: None,
@@ -1500,6 +1568,8 @@ impl ChunkedKvBacking {
             Arc<Vec<u8>>,
             Arc<Vec<f32>>,
             Arc<Vec<f32>>,
+            Arc<Vec<u8>>,
+            Arc<Vec<u8>>,
             Option<super::meta_pool::MetaGid>,
         )> = {
             let ps = state.sequences[parent_batch].as_ref().unwrap();
@@ -1536,6 +1606,8 @@ impl ChunkedKvBacking {
                         cw.v_pal.clone(),
                         cw.k_scale.clone(),
                         cw.v_scale.clone(),
+                        cw.k_fmt.clone(),
+                        cw.v_fmt.clone(),
                         cw.meta.clone(),
                     ))
                 })
@@ -1575,6 +1647,8 @@ impl ChunkedKvBacking {
                 source_v_pal,
                 source_k_scale,
                 source_v_scale,
+                source_k_fmt,
+                source_v_fmt,
                 source_meta,
             ) in borrowed_meta.into_iter()
             {
@@ -1586,6 +1660,8 @@ impl ChunkedKvBacking {
                     v_pal: source_v_pal,
                     k_scale: source_k_scale,
                     v_scale: source_v_scale,
+                    k_fmt: source_k_fmt,
+                    v_fmt: source_v_fmt,
                     // Shares the parent's GIDs/placement, so the parent's
                     // resident record applies — read it instead of rebuilding.
                     meta: source_meta,
@@ -1746,6 +1822,23 @@ impl ChunkedKvBacking {
     /// # Parameters
     /// * `batch_idx` — slot index of the sequence
     pub fn record_turn(&self, batch_idx: usize) -> Result<SealedSequence> {
+        self.record_turn_blocks(batch_idx, 0, usize::MAX)
+    }
+
+    /// Like [`Self::record_turn`] but restricted to the block-index range
+    /// `[start_block, end_block)` (clamped to the slot's block count). The walk
+    /// cost scales with the RANGE, not the slot — the projection assembler's
+    /// glue-island capture snapshots a couple of chunks out of a
+    /// multi-hundred-block slot, where a whole-slot record per layer costs tens
+    /// of milliseconds per wave. Per-chunk sealed metadata is self-contained
+    /// (un-rotated K, positions recomputed from the destination's cumulative
+    /// usage), so a ranged record equals the full record sliced to the range.
+    pub fn record_turn_blocks(
+        &self,
+        batch_idx: usize,
+        start_block: usize,
+        end_block: usize,
+    ) -> Result<SealedSequence> {
         let chunk_size = CHUNK_SIZE;
 
         let state = self
@@ -1759,43 +1852,27 @@ impl ChunkedKvBacking {
                 candle::bail!("record_turn: batch_idx {} is not allocated", batch_idx)
             }
         };
+        let all_chunks = slot.chunks_slice();
+        let end = end_block.min(all_chunks.len());
+        let start = start_block.min(end);
+        let range_chunks = &all_chunks[start..end];
 
-        // Pre-compute per-arena byte strides once for the whole record call — but
-        // only for the arenas this sequence's chunks actually reference (a
-        // couple), not the whole arena table. The full `to_arena_entry` walk per
-        // layer dominated the snapshot's per-scope cost.
-        let n_kv_head = self.inner.n_kv_head;
-        let needed: std::collections::HashSet<usize> = slot
-            .chunks_slice()
-            .iter()
-            .flat_map(|cw| {
-                (0..n_kv_head).flat_map(move |h| {
-                    (0..N_PALETTE).flat_map(move |p| {
-                        [
-                            cw.gids.k_gid_pal(h, p).arena_idx(),
-                            cw.gids.v_gid_pal(h, p).arena_idx(),
-                        ]
-                    })
-                })
-            })
-            .collect();
-        let arena_infos = self
-            .inner
-            .resolve_arena_info_for(&needed)
-            .unwrap_or_default();
+        // A chunk's byte size sums its bands' own payloads, so this needs the
+        // geometry and nothing from the arenas. It used to resolve a per-arena
+        // stride snapshot here, which dominated the per-scope cost.
+        let elems_per_chunk = self.inner.elems_per_chunk();
 
-        // Build SealedChunks from every block in the slot's block
-        // table, including the trailing partial.  No positional state
-        // is captured — K bytes in the chunks are un-rotated, and
+        // Build SealedChunks from every block in the requested range of the
+        // slot's block table, including a trailing partial.  No positional
+        // state is captured — K bytes in the chunks are un-rotated, and
         // RoPE is applied at the latest responsible moment by the
         // attention kernel using a slice_rope recomputed from the
         // destination slot's cumulative usage.  See `SealedChunk`
         // docs.
-        let sealed_chunks: Vec<SealedChunk> = slot
-            .chunks_slice()
+        let sealed_chunks: Vec<SealedChunk> = range_chunks
             .iter()
             .map(|cw| {
-                let byte_size = cw.gids.arena_byte_size(&arena_infos);
+                let byte_size = cw.byte_size(elems_per_chunk);
                 SealedChunk {
                     gids: cw.gids.clone(),
                     offset: cw.offset,
@@ -1804,6 +1881,8 @@ impl ChunkedKvBacking {
                     v_pal: cw.v_pal.clone(),
                     k_scale: cw.k_scale.clone(),
                     v_scale: cw.v_scale.clone(),
+                    k_fmt: cw.k_fmt.clone(),
+                    v_fmt: cw.v_fmt.clone(),
                     byte_size,
                     // Snapshot shares the live chunk's GIDs, so its record (if
                     // resident) stays valid — propagate the handle.
@@ -1820,90 +1899,6 @@ impl ChunkedKvBacking {
             chunk_size,
             location,
         })
-    }
-
-    /// Ensure the last chunk is a writable (float, uniquely-owned) block.
-    ///
-    /// Must be called before each inference pass.  Pushes a new empty float
-    /// chunk if the current tail is quantized or COW-shared (refcount > 1).
-    /// Returns `true` if a new chunk was pushed.
-    pub fn ensure_writable_tail(&self, batch_idx: usize) -> Result<bool> {
-        // Fast check under read lock: determine what action is needed.
-        // The tail block is never shared after fork/view — fork_sequence and
-        // create_view_sequence copy partial tails at fork time.  So we only
-        // need to check: empty, full, or quantized → push new float block;
-        // partial + float → already writable.
-        let needs_new_block: Option<bool> = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            let slot = match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
-                Some(s) => s,
-                None => return Ok(false),
-            };
-            if slot.is_empty() {
-                Some(true) // empty → push new block
-            } else {
-                let cw = slot.last_chunk().unwrap();
-                debug_assert!(
-                    cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
-                    "tail block must not be shared — fork should have copied it"
-                );
-                let is_full = (cw.offset as usize + cw.usage as usize) >= CHUNK_SIZE;
-                if is_full {
-                    Some(true)
-                } else {
-                    // If any head lives in a quantized arena the whole block
-                    // must be replaced with a fresh float block.
-                    let any_quantized = self.inner.storage.read(|s| {
-                        cw.gids.iter().any(|g| {
-                            s.arena_key(g.arena_idx())
-                                .map(|k| {
-                                    matches!(k.format, crate::kv_cache::KvFormat::Quantized(_))
-                                })
-                                .unwrap_or(true)
-                        })
-                    })?;
-                    if any_quantized {
-                        Some(true)
-                    } else {
-                        None // partial + float → already writable
-                    }
-                }
-            }
-        };
-
-        match needs_new_block {
-            None => return Ok(false), // already writable
-            Some(true) => {
-                // Push new empty float block.
-                let current_block_count = {
-                    let state = self
-                        .state
-                        .read()
-                        .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-                    state
-                        .sequences
-                        .get(batch_idx)
-                        .and_then(|s| s.as_ref())
-                        .map(|s| s.block_count())
-                        .unwrap_or(0)
-                };
-                self.ensure_max_blocks(current_block_count + 1)?;
-                let mut state = self
-                    .state
-                    .write()
-                    .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-                let cw = self.alloc_block_chunks(0, 0)?;
-                if let Some(Some(slot)) = state.sequences.get_mut(batch_idx) {
-                    slot.push_chunk(cw);
-                }
-            }
-            _ => unreachable!(),
-        }
-
-        Ok(true)
     }
 
     /// Truncate the sequence at `batch_idx` to keep only the first
@@ -2060,14 +2055,29 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
-    /// Truncate the sequence to exactly `target_tokens` cum-tokens, freeing any
-    /// writer-owned chunks/usage beyond it. Makes an offset-`N` re-prefill
-    /// idempotent: a caller (e.g. the bench harness's repeat loop) that re-runs a
-    /// prefill at the same offset must not stack stale tail chunks on top of the
-    /// previous run. Arc-shared prefix chunks (below `writer_start_idx`) are never
-    /// shrunk — `target_tokens` always covers them (it is ≥ the shared prefix
-    /// length). No-op when the sequence already holds ≤ `target_tokens` tokens
-    /// (growth is handled by `set_len`).
+    /// Truncate the sequence's **writer-owned tail** to `target_tokens`
+    /// cum-tokens. Makes an offset-`N` re-prefill idempotent: a caller (e.g.
+    /// the bench harness's repeat loop) that re-runs a prefill at the same
+    /// offset must not stack stale tail chunks on top of the previous run.
+    /// No-op when the sequence already holds ≤ `target_tokens` tokens (growth
+    /// is handled by `set_len`).
+    ///
+    /// **Sealed ground is not this operation's to cut.** Chunks below
+    /// `writer_start_idx` are Arc-shared projected layout — substrate borrows,
+    /// injected sections, and reprojection's reserved glue gaps — so a target
+    /// that falls inside them is clamped up to the sealed boundary and only
+    /// the writable chunks beyond it are freed. That case is not hypothetical:
+    /// a slot with a **deferred glue fire** counts its reserved gap tokens in
+    /// the chunk windows (the reproject stamps them at assembly so the fire
+    /// can scatter into place) but not in the scheduler's offset (glue "must
+    /// not advance its slot" until it fires), so every such slot arrives here
+    /// with `target` short of the sealed cum by exactly the pending glue. This
+    /// used to be a bail that one caller silently discarded — which made the
+    /// no-op accidental and the first caller to *propagate* errors killed the
+    /// wave with `target 1334 cuts into the Arc-shared prefix`. The clamp is
+    /// that no-op as a contract instead of an accident, and it is also what
+    /// keeps stale-tail cutting alive on the same slot: writable chunks past
+    /// the sealed boundary still go.
     pub fn truncate_sequence_to_tokens(
         &self,
         batch_idx: usize,
@@ -2098,17 +2108,26 @@ impl ChunkedKvBacking {
             return Ok(());
         }
         let writer_start = slot.writer_start_idx();
+        let sealed_cum: usize = slot.chunks_slice()[..writer_start.min(n)]
+            .iter()
+            .map(|c| c.usage as usize)
+            .sum();
+        let target_tokens = target_tokens.max(sealed_cum);
+        if total <= target_tokens {
+            return Ok(());
+        }
         let mut cum = 0usize;
         for i in 0..n {
             let usage = slot.chunks_slice()[i].usage as usize;
-            if cum + usage >= target_tokens {
+            // The `i + 1` bound keeps the landing at or past the last sealed
+            // chunk even when trailing sealed chunks hold zero tokens — landing
+            // earlier would `truncate_chunks` sealed layout away on a token
+            // count that never covered it.
+            if cum + usage >= target_tokens && i + 1 >= writer_start.min(n) {
                 let keep = target_tokens - cum;
-                if i < writer_start && keep < usage {
-                    candle::bail!(
-                        "truncate_sequence_to_tokens: target {target_tokens} cuts into the \
-                         Arc-shared prefix (chunk {i}, writer_start {writer_start})"
-                    );
-                }
+                // The clamp above puts the cut at or past the sealed boundary:
+                // a chunk below `writer_start` can be landed on only with
+                // `keep == usage`, which trims nothing from it.
                 // Keep chunks 0..=i (chunk i trimmed to `keep` tokens, possibly 0 →
                 // it becomes the empty writer chunk) and free everything after.
                 slot.chunk_at_mut(i).unwrap().usage = keep as u32;
@@ -2204,6 +2223,8 @@ impl ChunkedKvBacking {
                 v_pal: Arc::clone(&sc.v_pal),
                 k_scale: Arc::clone(&sc.k_scale),
                 v_scale: Arc::clone(&sc.v_scale),
+                k_fmt: Arc::clone(&sc.k_fmt),
+                v_fmt: Arc::clone(&sc.v_fmt),
                 // Injected chunk Arc-shares the sealed chunk's GIDs, so its
                 // resident record stays valid — share the handle into the slot.
                 meta: sc.meta.clone(),

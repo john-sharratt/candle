@@ -32,6 +32,7 @@ use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEven
 
 use zend::code_read::CodeReadState;
 use zend::loading::LoadProgress;
+use zend::repo_scan::DirState;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
@@ -110,14 +111,12 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 struct LoadedDaemon {
     engine: ConversationEngine,
     dialogue: Sequence,
-    /// Held alive — dropping this tears down the prefilled K/V on the
-    /// repo_map layer, which is what we're testing.
+    /// Neither ingest pass holds a live Sequence: each per-directory /
+    /// per-file conversation's slot is freed after ingest while the substrate
+    /// retains its sealed K/V, so retrieval reads it back from there. The hash
+    /// records are kept purely so the fields document the passes.
     #[allow(dead_code)]
-    repo_map: Sequence,
-    /// The code_reading pass holds no live Sequences: each per-file
-    /// conversation's slot is freed after ingest while the substrate
-    /// retains its sealed K/V, so retrieval reads it back from there.
-    /// We keep the hash record purely so the field documents the pass.
+    repo_map_state: DirState,
     #[allow(dead_code)]
     code_read_state: CodeReadState,
 }
@@ -187,7 +186,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // so they take a `&Mutex<ConversationEngine>`. Mirror the daemon: wrap for
     // the passes, then unwrap to hold on.
     let engine = Mutex::new(engine);
-    let (repo_map, walked, _cluster_state) = zend::repo_scan::ingest_repo_map(
+    let (walked, repo_map_state, _repo_map_report) = zend::repo_scan::ingest_repo_map(
         &engine,
         proj_builder_repo_map,
         workspace,
@@ -222,7 +221,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     LoadedDaemon {
         engine,
         dialogue,
-        repo_map,
+        repo_map_state,
         code_read_state,
     }
 }

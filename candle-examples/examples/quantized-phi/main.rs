@@ -1,3 +1,12 @@
+//! Text generation with GGUF-quantized Phi models: Phi-2, Phi-3 (`quantized_phi3`),
+//! Phi-4, and an alternative llama-based Phi-3 implementation (`quantized_llama`,
+//! selected via `--which phi-3b`) that uses the shared `KvCaches<CausalMaskCache>`.
+//!
+//! `--which` picks the GGUF repo/filename/revision on the HF hub; `--model`
+//! overrides with a local GGUF path. `--use-flash-attn` applies to the Phi-3/Phi-4
+//! path. `--prompt` supports `interactive` mode; sampling via `Sampling::{ArgMax,
+//! All,TopK,TopP,TopKThenTopP}`.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

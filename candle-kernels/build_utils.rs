@@ -28,8 +28,8 @@ const SIMPLE_KERNELS: [&str; 45] = [
     "src/simple/corpus_gather.cu",
     // Kernel implementations
     "src/simple/add_at_indices.cu",
-    "src/simple/arena_compact.cu",
     "src/simple/gather_r16_kv.cu",
+    "src/simple/gather_rows.cu",
     "src/simple/prov_sign_pack.cu",
     "src/simple/kv_migrate.cu",
     "src/simple/fletcher32.cu",

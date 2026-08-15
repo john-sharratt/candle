@@ -1,6 +1,6 @@
 name: file_edit
 category: Files
-description: 'Make a targeted edit to an existing VFS file by replacing a unique substring. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line without rewriting the whole file, applying small surgical changes. The old_str must appear exactly once — if it appears multiple times the call returns ambiguous and asks for more surrounding context. Triggered by "change X to Y in the file", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites use write.'
+description: 'Make a targeted edit to an existing file by replacing a unique substring. The file may be one this session created or one from the project on disk — editing a project file copies it into the session first, so the version on disk is never modified. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line without rewriting the whole file, applying small surgical changes. The old_str must appear exactly once — if it appears multiple times the call returns ambiguous and asks for more surrounding context. Triggered by "change X to Y in the file", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites use write.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -12,7 +12,7 @@ parameters:
       description: Substring to replace; must match exactly once in the file (multiple matches are rejected as ambiguous). Required.
       type: string
     path:
-      description: VFS path of the file to edit (session-relative, e.g. `src/main.rs`). Required.
+      description: Path of the file to edit — a project file from the working directory, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
   required:
@@ -135,4 +135,36 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_edit", "arguments": {"new_str": "receive", "old_str": "recieve", "path": "/workspace/src/handlers/mod.rs"}}
+  </tool_call><|projection|>
+- |-
+  in src/main.rs change the greeting from hello to hi<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants a targeted substring replacement inside src/main.rs. file_edit does exactly this: old_str must appear exactly once, and the file may be one from the project<|projection|> on disk — editing it copies it into the session, so the version on disk is not modified.
+
+  Here old_str is "hello" and new_str is "hi". If it turns out to appear more than once the call<|projection|> comes back ambiguous and I will need more surrounding context.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"path": "src/main.rs", "old_str": "hello", "new_str": "hi"}}
+  </tool_call><|projection|>
+- |-
+  update the version in Cargo.toml from 0.1.0 to 0.2.0<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This is a one-line change to the project's manifest, so file_edit rather than a full rewrite. The path is Cargo.toml, old_str is the current version string and<|projection|> new_str the new one. Using the quoted forms keeps the match unique — a bare 0.1.0 could well appear in a dependency line too.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"path": "Cargo.toml", "old_str": "version = \"0.1.0\"", "new_str": "version = \"0.2.0\""}}
+  </tool_call><|projection|>
+- |-
+  fix the typo teh -> the in docs/guide.md<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A single typo fix in a project file. file_edit replaces a unique substring, so old_str is "teh" and new_str is "the", with the path docs/guide.md.<|projection|> The edit lands on the session's copy; the file on disk stays as it is.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"path": "docs/guide.md", "old_str": "teh", "new_str": "the"}}
   </tool_call><|projection|>

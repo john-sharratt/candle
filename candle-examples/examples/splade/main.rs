@@ -1,3 +1,12 @@
+//! SPLADE sparse text embeddings (`prithivida/Splade_PP_en_v1` by default),
+//! built on a BERT masked-LM head.
+//!
+//! The sparse vector is `log(1 + relu(mlm_logits))` max-pooled over the
+//! sequence, giving one weight per vocabulary token. With `--prompt`, prints
+//! the nonzero (token, weight) pairs for that single input. Without it, runs
+//! a demo batch of fixed sentences and prints the top-5 most similar pairs
+//! by cosine similarity between their sparse vectors.
+
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};

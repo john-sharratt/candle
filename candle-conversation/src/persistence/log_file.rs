@@ -11,9 +11,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::direct_io::DirectFile;
 use super::record::{crc32, decode_record, verify_record_crc, Record, ALIGN};
 use super::{PersistenceError, Result};
+use candle::direct_io::DirectFile;
 
 /// Size of the file superblock — the first block, holding file identity,
 /// the format version, and the latest `HeaderIndex` hint.

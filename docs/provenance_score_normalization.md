@@ -11,7 +11,7 @@ module: if the code disagrees, fix the code (or fix this doc in the same change)
 
 ## 1. The problem
 
-Provenance selection scores each candidate (a tool section, a repo_map cluster, a
+Provenance selection scores each candidate (a tool section, a repo_map folder, a
 conversation turn) against a probe (the live decode Q signature) with the
 late-fusion scorer (`score_provenance_late_fusion`): per query token, the
 best-agreeing gallery token per case casts a `z × margin` vote, tallied per case.
@@ -112,10 +112,10 @@ over the whole substrate. Reading the selection path, every score comparison is
 
 The score-competition scopes are therefore:
 
-- **Turn group** → children are its turns (repo_map dir clusters, dialogue turns).
+- **Turn group** → children are its turns (repo_map folder turns, dialogue turns).
 - **Section collection** → children are its sections (tools).
 - **Sub-window** (future) → children are the regions within one turn (files inside
-  a repo_map listing — the self-referencing sub-windows).
+  a repo_map listing — self-referencing sub-windows).
 
 The nested "coarse → fine" selection — *pick the dir, then the file inside it* — is
 **turn group → sub-window**, both score-competition scopes. A member is

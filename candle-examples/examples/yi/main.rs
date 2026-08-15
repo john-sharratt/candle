@@ -1,3 +1,12 @@
+//! Yi (01-ai) autoregressive text generation, greedy/top-p sampling with
+//! repeat penalty, streamed to stdout.
+//!
+//! `--which` picks `6b` or `34b` (`Config::config_6b`/`config_34b`),
+//! defaulting to the `01-ai/Yi-6B` repo (override with `--model-id`); weight
+//! shards are resolved from `model.safetensors.index.json` via
+//! `candle_examples::hub_load_safetensors`. BF16 on CUDA, F32 otherwise. No
+//! quantized path. `<|im_end|>` in generated text is rendered as a newline.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

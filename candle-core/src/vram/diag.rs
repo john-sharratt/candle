@@ -1,7 +1,7 @@
 //! Diagnostics: a structured budget snapshot that renders as a table and that
 //! unit tests assert against — the same view a human debugs with.
 
-use super::{AllocClass, Criticality, VramGovernor};
+use super::{AllocClass, VramGovernor};
 
 /// One per-class row of the budget table (loose reserved tally).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,14 +25,13 @@ pub struct BudgetTable {
     pub source: super::ProbeKind,
     /// Loose per-class reserved tallies.
     pub rows: [BudgetRow; AllocClass::COUNT],
-    /// KV floor (`3 GiB + 15% × (C − Weights)`).
-    pub kv_floor: u64,
-    /// The five ladder trip points, indexed by [`Criticality`].
-    pub thresholds: [u64; 5],
-    /// Reversibly-evictable KV (up to `Moderate`) — the forecast input.
-    pub evictable_reversible: u64,
-    /// The last relief episode `(deepest tier, bytes freed)`.
-    pub last_relief: Option<(Criticality, u64)>,
+    /// Cushion left outside the reservation for the CUDA pool.
+    ///
+    /// This was `kv_floor` — the static KV reserve the expert budget had to
+    /// leave. There is no such reserve now: the KV side, the transient tier and
+    /// the expert cache share one span and negotiate the boundary between them,
+    /// so what is worth reporting here is the only quantity still held *back*.
+    pub pool_cushion: u64,
 }
 
 impl BudgetTable {
@@ -68,23 +67,13 @@ impl VramGovernor {
                 reserved: self.class_reserved(AllocClass::Kv),
             },
         ];
-        let thresholds = [
-            self.tier_threshold(Criticality::Trivial),
-            self.tier_threshold(Criticality::Cheap),
-            self.tier_threshold(Criticality::Moderate),
-            self.tier_threshold(Criticality::Costly),
-            self.tier_threshold(Criticality::Critical),
-        ];
         BudgetTable {
             capacity_c: self.capacity(),
             total: reading.total,
             headroom: reading.headroom,
             source: reading.source,
             rows,
-            kv_floor: self.kv_floor(),
-            thresholds,
-            evictable_reversible: self.evictable_estimate(Criticality::Moderate),
-            last_relief: self.last_relief(),
+            pool_cushion: self.pool_cushion(),
         }
     }
 
@@ -93,12 +82,13 @@ impl VramGovernor {
         let t = self.budget_table();
         let mut s = String::new();
         s.push_str(&format!(
-            "vram budget [{whence}] source={:?} C={}MiB total={}MiB headroom={}MiB kv_floor={}MiB\n",
+            "vram budget [{whence}] source={:?} C={}MiB total={}MiB headroom={}MiB \
+             pool_cushion={}MiB\n",
             t.source,
             mib(t.capacity_c),
             mib(t.total),
             mib(t.headroom),
-            mib(t.kv_floor),
+            mib(t.pool_cushion),
         ));
         for row in &t.rows {
             s.push_str(&format!(
@@ -107,19 +97,6 @@ impl VramGovernor {
                 mib(row.reserved)
             ));
         }
-        s.push_str(&format!(
-            "  thresholds MiB: Trivial={} Cheap={} Moderate={} Costly={} Critical={}\n",
-            mib(t.thresholds[0]),
-            mib(t.thresholds[1]),
-            mib(t.thresholds[2]),
-            mib(t.thresholds[3]),
-            mib(t.thresholds[4]),
-        ));
-        s.push_str(&format!(
-            "  evictable(≤Moderate)={}MiB last_relief={:?}",
-            mib(t.evictable_reversible),
-            t.last_relief.map(|(tier, b)| (tier, mib(b)))
-        ));
         s
     }
 

@@ -1,3 +1,13 @@
+//! Minimal from-scratch Mamba (selective state-space model) text generation.
+//!
+//! A single-file reimplementation (`mod model`) of the Mamba SSM architecture,
+//! run non-recurrently: each decode step re-feeds the full token sequence
+//! through `model.forward` rather than carrying an explicit recurrent state
+//! (compare `../mamba/main.rs`, which uses `mamba::State`). `Which` selects
+//! among the `state-spaces/mamba-{130m,370m,790m,1.4b,2.8b,2.8b-slimpj}`
+//! checkpoints; weights load as F32 mmapped safetensors, tokenizer is the
+//! shared `EleutherAI/gpt-neox-20b` one.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

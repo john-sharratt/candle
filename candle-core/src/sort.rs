@@ -1,4 +1,6 @@
-use crate::{Result, Tensor};
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::{alloc_inheriting, Backing, OutS};
+use crate::{LiveTensor, Result};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -90,13 +92,14 @@ mod cuda {
             dev: &CudaDevice,
             layout: &crate::Layout,
             _wrap: W,
-        ) -> Result<S> {
+            origin: Backing,
+        ) -> Result<OutS> {
             let slice = match layout.contiguous_offsets() {
                 None => crate::bail!("input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let elem_count = layout.shape().elem_count();
-            let dst = unsafe { dev.alloc::<u32>(elem_count)? };
+            let (dst, out_backing) = unsafe { alloc_inheriting::<u32>(dev, elem_count, origin)? };
             let ncols = self.last_dim;
             let nrows = elem_count / ncols;
             let ncols_pad = next_power_of_2(ncols);
@@ -136,7 +139,7 @@ mod cuda {
                     }
                 }
             }
-            Ok(S::U32(dst))
+            Ok((S::U32(dst), out_backing))
         }
     }
 }
@@ -174,10 +177,11 @@ impl crate::CustomOp1 for ArgSort {
         use crate::backend::BackendStorage;
         use crate::cuda_backend::Map1Any;
         let dev = storage.device();
-        let slice = self.map(&storage.slice, dev, layout)?;
+        let (slice, out_backing) = self.map(storage, dev, layout)?;
         let dst = crate::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
+            backing: out_backing,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -245,13 +249,13 @@ impl crate::CustomOp1 for ArgSort {
     }
 }
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     /// Returns the indices that sort the tensor along the last dimension.
     ///
     /// If `asc` is `true`, sorting is in ascending order. Otherwise sorting is performed in
     /// descending order. The sort is unstable so there is no guarantees on the final order when it
     /// comes to ties.
-    pub fn arg_sort_last_dim(&self, asc: bool) -> Result<Tensor> {
+    pub fn arg_sort_last_dim(&self, asc: bool) -> Result<Self> {
         if !self.is_contiguous() {
             return Err(crate::Error::RequiresContiguous {
                 op: "arg_sort_last_dim",
@@ -271,7 +275,7 @@ impl Tensor {
     /// If `asc` is `true`, sorting is in ascending order. Otherwise sorting is performed in
     /// descending order. The sort is unstable so there is no guarantees on the final order when it
     /// comes to ties.
-    pub fn sort_last_dim(&self, asc: bool) -> Result<(Tensor, Tensor)> {
+    pub fn sort_last_dim(&self, asc: bool) -> Result<(Self, Self)> {
         if !self.is_contiguous() {
             return Err(crate::Error::RequiresContiguous {
                 op: "sort_last_dim",

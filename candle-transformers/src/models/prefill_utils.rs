@@ -26,6 +26,12 @@ use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::HeadGids;
 
+use crate::models::wave_buffers::KernelOutput;
+#[cfg(feature = "cuda")]
+use candle::LiveTensor;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
+
 /// Uploaded per-slot `SlotHeader[b]` payloads for a chunked attention launch.
 ///
 /// Holds the GPU-resident headers + the host `SlotStateHost` per slot (its
@@ -422,12 +428,13 @@ fn build_slot_headers(
 ///
 /// Returns `Some(outputs_per_sequence)` on success, `None` if inapplicable or if the attempt fails.
 #[cfg(feature = "cuda")]
-fn paged_prefill_batched_impl(
+fn paged_prefill_batched_impl<'w>(
+    wave: Option<&'w WaveGeneration>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     b_sz: usize,
     q_lens: &[usize],
     n_head: usize,
@@ -439,7 +446,7 @@ fn paged_prefill_batched_impl(
     rope_interleaved: bool,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
     //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
     // where total_q = Σ q_lens and the per-sequence token ranges are described
@@ -462,13 +469,9 @@ fn paged_prefill_batched_impl(
         );
     }
 
-    // Reset caches where offset == 0.
-    for (cache, &off) in caches.iter_mut().zip(offsets.iter()) {
-        if off == 0 {
-            cache.reset();
-        }
-    }
-
+    // No reset and no truncation here: `wave_admit` did both for every layer
+    // before the forward began, and repeating them would discard the chunks that
+    // pass claimed.
     let mut use_chunks = caches
         .first()
         .and_then(|c| c.k_cache().chunked_arena_chunks())
@@ -533,24 +536,12 @@ fn paged_prefill_batched_impl(
         candle::bail!("chunked backing unavailable");
     }
 
-    // Ensure chunks for EXACTLY each sequence's own q_len — never over-allocate
-    // to max(q_lens). Extra trailing chunks on a shorter sequence desync the
-    // decode writer slice (the kernel's "one free slot per chunk" contract),
-    // tripping the `ws_offset + ws_len < CHUNK_SIZE` assert on its next decode.
-    // Per-cache calls use each cache's real batch_idx, so a single-element slice
-    // targets the correct slot.
     // Entry drain: attributes GPU work still in flight when the prefill
     // call begins (enqueued by the caller) separately from this call's own
     // spans — without it the first sync'd span absorbs the caller's tail.
     let t_entry = profile_now();
     profile_sync(q.device());
     pipeline_record("prefill:entry", t_entry);
-    let t_alloc = profile_now();
-    for (i, &add) in q_lens.iter().enumerate() {
-        KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
-    }
-    profile_sync(q.device());
-    pipeline_record("prefill:alloc", t_alloc);
 
     let t_meta = profile_now();
     let (compute_dtype, _chunk_size) = {
@@ -655,7 +646,7 @@ fn paged_prefill_batched_impl(
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
         match first.k_cache().chunked_storage_policy() {
             Some(policy) => {
-                let is_quant = policy.to_arena_key().is_quantized();
+                let is_quant = policy.is_quantized();
                 if is_quant && !policy.is_kernel_native() {
                     candle::bail!(
                         "storage policy uses a quantized format that the kernel cannot read natively; \
@@ -702,6 +693,7 @@ fn paged_prefill_batched_impl(
 
     let t_kernel = profile_now();
     let out_packed = paged_prefill_attn_varlen_chunks(
+        wave,
         &q_packed,
         &cu_seqlens_q,
         &q_lens_dev,
@@ -760,12 +752,13 @@ fn paged_prefill_batched_impl(
 /// quantized arena.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub fn paged_prefill_batched(
+pub fn paged_prefill_batched<'w>(
+    wave: Option<&'w WaveGeneration>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     b_sz: usize,
     q_lens: &[usize],
     n_head: usize,
@@ -777,8 +770,9 @@ pub fn paged_prefill_batched(
     rope_interleaved: bool,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     paged_prefill_batched_impl(
+        wave,
         caches,
         offsets,
         q,
@@ -801,11 +795,15 @@ pub fn paged_prefill_batched(
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_prefill_batched(
+    // Concrete, not generic: `W` would be unconstrained at the `None` call
+    // sites and force a turbofish on every one of them. Without CUDA there is
+    // no wave domain, so the unit type is the honest stand-in.
+    _wave: Option<&()>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     b_sz: usize,
     q_lens: &[usize],
     n_head: usize,
@@ -897,6 +895,8 @@ pub fn paged_prefill_batched(
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_glue_attn(
+    // As `paged_prefill_batched`: concrete so `None` infers.
+    _wave: Option<&()>,
     _caches: &mut [&mut KvCache],
     _offsets: &[usize],
     _q: &Tensor,
@@ -914,13 +914,14 @@ pub fn paged_glue_attn(
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
     _generation: &Generation,
+    _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     candle::bail!("paged-glue requires the cuda feature")
 }
 
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
-struct PagedPrefillInt8 {
+struct PagedPrefillInt8<'k> {
     /// Longest per-sequence q_len in the batch — sizes the kernel's
     /// query-tile grid exactly.
     max_q_len: usize,
@@ -928,8 +929,8 @@ struct PagedPrefillInt8 {
     cu_seqlens_q: Tensor,
     q_lens: Tensor,
     kv_lens: Tensor,
-    k_packed: Tensor,
-    v_packed: Tensor,
+    k_packed: LiveTensor<'k>,
+    v_packed: LiveTensor<'k>,
     /// Raw GPU virtual address of `SlotHeader[batch_size]`.
     headers_ptr: u64,
     batch_size: usize,
@@ -949,8 +950,9 @@ struct PagedPrefillInt8 {
 }
 
 #[cfg(feature = "cuda")]
-impl PagedPrefillInt8 {
+impl<'k> PagedPrefillInt8<'k> {
     fn cuda_fwd_t<
+        'w,
         Q: candle::cuda_backend::CudaDType + DeviceRepr, // Query type
         KV: candle::cuda_backend::CudaDType + DeviceRepr, // KV cache type
         O: candle::cuda_backend::CudaDType + DeviceRepr, // Output type
@@ -958,7 +960,8 @@ impl PagedPrefillInt8 {
         &self,
         q: &candle::CudaStorage,
         q_l: &Layout,
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let (total_q, n_head, head_dim) = q_l.shape().dims3()?;
         if n_head != self.n_head || head_dim != self.head_dim {
             candle::bail!(
@@ -1034,7 +1037,7 @@ impl PagedPrefillInt8 {
         .slice(v_packed_l.start_offset()..);
 
         let elem_count = q_l.shape().elem_count();
-        let dst = unsafe { dev.alloc::<O>(elem_count)? };
+        let dst = KernelOutput::<O>::new(dev, elem_count, wave)?;
 
         // Compute q_dtype code from Q's actual dtype
         // q_dtype codes: 0=F32, 1=F16, 2=BF16, 3=F8E4M3
@@ -1117,26 +1120,25 @@ impl PagedPrefillInt8 {
             );
         }
 
-        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
-        Ok((dst, q_l.shape().clone()))
+        Ok(dst.into_tensor(dev.clone(), q_l.shape().clone()))
     }
 }
 
+/// Dispatch on the compute dtype and run the kernel.
+///
+/// An inherent method rather than a `CustomOp1` impl: this kernel writes its
+/// output into the wave's transient half, and `CustomOp1::cuda_fwd` returns
+/// `(CudaStorage, Shape)` with nowhere to carry `'w`. Going through that trait
+/// would erase the bound and hand back a `Tensor` claiming to own memory the
+/// wave is about to reclaim.
 #[cfg(feature = "cuda")]
-impl candle::CustomOp1 for PagedPrefillInt8 {
-    fn name(&self) -> &'static str {
-        "paged-prefill-int8"
-    }
-
-    fn cpu_fwd(&self, _: &candle::CpuStorage, _: &Layout) -> Result<(candle::CpuStorage, Shape)> {
-        candle::bail!("no cpu support for paged-prefill-int8")
-    }
-
-    fn cuda_fwd(
+impl<'k> PagedPrefillInt8<'k> {
+    fn run<'w>(
         &self,
         q: &candle::CudaStorage,
         q_l: &Layout,
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         if q.dtype() != self.compute_dtype {
             candle::bail!(
                 "paged-prefill-int8: expected {:?} Q, got {:?}",
@@ -1145,8 +1147,8 @@ impl candle::CustomOp1 for PagedPrefillInt8 {
             );
         }
         match self.compute_dtype {
-            candle::DType::F16 => self.cuda_fwd_t::<f16, f16, f16>(q, q_l),
-            candle::DType::BF16 => self.cuda_fwd_t::<bf16, bf16, bf16>(q, q_l),
+            candle::DType::F16 => self.cuda_fwd_t::<f16, f16, f16>(q, q_l, wave),
+            candle::DType::BF16 => self.cuda_fwd_t::<bf16, bf16, bf16>(q, q_l, wave),
             dt => candle::bail!("paged-prefill-int8: unsupported compute dtype {:?}", dt),
         }
     }
@@ -1161,13 +1163,14 @@ impl candle::CustomOp1 for PagedPrefillInt8 {
 /// `headers_ptr` is the raw GPU address of `SlotHeader[batch_size]`, reusing the
 /// same persistent slot-payload representation as decode.
 /// `compute_dtype` is the pre-resolved F16 or BF16 dtype for Q/K/V (derived from arena formats).
-pub(crate) fn paged_prefill_attn_varlen_chunks(
-    q: &Tensor,
+pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
+    wave: Option<&'w WaveGeneration>,
+    q: &LiveTensor<'_>,
     cu_seqlens_q: &Tensor,
     q_lens: &Tensor,
     kv_lens: &Tensor,
-    k_packed: &Tensor,
-    v_packed: &Tensor,
+    k_packed: &LiveTensor<'_>,
+    v_packed: &LiveTensor<'_>,
     headers_ptr: u64,
     compute_dtype: DType,
     n_head: usize,
@@ -1178,7 +1181,7 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     max_q_len: usize,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     // The kernel's in-thread RoPE pairing needs head_dim % 64 == 0 with the
     // non-interleaved half-split pairing (Qwen/GPT2 style), and head_dim
     // 256's staging slabs exceed the 25.6 KB 4-blocks/SM union-arena budget.
@@ -1233,7 +1236,28 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
         rope_cs: rope_cs.clone(),
         rope_interleaved,
     };
-    q.apply_op1(op)
+    with_q_storage(&q, |s, l| op.run(s, l, wave))
+}
+
+/// Pull `q`'s CUDA storage out and hand it to a kernel's `run`.
+///
+/// What `Tensor::apply_op1` used to do for these four kernels, minus the part
+/// that erased the lifetime. The closure's `'w` is the caller's, so the result
+/// is bounded by the caller's wave guard rather than by what `CustomOp1` can
+/// express, which is nothing.
+#[cfg(feature = "cuda")]
+fn with_q_storage<'w, F>(q: &LiveTensor<'_>, run: F) -> Result<LiveTensor<'w>>
+where
+    F: FnOnce(&candle::CudaStorage, &Layout) -> Result<LiveTensor<'w>>,
+{
+    let (storage, layout) = q.storage_and_layout();
+    let candle::Storage::Cuda(cuda) = &*storage else {
+        candle::bail!(
+            "paged attention: q must be a CUDA tensor, got {:?}",
+            q.device()
+        )
+    };
+    run(cuda, layout)
 }
 
 /// FFI signature shared by the FP16/BF16 glue-kernel entry points.
@@ -1244,6 +1268,8 @@ type GlueFfi = unsafe extern "C" fn(
     *mut c_void,   // o
     i32,           // batch
     i32,           // max_glue
+    i32,           // total_q (Σ q_lens — sizes the split-KV partial pool)
+    i32,           // max_kv (max kv_lens[b] — sizes the split-KV grid)
     i32,           // n_q_head
     i32,           // n_kv_head
     i32,           // head_dim
@@ -1267,13 +1293,13 @@ type GlueFfi = unsafe extern "C" fn(
 /// write their own K/V into the writer chunks, and mask by TRUE sequence
 /// position via `col_actual_pos`. The output is `q`-shaped.
 #[cfg(feature = "cuda")]
-struct PagedGlueChunks {
+struct PagedGlueChunks<'k> {
     softmax_scale: f32,
     cu_seqlens_q: Tensor,
     q_lens: Tensor,
     kv_lens: Tensor,
-    k_new: Tensor,
-    v_new: Tensor,
+    k_new: LiveTensor<'k>,
+    v_new: LiveTensor<'k>,
     /// Flat `[Σ q_lens]` U32 — gap chunk slice index per glue row (scatter target).
     glue_write_slice: Tensor,
     /// Flat `[Σ q_lens]` U32 — in-block offset per glue row.
@@ -1283,6 +1309,8 @@ struct PagedGlueChunks {
     headers_ptr: u64,
     batch_size: usize,
     max_glue: usize,
+    /// Max `kv_lens[b]` over the batch — sizes the kernel's split-KV grid.
+    max_kv: usize,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -1292,14 +1320,15 @@ struct PagedGlueChunks {
 }
 
 #[cfg(feature = "cuda")]
-impl PagedGlueChunks {
-    fn cuda_fwd_t<T: candle::cuda_backend::CudaDType + DeviceRepr>(
+impl<'k> PagedGlueChunks<'k> {
+    fn cuda_fwd_t<'w, T: candle::cuda_backend::CudaDType + DeviceRepr>(
         &self,
         q: &candle::CudaStorage,
         q_l: &Layout,
         ffi: GlueFfi,
-    ) -> Result<(candle::CudaStorage, Shape)> {
-        let (_total_q, n_head, head_dim) = q_l.shape().dims3()?;
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
+        let (total_q, n_head, head_dim) = q_l.shape().dims3()?;
         if n_head != self.n_head || head_dim != self.head_dim {
             candle::bail!(
                 "paged-glue: q shape mismatch got {:?} expected (total_q, {}, {})",
@@ -1360,7 +1389,7 @@ impl PagedGlueChunks {
         let (cs_ptr, _csg) = cs_slice.device_ptr(&stream);
 
         let elem_count = q_l.shape().elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count)? };
+        let dst = KernelOutput::<T>::new(dev, elem_count, wave)?;
 
         unsafe {
             let (dst_ptr, _dg) = dst.device_ptr(&stream);
@@ -1371,6 +1400,8 @@ impl PagedGlueChunks {
                 dst_ptr as *mut c_void,
                 self.batch_size as i32,
                 self.max_glue as i32,
+                total_q as i32,
+                self.max_kv as i32,
                 self.n_head as i32,
                 self.n_kv_head as i32,
                 self.head_dim as i32,
@@ -1389,26 +1420,19 @@ impl PagedGlueChunks {
             );
         }
 
-        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
-        Ok((dst, q_l.shape().clone()))
+        Ok(dst.into_tensor(dev.clone(), q_l.shape().clone()))
     }
 }
 
+/// As [`PagedPrefillInt8::run`]: inherent so the wave-scoped output keeps `'w`.
 #[cfg(feature = "cuda")]
-impl candle::CustomOp1 for PagedGlueChunks {
-    fn name(&self) -> &'static str {
-        "paged-glue-chunks"
-    }
-
-    fn cpu_fwd(&self, _: &candle::CpuStorage, _: &Layout) -> Result<(candle::CpuStorage, Shape)> {
-        candle::bail!("no cpu support for paged-glue-chunks")
-    }
-
-    fn cuda_fwd(
+impl<'k> PagedGlueChunks<'k> {
+    fn run<'w>(
         &self,
         q: &candle::CudaStorage,
         q_l: &Layout,
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         if q.dtype() != self.compute_dtype {
             candle::bail!(
                 "paged-glue-chunks: expected {:?} Q, got {:?}",
@@ -1417,8 +1441,8 @@ impl candle::CustomOp1 for PagedGlueChunks {
             );
         }
         match self.compute_dtype {
-            DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, run_paged_glue_fp16),
-            DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, run_paged_glue_bf16),
+            DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, run_paged_glue_fp16, wave),
+            DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, run_paged_glue_bf16, wave),
             dt => candle::bail!("paged-glue-chunks: unsupported compute dtype {:?}", dt),
         }
     }
@@ -1434,12 +1458,13 @@ impl candle::CustomOp1 for PagedGlueChunks {
 /// bridge window). HD128 only — other head dims stay on the plain prefill path.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub fn paged_glue_attn(
+pub fn paged_glue_attn<'w>(
+    wave: Option<&'w WaveGeneration>,
     caches: &mut [&mut KvCache],
     offsets: &[usize],
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
     b_sz: usize,
     q_lens: &[usize],
     n_head: usize,
@@ -1452,7 +1477,8 @@ pub fn paged_glue_attn(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     generation: &Generation,
-) -> Result<Tensor> {
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
+) -> Result<LiveTensor<'w>> {
     if head_dim != 128 {
         candle::bail!("paged-glue requires head_dim==128 (got {head_dim})");
     }
@@ -1493,7 +1519,7 @@ pub fn paged_glue_attn(
             .first()
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
         match first.k_cache().chunked_storage_policy() {
-            Some(policy) => policy.to_arena_key().is_quantized(),
+            Some(policy) => policy.is_quantized(),
             None => false,
         }
     };
@@ -1545,11 +1571,14 @@ pub fn paged_glue_attn(
     let t_hdr = profile_now();
     // The gaps are real chunks already (no trailing write region), so the slot
     // headers cover exactly `[0, kv_len)`; pass zero glue so build_slot_headers
-    // does not extend a write region. Built fresh every call (always-miss).
+    // does not extend a write region. `shared_pm` is the forward's glue-group
+    // position-map cache: the map is layer-invariant (chunk boundaries are the
+    // same in every layer), so the first layer builds + uploads it and the
+    // other 47 reuse the device buffer, skipping the host build and the PCIe
+    // copy that otherwise dominate this span.
     let zero_q = vec![0usize; b_sz];
-    let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
     let header_upload = build_slot_headers(
-        caches, &zero_q, n_kv_head, head_dim, generation, &glue_pm, None,
+        caches, &zero_q, n_kv_head, head_dim, generation, shared_pm, None,
     )?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);
@@ -1570,6 +1599,7 @@ pub fn paged_glue_attn(
         headers_ptr: header_upload.headers_ptr,
         batch_size: b_sz,
         max_glue,
+        max_kv: kv_lens_host.iter().copied().max().unwrap_or(0),
         n_head,
         n_kv_head,
         head_dim,
@@ -1578,7 +1608,7 @@ pub fn paged_glue_attn(
         rope_interleaved,
     };
     let q_compute = q_packed.to_dtype(compute_dtype)?;
-    let out = q_compute.apply_op1(op)?;
+    let out = with_q_storage(&q_compute, |s, l| op.run(s, l, wave))?;
     profile_sync(device);
     pipeline_record("glue:kernel", t_kernel);
 
@@ -1638,19 +1668,20 @@ pub fn compute_rope_cs(
 /// (`run_paged_decode_*`) for head_dim 64/96/128/256.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub fn paged_decode_attn(
-    q: &Tensor,
+pub fn paged_decode_attn<'w>(
+    wave: Option<&'w WaveGeneration>,
+    q: &LiveTensor<'_>,
     headers_ptr: u64,
     arena_dtype: DType,
     n_q_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     softmax_scale: f32,
-    k_new: &Tensor,
-    v_new: &Tensor,
+    k_new: &LiveTensor<'_>,
+    v_new: &LiveTensor<'_>,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     let num_active_slots = q.dim(0)?;
     let k_new = k_new.contiguous()?;
     let v_new = v_new.contiguous()?;
@@ -1668,7 +1699,7 @@ pub fn paged_decode_attn(
         num_active_slots,
         emit_q8: false,
     };
-    q.apply_op1(op)
+    with_q_storage(q, |s, l| op.run(s, l, wave))
 }
 
 /// B2 decode: like [`paged_decode_attn`] but the combine kernel emits the attention context
@@ -1677,19 +1708,20 @@ pub fn paged_decode_attn(
 /// and feeds `o_proj` via the int8 path — no FP store + standalone quantize.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
-pub fn paged_decode_attn_q8(
-    q: &Tensor,
+pub fn paged_decode_attn_q8<'w>(
+    wave: Option<&'w WaveGeneration>,
+    q: &LiveTensor<'_>,
     headers_ptr: u64,
     arena_dtype: DType,
     n_q_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     softmax_scale: f32,
-    k_new: &Tensor,
-    v_new: &Tensor,
+    k_new: &LiveTensor<'_>,
+    v_new: &LiveTensor<'_>,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     let num_active_slots = q.dim(0)?;
     let k_new = k_new.contiguous()?;
     let v_new = v_new.contiguous()?;
@@ -1707,19 +1739,19 @@ pub fn paged_decode_attn_q8(
         num_active_slots,
         emit_q8: true,
     };
-    q.apply_op1(op)
+    with_q_storage(q, |s, l| op.run(s, l, wave))
 }
 
 #[cfg(feature = "cuda")]
-struct PagedDecode {
+struct PagedDecode<'k> {
     headers_ptr: u64, // raw GPU virtual address of SlotHeader[num_active_slots]
     arena_dtype: DType,
     n_q_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     softmax_scale: f32,
-    k_new: Tensor,
-    v_new: Tensor,
+    k_new: LiveTensor<'k>,
+    v_new: LiveTensor<'k>,
     rope_cs: Tensor,
     rope_interleaved: bool,
     num_active_slots: usize,
@@ -1730,7 +1762,7 @@ struct PagedDecode {
 }
 
 #[cfg(feature = "cuda")]
-impl PagedDecode {
+impl<'k> PagedDecode<'k> {
     /// q8a1024 byte size of the emitted context: `[num_active_slots × (n_q_head·head_dim)]`.
     fn q8_byte_size(&self) -> usize {
         let cols = self.n_q_head * self.head_dim;
@@ -1739,6 +1771,7 @@ impl PagedDecode {
     }
 
     fn cuda_fwd_typed<
+        'w,
         Q: candle::cuda_backend::CudaDType + DeviceRepr + 'static,
         KV: candle::cuda_backend::CudaDType + DeviceRepr,
         O: candle::cuda_backend::CudaDType + DeviceRepr,
@@ -1761,12 +1794,13 @@ impl PagedDecode {
             i32,
             *mut core::ffi::c_void,
         ),
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let dev = q.device().clone();
         let stream = dev.cuda_stream();
 
         let out_elem = self.num_active_slots * self.n_q_head * self.head_dim;
-        let dst = unsafe { dev.alloc::<O>(out_elem)? };
+        let dst = KernelOutput::<O>::new(&dev, out_elem, wave)?;
 
         {
             let q_slice = q.as_cuda_slice::<Q>()?.slice(q_l.start_offset()..);
@@ -1826,14 +1860,14 @@ impl PagedDecode {
             }
         } // all guards dropped here, dst no longer borrowed
 
-        let dst_cs = candle::CudaStorage::wrap_cuda_slice(dst, dev);
         let out_shape = Shape::from_dims(&[self.num_active_slots, self.n_q_head, self.head_dim]);
-        Ok((dst_cs, out_shape))
+        Ok(dst.into_tensor(dev, out_shape))
     }
 
     /// B2 q8a1024-emitting variant: allocates the q8a1024 byte buffer and passes it as the
     /// kernel's `q8_out`, returning a flat `[q8_bytes]` U8 storage (no FP context store).
     fn cuda_fwd_typed_q8<
+        'w,
         Q: candle::cuda_backend::CudaDType + DeviceRepr + 'static,
         KV: candle::cuda_backend::CudaDType + DeviceRepr,
     >(
@@ -1855,12 +1889,13 @@ impl PagedDecode {
             i32,
             *mut core::ffi::c_void,
         ),
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let dev = q.device().clone();
         let stream = dev.cuda_stream();
 
         let q8_bytes = self.q8_byte_size();
-        let dst = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        let dst = KernelOutput::<u8>::new(&dev, q8_bytes, wave)?;
 
         {
             let q_slice = q.as_cuda_slice::<Q>()?.slice(q_l.start_offset()..);
@@ -1915,26 +1950,19 @@ impl PagedDecode {
             }
         } // all guards dropped here, dst no longer borrowed
 
-        let dst_cs = candle::CudaStorage::wrap_cuda_slice(dst, dev);
-        Ok((dst_cs, Shape::from_dims(&[q8_bytes])))
+        Ok(dst.into_tensor(dev, Shape::from_dims(&[q8_bytes])))
     }
 }
 
+/// As [`PagedPrefillInt8::run`]: inherent so the wave-scoped output keeps `'w`.
 #[cfg(feature = "cuda")]
-impl candle::CustomOp1 for PagedDecode {
-    fn name(&self) -> &'static str {
-        "paged-decode"
-    }
-
-    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("no cpu support for paged-decode")
-    }
-
-    fn cuda_fwd(
+impl<'k> PagedDecode<'k> {
+    fn run<'w>(
         &self,
         q: &candle::CudaStorage,
         q_l: &Layout,
-    ) -> Result<(candle::CudaStorage, Shape)> {
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         match self.head_dim {
             64 | 96 | 128 | 256 => {}
             hd => candle::bail!(
@@ -1954,9 +1982,11 @@ impl candle::CustomOp1 for PagedDecode {
                 );
             }
             return match self.arena_dtype {
-                DType::F16 => self.cuda_fwd_typed_q8::<f16, f16>(q, q_l, run_paged_decode_fp16_q8),
+                DType::F16 => {
+                    self.cuda_fwd_typed_q8::<f16, f16>(q, q_l, run_paged_decode_fp16_q8, wave)
+                }
                 DType::BF16 | DType::F8E4M3 => {
-                    self.cuda_fwd_typed_q8::<bf16, bf16>(q, q_l, run_paged_decode_bf16_q8)
+                    self.cuda_fwd_typed_q8::<bf16, bf16>(q, q_l, run_paged_decode_bf16_q8, wave)
                 }
                 dt => candle::bail!("paged-decode q8: unsupported arena dtype {:?}", dt),
             };
@@ -1964,9 +1994,9 @@ impl candle::CustomOp1 for PagedDecode {
 
         use candle_kernels::paged_decode::{run_paged_decode_bf16, run_paged_decode_fp16};
         match self.arena_dtype {
-            DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16),
+            DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16, wave),
             DType::BF16 | DType::F8E4M3 => {
-                self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_bf16)
+                self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_bf16, wave)
             }
             dt => candle::bail!(
                 "paged-decode: unsupported arena dtype {:?} (only F16/BF16 supported)",
@@ -1979,15 +2009,14 @@ impl candle::CustomOp1 for PagedDecode {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::paged_prefill_batched as paged_prefill_flat;
+    use candle_nn::kv_cache::ChunkedKvBacking;
 
     /// Serialize the GPU tests: the split-KV launcher's grow-on-demand
     /// partial pool is a function-local static sized for the production
     /// single-scheduler-thread model — concurrent test launches interleave
-    /// its free/realloc. Same idiom as the prefill_ab harness's guard.
-    fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
-        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        M.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// its free/realloc. So does the region pool every `KvCache` here draws
+    /// from, which is why the lock is crate-wide rather than module-local.
+    use crate::models::gpu_test_lock::gpu_serial;
     use candle::quantized::pinned_staging::{Generation, PinnedStager};
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::KvCache;
@@ -2030,6 +2059,7 @@ mod tests {
             .reshape((total_q, n_kv_head, head_dim))?;
         let q_lens = vec![seq_len; b_sz];
         let out = paged_prefill_flat(
+            None,
             caches,
             offsets,
             &q_flat,
@@ -2293,10 +2323,25 @@ mod tests {
         offset: usize,
         dtype: DType,
     ) -> Result<Tensor> {
+        // Stand in for the scheduler and for `wave_admit`: the prefill entry
+        // neither creates a backing nor claims chunks of its own any more, so a
+        // test driving the kernel directly has to arrive with both, exactly as
+        // the real caller does.
+        let backing = ChunkedKvBacking::new(
+            b_sz,
+            n_kv_head,
+            head_dim,
+            dtype,
+            q.device(),
+            offset + seq_len,
+        )?;
         let mut cache0 = KvCache::new(2, 4096);
         cache0.force_dtype(dtype);
+        cache0.set_chunked_backing(&backing, 0, None)?;
+        cache0.set_current_seq_len(offset)?;
         let offsets = [offset];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
+        KvCache::ensure_chunked_capacity_batch(&mut caches, &offsets, seq_len)?;
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, q.device())?;
         let generation = PinnedStager::new(q.device().as_cuda_device()?).begin_generation();
 
@@ -2980,6 +3025,9 @@ mod tests {
 
         let offsets = [0usize];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
+        // Stand in for `wave_admit`: the prefill entry no longer claims its own
+        // chunks, so the caller must have made the write region before it runs.
+        KvCache::ensure_chunked_capacity_batch(&mut caches, &offsets, seq_len)?;
         let generation = backing.begin_stager_generation_required();
 
         let out = paged_prefill_uniform(

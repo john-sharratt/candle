@@ -121,3 +121,39 @@ examples:
   <|projection|><tool_call>
   <|projection|>{"name": "datetime", "arguments": {"timezone": "Australia/Sydney"}}
   </tool_call><|projection|>
+- |-
+  what is the current date<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user is asking for the current date. I must not answer this from memory — I have no idea what today is, and guessing would be a hallucinated date. The datetime tool<|projection|> returns the current date and time, so this is a call, not an answer.
+
+  No timezone was given. The timezone parameter is optional and defaults to UTC when omitted, so I can call datetime with empty<|projection|> arguments and read the date off the ISO 8601 timestamp it returns.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what time is it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants the current time. This is exactly the case the datetime tool exists for — the current clock is something I cannot know without calling it, and inventing a time would be<|projection|> wrong.
+
+  They did not name a city or zone, so the timezone parameter is omitted and the tool defaults to UTC. The call takes no arguments.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  what's the current date and time right now?<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A direct request for the current date and time. The datetime tool returns both together — an ISO 8601 timestamp, the unix epoch, and the weekday name — so one call<|projection|> answers all of it.
+
+  No zone was specified, so I leave the timezone out and the tool uses UTC. The whole reply is the tool call; I answer once the response comes back.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "datetime", "arguments": {}}
+  </tool_call><|projection|>

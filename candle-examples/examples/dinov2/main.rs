@@ -1,5 +1,10 @@
-//! DINOv2: Learning Robust Visual Features without Supervision
+//! DINOv2 ImageNet-1k classification (self-supervised ViT features + linear head).
 //! https://github.com/facebookresearch/dinov2
+//!
+//! Loads a single `--image` (224x224 ImageNet preprocessing), runs
+//! `candle_transformers::models::dinov2::vit_small`, and prints the top-5
+//! class probabilities. `--model` overrides the default weights fetched from
+//! `lmz/candle-dino-v2` on the HF Hub.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

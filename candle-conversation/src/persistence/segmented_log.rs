@@ -37,7 +37,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::direct_io::DirectFile;
 use super::header_index::IndexEntry;
 use super::log_file::{read_record_at, LogFile, LogSource, Superblock, SUPERBLOCK_SIZE};
 use super::manifest::Manifest;
@@ -46,6 +45,7 @@ use super::recovery;
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::WalkEntry;
 use super::Result;
+use candle::direct_io::DirectFile;
 
 /// Soft size the active segment grows to before the next commit seals it and
 /// mints a fresh active. ~4 GB (§12). A single commit is never split across

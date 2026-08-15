@@ -23,6 +23,10 @@ use super::{score_provenance_late_fusion_fused, score_provenance_late_fusion_gro
 pub struct SlotBelief {
     pub score: f32,
     pub selected: bool,
+    /// Whether this slot has ever reached the selection threshold on its own
+    /// belief this turn (as opposed to being force-filled by the min budget).
+    /// Carried across reprojections; gates the early-decode carry floor.
+    pub qualified: bool,
 }
 
 /// Scan `query` (the live probe window) against a gallery of past turn windows,
@@ -124,12 +128,17 @@ pub fn score_slots_fused(
 ///
 /// `carry_floor` is the early-decode grace floor (see
 /// [`crate::projection::PolicyConfig::windowed`]): when `Some(f)`, a carried
-/// already-selected slot whose belief decays below `f` is held at `f` so it
-/// survives the opening window; `None` is the steady-state (no floor).
+/// already-selected slot that has *qualified* (reached the selection threshold on
+/// its own belief at some point this turn) and whose belief decays below `f` is
+/// held at `f` so it survives the opening window; `None` is the steady-state (no
+/// floor). A slot that only ever entered scope through the min-budget force-fill
+/// is never floored — the floor protects a real pick whose decode-Q is still
+/// accruing, not a slot that has shown nothing.
 pub fn belief_step(
     fresh: &[f32],
     prior_scores: &[f32],
     prior_selected: &[bool],
+    prior_qualified: &[bool],
     policy: SectionPolicy,
     budget: GroupBudget,
     carry_floor: Option<f32>,
@@ -140,12 +149,13 @@ pub fn belief_step(
         *s = prior_scores.get(i).copied().unwrap_or(0.0);
     }
     let mut sel = SectionSelector::new(vec![policy; n], vec![budget]);
-    sel.seed(&seed, prior_selected);
+    sel.seed(&seed, prior_selected, prior_qualified);
     sel.update_with_floor(fresh, carry_floor);
     (0..n)
         .map(|i| SlotBelief {
             score: sel.scores()[i],
             selected: sel.is_selected(i),
+            qualified: sel.is_qualified(i),
         })
         .collect()
 }
@@ -231,6 +241,7 @@ mod tests {
             &[3.0, 6.0, 0.0],
             &[],
             &[],
+            &[],
             policy(0.5, 5.0, 2.0),
             OPEN,
             None,
@@ -239,21 +250,24 @@ mod tests {
             out[0],
             SlotBelief {
                 score: 3.0,
-                selected: false
+                selected: false,
+                qualified: false
             }
         );
         assert_eq!(
             out[1],
             SlotBelief {
                 score: 6.0,
-                selected: true
+                selected: true,
+                qualified: true
             }
         );
         assert_eq!(
             out[2],
             SlotBelief {
                 score: 0.0,
-                selected: false
+                selected: false,
+                qualified: false
             }
         );
     }
@@ -265,6 +279,7 @@ mod tests {
         let out = belief_step(
             &[0.0, 8.0],
             &[10.0, 0.0],
+            &[true, false],
             &[true, false],
             policy(0.5, 5.0, 2.0),
             OPEN,
@@ -283,6 +298,7 @@ mod tests {
             &[0.0, 20.0],
             &[6.0, 0.0],
             &[true, false],
+            &[true, false],
             policy(0.5, 5.0, 2.0),
             GroupBudget { min: 0, max: 1 },
             None,
@@ -297,6 +313,7 @@ mod tests {
         // Four slots cross min 0; max 2 keeps the two strongest.
         let out = belief_step(
             &[3.0, 9.0, 1.0, 7.0],
+            &[],
             &[],
             &[],
             policy(0.0, 0.0, 0.0),
@@ -317,6 +334,7 @@ mod tests {
             &[0.0],
             &[300.0],
             &[true],
+            &[true],
             policy(0.40, 250.0, 187.5),
             OPEN,
             Some(250.0),
@@ -328,12 +346,123 @@ mod tests {
             &[0.0],
             &[300.0],
             &[true],
+            &[true],
             policy(0.40, 250.0, 187.5),
             OPEN,
             None,
         );
         assert_eq!(out[0].score, 180.0);
         assert!(!out[0].selected);
+    }
+
+    /// The carry floor is for a pick that showed evidence. A slot that only ever
+    /// entered scope through the min-budget force-fill never qualified, so the
+    /// floor must not lift it — otherwise one evidence-free opening pick is
+    /// inflated to the early bar and locked in for the whole grace window, which
+    /// is how an unrelated tool came to sit at exactly `early_min_score` for
+    /// several reprojections while the right one never got in.
+    #[test]
+    fn carry_floor_ignores_a_pick_that_never_qualified() {
+        let out = belief_step(
+            &[0.0],
+            &[10.0],
+            &[true],  // carried as selected …
+            &[false], // … but never crossed min on its own belief
+            policy(0.40, 250.0, 187.5),
+            OPEN,
+            Some(250.0),
+        );
+        assert_eq!(out[0].score, 6.0, "decays normally, no floor applied");
+        assert!(!out[0].selected, "and falls out of the band");
+        assert!(!out[0].qualified);
+    }
+
+    /// Crossing `min_score` marks a slot qualified, and that survives the trip
+    /// through a projection event (the caller feeds it back as `prior_qualified`).
+    #[test]
+    fn qualification_is_recorded_when_a_slot_crosses_min() {
+        let first = belief_step(
+            &[300.0],
+            &[],
+            &[],
+            &[],
+            policy(0.40, 250.0, 187.5),
+            OPEN,
+            None,
+        );
+        assert!(first[0].selected);
+        assert!(first[0].qualified, "300 >= min 250");
+
+        // Fed back, it is now eligible for the floor.
+        let second = belief_step(
+            &[0.0],
+            &[first[0].score],
+            &[first[0].selected],
+            &[first[0].qualified],
+            policy(0.40, 250.0, 187.5),
+            OPEN,
+            Some(250.0),
+        );
+        assert_eq!(second[0].score, 250.0, "floored, because it qualified");
+    }
+
+    /// With no evidence anywhere, a min budget must not manufacture a selection:
+    /// the ordering among all-zero beliefs is arbitrary, so force-filling there
+    /// presents whichever slot happens to sort first as if it were a choice.
+    #[test]
+    fn min_budget_does_not_force_fill_from_an_empty_field() {
+        let out = belief_step(
+            &[0.0, 0.0, 0.0],
+            &[],
+            &[],
+            &[],
+            policy(0.40, 800.0, 600.0),
+            GroupBudget { min: 1, max: 3 },
+            None,
+        );
+        assert!(
+            out.iter().all(|b| !b.selected),
+            "an all-zero field selects nothing",
+        );
+    }
+
+    /// The turn-boundary challenger is seated at the selection bar but has not
+    /// crossed it, so it must decay out if its fresh signal does not hold up. If
+    /// the floor could reach it, it would instead sit at the seed score for the
+    /// whole grace window and squat a budget slot.
+    #[test]
+    fn a_seated_challenger_decays_out_instead_of_being_floored() {
+        // Seeded exactly at the windowed bar (250), selected, unqualified — the
+        // shape `seat_turn_boundary_challenger` produces.
+        let out = belief_step(
+            &[0.0],
+            &[250.0],
+            &[true],
+            &[false],
+            policy(0.40, 250.0, 187.5),
+            GroupBudget { min: 0, max: 3 },
+            Some(250.0),
+        );
+        assert_eq!(out[0].score, 150.0, "decays by beta, no floor");
+        assert!(!out[0].selected, "and drops out of the band");
+    }
+
+    /// A weak-but-real signal still force-fills — the guard is specifically about
+    /// *no* evidence, not about being below `min_score`.
+    #[test]
+    fn min_budget_still_force_fills_the_strongest_nonzero_slot() {
+        let out = belief_step(
+            &[0.0, 12.0, 3.0],
+            &[],
+            &[],
+            &[],
+            policy(0.40, 800.0, 600.0),
+            GroupBudget { min: 1, max: 3 },
+            None,
+        );
+        let sel: Vec<bool> = out.iter().map(|b| b.selected).collect();
+        assert_eq!(sel, vec![false, true, false]);
+        assert!(!out[1].qualified, "force-filled, not qualified");
     }
 
     #[test]

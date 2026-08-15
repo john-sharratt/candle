@@ -1,3 +1,11 @@
+//! Test harness for `sampled_selection`: re-exports the CPU/GPU sampling API
+//! under `pub(super)`, loads the golden Qwen3 KV dump
+//! (`src/kv_cache/chunked/tests/data/qwen3-kv-data.bin`) when present, and
+//! provides synthetic-batch/R16-packing generators used across the child test
+//! modules (`benchmark`, `calibration`, `gpu_vs_cpu`, `helpers`, `model`,
+//! `projection`, `test_data`) — CPU-vs-GPU parity, threshold calibration
+//! sweeps, and format-selection correctness against real and synthetic K/V.
+
 #[allow(unused_imports)]
 pub(super) use super::{
     model_compression_from_surface, sample_error_surface, sample_error_surface_cpu,

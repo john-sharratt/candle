@@ -1,3 +1,11 @@
+//! PaliGemma vision-language model: image-conditioned text generation.
+//!
+//! Fixed to `google/paligemma-3b-mix-224` (224x224 input, `[-1, 1]`
+//! normalized). The first decode step calls `model.setup(&image, &input)`
+//! to prime the model with both the image and the text prompt; subsequent
+//! steps call plain `model.forward`. Weights load as BF16 on CUDA / F32 on
+//! CPU. Standard temperature/top-p sampling with repeat penalty.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

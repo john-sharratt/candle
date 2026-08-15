@@ -10,7 +10,7 @@
 // column's K/V exactly ONCE and reuses it across all G x hpg query rows
 // (dequant-once). The G x hpg flash-state lives in shared memory; the warps
 // cooperate over the streamed columns rather than each owning a per-warp partial
-// (which would not scale past hpg rows). See docs/paged_glue_kernel.md.
+// (which would not scale past hpg rows). See docs/glue_prefill_kernel.md.
 //
 // v0: one block per (slot, kv_head); a per-column manual dot (correctness
 // first); query tokens tiled by G_TILE so the smem flash-state fits. The INT8
@@ -41,6 +41,24 @@ namespace paged_glue {
 // SM). Lower G_TILE trades more gridDim.z blocks for higher occupancy.
 constexpr int GLUE_G_TILE = 2;
 
+// Split-KV column quantum: each (slot, kv_head, glue_tile) block streams only
+// its `[split*GLUE_SPLIT_COLS, +GLUE_SPLIT_COLS)` column window; the per-split
+// un-normalized flash partials are merged by the decode combine kernel. This
+// bounds a wave's wall-clock by ONE window's stream time instead of the whole
+// slot's — the deep-slot fix (a 5-6k-column slot otherwise streams end-to-end
+// in every one of the ~26 z-tile blocks concurrently, wall = full-slot time).
+//
+// The quantum is FIXED (not derived from the batch): a slot's column partition
+// depends only on its own `kv_len`, so a slot in a mixed batch accumulates in
+// exactly the per-window order it accumulates alone — splits past a short
+// slot's end emit null partials (m=-inf, l=0) that add exact zeros in the
+// combine. That keeps the batched-vs-alone bit-identity contract. Only when a
+// slot exceeds GLUE_MAX_SPLITS windows does the quantum grow (and the
+// bit-identity guarantee then holds only among batches with the same grown
+// quantum — a >16k-column glue slot, far past current projection sizes).
+constexpr int GLUE_SPLIT_COLS = 1024;
+constexpr int GLUE_MAX_SPLITS = 16;
+
 // One block per (slot, kv_head). All warps cooperate: each streamed prefix /
 // glue column is dequantized once into smem and scored against every resident
 // glue row.
@@ -62,7 +80,17 @@ __global__ void paged_glue_kernel(
     const uint32_t* __restrict__ kv_lens,
     const uint32_t* __restrict__ glue_write_slice,
     const uint32_t* __restrict__ glue_write_in_blk,
-    const uint32_t* __restrict__ fwd_ahead     // per glue token: forward bridge window (tokens)
+    const uint32_t* __restrict__ fwd_ahead,    // per glue token: forward bridge window (tokens)
+    // Split-KV (gridDim.z = glue_tiles * num_splits). Non-null partial_acc →
+    // each block streams its `[split*split_cols, +split_cols)` column window and
+    // writes the un-normalized flash partial (ΣwV, m, l) at
+    // `[(q_start+t)*n_q_head+qh][split]`; the combine kernel normalizes. Null →
+    // num_splits==1, full-range stream, direct normalized write (the exact
+    // single-pass path).
+    float* __restrict__ partial_acc,           // [total_q*n_q_head][num_splits][HEAD_DIM]
+    float* __restrict__ partial_ml,            // [total_q*n_q_head][num_splits][2]
+    int num_splits,
+    int split_cols
 ) {
     constexpr int N_PALETTE = 4;
     constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
@@ -109,12 +137,14 @@ __global__ void paged_glue_kernel(
     // so no row can read into a neighbouring slot in the batch.
     const int stream_cols = kv_len;
 
-    // This block handles ONE query-row tile of GLUE_G_TILE glue tokens. The tiles
-    // run in parallel across gridDim.z so different tiles' prefix streams (the
-    // dequant work) overlap on the SMs instead of serializing as in-block passes
-    // — that is what keeps the per-column dequant ~once in wall-clock for large
-    // glue, within the per-block smem budget for the flash-state.
-    const int g0 = (int)blockIdx.z * GLUE_G_TILE;
+    // This block handles ONE query-row tile of GLUE_G_TILE glue tokens for ONE
+    // split-KV column window. gridDim.z = glue_tiles * num_splits, tile-major:
+    // different tiles' (and windows') prefix streams overlap on the SMs instead
+    // of serializing as in-block passes, within the per-block smem budget for
+    // the column staging.
+    const int glue_tiles = (int)gridDim.z / num_splits;
+    const int g0 = ((int)blockIdx.z % glue_tiles) * GLUE_G_TILE;
+    const int split_idx = (int)blockIdx.z / glue_tiles;
     if (g0 >= g_total) return; // empty tile: this slot has fewer glue tokens
 
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
@@ -240,10 +270,17 @@ __global__ void paged_glue_kernel(
         // from the chunk `rope_base` (causal mask + RoPE), stashed in col_pos_smem.
         int cur_slice = -1;             // per-warp: this warp's last-seen slice
         PalIter<VEC, HEAD_DIM> ki, vi;  // per-warp un-permute maps
-        for (int c0 = 0; c0 < stream_cols; c0 += TILE_COLS) {
+        // This block's column window. Single-pass (null partial_acc) streams the
+        // whole slot; split mode streams only its window — a window past this
+        // slot's end runs zero tiles, leaving the initial flash state (m=-inf,
+        // l=0, O=0) to be emitted as a null partial the combine ignores.
+        const int win_lo = (partial_acc != nullptr) ? split_idx * split_cols : 0;
+        const int win_hi =
+            (partial_acc != nullptr) ? min(win_lo + split_cols, stream_cols) : stream_cols;
+        for (int c0 = win_lo; c0 < win_hi; c0 += TILE_COLS) {
             const int c = c0 + warp; // this warp's column
             int col_pos = 0;
-            if (c < stream_cols) {
+            if (c < win_hi) {
                 int slice_idx = 0, in_blk = 0;
                 resolve_pos(slot, c, slice_idx, in_blk);
                 const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
@@ -309,7 +346,7 @@ __global__ void paged_glue_kernel(
             }
             __syncthreads(); // all warps' tile columns staged into k_col/v_col
 
-            const int tile_cols = min(TILE_COLS, stream_cols - c0);  // was kv_len
+            const int tile_cols = min(TILE_COLS, win_hi - c0);
 
             // Score the tile's columns against this warp's rows, accumulating the
             // online-softmax state in registers. `m_reg`/`l_reg` stay
@@ -359,7 +396,10 @@ __global__ void paged_glue_kernel(
             __syncthreads(); // before the next tile overwrites k_col/v_col
         }
 
-        // ── Normalize (register O / register l) + write out this warp's rows. ──
+        // ── Emit this warp's rows: split mode writes the un-normalized flash
+        // partial (ΣwV, m, l) for this window (a window with no attended
+        // columns emits the null initial state, which the combine ignores);
+        // single-pass normalizes and writes the final output directly. ──
         #pragma unroll
         for (int rl = 0; rl < ROWS_PER_WARP; ++rl) {
             const int row = warp + rl * n_warps;
@@ -367,19 +407,37 @@ __global__ void paged_glue_kernel(
             const int t = g0 + row / hpg;
             const int h = row % hpg;
             const int q_head = head_base + h;
-            const float inv = __fdividef(1.f, fmaxf(l_reg[rl], 1e-10f));
-            const int64_t ob =
-                ((int64_t)(q_start + t) * (int64_t)n_q_head + (int64_t)q_head) * (int64_t)HEAD_DIM;
-            #pragma unroll
-            for (int j = 0; j < VEC; ++j)
-                out[ob + lane * VEC + j] = from_f32<O>(o_reg[rl][j] * inv);
+            const int64_t orow = (int64_t)(q_start + t) * (int64_t)n_q_head + (int64_t)q_head;
+            if (partial_acc != nullptr) {
+                const int64_t base = orow * num_splits + split_idx;
+                float* acc = partial_acc + base * HEAD_DIM;
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) acc[lane * VEC + j] = o_reg[rl][j];
+                if (lane == 0) {
+                    partial_ml[base * 2] = m_reg[rl];
+                    partial_ml[base * 2 + 1] = l_reg[rl];
+                }
+            } else {
+                const float inv = __fdividef(1.f, fmaxf(l_reg[rl], 1e-10f));
+                const int64_t ob = orow * (int64_t)HEAD_DIM;
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j)
+                    out[ob + lane * VEC + j] = from_f32<O>(o_reg[rl][j] * inv);
+            }
         }
     }
 }
 
-// Host launcher. One block per (slot, kv_head, glue_tile); the flash-state is
-// register-resident, so dynamic smem is just the tile's dequanted K/V columns.
-// HEAD_DIM=128 is the production path.
+// Host launcher. One block per (slot, kv_head, glue_tile, split); the
+// flash-state is register-resident, so dynamic smem is just the tile's
+// dequanted K/V columns. HEAD_DIM=128 is the production path.
+//
+// Split-KV: `max_kv` (the batch's longest slot, in columns) sizes the split
+// grid — `num_splits = ceil(max_kv / GLUE_SPLIT_COLS)`, so every slot's
+// columns are covered and each block streams at most one quantum. One split
+// keeps the exact single-pass direct-write path; more go through the
+// per-split partial pool + the decode combine kernel. `total_q` (Σ q_lens)
+// sizes the partial pool: one row per (glue token, query head).
 template <typename Q_T, typename T, typename O, int HEAD_DIM>
 inline void launch_paged_glue_attn(
     const Q_T* q,
@@ -387,6 +445,8 @@ inline void launch_paged_glue_attn(
     O* out,
     int batch,
     int max_glue, // max q_lens[b] over slots — sizes the parallel glue-tile grid
+    int total_q,  // Σ q_lens over slots — sizes the split-KV partial pool
+    int max_kv,   // max kv_lens[b] over slots — sizes the split-KV grid
     int n_q_head,
     int n_kv_head,
     float softmax_scale,
@@ -419,17 +479,50 @@ inline void launch_paged_glue_attn(
 
     int glue_tiles = (max_glue + GLUE_G_TILE - 1) / GLUE_G_TILE;
     if (glue_tiles < 1) glue_tiles = 1;
-    dim3 grid(batch, n_kv_head, glue_tiles);
+
+    // Split factor from the deepest slot. The quantum stays FIXED at
+    // GLUE_SPLIT_COLS (slot-local partition — see the constant's comment);
+    // only past GLUE_MAX_SPLITS quanta does it grow to keep coverage.
+    int num_splits = (max_kv + GLUE_SPLIT_COLS - 1) / GLUE_SPLIT_COLS;
+    if (num_splits < 1) num_splits = 1;
+    int split_cols = GLUE_SPLIT_COLS;
+    if (num_splits > GLUE_MAX_SPLITS) {
+        num_splits = GLUE_MAX_SPLITS;
+        // Round the grown quantum up to TILE_COLS so window edges stay
+        // tile-aligned; num_splits * split_cols still covers max_kv.
+        split_cols = (max_kv + num_splits - 1) / num_splits;
+        split_cols = (split_cols + TILE_COLS - 1) / TILE_COLS * TILE_COLS;
+    }
+
+    float* pa = nullptr;
+    float* pm = nullptr;
+    if (num_splits > 1) {
+        fused_attn::fused_attn_partial_pool((int64_t)total_q * n_q_head, num_splits, HEAD_DIM,
+                                            &pa, &pm, stream);
+        if (pa == nullptr || pm == nullptr) num_splits = 1; // pool alloc failed: single-pass
+    }
+
+    dim3 grid(batch, n_kv_head, glue_tiles * num_splits);
     dim3 block(WARPS_PER_BLOCK * 32);
     kern<<<grid, block, smem_bytes, stream>>>(
         q, headers_ptr, out, batch, n_q_head, n_kv_head, softmax_scale,
         k_new, v_new, rope_cs, rope_interleaved != 0,
         cu_seqlens_q, q_lens, kv_lens,
-        glue_write_slice, glue_write_in_blk, fwd_ahead);
+        glue_write_slice, glue_write_in_blk, fwd_ahead,
+        (num_splits > 1) ? pa : nullptr, (num_splits > 1) ? pm : nullptr,
+        num_splits, split_cols);
     cudaError_t e2 = cudaGetLastError();
-    if (e1 != cudaSuccess || e2 != cudaSuccess) {
-        printf("[GLUE LAUNCH] smem_req=%zu dev_max=%d setattr=%s launch=%s\n",
-               smem_bytes, max_smem, cudaGetErrorString(e1), cudaGetErrorString(e2));
+    cudaError_t e3 = cudaSuccess;
+    if (num_splits > 1) {
+        const int num_rows = total_q * n_q_head;
+        fused_attn::int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
+            out, pa, pm, num_rows, num_splits, nullptr);
+        e3 = cudaGetLastError();
+    }
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+        printf("[GLUE LAUNCH] smem_req=%zu dev_max=%d splits=%d setattr=%s launch=%s combine=%s\n",
+               smem_bytes, max_smem, num_splits, cudaGetErrorString(e1), cudaGetErrorString(e2),
+               cudaGetErrorString(e3));
     }
 }
 

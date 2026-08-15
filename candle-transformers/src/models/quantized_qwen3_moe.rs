@@ -14,7 +14,13 @@
 #[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
-use super::batched_model::BatchedModelCore;
+use super::batched_model::{BatchedModelCore, WaveShapes};
+#[cfg(feature = "cuda")]
+use super::expert_lre::ExpertCacheSetup;
+#[cfg(feature = "cuda")]
+use super::expert_lre::GpuDispatchTables;
+#[cfg(feature = "cuda")]
+use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
 use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
@@ -22,15 +28,31 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
+use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
+use crate::models::wave_buffers::wave_root;
+use crate::models::wave_buffers::wave_zeros;
 use crate::quantized_nn::RmsNorm;
+use candle::cuda_backend::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::{moe_route, DynamicActs, MOE_MAX_TOPK};
+use candle::quantized::cuda::{
+    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
+    moe_bucketize, moe_route, silu_mul_q8a128, DynamicActs, Q8a128Operand, GROUPED_GEMM_TILE_W,
+    MOE_MAX_TOPK,
+};
 #[cfg(feature = "cuda")]
-use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
+use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
+use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::try_enter_relief, kv_cache::KvCache, Activation, Embedding, Module};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
+use candle_nn::kv_cache::WeightZone;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{
+    initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
+};
+use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -137,11 +159,11 @@ struct AttentionWeights {
 impl AttentionWeights {
     /// q/k/v projection over a producer-prepared [`DynamicActs`] (the fused `ln1` output).
     #[cfg(feature = "cuda")]
-    fn project_qkv(
+    fn project_qkv<'w>(
         &self,
-        acts: &DynamicActs,
+        acts: &DynamicActs<'w>,
         out_dtype: DType,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>)> {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         let q_proj = self
@@ -243,7 +265,12 @@ impl SparseMoeBlock {
     /// Float for Off). The router consumes it via `forward_dynamic`; the experts byte-gather the
     /// q8a128 directly (no gather-then-quantize). CUDA only.
     #[cfg(feature = "cuda")]
-    fn forward_dynamic(&self, acts: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+    fn forward_dynamic<'w>(
+        &self,
+        acts: DynamicActs<'w>,
+        out_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
             DynamicActs::Float(t) => t.dims3()?,
             DynamicActs::Int8(op) => match op.lead.as_slice() {
@@ -286,39 +313,66 @@ impl SparseMoeBlock {
             })
         }
         #[cfg(feature = "cuda")]
-        if let DynamicActs::Int8(op) = &acts {
-            // Every condition here degrades to the host path, never to an error.
-            // The model-level conditions are k inside the bucketize kernel's
-            // per-token sort bound, routing-trace capture (needs the CPU-side
-            // expert sets), and the diagnostic env override. The cache-owned
-            // safety chain (table coverage, router width == table width, live
-            // pipeline thread) is checked ONCE inside `forward_moe_gpu`, which
-            // returns `None` — falling through to the host path — when the
-            // GPU-native dispatch tables are unavailable.
-            if k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced() {
-                if let Some(ys) = self.cache.forward_moe_gpu(
-                    self.moe_layer_idx,
-                    &router_logits,
+        if matches!(&acts, DynamicActs::Int8(_)) {
+            // Every condition here degrades to the host path, never to an
+            // error. The cache-owned safety chain (table coverage, router
+            // width == table width, live pipeline thread) is
+            // `live_gpu_dispatch`; the model-level conditions are k inside
+            // the bucketize kernel's per-token sort bound, routing-trace
+            // capture (needs the CPU-side expert sets), and the diagnostic
+            // env override.
+            if let Some(gd) = self
+                .cache
+                .live_gpu_dispatch(self.moe_layer_idx, num_experts)
+                .filter(|_| {
+                    k <= MOE_MAX_TOPK && !routing_capture::is_enabled() && !host_dispatch_forced()
+                })
+            {
+                // Moved, not borrowed: the gather is the activation's last
+                // reader, and a borrow here would be a borrow of a local that
+                // the `'w`-bounded result outlives.
+                let DynamicActs::Int8(op) = acts else {
+                    unreachable!("guarded by the `matches!` above")
+                };
+                return self.forward_gpu_native(
+                    wave,
                     op,
+                    &router_logits,
+                    num_tokens,
+                    b_size,
+                    seq_len,
+                    hidden_dim,
                     k,
                     num_experts,
-                    self.norm_topk_prob,
+                    gd,
                     out_dtype,
-                )? {
-                    return ys.reshape((b_size, seq_len, hidden_dim));
-                }
+                    t,
+                );
             }
         }
 
-        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, k, t)?;
-        let input = match acts {
-            DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
-            DynamicActs::Int8(op) => MoeInput::Q8(op),
+        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
+        // The expert-pipeline thread takes its work over a channel, so
+        // `MoeWorkRequest` cannot carry a lifetime and the operand must be
+        // `'static`. That is a statement about ownership, not about how long the
+        // bytes live: `submit_moe_work` sends and immediately blocks on the
+        // response, so `acts` — and the FFN span it sits in — is live for the
+        // whole of the worker's use. So these lease rather than copy; owning the
+        // bytes would mean a device copy of the entire ln2 activation per layer.
+        let Device::Cuda(lease_dev) = router_logits.device().clone() else {
+            candle::bail!("SparseMoeBlock::forward_dynamic: expected a CUDA device")
+        };
+        let input = match &acts {
+            DynamicActs::Float(t2) => MoeInput::Float(unsafe {
+                t2.as_foreign_lease()?.reshape((num_tokens, hidden_dim))?
+            }),
+            DynamicActs::Int8(op) => MoeInput::Q8(unsafe { op.as_foreign_lease(&lease_dev)? }),
         };
         self.forward_with_indices(
             input,
             out_dtype,
-            weights_flat,
+            // Same channel boundary, same reasoning, same lease.
+            unsafe { weights_flat.as_foreign_lease()? },
             idx_cpu,
             b_size,
             seq_len,
@@ -326,17 +380,156 @@ impl SparseMoeBlock {
             k,
             num_experts,
             t,
+            wave.map(|g| g.ticket()),
         )
+    }
+
+    /// Fully GPU-native expert forward for the all-resident cache: the routing
+    /// indices stay on the device from `moe_route` through the scatter.
+    ///
+    ///   1. `moe_route` — fused softmax + top-k (weights + indices, both GPU);
+    ///   2. `moe_bucketize` — the expert counting-sort, on-device
+    ///      (bit-identical grouping, proven by its unit tests), into this
+    ///      layer's reusable workspace;
+    ///   3. `fused_moe_gather_q8a128` → gate/up/down `grouped_qmatmul_dev_q8a128`
+    ///      (dispatched by the static resident pointer tables, RAW expert ids)
+    ///      → fused SwiGLU;
+    ///   4. `fused_deterministic_scatter` with the bucketize's token-major
+    ///      tables — the same ascending-grouped-row accumulation order as the
+    ///      host path, so the output bits match it exactly.
+    ///
+    /// Every launch bound is data-independent (the `n_tokens × k` assignment
+    /// bound; the GEMM grid additionally tightens to `⌈a_ub/tile_w⌉ +
+    /// n_experts`, the most tiles any bucketing can produce — padding
+    /// tiles/rows are skipped in-kernel), so no data-dependent value ever
+    /// crosses back to the host.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    /// `'a` and `'w` are separate on purpose: `op` is consumed here, while the
+    /// returned combine target comes from `wave`. Unifying them would make the
+    /// result appear to borrow the activation and force the caller's operand to
+    /// outlive its own frame.
+    fn forward_gpu_native<'w>(
+        &self,
+        wave: Option<&'w WaveGeneration>,
+        op: Q8a128Operand<'w>,
+        router_logits: &LiveTensor<'_>,
+        num_tokens: usize,
+        b_size: usize,
+        seq_len: usize,
+        hidden_dim: usize,
+        k: usize,
+        num_experts: usize,
+        gd: &GpuDispatchTables,
+        out_dtype: DType,
+        t: ProfileMark,
+    ) -> Result<LiveTensor<'w>> {
+        let device = router_logits.device().clone();
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("forward_gpu_native: expected a CUDA device"),
+        };
+
+        // 1. Fused GPU routing; the flattened weights feed the scatter directly.
+        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
+        let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
+        self.cache.record_profile("fwd_routing", t);
+
+        // 2. On-device bucketize into the shared reusable workspace.
+        let t = profile_now();
+        let mut ws = gd
+            .workspace
+            .lock()
+            .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
+        moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
+        let a_ub = num_tokens * k;
+        // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and
+        // each expert adds at most one partial tile, so launching `a_ub` blocks
+        // (~25× too many at large prefill) is never needed.
+        let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + num_experts);
+        let expert_base = gd
+            .expert_base(self.moe_layer_idx)
+            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
+
+        // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
+        let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &cuda_dev, wave_root(wave))?;
+        let gate_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.gate_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype,
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let up_out = grouped_qmatmul_dev_q8a128(
+            &stacked,
+            &gd.up_ptrs,
+            expert_base,
+            num_experts,
+            gd.gate_dtype, // up shares gate's KO dtype
+            gd.gate_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
+        let down_out = grouped_qmatmul_dev_q8a128(
+            &inter_acts,
+            &gd.down_ptrs,
+            expert_base,
+            num_experts,
+            gd.down_dtype,
+            gd.down_nrows,
+            &ws.tile_expert,
+            &ws.tile_b_start,
+            &ws.tile_b_cnt,
+            launch_tiles,
+            &cuda_dev,
+        )?;
+        // The int8 matmul emits F32; the fused scatter requires the compute dtype.
+        let down_out = down_out.to_dtype(out_dtype)?;
+
+        // 4. Deterministic scatter — identical accumulation order to the host path.
+        // The combine target is the layer's largest transient, and it is
+        // scattered into rather than overwritten, so it has to start zeroed.
+        // `wave_zeros` gives it a range of the wave's half when the layer has a
+        // generation open around `ffn_forward` — which `forward_layer_batched_mixed`
+        // does, spanning this call through the residual add that consumes the
+        // result.
+        let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device, wave)?;
+        fused_deterministic_scatter(
+            &ys,
+            &down_out,
+            &ws.perm,
+            &weights_flat,
+            &ws.rw_ids,
+            &ws.token_starts,
+            num_tokens,
+            &cuda_dev,
+        )?;
+        self.cache.record_profile("fwd_expert_gpu", t);
+        ys.reshape((b_size, seq_len, hidden_dim))
     }
 
     /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
     /// Used by both the FP and q8a128 arms of `forward_dynamic` — operates only on the logits.
-    fn route_indices(
+    fn route_indices<'a>(
         &self,
-        router_logits: &Tensor,
+        router_logits: &LiveTensor<'a>,
+        num_tokens: usize,
         k: usize,
         t: ProfileMark,
-    ) -> Result<(Tensor, Vec<Vec<u32>>)> {
+    ) -> Result<(LiveTensor<'a>, Vec<Vec<u32>>)> {
+        // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
+        #[cfg(not(feature = "cuda"))]
+        let _ = num_tokens;
         // Fused routing: softmax + top-k select + (optional) renormalize in a single kernel,
         // replacing the `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches
         // over a tiny `[num_tokens, 128]` tensor). top-k of softmax == top-k of the logits (softmax
@@ -365,19 +558,124 @@ impl SparseMoeBlock {
         // Flatten weights to 1-D on GPU — stays device-resident.
         let weights_flat = top_k_weights.flatten_all()?.contiguous()?; // [num_tokens * k]
 
-        // Routing readback: the streaming expert cache needs host-visible expert ids to schedule
-        // its pinned→VRAM uploads, so pull the top-k indices to the CPU. A routing-stream /
-        // pinned-buffer ASYNC DtoH lived here and was REMOVED — it regressed the batched decode
-        // path without helping (measured −8% on DeepSeek cfg8; the per-layer routing readback is a
-        // genuine GPU-catch-up dependency, not a hideable command-buffer flush). The Markov
-        // prefetch hint still fires so the pipeline thread can start predicted-expert DMA while the
-        // readback drains.
-        let idx_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2::<u32>()?;
-        self.cache.record_profile("fwd_routing", t);
-        let prev_experts = self.cache.get_prev_layer_experts();
-        if !prev_experts.is_empty() {
-            self.cache.send_hint(self.moe_layer_idx, prev_experts);
-        }
+        // ── 1b. Async DtoH for routing indices ──
+        //
+        // Instead of to_vec2() which drains the compute pipeline, we:
+        //   1. Record event E1 on compute stream (marks sort output ready)
+        //   2. Routing stream waits for E1 (GPU-side, CPU does not block)
+        //   3. Async DtoH on routing stream to pinned buffer
+        //   4. Record event E2 on routing stream (marks DtoH done)
+        //   5. Send speculative hint to pipeline thread
+        //   6. cuEventSynchronize(E2) — CPU blocks only for routing stream
+        //   7. Read indices from pinned buffer
+        //
+        // Fallback: if routing stream or pinned buffer not available,
+        // fall back to synchronous to_vec2().
+        #[cfg(feature = "cuda")]
+        let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = router_logits.device() {
+            let total_indices = num_tokens * k;
+            let routing_stream = self.cache.routing_stream();
+            let pinned_ptr = self.cache.routing_pinned_ptr(total_indices);
+
+            if let (Some(rs), Some(ptr)) = (routing_stream, pinned_ptr) {
+                // One slice for the whole sequence — the DtoH destination in
+                // step 3 and the source read in step 7 are the same bytes, and
+                // minting a second slice for the read would alias this one.
+                //
+                // SAFETY: `routing_pinned_ptr` validated the length against the
+                // buffer's capacity. This forward is the buffer's only writer,
+                // and the DtoH that fills it is ordered against the read below
+                // by `e2`, which step 6 synchronizes on.
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, total_indices) };
+
+                // Step 1: Record event on compute stream after sort output
+                let compute_stream = cuda_dev.cuda_stream();
+                let e1 = compute_stream
+                    .record_event(None)
+                    .map_err(candle::Error::wrap)?;
+
+                // Step 2: Routing stream waits for sort to complete (GPU-side)
+                rs.wait(&e1).map_err(candle::Error::wrap)?;
+
+                // Step 3: Async DtoH on routing stream to pinned buffer
+                let (storage, layout) = top_k_indices.storage_and_layout();
+                if let candle::Storage::Cuda(cuda_storage) = &*storage {
+                    // Use contiguous_offsets to get the exact element range.
+                    // narrow() can leave a CudaSlice larger than the logical
+                    // tensor (e.g. [1,8] narrowed from [1,128] — slice is 128
+                    // but only 8 elements are valid).
+                    if let Some((o1, o2)) = layout.contiguous_offsets() {
+                        let elem_count = o2 - o1;
+                        cuda_storage.copy_u32_to_host_on_stream(buf, rs, o1, elem_count)?;
+                    } else {
+                        // Non-contiguous layout: fall back to sync path
+                        drop(storage);
+                        let idx = top_k_indices.to_vec2::<u32>()?;
+                        self.cache.record_profile("fwd_routing", t);
+
+                        // Send hint with previous layer's experts
+                        let prev_experts = self.cache.get_prev_layer_experts();
+                        if !prev_experts.is_empty() {
+                            self.cache.send_hint(self.moe_layer_idx, prev_experts);
+                        }
+
+                        return Ok((weights_flat, idx));
+                    }
+                } else {
+                    drop(storage);
+                    let idx = top_k_indices.to_vec2::<u32>()?;
+                    self.cache.record_profile("fwd_routing", t);
+                    return Ok((weights_flat, idx));
+                }
+                drop(storage);
+
+                // Step 4: Record event on routing stream
+                let e2 = rs.record_event(None).map_err(candle::Error::wrap)?;
+
+                self.cache.record_profile("fwd_routing", t);
+
+                // Step 5: Send speculative hint while DtoH is in-flight
+                let prev_experts = self.cache.get_prev_layer_experts();
+                if !prev_experts.is_empty() {
+                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
+                }
+
+                // Step 6: Wait for routing DtoH to complete
+                let t_wait = profile_now();
+                e2.synchronize().map_err(candle::Error::wrap)?;
+                self.cache.record_profile("fwd_routing_wait", t_wait);
+
+                // Step 7: Read indices from pinned buffer into Vec<Vec<u32>>
+                let mut idx_cpu: Vec<Vec<u32>> = Vec::with_capacity(num_tokens);
+                for tok in 0..num_tokens {
+                    let start = tok * k;
+                    idx_cpu.push(buf[start..start + k].to_vec());
+                }
+                idx_cpu
+            } else {
+                // Fallback: no routing stream or pinned buffer — sync path
+                let idx = top_k_indices.to_vec2::<u32>()?;
+                self.cache.record_profile("fwd_routing", t);
+
+                // Still send hint even on sync path
+                let prev_experts = self.cache.get_prev_layer_experts();
+                if !prev_experts.is_empty() {
+                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
+                }
+                idx
+            }
+        } else {
+            let idx = top_k_indices.to_vec2::<u32>()?;
+            self.cache.record_profile("fwd_routing", t);
+            idx
+        };
+
+        #[cfg(not(feature = "cuda"))]
+        let idx_cpu: Vec<Vec<u32>> = {
+            let idx = top_k_indices.to_vec2::<u32>()?;
+            self.cache.record_profile("fwd_routing", t);
+            idx
+        };
 
         Ok((weights_flat, idx_cpu))
     }
@@ -396,6 +694,7 @@ impl SparseMoeBlock {
         k: usize,
         num_experts: usize,
         _routing_start: ProfileMark,
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert via a counting sort ──
         // Each entry: (expert_id, token_idx, flat_weight_idx). Same-expert tokens
@@ -491,6 +790,7 @@ impl SparseMoeBlock {
             out_dtype,
             &weights_flat,
             assignments,
+            wave,
         )?;
 
         let result = ys.reshape((b_size, seq_len, hidden_dim))?;
@@ -505,6 +805,69 @@ impl SparseMoeBlock {
 enum FeedForward {
     Mlp(MlpWeights),
     MoE(SparseMoeBlock),
+}
+
+/// A layer's FFN before the expert cache exists.
+///
+/// The load order is dense-weights-then-span-then-experts (see
+/// `docs/elastic_vram_partition.md` §4): the reservation is sized from a live
+/// measurement taken once every dense tensor is resident, and the expert cache
+/// is filled into the span that measurement produced. A MoE layer's
+/// `SparseMoeBlock` holds an `Arc<ExpertCache>`, so it cannot be built during
+/// the dense loop — this is what the loop produces instead, and the cache is
+/// grafted on afterwards.
+///
+/// Only the expert half is deferred. The router gate is a dense tensor and is
+/// loaded in the loop with the rest of them.
+enum PendingFfn {
+    Mlp(MlpWeights),
+    MoE { gate: QMatMul, moe_layer_idx: usize },
+}
+
+/// A layer with everything except its expert cache.
+struct PendingLayer {
+    self_attn: AttentionWeights,
+    ffn: PendingFfn,
+    ln1: RmsNorm,
+    ln2: RmsNorm,
+}
+
+impl PendingLayer {
+    /// Graft the expert cache on. `cache` is `None` only for a model with no MoE
+    /// layers, where no `PendingFfn::MoE` can exist either.
+    fn resolve(
+        self,
+        cache: Option<&Arc<ExpertCache>>,
+        n_expert_used: usize,
+        norm_topk_prob: bool,
+    ) -> Result<LayerWeights> {
+        let ffn = match self.ffn {
+            PendingFfn::Mlp(mlp) => FeedForward::Mlp(mlp),
+            PendingFfn::MoE {
+                gate,
+                moe_layer_idx,
+            } => {
+                let cache = cache.ok_or_else(|| {
+                    candle::Error::Msg(
+                        "a MoE layer was loaded but no expert cache was built".into(),
+                    )
+                })?;
+                FeedForward::MoE(SparseMoeBlock {
+                    gate,
+                    cache: cache.clone(),
+                    moe_layer_idx,
+                    num_experts_per_tok: n_expert_used,
+                    norm_topk_prob,
+                })
+            }
+        };
+        Ok(LayerWeights {
+            self_attn: self.self_attn,
+            ffn,
+            ln1: self.ln1,
+            ln2: self.ln2,
+        })
+    }
 }
 
 // ============================================================================
@@ -542,13 +905,22 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B1 producer: fuse ln1 → q8a128 (int8) or FP rms_norm (Off) in one kernel.
     #[cfg(feature = "cuda")]
-    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
-        self.ln1.forward_dynamic(x, mode)
+    fn attention_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
+        self.ln1.forward_dynamic(x, mode, wave_root(wave))
     }
 
     /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
     #[cfg(feature = "cuda")]
-    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
+    fn project_qkv<'w>(
+        &self,
+        acts: &DynamicActs<'w>,
+        out_dtype: DType,
+    ) -> Result<QkvProjection<'w>> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
                 let (b, s, _) = t.dims3()?;
@@ -571,7 +943,7 @@ impl BatchedAttentionLayer for LayerWeights {
             .reshape((b_sz, seq_len, n_head, head_dim))?
             .transpose(1, 2)?;
         let q_flat = q.flatten(0, 2)?;
-        let q_flat = self.self_attn.q_norm.forward(&q_flat)?;
+        let q_flat = self.self_attn.q_norm.forward_live(&q_flat)?;
         let q = q_flat
             .reshape((b_sz, n_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -581,7 +953,7 @@ impl BatchedAttentionLayer for LayerWeights {
             .reshape((b_sz, seq_len, n_kv_head, head_dim))?
             .transpose(1, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        let k_flat = self.self_attn.k_norm.forward(&k_flat)?;
+        let k_flat = self.self_attn.k_norm.forward_live(&k_flat)?;
         let k = k_flat
             .reshape((b_sz, n_kv_head, seq_len, head_dim))?
             .transpose(1, 2)?
@@ -593,9 +965,14 @@ impl BatchedAttentionLayer for LayerWeights {
     /// B3: ln2 as a producer epilogue. Only the MoE path emits q8a128 (its router + expert gather
     /// consume it); a dense MLP layer stays FP (it has no int8 grouped path).
     #[cfg(feature = "cuda")]
-    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+    fn ffn_norm<'w>(
+        &self,
+        x: &Tensor,
+        mode: Int8Mode,
+        wave: WaveRef<'w>,
+    ) -> Result<DynamicActs<'w>> {
         match &self.ffn {
-            FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode),
+            FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode, wave_root(wave)),
             FeedForward::Mlp(_) => Ok(DynamicActs::Float(self.ln2.forward(x)?)),
         }
     }
@@ -603,7 +980,12 @@ impl BatchedAttentionLayer for LayerWeights {
     /// B3 consumer: the MoE/MLP over the producer-fused ln2 activation. MoE routes the q8a128 (or
     /// Float) through `forward_dynamic`; a dense MLP runs the FP path (with the stability cast).
     #[cfg(feature = "cuda")]
-    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor> {
+    fn ffn_forward<'w>(
+        &self,
+        acts: DynamicActs<'w>,
+        mlp_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
             FeedForward::MoE(m) => {
                 // FP acts get the F16→BF16 stability cast; q8a128 is range-safe (no cast).
@@ -611,10 +993,10 @@ impl BatchedAttentionLayer for LayerWeights {
                     DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(mlp_dtype)?),
                     int8 => int8,
                 };
-                m.forward_dynamic(acts, mlp_dtype)
+                m.forward_dynamic(acts, mlp_dtype, wave)
             }
             FeedForward::Mlp(m) => match acts {
-                DynamicActs::Float(t) => m.forward(&t.to_dtype(mlp_dtype)?),
+                DynamicActs::Float(t) => m.forward(&t.to_owned_tensor()?.to_dtype(mlp_dtype)?),
                 DynamicActs::Int8(_) => candle::bail!(
                     "dense MLP: int8 activation unsupported (ffn_norm emits Float for Mlp)"
                 ),
@@ -628,7 +1010,14 @@ impl BatchedAttentionLayer for LayerWeights {
 // ============================================================================
 
 pub struct ModelWeights {
-    embeddings: Embedding,
+    /// Resident embedding table. `None` when [`Self::host_embedding`] serves it
+    /// from the mmap instead — exactly one of the two is populated.
+    embeddings: Option<Embedding>,
+    /// Embedding table left in the GGUF mmap and gathered per forward, chosen at
+    /// load when the table is large relative to the card (see
+    /// [`crate::models::host_embedding`]).
+    #[cfg(feature = "cuda")]
+    host_embedding: Option<crate::models::host_embedding::HostEmbedding>,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -636,8 +1025,6 @@ pub struct ModelWeights {
     expert_cache: Option<Arc<ExpertCache>>,
     #[allow(dead_code)]
     _mmap: Option<Arc<memmap2::Mmap>>,
-    #[cfg(feature = "cuda")]
-    _mmap_registration: Option<MmapRegistration>,
     device: Device,
     /// Inference numeric mode for the dense (non-expert) projections. Baked into each dense
     /// `QMatMul` at load; retained here for introspection. Experts are unaffected (always FP16).
@@ -651,11 +1038,27 @@ pub struct ModelWeights {
     /// non-CUDA.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     base_weight_bytes: usize,
+    /// Shapes the transient tier is priced from, read from the checkpoint config.
+    wave_shapes: WaveShapes,
 }
 
 #[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
+
+    fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
+        for layer in &self.layers {
+            layer.ln1.maybe_change_dtype(dtype)?;
+            layer.ln2.maybe_change_dtype(dtype)?;
+            layer.self_attn.q_norm.maybe_change_dtype(dtype)?;
+            layer.self_attn.k_norm.maybe_change_dtype(dtype)?;
+        }
+        self.norm.maybe_change_dtype(dtype)
+    }
+
+    fn wave_shapes(&self) -> WaveShapes {
+        self.wave_shapes
+    }
 
     fn num_layers(&self) -> usize {
         self.layers.len()
@@ -679,8 +1082,13 @@ impl BatchedModelCore for ModelWeights {
         &self.device
     }
 
-    fn embeddings(&self) -> &Embedding {
-        &self.embeddings
+    fn embeddings(&self) -> Option<&Embedding> {
+        self.embeddings.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn host_embedding(&self) -> Option<&crate::models::host_embedding::HostEmbedding> {
+        self.host_embedding.as_ref()
     }
 
     fn layer(&self, idx: usize) -> &Self::Layer {
@@ -700,7 +1108,9 @@ impl BatchedModelCore for ModelWeights {
     }
 
     fn prune(&self) -> Result<()> {
-        self.embeddings.compact();
+        if let Some(e) = &self.embeddings {
+            e.compact();
+        }
         if let Some(layer) = self.layers.first() {
             if let Ok(mut cis) = layer.self_attn.rotary_emb.cis.write() {
                 cis.compact();
@@ -711,6 +1121,18 @@ impl BatchedModelCore for ModelWeights {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.expert_cache.as_ref().map(|cache| cache.expert_stats())
+    }
+
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.expert_cache
+            .as_ref()
+            .map_or(0, |cache| cache.request_kv_ground(regions))
+    }
+
+    fn reclaim_spare_ground(&self) {
+        if let Some(cache) = self.expert_cache.as_ref() {
+            cache.reclaim_spare_ground();
+        }
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -819,6 +1241,7 @@ pub fn read_hf_config(model_dir: &std::path::Path) -> HFModelConfig {
 ///
 /// Tries `qwen3moe`, `qwen2moe`, then falls back to whatever
 /// `general.architecture` says. Returns the prefix string (e.g. "qwen2moe").
+
 fn detect_arch_prefix(metadata: &HashMap<String, gguf_file::Value>) -> String {
     // Check general.architecture first
     if let Some(v) = metadata.get("general.architecture") {
@@ -898,6 +1321,34 @@ fn warm_mmap(mmap: &memmap2::Mmap) {
     );
 }
 
+/// The load-time choices a GGUF load takes that are not properties of the file.
+///
+/// There were two entry points for the first of these — `from_gguf_by_path` and
+/// `from_gguf_by_path_with_int8` — and a second knob would have made a third. A
+/// struct with defaults takes any number of them, and is where the next one
+/// goes.
+#[derive(Debug, Clone, Default)]
+pub struct GgufLoadOptions {
+    /// The numeric mode for dense projections *and* MoE experts. [`Int8Mode::Off`]
+    /// is the FP16 reference; an int8 mode repacks every dense weight (attention
+    /// q/k/v/o, MoE router gate, dense-MLP gate/up/down, lm_head) to its KO twin
+    /// so forward runs the q8a128 int8 tensor-core matmul, and stages each
+    /// expert's gate/up/down as their KO twins so the grouped expert matmul runs
+    /// int8 too.
+    ///
+    /// `None` picks it from the device and the checkpoint's size.
+    pub int8mode: Option<Int8Mode>,
+    /// Directory for the persistent repacked expert pack (`docs/expert_cache_design.md` §5).
+    ///
+    /// `None` — the default — uses a temp file that is unlinked as soon as it is
+    /// open, which costs the ~42 s repack on every start. A caller that will
+    /// restart often passes the GGUF's own directory, where one pack is shared by
+    /// every workspace on that checkpoint and survives a substrate wipe.
+    ///
+    /// MoE-only: the other architectures have no expert cache and ignore it.
+    pub expert_pack_dir: Option<std::path::PathBuf>,
+}
+
 impl ModelWeights {
     /// Load model from GGUF via reader (non-mmap path).
     /// MoE layers load all experts to VRAM (no LRU cache in this path).
@@ -939,6 +1390,10 @@ impl ModelWeights {
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
+        // Per-expert FFN width (moe_intermediate_size), which is what one expert
+        // GEMM produces and therefore what the transient plan prices against.
+        let expert_ffn_size =
+            md_opt_u32(&format!("{p}.expert_feed_forward_length")).unwrap_or(2048) as usize;
         // Qwen3-MoE always uses norm_topk_prob=true; GGUF often omits this key so default to 1.
         let norm_topk_prob = md_opt_u32(&format!("{p}.expert_weights_norm")).unwrap_or(1) == 1;
 
@@ -1114,7 +1569,10 @@ impl ModelWeights {
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
 
         Ok(Self {
-            embeddings,
+            embeddings: Some(embeddings),
+            #[cfg(feature = "cuda")]
+            // Reader path has no mmap to gather from, so the table is resident.
+            host_embedding: None,
             layers,
             norm,
             lm_head,
@@ -1123,8 +1581,12 @@ impl ModelWeights {
             // (The mmap path sets this to Some(...) for cross-layer LRU.)
             expert_cache: None,
             _mmap: None,
-            #[cfg(feature = "cuda")]
-            _mmap_registration: None,
+            wave_shapes: WaveShapes {
+                hidden: hidden_size,
+                intermediate: expert_ffn_size,
+                experts_per_tok: n_expert_used,
+                n_experts: n_expert,
+            },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
             // mmap (`from_gguf_by_path`) load path.
@@ -1145,35 +1607,41 @@ impl ModelWeights {
     /// `progress`, when supplied, is called with `(layers_loaded, num_layers)`
     /// after each layer's weights have been mounted — drives a UI progress
     /// bar without coupling this loader to the daemon's progress type.
+    ///
+    /// Load-time knobs take their defaults; [`ModelWeights::from_gguf_with_options`]
+    /// sets them.
     pub fn from_gguf_by_path(
         file_path: &std::path::Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
-        // VRAM-aware auto: int8 Precision on int8-MMA-capable GPUs when the
-        // weights leave headroom, else Performance (smaller footprint); FP16 Off
-        // on CPU. Sized by the GGUF length. Explicit-mode callers use
-        // `from_gguf_by_path_with_int8` instead.
-        let model_bytes = std::fs::metadata(file_path)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
-        let int8mode = Int8Mode::auto_sized(device, model_bytes);
-        Self::from_gguf_by_path_with_int8(file_path, device, progress, int8mode)
+        Self::from_gguf_with_options(file_path, device, progress, GgufLoadOptions::default())
     }
 
-    /// Like [`ModelWeights::from_gguf_by_path`] but selects the inference numeric `int8mode` for
-    /// the whole model — dense projections *and* MoE experts. [`Int8Mode::Off`] is the FP16
-    /// reference; an int8 mode repacks every dense weight (attention q/k/v/o, MoE router gate,
-    /// dense-MLP gate/up/down, lm_head) to its KO twin so forward runs the q8a128 int8 tensor-core
-    /// matmul, and stages each expert's gate/up/down as their KO twins through the [`ExpertCache`]
-    /// repack-to-host/DMA pipeline so the grouped expert matmul runs int8 too.
-    pub fn from_gguf_by_path_with_int8(
+    /// Like [`ModelWeights::from_gguf_by_path`] but with the load-time knobs set
+    /// explicitly rather than defaulted — see [`GgufLoadOptions`].
+    pub fn from_gguf_with_options(
         file_path: &std::path::Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
-        int8mode: Int8Mode,
+        options: GgufLoadOptions,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
+
+        // VRAM-aware auto when the caller did not choose: int8 Precision on
+        // int8-MMA-capable GPUs when the weights leave headroom, else
+        // Performance (smaller footprint); FP16 Off on CPU. Sized by the GGUF
+        // length.
+        let int8mode = match options.int8mode {
+            Some(m) => m,
+            None => {
+                let model_bytes = std::fs::metadata(file_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                Int8Mode::auto_sized(device, model_bytes)
+            }
+        };
+        let expert_pack_dir = options.expert_pack_dir;
 
         tracing::info!(
             "Inference int8 mode: {int8mode:?} (dense projections + MoE experts; \
@@ -1188,21 +1656,26 @@ impl ModelWeights {
                 .map_err(|e| candle::Error::Msg(format!("Failed to mmap file: {}", e)))?
         };
         let mmap = Arc::new(mmap);
+        // Feed the host-RAM budget: the budget reserves the full mmap size so
+        // warm-KV growth can never push weight pages out of RAM.
+        // One mmap per model here, so this single call IS the whole mapped size.
+        candle::vram::set_weights_mmap(mmap.len() as u64);
 
-        // Mmap warming is handled by ExpertCache::new() (prewarm_expert_cache)
-        // which fills VRAM slots first, then warms remaining pages.
-        // For non-MoE models, warm_mmap() is called below after cache building.
-
-        // Register mmap with CUDA for DMA acceleration
-        #[cfg(feature = "cuda")]
-        let _mmap_guard = if matches!(device, Device::Cuda(_)) {
-            register_mmap_cuda(&mmap)
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let _mmap_guard: Option<()> = None;
+        // **The mapping is deliberately not host-registered.**
+        //
+        // `register_mmap_cuda` pins the whole file so H2D copies out of it run
+        // at full DMA bandwidth without a bounce. For a dense model that is the
+        // right trade — the mmap *is* the weight source, read for the life of
+        // the process. Here it is not: the experts move to the pack file at
+        // startup, and what remains live in the mapping is the dense tensors and
+        // the embedding table, gathered a few tokens at a time.
+        //
+        // Registering would lock all 18.6 GB of it, non-pageable, for the
+        // process lifetime — competing directly with the warm expert tier, which
+        // wants 17.8 GB of pinned RAM for the same 31.5 GB machine and is the
+        // thing that keeps expert loads off the disk. The one-time load-path
+        // speedup is not worth a permanent claim on the memory the hot path
+        // needs.
 
         // Parse GGUF
         let mut cursor = std::io::Cursor::new(&mmap[..]);
@@ -1259,7 +1732,7 @@ impl ModelWeights {
         tracing::debug!("GGUF arch: {p}  layers={num_layers} hidden={hidden_size} eps={rms_norm_eps:.2e} heads={num_attention_heads}Q/{num_kv_heads}KV head_dim={head_dim} ctx={max_position_embeddings} rope_base={rope_freq_base} experts={n_expert}/{n_expert_used} norm={norm_topk_prob}");
 
         // Expert FFN size (moe_intermediate_size)
-        let _expert_ffn_size =
+        let expert_ffn_size =
             md_opt_u32(&format!("{p}.expert_feed_forward_length")).unwrap_or(2048) as usize;
 
         let dtype_model = DType::F16;
@@ -1292,20 +1765,6 @@ impl ModelWeights {
         };
         #[cfg(feature = "cuda")]
         if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
-            // Guard the governor's Critical-rung pool trim against the hot→warm
-            // migrate's captured arena base pointers. The trim's `cuMemPoolTrimTo`
-            // synchronously unmaps pool memory process-wide, and the sync-hook lives
-            // in candle-core (below candle-nn) so it can't reach candle-nn's
-            // arena-topology relief guard. Registered here (candle-transformers is
-            // above candle-nn): the wrapper holds `try_enter_relief` across the trim,
-            // and skips it while a migrate is capturing pointers — otherwise the
-            // in-flight select/quantize/kv_migrate kernels read an unmapped base
-            // pointer (`CUDA_ERROR_ILLEGAL_ADDRESS`).
-            candle::vram::set_pool_trim_guard(Box::new(|trim| {
-                if let Some(_relief) = try_enter_relief() {
-                    trim();
-                }
-            }));
             match candle::vram::VramGovernor::from_device(device, gpu_id) {
                 Ok(gov) => {
                     let mut balloon =
@@ -1324,18 +1783,18 @@ impl ModelWeights {
             }
         }
 
-        // Driver-used VRAM baseline BEFORE any weights load (the governor's
-        // balloon has already been freed). The delta from here to the fully-built
-        // model, minus the resident-expert footprint, is the fixed base-weight
-        // VRAM the whole-card decomposition reports (see `base_weight_bytes`).
-        #[cfg(feature = "cuda")]
-        let used_before_weights: usize = if matches!(device, Device::Cuda(_)) {
-            get_vram_info()
-                .map(|(free, total)| total.saturating_sub(free))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Running total of the DENSE (non-expert) weight bytes this load puts on
+        // the device — every tensor that goes through `load_tensor`, which is all
+        // of them except the experts (those are read as raw `MmapExpertRef`
+        // offsets straight into the cache's own slots).
+        //
+        // Summed rather than measured as a driver delta, because a driver delta
+        // cannot see through the caching allocator: the governor's balloon
+        // releases ~13 GiB back into the CUDA pool rather than to the driver, the
+        // weights then allocate out of those cached blocks, and driver-used
+        // barely moves. Measured, that read a 1313 MiB pre-load baseline against
+        // a ~230 MiB context and under-reported the weights by a third.
+        let dense_bytes = std::cell::Cell::new(0usize);
 
         // Helper: load tensor directly to VRAM
         let load_tensor = |name: &str| -> Result<QTensor> {
@@ -1343,12 +1802,100 @@ impl ModelWeights {
                 .tensor_infos
                 .get(name)
                 .ok_or_else(|| candle::Error::Msg(format!("tensor {} not found", name)))?;
-            tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)
+            let t = tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)?;
+            dense_bytes.set(dense_bytes.get() + t.storage_size_in_bytes());
+            Ok(t)
         };
 
-        // Load embeddings
-        let tok_embed = load_tensor("token_embd.weight")?.dequantize(device)?;
-        let embeddings = Embedding::new(tok_embed, hidden_size)?;
+        // Embeddings. The table is the worst VRAM-per-access ratio in the model —
+        // one row read per token, but the whole thing resident and dequantized —
+        // so on a card where it is a meaningful fraction of capacity it stays in
+        // the mmap and is gathered per forward instead. See
+        // `crate::models::host_embedding`.
+        #[cfg(feature = "cuda")]
+        let (embeddings, host_embedding, embed_dense_bytes) = {
+            let info = ct
+                .tensor_infos
+                .get("token_embd.weight")
+                .ok_or_else(|| candle::Error::Msg("tensor token_embd.weight not found".into()))?;
+            // `[vocab, hidden]`: a row is one token's embedding, so `rows` is the
+            // vocabulary and `cols` the hidden size. Not swapped — the shape is
+            // already row-major here, and inverting it makes `cols` the vocab,
+            // which fails the whole-blocks check rather than gathering garbage.
+            let (rows, cols) = match info.shape.dims() {
+                [r, c] => (*r, *c),
+                dims => candle::bail!("token_embd.weight is not 2-D: {dims:?}"),
+            };
+            // What the table costs the CARD if it stays resident: `Embedding`
+            // keeps its source on CPU and materialises a device copy at the
+            // compute dtype on first forward, so the F32 dequantize below is a
+            // transient, not the footprint.
+            let resident_bytes = (rows * cols * dtype_model.size_in_bytes()) as u64;
+            let capacity = candle::vram::get(gpu_id).map_or(0, |g| g.capacity());
+            let serve_from_host =
+                crate::models::host_embedding::should_serve_from_host(resident_bytes, capacity);
+
+            let host = if serve_from_host {
+                let byte_offset = ct.tensor_data_offset as usize + info.offset as usize;
+                match crate::models::host_embedding::HostEmbedding::new(
+                    &mmap,
+                    byte_offset,
+                    info.ggml_dtype,
+                    rows,
+                    cols,
+                ) {
+                    Ok(h) => Some(h),
+                    // Not GPU-reachable (mmap registration failed) — fall back to
+                    // the resident table rather than failing the load.
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "candle_transformers::quantized_qwen3_moe",
+                            "host embedding unavailable ({e}); keeping it resident"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            match host {
+                Some(h) => {
+                    tracing::info!(
+                        target: "candle_transformers::quantized_qwen3_moe",
+                        resident_mib = resident_bytes >> 20,
+                        capacity_mib = capacity >> 20,
+                        "embedding served from the mmap; VRAM reclaimed"
+                    );
+                    (None, Some(h), 0usize)
+                }
+                None => {
+                    let q = load_tensor("token_embd.weight")?;
+                    let q_bytes = q.storage_size_in_bytes();
+                    let t = q.dequantize(device)?;
+                    dense_bytes.set(dense_bytes.get() - q_bytes);
+                    // Charge the device cache, not the dequantize: `Embedding::new`
+                    // moves `t` to CPU, so the F32 copy is gone before the first
+                    // forward and only the compute-dtype variant is ever resident.
+                    (
+                        Some(Embedding::new(t, hidden_size)?),
+                        None,
+                        resident_bytes as usize,
+                    )
+                }
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (embeddings, embed_dense_bytes) = {
+            let q = load_tensor("token_embd.weight")?;
+            let q_bytes = q.storage_size_in_bytes();
+            let t = q.dequantize(device)?;
+            // As above: the resident copy is the compute-dtype device cache.
+            let bytes = t.elem_count() * dtype_model.size_in_bytes();
+            dense_bytes.set(dense_bytes.get() - q_bytes);
+            (Some(Embedding::new(t, hidden_size)?), bytes)
+        };
+        dense_bytes.set(dense_bytes.get() + embed_dense_bytes);
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype_model,
@@ -1481,116 +2028,35 @@ impl ModelWeights {
         }
 
         // Combined progress denominator for the `from_gguf_by_path`
-        // outer callback: expert cache uploads (`num_moe_layers ×
-        // n_expert`) followed by the per-layer attention loop
-        // (`num_layers`). The bar then advances continuously through
-        // both phases, instead of sitting at 0% until the cache
-        // finishes.
+        // outer callback: the per-layer dense loop (`num_layers`) followed by
+        // the expert cache uploads (`num_moe_layers × n_expert`). The bar then
+        // advances continuously through both phases.
+        //
+        // The two phases swapped order. The dense weights must be **resident**
+        // before the span is reserved, because the span is sized from
+        // `usable()` — a live measurement — and that is what subtracts them
+        // exactly once. Sizing the expert cache first meant forecasting the
+        // dense footprint from the GGUF tensor table and hoping the forecast
+        // matched (`pending_dense_bytes`, now deleted).
         let total_expert_ticks = num_moe_layers * n_expert;
         let total_units = total_expert_ticks + num_layers;
 
-        // ── Build Expert Cache ──
-        // Driver-used VRAM bracketing the expert-cache build, so the base-weight
-        // measurement can EXCLUDE experts by construction (base = the driver delta
-        // OUTSIDE this bracket). Subtracting the expert gauge instead would cancel
-        // against the gauge re-added in `resident_weight_bytes`, collapsing the
-        // whole figure back to the raw (governor-balloon-polluted) driver delta.
-        #[cfg(feature = "cuda")]
-        let used_before_experts = super::batched_model::driver_used_bytes(device);
-        let expert_cache = if !all_host_refs.is_empty() && n_expert > 0 {
-            // Determine per-expert shapes from the first layer's first expert
-            // Use max expert size across all layers for budget calculation
-            let max_expert_size = all_host_refs
-                .iter()
-                .flat_map(|layer| layer.iter())
-                .map(|r| r.gate_len + r.up_len + r.down_len)
-                .max()
-                .unwrap_or(0);
-            let total_experts = num_moe_layers * n_expert;
-            let total_expert_bytes = total_experts * max_expert_size;
-
-            // ── VRAM budget for expert LRU cache ──
-            // Preferred: the VRAM Governor computes it from the live measurement
-            // at this instant (weights already resident), leaving the KV floor +
-            // scratch cushion free so experts can never starve KV
-            // (`docs/vram_governor_design.md` §11). Fallback (no governor): the
-            // legacy `min(max(free−5GB, free×50%), total_expert_bytes)`.
-            #[cfg(feature = "cuda")]
-            let gov_budget = candle::vram::get(gpu_id).and_then(|g| g.expert_budget().ok());
-            #[cfg(not(feature = "cuda"))]
-            let gov_budget: Option<u64> = None;
-            let expert_budget = match gov_budget {
-                Some(b) => (b as usize).min(total_expert_bytes),
-                None => {
-                    const RESERVE_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GB
-                    let generous = free_vram.saturating_sub(RESERVE_BYTES).max(free_vram / 2);
-                    generous.min(total_expert_bytes)
-                }
-            };
-
-            let num_slots = if max_expert_size > 0 {
-                let base = expert_budget / max_expert_size;
-                // Round up: if leftover VRAM can fit ≥50% of another expert,
-                // take it — avoids DMA churn when the model *almost* fits.
-                let remainder = expert_budget % max_expert_size;
-                let rounded = if remainder >= max_expert_size / 2 {
-                    base + 1
-                } else {
-                    base
-                };
-                rounded.min(total_experts)
-            } else {
-                0
-            };
-
-            tracing::debug!(
-                "Expert cache: {} slots / {} total (budget {:.1} GB / {:.1} GB model, max expert {:.1} KB)",
-                num_slots,
-                total_experts,
-                expert_budget as f64 / 1e9,
-                total_expert_bytes as f64 / 1e9,
-                max_expert_size as f64 / 1e3,
-            );
-
-            // Wrap the outer callback so the cache's per-expert
-            // `(done, total_experts)` ticks land on the combined
-            // denominator computed above.
-            let cache_wrapper =
-                progress.map(|cb| move |done: usize, _total: usize| cb(done, total_units));
-            let cache_progress: Option<&dyn Fn(usize, usize)> =
-                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
-            let cache = ExpertCache::new(
-                mmap.clone(),
-                all_host_refs,
-                num_slots,
-                device,
-                n_expert,
-                Some(file_path),
-                cache_progress,
-                int8mode,
-            )?;
-            // Record the resident expert footprint with the governor (tally +
-            // kv_floor base; the availability gate stays the live measurement).
-            #[cfg(feature = "cuda")]
-            if let Some(g) = candle::vram::get(gpu_id) {
-                g.credit_class(
-                    candle::vram::AllocClass::Expert,
-                    (num_slots * max_expert_size) as u64,
-                );
-            }
-            Some(Arc::new(cache))
-        } else {
-            // No MoE layers — warm the entire mmap the simple way.
+        // The expert cache is built **after** the dense weights, further down.
+        // Only the "is there one at all" question is answered here, because a
+        // model without MoE layers warms its whole mmap now and never comes
+        // back to this.
+        let has_experts = !all_host_refs.is_empty() && n_expert > 0;
+        if !has_experts {
             warm_mmap(&mmap);
-            None
-        };
-        // Driver-used VRAM right after the expert cache built — the delta from
-        // `used_before_experts` is the experts' driver footprint (excluded from base).
-        #[cfg(feature = "cuda")]
-        let used_after_experts = super::batched_model::driver_used_bytes(device);
+        }
 
-        // ── Load layers ──
-        let mut layers = Vec::with_capacity(num_layers);
+        // ── Load layers (dense) ──
+        //
+        // Everything except the experts. The FFN half of a MoE layer needs the
+        // expert cache, which needs the span, which is sized from a measurement
+        // taken once these are resident — so the loop yields a [`PendingLayer`]
+        // and the cache is grafted on below.
+        let mut pending: Vec<PendingLayer> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let prefix = format!("blk.{i}");
 
@@ -1652,22 +2118,12 @@ impl ModelWeights {
                     load_tensor(&format!("{prefix}.ffn_gate_inp.weight"))?.into(),
                     int8mode,
                 )?;
-
-                let cache_ref = expert_cache
-                    .as_ref()
-                    .ok_or_else(|| candle::Error::Msg("expert_cache is None for MoE layer".into()))?
-                    .clone();
-
                 let moe_layer_idx = moe_count;
                 moe_count += 1;
-
-                FeedForward::MoE(SparseMoeBlock {
+                PendingFfn::MoE {
                     gate,
-                    cache: cache_ref,
                     moe_layer_idx,
-                    num_experts_per_tok: n_expert_used,
-                    norm_topk_prob,
-                })
+                }
             } else {
                 // Dense MLP
                 let gate_w = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
@@ -1705,7 +2161,7 @@ impl ModelWeights {
                         Some(QMatMul::from_weights_with_mode(up_w.into(), int8mode)?),
                     )
                 };
-                FeedForward::Mlp(MlpWeights {
+                PendingFfn::Mlp(MlpWeights {
                     gate_up_proj,
                     gate_proj,
                     up_proj,
@@ -1715,7 +2171,7 @@ impl ModelWeights {
                 })
             };
 
-            layers.push(LayerWeights {
+            pending.push(PendingLayer {
                 self_attn,
                 ffn,
                 ln1,
@@ -1725,22 +2181,172 @@ impl ModelWeights {
             if (i + 1) % 8 == 0 || i == num_layers - 1 {
                 tracing::debug!("Layer {}/{} loaded", i + 1, num_layers);
             }
-            // Continue the bar from where the expert cache left off, on
-            // the same combined denominator (`total_units`). Each layer
-            // is one tick — the layers run far faster than experts but
-            // they're a small fraction of the total either way.
+            // The dense loop runs first now, so it holds the first `num_layers`
+            // ticks of the combined denominator and the expert fill continues
+            // from there.
             if let Some(cb) = progress {
-                cb(total_expert_ticks + i + 1, total_units);
+                cb(i + 1, total_units);
             }
         }
 
-        // Load final norm and output projection
+        // Load final norm and output projection — the last of the dense weights.
         let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let lm_head_tensor = match load_tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
+
+        // ── Reserve the span, then build the expert cache into it ──
+        //
+        // This is the moment §4 describes: every dense tensor is resident, so
+        // `usable()` reports what is genuinely left, and the reservation takes
+        // it. Nothing after this point allocates weights outside the span.
+        #[cfg(feature = "cuda")]
+        if let Some(g) = candle::vram::get(gpu_id) {
+            g.set_class(candle::vram::AllocClass::Weights, dense_bytes.get() as u64);
+        }
+
+        let expert_cache = if has_experts {
+            let total_experts = num_moe_layers * n_expert;
+            //
+            // There used to be one — `pending_dense_bytes`, summed from the GGUF
+            // tensor table — because the expert budget was computed while ~1 GiB
+            // of dense tensors had not loaded yet, so the KV side paid for the
+            // model's own weights (measured at 2,912 MiB where the partition
+            // intended ~4,439). The forecast existed only because the ordering
+            // was wrong.
+            //
+            // Under the current order every dense tensor is resident before this
+            // point, so `usable()` — the drop in headroom since `C` was measured
+            // — has already netted them out, exactly once. Re-declaring them
+            // would book the same bytes twice.
+            //
+            // ── The span decides the slot count ──
+            //
+            // `VramGovernor::expert_budget()` used to compute a byte budget here
+            // and divide it by `max_expert_size`. Both are gone. The weight zone
+            // is a region of the reservation, its capacity is
+            // `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, and that quotient
+            // **is** the resident-expert count — there is no second arithmetic
+            // deriving one from the other, and no forecast of anything.
+            //
+            // `slot_bytes` comes from the *repacked* geometry rather than the
+            // raw GGML lengths the old budget used. A slot holds one expert's
+            // three projections at aligned offsets, and it is what the zone is
+            // carved into, so it has to be the exact figure the upload writes.
+            #[cfg(feature = "cuda")]
+            let zone = if let Device::Cuda(cuda_dev) = device {
+                let stream = cuda_dev.cuda_stream();
+                let geoms = layer_geometries(&all_host_refs, int8mode)?;
+                let slot_bytes = slot_bytes_for(&geoms);
+                // Two different numbers: where the boundary starts, and how far
+                // it may ever go. The zone opens at `initial` — sized to leave
+                // the KV side its measured cold-boot peak — and its `limit` is
+                // the hard floor it may grow to once the KV side has shown what
+                // it actually uses.
+                let limit_bytes = weight_capacity_bytes(&stream)?;
+                let initial_bytes = initial_weight_bytes(&stream)?;
+                let slots_in = |bytes: usize| {
+                    if slot_bytes > 0 {
+                        (bytes / slot_bytes).min(total_experts)
+                    } else {
+                        0
+                    }
+                };
+                let capacity = slots_in(initial_bytes);
+                let limit = slots_in(limit_bytes);
+                // The zone's floor, and the only bound on how much expert
+                // residency the KV side can buy — so it is the pinning rule's
+                // own arithmetic, not a fraction of wherever the boundary opened.
+                let floor = minimum_resident_slots(n_expert);
+                let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
+                // Place the boundary. Everything left of it belongs to the KV
+                // side, and the region count is re-derived from it here rather
+                // than assumed anywhere.
+                let regions = set_weight_floor(&stream, zone.frontier_for_capacity())?;
+                tracing::info!(
+                    target: "candle_transformers::quantized_qwen3_moe",
+                    slots = capacity,
+                    max_slots = limit,
+                    floor_slots = floor,
+                    total_experts,
+                    slot_bytes,
+                    weight_gib = (capacity * slot_bytes) as f64 / 1e9,
+                    model_gib = (total_experts * slot_bytes) as f64 / 1e9,
+                    kv_regions = regions,
+                    "expert cache opened against the span"
+                );
+                zone
+            } else {
+                // A cuda build on a CPU device has no expert path at all, and
+                // `ExpertCache::new` says so. The zone it would be handed has no
+                // device reservation behind it, so a plausible-looking one built
+                // here would only make the failure land further from its cause.
+                WeightZone::new(0, 0, 0, 0, 0)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let zone = WeightZone::new(0, 0, total_experts, total_experts, 0);
+            let capacity = zone.capacity();
+            let slot_bytes = zone.slot_bytes();
+
+            // Wrap the outer callback so the cache's per-expert
+            // `(done, total_experts)` ticks land on the combined denominator,
+            // after the `num_layers` ticks the dense loop already spent.
+            let cache_wrapper = progress
+                .map(|cb| move |done: usize, _total: usize| cb(num_layers + done, total_units));
+            let cache_progress: Option<&dyn Fn(usize, usize)> =
+                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
+            let cache = ExpertCache::new(ExpertCacheSetup {
+                mmap: mmap.clone(),
+                host_refs: all_host_refs,
+                zone,
+                device,
+                experts_per_layer: n_expert,
+                gguf_path: file_path,
+                expert_pack_dir: expert_pack_dir.as_deref(),
+                progress: cache_progress,
+                int8mode,
+            })?;
+            // Record the resident expert footprint with the governor. Reporting
+            // only — nothing sizes itself from this any more.
+            #[cfg(feature = "cuda")]
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.set_class(
+                    candle::vram::AllocClass::Expert,
+                    (capacity * slot_bytes) as u64,
+                );
+            }
+            let cache = Arc::new(cache);
+            // **Open the shop.** From here a KV arena claim that runs out of
+            // ground can buy more, at the price of expert residency, instead of
+            // refusing and leaving the demand for something else to interpret.
+            //
+            // Registered against this device's ordinal, because the weight zone
+            // it sells from is this device's. A `Weak` so the registry — which
+            // outlives every model, being static — does not keep the cache alive
+            // past the model that owns it; a dead reference answers zero, the
+            // same answer as no seller, and the next model on this ordinal
+            // replaces the registration outright.
+            #[cfg(feature = "cuda")]
+            {
+                let seller = Arc::downgrade(&cache);
+                candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
+                    seller
+                        .upgrade()
+                        .map_or(0, |cache| cache.request_kv_ground(regions))
+                });
+            }
+            Some(cache)
+        } else {
+            None
+        };
+
+        // ── Graft the cache onto the layers ──
+        let layers = pending
+            .into_iter()
+            .map(|p| p.resolve(expert_cache.as_ref(), n_expert_used, norm_topk_prob))
+            .collect::<Result<Vec<_>>>()?;
 
         tracing::debug!(
             "Model loaded: {} layers ({} MoE), int8mode={:?}",
@@ -1749,45 +2355,57 @@ impl ModelWeights {
             int8mode
         );
 
-        // Base-weight VRAM = the driver-used growth OUTSIDE the expert-cache
-        // bracket: embeddings + rotary/misc (before the cache) plus attention +
-        // norms + router + lm_head (the layer loop, after it). Experts are
-        // excluded by construction — `resident_weight_bytes` adds the live expert
-        // gauge back on top, so nothing cancels. Fixed for the session (dense
-        // weights never move); the experts are the only time-varying part.
+        // Dense (non-expert) weight VRAM: the exact sum `load_tensor` accumulated.
+        // Fixed for the session — dense weights never move — while the experts
+        // are the time-varying part `resident_weight_bytes` adds back on top, so
+        // nothing double-counts.
+        //
+        // This was a driver delta bracketed around the expert load, and it was
+        // wrong twice over: it read 3936 MiB, then 733 MiB after the bracket was
+        // anchored on the expert gauge, against a true ~990 MiB (the embedding
+        // tensor alone is 594 MiB dequantized, and `lm_head` another ~167 MiB).
+        // A driver delta cannot measure this at all — the governor's balloon
+        // releases ~13 GiB into the CUDA pool rather than back to the driver, the
+        // weights then allocate out of those cached blocks, and driver-used
+        // barely moves. Summing the tensors is immune to both the caching
+        // allocator and to load-time transients.
+        let base_weight_bytes: usize = dense_bytes.get();
         #[cfg(feature = "cuda")]
-        let base_weight_bytes: usize = if matches!(device, Device::Cuda(_)) {
-            let used_after = get_vram_info()
-                .map(|(free, total)| total.saturating_sub(free))
-                .unwrap_or(0);
-            let pre_experts = used_before_experts.saturating_sub(used_before_weights);
-            let post_experts = used_after.saturating_sub(used_after_experts);
-            let base = pre_experts + post_experts;
-            let expert_driver = used_after_experts.saturating_sub(used_before_experts);
+        if matches!(device, Device::Cuda(_)) {
             let expert_gauge = expert_cache.as_ref().map_or(0, |c| c.resident_vram_bytes());
             tracing::info!(
                 target: "candle_transformers::quantized_qwen3_moe",
-                base_gib = base as f64 / 1e9,
-                expert_driver_gib = expert_driver as f64 / 1e9,
-                expert_gauge_gib = expert_gauge as f64 / 1e9,
-                "weight VRAM breakdown (base = non-expert driver delta; experts from gauge)"
+                base_mib = base_weight_bytes >> 20,
+                expert_gauge_mib = expert_gauge >> 20,
+                "weight VRAM breakdown (base = summed dense tensors)"
             );
-            base
-        } else {
-            0
-        };
-        #[cfg(not(feature = "cuda"))]
-        let base_weight_bytes: usize = 0;
+            // Record the dense weights with the governor. `kv_floor` is
+            // `abs + pct x (C - weights)`, so leaving this unrecorded computes
+            // the floor against the whole card as though the model were free —
+            // inflating the floor and taking the difference straight out of the
+            // expert budget, which is the scarcest thing on a tight card.
+            // Set, not add: this is the session's whole dense footprint, and
+            // adding it a second time would drive `C - weights` to zero.
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.set_class(candle::vram::AllocClass::Weights, base_weight_bytes as u64);
+            }
+        }
 
         Ok(Self {
             embeddings,
+            #[cfg(feature = "cuda")]
+            host_embedding,
             layers,
             norm,
             lm_head,
             expert_cache,
             _mmap: Some(mmap),
-            #[cfg(feature = "cuda")]
-            _mmap_registration: _mmap_guard,
+            wave_shapes: WaveShapes {
+                hidden: hidden_size,
+                intermediate: expert_ffn_size,
+                experts_per_tok: n_expert_used,
+                n_experts: n_expert,
+            },
             device: device.clone(),
             int8mode,
             base_weight_bytes,
@@ -2055,6 +2673,8 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            /*
+            // C10 does not work on this model, the compression is just too much
             TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
@@ -2063,6 +2683,7 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            */
             // BF16 single context (after everything is warm)
             TestConfig {
                 mode: InferenceMode::BF16,
@@ -2099,8 +2720,18 @@ mod tests {
         println!("int8 mode = {int8mode:?}\n");
 
         let load_model = || {
-            let model =
-                ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, None, int8mode)?;
+            // Keep the pack beside the checkpoint. The gate reloads the model
+            // once per invocation while iterating, and a persistent pack turns
+            // the ~42 s repack into a read.
+            let model = ModelWeights::from_gguf_with_options(
+                &model_path,
+                &device,
+                None,
+                GgufLoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                },
+            )?;
             println!("✓ Model loaded\n");
             let inv_freq = model
                 .rope_inv_freq()
@@ -2135,7 +2766,7 @@ mod tests {
         {
             use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{
-                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
+                BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
             use crate::models::batched_model::BatchedInference;
 
@@ -2180,8 +2811,7 @@ mod tests {
              -> Result<Vec<Tensor>> {
                 Ok(model
                     .forward_wave(session, &[], &[], seqs, inputs, &[], &[], 0, n, None)?
-                    .logits
-                    .unwrap_or_default())
+                    .logits_owned()?)
             };
             // Layer-range reference through the wave entry (the retired
             // `forward_batched_layers`): prefill group, layers `[ls, le)`, residual.
@@ -2191,7 +2821,7 @@ mod tests {
                        ls: usize,
                        le: usize,
                        residual: Option<Tensor>|
-             -> Result<WaveStep> {
+             -> Result<WaveResult> {
                 model.forward_wave(session, &[], &[], seqs, inputs, &[], &[], ls, le, residual)
             };
             // Prefill an identical `ctx` context into `s`, leaving offset at ctx.len().
@@ -2232,8 +2862,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("full-range wave must produce logits");
+                .logits_owned()?;
             assert_eq!(wave.len(), 2, "wave logits = decode + prefill rows");
             let c_dec = cos(&sep_dec[0], &wave[0])?;
             let c_pre = cos(&sep_pre[0], &wave[1])?;
@@ -2246,16 +2875,13 @@ mod tests {
             let b = session.create_sequence()?;
             prep(&mut session, a, &ctx_p)?;
             prep(&mut session, b, &ctx_p)?;
-            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?
-                .logits
-                .expect("full sweep logits");
+            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?.logits_owned()?;
             let k = n / 2;
             let mid = fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
-                .residual
+                .into_residual()
                 .expect("paused sweep must return a residual");
-            let split = fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?
-                .logits
-                .expect("resumed sweep logits");
+            let split =
+                fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?.logits_owned()?;
             let c_split = cos(&full[0], &split[0])?;
             println!("split sweep [0,{k})+[{k},{n}) vs full: cos={c_split:.5}");
             assert!(c_split > 0.999, "re-entrant sweep diverged (cos={c_split})");
@@ -2285,8 +2911,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("decode-only wave logits");
+                .logits_owned()?;
             assert_eq!(wave_d2.len(), 2, "decode-only wave = 2 decode rows");
             let c_d0 = cos(&sep_d2[0], &wave_d2[0])?;
             let c_d1 = cos(&sep_d2[1], &wave_d2[1])?;
@@ -2322,8 +2947,7 @@ mod tests {
                     n,
                     None,
                 )?
-                .logits
-                .expect("co-batch wave logits");
+                .logits_owned()?;
             assert_eq!(wave_1.len(), 2, "co-batch = decode + 1-token prefill");
             let c_1d = cos(&sep_dec1[0], &wave_1[0])?;
             let c_1p = cos(&sep_pre1[0], &wave_1[1])?;
@@ -2377,7 +3001,7 @@ mod tests {
                 kk,
                 None,
             )?
-            .residual
+            .into_residual()
             .expect("paused mixed cohort must return a residual");
             let mixed_split = fbl(
                 &mut session,
@@ -2387,8 +3011,7 @@ mod tests {
                 n,
                 Some(mixed_res),
             )?
-            .logits
-            .expect("resumed mixed cohort must produce logits");
+            .logits_owned()?;
             assert_eq!(mixed_split.len(), 2, "split cohort = one logit row per seq");
             let c_sm = cos(&ref_multi[0], &mixed_split[0])?;
             let c_ss = cos(&ref_one[0], &mixed_split[1])?;
@@ -2447,7 +3070,7 @@ mod tests {
                     kk2,
                     None,
                 )?
-                .residual
+                .into_residual()
                 .expect("paused co-batch must return a residual");
             // Split: 1 decode token, then the group's tokens (held whole).
             let gtok = pre_tok.len() + pre_tok.len() + one_tok.len();
@@ -2467,8 +3090,7 @@ mod tests {
                     n,
                     Some(dec_part),
                 )?
-                .logits
-                .expect("decode resume logits");
+                .logits_owned()?;
             // Resume the group alone to N (members re-passed in the SAME order).
             let grp_fin = model
                 .forward_wave(
@@ -2483,8 +3105,7 @@ mod tests {
                     n,
                     Some(grp_part),
                 )?
-                .logits
-                .expect("group resume logits");
+                .logits_owned()?;
             assert_eq!(dec_fin.len(), 1, "decode resume = one row");
             assert_eq!(grp_fin.len(), 3, "group resume = one row per member");
             let c_ed = cos(&sref_d[0], &dec_fin[0])?;
@@ -2543,7 +3164,7 @@ mod tests {
                     kk3,
                     None,
                 )?
-                .residual
+                .into_residual()
                 .expect("paused three-group co-batch must return a residual");
             let creep_tok3 = pre_tok.len() + one_tok.len();
             let glue_tok3 = pre_tok.len();
@@ -2564,8 +3185,7 @@ mod tests {
                     n,
                     Some(dec_part3),
                 )?
-                .logits
-                .expect("decode resume logits");
+                .logits_owned()?;
             let creep_fin3 = model
                 .forward_wave(
                     &mut session,
@@ -2579,8 +3199,7 @@ mod tests {
                     n,
                     Some(creep_part3),
                 )?
-                .logits
-                .expect("creep resume logits");
+                .logits_owned()?;
             let glue_fin3 = model
                 .forward_wave(
                     &mut session,
@@ -2594,8 +3213,7 @@ mod tests {
                     n,
                     Some(glue_part3),
                 )?
-                .logits
-                .expect("glue resume logits");
+                .logits_owned()?;
             let c_fd = cos(&href_d[0], &dec_fin3[0])?;
             let c_fca = cos(&href_ca[0], &creep_fin3[0])?;
             let c_fcb = cos(&href_cb[0], &creep_fin3[1])?;
@@ -3043,8 +3661,7 @@ mod tests {
                     nl,
                     None,
                 )?
-                .logits
-                .unwrap_or_default();
+                .logits_owned()?;
             session.advance_sequence(seq_idx, prefill_len)?;
             println!("Prefill done ({} tokens)", prefill_len);
 
@@ -3074,8 +3691,7 @@ mod tests {
                         nl,
                         None,
                     )?
-                    .logits
-                    .unwrap_or_default();
+                    .logits_owned()?;
                 session.advance_sequence(seq_idx, 1)?;
                 last_logits = out
                     .into_iter()

@@ -25,6 +25,8 @@ mod tests {
             v_pal: std::sync::Arc::new(Vec::new()),
             k_scale: std::sync::Arc::new(Vec::new()),
             v_scale: std::sync::Arc::new(Vec::new()),
+            k_fmt: std::sync::Arc::new(Vec::new()),
+            v_fmt: std::sync::Arc::new(Vec::new()),
             meta: None,
         }
     }
@@ -34,38 +36,6 @@ mod tests {
             layer_idx: 0,
             max_blocks,
             sequences: vec![None; batch],
-        }
-    }
-
-    fn bytes_per_chunk_for_format(format: crate::kv_cache::KvFormat) -> usize {
-        let elems_per_chunk =
-            crate::kv_cache::chunked::CHUNK_SIZE * crate::kv_cache::chunked::CHUNK_SIZE;
-        match format {
-            crate::kv_cache::KvFormat::Float(dtype) => elems_per_chunk * dtype.size_in_bytes(),
-            crate::kv_cache::KvFormat::Quantized(qf) => {
-                let ggml = qf.to_ggml_dtype();
-                (elems_per_chunk / ggml.block_size()) * ggml.type_size()
-            }
-        }
-    }
-
-    mod arena_sizing_tests {
-        use crate::kv_cache::chunked::types::{arena_chunks_for_format, TARGET_ARENA_BYTES};
-        use crate::kv_cache::{KvFormat, QuantFormat};
-        use candle::DType;
-
-        #[test]
-        fn test_f16_formula_matches_legacy_arena_chunks() {
-            assert_eq!(arena_chunks_for_format(KvFormat::Float(DType::F16)), 8192);
-        }
-
-        #[test]
-        fn test_quant_formula_stays_within_16mib_budget() {
-            let format = KvFormat::Quantized(QuantFormat::Q8_0);
-            let n = arena_chunks_for_format(format);
-            let bytes_per_chunk = super::bytes_per_chunk_for_format(format);
-            assert!(n * bytes_per_chunk <= TARGET_ARENA_BYTES);
-            assert!((n + 1) * bytes_per_chunk > TARGET_ARENA_BYTES);
         }
     }
 
@@ -90,7 +60,7 @@ mod tests {
 
         #[test]
         fn test_chunk_gid_arena_addressing() {
-            let arena_stride = crate::arena_gid_stride();
+            let arena_stride = crate::GID_STRIDE;
 
             let handle0 = create_test_handle(0);
             let ref0 = handle0;
@@ -283,6 +253,8 @@ mod tests {
                 std::sync::Arc::new(Vec::new()),
                 std::sync::Arc::new(Vec::new()),
                 std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
             );
 
             assert_eq!(
@@ -340,7 +312,10 @@ mod tests {
             // free count returns to the baseline.
             let _state = create_test_state(2, 4);
             let pool = ChunkGidPool::new();
-            let key = ArenaKey::gpu_float(candle::DType::BF16);
+            let key = ArenaKey::new(
+                crate::kv_cache::chunked::SizeClass::at(5),
+                crate::kv_cache::ArenaLocation::Gpu,
+            );
 
             pool.register_arena(key.clone());
             pool.register_arena(key.clone());

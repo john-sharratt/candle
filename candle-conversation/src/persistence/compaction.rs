@@ -182,7 +182,23 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
         let mut turn_dead = false;
         let distill: Option<DistillMode> =
             if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
-                if tombstoned.contains(&t.timeline_id) {
+                // A tombstoned timeline's records go wholesale — UNLESS it is
+                // also distilled. That pair is the provenance corpus: calibration
+                // exemplars are archived, distilled `ProvenanceOnly`, and then
+                // tombstoned so they leave the live gather, while their
+                // `WideQSig`s and projection events keep answering the belief
+                // scan. Dropping them here erased the very records the tombstone
+                // exists to preserve, and — because the `Distilled` marker went
+                // with them — the next reload saw a content-declaring turn with
+                // no KV and no distill exemption, i.e. `TurnIntegrity::MissingKv`.
+                // Integrity repair then tombstoned it "for corruption", the
+                // calibration resume filter could no longer see it, and the case
+                // regenerated: ~196 exemplars rebuilt per boot, forever.
+                //
+                // So distilled timelines fall through to the per-mode retention
+                // below whether or not they are tombstoned; only an undistilled
+                // tombstone is dropped outright.
+                if tombstoned.contains(&t.timeline_id) && !distilled.contains_key(&t.timeline_id) {
                     continue;
                 }
                 // A turn-scoped tombstone on a LIVE timeline sheds the turn's
@@ -338,7 +354,13 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
     // skipped so retired conversations don't leave dangling
     // sidebar entries on disk.
     for (timeline_id, conv_id, label, archived, custom) in substrate.live_conv_meta() {
-        if tombstoned.contains(&timeline_id) {
+        // A tombstoned timeline that is ALSO distilled is the provenance corpus
+        // (calibration exemplars: archived, distilled, then tombstoned out of the
+        // live gather while their signatures keep answering the belief scan).
+        // Its marker/metadata must survive, or the next reload sees a
+        // content-declaring turn with no distill exemption and condemns it.
+        // Only an undistilled tombstone is a retired conversation.
+        if tombstoned.contains(&timeline_id) && !distilled.contains_key(&timeline_id) {
             continue;
         }
         let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label, &custom);
@@ -416,12 +438,16 @@ pub fn collect_live_records(manifest: &Manifest, substrate: &Substrate) -> Vec<C
     // Per-distilled-timeline marker — re-emitted (with mode) so a distilled
     // timeline stays distilled across the compaction it just shed through.
     // Without this the marker is lost and, e.g., a text-only archived
-    // conversation would read back as un-distilled. Tombstoned timelines are
-    // gone, so skip them.
+    // conversation would read back as un-distilled.
+    //
+    // Re-emitted for TOMBSTONED timelines too. The marker is what exempts a
+    // distilled turn from the `MissingKv` integrity verdict (`classify_turn`),
+    // and a distilled turn has legitimately shed its KV — so losing the marker
+    // condemns the very corpus the distillation created. The provenance corpus
+    // is tombstoned by design (out of the live gather, still answering the
+    // belief scan by signature), so "tombstoned" cannot mean "forget it was
+    // distilled".
     for (&timeline_id, &mode) in &distilled {
-        if tombstoned.contains(&timeline_id) {
-            continue;
-        }
         let payload = DistillPayload { timeline_id, mode }.encode();
         out.push(CompactItem::synth(
             RecordHeader {
@@ -812,6 +838,217 @@ mod tests {
     /// decl/chunk for X, then a `Tombstone` for X.  The
     /// compactor's `collect_live_records` output must contain
     /// neither the Label nor the chunk.
+    /// A tombstoned timeline that is ALSO distilled is the provenance corpus —
+    /// calibration exemplars, archived then distilled `ProvenanceOnly` then
+    /// tombstoned so they leave the live gather while still answering the belief
+    /// scan by signature. Compaction must retain them by their MODE, and must
+    /// keep re-emitting the `Distilled` marker.
+    ///
+    /// Losing the marker is what made this self-sustaining: the next reload saw
+    /// a content-declaring turn with no KV and no distill exemption
+    /// (`TurnIntegrity::MissingKv`), integrity repair tombstoned it "for
+    /// corruption", and the calibration resume filter regenerated the case —
+    /// ~196 exemplars rebuilt every boot.
+    #[test]
+    fn distilled_tombstoned_timeline_keeps_its_marker_and_sigs() {
+        use crate::persistence::record::{DistillPayload, TombstonePayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let corpus_tl: u64 = 4242;
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: corpus_tl,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, 300, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, 300, 0, b"corpus-kv"));
+        blob.extend_from_slice(&record(RecordType::WideQSig, 300, 0, b"corpus-sig"));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: corpus_tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: corpus_tl,
+                turn_index: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
+
+        // The marker survives, at its mode — without it the exemption is lost.
+        assert!(
+            live.iter()
+                .any(|it| it.header().record_type == RecordType::Distilled
+                    && it
+                        .synth_payload()
+                        .and_then(|p| DistillPayload::decode(p).ok())
+                        .map(|d| d.mode)
+                        == Some(DistillMode::ProvenanceOnly)),
+            "distilled+tombstoned timeline must keep its Distilled marker",
+        );
+        // ProvenanceOnly retention still applies: the signature is what the
+        // belief scan reads, so it stays; the KV is shed as usual.
+        assert!(
+            live.iter()
+                .any(|it| it.header().record_type == RecordType::WideQSig
+                    && it.header().stream_id == 300),
+            "the provenance corpus keeps its WideQSig",
+        );
+        assert!(
+            !live
+                .iter()
+                .any(|it| it.header().record_type == RecordType::Chunk
+                    && it.header().stream_id == 300),
+            "ProvenanceOnly still sheds the KV",
+        );
+    }
+
+    /// The corpus's Label must survive its tombstone too.
+    ///
+    /// The Label carries `custom` — which holds the calibration marker the
+    /// resume filter matches on — and the archived flag it then tests. Dropping
+    /// it leaves an exemplar that cannot be recognised as done even once the
+    /// distill marker is found, so the case regenerates anyway.
+    #[test]
+    fn distilled_tombstoned_timeline_keeps_its_label_and_marker() {
+        use crate::persistence::record::{DistillPayload, TombstonePayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let corpus_tl: u64 = 777;
+        let retired_tl: u64 = 888;
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("calib_marker".to_string(), "file_read|abc".to_string());
+
+        // Both need a turn stream, or the timeline is never registered and
+        // `live_conv_meta` (which the Label re-emit walks) never sees it.
+        let turn_decl = |tl: u64| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::StreamDecl,
+            400,
+            0,
+            &turn_decl(corpus_tl).encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::StreamDecl,
+            500,
+            0,
+            &turn_decl(retired_tl).encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Label,
+            0,
+            0,
+            &super::super::manifest::encode_label_payload(
+                corpus_tl,
+                "corpus-conv",
+                "Corpus",
+                &custom,
+            ),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Label,
+            0,
+            0,
+            &super::super::manifest::encode_label_payload(
+                retired_tl,
+                "retired-conv",
+                "Retired",
+                &custom,
+            ),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: corpus_tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+        for tl in [corpus_tl, retired_tl] {
+            blob.extend_from_slice(&record(
+                RecordType::Tombstone,
+                0,
+                0,
+                &TombstonePayload {
+                    timeline_id: tl,
+                    turn_index: None,
+                    reason: None,
+                }
+                .encode(),
+            ));
+        }
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate);
+
+        let has_label = |needle: &str| {
+            live.iter().any(|it| {
+                it.header().record_type == RecordType::Label
+                    && it
+                        .synth_payload()
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .map(|s| s.contains(needle))
+                        .unwrap_or(false)
+            })
+        };
+        assert!(
+            has_label("corpus-conv"),
+            "distilled+tombstoned keeps its Label (marker + archived flag)"
+        );
+        assert!(
+            !has_label("retired-conv"),
+            "an ordinary tombstone still drops its Label"
+        );
+    }
+
     #[test]
     fn tombstoned_timeline_records_drop_during_compaction() {
         use crate::persistence::record::TombstonePayload;

@@ -2,11 +2,11 @@
 //!
 //! This implementation should be in line with the [PyTorch version](https://github.com/pytorch/pytorch/blob/7b419e8513a024e172eae767e24ec1b849976b13/torch/_tensor_str.py).
 //!
-use crate::{DType, Result, Tensor, WithDType};
+use crate::{DType, LiveTensor, Result, Tensor, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16};
 
-impl Tensor {
+impl<'w> LiveTensor<'w> {
     fn fmt_dt<T: WithDType + std::fmt::Display>(
         &self,
         f: &mut std::fmt::Formatter,

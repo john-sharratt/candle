@@ -16,11 +16,19 @@ use super::compute::compute_experts_grouped;
 #[cfg(feature = "cuda")]
 use super::gpu_dispatch::GpuDispatchTables;
 #[cfg(feature = "cuda")]
-use super::pinned::{ExpertLocation, LayerGeometry, PinnedPool};
+use super::pack::{
+    open_or_create, repack_fingerprint, LayerSpansInput, PackIdentity, PackSource, PackSpec,
+    RecordLayout,
+};
+#[cfg(feature = "cuda")]
+use super::pinned::{stratified_membership, ExpertResidency, WarmPool};
 #[cfg(not(feature = "cuda"))]
 use super::pipeline::prewarm_expert_cache;
 #[cfg(feature = "cuda")]
-use super::pipeline::startup_two_tier;
+use super::pipeline::{
+    slot_bytes_for, slot_offsets, startup_from_pack, startup_repack, ColdStaging, StartupTargets,
+    COLD_STAGING_BUFFERS,
+};
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 use super::transition::TransitionMatrix;
 use super::types::{
@@ -28,17 +36,111 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
-#[cfg(feature = "cuda")]
-use candle::quantized::cuda::{
-    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
-    moe_bucketize, moe_route, silu_mul_q8a128, Q8a128Operand, GROUPED_GEMM_TILE_W,
-};
+use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+// ============================================================================
+// Warm tier sizing
+// ============================================================================
+
+/// The seed for the warm tier's stratified draw.
+///
+/// Fixed rather than random so that two runs of the same build on the same model
+/// warm the same experts: a change in expert-cache hit rate is then attributable
+/// to the change under test, not to which experts got lucky at startup.
+const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
+
+/// Host RAM left unclaimed by the warm tier, for everything the process needs
+/// after it.
+///
+/// The warm tier is the single largest host allocation the engine makes and the
+/// first one it makes, so whatever it takes, the rest of the process must live
+/// in what remains — the cold-tier staging ring, the routing buffer, the
+/// substrate's pinned cold-load and elevate scratch (192 MiB between them), the
+/// `PinnedStager` arenas, and the warm **KV** tier's pageable arenas.
+///
+/// Sizing the tier to the last free page is what makes this necessary: pinned
+/// pages cannot be reclaimed under pressure, so a warm tier that fits by exactly
+/// nothing leaves the next allocation to fail instead of merely running slower.
+/// That happened — a 46 MB staging ring failed with `CUDA_ERROR_OUT_OF_MEMORY`
+/// immediately after a warm pool sized against *total* RAM took every free page
+/// on a machine with 12 GB already in use by other processes.
+///
+/// **3 GiB rather than the ~250 MiB those allocations actually total, because
+/// the tier is past its knee well before it runs out of room.** Lowering this to
+/// 1 GiB was measured: the tier grew from 4,979 slots to 5,090, cold loads
+/// halved (986 → 435), and throughput did not improve — flat to 1–2 % down, with
+/// single-stream t/s falling further (204.5 → 197.0). Once the draw covers
+/// VRAM's complement (§6.1) the remaining cold reads are not the bottleneck, and
+/// pinned pages taken past that point are taken from the page cache and the warm
+/// KV tier, which this gate barely exercises and a daemon workload does. When
+/// the performance argument is a wash, the safety argument decides.
+const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
+
+/// How many warm slots to ask for: **every expert the machine will actually
+/// give room for.**
+///
+/// The target is the whole model. A miss that reaches the cold tier is a
+/// synchronous NVMe read on the pipeline thread, so the warm tier is not an
+/// optimisation over the pack — it is what keeps the pack off the critical path.
+/// The first build of this sized it as a *share* of spare RAM (half), which left
+/// 2,241 of 6,144 experts warm and sent **64 % of every miss to disk**;
+/// aggregate throughput fell by a third against the two-tier cache it replaced.
+///
+/// The bound is **available** RAM, not total. Total is what the machine has;
+/// available is what it will give, and on a dev box with an editor and a browser
+/// open the two differ by 12 GB. `host_ram_budget` reasons in totals because its
+/// other callers ask "is this machine big enough for this model", which is a
+/// question about the machine. This one is "may I have these pages now", which
+/// is a question about this moment.
+///
+/// `cuMemAllocHost` remains the authority — [`WarmPool::new`] halves on refusal
+/// — but a refusal costs half the tier, so the first ask should be one that can
+/// succeed.
+fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
+    if stride == 0 {
+        return 0;
+    }
+    let (Some(total_ram), Some(available)) = (
+        candle::vram::total_physical_ram(),
+        candle::vram::available_physical_ram(),
+    ) else {
+        // No probe on this platform: take no warm tier rather than guess at a
+        // number that could be most of the machine. Every expert is still
+        // served, from the pack.
+        tracing::warn!(
+            target: "candle_transformers::expert_lre",
+            "warm tier: no host-RAM probe on this platform; running cold-tier only"
+        );
+        return 0;
+    };
+    let budget = candle::vram::host_ram_budget(total_ram);
+    // Two ceilings, both real: what the machine is big enough for, and what it
+    // has free this second.
+    let affordable = budget
+        .kv_warm_budget_bytes
+        .min(available.saturating_sub(WARM_TIER_HEADROOM)) as usize;
+    let slots = (affordable / stride).min(total_experts);
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        total_gib = total_ram as f64 / 1e9,
+        available_gib = available as f64 / 1e9,
+        budgeted_gib = budget.kv_warm_budget_bytes as f64 / 1e9,
+        weights_gib = budget.weights_reserved_bytes as f64 / 1e9,
+        take_gib = (slots * stride) as f64 / 1e9,
+        slots,
+        of = total_experts,
+        "warm tier: sized against available RAM"
+    );
+    slots
+}
 
 // ============================================================================
 // Pipeline mode
@@ -84,6 +186,15 @@ pub struct ExpertCache {
     mode: PipelineMode,
     /// True when all experts fit in VRAM — hint sending is elided.
     all_resident: bool,
+    /// Dedicated CUDA stream for async routing index DtoH.
+    /// Lives on the forward thread — never crosses to the pipeline thread.
+    #[cfg(feature = "cuda")]
+    routing_stream: Option<Arc<CudaStream>>,
+    /// Pinned host buffer for routing indices: `[max_tokens × k]` u32.
+    /// Allocated via `cuMemAllocHost` — truly async DtoH destination.
+    /// Reused every MoE layer (only one is active at a time).
+    #[cfg(feature = "cuda")]
+    routing_pinned: Option<PinnedRoutingBuffer>,
     /// Static GPU-native dispatch tables (all-resident cache only): per-expert
     /// weight pointers indexed on-device by `moe_bucketize`'s tile tables, so
     /// the expert forward needs no routing readback. `None` ⇒ host path.
@@ -107,27 +218,105 @@ pub struct ExpertCache {
     forward_profile: Mutex<ProfileAccumulator>,
 }
 
+/// Pinned host buffer for routing indices (async DtoH destination).
+#[cfg(feature = "cuda")]
+struct PinnedRoutingBuffer {
+    /// Raw pointer from `cuMemAllocHost`.
+    ptr: *mut u32,
+    /// Capacity in u32 elements.
+    capacity: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl PinnedRoutingBuffer {
+    /// Allocate a pinned buffer for `capacity` u32 elements.
+    fn new(capacity: usize) -> Result<Self> {
+        let byte_size = capacity * std::mem::size_of::<u32>();
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, byte_size) };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            candle::bail!(
+                "cuMemAllocHost for routing buffer failed: {:?} ({} bytes)",
+                result,
+                byte_size,
+            );
+        }
+        Ok(Self {
+            ptr: ptr as *mut u32,
+            capacity,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PinnedRoutingBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+// SAFETY: The pinned memory is GPU-accessible and not tied to a thread.
+#[cfg(feature = "cuda")]
+unsafe impl Send for PinnedRoutingBuffer {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for PinnedRoutingBuffer {}
+
+/// Everything [`ExpertCache::new`] needs, gathered rather than passed as nine
+/// positional arguments.
+///
+/// `zone` is the weight side of the device reservation, already sized: its
+/// capacity **is** the resident-expert count. There is no budget arithmetic left
+/// at this level — `VramGovernor::expert_budget` used to divide bytes by
+/// `max_expert_size` here, and the zone's capacity is that same quotient taken
+/// once, against a span whose extent is a fact rather than a forecast.
+pub struct ExpertCacheSetup<'a> {
+    /// The GGUF, mapped. Read only while the pack is being built.
+    pub mmap: Arc<memmap2::Mmap>,
+    /// Per-`[layer][expert]` byte ranges into that mapping.
+    pub host_refs: Vec<Vec<MmapExpertRef>>,
+    /// The weight side of the device reservation.
+    pub zone: WeightZone,
+    pub device: &'a Device,
+    pub experts_per_layer: usize,
+    /// The checkpoint the experts come from — names the pack and identifies it.
+    pub gguf_path: &'a std::path::Path,
+    /// Where a persistent pack lives, or `None` for a temp file that is
+    /// unlinked as soon as it is open and costs a repack every boot.
+    pub expert_pack_dir: Option<&'a std::path::Path>,
+    pub progress: Option<&'a dyn Fn(usize, usize)>,
+    pub int8mode: Int8Mode,
+}
+
 impl ExpertCache {
     /// Create a new expert cache with a background pipeline thread.
     ///
-    /// **CUDA path (two-tier):** GPU-repacks every expert from GGUF to K/128,
-    /// fills VRAM slots first, overflows to a pinned host-memory pool.
-    /// After startup the GGUF mmap is no longer needed.
+    /// **CUDA path:** opens the pack file for this checkpoint — building it by
+    /// repacking every expert out of the GGUF if there is not already a matching
+    /// one — then fills the warm and hot tiers from it. After startup the GGUF's
+    /// expert regions are never read again. Requires an actual CUDA device: a
+    /// cuda-feature build handed a CPU device fails here rather than later.
     ///
-    /// **Non-CUDA path:** fills VRAM from mmap (legacy GGML path).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        mmap: Arc<memmap2::Mmap>,
-        host_refs: Vec<Vec<MmapExpertRef>>,
-        num_slots: usize,
-        device: &Device,
-        experts_per_layer: usize,
-        _gguf_path: Option<&std::path::Path>,
-        progress: Option<&dyn Fn(usize, usize)>,
-        int8mode: candle::quantized::Int8Mode,
-    ) -> Result<Self> {
+    /// **Non-CUDA builds** (`not(feature = "cuda")`) take a separate path
+    /// entirely, filling from the mmap with no pack and no warm tier.
+    pub fn new(setup: ExpertCacheSetup<'_>) -> Result<Self> {
+        let ExpertCacheSetup {
+            mmap,
+            host_refs,
+            zone,
+            device,
+            experts_per_layer,
+            gguf_path,
+            expert_pack_dir,
+            progress,
+            int8mode,
+        } = setup;
         let num_moe_layers = host_refs.len();
-        let mut inner = ExpertCacheInner::new(num_slots, num_moe_layers, experts_per_layer);
+        let num_slots = zone.capacity();
+        let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
 
         // ── CUDA copy stream (pipeline thread) ──
         #[cfg(feature = "cuda")]
@@ -148,6 +337,41 @@ impl ExpertCache {
             None
         };
 
+        // ── CUDA routing stream + pinned buffer (forward thread) ──
+        #[cfg(feature = "cuda")]
+        let (routing_stream, routing_pinned): (
+            Option<Arc<CudaStream>>,
+            Option<PinnedRoutingBuffer>,
+        ) = if let Device::Cuda(cuda_dev) = device {
+            let stream = match cuda_dev.cuda_context().new_stream() {
+                Ok(s) => {
+                    tracing::info!("Expert cache: created routing stream for async DtoH");
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::warn!("Expert cache: failed to create routing stream: {e}");
+                    None
+                }
+            };
+            // 1024 tokens × 8 experts = 8192 u32 elements = 32 KB
+            let buf = match PinnedRoutingBuffer::new(1024 * experts_per_layer) {
+                Ok(b) => {
+                    tracing::info!(
+                        "Expert cache: allocated {} KB pinned routing buffer",
+                        (1024 * experts_per_layer * 4) / 1024,
+                    );
+                    Some(b)
+                }
+                Err(e) => {
+                    tracing::warn!("Expert cache: failed to allocate pinned routing buffer: {e}");
+                    None
+                }
+            };
+            (stream, buf)
+        } else {
+            (None, None)
+        };
+
         let transition_matrix = TransitionMatrix::new(num_moe_layers, experts_per_layer);
         if num_moe_layers > 1 {
             tracing::info!(
@@ -157,116 +381,171 @@ impl ExpertCache {
             );
         }
 
-        // ── CUDA two-tier startup ──
+        // ── CUDA startup: the pack, then the two resident tiers from it ──
         #[cfg(feature = "cuda")]
-        let (pinned_pool, expert_locations, layer_geometries, all_resident) =
+        let (pack, warm, cold_staging, residency, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
-                // Build per-layer geometry. The pinned pool caches the *target* format: for Off
-                // that is the gemx K/128 repack of the source dtype; for int8 it is the KO twin
-                // (repacked once per expert, then DMA-reloaded on a miss — no per-miss re-quant).
-                let mut geoms: Vec<LayerGeometry> = Vec::with_capacity(num_moe_layers);
-                for moe_idx in 0..num_moe_layers {
-                    let r = &host_refs[moe_idx][0];
-                    let tko = |d: candle::quantized::GgmlDType| {
-                        if int8mode.is_int8() {
-                            d.to_ko(int8mode)
-                        } else {
-                            Ok(d)
-                        }
-                    };
-                    let gate_dtype = tko(r.gate_dtype)?;
-                    let up_dtype = tko(r.up_dtype)?;
-                    let down_dtype = tko(r.down_dtype)?;
-                    let gate_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.gate_shape[0],
-                        r.gate_shape[1],
-                        gate_dtype,
-                    )?;
-                    let up_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.up_shape[0],
-                        r.up_shape[1],
-                        up_dtype,
-                    )?;
-                    let down_repacked_size = candle::quantized::repacked_size_bytes(
-                        r.down_shape[0],
-                        r.down_shape[1],
-                        down_dtype,
-                    )?;
-                    geoms.push(LayerGeometry {
-                        gate_shape: r.gate_shape.clone(),
-                        gate_dtype,
-                        gate_repacked_size,
-                        up_shape: r.up_shape.clone(),
-                        up_dtype,
-                        up_repacked_size,
-                        down_shape: r.down_shape.clone(),
-                        down_dtype,
-                        down_repacked_size,
-                        total_repacked_size: gate_repacked_size
-                            + up_repacked_size
-                            + down_repacked_size,
-                    });
-                }
-
-                // Compute pinned pool size: total experts minus VRAM slots,
-                // plus 10% headroom for runtime evictions (drip + end-of-pass
-                // move VRAM experts to pinned — need free pinned slots for that).
-                // When all experts fit in VRAM, skip the pinned pool entirely —
-                // no eviction is needed and pinned RAM would be wasted.
+                let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
                 let total_experts = num_moe_layers * experts_per_layer;
                 let all_resident = num_slots >= total_experts;
-                let num_pinned = if all_resident {
-                    0
-                } else {
-                    // Free pinned slots the drip / end-of-pass demotion moves VRAM experts into.
-                    // Under CUDA there is NO mmap reload path (the pinned pool is the only warm
-                    // tier — see `PipelineState`), so an eviction that finds the pool full loses the
-                    // expert and corrupts its location; this headroom is the invariant that keeps
-                    // the pool from ever running out. Do NOT shrink it to save pinned RAM.
-                    let eviction_headroom = num_slots / 10; // 10% of VRAM slots
-                    total_experts.saturating_sub(num_slots) + eviction_headroom
-                };
-                let slot_size = geoms
+
+                // **The GGUF's expert regions become dead pages here.** They are
+                // read once — streaming, to build the pack — and never again:
+                // every later load comes from the pack, the warm pool, or VRAM.
+                // The loader declared the whole mapping as resident weight
+                // bytes, which is right for a dense model where the mmap *is*
+                // the weight source, and wrong here by 16.6 GiB of a 18.6 GB
+                // file. That reservation is subtracted from the host-RAM budget
+                // the warm tier is then sized out of, so leaving it in place
+                // does not merely misreport — it takes the RAM away from the
+                // tier whose whole job is to stop those pages being needed.
+                let expert_source_bytes: u64 = host_refs
                     .iter()
-                    .map(|g| g.total_repacked_size)
-                    .max()
-                    .unwrap_or(0);
-
-                let mut pool = PinnedPool::new(num_pinned, slot_size)?;
-
-                // Initialize location tracking. Every expert starts as `Pinned { slot_idx: 0 }`;
-                // `startup_two_tier` below overwrites each entry with its real resident-VRAM or
-                // pinned-slot location as it repacks the weights.
-                let mut locations: Vec<Vec<ExpertLocation>> = Vec::with_capacity(num_moe_layers);
-                for _ in 0..num_moe_layers {
-                    let mut layer_locs = Vec::with_capacity(experts_per_layer);
-                    for _ in 0..experts_per_layer {
-                        layer_locs.push(ExpertLocation::Pinned { slot_idx: 0 });
-                    }
-                    locations.push(layer_locs);
-                }
-
-                // Run startup: GGUF → GPU repack → VRAM or pinned.
-                startup_two_tier(
-                    &mut inner,
-                    &mut pool,
-                    &mut locations,
-                    &geoms,
-                    &mmap,
-                    &host_refs,
-                    cuda_dev,
-                    _gguf_path,
-                    progress,
+                    .flatten()
+                    .map(|r| (r.gate_len + r.up_len + r.down_len) as u64)
+                    .sum();
+                let live_weight_bytes = (mmap.len() as u64).saturating_sub(expert_source_bytes);
+                candle::vram::set_weights_mmap(live_weight_bytes);
+                tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    mapped_gib = mmap.len() as f64 / 1e9,
+                    dead_gib = expert_source_bytes as f64 / 1e9,
+                    live_gib = live_weight_bytes as f64 / 1e9,
+                    "expert cache: the GGUF's expert pages are the pack's job now"
                 );
 
-                (pool, locations, geoms, all_resident)
+                // The pack's record layout **is** the VRAM slot's layout: same
+                // three projections, same aligned offsets. One geometry, so a
+                // load is a read and a copy with nothing rearranged in between.
+                let slot_bytes = slot_bytes_for(&geoms);
+                let layers: Vec<LayerSpansInput> = geoms
+                    .iter()
+                    .map(|g| {
+                        let (gate, up, down, _) = slot_offsets(g);
+                        LayerSpansInput {
+                            gate: (gate, g.gate_repacked_size, g.gate_dtype),
+                            up: (up, g.up_repacked_size, g.up_dtype),
+                            down: (down, g.down_repacked_size, g.down_dtype),
+                        }
+                    })
+                    .collect();
+                let layouts: Vec<RecordLayout> =
+                    layers.iter().copied().map(RecordLayout::from).collect();
+                // Run the repack over a reference matrix in every quantisation
+                // the engine supports, and hash it. The pack's validity is then
+                // checked against what this build *produces* and not only
+                // against where it would put it — see `pack::fingerprint`.
+                let source = open_or_create(PackSpec {
+                    dir: expert_pack_dir,
+                    gguf_path,
+                    identity: PackIdentity::of(&mmap, int8mode, repack_fingerprint(cuda_dev)),
+                    num_layers: num_moe_layers,
+                    experts_per_layer,
+                    slot_bytes,
+                    layers,
+                })?;
+
+                // The warm tier is sized by what the machine can spare, not by
+                // what residency demands — the cold tier serves every expert at
+                // any warm size, including zero.
+                let stride = candle::direct_io::round_up_sector(slot_bytes);
+                // **Before the warm tier, not after.** This is 46 MB and
+                // mandatory; the warm tier is ~14 GB and elastic. Taking the
+                // elastic one first left this to fail on a machine the warm
+                // tier had just filled — a model load dying with
+                // `CUDA_ERROR_OUT_OF_MEMORY` where it should have been a
+                // slightly smaller warm tier. The order is the fix; the
+                // aligned-host fallback inside is the belt.
+                let cold_staging = ColdStaging::new(stride, COLD_STAGING_BUFFERS)?;
+                // **A cache that holds every expert in VRAM wants no warm tier
+                // at all.** Nothing is ever evicted in that state — `post_compute`
+                // returns before the eviction and boundary passes — so a warm
+                // slot could only ever be read if a load missed, and no load
+                // does. Sizing it anyway would pin the model's size in host RAM
+                // to serve nothing, and pay a full-pack read at startup for it.
+                let want_warm = if all_resident {
+                    0
+                } else {
+                    warm_slots_for(stride, total_experts)
+                };
+                // `num_slots` is exactly what the startup fill will take into
+                // VRAM, in flat order, so it is the prefix the draw skips over.
+                let membership = stratified_membership(
+                    num_moe_layers,
+                    experts_per_layer,
+                    want_warm,
+                    num_slots,
+                    WARM_DRAW_SEED,
+                );
+                let mut warm = WarmPool::new(membership.len(), stride);
+                // A refusal shortens the draw rather than leaving slots the pool
+                // does not have: `ram` must never name a slot outside it.
+                let membership = &membership[..membership.len().min(warm.num_slots())];
+
+                let mut residency =
+                    vec![vec![ExpertResidency::default(); experts_per_layer]; num_moe_layers];
+                // The eviction policy weighs what a reload would cost, so it has
+                // to know which experts the warm tier holds before the first
+                // victim is chosen.
+                inner.set_warm_backed(membership);
+                let targets = StartupTargets {
+                    inner: &mut inner,
+                    warm: &mut warm,
+                    residency: &mut residency,
+                    membership,
+                    geoms: &geoms,
+                    layouts: &layouts,
+                    stride,
+                };
+                let pack = match source {
+                    PackSource::Ready(pack) => {
+                        startup_from_pack(
+                            targets,
+                            &pack,
+                            num_moe_layers,
+                            experts_per_layer,
+                            cuda_dev,
+                            progress,
+                        )?;
+                        pack
+                    }
+                    PackSource::Build(mut writer) => {
+                        startup_repack(
+                            targets,
+                            &mut writer,
+                            &mmap,
+                            &host_refs,
+                            cuda_dev,
+                            progress,
+                        )?;
+                        writer.finish()?
+                    }
+                };
+
+                // The pack's stride is what the geometry said it would be — the
+                // buffers above were cut to it before the file was opened.
+                debug_assert_eq!(pack.stride(), stride);
+                (pack, warm, cold_staging, residency, geoms, all_resident)
             } else {
-                // Non-CUDA device — empty pinned pool + empty locations.
-                let pool = PinnedPool::empty();
-                let locations: Vec<Vec<ExpertLocation>> = Vec::new();
-                let geoms: Vec<LayerGeometry> = Vec::new();
-                let all_resident = num_slots >= num_moe_layers * experts_per_layer;
-                (pool, locations, geoms, all_resident)
+                // **A cuda-feature build has no expert path for a CPU device,
+                // and never had one.** Every tier is device-side or DMA-bound:
+                // the hot tier is weight-zone slots, the warm tier is pinned
+                // host memory the GPU reads, the pack's records are uploaded
+                // with `cuMemcpyHtoD`. The `not(feature = "cuda")` build has a
+                // separate mmap path (`prewarm_expert_cache`); this build does
+                // not, and cannot borrow it — the zone it would fill has no
+                // device reservation behind it.
+                //
+                // This used to construct an empty pool and empty tables and
+                // return successfully, which meant the load *appeared* to work
+                // and the first MoE layer panicked indexing an empty
+                // per-layer table. Failing here says the same thing at the
+                // point where it can still be acted on.
+                candle::bail!(
+                    "MoE expert cache: this build has CUDA compiled in but was given {device:?}. \
+                     The expert tiers are all device-side or DMA-bound, so there is no CPU path — \
+                     run on a CUDA device, or build without the `cuda` feature for the mmap path."
+                )
             };
 
         // ── Non-CUDA prewarm path ──
@@ -287,7 +566,7 @@ impl ExpertCache {
         // before they move into `PipelineState` below.
         #[cfg(feature = "cuda")]
         {
-            let occupied = inner.slots.len() - inner.free_slots.len();
+            let occupied = inner.num_slots() - inner.free_len();
             let slot_bytes = layer_geometries
                 .iter()
                 .map(|g| g.total_repacked_size)
@@ -296,8 +575,8 @@ impl ExpertCache {
             let seeded = occupied * slot_bytes;
             tracing::info!(
                 target: "candle_transformers::expert_lre",
-                num_slots = inner.slots.len(),
-                free_slots = inner.free_slots.len(),
+                num_slots = inner.num_slots(),
+                free_slots = inner.free_len(),
                 occupied,
                 slot_bytes,
                 resident_gib = seeded as f64 / 1e9,
@@ -305,6 +584,8 @@ impl ExpertCache {
             );
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;
+                s.warm_slots = warm.num_slots();
+                s.total_experts = num_moe_layers * experts_per_layer;
             }
         }
 
@@ -331,9 +612,13 @@ impl ExpertCache {
             #[cfg(feature = "cuda")]
             copy_stream,
             #[cfg(feature = "cuda")]
-            pinned_pool,
+            pack,
             #[cfg(feature = "cuda")]
-            expert_locations,
+            warm,
+            #[cfg(feature = "cuda")]
+            cold_staging,
+            #[cfg(feature = "cuda")]
+            residency,
             #[cfg(feature = "cuda")]
             layer_geometries,
             num_moe_layers,
@@ -342,6 +627,7 @@ impl ExpertCache {
             transition_matrix,
             last_moe_layer_idx: None,
             speculative_loads: HashSet::new(),
+            pending_prefetch_fence: CopyBatchFence::noop(),
             hint_stats: (0, 0),
             profile: ProfileAccumulator::new(),
             stats: stats.clone(),
@@ -364,6 +650,10 @@ impl ExpertCache {
             mode: PipelineMode::Threaded { tx },
             all_resident,
             #[cfg(feature = "cuda")]
+            routing_stream,
+            #[cfg(feature = "cuda")]
+            routing_pinned,
+            #[cfg(feature = "cuda")]
             gpu_dispatch,
             pipeline_dead,
             prev_layer_experts: Mutex::new(Vec::new()),
@@ -385,9 +675,18 @@ impl ExpertCache {
         slot_to_key: Vec<Option<(usize, usize)>>,
         device: &Device,
     ) -> Self {
+        // Every slot is occupied and none ever moves, so the zone exists only to
+        // answer "which index is where" — the addresses are the pre-built
+        // storages' own, not the zone's, and nothing here allocates from it. The
+        // floor is the whole capacity for the same reason: nothing may retract a
+        // zone whose slots it does not own.
+        let mut zone = WeightZone::new(0, 0, slots.len(), slots.len(), slots.len());
+        for _ in 0..slots.len() {
+            zone.alloc();
+        }
         let inner = ExpertCacheInner {
             slots,
-            free_slots: vec![],
+            zone,
             key_to_slot,
             last_used,
             generation,
@@ -395,6 +694,9 @@ impl ExpertCache {
             expert_scores: vec![],
             num_moe_layers: 0,
             experts_per_layer: 0,
+            // Inline mode holds every expert in VRAM and never evicts, so no
+            // reload cost is ever weighed.
+            warm_backed: vec![],
         };
         // All experts are VRAM-resident and never move, so their weight
         // addresses are static: capture them once into device pointer tables
@@ -412,6 +714,10 @@ impl ExpertCache {
                 device: device.clone(),
             },
             all_resident: true, // prepopulated = all in VRAM
+            #[cfg(feature = "cuda")]
+            routing_stream: None,
+            #[cfg(feature = "cuda")]
+            routing_pinned: None,
             #[cfg(feature = "cuda")]
             gpu_dispatch,
             pipeline_dead: Arc::new(AtomicBool::new(false)),
@@ -461,6 +767,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: Vec<(u32, u32, u32)>,
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         match &self.mode {
             PipelineMode::Threaded { tx } => {
@@ -478,6 +785,7 @@ impl ExpertCache {
                     assignments,
                     // Captured right before `send` so the worker can split the inbound handoff
                     // (channel wakeup) out of the actual work.
+                    wave,
                     submitted_at: profile_now(),
                     response_tx: resp_tx,
                 };
@@ -511,6 +819,7 @@ impl ExpertCache {
                     out_dtype,
                     weights_flat,
                     &assignments,
+                    wave,
                 )
             }
         }
@@ -531,6 +840,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: &[(u32, u32, u32)],
+        wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         let mut inner = mutex
             .lock()
@@ -559,6 +869,11 @@ impl ExpertCache {
         };
 
         let (num_tokens, hidden) = input.shape()?;
+        // The inline twin of the threaded pipeline's combine target. It runs on
+        // the caller's thread and stream, so the layer's FFN generation *would*
+        // bound it — but this mode exists only when there is no pipeline thread,
+        // which production never configures, so it stays an ordinary allocation
+        // rather than a second wave consumer for a path nothing takes.
         let mut ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
         let mut _inline_prof = ProfileAccumulator::new();
         #[cfg(feature = "cuda")]
@@ -580,6 +895,7 @@ impl ExpertCache {
                     &experts_vec,
                     weights_flat,
                     &mut _inline_prof,
+                    wave,
                 )?;
             }
         }
@@ -715,6 +1031,12 @@ impl ExpertCache {
         }
     }
 
+    /// Get the routing stream for async DtoH (if available).
+    #[cfg(feature = "cuda")]
+    pub fn routing_stream(&self) -> Option<&Arc<CudaStream>> {
+        self.routing_stream.as_ref()
+    }
+
     /// The static GPU-native dispatch tables, when this cache is all-resident
     /// and they were successfully built at construction. `Some` ⇒ the expert
     /// forward can run entirely on-device (no routing readback).
@@ -758,132 +1080,21 @@ impl ExpertCache {
         Some(gd)
     }
 
-    /// GPU-native resident MoE executor: route → bucketize → gather → grouped
-    /// GEMM ×3 → SwiGLU → deterministic scatter, entirely on the compute stream
-    /// with no routing readback. This is the **all-resident** fast lane — the
-    /// only caller is the qwen3 `SparseMoeBlock` (every expert VRAM-resident).
-    /// DeepSeek's paged cache uses the host `submit_moe_work` path.
+    /// Base pointer of the pinned routing buffer, if it exists and holds `len`.
     ///
-    /// Every active expert is already VRAM-resident with a static address
-    /// (`GpuDispatchTables`), so the per-layer weight-pointer table is the
-    /// prebuilt static table and there is **no active-list readback, no DMA, and
-    /// no flag-wait** — every expert forward runs entirely on the compute stream.
-    ///
-    /// `router_logits` is `[num_tokens, num_experts]`; `op` is the q8a1024
-    /// activation the experts consume. Returns `Some([num_tokens, hidden_dim])`
-    /// (the caller reshapes), or `Ok(None)` when the GPU-native dispatch tables
-    /// are unavailable (sparse/oversized id space, or a dead pipeline) so the
-    /// caller falls back to the host path — this is the single dispatch-table
-    /// lookup (the caller does not pre-check). Bit-identical to the host-
-    /// orchestrated expert path — the bucketize tables reproduce the CPU
-    /// counting-sort and the grouped GEMM / gather / silu / scatter kernels are
-    /// shared verbatim.
+    /// A pointer rather than a `&mut [u32]`: the cache lives behind an `Arc`, so
+    /// a `&mut` handed out from `&self` is one the borrow checker cannot police —
+    /// nothing stops a second call from minting an overlapping one. The single
+    /// writer here is the forward thread, and the ordering against the routing
+    /// stream's DtoH is the caller's (it holds the events), so the caller is
+    /// where the slice and its `unsafe` belong.
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_moe_gpu(
-        &self,
-        moe_layer_idx: usize,
-        router_logits: &Tensor,
-        op: &Q8a128Operand,
-        k: usize,
-        num_experts: usize,
-        norm_topk_prob: bool,
-        out_dtype: DType,
-    ) -> Result<Option<Tensor>> {
-        let device = router_logits.device().clone();
-        let cuda_dev = match &device {
-            Device::Cuda(d) => d.clone(),
-            _ => candle::bail!("forward_moe_gpu: expected a CUDA device"),
-        };
-        let num_tokens = router_logits.dim(0)?;
-
-        // Single dispatch-table lookup: `None` ⇒ no GPU-native path, caller uses host.
-        let gd = match self.live_gpu_dispatch(moe_layer_idx, num_experts) {
-            Some(gd) => gd,
-            None => return Ok(None),
-        };
-        let hidden_dim = gd.down_nrows;
-
-        // 1. Fused GPU routing; the flattened weights feed the scatter directly.
-        let t = profile_now();
-        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, norm_topk_prob)?;
-        let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
-        self.record_profile("fwd_routing", t);
-
-        // 2. On-device bucketize into the shared reusable workspace.
-        let t = profile_now();
-        let mut ws = gd
-            .workspace
-            .lock()
-            .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
-        moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
-        let a_ub = num_tokens * k;
-        // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and each
-        // expert adds at most one partial tile.
-        let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + num_experts);
-        let expert_base = gd
-            .expert_base(moe_layer_idx)
-            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
-
-        // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
-        let stacked = fused_moe_gather_q8a128(op, &ws.tok_ids, a_ub, &cuda_dev)?;
-        let gate_out = grouped_qmatmul_dev_q8a128(
-            &stacked,
-            &gd.gate_ptrs,
-            expert_base,
-            num_experts,
-            gd.gate_dtype,
-            gd.gate_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
-        )?;
-        let up_out = grouped_qmatmul_dev_q8a128(
-            &stacked,
-            &gd.up_ptrs,
-            expert_base,
-            num_experts,
-            gd.gate_dtype, // up shares gate's KO dtype
-            gd.gate_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
-        )?;
-        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev)?;
-        let down_out = grouped_qmatmul_dev_q8a128(
-            &inter_acts,
-            &gd.down_ptrs,
-            expert_base,
-            num_experts,
-            gd.down_dtype,
-            gd.down_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
-        )?;
-        // The int8 matmul emits F32; the fused scatter requires the compute dtype.
-        let down_out = down_out.to_dtype(out_dtype)?;
-
-        // 4. Deterministic scatter — identical accumulation order to the host path.
-        let ys = Tensor::zeros((num_tokens, hidden_dim), out_dtype, &device)?;
-        fused_deterministic_scatter(
-            &ys,
-            &down_out,
-            &ws.perm,
-            &weights_flat,
-            &ws.rw_ids,
-            &ws.token_starts,
-            num_tokens,
-            &cuda_dev,
-        )?;
-        self.record_profile("fwd_expert_gpu", t);
-        Ok(Some(ys))
+    pub fn routing_pinned_ptr(&self, len: usize) -> Option<*mut u32> {
+        let pinned = self.routing_pinned.as_ref()?;
+        if len > pinned.capacity {
+            return None;
+        }
+        Some(pinned.ptr)
     }
 
     /// Store the expert IDs from the most recently completed MoE layer.
@@ -899,6 +1110,91 @@ impl ExpertCache {
         self.prev_layer_experts
             .lock()
             .map_or_else(|_| vec![], |v| v.clone())
+    }
+
+    /// Buy `regions` of weight-side ground for the KV side, and answer with the
+    /// bytes it conceded.
+    ///
+    /// **The caller states the quantity.** It is either an arena claim that has
+    /// run the KV side out and is asking for what it is about to allocate, or the
+    /// scheduler's relief asking for its measured setpoint shortfall. Both know
+    /// the number; neither can accumulate one, because the request does not
+    /// outlive the call that made it. What this replaced — a running count of
+    /// refused claims drained here — could and did: 4,436 regions against a
+    /// twenty-eight-region need, paid in full.
+    ///
+    /// **For a caller that is stuck.** The other direction — the weight side
+    /// taking back ground the KV side is not using — only runs between forwards
+    /// ([`Self::reclaim_spare_ground`]), and a KV side that cannot allocate the
+    /// arenas a wave needs never reaches the next one. This is the path that
+    /// breaks that.
+    ///
+    /// Zero is an ordinary answer: the zone may already sit at its floor, or a
+    /// wave generation may still be open, in which case `set_weight_floor`
+    /// refuses and this reports that it did. The caller decides whether to retry
+    /// on that basis rather than spinning on a claim that cannot succeed.
+    ///
+    /// Blocks on the pipeline thread's reply — it owns the cache state and is
+    /// the only place a boundary move is safe.
+    pub fn request_kv_ground(&self, regions: usize) -> u64 {
+        let PipelineMode::Threaded { tx } = &self.mode else {
+            // Inline mode holds every expert in VRAM and never moves the
+            // boundary; there is no ground to offer.
+            return 0;
+        };
+        if regions == 0 {
+            return 0;
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if tx
+            .send(PipelineMessage::RenegotiateBoundary {
+                regions,
+                response_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
+    }
+
+    /// The other direction: take back KV regions that are standing free.
+    ///
+    /// **Call this only between forwards.** Moving the boundary evicts and
+    /// relocates expert slots, and a wave in flight may be reading either, so
+    /// `set_weight_floor` refuses while a wave generation is open on the span.
+    ///
+    /// This used to be driven from the pipeline thread's `post_compute`, which
+    /// runs the instant a MoE layer's work is answered — with the forward thread
+    /// still inside `ffn_forward` holding that layer's FFN wave guard. So it was
+    /// asked forty-eight times a forward from inside the wave, and whether it
+    /// landed came down to a race with the forward thread's phase transitions:
+    /// refused in the common case, and in the narrow window between one layer's
+    /// guard dropping and the next one's opening, granted — at the cost of a
+    /// device-wide quiesce in the middle of a forward. Neither outcome is one the
+    /// engine should depend on, which is why the caller is now the wave loop's
+    /// own inter-forward gap, alongside the transient tier's hand-back.
+    ///
+    /// Answers with the bytes taken — always zero, since this direction concedes
+    /// nothing; the value exists so the two directions share a signature.
+    pub fn reclaim_spare_ground(&self) -> u64 {
+        let PipelineMode::Threaded { tx } = &self.mode else {
+            return 0;
+        };
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        // Zero regions is the growth question — "how much is the KV side holding
+        // that I could take?" — as against a positive count, which is the KV side
+        // stating what it needs.
+        if tx
+            .send(PipelineMessage::RenegotiateBoundary {
+                regions: 0,
+                response_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
     }
 
     /// Snapshot and reset all profile accumulators (forward + pipeline threads).

@@ -75,7 +75,9 @@ use super::compute::compute_expert_contribution_gpu_weights;
 use super::compute::compute_experts_grouped;
 use super::compute::QMatMul;
 #[cfg(feature = "cuda")]
-use super::pinned::{ExpertLocation, LayerGeometry, PinnedPool};
+use super::pack::{ExpertPack, PackRead, PackWriter, RecordLayout};
+#[cfg(feature = "cuda")]
+use super::pinned::{ExpertResidency, LayerGeometry, WarmPool};
 use super::transition::TransitionMatrix;
 #[cfg(not(feature = "cuda"))]
 use super::types::MoeInput;
@@ -84,13 +86,19 @@ use super::types::{
     PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator};
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_zeros_ticketed;
+#[cfg(feature = "cuda")]
+use candle::direct_io::AlignedScratch;
+#[cfg(feature = "cuda")]
+use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(not(feature = "cuda"))]
 use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
-use cudarc::driver::CudaStream;
+use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, weight_floor_after};
 #[cfg(feature = "cuda")]
-use rayon::prelude::*;
+use cudarc::driver::{CudaEvent, CudaStream};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -124,369 +132,280 @@ fn mmap_evict_expert(mmap: &memmap2::Mmap, r: &MmapExpertRef) {
 }
 
 // ============================================================================
-// Two-tier startup: GGUF → GPU repack → VRAM or pinned RAM
+// Startup: build or reuse the pack, then fill the warm and hot tiers from it
 // ============================================================================
 
-/// Positioned block read that fills `buf` entirely from `offset` (looping over
-/// short reads). Uses the OS positioned-read primitive so many threads can read
-/// disjoint regions of one file concurrently without a shared cursor.
-#[cfg(all(feature = "cuda", windows))]
-fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        let n = file.seek_read(buf, offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short read",
-            ));
-        }
-        buf = &mut buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-#[cfg(all(feature = "cuda", unix))]
-fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
-/// MXFP4_KO fast startup: the on-disk bytes are already the final GPU layout, so
-/// this is pure I/O. Slots are assigned serially (cheap), then every expert's
-/// bytes are read STRAIGHT from the file into its destination with positioned
-/// block reads across the rayon pool — pinned slots filled in place (disjoint,
-/// so no aliasing), VRAM experts staged in bounded chunks and H2D'd serially
-/// (the CUDA context is single-threaded). No mmap fault storm, no intermediate
-/// copy. Returns `(vram_count, pinned_count, errors)`.
+/// Everything the startup fill writes into, gathered so the two entry points
+/// below take one argument each instead of six.
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn startup_two_tier_ko_blockread(
-    inner: &mut ExpertCacheInner,
-    pinned_pool: &mut PinnedPool,
-    expert_locations: &mut [Vec<ExpertLocation>],
-    layer_geometries: &[LayerGeometry],
-    host_refs: &[Vec<MmapExpertRef>],
-    cuda_dev: &candle::CudaDevice,
-    gguf_path: &std::path::Path,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> (usize, usize, usize) {
-    use std::fs::File;
-    let num_moe = host_refs.len();
-    let num_exp = host_refs[0].len();
-
-    // Pass 1 — serial slot assignment (bookkeeping only, no I/O). VRAM fills
-    // first (matching the free-list order), the remainder goes pinned.
-    let mut vram_jobs: Vec<(usize, usize, usize)> = Vec::new();
-    let mut pinned_jobs: Vec<(usize, usize, usize)> = Vec::new();
-    for moe in 0..num_moe {
-        for exp in 0..num_exp {
-            if let Some(s) = inner.free_slots.pop() {
-                expert_locations[moe][exp] = ExpertLocation::Vram { slot_idx: s };
-                vram_jobs.push((moe, exp, s));
-            } else if let Some(p) = pinned_pool.alloc() {
-                expert_locations[moe][exp] = ExpertLocation::Pinned { slot_idx: p };
-                pinned_jobs.push((moe, exp, p));
-            }
-        }
-    }
-    let mut errors = 0usize;
-
-    // Pass 2a — pinned experts: parallel positioned reads DIRECT into the pinned
-    // slot bytes (each `p` is unique ⇒ the destination ranges are disjoint).
-    let t_pin = std::time::Instant::now();
-    // Chunk bases + geometry, carried into the threads as plain integers. Slot `p` lives in chunk
-    // `p / slots_per_chunk` at local offset `(p % slots_per_chunk) * slot_size` — the chunked
-    // PinnedPool's own addressing, inlined so the parallel fill needs no `&pool`.
-    let chunk_ptrs = pinned_pool.chunk_ptrs();
-    let slots_per_chunk = pinned_pool.slots_per_chunk();
-    let slot_size = pinned_pool.slot_size();
-    let pin_errs: usize = pinned_jobs
-        .par_iter()
-        .map_init(
-            || File::open(gguf_path).ok(),
-            |file, &(moe, exp, p)| {
-                let Some(file) = file.as_ref() else {
-                    return 1usize;
-                };
-                let geom = &layer_geometries[moe];
-                let r = &host_refs[moe][exp];
-                let (g, u, d) = (
-                    geom.gate_repacked_size,
-                    geom.up_repacked_size,
-                    geom.down_repacked_size,
-                );
-                // SAFETY: `p` is a unique slot index, so this range does not
-                // overlap any other worker's range; the pool outlives the fill.
-                let slot_base = chunk_ptrs[p / slots_per_chunk] + (p % slots_per_chunk) * slot_size;
-                let dst =
-                    unsafe { std::slice::from_raw_parts_mut(slot_base as *mut u8, g + u + d) };
-                let ok = read_exact_at(file, &mut dst[..g], r.gate_offset as u64).is_ok()
-                    && read_exact_at(file, &mut dst[g..g + u], r.up_offset as u64).is_ok()
-                    && read_exact_at(file, &mut dst[g + u..g + u + d], r.down_offset as u64)
-                        .is_ok();
-                usize::from(!ok)
-            },
-        )
-        .sum();
-    errors += pin_errs;
-    let pin_secs = t_pin.elapsed().as_secs_f64();
-
-    // Pass 2b — VRAM experts: parallel positioned reads into bounded chunks of
-    // host buffers, then serial H2D + install (CUDA is single-threaded).
-    let t_vram = std::time::Instant::now();
-    let mut vram_count = 0usize;
-    const CHUNK: usize = 512;
-    let mut done = pinned_jobs.len();
-    for chunk in vram_jobs.chunks(CHUNK) {
-        let bufs: Vec<Option<(usize, usize, usize, Vec<u8>, Vec<u8>, Vec<u8>)>> = chunk
-            .par_iter()
-            .map_init(
-                || File::open(gguf_path).ok(),
-                |file, &(moe, exp, s)| {
-                    let file = file.as_ref()?;
-                    let geom = &layer_geometries[moe];
-                    let r = &host_refs[moe][exp];
-                    let mut gate = vec![0u8; geom.gate_repacked_size];
-                    let mut up = vec![0u8; geom.up_repacked_size];
-                    let mut down = vec![0u8; geom.down_repacked_size];
-                    read_exact_at(file, &mut gate, r.gate_offset as u64).ok()?;
-                    read_exact_at(file, &mut up, r.up_offset as u64).ok()?;
-                    read_exact_at(file, &mut down, r.down_offset as u64).ok()?;
-                    Some((moe, exp, s, gate, up, down))
-                },
-            )
-            .collect();
-        for b in bufs {
-            match b {
-                Some((moe, exp, s, gate, up, down)) => {
-                    let geom = &layer_geometries[moe];
-                    match build_slot_from_repacked_with_device(&gate, &up, &down, geom, cuda_dev) {
-                        Ok(slot) => {
-                            inner.install(s, moe, exp, slot);
-                            vram_count += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!("startup(ko): wrap failed L{moe}E{exp}: {e}");
-                            inner.free_slots.push(s);
-                            errors += 1;
-                        }
-                    }
-                }
-                None => errors += 1,
-            }
-        }
-        done += chunk.len();
-        if let Some(cb) = progress {
-            cb(done, num_moe * num_exp);
-        }
-    }
-    let vram_secs = t_vram.elapsed().as_secs_f64();
-    eprintln!(
-        "[stage-ko] pinned(direct,parallel)={:.1}s vram(read+h2d)={:.1}s",
-        pin_secs, vram_secs
-    );
-    (vram_count, pinned_jobs.len(), errors)
+pub(crate) struct StartupTargets<'a> {
+    pub inner: &'a mut ExpertCacheInner,
+    pub warm: &'a mut WarmPool,
+    pub residency: &'a mut [Vec<ExpertResidency>],
+    /// Warm slot `i` holds `membership[i]`, decided once by the stratified draw.
+    pub membership: &'a [(usize, usize)],
+    pub geoms: &'a [LayerGeometry],
+    pub layouts: &'a [RecordLayout],
+    pub stride: usize,
 }
 
-/// Fill the VRAM cache and pinned pool from the GGUF mmap.
+/// Repack every expert out of the GGUF, write the pack, and fill both resident
+/// tiers from the bytes as they pass through.
 ///
-/// For each expert, reads GGML bytes from GGUF, GPU-repacks to K/128, then:
-///   - If VRAM has free slots → install as ExpertSlot (stays in VRAM)
-///   - Else → D2H repacked bytes to a pinned pool slot
-///
-/// After all experts are processed, the GGUF mmap can be dropped.
+/// This is the first-boot path and the only one that pays the ~42 s repack. It
+/// writes every expert to the pack — including the ones that go straight to
+/// VRAM — because the pack is authoritative: an expert that exists only in a
+/// VRAM slot could not be evicted without losing it, which is the defect this
+/// whole design removes.
 #[cfg(feature = "cuda")]
-pub(crate) fn startup_two_tier(
-    inner: &mut ExpertCacheInner,
-    pinned_pool: &mut PinnedPool,
-    expert_locations: &mut Vec<Vec<ExpertLocation>>,
-    layer_geometries: &[LayerGeometry],
+pub(crate) fn startup_repack(
+    t: StartupTargets<'_>,
+    writer: &mut PackWriter,
     mmap: &[u8],
     host_refs: &[Vec<MmapExpertRef>],
     cuda_dev: &candle::CudaDevice,
-    gguf_path: Option<&std::path::Path>,
     progress: Option<&dyn Fn(usize, usize)>,
-) {
+) -> Result<()> {
     let num_moe_layers = host_refs.len();
-    let num_experts = if num_moe_layers > 0 {
-        host_refs[0].len()
-    } else {
-        0
-    };
-    let total_slots = inner.slots.len();
-
-    if total_slots == 0 || num_moe_layers == 0 || num_experts == 0 {
-        return;
+    let num_experts = host_refs.first().map_or(0, |l| l.len());
+    if num_moe_layers == 0 || num_experts == 0 {
+        return Ok(());
     }
     let total_experts = num_moe_layers * num_experts;
-
-    // Fast path for the pre-repacked (MXFP4_KO) model: the on-disk bytes are the
-    // final layout, so loading is pure I/O. mmap page-faults (4 KB at a time,
-    // ~1.7 GB/s here) are the wrong access pattern — explicit positioned block
-    // reads over many threads hit ~8× that. Read every expert's bytes STRAIGHT
-    // from the file into its destination slot (pinned in parallel, VRAM staged +
-    // H2D), no intermediate `Vec`, no mmap fault storm.
-    let all_ko = layer_geometries.iter().all(|g| {
-        use candle::quantized::GgmlDType::MXFP4_KO;
-        g.gate_dtype == MXFP4_KO && g.up_dtype == MXFP4_KO && g.down_dtype == MXFP4_KO
-    });
-    if all_ko {
-        if let Some(path) = gguf_path {
-            let t0 = std::time::Instant::now();
-            let (v, p, err) = startup_two_tier_ko_blockread(
-                inner,
-                pinned_pool,
-                expert_locations,
-                layer_geometries,
-                host_refs,
-                cuda_dev,
-                path,
-                progress,
-            );
-            eprintln!(
-                "[stage] done in {:.1}s (block-read KO path) — {} VRAM + {} pinned ({} errors)",
-                t0.elapsed().as_secs_f64(),
-                v,
-                p,
-                err,
-            );
-            return;
-        }
+    // Warm slot for each expert, so the fill can place bytes as they go by
+    // rather than re-reading them afterwards.
+    let mut warm_slot_of: Vec<Vec<Option<usize>>> = vec![vec![None; num_experts]; num_moe_layers];
+    for (slot, &(layer, expert)) in t.membership.iter().enumerate() {
+        warm_slot_of[layer][expert] = Some(slot);
     }
 
     tracing::info!(
-        "startup: repacking {}×{} experts → {} VRAM + {} pinned slots …",
-        num_moe_layers,
-        num_experts,
-        total_slots,
-        pinned_pool.num_slots(),
+        target: "candle_transformers::expert_lre",
+        layers = num_moe_layers,
+        experts = num_experts,
+        vram_slots = t.inner.num_slots(),
+        warm_slots = t.warm.num_slots(),
+        "startup: repacking every expert into the pack, filling both tiers as it goes"
     );
     let t0 = std::time::Instant::now();
-
-    let mut vram_count: usize = 0;
-    let mut pinned_count: usize = 0;
-    let mut errors: usize = 0;
-    // Coarse phase attribution across the whole stage: `repack` = mmap read + host reorder
-    // (the parallel part), `place` = VRAM H2D + qtensor wrap OR pinned-pool memcpy (serial).
-    let mut repack_ns: u128 = 0;
-    let mut place_ns: u128 = 0;
+    let mut vram_count = 0usize;
+    let mut warm_count = 0usize;
 
     for moe_idx in 0..num_moe_layers {
-        let geom = &layer_geometries[moe_idx];
+        let geom = &t.geoms[moe_idx];
+        let layout = t.layouts[moe_idx];
+        for expert_idx in 0..num_experts {
+            let r = &host_refs[moe_idx][expert_idx];
+            // A repack that fails leaves an expert with no valid record, and a
+            // record of zeroes reads back as a plausible expert. There is no
+            // partial answer here: the pack is authoritative or it is nothing.
+            let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
+            writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
 
-        // ── Repack this layer's experts (mmap read + reorder) ──
-        // MXFP4_KO repacks purely host-side (`mxfp4_native_to_ko_gpu_chunk` — no CUDA calls), so
-        // we fan the whole layer across the CPU pool: concurrent page faults saturate NVMe and the
-        // reorder parallelizes. The other KO twins re-quant on the GPU (single context), so they
-        // must stay serial. Placement (below) is always serial — it mutates the slot pools.
-        let t_rp = std::time::Instant::now();
-        let repacked: Vec<Result<(Vec<u8>, Vec<u8>, Vec<u8>)>> = if geom.gate_dtype
-            == candle::quantized::GgmlDType::MXFP4_KO
-        {
-            (0..num_experts)
-                .into_par_iter()
-                .map(|e| repack_expert_projections(mmap, &host_refs[moe_idx][e], geom, cuda_dev))
-                .collect()
-        } else {
-            (0..num_experts)
-                .map(|e| repack_expert_projections(mmap, &host_refs[moe_idx][e], geom, cuda_dev))
-                .collect()
-        };
-        repack_ns += t_rp.elapsed().as_nanos();
-
-        // ── Place each repacked expert (serial: mutates VRAM/pinned pools) ──
-        let t_pl = std::time::Instant::now();
-        for (expert_idx, result) in repacked.into_iter().enumerate() {
-            match result {
-                Ok((gate_repacked, up_repacked, down_repacked)) => {
-                    if !inner.free_slots.is_empty() {
-                        // ── VRAM path: install as ExpertSlot ──
-                        let slot_idx = inner.free_slots.pop().unwrap();
-                        match build_slot_from_repacked_with_device(
-                            &gate_repacked,
-                            &up_repacked,
-                            &down_repacked,
-                            geom,
-                            cuda_dev,
-                        ) {
-                            Ok(slot) => {
-                                inner.install(slot_idx, moe_idx, expert_idx, slot);
-                                expert_locations[moe_idx][expert_idx] =
-                                    ExpertLocation::Vram { slot_idx };
-                                vram_count += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!("startup: wrap failed L{moe_idx}E{expert_idx}: {e}");
-                                inner.free_slots.push(slot_idx);
-                                errors += 1;
-                            }
-                        }
-                    } else {
-                        // ── Pinned path: D2H repacked bytes to pinned pool ──
-                        match pinned_pool.alloc() {
-                            Some(p_slot) => {
-                                let dst = pinned_pool.slot_mut(p_slot, geom.total_repacked_size);
-                                let g = geom.gate_repacked_size;
-                                let u = geom.up_repacked_size;
-                                let d = geom.down_repacked_size;
-                                dst[..g].copy_from_slice(&gate_repacked);
-                                dst[g..g + u].copy_from_slice(&up_repacked);
-                                dst[g + u..g + u + d].copy_from_slice(&down_repacked);
-                                expert_locations[moe_idx][expert_idx] =
-                                    ExpertLocation::Pinned { slot_idx: p_slot };
-                                pinned_count += 1;
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "startup: pinned pool full at L{moe_idx}E{expert_idx}"
-                                );
-                                errors += 1;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("startup: repack failed L{moe_idx}E{expert_idx}: {e}");
-                    errors += 1;
-                }
+            let mut res = ExpertResidency::default();
+            if let Some(warm_slot) = warm_slot_of[moe_idx][expert_idx] {
+                let dst = t.warm.slot_mut(warm_slot, t.stride);
+                write_record(dst, layout, &gate, &up, &down);
+                res.ram = Some(warm_slot);
+                warm_count += 1;
             }
+            // The zone hands out the rightmost free slot, so the startup fill
+            // packs experts against the span's right edge and the volatile left
+            // margin is the last ground to be taken.
+            if let Some(slot_idx) = t.inner.take_free() {
+                let slot_base = t.inner.slot_base(slot_idx);
+                // SAFETY: `slot_idx` was just handed out by the zone and is not
+                // reclaimed until an eviction returns it.
+                let slot = unsafe {
+                    build_slot_from_repacked_with_device(
+                        &gate, &up, &down, geom, cuda_dev, slot_base,
+                    )?
+                };
+                t.inner.install(slot_idx, moe_idx, expert_idx, slot);
+                res.vram = Some(slot_idx);
+                vram_count += 1;
+            }
+            t.residency[moe_idx][expert_idx] = res;
             if let Some(cb) = progress {
                 cb(moe_idx * num_experts + expert_idx + 1, total_experts);
             }
         }
-        place_ns += t_pl.elapsed().as_nanos();
-        // Progress every 8 layers.
         if (moe_idx + 1) % 8 == 0 || moe_idx + 1 == num_moe_layers {
             tracing::info!(
-                "  startup: layer {}/{} — {} VRAM, {} pinned, {} errors",
-                moe_idx + 1,
-                num_moe_layers,
+                target: "candle_transformers::expert_lre",
+                layer = moe_idx + 1,
+                of = num_moe_layers,
                 vram_count,
-                pinned_count,
-                errors,
+                warm_count,
+                "startup: repacking"
             );
         }
     }
 
-    let elapsed = t0.elapsed();
-    eprintln!(
-        "[stage] done in {:.1}s — {} VRAM + {} pinned ({} errors) | repack(read+reorder)={:.1}s \
-         place(h2d/pinned)={:.1}s",
-        elapsed.as_secs_f64(),
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        secs = t0.elapsed().as_secs_f64(),
         vram_count,
-        pinned_count,
-        errors,
-        repack_ns as f64 / 1e9,
-        place_ns as f64 / 1e9,
+        warm_count,
+        warm_gib = t.warm.total_bytes() as f64 / 1e9,
+        "startup: repack complete"
     );
+    Ok(())
+}
+
+/// Fill both resident tiers from a pack that already exists.
+///
+/// The restart path, and the reason the pack is worth its 16.6 GiB: no repack,
+/// no GGUF expert reads at all. Only the experts that land somewhere are read —
+/// the rest stay on disk until something asks for them.
+#[cfg(feature = "cuda")]
+pub(crate) fn startup_from_pack(
+    t: StartupTargets<'_>,
+    pack: &ExpertPack,
+    num_moe_layers: usize,
+    num_experts: usize,
+    cuda_dev: &candle::CudaDevice,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<()> {
+    if num_moe_layers == 0 || num_experts == 0 {
+        return Ok(());
+    }
+    let total_experts = num_moe_layers * num_experts;
+    let t0 = std::time::Instant::now();
+
+    // ── Warm tier: every membership record at once, at full queue depth ──
+    //
+    // The pool's slots are cut to the pack's stride, so each read lands in its
+    // final home with nothing in between: no staging buffer, no host-to-host
+    // copy, one NVMe DMA per expert.
+    if !t.membership.is_empty() {
+        let stride = t.stride;
+        let mut rest = t.warm.span_mut(0, t.membership.len());
+        let mut reads: Vec<PackRead<'_>> = Vec::with_capacity(t.membership.len());
+        for &(layer, expert) in t.membership.iter() {
+            let (head, tail) = rest.split_at_mut(stride);
+            reads.push(PackRead {
+                layer,
+                expert,
+                dest: head,
+            });
+            rest = tail;
+        }
+        pack.read_many(reads)?;
+        for (slot, &(layer, expert)) in t.membership.iter().enumerate() {
+            t.residency[layer][expert].ram = Some(slot);
+        }
+    }
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        warm_slots = t.membership.len(),
+        secs = t0.elapsed().as_secs_f64(),
+        "startup: warm tier filled from the pack"
+    );
+
+    // ── Hot tier: fill VRAM in layer order, from warm where possible ──
+    let mut staging = ColdStaging::new(t.stride, COLD_STAGING_BUFFERS)?;
+    let stream = cuda_dev.cuda_stream();
+    let mut vram_count = 0usize;
+    let mut cold_reads = 0usize;
+    'fill: for moe_idx in 0..num_moe_layers {
+        let geom = &t.geoms[moe_idx];
+        let layout = t.layouts[moe_idx];
+        for expert_idx in 0..num_experts {
+            let Some(slot_idx) = t.inner.take_free() else {
+                break 'fill;
+            };
+            let slot_base = t.inner.slot_base(slot_idx);
+            // SAFETY (both arms): `slot_idx` was just handed out by the zone and
+            // is not reclaimed while this runs.
+            let slot = match t.residency[moe_idx][expert_idx].ram {
+                // The warm pool is written once and never again, so it is a
+                // source no later write can race — no event, no wait.
+                Some(warm_slot) => unsafe {
+                    build_slot_from_record_with_device(
+                        t.warm.slot_ref(warm_slot, t.stride),
+                        layout,
+                        geom,
+                        cuda_dev,
+                        slot_base,
+                    )?
+                },
+                None => {
+                    let idx = staging.acquire()?;
+                    pack.read_into(moe_idx, expert_idx, staging.buffer_mut(idx, t.stride))?;
+                    let slot = unsafe {
+                        build_slot_from_record_with_device(
+                            staging.buffer_ref(idx, t.stride),
+                            layout,
+                            geom,
+                            cuda_dev,
+                            slot_base,
+                        )?
+                    };
+                    staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
+                    cold_reads += 1;
+                    slot
+                }
+            };
+            t.inner.install(slot_idx, moe_idx, expert_idx, slot);
+            t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
+            vram_count += 1;
+            if let Some(cb) = progress {
+                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+            }
+        }
+    }
+    // The uploads above are asynchronous against pinned buffers this function
+    // is about to drop.
+    stream.synchronize().map_err(candle::Error::wrap)?;
+    // The fill stops as soon as VRAM is full, so the remaining experts never
+    // reach the progress callback. Land it on the total so a UI bar completes.
+    if let Some(cb) = progress {
+        cb(total_experts, total_experts);
+    }
+
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        secs = t0.elapsed().as_secs_f64(),
+        vram_count,
+        cold_reads,
+        warm_slots = t.membership.len(),
+        warm_gib = t.warm.total_bytes() as f64 / 1e9,
+        staging_mib = staging.total_bytes() as f64 / 1e6,
+        pack = %pack.path().display(),
+        "startup: filled from the pack — no repack this boot"
+    );
+    Ok(())
+}
+
+/// Pinned landing buffers the pipeline thread keeps for cold reads.
+///
+/// Deep enough that a buffer is never waited on in practice: a layer routes to
+/// far fewer experts than this, so a buffer has always been round the ring and
+/// its upload retired long before it comes up again. At one record each that is
+/// ~46 MB of pinned host memory on Qwen3-30B-A3B — a rounding error against the
+/// warm tier, and the thing that keeps a cold miss from stalling the host.
+#[cfg(feature = "cuda")]
+pub(crate) const COLD_STAGING_BUFFERS: usize = 16;
+
+/// Lay one expert's three projections into a record buffer at their spans.
+///
+/// The gaps between projections are alignment padding the kernels never read;
+/// they are zeroed so a record is a deterministic function of its expert, which
+/// is what lets the pack file be compared byte for byte between builds.
+#[cfg(feature = "cuda")]
+fn write_record(dst: &mut [u8], layout: RecordLayout, gate: &[u8], up: &[u8], down: &[u8]) {
+    dst.fill(0);
+    for (span, src) in [(layout.gate, gate), (layout.up, up), (layout.down, down)] {
+        dst[span.offset..span.offset + src.len()].copy_from_slice(src);
+    }
 }
 
 /// GPU-repack one expert's three projections from GGML to K/128 format.
 ///
 /// Returns `(gate_bytes, up_bytes, down_bytes)` as host `Vec<u8>`.
 #[cfg(feature = "cuda")]
-fn repack_expert_projections(
+pub(crate) fn repack_expert_projections(
     mmap: &[u8],
     r: &MmapExpertRef,
     geom: &LayerGeometry,
@@ -526,24 +445,92 @@ fn repack_expert_projections(
     Ok((gate_repacked, up_repacked, down_repacked))
 }
 
-/// Build an `ExpertSlot` from already-repacked host bytes by loading them
-/// to a CUDA device's VRAM and wrapping as `QMatMul`.
+/// Alignment every projection's base within a slot is rounded up to — what the
+/// tensor-core paths require of an operand.
 #[cfg(feature = "cuda")]
-fn build_slot_from_repacked_with_device(
-    gate_bytes: &[u8],
-    up_bytes: &[u8],
-    down_bytes: &[u8],
+const PROJECTION_ALIGN: usize = 256;
+
+/// Byte offsets of gate / up / down within one expert slot, and the aligned
+/// total.
+///
+/// A slot is one range of the weight zone holding all three projections, so the
+/// zone can stay an array of equal-sized units — the property that makes "the
+/// rightmost free spot" a single index and a relocation a memcpy. The three sit
+/// at aligned offsets inside it.
+///
+/// The total is what [`slot_bytes_for`] maxes over layers, so a slot always
+/// holds the widest layer's three projections and any layer's fit in any slot.
+#[cfg(feature = "cuda")]
+pub(crate) fn slot_offsets(geom: &LayerGeometry) -> (usize, usize, usize, usize) {
+    let align = |n: usize| n.div_ceil(PROJECTION_ALIGN) * PROJECTION_ALIGN;
+    let up = align(geom.gate_repacked_size);
+    let down = up + align(geom.up_repacked_size);
+    let total = down + align(geom.down_repacked_size);
+    (0, up, down, total)
+}
+
+/// Bytes one zone slot must be to hold any layer's expert.
+///
+/// The max over layers of the aligned three-projection total. `max_expert_size`
+/// used to be the max over the *unaligned* sum, which is the same number the
+/// pinned pool uses for its own slots; this is that number plus at most two
+/// alignments, and it is the one the zone is carved with.
+#[cfg(feature = "cuda")]
+pub(crate) fn slot_bytes_for(geoms: &[LayerGeometry]) -> usize {
+    geoms.iter().map(|g| slot_offsets(g).3).max().unwrap_or(0)
+}
+
+/// Regions the weight side leaves above the KV side's recent high-water mark.
+///
+/// Headroom for the KV side to grow into without the weight side having to give
+/// anything back — 32 regions is 512 MiB, which is several turns' worth at the
+/// measured steady state. Taking right up to the mark would make every small
+/// increase in KV demand a boundary move, and a boundary move costs an eviction.
+///
+/// Deriving this from the measured per-forward claim count was tried and is not
+/// an improvement: on the quantized path that count is dominated by the
+/// compressor creating size-class arenas as it works, so the "headroom" it
+/// produces is the same order as the KV side itself and the weight side is
+/// offered nothing at all.
+#[cfg(feature = "cuda")]
+const KV_REGION_SLACK: usize = 32;
+
+/// Wrap an already-populated slot at `slot_base` as an `ExpertSlot`, without
+/// moving any bytes.
+///
+/// For a relocation, where the copy has already put the bytes in place: the
+/// three `QMatMul`s hold device pointers, so a slot that moves needs its
+/// storages rebuilt over the new address even though its contents are identical.
+///
+/// # Safety
+///
+/// `slot_base` must name a slot the zone has handed out, already holding this
+/// layer's three projections at [`slot_offsets`].
+#[cfg(feature = "cuda")]
+unsafe fn build_slot_view(
     geom: &LayerGeometry,
     cuda_dev: &candle::CudaDevice,
+    slot_base: u64,
 ) -> Result<ExpertSlot> {
-    let gate_storage = candle::quantized::load_repacked(cuda_dev, gate_bytes, geom.gate_dtype)?;
-    let up_storage = candle::quantized::load_repacked(cuda_dev, up_bytes, geom.up_dtype)?;
-    let down_storage = candle::quantized::load_repacked(cuda_dev, down_bytes, geom.down_dtype)?;
-
-    let gate_qt = candle::quantized::QTensor::new(gate_storage, geom.gate_shape.clone())?;
-    let up_qt = candle::quantized::QTensor::new(up_storage, geom.up_shape.clone())?;
-    let down_qt = candle::quantized::QTensor::new(down_storage, geom.down_shape.clone())?;
-
+    let (gate_off, up_off, down_off, _) = slot_offsets(geom);
+    let view = |off: usize, bytes: usize, dtype, shape: &Vec<usize>| -> Result<_> {
+        let storage =
+            candle::quantized::view_repacked(cuda_dev, slot_base + off as u64, bytes, dtype)?;
+        candle::quantized::QTensor::new(storage, shape.clone())
+    };
+    let gate_qt = view(
+        gate_off,
+        geom.gate_repacked_size,
+        geom.gate_dtype,
+        &geom.gate_shape,
+    )?;
+    let up_qt = view(up_off, geom.up_repacked_size, geom.up_dtype, &geom.up_shape)?;
+    let down_qt = view(
+        down_off,
+        geom.down_repacked_size,
+        geom.down_dtype,
+        &geom.down_shape,
+    )?;
     Ok(ExpertSlot {
         gate_proj: QMatMul::from_qtensor_repacked(gate_qt)?,
         up_proj: QMatMul::from_qtensor_repacked(up_qt)?,
@@ -551,36 +538,83 @@ fn build_slot_from_repacked_with_device(
     })
 }
 
-/// Build an `ExpertSlot` from already-repacked host bytes using a copy stream
-/// for async DMA.
+/// Build an `ExpertSlot` from already-repacked host bytes, uploading them into
+/// the weight-zone slot at `slot_base`.
+///
+/// # Safety
+///
+/// `slot_base` must name a slot the zone has handed out and not reclaimed, of at
+/// least `slot_offsets(geom).3` bytes.
 #[cfg(feature = "cuda")]
-fn build_slot_from_repacked_on_stream(
+unsafe fn build_slot_from_repacked_with_device(
     gate_bytes: &[u8],
     up_bytes: &[u8],
     down_bytes: &[u8],
     geom: &LayerGeometry,
     cuda_dev: &candle::CudaDevice,
-    copy_stream: &Arc<CudaStream>,
-    profile: &mut ProfileAccumulator,
+    slot_base: u64,
 ) -> Result<ExpertSlot> {
-    let t = profile_now();
-    let gate_storage = candle::quantized::load_repacked_on_stream(
+    build_slot_from_repacked_on_stream_inner(
+        gate_bytes,
+        up_bytes,
+        down_bytes,
+        geom,
         cuda_dev,
-        copy_stream,
+        &cuda_dev.cuda_stream(),
+        slot_base,
+        None,
+    )
+}
+
+/// The one upload path, shared by the startup fill and the miss path.
+///
+/// Both used to allocate three buffers from the CUDA pool and hand ownership to
+/// the storages. Now the three are views into a slot the zone owns: the upload
+/// writes over whatever the previous tenant left, and dropping the storages
+/// releases the views and not the memory
+/// (`Backing::Lease(LeaseOrigin::Foreign)`). That is what makes an eviction a
+/// bookkeeping change rather than a free, and a relocation a memcpy rather than
+/// a reload.
+///
+/// # Safety
+///
+/// As [`build_slot_from_repacked_with_device`].
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_slot_from_repacked_on_stream_inner(
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_bytes: &[u8],
+    geom: &LayerGeometry,
+    cuda_dev: &candle::CudaDevice,
+    stream: &Arc<CudaStream>,
+    slot_base: u64,
+    profile: Option<&mut ProfileAccumulator>,
+) -> Result<ExpertSlot> {
+    let (gate_off, up_off, down_off, _) = slot_offsets(geom);
+    let t = profile_now();
+    let gate_storage = candle::quantized::load_repacked_into(
+        cuda_dev,
+        stream,
+        slot_base + gate_off as u64,
         gate_bytes,
         geom.gate_dtype,
     )?;
-    let up_storage =
-        candle::quantized::load_repacked_on_stream(cuda_dev, copy_stream, up_bytes, geom.up_dtype)?;
-    let down_storage = candle::quantized::load_repacked_on_stream(
+    let up_storage = candle::quantized::load_repacked_into(
         cuda_dev,
-        copy_stream,
+        stream,
+        slot_base + up_off as u64,
+        up_bytes,
+        geom.up_dtype,
+    )?;
+    let down_storage = candle::quantized::load_repacked_into(
+        cuda_dev,
+        stream,
+        slot_base + down_off as u64,
         down_bytes,
         geom.down_dtype,
     )?;
-    profile.record("dma_h2d", t);
 
-    let t = profile_now();
     let gate_qt = candle::quantized::QTensor::new(gate_storage, geom.gate_shape.clone())?;
     let up_qt = candle::quantized::QTensor::new(up_storage, geom.up_shape.clone())?;
     let down_qt = candle::quantized::QTensor::new(down_storage, geom.down_shape.clone())?;
@@ -590,13 +624,196 @@ fn build_slot_from_repacked_on_stream(
         up_proj: QMatMul::from_qtensor_repacked(up_qt)?,
         down_proj: QMatMul::from_qtensor_repacked(down_qt)?,
     };
-    profile.record("dma_wrap", t);
-
+    if let Some(p) = profile {
+        p.record("dma_h2d", t);
+    }
     Ok(slot)
 }
 
+/// Build an `ExpertSlot` from one pack **record** — the form both resident
+/// tiers hold — uploading it into the weight-zone slot at `slot_base`.
+///
+/// The record is the three projections at the offsets `layout` names, which is
+/// the same arrangement a VRAM slot uses, so this is three subslices and the
+/// ordinary upload. Everything downstream of the pack goes through here: warm
+/// promotions, cold misses, and the startup fill.
+///
+/// # Safety
+///
+/// As [`build_slot_from_repacked_with_device`].
+#[cfg(feature = "cuda")]
+unsafe fn build_slot_from_record_on_stream(
+    record: &[u8],
+    layout: RecordLayout,
+    geom: &LayerGeometry,
+    cuda_dev: &candle::CudaDevice,
+    stream: &Arc<CudaStream>,
+    slot_base: u64,
+    profile: Option<&mut ProfileAccumulator>,
+) -> Result<ExpertSlot> {
+    let at = |s: super::pack::RecordSpan| &record[s.offset..s.offset + s.bytes];
+    build_slot_from_repacked_on_stream_inner(
+        at(layout.gate),
+        at(layout.up),
+        at(layout.down),
+        geom,
+        cuda_dev,
+        stream,
+        slot_base,
+        profile,
+    )
+}
+
+/// [`build_slot_from_record_on_stream`] on the device's default stream.
+///
+/// # Safety
+///
+/// As [`build_slot_from_repacked_with_device`].
+#[cfg(feature = "cuda")]
+unsafe fn build_slot_from_record_with_device(
+    record: &[u8],
+    layout: RecordLayout,
+    geom: &LayerGeometry,
+    cuda_dev: &candle::CudaDevice,
+    slot_base: u64,
+) -> Result<ExpertSlot> {
+    build_slot_from_record_on_stream(
+        record,
+        layout,
+        geom,
+        cuda_dev,
+        &cuda_dev.cuda_stream(),
+        slot_base,
+        None,
+    )
+}
+
+/// Pinned landing buffers for reads out of the cold tier.
+///
+/// A cold read has to land in pinned memory twice over: direct I/O needs a
+/// sector-aligned destination, and the H2D that follows wants a source the DMA
+/// engine can take without a bounce copy. `cuMemAllocHost` satisfies both.
+///
+/// The buffers rotate, and each carries the event for the upload it last fed.
+/// **That event is why this is a ring and not one buffer**: the H2D is issued on
+/// the copy stream and returns before the bytes have moved, so writing the next
+/// record into the same buffer would race the copy reading it. Reusing a buffer
+/// waits on its event first — a host-side wait, but only for a buffer that has
+/// been round the ring since, which under any working warm tier is never.
+/// One landing buffer: pinned if the machine will give it, sector-aligned host
+/// memory otherwise.
+///
+/// **The fallback is not a nicety.** Both arms satisfy direct I/O's 4 KiB
+/// alignment — `cuMemAllocHost` returns page-aligned memory and
+/// [`AlignedScratch`] aligns explicitly — so the read works either way, and only
+/// the H2D loses the no-bounce property. What it must never do is fall back to a
+/// plain `Vec`, whose 8- or 16-byte alignment `ReadFile` with
+/// `FILE_FLAG_NO_BUFFERING` rejects outright.
+#[cfg(feature = "cuda")]
+enum StagingBuf {
+    Pinned(PinnedBuf),
+    Aligned(AlignedScratch),
+}
+
+#[cfg(feature = "cuda")]
+impl StagingBuf {
+    fn alloc(len: usize) -> Result<Self> {
+        match PinnedBuf::alloc_owned_default(len) {
+            Ok(b) => Ok(Self::Pinned(b)),
+            Err(_) => {
+                let mut a = AlignedScratch::new();
+                a.ensure(len).map_err(|e| {
+                    candle::Error::Msg(format!("cold staging: aligned fallback of {len} B: {e}"))
+                })?;
+                Ok(Self::Aligned(a))
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Pinned(b) => b.len(),
+            Self::Aligned(a) => a.capacity(),
+        }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        match self {
+            Self::Pinned(b) => &mut b.as_mut_slice()[..len],
+            Self::Aligned(a) => a.as_mut_slice(len),
+        }
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        match self {
+            Self::Pinned(b) => &b.as_slice()[..len],
+            Self::Aligned(a) => a.as_slice(len),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct ColdStaging {
+    bufs: Vec<StagingBuf>,
+    /// The upload each buffer last fed, or `None` if it has not fed one since
+    /// the last wait.
+    events: Vec<Option<CudaEvent>>,
+    next: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl ColdStaging {
+    /// `count` buffers of `stride` bytes each.
+    ///
+    /// **Allocate this before the warm tier, not after.** It is small (46 MB)
+    /// and mandatory; the warm tier is enormous and elastic, and halves itself
+    /// when refused. Taking the elastic allocation first leaves this one to fail
+    /// on a machine the warm tier has just filled — which is a model load that
+    /// dies with `CUDA_ERROR_OUT_OF_MEMORY` where it should have been a slightly
+    /// smaller warm tier. Mandatory-and-small first, elastic-and-large last.
+    pub(crate) fn new(stride: usize, count: usize) -> Result<Self> {
+        let mut bufs = Vec::with_capacity(count);
+        for _ in 0..count {
+            bufs.push(StagingBuf::alloc(stride)?);
+        }
+        Ok(Self {
+            bufs,
+            events: (0..count).map(|_| None).collect(),
+            next: 0,
+        })
+    }
+
+    /// Total bytes held, for the memory report.
+    fn total_bytes(&self) -> usize {
+        self.bufs.iter().map(|b| b.len()).sum()
+    }
+
+    /// The next buffer, once the upload it last fed has retired.
+    fn acquire(&mut self) -> Result<usize> {
+        let idx = self.next;
+        self.next = (self.next + 1) % self.bufs.len();
+        if let Some(event) = self.events[idx].take() {
+            event.synchronize().map_err(candle::Error::wrap)?;
+        }
+        Ok(idx)
+    }
+
+    /// Record that buffer `idx` is the source of an upload that has not landed.
+    fn publish(&mut self, idx: usize, event: CudaEvent) {
+        self.events[idx] = Some(event);
+    }
+
+    fn buffer_mut(&mut self, idx: usize, len: usize) -> &mut [u8] {
+        self.bufs[idx].as_mut_slice(len)
+    }
+
+    fn buffer_ref(&self, idx: usize, len: usize) -> &[u8] {
+        self.bufs[idx].as_slice(len)
+    }
+}
+
 /// Device-direct prewarm: fill VRAM slots straight from the mmap. Non-CUDA-only — under CUDA the
-/// int8/KO experts are staged through `startup_two_tier`'s gemx pinned pool, so this is unused.
+/// experts are staged through the pack file, so this is unused there.
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn prewarm_expert_cache(
     inner: &mut ExpertCacheInner,
@@ -628,10 +845,9 @@ pub(crate) fn prewarm_expert_cache(
 
     'fill: for moe_idx in 0..num_moe_layers {
         for expert_idx in 0..num_experts {
-            if inner.free_slots.is_empty() {
+            let Some(slot_idx) = inner.take_free() else {
                 break 'fill;
-            }
-            let slot_idx = inner.free_slots.pop().unwrap();
+            };
             let mmap_bytes: &[u8] = mmap;
             let result = load_from_mmap(mmap_bytes, &host_refs[moe_idx][expert_idx], device, mode);
             match result {
@@ -643,7 +859,7 @@ pub(crate) fn prewarm_expert_cache(
                 }
                 Err(e) => {
                     tracing::warn!("prewarm: failed to load L{moe_idx}E{expert_idx}: {e}");
-                    inner.free_slots.push(slot_idx);
+                    inner.put_free(slot_idx);
                 }
             }
         }
@@ -664,7 +880,7 @@ pub(crate) fn prewarm_expert_cache(
 /// Build an expert slot directly from the GGUF mmap. `mode` selects the weight form via
 /// `QMatMul::from_weights_with_mode`: `Off` → FP GEMX (the dequant-weight grouped path); an int8
 /// mode → the KO twin (device-direct `repack_ko`). Non-CUDA-only: under CUDA the experts (FP and
-/// int8/KO alike) are staged through `startup_two_tier`'s gemx pinned pool, so this is unused.
+/// int8/KO alike) are staged through the pack file, so this is unused.
 #[cfg(not(feature = "cuda"))]
 fn load_from_mmap(
     mmap: &[u8],
@@ -704,55 +920,7 @@ fn load_from_mmap(
 }
 
 // ============================================================================
-// Two-tier eviction helper (VRAM → pinned)
-// ============================================================================
-
-/// Copy an ExpertSlot's three projections from VRAM to a pinned pool slot.
-///
-/// Uses the copy stream for async D2H DMA.  The caller must record a fence
-/// event and wait before reusing the pinned slot.
-#[cfg(feature = "cuda")]
-fn evict_slot_to_pinned(
-    slot: &ExpertSlot,
-    pinned_pool: &mut PinnedPool,
-    pinned_slot: usize,
-    geom: &LayerGeometry,
-    copy_stream: &Arc<CudaStream>,
-) -> Result<()> {
-    let g = geom.gate_repacked_size;
-    let u = geom.up_repacked_size;
-    let d = geom.down_repacked_size;
-    let total = g + u + d;
-
-    let dst = pinned_pool.slot_mut(pinned_slot, total);
-
-    // Get QTensor from each QMatMul → QStorage::Cuda → copy_to_host_on_stream
-    let gate_qt = slot
-        .gate_proj
-        .inner()
-        .qtensor()
-        .ok_or_else(|| candle::Error::Msg("evict: gate_proj is not QTensor".into()))?;
-    gate_qt.copy_data_to_host_on_stream(&mut dst[..g], copy_stream)?;
-
-    let up_qt = slot
-        .up_proj
-        .inner()
-        .qtensor()
-        .ok_or_else(|| candle::Error::Msg("evict: up_proj is not QTensor".into()))?;
-    up_qt.copy_data_to_host_on_stream(&mut dst[g..g + u], copy_stream)?;
-
-    let down_qt = slot
-        .down_proj
-        .inner()
-        .qtensor()
-        .ok_or_else(|| candle::Error::Msg("evict: down_proj is not QTensor".into()))?;
-    down_qt.copy_data_to_host_on_stream(&mut dst[g + u..g + u + d], copy_stream)?;
-
-    Ok(())
-}
-
-// ============================================================================
-// Pipeline state — two-tier architecture
+// Pipeline state — three tiers over an authoritative cold copy
 // ============================================================================
 
 /// The pipeline thread's private state.  Never crosses a thread boundary
@@ -765,12 +933,19 @@ pub(crate) struct PipelineState {
     /// Secondary CUDA stream for DMA overlap.
     #[cfg(feature = "cuda")]
     pub(crate) copy_stream: Option<Arc<CudaStream>>,
-    /// Pinned host memory pool — warm tier for experts not in VRAM.
+    /// The cold tier: every expert, always, in kernel-ready form.
     #[cfg(feature = "cuda")]
-    pub(crate) pinned_pool: PinnedPool,
-    /// Per-expert location tracking: `[moe_layer][expert_idx]`.
+    pub(crate) pack: ExpertPack,
+    /// The warm tier: a stratified subset of the pack, pinned. Filled once.
     #[cfg(feature = "cuda")]
-    pub(crate) expert_locations: Vec<Vec<ExpertLocation>>,
+    pub(crate) warm: WarmPool,
+    /// Pinned landing buffers for reads that miss both resident tiers.
+    #[cfg(feature = "cuda")]
+    pub(crate) cold_staging: ColdStaging,
+    /// Per-expert residency: `[moe_layer][expert_idx]`. Two independent facts
+    /// over the pack, not a choice of one place.
+    #[cfg(feature = "cuda")]
+    pub(crate) residency: Vec<Vec<ExpertResidency>>,
     /// Per-layer geometry (shapes, dtypes, repacked sizes).
     #[cfg(feature = "cuda")]
     pub(crate) layer_geometries: Vec<LayerGeometry>,
@@ -786,6 +961,17 @@ pub(crate) struct PipelineState {
     /// Set of `(layer_idx, expert_idx)` pairs speculatively loaded via Hint.
     /// Cleared when the corresponding Work request arrives.
     pub(crate) speculative_loads: HashSet<(usize, usize)>,
+    /// Fence covering the most recent speculative DMA batch — prefetch loads
+    /// (recorded in `post_compute`) and hint loads (recorded in
+    /// `process_hint`). Recorded WITHOUT waiting — the DMA overlaps the
+    /// forward thread's next-layer attention — and awaited at the next work
+    /// request's compute phase BEFORE hits are computed, by which point it has
+    /// usually already signalled. Speculatively-loaded slots install (and so
+    /// classify as hits) while their H2D is still in flight, so this wait is
+    /// what keeps a hit from computing on half-copied expert bytes; waiting
+    /// inline at load time instead would serialize the DMA on the pipe
+    /// thread, stalling the next layer's work behind it.
+    pub(crate) pending_prefetch_fence: CopyBatchFence,
     /// Prediction accuracy counters: (hints_sent, hits_in_actual_set).
     pub(crate) hint_stats: (usize, usize),
     /// Timing accumulator for pipeline spans.
@@ -802,8 +988,8 @@ pub(crate) struct PipelineState {
     /// EMA-smoothed drip headroom fraction.  Seed 0.02.
     pub(crate) drip_headroom: f32,
     // ── Non-CUDA legacy device-direct mmap path ──
-    // Under CUDA every expert (FP and int8/KO) is staged through `startup_two_tier`'s gemx pinned
-    // pool, so these fields back only the non-CUDA `load_from_mmap` reload path.
+    // Under CUDA every expert (FP and int8/KO) is staged through the pack file,
+    // so these fields back only the non-CUDA `load_from_mmap` reload path.
     /// GGUF mmap, retained for non-CUDA device-direct slot builds.
     #[cfg(not(feature = "cuda"))]
     pub(crate) mmap: Arc<memmap2::Mmap>,
@@ -816,10 +1002,11 @@ pub(crate) struct PipelineState {
 }
 
 impl PipelineState {
-    /// Classify experts as hits/misses, load misses via DMA from pinned pool.
+    /// Classify experts as hits/misses and load the misses.
     ///
-    /// CUDA path: misses are loaded from pinned RAM (H2D on copy_stream).
-    /// Eviction goes VRAM → pinned RAM (D2H on copy_stream).
+    /// A miss loads from the warm tier when the expert is there and from the
+    /// pack when it is not. Displacing a resident expert to make room costs
+    /// nothing but the bookkeeping: its bytes are already in the cold tier.
     fn classify_and_load(
         &mut self,
         moe_idx: usize,
@@ -845,7 +1032,7 @@ impl PipelineState {
         // which every forward fails forever. Drop such ids and log instead:
         // that token loses one expert (negligible) rather than bricking decode.
         #[cfg(feature = "cuda")]
-        let n_experts = self.expert_locations[moe_idx].len();
+        let n_experts = self.residency[moe_idx].len();
         #[cfg(not(feature = "cuda"))]
         let n_experts = self.host_refs[moe_idx].len();
 
@@ -869,24 +1056,11 @@ impl PipelineState {
             }
 
             // Cache miss — allocate a slot (layer-aware eviction)
-            let (slot_idx, evicted_key, evicted_slot) = self.inner.allocate_slot(moe_idx)?;
-
-            // D2H eviction: copy evicted expert to pinned pool.
-            // If pinned is full, the evicted expert is lost (acceptable
-            // since the miss we're about to load will free a pinned slot,
-            // and the evicted expert was the lowest-scored anyway).
+            let (slot_idx, evicted_key) = self.inner.allocate_slot(moe_idx)?;
             #[cfg(feature = "cuda")]
-            if let (Some((evict_moe, evict_exp)), Some(slot)) = (evicted_key, evicted_slot) {
-                if let Err(_e) = self.evict_to_pinned(evict_moe, evict_exp, &slot) {
-                    // Pinned full — expert data lost.  Mark location as
-                    // Vram with a sentinel so it's treated as absent.
-                    // (The slot index is already freed by allocate_slot.)
-                }
-            }
+            self.note_eviction(evicted_key);
             #[cfg(not(feature = "cuda"))]
-            {
-                let _ = (evicted_key, evicted_slot);
-            }
+            let _ = evicted_key;
 
             to_load.push((expert_idx, slot_idx));
         }
@@ -903,16 +1077,30 @@ impl PipelineState {
 
         let mut loaded_slots: Vec<(usize, usize, ExpertSlot)> = Vec::with_capacity(to_load.len());
 
+        // **Every slot in `to_load` is allocated and keyless right now**, and it
+        // stays keyless until the install below. So a failure anywhere in this
+        // phase hands the batch back to the caller while the zone still counts
+        // those slots as occupied — and a slot the zone holds with no expert in
+        // it is one neither `alloc` nor the eviction scans can ever return. Ten
+        // failed loads is ten slots gone for the life of the process.
+        //
+        // Hence the explicit unwinding rather than `?`: the error still
+        // propagates unchanged, but the slots go back first.
         #[cfg(feature = "cuda")]
-        {
+        let outcome = (|| -> Result<()> {
+            // Before any byte moves: the slots below may still be under read by
+            // the previous layer's GEMM.
+            self.order_copies_after_compute()?;
             for &(expert_idx, slot_idx) in &to_load {
-                let expert_slot = self.load_from_pinned(moe_idx, expert_idx)?;
+                let slot_base = self.inner.slot_base(slot_idx);
+                let expert_slot = self.load_expert(moe_idx, expert_idx, slot_base)?;
                 loaded_slots.push((expert_idx, slot_idx, expert_slot));
             }
-        }
+            Ok(())
+        })();
 
         #[cfg(not(feature = "cuda"))]
-        {
+        let outcome = (|| -> Result<()> {
             let mmap_bytes: &[u8] = &self.mmap;
             for &(expert_idx, slot_idx) in &to_load {
                 let mmap_ref = &self.host_refs[moe_idx][expert_idx];
@@ -920,6 +1108,16 @@ impl PipelineState {
                     load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode)?;
                 loaded_slots.push((expert_idx, slot_idx, expert_slot));
             }
+            Ok(())
+        })();
+
+        if let Err(e) = outcome {
+            for &(_, slot_idx) in &to_load {
+                if self.inner.slot_to_key[slot_idx].is_none() {
+                    self.inner.zone.release(slot_idx);
+                }
+            }
+            return Err(e);
         }
 
         // ── Record single fence event ──
@@ -942,10 +1140,11 @@ impl PipelineState {
             self.inner.install(slot_idx, moe_idx, expert_idx, slot);
             loaded.push((expert_idx, slot_idx));
 
-            // Update location tracker: now in VRAM.
+            // A device copy now exists. Whether a host one also does is a
+            // separate, immutable fact this does not touch.
             #[cfg(feature = "cuda")]
             {
-                self.expert_locations[moe_idx][expert_idx] = ExpertLocation::Vram { slot_idx };
+                self.residency[moe_idx][expert_idx].vram = Some(slot_idx);
             }
         }
         self.profile.record("cl_install", t);
@@ -960,7 +1159,7 @@ impl PipelineState {
             // whole-card decomposition tracks experts paging VRAM↔pinned RAM.
             #[cfg(feature = "cuda")]
             let resident_vram = {
-                let occupied = self.inner.slots.len() - self.inner.free_slots.len();
+                let occupied = self.inner.num_slots() - self.inner.free_len();
                 let slot_bytes = self
                     .layer_geometries
                     .iter()
@@ -987,147 +1186,204 @@ impl PipelineState {
         })
     }
 
-    /// Evict an expert from VRAM to the pinned pool (D2H).
+    /// Record that an expert has left VRAM.
+    ///
+    /// **This is the whole of eviction.** One field assignment, no copy, no
+    /// stream, no ordering, no destination slot to find, and no failure mode:
+    /// the cold tier holds a valid copy of every expert at all times, and the
+    /// warm tier — which is immutable, so it never reclaimed the slot — usually
+    /// holds one too. Clearing `vram` re-exposes whichever copy is nearest.
+    ///
+    /// It used to be a 2.9 MB device-to-host copy into a pinned slot that had to
+    /// be found first, and could fail with the expert's only copy in the slot
+    /// being reused. Measured over one gate config that was 23,415 evictions —
+    /// 68 GB of PCIe traffic, competing on the copy stream with an equal number
+    /// of loads, all of it duplicating bytes the pack file already held.
+    ///
+    /// `None` means the allocator found a free slot and displaced nothing.
     #[cfg(feature = "cuda")]
-    fn evict_to_pinned(
+    fn note_eviction(&mut self, evicted: Option<(usize, usize)>) {
+        let Some((moe_idx, expert_idx)) = evicted else {
+            return;
+        };
+        self.residency[moe_idx][expert_idx].vram = None;
+        if let Ok(mut s) = self.stats.lock() {
+            s.evictions += 1;
+        }
+    }
+
+    /// Order the copy stream behind everything already issued on the compute
+    /// stream, before a batch of H2D loads.
+    ///
+    /// **A slot is a fixed address now**, so an H2D that re-tenants one
+    /// overwrites bytes a still-executing expert GEMM may be reading. The
+    /// eviction policy deliberately prefers experts from layers already executed
+    /// *this pass* — `allocate_slot`'s behind-layer scan takes
+    /// `PINNED_LAYERS <= layer < current_layer` — and "already executed" means
+    /// issued, not retired, so the previous layer's GEMM is exactly the kernel
+    /// most likely to still be reading the slot being overwritten.
+    ///
+    /// The CUDA pool used to supply this ordering for free: `cuMemAllocAsync`
+    /// returns memory whose `cuMemFreeAsync` has retired in stream order, so a
+    /// reused buffer could not be written before its last reader finished. A
+    /// fixed-address slot has no such guarantee, and the same gap in the KV side
+    /// is what `region_pool::claim_region`'s quiesce exists to close.
+    ///
+    /// This is the cheap half of that: a GPU-side `cudaStreamWaitEvent`, so the
+    /// **host does not block** — exactly as it did not under the pool. What is
+    /// serialised is the copy stream against compute already issued, which is
+    /// the same dependency the pool enforced internally.
+    #[cfg(feature = "cuda")]
+    fn order_copies_after_compute(&self) -> Result<()> {
+        let (Some(cs), Device::Cuda(cd)) = (&self.copy_stream, &self.device) else {
+            return Ok(());
+        };
+        let compute = cd.cuda_stream();
+        let event = compute.record_event(None).map_err(candle::Error::wrap)?;
+        cs.wait(&event).map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+
+    /// The other half: order the compute stream **behind** every copy issued so
+    /// far, before a slot those copies wrote is computed on.
+    ///
+    /// [`Self::order_copies_after_compute`] stops a copy overwriting bytes a
+    /// kernel is still reading. This stops a kernel reading bytes a copy has not
+    /// finished writing, and the two are not interchangeable — a path that does
+    /// only the first publishes a slot whose contents are still in flight.
+    ///
+    /// The load paths get this from [`CopyBatchFence`]: the batch records an
+    /// event and whoever computes on the result waits for it
+    /// (`prefetch_fence`, `classified.fence`, `pending_prefetch_fence`). A
+    /// relocation has no such consumer — it is not answering a work request, it
+    /// runs at end of pass and hands its slots to whatever comes next — so it
+    /// waits here instead, immediately, rather than threading a fence to a
+    /// caller that does not exist.
+    ///
+    /// One call covers any number of copies: a later event on the same stream
+    /// implies completion of everything enqueued before it. The wait is a
+    /// GPU-side `cudaStreamWaitEvent`, so the host does not block.
+    #[cfg(feature = "cuda")]
+    fn order_compute_after_copies(&self) -> Result<()> {
+        let (Some(cs), Device::Cuda(cd)) = (&self.copy_stream, &self.device) else {
+            // Without a copy stream the copies were issued on the compute
+            // stream itself, which already orders them.
+            return Ok(());
+        };
+        let event = cs.record_event(None).map_err(candle::Error::wrap)?;
+        cd.cuda_stream().wait(&event).map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+
+    /// Load an expert into the weight-zone slot at `slot_base`, from wherever
+    /// its nearest copy is.
+    ///
+    /// **A total function with no error case for "where from".** The residency
+    /// pair answers it directly:
+    ///
+    /// ```text
+    /// ram = Some(s)  →  H2D from pinned slot s
+    /// ram = None     →  read the pack, then H2D from the landing buffer
+    /// ```
+    ///
+    /// There is no third case and no state this cannot serve. The warm copy is
+    /// **not** surrendered on promotion: the warm tier is immutable, so the slot
+    /// could not be reused by anything else, and keeping it is what makes the
+    /// next eviction of this expert free. Without that the warm tier drains —
+    /// every expert ever promoted would leave the warm set permanently, and
+    /// since promotion is driven by demand, the ones lost first would be the
+    /// most useful.
+    ///
+    /// The slot must already be held by the caller — every path reaches here
+    /// after taking or forcing a slot, so the address is decided before the
+    /// bytes move rather than by the allocator afterwards.
+    #[cfg(feature = "cuda")]
+    fn load_expert(
         &mut self,
         moe_idx: usize,
         expert_idx: usize,
-        slot: &ExpertSlot,
-    ) -> Result<()> {
+        slot_base: u64,
+    ) -> Result<ExpertSlot> {
+        let Device::Cuda(cd) = &self.device else {
+            candle::bail!("load_expert requires a CUDA device");
+        };
         let geom = &self.layer_geometries[moe_idx];
-
-        // Allocate a pinned slot.
-        let pinned_slot = self.pinned_pool.alloc().ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "pinned pool full — cannot evict L{moe_idx}E{expert_idx}"
-            ))
-        })?;
-
-        // D2H copy on the copy stream.
-        if let Some(cs) = &self.copy_stream {
-            evict_slot_to_pinned(slot, &mut self.pinned_pool, pinned_slot, geom, cs)?;
-        } else {
-            // Fallback: synchronous D2H via data().
-            let gate_qt = slot
-                .gate_proj
-                .inner()
-                .qtensor()
-                .ok_or_else(|| candle::Error::Msg("evict: gate not QTensor".into()))?;
-            let gate_bytes = gate_qt.data()?;
-            let up_qt = slot
-                .up_proj
-                .inner()
-                .qtensor()
-                .ok_or_else(|| candle::Error::Msg("evict: up not QTensor".into()))?;
-            let up_bytes = up_qt.data()?;
-            let down_qt = slot
-                .down_proj
-                .inner()
-                .qtensor()
-                .ok_or_else(|| candle::Error::Msg("evict: down not QTensor".into()))?;
-            let down_bytes = down_qt.data()?;
-
-            let g = geom.gate_repacked_size;
-            let u = geom.up_repacked_size;
-            let d = geom.down_repacked_size;
-            let dst = self.pinned_pool.slot_mut(pinned_slot, g + u + d);
-            dst[..g].copy_from_slice(&gate_bytes);
-            dst[g..g + u].copy_from_slice(&up_bytes);
-            dst[g + u..g + u + d].copy_from_slice(&down_bytes);
-        }
-
-        self.expert_locations[moe_idx][expert_idx] = ExpertLocation::Pinned {
-            slot_idx: pinned_slot,
+        let layout = self.pack.layout(moe_idx);
+        let stride = self.pack.stride();
+        let stream = match &self.copy_stream {
+            Some(cs) => cs.clone(),
+            None => cd.cuda_stream(),
         };
 
-        if let Ok(mut s) = self.stats.lock() {
-            s.evictions += 1;
-            s.dma_evicts += 1;
-        }
-
-        Ok(())
-    }
-
-    /// Load an expert from the pinned pool to VRAM (H2D).
-    #[cfg(feature = "cuda")]
-    fn load_from_pinned(&mut self, moe_idx: usize, expert_idx: usize) -> Result<ExpertSlot> {
-        let geom = &self.layer_geometries[moe_idx];
-
-        // Find the pinned slot.
-        let pinned_slot = match self.expert_locations[moe_idx][expert_idx] {
-            ExpertLocation::Pinned { slot_idx } => slot_idx,
-            ExpertLocation::Vram { .. } => {
-                candle::bail!("load_from_pinned: L{moe_idx}E{expert_idx} is already in VRAM");
+        // SAFETY (both arms): `slot_base` names a slot the zone handed the
+        // caller and has not reclaimed. Overwriting it is the point — a miss
+        // replaces whatever the previous tenant left, in place.
+        match self.residency[moe_idx][expert_idx].ram {
+            Some(warm_slot) => {
+                let src = self.warm.slot_ref(warm_slot, stride);
+                if let Ok(mut s) = self.stats.lock() {
+                    s.warm_loads += 1;
+                }
+                unsafe {
+                    build_slot_from_record_on_stream(
+                        src,
+                        layout,
+                        geom,
+                        cd,
+                        &stream,
+                        slot_base,
+                        Some(&mut self.profile),
+                    )
+                }
             }
-        };
-
-        let g = geom.gate_repacked_size;
-        let u = geom.up_repacked_size;
-        let d = geom.down_repacked_size;
-
-        // Read pinned bytes.
-        let src = self.pinned_pool.slot_ref(pinned_slot, g + u + d);
-        let gate_bytes = &src[..g];
-        let up_bytes = &src[g..g + u];
-        let down_bytes = &src[g + u..g + u + d];
-
-        // H2D load + wrap.
-        let slot = if let (Some(cs), Device::Cuda(cd)) = (&self.copy_stream, &self.device) {
-            build_slot_from_repacked_on_stream(
-                gate_bytes,
-                up_bytes,
-                down_bytes,
-                geom,
-                cd,
-                cs,
-                &mut self.profile,
-            )?
-        } else if let Device::Cuda(cd) = &self.device {
-            build_slot_from_repacked_with_device(gate_bytes, up_bytes, down_bytes, geom, cd)?
-        } else {
-            candle::bail!("load_from_pinned requires CUDA device");
-        };
-
-        // Free the pinned slot — expert is now in VRAM.
-        self.pinned_pool.free(pinned_slot);
-
-        Ok(slot)
+            None => {
+                let t = profile_now();
+                let idx = self.cold_staging.acquire()?;
+                self.pack.read_into(
+                    moe_idx,
+                    expert_idx,
+                    self.cold_staging.buffer_mut(idx, stride),
+                )?;
+                self.profile.record("cold_read", t);
+                let slot = unsafe {
+                    build_slot_from_record_on_stream(
+                        self.cold_staging.buffer_ref(idx, stride),
+                        layout,
+                        geom,
+                        cd,
+                        &stream,
+                        slot_base,
+                        Some(&mut self.profile),
+                    )?
+                };
+                // The buffer cannot be written again until this upload lands.
+                let event = stream.record_event(None).map_err(candle::Error::wrap)?;
+                self.cold_staging.publish(idx, event);
+                if let Ok(mut s) = self.stats.lock() {
+                    s.cold_loads += 1;
+                }
+                Ok(slot)
+            }
+        }
     }
 
-    /// Proactive eviction: move bottom-N VRAM experts to pinned pool.
+    /// Proactive eviction: drop the bottom-N VRAM experts.
     ///
-    /// Called to maintain VRAM headroom so real misses find free slots
-    /// without triggering inline eviction scans.
-    /// Automatically capped at available pinned pool capacity.
+    /// Called to maintain VRAM headroom so real misses find free slots without
+    /// triggering inline eviction scans. Nothing bounds `count` but the slots
+    /// that exist — this used to be clamped by free pinned slots, because an
+    /// eviction needed somewhere to put the bytes.
     #[cfg(feature = "cuda")]
-    fn drip_evict(&mut self, count: usize) -> Result<()> {
-        // Clamp to available pinned capacity — can't evict more than
-        // pinned can absorb.
-        let available = self.pinned_pool.free_slots.len();
-        let count = count.min(available);
+    fn drip_evict(&mut self, count: usize) {
         if count == 0 {
-            return Ok(());
+            return;
         }
-
         let evicted = self
             .inner
             .end_of_pass_eviction(count as f32 / self.inner.slots.len().max(1) as f32);
-
-        for ((moe_idx, expert_idx), slot) in evicted {
-            if let Err(e) = self.evict_to_pinned(moe_idx, expert_idx, &slot) {
-                tracing::warn!("drip_evict: failed L{moe_idx}E{expert_idx}: {e}");
-            }
-            // ExpertSlot dropped here — VRAM freed.
+        for key in evicted {
+            self.note_eviction(Some(key));
         }
-
-        // Sync the copy stream so pinned data is valid.
-        if let (Some(cs), Device::Cuda(cd)) = (&self.copy_stream, &self.device) {
-            let event = cs.record_event(None).map_err(candle::Error::wrap)?;
-            cd.cuda_stream().wait(&event).map_err(candle::Error::wrap)?;
-        }
-
-        Ok(())
     }
 
     /// Process a single MoE work request: classify, DMA, compute, return output.
@@ -1186,6 +1442,17 @@ impl PipelineState {
         let classified = self.classify_and_load(req.moe_layer_idx, &req.expert_ids)?;
         self.profile.record("pipe_classify_load", t);
 
+        // ── Wait for the deferred speculative-prefetch fence BEFORE computing
+        // hits: a speculatively-loaded expert is installed (and classifies as a
+        // hit) while its H2D may still be in flight. The DMA overlapped the
+        // forward thread's attention window, so this is usually already
+        // signalled. ──
+        let t = profile_now();
+        let prefetch_fence =
+            std::mem::replace(&mut self.pending_prefetch_fence, CopyBatchFence::noop());
+        prefetch_fence.wait(&self.device)?;
+        self.profile.record("pipe_prefetch_fence", t);
+
         // Helper: extract (token_ids, weight_ids) for a given expert.
         let expert_group = |eid: usize| -> (Vec<u32>, Vec<u32>) {
             let eid32 = eid as u32;
@@ -1197,6 +1464,19 @@ impl PipelineState {
         };
 
         let (num_tokens, hidden) = req.input.shape()?;
+        // The combine target comes from the submitting layer's FFN span. This
+        // thread cannot borrow that generation, but the request carries its
+        // ticket, and the submitter blocks on the response for the whole
+        // request — so the span is open from here to the hand-back, and the
+        // returned tensor is a lease that frees nothing when the caller drops
+        // it.
+        // There is no wave domain without CUDA, so off-CUDA the target is an
+        // ordinary owned allocation — the same split the `MoeInput` match below
+        // makes, for the same reason.
+        #[cfg(feature = "cuda")]
+        let mut ys =
+            wave_zeros_ticketed((num_tokens, hidden), req.out_dtype, &self.device, req.wave)?;
+        #[cfg(not(feature = "cuda"))]
         let mut ys = Tensor::zeros((num_tokens, hidden), req.out_dtype, &self.device)?;
         // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
         #[cfg(not(feature = "cuda"))]
@@ -1227,6 +1507,7 @@ impl PipelineState {
                     &experts_vec,
                     &req.weights_flat,
                     &mut self.profile,
+                    req.wave,
                 )?;
             }
         }
@@ -1285,6 +1566,7 @@ impl PipelineState {
                     &experts_vec,
                     &req.weights_flat,
                     &mut self.profile,
+                    req.wave,
                 )?;
             }
         }
@@ -1323,32 +1605,30 @@ impl PipelineState {
         }
 
         // ── Speculative prefetch for next MoE layer ──
+        // The fence is NOT awaited here: the DMA runs on the copy stream while
+        // the forward thread computes the next layer's attention, and the next
+        // work request's compute phase waits on it (usually already signalled
+        // by then). An inline wait would serialize the prefetch on the pipe
+        // thread and stall the next layer's work behind it.
         let t = profile_now();
         if let Ok(prefetch_fence) = self.speculative_prefetch(moe_layer_idx, expert_ids) {
-            self.profile.record("pipe_prefetch", t);
-            let t2 = profile_now();
-            let _ = prefetch_fence.wait(&self.device);
-            self.profile.record("pipe_prefetch_fence", t2);
-        } else {
-            self.profile.record("pipe_prefetch", t);
+            self.pending_prefetch_fence = prefetch_fence;
         }
+        self.profile.record("pipe_prefetch", t);
 
         // ── Drip eviction (adaptive headroom) ──
         // Skip all eviction when every expert is resident in VRAM — there
         // is nothing to rotate and evicting would only cause needless DMA.
         #[cfg(feature = "cuda")]
         if !self.all_resident {
-            let vram_slots = self.inner.slots.len();
-            let free = self.inner.free_slots.len();
+            let vram_slots = self.inner.num_slots();
+            let free = self.inner.free_len();
             let target_free = ((vram_slots as f32 * self.drip_headroom).ceil() as usize).max(1);
             if free < target_free {
                 let deficit = target_free - free;
                 let t = profile_now();
-                if let Err(e) = self.drip_evict(deficit) {
-                    tracing::warn!("drip eviction failed: {e}");
-                } else {
-                    self.pass_drip_evicts += deficit;
-                }
+                self.drip_evict(deficit);
+                self.pass_drip_evicts += deficit;
                 self.profile.record("pipe_drip_evict", t);
             }
         }
@@ -1388,23 +1668,16 @@ impl PipelineState {
             // Skip heavy eviction when the cache already has enough
             // free headroom. This keeps single-token generation fast when
             // the cache is stable (few misses → free slots accumulate).
-            let free_slots = self.inner.free_slots.len();
+            let free_slots = self.inner.free_len();
             let do_eviction = free_slots < target_free;
 
             let t = profile_now();
             #[cfg(feature = "cuda")]
             if !self.all_resident && do_eviction {
                 let desired = ((occupied as f32 * self.eviction_rate).ceil() as usize).max(1);
-                let pinned_free = self.pinned_pool.free_slots.len();
-                let capped = desired.min(pinned_free);
-                if capped > 0 {
-                    let fraction = capped as f32 / occupied as f32;
-                    let evicted = self.inner.end_of_pass_eviction(fraction);
-                    for ((moe_idx, expert_idx), slot) in evicted {
-                        if let Err(e) = self.evict_to_pinned(moe_idx, expert_idx, &slot) {
-                            tracing::warn!("end-of-pass evict failed L{moe_idx}E{expert_idx}: {e}");
-                        }
-                    }
+                let fraction = desired as f32 / occupied as f32;
+                for key in self.inner.end_of_pass_eviction(fraction) {
+                    self.note_eviction(Some(key));
                 }
             }
             #[cfg(not(feature = "cuda"))]
@@ -1414,10 +1687,395 @@ impl PipelineState {
             }
             self.profile.record("pipe_eviction", t);
 
+            // **The boundary does not move from here.**
+            //
+            // This was the growing direction's call site, and "end of pass" is
+            // what made it look safe: the eviction above has produced whatever
+            // free slots it was going to, and no GEMM for the pass is still being
+            // *issued*. But end-of-pass on this thread is the middle of a forward
+            // on the other one — `post_compute` runs the instant a MoE layer's
+            // work is answered, while the forward thread is still inside
+            // `ffn_forward` holding that layer's FFN wave guard. A wave arena is
+            // live, and moving the boundary under one evicts and relocates slots
+            // the wave may be reading.
+            //
+            // So the move lives where the wave genuinely is not: the wave loop's
+            // inter-forward gap, beside the transient tier's hand-back
+            // (`batched_model::forward_wave` phase 0 → `reclaim_spare_ground`).
+            // The KV side's own direction is unchanged — it buys at the claim,
+            // through `request_kv_ground`, and does not wait for a pass to end.
+
             // Reset per-pass adaptive counters.
             self.pass_misses = 0;
             self.pass_drip_evicts = 0;
         }
+    }
+
+    /// Move the weight/KV boundary. `want` is regions the KV side is asking for;
+    /// `None` asks the opposite question — how much it is holding free that the
+    /// weight side could take back.
+    ///
+    /// **This is the elastic partition.** It runs on the pipeline thread because
+    /// that is the only place the weight side is safe to change: this thread owns
+    /// the cache. *When* it may run is a separate condition and a stricter one —
+    /// no wave generation open on the span — which neither this function nor its
+    /// thread can establish. Both callers reach it from outside a forward, and
+    /// `set_weight_floor` checks rather than trusts that.
+    ///
+    /// # `want` is stated by the caller, never inferred here
+    ///
+    /// It used to come from `take_kv_demand`, which drained a running count of
+    /// refused claims. That count was of *events*, and this function spent it as
+    /// *regions*: one failed section-quantize drain walked the size-class ladder
+    /// and left 4,436 behind it, against a KV side that was 28 regions short. The
+    /// retraction that followed evicted 1,598 experts and put the zone below its
+    /// own pinned working set, after which every forward failed `cannot evict
+    /// (all pinned)` — 1,774 times, until the daemon was killed.
+    ///
+    /// Now the number arrives from whoever knows it: an arena claim that ran out
+    /// asks for the regions it is claiming, and the scheduler's relief asks for
+    /// its measured setpoint shortfall. Neither can accumulate, because neither
+    /// survives the call that made it.
+    ///
+    /// Both directions are **non-destructive by preference**. Growing takes only
+    /// free regions. Shrinking relocates the hottest doomed experts into free
+    /// slots below the new frontier and drops the rest, exactly as an ordinary
+    /// eviction does — so the worst case is a reload, never a loss.
+    ///
+    /// **The retraction stops at the zone's floor and nowhere else.** It was once
+    /// capped at the expert cache's free pinned slots, because an evicted expert
+    /// needed somewhere to be, and that cap was measured at 0–109 usable slots.
+    /// With the cold tier authoritative there is no destination to find, so the
+    /// range is the full `[floor, max_slots]` span the elastic partition was
+    /// written to deliver — where `floor` is `minimum_resident_slots`, the fewest
+    /// this cache can serve a token with. That floor is now the *only* thing
+    /// bounding how much residency the KV side can buy, so it is measured from
+    /// the pinning rule rather than guessed as a fraction (see `WeightZone::new`).
+    ///
+    /// **Ground changes hands only behind a device quiesce** — see
+    /// [`Self::quiesce_before_handover`]. Removing the cap is what made that
+    /// necessary: while a retraction moved nothing, no byte ever changed owner.
+    ///
+    /// Answers with the **bytes conceded to the KV side** — zero when the
+    /// boundary held or moved the other way.
+    #[cfg(feature = "cuda")]
+    fn renegotiate_boundary(&mut self, want: Option<usize>) -> Result<u64> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(0);
+        };
+        let stream = cd.cuda_stream();
+        // One conversion, one direction: regions the KV side is short (positive
+        // ⇒ the floor moves right, the weight side shrinks) or holding spare
+        // (negative ⇒ the floor moves left, the weight side grows).
+        let delta = match want {
+            Some(0) | None => {
+                let spare = kv_spare_regions(&stream, KV_REGION_SLACK)?;
+                if spare == 0 {
+                    return Ok(0);
+                }
+                -(spare as isize)
+            }
+            Some(wanted) => wanted as isize,
+        };
+        let floor = weight_floor_after(&stream, delta)?;
+        let before = self.inner.zone.capacity();
+        let target = self.inner.zone.capacity_for_frontier(floor);
+        if target == before {
+            return Ok(0);
+        }
+
+        if target > self.inner.zone.capacity() {
+            // Taking ground is a handover too: those regions were the KV side's
+            // until this instant, and "free" there means no host-side gid names
+            // them, not that no kernel is still reading them.
+            self.quiesce_before_handover()?;
+            // **The floor moves first, and the zone follows it.**
+            //
+            // `set_weight_floor` is refusable — it declines while a wave
+            // generation is open on the span — and this ran the other way round:
+            // `grow_zone` applied, then the publish, then `?` carried the refusal
+            // out to a caller that logs a warning. What it left behind was a zone
+            // one slot wider than the boundary the KV side had been told about,
+            // so the next miss allocated the new top slot and handed the GEMM
+            // `slot_base(capacity)` — an address exactly one `slot_bytes` *below*
+            // `weight_floor`, which is KV ground.
+            //
+            // Measured: `gate weights for expert 43 are at 0xee10c0000, below the
+            // weight floor 0xee1384000`, one slot down, from the first wave step
+            // of a bulk ingest — and every later symptom (experts unable to
+            // evict, KV unable to reclaim regions the failed steps never retired)
+            // hung off that one refusal.
+            //
+            // Growing shrinks the KV side, so publishing first is also the safe
+            // order in its own right: the KV side stops handing out the ground
+            // before the weight side starts filling it. A refusal now lands with
+            // nothing yet moved, and the next pass tries again.
+            let grown_floor = self.inner.zone.frontier_after_growth(target);
+            let gained = if grown_floor < self.inner.zone.frontier_for_capacity() {
+                set_weight_floor(&stream, grown_floor)?;
+                self.inner.grow_zone(target)
+            } else {
+                // `grow_to` clamps to the zone's limit, so a target past it moves
+                // no boundary and must publish none.
+                0
+            };
+            if gained > 0 {
+                tracing::debug!(
+                    target: "candle_transformers::expert_lre",
+                    gained,
+                    spare = -delta,
+                    slots = self.inner.zone.capacity(),
+                    "weight side took free KV regions"
+                );
+            }
+            return Ok(0);
+        }
+
+        // **Refuse before touching anything, exactly as the growth path does.**
+        //
+        // This check used to sit at the end, just before `set_weight_floor` —
+        // after `retract_zone` had already shrunk the zone, after the
+        // relocations had moved experts, after the evictions, and after
+        // `truncate_tables`. When it refused, `?` carried the error out through
+        // a caller that logs it as a warning, so the whole retraction stayed
+        // half-applied: the zone believed it was smaller while experts were
+        // still live at indices past the new capacity, and the next pass handed
+        // one of their addresses to a grouped GEMM.
+        //
+        // Measured: `boundary renegotiation failed: refusing to move the weight
+        // boundary while a wave generation is open` at t=00:59:49.222, then at
+        // t=00:59:49.844 a gate weight pointer exactly `slot_bytes` below
+        // `weight_floor` — `slot_base(capacity)`, one slot past the last valid
+        // index. That address is KV ground, and reading it is the
+        // CUDA_ERROR_ILLEGAL_ADDRESS this hunt has been chasing.
+        //
+        // The growth branch above already had this right: quiesce, *then*
+        // `grow_zone`. Retraction is the same handover and gets the same order.
+        //
+        // A zone already sitting on its floor concedes nothing, and `retract_to`
+        // clamps to that floor rather than reporting it — so the answer is known
+        // here, before a device-wide synchronize is spent on it. The relief
+        // ladder asks on every rung of every failed wave; at the floor that was
+        // 188 consecutive quiesces to arrive at zero each time.
+        if target.max(self.inner.zone.min_capacity()) >= before {
+            tracing::debug!(
+                target: "candle_transformers::expert_lre",
+                wanted = delta,
+                slots = before,
+                floor_slots = self.inner.zone.min_capacity(),
+                "weight side is on its floor and can concede no further ground"
+            );
+            return Ok(0);
+        }
+        self.quiesce_before_handover()?;
+
+        // The zone decides who moves and who goes; this performs it.
+        let plan = self.inner.retract_zone(target);
+        for &(from, to) in &plan.relocate {
+            self.relocate_slot(from, to)?;
+        }
+        // **The relocations are published but not yet landed.** Each one
+        // installed its destination into the tables the instant its copy was
+        // *enqueued*, so as far as the next pass is concerned those experts are
+        // resident — while the bytes are still moving on the copy stream. One
+        // wait covers the whole plan and must happen before the boundary moves,
+        // because moving it is what lets the next pass start issuing GEMMs
+        // against the slots that just changed address.
+        if !plan.relocate.is_empty() {
+            self.order_compute_after_copies()?;
+        }
+        // The doomed remainder is dropped. This used to be the dangerous half of
+        // a retraction — a D2H copy per expert, into a pool that could be full,
+        // with the expert already out of the tables by the time the copy ran, so
+        // a failure meant those bytes existed nowhere and every later forward
+        // reported `Expert cache full, cannot evict (all pinned)` forever. It is
+        // now a bookkeeping update that cannot fail.
+        for &slot_idx in &plan.evict {
+            let key = self.inner.evict(slot_idx);
+            self.note_eviction(key);
+        }
+        // Only now: the relocations above read `slot_to_key` for the slots the
+        // truncation removes.
+        self.inner.truncate_tables();
+
+        // **`residency` is the fifth table, and the truncation cannot reach it.**
+        //
+        // `truncate_tables` cleans `slots`, `last_used`, `slot_to_key` and
+        // `key_to_slot` — every structure `inner` owns. `residency` lives on
+        // *this* struct, so a retraction left it still claiming
+        // `vram = Some(idx)` for slots the zone had just given up. Those entries
+        // are what say "this expert is resident, in that slot", so the next pass
+        // resolved one to an address at or below the frontier and handed it to a
+        // grouped GEMM: `slot_base(idx)` for `idx >= capacity` is below
+        // `weight_floor`, which is KV ground.
+        //
+        // Measured before this: gate weights for expert 49 exactly one
+        // `slot_bytes` below the floor, and experts 27 and 28 sharing a single
+        // address three slots below it — two keys resolving to one slot because
+        // both had stale residency pointing into the conceded range.
+        //
+        // Cleared here rather than inside `truncate_tables` because that is a
+        // method on `inner`, which has no access to `residency`; keeping the two
+        // adjacent is what makes the pairing visible.
+        let cap = self.inner.zone.capacity();
+        for layer in self.residency.iter_mut() {
+            for res in layer.iter_mut() {
+                if res.vram.is_some_and(|s| s >= cap) {
+                    res.vram = None;
+                }
+            }
+        }
+        // The conceded slots stop being ours the moment the floor moves.
+        self.quiesce_before_handover()?;
+        // **A refused publish here has to be undone, not carried out.**
+        //
+        // Retraction cannot publish first the way growth does — the floor moving
+        // right is what hands the KV side ground the experts above it are only
+        // now vacating. So the refusable step stays last, and the failure it can
+        // still produce is repaired instead of propagated: the zone believes it
+        // is smaller while `pool.weight_floor` says otherwise, and *both* sides
+        // lose the ground — the weight side has evicted off it, the KV side was
+        // never told it may use it. Worse, the next attempt computes its target
+        // from the unmoved floor, finds it equal to the capacity already reached,
+        // and returns zero: the relief loop then asks 188 times in a row and is
+        // answered `conceded_mib=0` every time while nothing is actually pinned.
+        //
+        // Growing the zone back is a true rollback. The doomed slots were evicted
+        // or relocated, so they are free; restoring the capacity restores the
+        // agreement between the zone and the published floor, and the only cost
+        // is reloading experts that were dropped for nothing.
+        if let Err(e) = set_weight_floor(&stream, self.inner.zone.frontier_for_capacity()) {
+            self.inner.grow_zone(before);
+            return Err(e);
+        }
+        let conceded =
+            (before - self.inner.zone.capacity()) as u64 * self.inner.zone.slot_bytes() as u64;
+        tracing::debug!(
+            target: "candle_transformers::expert_lre",
+            wanted = delta,
+            relocated = plan.relocate.len(),
+            evicted = plan.evict.len(),
+            slots = self.inner.zone.capacity(),
+            floor_slots = self.inner.zone.min_capacity(),
+            conceded_mib = conceded / (1 << 20),
+            "weight side gave ground to KV"
+        );
+        Ok(conceded)
+    }
+
+    /// Retire every kernel in flight before a byte changes owner.
+    ///
+    /// **The boundary is the one place where memory changes side**, and neither
+    /// side's own ordering reaches across it. The KV side quiesces before
+    /// re-tenanting a *recycled* region (`region_pool::claim_region`), because a
+    /// region on its free list may still be under read. But ground arriving from
+    /// the weight side is not recycled — it is **fresh**, claimed by advancing
+    /// `pool.next` past a ceiling that just moved, and that path has no wait at
+    /// all. Nothing was wrong with that: until the concession cap was removed,
+    /// the ceiling never moved over ground an expert had been sitting on, so a
+    /// fresh region had never been anyone's.
+    ///
+    /// Now it has. `renegotiate_boundary` runs between forwards, and "between
+    /// forwards" bounds only what is being *issued* — the last pass's expert
+    /// GEMMs may still be executing. Publishing a lower floor lets the KV side
+    /// memset and write bytes those GEMMs are still reading, which surfaces as
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS` in whatever unrelated kernel is running when
+    /// the fault lands. The same applies in reverse when the weight side takes
+    /// regions back: an expert upload would overwrite bytes a KV kernel is
+    /// reading.
+    ///
+    /// A GPU-side `cudaStreamWaitEvent` — what
+    /// [`Self::order_compute_after_copies`] uses — cannot do this job. It orders
+    /// two streams we know about; the readers here include the persistence
+    /// thread's copy stream and the KV side's own work, and the *host* has to
+    /// know the ground is quiet before it tells the other side it may have it.
+    /// So this is a device-wide synchronize, exactly as `claim_region`'s quiesce
+    /// is and for the same reason.
+    ///
+    /// It costs a full drain, and it is paid **only when the boundary actually
+    /// moves** — a rare event at end of pass, against a retraction that already
+    /// relocates or drops thousands of slots.
+    #[cfg(feature = "cuda")]
+    fn quiesce_before_handover(&self) -> Result<()> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(());
+        };
+        let stream = cd.cuda_stream();
+        let ctx = stream.context();
+        ctx.bind_to_thread().map_err(candle::Error::wrap)?;
+        ctx.synchronize().map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+
+    /// Move one expert's bytes from slot `from` to slot `to`, in place.
+    ///
+    /// A device-to-device copy of one slot — a few microseconds at card
+    /// bandwidth — and a rewrite of the tables that name it. This is what keeps
+    /// a *hot* expert alive when the boundary takes the ground it was sitting
+    /// on, and it is only possible because every slot is the same size: the
+    /// copy is a memcpy between two addresses of identical length, not a
+    /// compaction.
+    ///
+    /// Issued on the copy stream, behind the same ordering as a load: the
+    /// destination may have been read by the pass that just finished.
+    ///
+    /// **The tables are rewritten as soon as the copy is enqueued, so this
+    /// returns with the expert published and its bytes still in flight.** The
+    /// caller closes that with one [`Self::order_compute_after_copies`] for the
+    /// whole plan — cheaper than a fence per slot, and correct for the same
+    /// reason: a later event on the copy stream implies every copy before it.
+    /// Calling this without that wait computes the next pass on a half-copied
+    /// expert.
+    #[cfg(feature = "cuda")]
+    fn relocate_slot(&mut self, from: usize, to: usize) -> Result<()> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(());
+        };
+        let Some(key) = self.inner.slot_to_key[from] else {
+            // **Nothing to move, so give the destination back.**
+            // `WeightZone::retract_to` marks `to` occupied when it builds the
+            // plan — it deals in occupancy and cannot see keys — so returning
+            // here without releasing leaves a slot the zone believes is taken
+            // and the tables believe is empty. It is then invisible to `alloc`
+            // (not on the free list) and to both eviction scans (no key), and
+            // it never comes back.
+            //
+            // Self-amplifying, which is what made it fatal: one such slot in a
+            // later retraction's doomed range produces another, and this run
+            // retracted twenty-four times.
+            self.inner.zone.release(to);
+            return Ok(());
+        };
+        let geom = &self.layer_geometries[key.0];
+        let bytes = slot_offsets(geom).3;
+        let src = self.inner.slot_base(from);
+        let dst = self.inner.slot_base(to);
+        self.order_copies_after_compute()?;
+        let stream = self.copy_stream.clone().unwrap_or_else(|| cd.cuda_stream());
+        // SAFETY: both addresses name whole slots of the zone, of `slot_bytes`
+        // each; `bytes` is this layer's aligned total and never exceeds it. The
+        // source is live (the zone has not reclaimed it) and the destination is
+        // free (the plan chose it from the free list), so the two cannot alias.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, stream.cu_stream())
+                .map_err(candle::Error::wrap)?;
+        }
+        // Rebuild the slot's storages over the new address, then move the
+        // bookkeeping. The old `ExpertSlot`'s storages are leases, so dropping
+        // them releases the views and touches no memory.
+        // SAFETY: the copy above put this layer's three projections at `dst`,
+        // at the offsets `slot_offsets` names, and the zone holds the slot.
+        let moved = unsafe { build_slot_view(geom, cd, dst)? };
+        self.inner.slots[from] = None;
+        self.inner.slot_to_key[from] = None;
+        self.inner.slots[to] = Some(moved);
+        self.inner.slot_to_key[to] = Some(key);
+        self.inner.key_to_slot.insert(key, to);
+        self.inner.last_used[to] = self.inner.last_used[from];
+        if let Some(res) = self.residency.get_mut(key.0).and_then(|l| l.get_mut(key.1)) {
+            res.vram = Some(to);
+        }
+        Ok(())
     }
 
     /// Process a speculative prediction hint from the forward thread.
@@ -1452,6 +2110,15 @@ impl PipelineState {
         #[allow(unused_mut)]
         let mut loaded_count = 0usize;
 
+        // A hint load takes only free slots, but "free" can mean "evicted this
+        // pass and still under read" — see `order_copies_after_compute`.
+        #[cfg(feature = "cuda")]
+        if let Err(e) = self.order_copies_after_compute() {
+            tracing::warn!("hint: could not order the copy stream ({e}); skipping");
+            self.profile.record("pipe_hint", t);
+            return;
+        }
+
         for &expert_idx in &predicted {
             // Skip if already resident in VRAM.
             if self
@@ -1464,7 +2131,7 @@ impl PipelineState {
             }
 
             // Free-slots-only: never evict for speculative loads.
-            let slot_idx = match self.inner.free_slots.pop() {
+            let slot_idx = match self.inner.take_free() {
                 Some(s) => s,
                 None => break, // no free slots — stop speculating
             };
@@ -1472,15 +2139,17 @@ impl PipelineState {
             // Load from pinned pool (CUDA only — no-op on CPU builds).
             #[cfg(not(feature = "cuda"))]
             {
-                self.inner.free_slots.push(slot_idx);
+                self.inner.put_free(slot_idx);
                 continue;
             }
 
             #[cfg(feature = "cuda")]
-            let expert_slot = match self.load_from_pinned(layer_idx, expert_idx) {
+            let slot_base = self.inner.slot_base(slot_idx);
+            #[cfg(feature = "cuda")]
+            let expert_slot = match self.load_expert(layer_idx, expert_idx, slot_base) {
                 Ok(slot) => slot,
                 Err(_) => {
-                    self.inner.free_slots.push(slot_idx);
+                    self.inner.put_free(slot_idx);
                     continue;
                 }
             };
@@ -1492,11 +2161,7 @@ impl PipelineState {
 
             #[cfg(feature = "cuda")]
             {
-                self.expert_locations[layer_idx][expert_idx] = ExpertLocation::Vram { slot_idx };
-            }
-
-            #[cfg(feature = "cuda")]
-            {
+                self.residency[layer_idx][expert_idx].vram = Some(slot_idx);
                 self.speculative_loads.insert((layer_idx, expert_idx));
                 loaded_count += 1;
             }
@@ -1505,6 +2170,30 @@ impl PipelineState {
         if loaded_count > 0 {
             if let Ok(mut s) = self.stats.lock() {
                 s.hint_loads += loaded_count;
+            }
+            // Fence the batch: hint loads install their slots IMMEDIATELY (so
+            // the next work request classifies them as hits), but the H2D
+            // copies are still in flight on the copy stream. Without a fence a
+            // hit whose bytes are half-copied computes a garbage expert
+            // contribution — an intermittent, hard-to-attribute quality bug.
+            // Recording into `pending_prefetch_fence` reuses the deferred-fence
+            // wait that runs before the next request's hit compute; replacing
+            // an older pending fence is safe because a later event on the same
+            // copy stream implies completion of everything enqueued before it.
+            #[cfg(feature = "cuda")]
+            if let (Some(cs), Device::Cuda(_)) = (&self.copy_stream, &self.device) {
+                match cs.record_event(None) {
+                    Ok(event) => {
+                        self.pending_prefetch_fence = CopyBatchFence { event: Some(event) };
+                    }
+                    // No event → no deferred cover for the in-flight copies.
+                    // Fall back to draining the copy stream inline: rare and
+                    // slow, but the alternative is the next work request
+                    // computing a hint-installed expert on half-copied bytes.
+                    Err(_) => {
+                        let _ = cs.synchronize();
+                    }
+                }
             }
             self.profile.record("pipe_hint_dma", t);
         } else {
@@ -1570,31 +2259,30 @@ impl PipelineState {
         // and the current free slots by evicting the safest furthest-window
         // victims — the just-computed "behind" layers (the double-buffer; the
         // wave tail at the pinned boundary). One scan, not one per victim.
-        // Evicted experts are D2H'd to the pinned pool exactly as the demand-miss
-        // path does; their slots then join the free list for the load loop.
+        // Each eviction is a drop, so making room costs nothing but the scan.
         #[cfg(feature = "cuda")]
         {
-            let need = misses.len().saturating_sub(self.inner.free_slots.len());
+            let need = misses.len().saturating_sub(self.inner.free_len());
             if need > 0 {
-                for (slot_idx, evicted_key, evicted_slot) in
+                for (slot_idx, evicted_key) in
                     self.inner.evict_for_prefetch_batch(moe_layer_idx, need)
                 {
-                    if let (Some((evict_moe, evict_exp)), Some(slot)) = (evicted_key, evicted_slot)
-                    {
-                        // Pinned-pool full → evicted expert is lost; acceptable,
-                        // same as the demand-miss eviction path.
-                        let _ = self.evict_to_pinned(evict_moe, evict_exp, &slot);
-                    }
-                    self.inner.free_slots.push(slot_idx);
+                    self.note_eviction(evicted_key);
+                    self.inner.put_free(slot_idx);
                 }
             }
         }
 
         // Load each miss into a (now-provisioned) free slot. Stops early if the
         // window couldn't supply enough room — the demand path loads the rest.
+        //
+        // The slots just freed above were occupied by experts of layers behind
+        // the wave, whose GEMMs may still be executing.
+        #[cfg(feature = "cuda")]
+        self.order_copies_after_compute()?;
         let mut loaded = 0usize;
         for &expert_idx in &misses {
-            let slot_idx = match self.inner.free_slots.pop() {
+            let slot_idx = match self.inner.take_free() {
                 Some(s) => s,
                 None => break,
             };
@@ -1602,10 +2290,11 @@ impl PipelineState {
             let expert_slot = {
                 #[cfg(feature = "cuda")]
                 {
-                    match self.load_from_pinned(target_layer, expert_idx) {
+                    let slot_base = self.inner.slot_base(slot_idx);
+                    match self.load_expert(target_layer, expert_idx, slot_base) {
                         Ok(s) => s,
                         Err(_) => {
-                            self.inner.free_slots.push(slot_idx);
+                            self.inner.put_free(slot_idx);
                             continue;
                         }
                     }
@@ -1617,7 +2306,7 @@ impl PipelineState {
                     match load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode) {
                         Ok(s) => s,
                         Err(_) => {
-                            self.inner.free_slots.push(slot_idx);
+                            self.inner.put_free(slot_idx);
                             continue;
                         }
                     }
@@ -1629,7 +2318,7 @@ impl PipelineState {
 
             #[cfg(feature = "cuda")]
             {
-                self.expert_locations[target_layer][expert_idx] = ExpertLocation::Vram { slot_idx };
+                self.residency[target_layer][expert_idx].vram = Some(slot_idx);
             }
 
             // Track for prediction-precision measurement — validated when the
@@ -1658,6 +2347,21 @@ impl PipelineState {
         if let Ok(mut s) = self.stats.lock() {
             s.prefetch_loads += loaded;
         }
+        // Prefetch funnel diagnostic: how demand narrows to actual loads —
+        // sources → transition predictions → non-resident misses → DMA'd.
+        // A wide wave stalling on demand DMA with `loaded ≈ 0` here means the
+        // predictor (not the load path) is the bottleneck. TRACE, not debug:
+        // it fires once per MoE layer per forward (up to 48 lines per decoded
+        // token), which floods a debug-level log.
+        tracing::trace!(
+            target: "candle_transformers::expert_lre::prefetch",
+            layer = moe_layer_idx,
+            sources = current_expert_ids.len(),
+            predicted = predicted.len(),
+            misses = misses.len(),
+            loaded,
+            "speculative prefetch funnel",
+        );
 
         Ok(fence)
     }
@@ -1719,6 +2423,30 @@ pub(crate) fn spawn_pipeline_thread(
                         let snap = state.profile.snapshot();
                         state.profile.reset();
                         let _ = response_tx.send(snap);
+                    }
+                    // The give-back, reachable without a completed forward. The
+                    // scheduler asks when a wave could not allocate; answering
+                    // zero is a legitimate outcome (nothing spare, or a wave
+                    // generation still open), and the caller retries or gives up
+                    // on that basis rather than spinning.
+                    PipelineMessage::RenegotiateBoundary {
+                        regions,
+                        response_tx,
+                    } => {
+                        #[cfg(feature = "cuda")]
+                        let conceded = match state.renegotiate_boundary(Some(regions)) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!("requested boundary move failed: {e}");
+                                0
+                            }
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let conceded = {
+                            let _ = regions;
+                            0u64
+                        };
+                        let _ = response_tx.send(conceded);
                     }
                 }
             }

@@ -51,9 +51,7 @@ pub use embedding::{embedding, Embedding};
 pub use func::{func, func_t, Func, FuncT};
 pub use group_norm::{group_norm, GroupNorm};
 pub use init::Init;
-pub use kv_cache::{
-    arena_chunks_for_format, arena_gid_stride, ChunkGid, ChunkGidPool, KvCache, CHUNK_SIZE,
-};
+pub use kv_cache::{ChunkGid, ChunkGidPool, KvCache, CHUNK_SIZE, GID_STRIDE};
 pub use kv_caches::KvCaches;
 pub use layer_norm::{
     layer_norm, layer_norm_no_bias, rms_norm, LayerNorm, LayerNormConfig, RmsNorm,

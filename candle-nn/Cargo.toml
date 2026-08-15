@@ -45,6 +45,7 @@ serial_test = "3.0"
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
 cuda = ["candle/cuda"]
+forbidden_allocations = ["candle/forbidden_allocations"]
 verbose = []
 dont_check = []
 cudnn = ["candle/cudnn"]

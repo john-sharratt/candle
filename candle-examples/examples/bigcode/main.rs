@@ -1,3 +1,12 @@
+//! Code generation with StarCoder / GPTBigCode (`candle_transformers::models::bigcode::GPTBigCode`).
+//!
+//! Fixed to `Config::starcoder_1b()`; `--model-id` (default
+//! `bigcode/starcoderbase-1b`) and `--revision` select the HF Hub checkpoint,
+//! `--weight-file` overrides with a local safetensors path. Greedy/sampled
+//! autoregressive decode over `--prompt`, using the model's own KV-cache
+//! toggle (`config().use_cache`) to decode one token at a time after the
+//! initial prefill.
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 

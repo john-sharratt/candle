@@ -222,6 +222,20 @@ impl GalleryArena {
         self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Scalar))
     }
 
+    /// [`Self::scan_weighted`] forced onto the b1 tensor-core (BMMA) kernel —
+    /// the auto ladder's top rung on sm_75..sm_89. Forcing it surfaces a
+    /// backend-specific launch failure as a hard error instead of the ladder's
+    /// silent degrade, which is what differential tests and geometry
+    /// reproductions need. Errors on devices without b1 BMMA.
+    pub fn scan_weighted_bmma(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        group_weights: &[f32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Bmma))
+    }
+
     /// [`Self::scan_weighted`] forced onto the INT8 tensor-core (IMMA) kernel —
     /// the backend the auto ladder selects on devices without b1 BMMA (Hopper/
     /// Blackwell). Forcing it keeps the path benchmarkable and differential-
@@ -413,20 +427,50 @@ impl GalleryArena {
                             // The launcher's host-side gate declined (device or
                             // geometry) — nothing was enqueued; try the next rung.
                             tracing::debug!(
-                                target: "provenance",
+                                target: "candle_conversation::provenance",
                                 "paged scan: {backend:?} gate declined, next rung"
                             );
                             continue;
                         }
                         // Negative rc: a CUDA error mid-sequence — work may
                         // already be in flight, so drain the stream BEFORE
-                        // surfacing (the caller unpins the scanned turns on
+                        // continuing (the caller unpins the scanned turns on
                         // return, and the governor must never free pages a
-                        // still-running kernel is reading).
+                        // still-running kernel is reading). After the drain the
+                        // stream is quiescent, so the NEXT rung can safely
+                        // retry the same geometry — a backend-specific launch
+                        // failure degrades to the next backend, not to the CPU.
                         let _ = stream.synchronize();
-                        return Err(candle::Error::Msg(format!(
-                            "paged scan: {backend:?} launch failed (rc {rc})"
-                        )));
+                        // Decode `-(stage * 1000 + cudaError)`; `stage` names
+                        // WHICH CUDA call rejected the work (1 alloc, 2 memset,
+                        // 3 accum launch, 4 finalize launch) and `cuda_err` is
+                        // the raw `cudaError_t`. A bare rc named neither.
+                        let (stage, cuda_err) = if rc <= -1000 {
+                            ((-rc) / 1000, (-rc) % 1000)
+                        } else {
+                            (0, -rc)
+                        };
+                        let stage_name = match stage {
+                            1 => "alloc",
+                            2 => "memset",
+                            3 => "accum_launch",
+                            4 => "finalize_launch",
+                            _ => "unstaged",
+                        };
+                        tracing::warn!(
+                            target: "candle_conversation::provenance",
+                            backend = ?backend,
+                            rc,
+                            stage = stage_name,
+                            cuda_err,
+                            n_tokens = idx.pos_map.len(),
+                            n_probe_tokens,
+                            n_groups,
+                            n_segments,
+                            n_cases,
+                            "paged scan: launch failed; draining and trying next rung"
+                        );
+                        continue;
                     }
                     PagedBackend::Scalar => {
                         // Shared-memory budget guard: the scalar kernel's dynamic

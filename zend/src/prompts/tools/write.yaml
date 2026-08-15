@@ -1,6 +1,6 @@
 name: write
 category: Files
-description: 'Create a new file or overwrite an existing one in the in-memory virtual filesystem (VFS) for this session. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
+description: 'Create a new file or overwrite an existing one. The result is held in this session only — a project file of the same path is shadowed, never modified on disk. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -9,7 +9,7 @@ parameters:
       description: Full file content to write, replacing any existing content. Required.
       type: string
     path:
-      description: VFS path to create or overwrite (session-relative, e.g. `src/main.rs`). Required.
+      description: Path to create or overwrite (e.g. `src/main.rs`). The result is held in this session; a project file of the same path is shadowed, never modified on disk. Required.
       minLength: 1
       type: string
   required:
@@ -221,4 +221,32 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "write", "arguments": {"content": "FROM rust:1.79\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\nCMD [\"./target/release/my_app\"]", "path": "workspace/Dockerfile"}}
+  </tool_call><|projection|>
+- |-
+  create a notes.md at the project root summarising what we found<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants a new file created. write creates or overwrites a file, holding the result in this session — a project file of the same path would be shadowed rather than modified<|projection|> on disk, and here nothing of that name exists anyway.
+
+  The path is notes.md at the root, and the content is the summary.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "write", "arguments": {"path": "notes.md", "content": "# Notes
+
+  Summary of the findings.
+  "}}
+  </tool_call><|projection|>
+- |-
+  save that snippet as scratch/example.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants the snippet written to a file. write takes a path and the full content. The path is scratch/example.rs — a session file, since it does not exist in<|projection|> the project. The call returns the byte count and whether it was newly created.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "write", "arguments": {"path": "scratch/example.rs", "content": "fn main() {
+      println!(\"example\");
+  }
+  "}}
   </tool_call><|projection|>
