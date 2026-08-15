@@ -2034,6 +2034,9 @@ pub enum QType {
     // routed experts repack to (stays 4-bit; the four per-32 subs collapse onto e_max
     // in-register). Value 50 mirrors QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul kernel.
     MXFP4_KO = 50,
+    /// Lane-major per-128 affine KO twin at 2-bit — the smallest KO weight (value 0..3, the
+    /// 2-bit crumb region Q6_KO carries, used as the whole value). Value 51 mirrors QTYPE_Q2_KO.
+    Q2_KO = 51,
 }
 
 #[cfg(test)]

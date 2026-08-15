@@ -310,7 +310,7 @@ impl SparseMoeBlock {
             }
         }
 
-        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
+        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, k, t)?;
         let input = match acts {
             DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
             DynamicActs::Int8(op) => MoeInput::Q8(op),
@@ -334,13 +334,9 @@ impl SparseMoeBlock {
     fn route_indices(
         &self,
         router_logits: &Tensor,
-        num_tokens: usize,
         k: usize,
         t: ProfileMark,
     ) -> Result<(Tensor, Vec<Vec<u32>>)> {
-        // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
-        #[cfg(not(feature = "cuda"))]
-        let _ = num_tokens;
         // Fused routing: softmax + top-k select + (optional) renormalize in a single kernel,
         // replacing the `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches
         // over a tiny `[num_tokens, 128]` tensor). top-k of softmax == top-k of the logits (softmax
@@ -369,118 +365,19 @@ impl SparseMoeBlock {
         // Flatten weights to 1-D on GPU — stays device-resident.
         let weights_flat = top_k_weights.flatten_all()?.contiguous()?; // [num_tokens * k]
 
-        // ── 1b. Async DtoH for routing indices ──
-        //
-        // Instead of to_vec2() which drains the compute pipeline, we:
-        //   1. Record event E1 on compute stream (marks sort output ready)
-        //   2. Routing stream waits for E1 (GPU-side, CPU does not block)
-        //   3. Async DtoH on routing stream to pinned buffer
-        //   4. Record event E2 on routing stream (marks DtoH done)
-        //   5. Send speculative hint to pipeline thread
-        //   6. cuEventSynchronize(E2) — CPU blocks only for routing stream
-        //   7. Read indices from pinned buffer
-        //
-        // Fallback: if routing stream or pinned buffer not available,
-        // fall back to synchronous to_vec2().
-        #[cfg(feature = "cuda")]
-        let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = router_logits.device() {
-            let total_indices = num_tokens * k;
-            let routing_stream = self.cache.routing_stream();
-            let pinned_buf = self.cache.routing_pinned_mut(total_indices);
-
-            if let (Some(rs), Some(buf)) = (routing_stream, pinned_buf) {
-                // Step 1: Record event on compute stream after sort output
-                let compute_stream = cuda_dev.cuda_stream();
-                let e1 = compute_stream
-                    .record_event(None)
-                    .map_err(candle::Error::wrap)?;
-
-                // Step 2: Routing stream waits for sort to complete (GPU-side)
-                rs.wait(&e1).map_err(candle::Error::wrap)?;
-
-                // Step 3: Async DtoH on routing stream to pinned buffer
-                let (storage, layout) = top_k_indices.storage_and_layout();
-                if let candle::Storage::Cuda(cuda_storage) = &*storage {
-                    // Use contiguous_offsets to get the exact element range.
-                    // narrow() can leave a CudaSlice larger than the logical
-                    // tensor (e.g. [1,8] narrowed from [1,128] — slice is 128
-                    // but only 8 elements are valid).
-                    if let Some((o1, o2)) = layout.contiguous_offsets() {
-                        let elem_count = o2 - o1;
-                        cuda_storage.copy_u32_to_host_on_stream(buf, rs, o1, elem_count)?;
-                    } else {
-                        // Non-contiguous layout: fall back to sync path
-                        drop(storage);
-                        let idx = top_k_indices.to_vec2::<u32>()?;
-                        self.cache.record_profile("fwd_routing", t);
-
-                        // Send hint with previous layer's experts
-                        let prev_experts = self.cache.get_prev_layer_experts();
-                        if !prev_experts.is_empty() {
-                            self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                        }
-
-                        return Ok((weights_flat, idx));
-                    }
-                } else {
-                    drop(storage);
-                    let idx = top_k_indices.to_vec2::<u32>()?;
-                    self.cache.record_profile("fwd_routing", t);
-                    return Ok((weights_flat, idx));
-                }
-                drop(storage);
-
-                // Step 4: Record event on routing stream
-                let e2 = rs.record_event(None).map_err(candle::Error::wrap)?;
-
-                self.cache.record_profile("fwd_routing", t);
-
-                // Step 5: Send speculative hint while DtoH is in-flight
-                let prev_experts = self.cache.get_prev_layer_experts();
-                if !prev_experts.is_empty() {
-                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                }
-
-                // Step 6: Wait for routing DtoH to complete
-                let t_wait = profile_now();
-                e2.synchronize().map_err(candle::Error::wrap)?;
-                self.cache.record_profile("fwd_routing_wait", t_wait);
-
-                // Step 7: Read indices from pinned buffer into Vec<Vec<u32>>
-                let pinned_slice = self
-                    .cache
-                    .routing_pinned_mut(total_indices)
-                    .expect("pinned buffer disappeared");
-                let mut idx_cpu: Vec<Vec<u32>> = Vec::with_capacity(num_tokens);
-                for tok in 0..num_tokens {
-                    let start = tok * k;
-                    idx_cpu.push(pinned_slice[start..start + k].to_vec());
-                }
-                idx_cpu
-            } else {
-                // Fallback: no routing stream or pinned buffer — sync path
-                let idx = top_k_indices.to_vec2::<u32>()?;
-                self.cache.record_profile("fwd_routing", t);
-
-                // Still send hint even on sync path
-                let prev_experts = self.cache.get_prev_layer_experts();
-                if !prev_experts.is_empty() {
-                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                }
-                idx
-            }
-        } else {
-            let idx = top_k_indices.to_vec2::<u32>()?;
-            self.cache.record_profile("fwd_routing", t);
-            idx
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let idx_cpu: Vec<Vec<u32>> = {
-            let idx = top_k_indices.to_vec2::<u32>()?;
-            self.cache.record_profile("fwd_routing", t);
-            idx
-        };
+        // Routing readback: the streaming expert cache needs host-visible expert ids to schedule
+        // its pinned→VRAM uploads, so pull the top-k indices to the CPU. A routing-stream /
+        // pinned-buffer ASYNC DtoH lived here and was REMOVED — it regressed the batched decode
+        // path without helping (measured −8% on DeepSeek cfg8; the per-layer routing readback is a
+        // genuine GPU-catch-up dependency, not a hideable command-buffer flush). The Markov
+        // prefetch hint still fires so the pipeline thread can start predicted-expert DMA while the
+        // readback drains.
+        let idx_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2::<u32>()?;
+        self.cache.record_profile("fwd_routing", t);
+        let prev_experts = self.cache.get_prev_layer_experts();
+        if !prev_experts.is_empty() {
+            self.cache.send_hint(self.moe_layer_idx, prev_experts);
+        }
 
         Ok((weights_flat, idx_cpu))
     }

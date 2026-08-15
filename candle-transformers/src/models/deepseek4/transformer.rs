@@ -67,6 +67,36 @@ impl Block {
         self.hc.post(&x, residual, &post, &comb)
     }
 
+    /// DSpark backbone block (`graph_dsv4`): identical to [`Self::forward`] except the attention
+    /// is the **non-causal injected-context** variant — the draft block attends over
+    /// `[wkv(ctx) ‖ wkv(x)]` (`ctx` = the encoder's `Hctx`), with `ctx_start`/`q_start` the
+    /// absolute RoPE positions. Everything else (mHC pre/post, norms, MoE) is unchanged.
+    pub fn forward_injected(
+        &self,
+        h: &Tensor,
+        ctx: &Tensor,
+        input_ids: &Tensor,
+        rope: &RotaryCache,
+        ctx_start: usize,
+        q_start: usize,
+    ) -> Result<Tensor> {
+        // Attention sub-block (mHC pre → norm → injected non-causal attention → mHC post).
+        let residual = h;
+        let (x, post, comb) = self.hc.pre(h, &self.hc_attn)?;
+        let x = rms_norm(&x, &self.attn_norm, self.eps)?;
+        let x = self
+            .attn
+            .forward_injected(&x, ctx, rope, ctx_start, q_start)?;
+        let h = self.hc.post(&x, residual, &post, &comb)?;
+
+        // MoE sub-block (per-token, identical to prefill).
+        let residual = &h;
+        let (x, post, comb) = self.hc.pre(&h, &self.hc_ffn)?;
+        let x = rms_norm(&x, &self.ffn_norm, self.eps)?;
+        let x = self.moe.forward(&x, input_ids)?;
+        self.hc.post(&x, residual, &post, &comb)
+    }
+
     /// Build the incremental (decode) form of this block: the mHC mix, norms, and MoE are all
     /// per-token stateless, so only the attention needs streaming KV state (see
     /// [`super::attention::IncrementalAttention`]).
@@ -245,7 +275,7 @@ impl IncrementalTransformer<'_> {
 }
 
 /// RMSNorm with a learned weight.
-fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
     let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = x.broadcast_div(&(ms + eps)?.sqrt()?)?;

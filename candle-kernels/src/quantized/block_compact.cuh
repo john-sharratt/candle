@@ -917,6 +917,25 @@ typedef struct __align__(16) {
 } block_c_q8_KO_k128;
 static_assert(sizeof(block_c_q8_KO_k128) == 128, "block_c_q8_KO_k128 must be 128 bytes (quant only; scales separate)");
 
+// Q2_KO K/128: the smallest KO twin. One row's 128 values × 2-bit = 32 B (quant only; the
+// per-128 (scale,min) rides the k1024 chunk's `dm`). Byte layout mirrors Q6_KO's 2-bit crumb
+// region — for `(lane q3, sub)` the uint16 at `q3*8 + sub*2` is `{cr0, cr1}`, where `cr0`
+// packs the 4 LOW-half values (K = q3*4 + {0..3}) at bit positions 0,2,4,6 and `cr1` the 4
+// HIGH-half values (K = q3*4 + 16 + {0..3}) — but here the crumb IS the whole value (0..3), not
+// Q6's high-2-bits. Byte-identical to CPU `quantize_q2_ko`. int2 LDS at `lane*8` pulls all 4
+// subs' crumb uint16s.
+typedef struct __align__(16) {
+    int qs[8];   // 0-31: 4 subs × {cr0,cr1} uint16, at (q3-local) sub*2
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 2; i++) d[i] = s[i];
+    }
+} block_c_q2_KO_k128;
+static_assert(sizeof(block_c_q2_KO_k128) == 32, "block_c_q2_KO_k128 must be 32 bytes (quant only; scales separate)");
+
 // =============================================================================
 // KO K/1024 CHUNK BLOCKS — the strongly-typed unit the int8 (q8a128) path streams.
 // =============================================================================
@@ -939,6 +958,7 @@ typedef block_c_KO_k1024<block_c_q4_KO_k128> block_c_q4_KO_k1024;
 typedef block_c_KO_k1024<block_c_q5_KO_k128> block_c_q5_KO_k1024;
 typedef block_c_KO_k1024<block_c_q6_KO_k128> block_c_q6_KO_k1024;
 typedef block_c_KO_k1024<block_c_q8_KO_k128> block_c_q8_KO_k1024;
+typedef block_c_KO_k1024<block_c_q2_KO_k128> block_c_q2_KO_k1024;
 
 // MXFP4_KO K/1024 chunk — the native-MXFP4 exponent-collapse int8 format. The 512 B quant
 // region is the SAME lane-major layout as block_c_q4_KO_k1024 (byte for (lane, sub, i) at
@@ -964,6 +984,7 @@ template <> struct int8_chunk_bytes<block_c_q4_KO_k1024> { static constexpr int 
 template <> struct int8_chunk_bytes<block_c_q5_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q5_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q6_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q6_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_q8_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q8_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_q2_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q2_KO_k1024); };
 template <> struct int8_chunk_bytes<block_c_mxfp4_k1024> { static constexpr int value = (int)sizeof(block_c_mxfp4_k1024); };
 
 // =============================================================================
@@ -1124,6 +1145,14 @@ struct gemx_tile_traits<block_c_q8_KO_k128> {
     static constexpr int stride = 144;            // 128 quant + 16 scale (old 16B pad removed)
     static constexpr int elements_per_tile = 128;
     static constexpr int bits_per_element = 8;
+    static constexpr int scales_per_ktile = 4;
+};
+template<>
+struct gemx_tile_traits<block_c_q2_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 48;             // 32 quant + 16 scale
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 2;
     static constexpr int scales_per_ktile = 4;
 };
 
@@ -1289,7 +1318,12 @@ enum QType {
     // single int32 (see loader/mxfp4.cuh). Stays 4-bit in storage. First slot past Q8_KO.
     QTYPE_MXFP4_KO = 50,
 
-    QTYPE_COUNT   = 51
+    // Lane-major per-128 affine KO twin at 2-bit (value 0..3). Smallest KO weight: 32 B of
+    // quants per 128-K (vs Q4_KO's 64 B) — the 2-bit crumb region Q6_KO already carries, used
+    // here as the whole value. Read by the maintained per-128 int8 fold. First slot past MXFP4_KO.
+    QTYPE_Q2_KO  = 51,
+
+    QTYPE_COUNT   = 52
 };
 
 // =============================================================================
@@ -1343,7 +1377,8 @@ static_assert(QTYPE_Q6_KO   == 47, "QTYPE_Q6_KO must be 47");
 static_assert(QTYPE_Q8_KO   == 48, "QTYPE_Q8_KO must be 48");
 static_assert(QTYPE_MXFP4    == 49, "QTYPE_MXFP4 must be 49 to match GgmlDType::MXFP4");
 static_assert(QTYPE_MXFP4_KO == 50, "QTYPE_MXFP4_KO must be 50");
-static_assert(QTYPE_COUNT   == 51, "QTYPE_COUNT must be 51");
+static_assert(QTYPE_Q2_KO   == 51, "QTYPE_Q2_KO must be 51");
+static_assert(QTYPE_COUNT   == 52, "QTYPE_COUNT must be 52");
 
 // =============================================================================
 // QType -> matmul kernel index
@@ -1381,6 +1416,7 @@ __host__ __device__ inline int qtype_to_matmul_kernel_index(int qtype) {
         case QTYPE_Q6_KO:    return 16;
         case QTYPE_Q8_KO:    return 17;
         case QTYPE_MXFP4_KO: return 18;
+        case QTYPE_Q2_KO:    return 19;
         default:             return -1;
     }
 }
@@ -1462,6 +1498,7 @@ __host__ __device__ inline int qtype_output_block_size(int qtype) {
         case QTYPE_Q6_KO:    return gemx_tile_traits<block_c_q6_KO_k128>::stride;
         case QTYPE_Q8_KO:    return gemx_tile_traits<block_c_q8_KO_k128>::stride;
         case QTYPE_MXFP4_KO: return gemx_tile_traits<block_c_mxfp4_k128>::stride;
+        case QTYPE_Q2_KO:    return gemx_tile_traits<block_c_q2_KO_k128>::stride;
         default:             return -1;   // Unsupported by GEMX output layout
     }
 }
@@ -1500,6 +1537,7 @@ typedef block_c_q5_KO_k128 block_c_q5_KO;
 typedef block_c_q6_K_k128 block_c_q6_K;
 typedef block_c_q6_KO_k128 block_c_q6_KO;
 typedef block_c_q8_KO_k128 block_c_q8_KO;
+typedef block_c_q2_KO_k128 block_c_q2_KO;
 typedef block_c_mxfp4_k128 block_c_mxfp4;
 typedef block_c_q8_K_k128 block_c_q8_K;
 

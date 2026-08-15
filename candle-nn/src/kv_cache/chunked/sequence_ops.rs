@@ -2085,6 +2085,14 @@ impl ChunkedKvBacking {
         if n == 0 {
             return Ok(());
         }
+        // `target_tokens` is ABSOLUTE (the session offset space); chunk usages
+        // are RESIDENT (the sliding-window ring drops `base_pos` front tokens).
+        // Translate, or a truncate on a slid ring silently no-ops (`resident
+        // total <= absolute target` is always true once the ring has slid) —
+        // the speculative rollback then leaves rejected draft rows committed
+        // and the arena length drifts ahead of the true content every partial
+        // accept. Zero until the first slide, so unslid rings are unchanged.
+        let target_tokens = target_tokens.saturating_sub(slot.base_pos() as usize);
         let total: usize = slot.chunks_slice().iter().map(|c| c.usage as usize).sum();
         if total <= target_tokens {
             return Ok(());

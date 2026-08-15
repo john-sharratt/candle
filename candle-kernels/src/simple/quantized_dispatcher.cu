@@ -303,6 +303,7 @@ extern "C" void run_quantize_ko(
         case QTYPE_Q5_KO: quantize_ko_affine_kernel<31, 0, 128><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
         case QTYPE_Q6_KO: quantize_ko_affine_kernel<63, 256, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
         case QTYPE_Q8_KO: quantize_q8_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q2_KO: quantize_q2_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
     }
 }
 
@@ -319,6 +320,7 @@ extern "C" void run_dequantize_ko(
         case QTYPE_Q5_KO: dequantize_ko_affine_kernel<0, 128><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
         case QTYPE_Q6_KO: dequantize_ko_affine_kernel<256, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
         case QTYPE_Q8_KO: dequantize_q8_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q2_KO: dequantize_q2_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
     }
 }
 

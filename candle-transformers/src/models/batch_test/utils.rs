@@ -76,6 +76,12 @@ pub struct TestParams {
     /// table records which numeric mode produced it. Defaults to `Off`; set via
     /// [`Self::with_int8mode`].
     pub int8mode: Int8Mode,
+    /// When `Some(k)`, the generate phase uses lossless speculative decoding via
+    /// [`ManagedBatchedModel::speculative_decode_step`] with a draft budget of `k`, instead of
+    /// the one-token-per-step batched loop. Model-agnostic: a model with no drafter degrades to
+    /// plain decode, so the output (and validation) is unchanged; a model with a drafter produces
+    /// the same tokens faster. Defaults to `None` (classic batched decode).
+    pub speculative_max_draft: Option<usize>,
 }
 
 impl TestParams {
@@ -118,7 +124,14 @@ impl TestParams {
             begin_document_token,
             timeout_secs: 120,
             int8mode: Int8Mode::Off,
+            speculative_max_draft: None,
         })
+    }
+
+    /// Enable lossless speculative decoding in the generate phase with a draft budget of `k`.
+    pub fn with_speculative(mut self, max_draft: usize) -> Self {
+        self.speculative_max_draft = Some(max_draft);
+        self
     }
 
     /// Set the inference [`Int8Mode`] shown in the comparison table's `int8` column.
@@ -814,27 +827,41 @@ impl TestParams {
             !self.stop_on_eos.is_empty() && toks.iter().all(|t| self.stop_on_eos.contains(t))
         };
 
-        // Warmup step (step 0)
-        let mut stopped = false;
-        if remaining_steps > 0 {
-            let toks =
-                self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
-            self.device.synchronize()?;
-            remaining_steps -= 1;
-            stopped = all_stopped(&toks);
-        }
-
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
         let mut steps_run = 0usize;
-        if !stopped {
-            for _step_num in 0..remaining_steps {
+        if let Some(max_draft) = self.speculative_max_draft {
+            // Lossless speculative decode (model-agnostic), per session.
+            steps_run = self.speculative_decode_phase(
+                &mut session,
+                &sequence_indices,
+                &mut runs,
+                model,
+                max_draft,
+            )?;
+        } else {
+            // Warmup step (step 0)
+            let mut stopped = false;
+            if remaining_steps > 0 {
                 let toks =
                     self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
-                steps_run += 1;
-                if all_stopped(&toks) {
-                    break;
+                self.device.synchronize()?;
+                remaining_steps -= 1;
+                stopped = all_stopped(&toks);
+            }
+            if !stopped {
+                for _step_num in 0..remaining_steps {
+                    let toks = self.decode_step_batched(
+                        &mut session,
+                        &sequence_indices,
+                        &mut runs,
+                        model,
+                    )?;
+                    steps_run += 1;
+                    if all_stopped(&toks) {
+                        break;
+                    }
                 }
             }
         }
@@ -992,6 +1019,76 @@ impl TestParams {
             generate_total_ms: 0.0,
             total_time_ms: 0.0,
         }
+    }
+
+    /// Lossless speculative-decode generate phase (model-agnostic): decode ALL sessions together
+    /// via the generic [`ManagedBatchedModel::speculative_decode_step_batch`] driver — every
+    /// active session drafts a block, every block verifies in ONE call (a single wave when the
+    /// model overrides `verify_blocks`), and each session accepts/rolls back independently. Fills
+    /// each `runs[i].output` with the model's exact greedy continuation, so validation is
+    /// identical to the batched loop — a model with no drafter degrades to plain decode. Sessions
+    /// drop out of the cohort as they hit EOS/budget. Returns a nominal step count for the perf
+    /// table.
+    fn speculative_decode_phase<M>(
+        &self,
+        session: &mut BatchedInferenceSession,
+        sequence_indices: &[usize],
+        runs: &mut [TestRun],
+        model: &M,
+        max_draft: usize,
+    ) -> Result<usize>
+    where
+        M: ManagedBatchedModel,
+    {
+        let nl = model.num_layers();
+        let max_tokens = self.generate_token_count;
+        let stop_on = &self.stop_on_eos;
+        // First generated token per session = argmax of its prefill logits, held
+        // OUT of the KV as the driver's `committed` seed.
+        let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
+        let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
+        for run in runs.iter_mut() {
+            let c = run.logits.squeeze(0)?.argmax(0)?.to_scalar::<u32>()?;
+            run.output.push(c);
+            committed.push(c);
+            active.push(run.output.len() < max_tokens && !stop_on.contains(&c));
+        }
+        loop {
+            let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
+            if idxs.is_empty() {
+                break;
+            }
+            let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
+            let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
+            // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
+            // into its own output and applies the budget/EOS policy — the exact
+            // per-token loop plain decode uses.
+            let mut emits: Vec<Box<dyn FnMut(u32) -> bool + '_>> = runs
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| active[*i])
+                .map(|(_, run)| {
+                    let out = &mut run.output;
+                    Box::new(move |t: u32| {
+                        out.push(t);
+                        out.len() < max_tokens && !stop_on.contains(&t)
+                    }) as Box<dyn FnMut(u32) -> bool>
+                })
+                .collect();
+            let next = model
+                .speculative_decode_step_batch(session, &seqs, &comms, max_draft, nl, &mut emits)?;
+            drop(emits);
+            for (k, &i) in idxs.iter().enumerate() {
+                // `Some(c)` ⇒ the sink accepted `c` under budget/EOS policy (it
+                // is already emitted and becomes the next seed); `None` ⇒ the
+                // sink stopped this session.
+                match next[k] {
+                    Some(c) => committed[i] = c,
+                    None => active[i] = false,
+                }
+            }
+        }
+        Ok(max_tokens)
     }
 
     /// Decode step for batched mode

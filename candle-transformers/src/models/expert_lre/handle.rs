@@ -30,8 +30,8 @@ use super::types::{
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
-    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128, moe_bucketize,
-    moe_route, silu_mul_q8a128, Q8a128Operand, GROUPED_GEMM_TILE_W,
+    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
+    moe_bucketize, moe_route, silu_mul_q8a128, Q8a128Operand, GROUPED_GEMM_TILE_W,
 };
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -84,15 +84,6 @@ pub struct ExpertCache {
     mode: PipelineMode,
     /// True when all experts fit in VRAM — hint sending is elided.
     all_resident: bool,
-    /// Dedicated CUDA stream for async routing index DtoH.
-    /// Lives on the forward thread — never crosses to the pipeline thread.
-    #[cfg(feature = "cuda")]
-    routing_stream: Option<Arc<CudaStream>>,
-    /// Pinned host buffer for routing indices: `[max_tokens × k]` u32.
-    /// Allocated via `cuMemAllocHost` — truly async DtoH destination.
-    /// Reused every MoE layer (only one is active at a time).
-    #[cfg(feature = "cuda")]
-    routing_pinned: Option<PinnedRoutingBuffer>,
     /// Static GPU-native dispatch tables (all-resident cache only): per-expert
     /// weight pointers indexed on-device by `moe_bucketize`'s tile tables, so
     /// the expert forward needs no routing readback. `None` ⇒ host path.
@@ -115,53 +106,6 @@ pub struct ExpertCache {
     #[cfg(feature = "profile")]
     forward_profile: Mutex<ProfileAccumulator>,
 }
-
-/// Pinned host buffer for routing indices (async DtoH destination).
-#[cfg(feature = "cuda")]
-struct PinnedRoutingBuffer {
-    /// Raw pointer from `cuMemAllocHost`.
-    ptr: *mut u32,
-    /// Capacity in u32 elements.
-    capacity: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl PinnedRoutingBuffer {
-    /// Allocate a pinned buffer for `capacity` u32 elements.
-    fn new(capacity: usize) -> Result<Self> {
-        let byte_size = capacity * std::mem::size_of::<u32>();
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, byte_size) };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            candle::bail!(
-                "cuMemAllocHost for routing buffer failed: {:?} ({} bytes)",
-                result,
-                byte_size,
-            );
-        }
-        Ok(Self {
-            ptr: ptr as *mut u32,
-            capacity,
-        })
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for PinnedRoutingBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
-            }
-        }
-    }
-}
-
-// SAFETY: The pinned memory is GPU-accessible and not tied to a thread.
-#[cfg(feature = "cuda")]
-unsafe impl Send for PinnedRoutingBuffer {}
-#[cfg(feature = "cuda")]
-unsafe impl Sync for PinnedRoutingBuffer {}
 
 impl ExpertCache {
     /// Create a new expert cache with a background pipeline thread.
@@ -202,41 +146,6 @@ impl ExpertCache {
             }
         } else {
             None
-        };
-
-        // ── CUDA routing stream + pinned buffer (forward thread) ──
-        #[cfg(feature = "cuda")]
-        let (routing_stream, routing_pinned): (
-            Option<Arc<CudaStream>>,
-            Option<PinnedRoutingBuffer>,
-        ) = if let Device::Cuda(cuda_dev) = device {
-            let stream = match cuda_dev.cuda_context().new_stream() {
-                Ok(s) => {
-                    tracing::info!("Expert cache: created routing stream for async DtoH");
-                    Some(s)
-                }
-                Err(e) => {
-                    tracing::warn!("Expert cache: failed to create routing stream: {e}");
-                    None
-                }
-            };
-            // 1024 tokens × 8 experts = 8192 u32 elements = 32 KB
-            let buf = match PinnedRoutingBuffer::new(1024 * experts_per_layer) {
-                Ok(b) => {
-                    tracing::info!(
-                        "Expert cache: allocated {} KB pinned routing buffer",
-                        (1024 * experts_per_layer * 4) / 1024,
-                    );
-                    Some(b)
-                }
-                Err(e) => {
-                    tracing::warn!("Expert cache: failed to allocate pinned routing buffer: {e}");
-                    None
-                }
-            };
-            (stream, buf)
-        } else {
-            (None, None)
         };
 
         let transition_matrix = TransitionMatrix::new(num_moe_layers, experts_per_layer);
@@ -309,6 +218,11 @@ impl ExpertCache {
                 let num_pinned = if all_resident {
                     0
                 } else {
+                    // Free pinned slots the drip / end-of-pass demotion moves VRAM experts into.
+                    // Under CUDA there is NO mmap reload path (the pinned pool is the only warm
+                    // tier — see `PipelineState`), so an eviction that finds the pool full loses the
+                    // expert and corrupts its location; this headroom is the invariant that keeps
+                    // the pool from ever running out. Do NOT shrink it to save pinned RAM.
                     let eviction_headroom = num_slots / 10; // 10% of VRAM slots
                     total_experts.saturating_sub(num_slots) + eviction_headroom
                 };
@@ -450,10 +364,6 @@ impl ExpertCache {
             mode: PipelineMode::Threaded { tx },
             all_resident,
             #[cfg(feature = "cuda")]
-            routing_stream,
-            #[cfg(feature = "cuda")]
-            routing_pinned,
-            #[cfg(feature = "cuda")]
             gpu_dispatch,
             pipeline_dead,
             prev_layer_experts: Mutex::new(Vec::new()),
@@ -502,10 +412,6 @@ impl ExpertCache {
                 device: device.clone(),
             },
             all_resident: true, // prepopulated = all in VRAM
-            #[cfg(feature = "cuda")]
-            routing_stream: None,
-            #[cfg(feature = "cuda")]
-            routing_pinned: None,
             #[cfg(feature = "cuda")]
             gpu_dispatch,
             pipeline_dead: Arc::new(AtomicBool::new(false)),
@@ -809,12 +715,6 @@ impl ExpertCache {
         }
     }
 
-    /// Get the routing stream for async DtoH (if available).
-    #[cfg(feature = "cuda")]
-    pub fn routing_stream(&self) -> Option<&Arc<CudaStream>> {
-        self.routing_stream.as_ref()
-    }
-
     /// The static GPU-native dispatch tables, when this cache is all-resident
     /// and they were successfully built at construction. `Some` ⇒ the expert
     /// forward can run entirely on-device (no routing readback).
@@ -984,26 +884,6 @@ impl ExpertCache {
         )?;
         self.record_profile("fwd_expert_gpu", t);
         Ok(Some(ys))
-    }
-
-    /// Get mutable access to the pinned routing buffer.
-    ///
-    /// Returns `(buffer_ptr_as_mut_slice, capacity)` if available.
-    /// The caller must ensure no concurrent DMA is in flight.
-    #[cfg(feature = "cuda")]
-    // Deliberate interior mutability over a raw pinned host buffer (the cache
-    // is behind `Arc`); exclusivity is a documented caller obligation.
-    #[allow(clippy::mut_from_ref)]
-    pub fn routing_pinned_mut(&self, len: usize) -> Option<&mut [u32]> {
-        // SAFETY: We're the only thread accessing the routing buffer
-        // (it lives on the forward thread), and the caller ensures
-        // DMA has completed before reading.  We use interior mutability
-        // via raw pointer since ExpertCache is behind Arc.
-        let pinned = self.routing_pinned.as_ref()?;
-        if len > pinned.capacity {
-            return None;
-        }
-        Some(unsafe { std::slice::from_raw_parts_mut(pinned.ptr, len) })
     }
 
     /// Store the expert IDs from the most recently completed MoE layer.

@@ -68,6 +68,10 @@ pub enum QType {
     // int32). Stays 4-bit. Value 50 mirrors QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul
     // kernel, so it is intentionally absent from this kernel-only enum.
     MXFP4_KO = 50,
+    /// Lane-major per-128 affine KO twin at 2-bit — the smallest KO weight (value 0..3, stored
+    /// as the 2-bit crumb region Q6_KO carries, used as the whole value). Value 51 mirrors
+    /// QTYPE_Q2_KO. Read by the maintained per-128 int8 fold; GPU-only.
+    Q2_KO = 51,
 }
 
 /// Y vector type enum (matches dispatcher ytype parameter).

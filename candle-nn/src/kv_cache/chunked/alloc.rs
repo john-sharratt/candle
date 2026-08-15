@@ -42,14 +42,13 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 /// that fit fine in VRAM with no spill. A fixed headroom matches what the
 /// forward pass actually needs.
 ///
-/// Scales with the card (`total / 12`, floored at 384 MiB); override with
-/// `CANDLE_KV_VRAM_RESERVE_MB`.
+/// Scales with the card (`total / 12`, floored at 384 MiB) unless an engine has
+/// installed its measured budget via [`set_vram_reserve_bytes`].
 #[cfg(feature = "cuda")]
 fn vram_reserve_bytes(total: usize) -> usize {
-    if let Ok(v) = std::env::var("CANDLE_KV_VRAM_RESERVE_MB") {
-        if let Ok(mb) = v.trim().parse::<usize>() {
-            return mb.saturating_mul(1024 * 1024);
-        }
+    let installed = VRAM_RESERVE_BYTES.load(Ordering::Relaxed);
+    if installed != 0 {
+        return installed as usize;
     }
     // Serves two roles: headroom for the forward pass's transient activations in
     // our own accounting, AND the hard floor of *current* driver-free VRAM we
@@ -67,10 +66,28 @@ fn vram_reserve_bytes(total: usize) -> usize {
     // on big cards), so scale the reserve with `total`: `total / 12` is 6 GiB on a
     // 72 GiB card, 2.7 GiB on 32 GiB, ~1.3 GiB on a 16 GiB card — enough contiguous
     // driver-free that the wide prefill activations (and any decode alloc) stay
-    // resident. Floored at 384 MiB for tiny cards; raise via the env var if a
-    // workload's activations still spill (it caps the hot-KV budget in exchange,
-    // which the ingest's evict-to-cold absorbs).
+    // resident. Floored at 384 MiB for tiny cards; an engine whose residents
+    // change that arithmetic installs its measured budget via
+    // `set_vram_reserve_bytes` instead.
     (total / 12).max(384 * 1024 * 1024)
+}
+
+/// Engine-installed VRAM reserve (bytes). `0` = not installed → the
+/// card-scaled default above. See [`set_vram_reserve_bytes`].
+#[cfg(feature = "cuda")]
+static VRAM_RESERVE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Install the KV VRAM reserve from the ENGINE's own memory accounting instead
+/// of the card-scaled default. The default (`total / 12`) assumes the card is
+/// mostly KV territory; an engine whose resident weights (and optional drafter)
+/// already claim the card knows the true activation/KV split and must size the
+/// reserve from the VRAM that actually remains — a 6 GiB reserve on a card with
+/// 1 GiB free refuses every arena, while 6 GiB on an empty 72 GiB card is
+/// correct. Called at model construction (and again after late residents load);
+/// `0` restores the default. Process-wide, like the pool it guards.
+#[cfg(feature = "cuda")]
+pub fn set_vram_reserve_bytes(bytes: usize) {
+    VRAM_RESERVE_BYTES.store(bytes as u64, Ordering::Relaxed);
 }
 
 /// Extra VRAM headroom kept free ON TOP of [`vram_reserve_bytes`] that ONLY a

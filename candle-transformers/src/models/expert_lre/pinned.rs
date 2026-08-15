@@ -88,11 +88,14 @@ pub(crate) enum ExpertLocation {
 /// No interior mutability or atomic operations.
 #[cfg(feature = "cuda")]
 pub(crate) struct PinnedPool {
-    /// Base pointer from `cuMemAllocHost`.
-    base: *mut u8,
-    /// Total allocation size in bytes.
-    #[allow(dead_code)]
-    total_size: usize,
+    /// One `cuMemAllocHost` block per chunk. The pool is split into ≤ [`Self::CHUNK_BYTES`] blocks
+    /// because a single ~100+ GB `cuMemAllocHost` OOMs under WDDM even with far more host RAM free
+    /// (a per-allocation ceiling, not a total-memory one) — chunking lets the warm tier use the
+    /// machine's real RAM (e.g. a 145 GB expert overflow on a 194 GB box).
+    chunks: Vec<*mut u8>,
+    /// Slots per chunk (uniform; the last chunk may hold fewer). `slot_idx → (idx / slots_per_chunk,
+    /// idx % slots_per_chunk)` addresses the block + offset.
+    slots_per_chunk: usize,
     /// Per-slot byte size (uniform, = max repacked expert size across layers).
     slot_size: usize,
     /// Number of slots.
@@ -103,49 +106,89 @@ pub(crate) struct PinnedPool {
 
 #[cfg(feature = "cuda")]
 impl PinnedPool {
-    /// Allocate a pinned memory pool with `num_slots` × `slot_size` bytes.
+    /// Max bytes per `cuMemAllocHost` block. A ~100 GB single allocation OOMs on WDDM even with
+    /// more host RAM free, and the 93.6 GB pool that used to work sat right below that wall, so cap
+    /// each block at 32 GiB — many small blocks reach the machine's full RAM.
+    const CHUNK_BYTES: usize = 32usize << 30;
+
+    /// Allocate a pinned memory pool with `num_slots` × `slot_size` bytes, split across
+    /// [`Self::CHUNK_BYTES`] `cuMemAllocHost` blocks.
     ///
-    /// Uses `cuMemAllocHost` to physically lock the pages, enabling the
-    /// GPU DMA engine to access them without OS page faults.
+    /// Each block physically locks its pages, enabling the GPU DMA engine to access them without OS
+    /// page faults.
     pub(crate) fn new(num_slots: usize, slot_size: usize) -> Result<Self> {
         if num_slots == 0 || slot_size == 0 {
-            return Ok(Self {
-                base: std::ptr::null_mut(),
-                total_size: 0,
-                slot_size,
-                num_slots: 0,
-                free_slots: Vec::new(),
-            });
+            return Ok(Self::empty());
         }
 
-        let total_size = num_slots * slot_size;
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-
-        let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, total_size) };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            candle::bail!(
-                "cuMemAllocHost failed: {:?} (requested {} slots × {} bytes = {:.1} GB)",
-                result,
-                num_slots,
-                slot_size,
-                total_size as f64 / 1e9,
-            );
+        let slots_per_chunk = (Self::CHUNK_BYTES / slot_size).max(1);
+        let n_chunks = num_slots.div_ceil(slots_per_chunk);
+        let mut chunks: Vec<*mut u8> = Vec::with_capacity(n_chunks);
+        let mut allocated = 0usize;
+        for c in 0..n_chunks {
+            let this_slots = (num_slots - c * slots_per_chunk).min(slots_per_chunk);
+            let sz = this_slots * slot_size;
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, sz) };
+            if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                // Free the blocks already taken before bailing.
+                for &p in &chunks {
+                    unsafe {
+                        let _ = cudarc::driver::sys::cuMemFreeHost(p as *mut std::ffi::c_void);
+                    }
+                }
+                candle::bail!(
+                    "cuMemAllocHost failed: {:?} (chunk {}/{}: {} slots × {} bytes = {:.1} GB; \
+                     pool so far {:.1} GB of {} slots)",
+                    result,
+                    c + 1,
+                    n_chunks,
+                    this_slots,
+                    slot_size,
+                    sz as f64 / 1e9,
+                    allocated as f64 / 1e9,
+                    num_slots,
+                );
+            }
+            chunks.push(ptr as *mut u8);
+            allocated += sz;
         }
 
         tracing::info!(
-            "PinnedPool: allocated {:.1} GB pinned RAM ({} slots × {:.1} KB)",
-            total_size as f64 / 1e9,
+            "PinnedPool: allocated {:.1} GB pinned RAM in {} chunk(s) ({} slots × {:.1} KB)",
+            allocated as f64 / 1e9,
+            n_chunks,
             num_slots,
             slot_size as f64 / 1e3,
         );
 
         Ok(Self {
-            base: ptr as *mut u8,
-            total_size,
+            chunks,
+            slots_per_chunk,
             slot_size,
             num_slots,
             free_slots: (0..num_slots).rev().collect(),
         })
+    }
+
+    /// Host pointer to slot `slot_idx`'s bytes, resolving its chunk + offset.
+    #[inline]
+    pub(crate) fn slot_ptr(&self, slot_idx: usize) -> *mut u8 {
+        let c = slot_idx / self.slots_per_chunk;
+        let local = slot_idx % self.slots_per_chunk;
+        unsafe { self.chunks[c].add(local * self.slot_size) }
+    }
+
+    /// Slots per chunk — for the parallel startup fill, which resolves slot pointers itself.
+    #[inline]
+    pub(crate) fn slots_per_chunk(&self) -> usize {
+        self.slots_per_chunk
+    }
+
+    /// Chunk base pointers as `usize` (carried across the parallel fill's threads).
+    #[inline]
+    pub(crate) fn chunk_ptrs(&self) -> Vec<usize> {
+        self.chunks.iter().map(|&p| p as usize).collect()
     }
 
     /// Get a mutable byte slice for a slot.
@@ -155,10 +198,7 @@ impl PinnedPool {
     pub(crate) fn slot_mut(&mut self, slot_idx: usize, len: usize) -> &mut [u8] {
         debug_assert!(slot_idx < self.num_slots);
         debug_assert!(len <= self.slot_size);
-        unsafe {
-            let ptr = self.base.add(slot_idx * self.slot_size);
-            std::slice::from_raw_parts_mut(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.slot_ptr(slot_idx), len) }
     }
 
     /// Get a shared byte slice for a slot.
@@ -166,10 +206,7 @@ impl PinnedPool {
     pub(crate) fn slot_ref(&self, slot_idx: usize, len: usize) -> &[u8] {
         debug_assert!(slot_idx < self.num_slots);
         debug_assert!(len <= self.slot_size);
-        unsafe {
-            let ptr = self.base.add(slot_idx * self.slot_size);
-            std::slice::from_raw_parts(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts(self.slot_ptr(slot_idx), len) }
     }
 
     /// Allocate a free slot.  Returns `None` if the pool is full.
@@ -191,14 +228,6 @@ impl PinnedPool {
         self.num_slots
     }
 
-    /// Raw base pointer + uniform slot size — for filling many disjoint slots
-    /// in parallel at startup (each worker writes `base + slot_idx*slot_size`,
-    /// non-overlapping, so no aliasing). The pointer is carried across threads
-    /// as a `usize`; the pool outlives the parallel fill.
-    #[inline]
-    pub(crate) fn base_ptr(&self) -> *mut u8 {
-        self.base
-    }
     #[inline]
     pub(crate) fn slot_size(&self) -> usize {
         self.slot_size
@@ -209,8 +238,8 @@ impl PinnedPool {
     /// Used when running on a non-CUDA device but the `cuda` feature is enabled.
     pub(crate) fn empty() -> Self {
         Self {
-            base: std::ptr::null_mut(),
-            total_size: 0,
+            chunks: Vec::new(),
+            slots_per_chunk: 1,
             slot_size: 0,
             num_slots: 0,
             free_slots: Vec::new(),
@@ -221,9 +250,8 @@ impl PinnedPool {
 #[cfg(feature = "cuda")]
 impl Drop for PinnedPool {
     fn drop(&mut self) {
-        if !self.base.is_null() {
-            let result =
-                unsafe { cudarc::driver::sys::cuMemFreeHost(self.base as *mut std::ffi::c_void) };
+        for &p in &self.chunks {
+            let result = unsafe { cudarc::driver::sys::cuMemFreeHost(p as *mut std::ffi::c_void) };
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 tracing::warn!("PinnedPool: cuMemFreeHost failed: {:?}", result);
             }
@@ -236,3 +264,63 @@ impl Drop for PinnedPool {
 // owned by the pipeline thread (no shared access).
 #[cfg(feature = "cuda")]
 unsafe impl Send for PinnedPool {}
+
+#[cfg(all(test, feature = "cuda"))]
+mod probe {
+    /// Measure the real per-process pinned (`cuMemAllocHost`) ceiling on this machine: allocate
+    /// 4 GiB blocks until one fails, report the total + the exact error, then confirm the same
+    /// amount of PAGEABLE RAM allocates fine (so the wall is page-locking, not physical RAM). Run:
+    ///   cargo test --release --features cuda -p candle-transformers pinned::probe -- --ignored --nocapture
+    /// Re-run after granting "Lock pages in memory" / switching driver model to see if the ceiling moves.
+    #[test]
+    #[ignore]
+    fn probe_pinned_ceiling() {
+        // A CUDA context must be current for cuMemAllocHost.
+        let _dev = candle::Device::new_cuda(0).expect("cuda device");
+        const CHUNK: usize = 4usize << 30; // 4 GiB
+        let mut blocks: Vec<*mut std::ffi::c_void> = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let r = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, CHUNK) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!(
+                    "[pinned-probe] cuMemAllocHost FAILED at total={:.1} GiB (next +4 GiB): {:?}",
+                    total as f64 / (1u64 << 30) as f64,
+                    r
+                );
+                break;
+            }
+            blocks.push(ptr);
+            total += CHUNK;
+            eprintln!(
+                "[pinned-probe] pinned OK: {:.1} GiB",
+                total as f64 / (1u64 << 30) as f64
+            );
+            if total >= 180usize << 30 {
+                eprintln!("[pinned-probe] reached 180 GiB without failing — stopping");
+                break;
+            }
+        }
+        let pinned_ceiling = total;
+        for p in blocks {
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemFreeHost(p);
+            }
+        }
+        // Now show PAGEABLE RAM well past the pinned ceiling is fine (proves it's page-locking).
+        let pageable_target = pinned_ceiling + (16usize << 30);
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut pg = 0usize;
+        while pg < pageable_target {
+            bufs.push(vec![0u8; CHUNK]); // touch via zero-init so pages are committed
+            pg += CHUNK;
+        }
+        eprintln!(
+            "[pinned-probe] PAGEABLE allocated {:.1} GiB (past the {:.1} GiB pinned ceiling) — the \
+             wall is page-locking, not RAM",
+            pg as f64 / (1u64 << 30) as f64,
+            pinned_ceiling as f64 / (1u64 << 30) as f64,
+        );
+    }
+}

@@ -18,7 +18,8 @@ use candle::{DType, Device, Result, Tensor};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
 };
-use candle_nn::kv_cache::CHUNK_SIZE;
+use candle::quantized::get_vram_info;
+use candle_nn::kv_cache::{set_vram_reserve_bytes, CHUNK_SIZE};
 
 use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
@@ -105,15 +106,129 @@ struct SeqEntry {
     layers: Vec<KernelLayerSeqState>,
 }
 
+/// One layer's slice of a [`VerifySnapshot`]: the pre-verify compressor states +
+/// gallery length, plus the verify block's projected compressor rows (stashed by
+/// `forward_wave` during the verify pass — the replay source for the accepted
+/// prefix).
+struct LayerVerifySnap {
+    comp: Option<super::compressor::CompressorState>,
+    icomp: Option<super::compressor::CompressorState>,
+    gallery_len: usize,
+    /// `(kv, score)` each `[s, cd]` — the block's rows through this layer's
+    /// attention compressor projection.
+    comp_rows: Option<(Tensor, Tensor)>,
+    /// Same for the indexer compressor (CSA layers).
+    icomp_rows: Option<(Tensor, Tensor)>,
+}
+
+/// Rolling speculative-acceptance state for one sequence — the driver-level
+/// cost control. A speculative step only pays when the accepted tokens/step
+/// exceed the verify-wave's cost ratio over a plain decode (≈2.5–3× on this
+/// box: a block's diverse tokens hit the streaming expert cache far harder
+/// than one decode token). The EMA tracks accepted/step over drafted steps;
+/// below [`SPEC_MIN_ACCEPT`] the drafter is skipped (the step becomes a
+/// 1-token verify — plain-decode cost, still lossless) and every
+/// [`SPEC_PROBE_INTERVAL`] skipped steps one drafted probe re-measures, so a
+/// workload shift (story → code) re-enables speculation.
+struct SpecStats {
+    /// EMA of accepted tokens per DRAFTED step. Seeded optimistically so fresh
+    /// sequences speculate until measured otherwise.
+    ema: f32,
+    /// Verify-only steps since the last drafted step (probe scheduling).
+    fallback_steps: u32,
+}
+
+/// EMA smoothing for [`SpecStats::ema`] (≈ last ~8 drafted steps dominate).
+const SPEC_EMA_ALPHA: f32 = 0.25;
+/// Draft only while the acceptance EMA clears this. Below it, a drafted step
+/// loses to plain decode on this box's verify/decode cost ratio.
+const SPEC_MIN_ACCEPT: f32 = 2.0;
+/// Verify-only steps between drafted probes while below the threshold.
+const SPEC_PROBE_INTERVAL: u32 = 8;
+
+/// Pre-verify snapshot of one sequence's streaming corpus state, taken by
+/// `verify_block` before its prefill forward. On a partial accept the driver's
+/// `truncate_sequence` restores it and replays exactly the accepted prefix's
+/// rows, so the compressors/galleries never retain rejected draft tokens —
+/// without this, a rejected tail stays absorbed (wrong rows in the partial-group
+/// buffer, a group pooled over draft tokens in the gallery, `group_idx` advanced)
+/// and the re-decoded positions get absorbed AGAIN as duplicate, shifted groups:
+/// the model re-attends duplicated context and repeats itself.
+struct VerifySnapshot {
+    /// Absolute position of the block's first token (`q_start`).
+    base: usize,
+    /// The verify block's length (`[committed, drafts…]`).
+    block_len: usize,
+    layers: Vec<LayerVerifySnap>,
+}
+
 /// DeepSeek's batched wave model. See the module docs.
 pub struct DeepSeekBatched {
     engine: Dsv4Engine,
     layer_static: Vec<KernelLayerStatic>,
     seq_state: RwLock<HashMap<usize, SeqEntry>>,
+    /// Optional DSpark speculative-decode drafter (loaded via [`Self::with_drafter`]). When
+    /// present, `speculative_draft` proposes a block per decode step; absent → plain decode.
+    /// Behind a `Mutex` because the streaming expert cache mutates its LRU residency each draft,
+    /// while the `ManagedBatchedModel` hooks are all `&self` (the model is immutable during decode).
+    drafter: Option<std::sync::Mutex<super::dspark::DsparkDrafter>>,
+    /// Per-sequence target-feature stash keyed by ABSOLUTE token position: `seq → (pos → Hctx
+    /// source)`. `forward_wave` records the concatenated target-layer hidden for every scored row at
+    /// its absolute position; `speculative_draft` reads the feature at `q_start-1` — the position
+    /// whose hidden predicted the token the drafter is about to extend. (Keying by seq alone and
+    /// overwriting to the last scored row misaligns the feature by the block length after a
+    /// partial-accept verify, which conditions the draft on a future/rejected position.)
+    target_feat: RwLock<HashMap<usize, HashMap<usize, Tensor>>>,
+    /// Set transiently by `verify_blocks` to the sequences whose prefill rows should ALL be
+    /// scored (not just the last), so one forward over the `[committed, drafts…]` blocks yields
+    /// the per-position next-token logits the speculative driver needs. Cleared immediately after
+    /// the forward. Empty outside a batched verify (normal prefill scores only its last row —
+    /// scoring every prompt row would materialise a ~1 GB discarded logits tensor).
+    verify_all_rows: RwLock<Vec<usize>>,
+    /// Per-sequence pre-verify corpus-state snapshot (see [`VerifySnapshot`]): inserted by
+    /// `verify_block` before its forward (which also stashes the block's projected compressor
+    /// rows into it, per layer), consumed by `truncate_sequence` — full accept discards it,
+    /// partial accept restores + replays the accepted prefix.
+    verify_snap: RwLock<HashMap<usize, VerifySnapshot>>,
+    /// Per-sequence rolling speculative-acceptance stats (see [`SpecStats`]): updated by
+    /// `rollback_verify_state` after every DRAFTED step, read by `speculative_draft` to fall
+    /// back to verify-only (plain-decode-cost) steps while acceptance is below the economic
+    /// threshold, with periodic probe steps so a workload shift re-enables drafting.
+    spec_stats: RwLock<HashMap<usize, SpecStats>>,
+    /// The target-model layer indices (0-based) whose per-token hidden states condition the DSpark
+    /// drafter (paper Eq. 2, `dflash.target_layers`). Empty when no drafter is attached. When set,
+    /// `forward_wave` captures `head_reduce(h)` at each of these layers and stashes their
+    /// concatenation as each scored sequence's `target_feat` — the faithful `Hctx` source (vs a
+    /// single final hidden replicated, which starves the drafter of layer diversity → low acceptance).
+    target_layers: Vec<usize>,
 }
 
 impl DeepSeekBatched {
+    /// Install the KV VRAM reserve from MEASURED post-resident free VRAM. The
+    /// card-scaled default (`total/12` ≈ 6 GiB here) assumes the card is mostly
+    /// KV territory; this engine's residents claim nearly all of it (57 GB
+    /// expert pool + 6.6 GB base, plus ~5.5 GB drafter when speculative decode
+    /// is enabled — the expert pool cannot shrink to compensate, its pinned
+    /// remainder already rides the page-lock ceiling), so the reserve must be
+    /// carved from what actually remains: a sixth of free for the wave's
+    /// transient activations (floored well above the biggest single transient),
+    /// the rest is the KV budget. Called at construction and again after the
+    /// drafter loads (`with_drafter`), so the reserve always reflects the
+    /// current residents.
+    fn install_kv_vram_reserve(_engine: &Dsv4Engine) -> Result<()> {
+        let (free, _total) = get_vram_info()?;
+        let reserve = (free / 6).clamp(96 << 20, 4 << 30);
+        set_vram_reserve_bytes(reserve);
+        eprintln!(
+            "[mem] kv vram reserve = {} MiB (from {} MiB post-resident free)",
+            reserve >> 20,
+            free >> 20
+        );
+        Ok(())
+    }
+
     pub fn new(engine: Dsv4Engine) -> Result<Self> {
+        Self::install_kv_vram_reserve(&engine)?;
         let cfg = engine.cfg();
         let mut layer_static = Vec::with_capacity(cfg.n_layers);
         let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(
@@ -136,7 +251,47 @@ impl DeepSeekBatched {
             engine,
             layer_static,
             seq_state: RwLock::new(HashMap::new()),
+            drafter: None,
+            target_feat: RwLock::new(HashMap::new()),
+            verify_all_rows: RwLock::new(Vec::new()),
+            verify_snap: RwLock::new(HashMap::new()),
+            spec_stats: RwLock::new(HashMap::new()),
+            target_layers: Vec::new(),
         })
+    }
+
+    /// Attach a pre-loaded DSpark drafter, enabling speculative decode through the generic
+    /// `ManagedBatchedModel` hook. The drafter shares the target's embedding + LM head (borrowed at
+    /// draft time).
+    ///
+    /// **Load order matters.** The drafter's int8 backbone (attention + norms + router + shared) is
+    /// GPU-resident (~1 GB); its 3×256 routed experts live in host RAM and stream into a small VRAM
+    /// slot set on demand ([`super::dspark_experts::DsparkStreamingMoe`], VRAM-adaptive count). The
+    /// target engine sizes its expert pool greedily to *all* free VRAM (spilling the remainder to
+    /// the pinned pool), so the engine must be loaded **first**; the drafter then loads into the
+    /// engine's activation headroom (shared with target KV/activations), leaving the target's expert
+    /// pool — and its pinned remainder — at the baseline that fits the page-lock ceiling. On a
+    /// device below the smallest slot tier (≤ 24 GiB) the drafter's `load` already errored, so this
+    /// is never reached and speculative stays disabled.
+    pub fn with_drafter(mut self, drafter: super::dspark::DsparkDrafter) -> Result<Self> {
+        // `dflash.target_layers` (1-based, [41,42,43] on the 43-layer target) name the three
+        // consecutive target layers whose RAW hidden states condition the drafter (llama.cpp
+        // `dflash.cpp`: the encoder input is `target_layers.size()·n_embd` concatenated raw residual
+        // streams — no norm, no per-layer reduction beyond the model's dim-wide readout). Shift to
+        // 0-based → [40,41,42], the last three layer outputs. `forward_wave` captures `head_reduce(h)`
+        // (our hc_mult→dim readout) after each and stashes the concatenation.
+        let n = self.num_layers();
+        self.target_layers = drafter
+            .cfg
+            .target_layers
+            .iter()
+            .map(|&l| if l >= 1 && l <= n { l - 1 } else { l })
+            .collect();
+        self.drafter = Some(std::sync::Mutex::new(drafter));
+        // The drafter's VRAM residency (backbone + all-resident expert set)
+        // shrank free VRAM — refresh the KV reserve to the new reality.
+        Self::install_kv_vram_reserve(&self.engine)?;
+        Ok(self)
     }
 
     pub fn engine(&self) -> &Dsv4Engine {
@@ -363,6 +518,133 @@ impl DeepSeekBatched {
         Ok(())
     }
 
+    /// Snapshot `seq`'s streaming corpus state ahead of a verify forward (see
+    /// [`VerifySnapshot`]). Cheap: per layer a handful of `Arc` clones + the
+    /// gallery length. No-op when the sequence has no state yet (nothing to
+    /// roll back — `truncate_sequence` then degrades to the KV truncation).
+    fn snapshot_verify_state(&self, seq: usize, base: usize, block_len: usize) -> Result<()> {
+        let map = self
+            .seq_state
+            .read()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        let Some(entry) = map.get(&seq) else {
+            return Ok(());
+        };
+        let layers = entry
+            .layers
+            .iter()
+            .map(|ls| LayerVerifySnap {
+                comp: ls.comp.as_ref().map(|c| c.state_snapshot()),
+                icomp: ls.icomp.as_ref().map(|c| c.state_snapshot()),
+                gallery_len: ls.gallery.as_ref().map_or(0, |g| g.len()),
+                comp_rows: None,
+                icomp_rows: None,
+            })
+            .collect();
+        drop(map);
+        self.verify_snap
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_snap lock poisoned".into()))?
+            .insert(
+                seq,
+                VerifySnapshot {
+                    base,
+                    block_len,
+                    layers,
+                },
+            );
+        Ok(())
+    }
+
+    /// Roll `seq`'s streaming corpus state back to `tokens` total absorbed
+    /// tokens after a speculative verify. Consumes the pre-verify snapshot: a
+    /// full accept (`tokens ≥ base + block_len`) discards it — the absorbed
+    /// block IS the accepted text; a partial accept restores the compressors +
+    /// gallery to the snapshot and replays exactly the accepted prefix's
+    /// stashed rows — bit-identical to having absorbed only those tokens (same
+    /// rows, same state, same pool — `emit_groups_batched_matches_streamed`).
+    fn rollback_verify_state(&self, seq: usize, tokens: usize) -> Result<()> {
+        let Some(snap) = self
+            .verify_snap
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_snap lock poisoned".into()))?
+            .remove(&seq)
+        else {
+            return Ok(());
+        };
+        let accepted = tokens.saturating_sub(snap.base);
+        // Rolling acceptance (DRAFTED steps only — a 1-token verify-only step
+        // says nothing about the drafter): feeds `speculative_draft`'s
+        // fallback decision.
+        if snap.block_len > 1 {
+            let kept = accepted.min(snap.block_len) as f32;
+            let mut stats = self
+                .spec_stats
+                .write()
+                .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
+            let s = stats.entry(seq).or_insert(SpecStats {
+                ema: SPEC_MIN_ACCEPT + 1.0,
+                fallback_steps: 0,
+            });
+            s.ema = (1.0 - SPEC_EMA_ALPHA) * s.ema + SPEC_EMA_ALPHA * kept;
+        }
+        if accepted >= snap.block_len {
+            return Ok(()); // full accept: the absorbed state is already exact
+        }
+        let mut map = self
+            .seq_state
+            .write()
+            .map_err(|_| candle::Error::Msg("seq_state lock poisoned".into()))?;
+        let Some(entry) = map.get_mut(&seq) else {
+            return Ok(());
+        };
+        for (l, lsnap) in snap.layers.into_iter().enumerate() {
+            let ls = &mut entry.layers[l];
+            if let (Some(c), Some(s)) = (ls.comp.as_mut(), lsnap.comp) {
+                c.state_restore(s);
+            }
+            if let (Some(c), Some(s)) = (ls.icomp.as_mut(), lsnap.icomp) {
+                c.state_restore(s);
+            }
+            if let Some(g) = ls.gallery.as_mut() {
+                g.truncate(lsnap.gallery_len);
+            }
+            if accepted == 0 {
+                continue;
+            }
+            // Replay the accepted prefix through the restored compressors — the
+            // same projected rows the verify forward consumed, so any group they
+            // complete is byte-identical to the one the forward appended.
+            let comp_gp = match (ls.comp.as_mut(), lsnap.comp_rows.as_ref()) {
+                (Some(c), Some((k, sc))) => c.emit_groups_projected(
+                    &k.narrow(0, 0, accepted)?,
+                    &sc.narrow(0, 0, accepted)?,
+                    None,
+                )?,
+                _ => None,
+            };
+            let ikey = match (ls.icomp.as_mut(), lsnap.icomp_rows.as_ref()) {
+                (Some(c), Some((k, sc))) => c.emit_groups_projected(
+                    &k.narrow(0, 0, accepted)?,
+                    &sc.narrow(0, 0, accepted)?,
+                    Some(self.engine.rope_for(l)),
+                )?,
+                _ => None,
+            };
+            if let (Some((entry_t, positions)), Some(g)) = (comp_gp, ls.gallery.as_mut()) {
+                // HCA layers have no indexer: 1-wide placeholder key, matching
+                // the wave's append path.
+                let key_t = match ikey {
+                    Some((k, _)) => k,
+                    None => Tensor::zeros((positions.len(), 1), DType::F32, entry_t.device())?,
+                };
+                g.append_batch(&entry_t, &key_t, &positions)?;
+            }
+        }
+        entry.absorbed = tokens;
+        Ok(())
+    }
+
     /// Extract host token ids from an input tensor (`[1, s]` or `[s]`).
     /// Inputs are scheduler-built host tensors; when one arrives on the GPU
     /// this is a transfer — counted by the readback instrumentation.
@@ -447,7 +729,30 @@ impl ManagedBatchedModel for DeepSeekBatched {
         if let Ok(mut map) = self.seq_state.write() {
             map.clear();
         }
+        if let Ok(mut map) = self.verify_snap.write() {
+            map.clear();
+        }
+        if let Ok(mut map) = self.target_feat.write() {
+            map.clear();
+        }
+        if let Ok(mut map) = self.spec_stats.write() {
+            map.clear();
+        }
         Ok(())
+    }
+
+    /// Session KV truncation + streaming-corpus rollback: consume the pre-verify
+    /// [`VerifySnapshot`], restore the compressor/gallery state, and replay
+    /// exactly the accepted prefix — so rejected draft tokens never stay
+    /// absorbed (the KV truncation alone cannot see that state).
+    fn truncate_sequence(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        session.truncate_sequence_to_tokens(seq, tokens)?;
+        self.rollback_verify_state(seq, tokens)
     }
 
     fn expert_stats(&self) -> Option<PipelineStats> {
@@ -648,6 +953,31 @@ impl ManagedBatchedModel for DeepSeekBatched {
             }
         };
 
+        // Read once for the whole wave: the sequences (if any) whose prefill
+        // rows are speculative verify blocks. Their attention runs the DECODE
+        // kernel over per-position virtual slots (below, one launch across ALL
+        // blocks), prefill pass 1 stashes their projected compressor rows
+        // (rollback replay source), and the head scores ALL their rows instead
+        // of just the last.
+        let verify_seqs: Vec<usize> = self
+            .verify_all_rows
+            .read()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
+            .clone();
+        // A verify wave is ALL-verify by construction (`verify_blocks` builds
+        // it); a mixed wave would need per-seq kernel routing.
+        let is_verify_wave = !verify_seqs.is_empty();
+        if is_verify_wave
+            && (prefill_seqs.len() != verify_seqs.len()
+                || !prefill_seqs.iter().all(|s| verify_seqs.contains(s)))
+        {
+            candle::bail!(
+                "verify wave: prefill set {:?} != verify set {:?}",
+                prefill_seqs,
+                verify_seqs
+            );
+        }
+
         // Metadata: commit each layer's CPU chunk usage to the committed
         // prefix, then serialize slot headers for decode ++ prefill ++ glue
         // sequences (glue tables are already the scheduler-reserved state —
@@ -731,6 +1061,22 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // survives the reallocation. Bit-exactness of the live vs snapshot decode
         // path across chunk boundaries is gated by
         // `decode_live_buffer_matches_snapshot_multistep`.
+        // Speculative-verify: capacity-ensure every block's whole write range
+        // BEFORE the standard header build — `ensure_for_offset` above uses
+        // positional block math, which under-allocates on a slid ring (chunk
+        // count exceeds positional blocks while the writer tail lacks free
+        // slots), and a chunk allocated after the snapshot is invisible to the
+        // writeback scatter (→ OOB).
+        if is_verify_wave {
+            for (pi, &vseq) in prefill_seqs.iter().enumerate() {
+                for backing in session.backings() {
+                    backing.ensure_for_batch_entries(
+                        &[(vseq, prefill_resident[pi])],
+                        prefill_lens[pi],
+                    )?;
+                }
+            }
+        }
         let snapshot_seqs: Vec<usize> = prefill_seqs.iter().chain(glue_seqs).copied().collect();
         let (pm, headers, stride) = session.build_decode_metadata_at(
             &all_seqs,
@@ -744,6 +1090,64 @@ impl ManagedBatchedModel for DeepSeekBatched {
         let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
             let (_, headers, stride) = &snaps[0];
             headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
+        };
+
+        // Speculative-verify metadata: the verify block's attention runs the
+        // DECODE kernel over one virtual slot per block position — decode
+        // numerics by construction (fp PV, read-time rope, decode softmax
+        // structure), vs the prefill kernel's int8-PV envelope that flips
+        // narrow-margin argmaxes. All virtual slots share IDENTICAL headers
+        // serialized with the write length committed over the whole block (the
+        // rows are host-written before each layer's launch); per-slot causal
+        // visibility comes from the kernel's `key_pos <= q_pos` bound alone.
+        let verify_meta = if is_verify_wave {
+            // Commit every block's write length NOW: the virtual-slot headers
+            // must expose the block rows physically (part C's set_len becomes a
+            // no-op re-set), and each position map must cover
+            // [0, resident+s_len). `set_len` deliberately never touches the
+            // serialized slot buffer (see its DMA-race comment), so ALSO
+            // invalidate the cached slot state — forcing the build's REBUILD
+            // path. Otherwise the REUSE arm snapshots slice lens/rope bases
+            // serialized at the PRE-set_len offset (fresh after a
+            // partial-accept truncate) and only the write chunk's len gets
+            // patched: a block spanning the write-chunk boundary then reads
+            // its earlier rows short (stale len) and the next chunk's keys
+            // one position early (stale rope base).
+            // (Each block's write range was capacity-ensured BEFORE the
+            // standard header build above, so the writeback snapshot already
+            // covers every chunk `set_len` fills here.)
+            let mut entries: Vec<usize> = Vec::with_capacity(prefill_lens.iter().sum());
+            let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(prefill_seqs.len());
+            for (pi, &vseq) in prefill_seqs.iter().enumerate() {
+                let s_len = prefill_lens[pi];
+                let resident = prefill_resident[pi];
+                for backing in session.backings() {
+                    backing.set_len(vseq, resident + s_len);
+                    backing.invalidate_decode_slot(vseq);
+                }
+                // One virtual slot per block position, concatenated across
+                // sequences in prefill-span order — the SAME row order the
+                // batched projection (q rows) and comp_idx use, so header slot
+                // i pairs with q row i in the single launch below.
+                entries.extend((0..s_len).map(|_| vseq));
+                overrides.push((vseq, resident + s_len));
+            }
+            let (vpm, vhdr, vstride) = session.build_decode_metadata_at(
+                &entries,
+                &generation,
+                &overrides,
+                &[],
+                &entries, // immutable snapshots of the freshly-rebuilt state
+            )?;
+            let vhdr =
+                vhdr.ok_or_else(|| candle::Error::Msg("no verify decode metadata".into()))?;
+            Some((vpm, vhdr, vstride))
+        } else {
+            None
+        };
+        let verify_hdr_of = |layer: usize| -> u64 {
+            let (_, vhdr, vstride) = verify_meta.as_ref().expect("verify metadata built");
+            vhdr.dev_ptr() + (layer as u64) * vstride
         };
         pipeline_record("deepseek:wave_metadata", t_meta);
 
@@ -785,6 +1189,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .copied()
             .chain(prefill_ids.iter().chain(&glue_ids).flatten().copied())
             .collect();
+
+        // DSpark target-feature capture (paper Eq. 2): when a drafter is attached and this wave runs
+        // through the head (full stack), stash `head_reduce(h)` after each real target layer — the
+        // per-layer hidden `fc`/`Wc` consumes. Keyed by layer so the head can order them by
+        // `target_layers` and substitute the post-output-norm hidden for the `n_layers` sentinel.
+        let capture_targets = layer_end == n_layers && !self.target_layers.is_empty();
+        let mut target_reduced: Vec<(usize, Tensor)> = Vec::with_capacity(self.target_layers.len());
 
         for l in layer_start..layer_end {
             let layer = e.engine_layer(l);
@@ -1077,6 +1488,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     // Decode rows use the live persistent buffer, so always commit
                     // the write-len on-device to advance it for the next step.
                     true,
+                    false, // the fused scatter writes each slot's token
                     st.ws(),
                     None,
                 )?;
@@ -1126,9 +1538,36 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
                     let e = state.get_mut(&seq).expect("ensured above");
+                    let p = proj.expect("prefill rows imply a projection");
+                    // Verify-path row stash: this layer's projected compressor
+                    // rows for the verify block, kept in the pre-verify snapshot
+                    // as the rollback's replay source (`Arc`-clone views).
+                    if is_verify_wave {
+                        if let Some(vs) = self
+                            .verify_snap
+                            .write()
+                            .map_err(|_| candle::Error::Msg("verify_snap lock poisoned".into()))?
+                            .get_mut(&seq)
+                        {
+                            if let Some(lsnap) = vs.layers.get_mut(l) {
+                                lsnap.comp_rows = match &p.comp_proj {
+                                    Some((k, sc)) => {
+                                        Some((k.narrow(0, off, s_len)?, sc.narrow(0, off, s_len)?))
+                                    }
+                                    None => None,
+                                };
+                                lsnap.icomp_rows = match &p.icomp_proj {
+                                    Some((k, sc)) => {
+                                        Some((k.narrow(0, off, s_len)?, sc.narrow(0, off, s_len)?))
+                                    }
+                                    None => None,
+                                };
+                            }
+                        }
+                    }
                     preps.push(super::kernel_attention::kernel_attn_prefill_assemble(
                         &mut e.layers[l],
-                        proj.expect("prefill rows imply a projection"),
+                        p,
                         off,
                         s_len,
                     )?);
@@ -1179,7 +1618,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             let mut new_meta_host: Vec<u32> = Vec::with_capacity(prefill_seqs.len() * 4);
             let mut g_off = 0u32; // running packed-corpus row offset
             let mut new_off = 0u32; // running packed kv_new row offset
-                                      // Part A: append + select + build (per seq); NO gather/kernel yet.
+                                    // Part A: append + select + build (per seq); NO gather/kernel yet.
             for (pi, &seq) in prefill_seqs.iter().enumerate() {
                 let s_len = prefill_lens[pi];
                 let base = prefill_base[pi];
@@ -1343,24 +1782,102 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let seq_of = Tensor::from_vec(seq_of_host, prefill_total, &dev)?;
                 let new_meta = Tensor::from_vec(new_meta_host, (pf.len(), 4), &dev)?;
                 let q_pos_all = Tensor::cat(&prefill_q_pos.iter().collect::<Vec<_>>(), 0)?;
-                let out = super::paged::paged_latent_prefill_raw(
-                    &projref.q_bf,
-                    hdr_of(l, decode_seqs.len()),
-                    &q_pos_all,
-                    &seq_of,
-                    &projref.kv_bf,
-                    &new_meta,
-                    &cache,
-                    &comp_idx,
-                    &comp_cnt,
-                    st.sinks(),
-                    st.rope_tab(),
-                    a.softmax_scale() as f32,
-                    a.window_size(),
-                    0,
-                    session.backings()[l].k_format().to_tag(),
-                    st.ws(),
-                )?;
+                // A speculative-verify block runs its positions as VIRTUAL DECODE
+                // SLOTS — the decode kernel, decode numerics (fp PV, read-time
+                // rope), one launch: the accepted stream is then argmax-consistent
+                // with plain decode, where the prefill kernel's int8-PV envelope
+                // flipped narrow-margin tokens. The block's latents are written
+                // to the arena FIRST (same `store_band_elem` encode the fused
+                // scatter uses → byte-identical read-back), each slot's causal
+                // visibility comes from `key_pos <= q_pos`, and the shared
+                // headers carry the pre-committed block write length.
+                let out = if is_verify_wave {
+                    // Per-seq writeback FIRST: map each block row's RESIDENT
+                    // offset to its (slice, in_blk) by WALKING the chunk table —
+                    // the same walk the position map uses — not positional
+                    // `off/32` math, which shears once the sliding ring has slid
+                    // (front chunks freed/partially evicted ⇒ resident indices
+                    // and 32-aligned block indices diverge). The usages already
+                    // cover each block (`set_len` pre-committed
+                    // `resident + s_len` before the header build).
+                    for (pi, &vseq) in prefill_seqs.iter().enumerate() {
+                        let s_len = prefill_lens[pi];
+                        let base_resident = prefill_base[pi] - prefill_base_ev[pi] as usize;
+                        let (wslice, wblk): (Vec<u32>, Vec<u32>) = {
+                            let chunks = session.backings()[l]
+                                .live_chunks_as_sealed(vseq, &[])
+                                .unwrap_or_default();
+                            let mut map: Vec<(u32, u32)> = Vec::with_capacity(s_len);
+                            let mut cum = 0usize;
+                            for (si, c) in chunks.iter().enumerate() {
+                                let cnt = c.token_count as usize;
+                                for w in 0..cnt {
+                                    let r = cum + w;
+                                    if r >= base_resident && r < base_resident + s_len {
+                                        map.push((si as u32, c.offset as u32 + w as u32));
+                                    }
+                                }
+                                cum += cnt;
+                            }
+                            if map.len() != s_len {
+                                candle::bail!(
+                                    "verify writeback: chunk walk covered {} of {} block rows \
+                                     (seq {vseq}, base_resident {base_resident}, {} chunks)",
+                                    map.len(),
+                                    s_len,
+                                    chunks.len()
+                                );
+                            }
+                            map.into_iter().unzip()
+                        };
+                        super::paged::paged_latent_glue_scatter(
+                            &preps[pi].kv_bf,
+                            hdr_of(l, decode_seqs.len() + pi),
+                            &Tensor::from_vec(wslice, s_len, &dev)?,
+                            &Tensor::from_vec(wblk, s_len, &dev)?,
+                        )?;
+                    }
+                    // ONE decode-kernel launch over every sequence's virtual
+                    // slots: q rows, q_pos, comp_idx/cnt and the header entries
+                    // are all concatenated in the same prefill-span order.
+                    super::paged::paged_latent_decode_raw(
+                        &projref.q_bf, // [Σs, h, hd] bf16 — decode's q layout
+                        verify_hdr_of(l),
+                        &projref.kv_bf, // unused (pre_scattered) — ABI slot
+                        &cache,
+                        &comp_idx,
+                        &comp_cnt,
+                        &q_pos_all,
+                        st.sinks(),
+                        st.rope_tab(),
+                        a.softmax_scale() as f32,
+                        a.window_size(),
+                        0,
+                        false, // headers are throwaway snapshots — no commit
+                        true,  // rows pre-written above — skip the fused scatter
+                        st.ws(),
+                        None,
+                    )?
+                } else {
+                    super::paged::paged_latent_prefill_raw(
+                        &projref.q_bf,
+                        hdr_of(l, decode_seqs.len()),
+                        &q_pos_all,
+                        &seq_of,
+                        &projref.kv_bf,
+                        &new_meta,
+                        &cache,
+                        &comp_idx,
+                        &comp_cnt,
+                        st.sinks(),
+                        st.rope_tab(),
+                        a.softmax_scale() as f32,
+                        a.window_size(),
+                        0,
+                        session.backings()[l].k_format().to_tag(),
+                        st.ws(),
+                    )?
+                };
                 pipeline_record("prefill:kernel", t_pkern);
                 let t_poutp = profile_now();
                 let o_all = out.reshape((1, prefill_total, a.n_heads(), a.head_dim()))?;
@@ -1369,24 +1886,29 @@ impl ManagedBatchedModel for DeepSeekBatched {
 
                 // Part C: writeback each seq's prompt latents to its arena (deferred —
                 // set_len must run AFTER the batched kernel read the committed prefix).
+                // A verify block already wrote back BEFORE its virtual-slot launch
+                // (the slots read the block rows from the arena) with the length
+                // pre-committed — only its `absorbed` bookkeeping remains.
                 let t_pwb = profile_now();
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
                     let base = prefill_base[pi];
                     let base_resident = base - prefill_base_ev[pi] as usize;
-                    let (wslice, wblk): (Vec<u32>, Vec<u32>) = (0..s_len)
-                        .map(|t| {
-                            let off = base_resident + t;
-                            ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
-                        })
-                        .unzip();
-                    super::paged::paged_latent_glue_scatter(
-                        &preps[pi].kv_bf,
-                        hdr_of(l, decode_seqs.len() + pi),
-                        &Tensor::from_vec(wslice, s_len, &dev)?,
-                        &Tensor::from_vec(wblk, s_len, &dev)?,
-                    )?;
-                    session.backings()[l].set_len(seq, base_resident + s_len);
+                    if !is_verify_wave {
+                        let (wslice, wblk): (Vec<u32>, Vec<u32>) = (0..s_len)
+                            .map(|t| {
+                                let off = base_resident + t;
+                                ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
+                            })
+                            .unzip();
+                        super::paged::paged_latent_glue_scatter(
+                            &preps[pi].kv_bf,
+                            hdr_of(l, decode_seqs.len() + pi),
+                            &Tensor::from_vec(wslice, s_len, &dev)?,
+                            &Tensor::from_vec(wblk, s_len, &dev)?,
+                        )?;
+                        session.backings()[l].set_len(seq, base_resident + s_len);
+                    }
                     if l + 1 == n_layers {
                         state.get_mut(&seq).expect("ensured above").absorbed = base + s_len;
                     }
@@ -1463,6 +1985,14 @@ impl ManagedBatchedModel for DeepSeekBatched {
             h = hc.post(&moe, &h1, &post, &comb)?;
             pipeline_record("moe:hc_post", t_moe_hcpost);
             pipeline_record("deepseek:moe", t_moe);
+
+            // Capture this layer's hidden for the drafter if it is a target layer. Per DeepSeek's
+            // `inference/model.py` (`main_hiddens.append(h.mean(dim=2))`), the target feature is the
+            // MEAN over the mHC copies of the RAW post-layer residual — not `head_reduce` (the final
+            // output collapse) and not normed (the drafter's own `main_norm` does the only norm).
+            if capture_targets && self.target_layers.contains(&l) {
+                target_reduced.push((l, h.mean(2)?)); // [1, rows, hc, dim] → [1, rows, dim]
+            }
         }
         drop(state);
         drop(generation);
@@ -1500,24 +2030,287 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // lm_head in a SINGLE batched GEMM (was R per-row GEMV launches);
         // bit-identical since each row's logits are independent.
         let hdev = normed.device().clone();
+        // A batched `verify_block` marks one prefill sequence for full scoring — every row of its
+        // block gets a logits row (the per-position next-token prediction the speculative driver
+        // verifies), instead of just the sequence's last row. (`verify_seq` was read once, above
+        // the layer loop.)
         let mut sel_rows: Vec<u32> = (0..decode_seqs.len() as u32).collect();
+        let mut scored_seqs: Vec<usize> = decode_seqs.to_vec();
+        // Absolute token position of each scored row (for the position-keyed target-feature stash).
+        let mut scored_pos: Vec<usize> = decode_seqs
+            .iter()
+            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+            .collect();
         let mut cursor = decode_seqs.len();
-        for &s_len in &prefill_lens {
-            sel_rows.push((cursor + s_len - 1) as u32);
+        for (pi, &s_len) in prefill_lens.iter().enumerate() {
+            let base = prefill_base[pi];
+            if verify_seqs.contains(&prefill_seqs[pi]) {
+                for r in 0..s_len {
+                    sel_rows.push((cursor + r) as u32);
+                    scored_seqs.push(prefill_seqs[pi]);
+                    scored_pos.push(base + r);
+                }
+            } else {
+                sel_rows.push((cursor + s_len - 1) as u32);
+                scored_seqs.push(prefill_seqs[pi]);
+                scored_pos.push(base + s_len - 1);
+            }
             cursor += s_len;
         }
         let r_total = sel_rows.len();
         let idx = Tensor::from_vec(sel_rows, r_total, &hdev)?;
-        let logits_all = e.lm_head().forward(&normed.index_select(&idx, 1)?)?; // [1,R,vocab]
+        let scored_hidden = normed.index_select(&idx, 1)?; // [1, R, dim]
+        let logits_all = e.lm_head().forward(&scored_hidden)?; // [1,R,vocab]
         let mut logits_rows: Vec<Tensor> = Vec::with_capacity(r_total);
         for r in 0..r_total {
             logits_rows.push(logits_all.narrow(1, r, 1)?.reshape((1, cfg.vocab_size))?);
+        }
+        // Stash each scored row's target-layer feature — the drafter's conditioning source (`fc`
+        // input, paper `Hctx = RMSNorm(Wc·[H^{l₁};…;H^{lₘ}])`), read by `speculative_draft` next
+        // step. The per-layer captures (ordered by `target_layers`) are scored-row-selected and
+        // concatenated along the feature axis → one `[m·dim]` vector per row, keyed by its absolute
+        // position so the next draft picks the feature at `q_start-1`. Drafter only.
+        if capture_targets {
+            let per_layer: Vec<Tensor> = self
+                .target_layers
+                .iter()
+                .map(|&tl| -> Result<Tensor> {
+                    target_reduced
+                        .iter()
+                        .find(|(l, _)| *l == tl)
+                        .ok_or_else(|| {
+                            candle::Error::msg(format!("target layer {tl} not captured"))
+                        })?
+                        .1
+                        .index_select(&idx, 1) // [1, R, dim]
+                })
+                .collect::<Result<_>>()?;
+            let feats = Tensor::cat(&per_layer, 2)?; // [1, R, m·dim]
+            let mdim = per_layer.len() * cfg.dim;
+            let mut tf = self
+                .target_feat
+                .write()
+                .map_err(|_| candle::Error::Msg("target_feat lock poisoned".into()))?;
+            // ACCUMULATE a sliding window of the recent positions' features — the drafter attends to
+            // the last `window_size` target hiddens (DSparkAttention's main_kv ring), not just the
+            // current one. Rejected-draft positions are overwritten when re-decoded next step; we
+            // keep `window + block_size` positions per seq to bound growth.
+            let window = cfg.window_size;
+            for (r, (&sq, &pos)) in scored_seqs.iter().zip(scored_pos.iter()).enumerate() {
+                let feat = feats.narrow(1, r, 1)?.reshape((mdim,))?;
+                tf.entry(sq).or_default().insert(pos, feat);
+            }
+            for &sq in scored_seqs.iter() {
+                if let Some(m) = tf.get_mut(&sq) {
+                    if let Some(&newest) = m.keys().max() {
+                        let floor = newest.saturating_sub(window + 8);
+                        m.retain(|&p, _| p >= floor);
+                    }
+                }
+            }
         }
         pipeline_record("deepseek:head_lm", t_head);
         Ok(WaveStep {
             residual: None,
             logits: Some(logits_rows),
         })
+    }
+
+    /// Batched speculative verify: run EVERY sequence's `[committed, drafts…]` block in ONE
+    /// forward — each block's positions as virtual decode slots (decode numerics), all sequences
+    /// in a single wave — and return each sequence's per-position next-token logits rows. The wave
+    /// is launch-bound, so its fixed costs (per-layer MoE routing readbacks, expert DMA) amortize
+    /// across every session instead of being paid once per session. Lossless is unchanged: the
+    /// driver still accepts only the model's own argmaxes. `verify_all_rows` makes the head score
+    /// every row of these sequences (see `forward_wave`); it is cleared before returning, even on
+    /// error. Advances each sequence by its block length; the driver truncates back to the
+    /// accepted lengths.
+    fn verify_blocks(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        layer_end: usize,
+    ) -> Result<Vec<Vec<Tensor>>> {
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pre-verify corpus-state snapshots: the forward below absorbs the WHOLE
+        // blocks (including drafts the driver may reject) into the streaming
+        // compressors/galleries; the driver's `truncate_sequence` consumes each
+        // snapshot to roll that state back to the accepted prefix — the KV
+        // truncation alone cannot see it.
+        let mut inputs: Vec<Tensor> = Vec::with_capacity(seqs.len());
+        for (i, &seq) in seqs.iter().enumerate() {
+            if blocks[i].is_empty() {
+                candle::bail!("verify_blocks: empty block for seq {seq}");
+            }
+            let q_start = session.sequence_offset(seq).unwrap_or(0);
+            self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
+            inputs.push(Tensor::from_vec(
+                blocks[i].clone(),
+                (1, blocks[i].len()),
+                &Device::Cpu,
+            )?);
+        }
+        *self
+            .verify_all_rows
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))? =
+            seqs.to_vec();
+        let step = self.forward_wave(
+            session,
+            &[],
+            &[],
+            seqs,
+            &inputs,
+            &[],
+            &[],
+            0,
+            layer_end,
+            None,
+        );
+        self.verify_all_rows
+            .write()
+            .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
+            .clear();
+        let step = match step {
+            Ok(s) => s,
+            Err(e) => {
+                // Failed verify: drop the snapshots so a later truncate cannot
+                // replay from a half-populated one.
+                if let Ok(mut m) = self.verify_snap.write() {
+                    for &s in seqs {
+                        m.remove(&s);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        for (i, &seq) in seqs.iter().enumerate() {
+            session.advance_sequence(seq, blocks[i].len())?;
+        }
+        let logits = step
+            .logits
+            .ok_or_else(|| candle::Error::msg("verify_blocks: forward_wave produced no logits"))?;
+        let total: usize = blocks.iter().map(|b| b.len()).sum();
+        if logits.len() != total {
+            candle::bail!(
+                "verify_blocks: expected {} scored rows, got {}",
+                total,
+                logits.len()
+            );
+        }
+        // Split the scored rows back per sequence (prefill-span order).
+        let mut out = Vec::with_capacity(seqs.len());
+        let mut off = 0usize;
+        for b in blocks {
+            out.push(logits[off..off + b.len()].to_vec());
+            off += b.len();
+        }
+        Ok(out)
+    }
+
+    /// DSpark speculative draft: propose a block of up to `max_len` tokens after `committed`,
+    /// conditioned on `seq`'s stashed target feature (the concatenated `dflash.target_layers`
+    /// hidden states — paper Eq. 2). Lossless — the caller verifies every proposal against the
+    /// target — so the conditioning only affects acceptance, never output. Returns empty (⇒ plain
+    /// decode) when no drafter is attached or the sequence has no stashed feature yet.
+    fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        committed: u32,
+        max_len: usize,
+    ) -> Result<Vec<u32>> {
+        let drafter_lock = match &self.drafter {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        // Rolling-acceptance fallback: while this sequence's accepted/step EMA
+        // sits below the economic threshold, skip drafting — the step becomes a
+        // 1-token verify (plain-decode cost, still lossless) — and every
+        // `SPEC_PROBE_INTERVAL` skipped steps run one drafted probe so a
+        // workload shift re-enables speculation.
+        {
+            let mut stats = self
+                .spec_stats
+                .write()
+                .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
+            if let Some(s) = stats.get_mut(&seq) {
+                if s.ema < SPEC_MIN_ACCEPT {
+                    if s.fallback_steps < SPEC_PROBE_INTERVAL {
+                        s.fallback_steps += 1;
+                        return Ok(Vec::new());
+                    }
+                    s.fallback_steps = 0; // probe this step
+                } else {
+                    s.fallback_steps = 0;
+                }
+            }
+        }
+        // The block's first position (where `committed` will sit). The drafter conditions on a
+        // sliding WINDOW of the last `window_size` target hiddens ending at `q_start-1` (the position
+        // whose argmax produced `committed`) — matching DSparkAttention's main_kv ring. Gather the
+        // longest CONSECUTIVE run of stashed positions ending at q_start-1 → `[W, m·dim]`, oldest
+        // first, so the drafter ropes them at their true absolute positions (q_start-W .. q_start-1).
+        let q_start = session.sequence_offset(seq).unwrap_or(0);
+        if q_start == 0 {
+            return Ok(Vec::new());
+        }
+        let window = self.engine.cfg().window_size;
+        let feats: Vec<Tensor> = {
+            let tf = self
+                .target_feat
+                .read()
+                .map_err(|_| candle::Error::Msg("target_feat lock poisoned".into()))?;
+            let map = match tf.get(&seq) {
+                Some(m) => m,
+                None => return Ok(Vec::new()),
+            };
+            let mut acc = Vec::new();
+            let mut p = q_start - 1;
+            loop {
+                match map.get(&p) {
+                    Some(f) => acc.push(f.clone()),
+                    None => break,
+                }
+                if acc.len() >= window || p == 0 {
+                    break;
+                }
+                p -= 1;
+            }
+            acc.reverse(); // oldest → newest (ascending absolute position)
+            acc
+        };
+        if feats.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut drafter = drafter_lock
+            .lock()
+            .map_err(|_| candle::Error::Msg("dspark drafter lock poisoned".into()))?;
+        // `[W, m·dim]` window of per-target-layer hiddens → `Wc`'s input; the drafter starts the
+        // context RoPE at `q_start - W` (the window is consecutive ending at q_start-1).
+        let features = Tensor::stack(&feats, 0)?;
+        // The block-diffusion mask token fills the not-yet-sampled block positions. τ is the
+        // confidence-schedule threshold (paper Alg. 1): drafting stops at the longest prefix whose
+        // cumulative survival probability ∏cᵢ clears it, so an unsure drafter proposes SHORT
+        // blocks — fewer wasted verify rows (each rejected row still pays the block's expert-DMA
+        // diversity in the verify wave). Confident runs (counting/structured code, cᵢ→1) still
+        // draft full blocks. Both τ and the mask only affect acceptance/cost, never output
+        // (lossless — the target's verify accepts only its own argmaxes).
+        let mask_token = drafter.cfg.mask_token;
+        const DSPARK_TAU: f32 = 0.3;
+        let drafts = drafter.draft(
+            &features,
+            committed,
+            mask_token,
+            self.engine.embed(),
+            self.engine.lm_head(),
+            q_start,
+            DSPARK_TAU,
+        )?;
+        Ok(drafts.into_iter().take(max_len).collect())
     }
 }
 
@@ -1594,6 +2387,16 @@ mod tests {
         // keep the run inside the harness timeout while still exercising genuine
         // concurrency. The `InferenceMode` is cosmetic: `create_batched_session`
         // forces DeepSeek's single-latent FP8 arena regardless.
+        // NO drafter in this gate. This is the plain prefill/decode throughput +
+        // coherence benchmark; speculative decode is covered by the dedicated
+        // gates (`wave_speculative_*`, tiny prompts). Attaching the ~6 GB
+        // all-resident drafter here leaves ~0 free VRAM beside the 64 GB target
+        // (the expert pool cannot shrink — its pinned remainder rides the
+        // page-lock ceiling), so the cfg8 prefill's transient activations spill
+        // to host via WDDM paging and prefill collapses ~20× (measured 590→29
+        // t/s). Target + resident drafter + wide prefill do not co-fit on this
+        // card; speculative-with-prefill benchmarking needs the free-VRAM
+        // headroom the NVMe expert-offload work will create.
         let params = TestParams::new(64, &tokenizer_json, Dialect::deepseek())
             .map_err(|e| candle::Error::msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true) // strip <think>…</think> before validation
@@ -1762,6 +2565,537 @@ mod tests {
             "wave-path readbacks beyond the documented MoE-routing set: \
              {got} vs {expected}"
         );
+        Ok(())
+    }
+
+    /// Speculative-decode gate: the SAME "Paris" prompt, decoded through the
+    /// generic `ManagedBatchedModel::speculative_decode_step` driver (draft →
+    /// verify → accept longest matching prefix → roll back the rest). Speculative
+    /// decode is lossless by construction — the accepted tokens are the model's own
+    /// argmaxes — so the stream must be **bit-identical** to greedy `wave_paris`
+    /// ("Paris"+EOS). This proves the generic driver + `verify_block` +
+    /// `truncate_sequence_to_tokens` rollback are correct on the real model, with
+    /// whatever drafter DeepSeek provides (default = none ⇒ plain decode; a real
+    /// DSpark drafter ⇒ the same stream, faster). `--ignored` (needs the model).
+    #[test]
+    #[ignore]
+    fn wave_paris_speculative() -> Result<()> {
+        let _serial = model_test_guard();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        if !path.exists() {
+            eprintln!("[skip] merged file absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        let model = DeepSeekBatched::new(engine)?;
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>What is the capital of France? \
+             Reply with only the city name.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+        let eos = tokenizer
+            .token_to_id("<｜end▁of▁sentence｜>")
+            .expect("eos id");
+
+        let mut session = model.create_batched_session(BatchedConfig::default())?;
+        let seq = session.create_sequence()?;
+        let n_layers = model.num_layers();
+
+        // Prefill the prompt; the first generated token is the argmax of the last
+        // prefill row — held OUT of the KV as the driver's `committed` seed.
+        let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+        let step = model.forward_wave(
+            &mut session,
+            &[],
+            &[],
+            &[seq],
+            std::slice::from_ref(&prompt_t),
+            &[],
+            &[],
+            0,
+            n_layers,
+            None,
+        )?;
+        session.advance_sequence(seq, ids.len())?;
+        let logits = step
+            .logits
+            .ok_or_else(|| candle::Error::msg("prefill produced no logits"))?;
+        let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
+
+        // Speculative decode loop: each step commits ≥1 token (the model's exact
+        // greedy continuation), draft length up to 4.
+        let mut gen = vec![committed];
+        let mut steps = 0usize;
+        let t0 = std::time::Instant::now();
+        while gen.len() < 12 && committed != eos {
+            steps += 1;
+            let next = model.speculative_decode_step(
+                &mut session,
+                seq,
+                committed,
+                4,
+                n_layers,
+                &mut |t| {
+                    gen.push(t);
+                    gen.len() < 12 && t != eos
+                },
+            )?;
+            match next {
+                Some(c) => committed = c,
+                None => break,
+            }
+        }
+        let dt = t0.elapsed().as_secs_f32();
+        let text = tokenizer
+            .decode(&gen, false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        eprintln!("[spec] ids={gen:?}");
+        eprintln!("[spec] continuation={text:?}");
+        eprintln!(
+            "[spec] {steps} spec steps, {} tokens in {dt:.1}s = {:.2} tok/s",
+            gen.len(),
+            gen.len() as f32 / dt
+        );
+        assert_eq!(
+            *gen.last().unwrap(),
+            eos,
+            "speculative path did not stop on EOS within 12 tokens: {text:?}"
+        );
+        let answer = tokenizer
+            .decode(&gen[..gen.len() - 1], false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        assert_eq!(
+            answer.trim(),
+            "Paris",
+            "speculative path must answer exactly \"Paris\" (lossless vs greedy): {text:?}"
+        );
+        Ok(())
+    }
+
+    /// Speculative decode with the REAL DSpark drafter attached (streaming expert cache). Same
+    /// "Paris" prompt through the generic `speculative_decode_step` driver, but now
+    /// `speculative_draft` proposes a DSpark block each step. Proves the full drafter integration
+    /// end-to-end (streaming MoE + injected-context backbone + Markov sampler + accept/rollback) is
+    /// **lossless** — the accepted tokens are still the target's own argmaxes, so the answer is
+    /// bit-identical "Paris". Reports the mean committed tokens/step: with the default sequential
+    /// `verify_block` this is not yet a wall-clock win (verify runs one wave per block token), but
+    /// tokens/step > 1 is the ACCEPTANCE signal that a batched `verify_block` will convert into the
+    /// speedup on this launch-bound decode. Skips when the drafter GGUF is absent (fetch it with
+    /// `zend --download-deepseek`). `--ignored` (needs the 156 GB target + the drafter).
+    #[test]
+    #[ignore]
+    fn wave_paris_speculative_dspark() -> Result<()> {
+        let _serial = model_test_guard();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
+        if !path.exists() || !dspark.exists() {
+            eprintln!("[skip] target or DSpark drafter absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        // Load the ENGINE first so its expert VRAM pool sizes to the full free VRAM (pinned
+        // remainder stays under the page-lock ceiling); the drafter's small int8 backbone + its
+        // lazily-streamed expert slots then live in the target's 13 GB activation headroom. (Loading
+        // the drafter first would shrink the expert pool and spill the target past the pinned
+        // ceiling on this saturated box.)
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        let (free0, _tot0) = device.mem_get_info()?;
+        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
+        let (free1, _tot1) = device.mem_get_info()?;
+        eprintln!(
+            "[spec-dspark] drafter backbone VRAM footprint = {:.2} GB (free {:.1}→{:.1} GB after engine)",
+            (free0 - free1) as f64 / (1u64 << 30) as f64,
+            free0 as f64 / (1u64 << 30) as f64,
+            free1 as f64 / (1u64 << 30) as f64,
+        );
+        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>What is the capital of France? \
+             Reply with only the city name.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+        let eos = tokenizer
+            .token_to_id("<｜end▁of▁sentence｜>")
+            .expect("eos id");
+
+        let mut session = model.create_batched_session(BatchedConfig::default())?;
+        let seq = session.create_sequence()?;
+        let n_layers = model.num_layers();
+
+        let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+        let step = model.forward_wave(
+            &mut session,
+            &[],
+            &[],
+            &[seq],
+            std::slice::from_ref(&prompt_t),
+            &[],
+            &[],
+            0,
+            n_layers,
+            None,
+        )?;
+        session.advance_sequence(seq, ids.len())?;
+        let logits = step
+            .logits
+            .ok_or_else(|| candle::Error::msg("prefill produced no logits"))?;
+        let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
+
+        let max_draft = 4usize;
+        let mut gen = vec![committed];
+        let mut steps = 0usize;
+        let t0 = std::time::Instant::now();
+        while gen.len() < 12 && committed != eos {
+            steps += 1;
+            // The driver emits each accepted token; we keep it and stop at the first EOS — the exact
+            // per-token loop plain decode uses (the drafter drafts a whole block that can run PAST
+            // EOS; those post-EOS argmaxes are simply never generated). No special block handling.
+            let next = model.speculative_decode_step(
+                &mut session,
+                seq,
+                committed,
+                max_draft,
+                n_layers,
+                &mut |t| {
+                    gen.push(t);
+                    gen.len() < 12 && t != eos
+                },
+            )?;
+            match next {
+                Some(c) => committed = c,
+                None => break,
+            }
+        }
+        let dt = t0.elapsed().as_secs_f32();
+        let text = tokenizer
+            .decode(&gen, false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        let per_step = gen.len() as f32 / steps.max(1) as f32;
+        eprintln!("[spec-dspark] ids={gen:?}");
+        eprintln!("[spec-dspark] continuation={text:?}");
+        eprintln!(
+            "[spec-dspark] {steps} spec steps for {} tokens ⇒ {per_step:.2} tokens/step \
+             (max_draft={max_draft}); {dt:.1}s",
+            gen.len(),
+        );
+        assert_eq!(
+            *gen.last().unwrap(),
+            eos,
+            "speculative+DSpark did not stop on EOS within 12 tokens: {text:?}"
+        );
+        let answer = tokenizer
+            .decode(&gen[..gen.len() - 1], false)
+            .map_err(|e| candle::Error::msg(format!("decode: {e}")))?;
+        assert_eq!(
+            answer.trim(),
+            "Paris",
+            "speculative+DSpark must answer exactly \"Paris\" (lossless vs greedy): {text:?}"
+        );
+        Ok(())
+    }
+
+    /// The SPEEDUP measurement: a longer, drafter-friendly generation decoded two ways from the same
+    /// prefill — (1) plain greedy (one wave per token), (2) speculative with the DSpark drafter +
+    /// **batched** `verify_block` (draft a block, verify it in ONE wave, accept the matching prefix).
+    /// Asserts the two token streams are **identical** (speculative is lossless) and reports the
+    /// wall-clock speedup + mean accepted tokens/step. Because DeepSeek decode is launch-bound, a
+    /// batched K-token verify costs ~one decode, so accepted drafts translate almost directly into
+    /// throughput. `--ignored` (needs the 156 GB target + drafter; the KV VRAM reserve is
+    /// installed from the engine's measured post-resident budget, so no tuning is needed).
+    #[test]
+    #[ignore]
+    fn wave_speculative_speedup_dspark() -> Result<()> {
+        let _serial = model_test_guard();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
+        if !path.exists() || !dspark.exists() {
+            eprintln!("[skip] target or DSpark drafter absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
+        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        // A deterministic, structured continuation the drafter predicts well (high acceptance).
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>Count from 1 to 30, separated by \
+             commas.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+        let eos = tokenizer
+            .token_to_id("<｜end▁of▁sentence｜>")
+            .expect("eos id");
+        let n_layers = model.num_layers();
+        const MAX_NEW: usize = 64;
+
+        // Prefill helper → returns (session, first committed token).
+        let prefill = |model: &DeepSeekBatched| -> Result<(BatchedInferenceSession, usize, u32)> {
+            let mut session = model.create_batched_session(BatchedConfig::default())?;
+            let seq = session.create_sequence()?;
+            let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+            let step = model.forward_wave(
+                &mut session,
+                &[],
+                &[],
+                &[seq],
+                std::slice::from_ref(&prompt_t),
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
+            session.advance_sequence(seq, ids.len())?;
+            let logits = step
+                .logits
+                .ok_or_else(|| candle::Error::msg("no prefill logits"))?;
+            let first = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
+            Ok((session, seq, first))
+        };
+
+        // ── Greedy baseline: one wave per token. ──
+        let (mut gsession, gseq, gfirst) = prefill(&model)?;
+        let mut greedy = vec![gfirst];
+        let mut committed = gfirst;
+        let t0 = std::time::Instant::now();
+        while greedy.len() < MAX_NEW && committed != eos {
+            let t = Tensor::from_vec(vec![committed], (1, 1), &Device::Cpu)?;
+            let step = model.forward_wave(
+                &mut gsession,
+                &[gseq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                n_layers,
+                None,
+            )?;
+            gsession.advance_sequence(gseq, 1)?;
+            committed = step
+                .logits
+                .ok_or_else(|| candle::Error::msg("no decode logits"))?[0]
+                .i(0)?
+                .argmax(0)?
+                .to_scalar::<u32>()?;
+            greedy.push(committed);
+        }
+        let greedy_dt = t0.elapsed().as_secs_f32();
+
+        // ── Speculative: drafter + batched verify_block, up to 4 drafts/step. ──
+        let (mut ssession, sseq, sfirst) = prefill(&model)?;
+        let mut spec = vec![sfirst];
+        let mut committed = sfirst;
+        let mut steps = 0usize;
+        let mut accepts: Vec<usize> = Vec::new(); // committed tokens per step (1 = 0 drafts accepted)
+        let t0 = std::time::Instant::now();
+        while spec.len() < MAX_NEW && committed != eos {
+            steps += 1;
+            let before = spec.len();
+            let next = model.speculative_decode_step(
+                &mut ssession,
+                sseq,
+                committed,
+                4,
+                n_layers,
+                &mut |t| {
+                    spec.push(t);
+                    spec.len() < MAX_NEW && t != eos
+                },
+            )?;
+            accepts.push(spec.len() - before); // committed tokens this step
+            match next {
+                Some(c) => committed = c,
+                None => break,
+            }
+        }
+        let spec_dt = t0.elapsed().as_secs_f32();
+        eprintln!("[spec-speedup] per-step committed (1=no draft accepted): {accepts:?}");
+
+        let greedy_tps = greedy.len() as f32 / greedy_dt.max(1e-6);
+        let spec_tps = spec.len() as f32 / spec_dt.max(1e-6);
+        let text = tokenizer.decode(&spec, false).unwrap_or_default();
+        eprintln!("[spec-speedup] continuation={text:?}");
+        eprintln!(
+            "[spec-speedup] greedy {greedy_tps:.2} tok/s ({} tok, {greedy_dt:.2}s) | speculative \
+             {spec_tps:.2} tok/s ({} tok, {steps} steps ⇒ {:.2} tok/step, {spec_dt:.2}s) | \
+             SPEEDUP {:.2}×",
+            greedy.len(),
+            spec.len(),
+            spec.len() as f32 / steps.max(1) as f32,
+            spec_tps / greedy_tps,
+        );
+        // Speculative commits whole blocks, so it may overshoot MAX_NEW by up to block_size-1; the
+        // tokens must be identical on the common prefix (lossless — accepted tokens are the target's
+        // own argmaxes).
+        let n = spec.len().min(greedy.len());
+        assert_eq!(
+            &spec[..n],
+            &greedy[..n],
+            "speculative + batched verify must be BIT-IDENTICAL to greedy decode"
+        );
+        Ok(())
+    }
+
+    /// DSpark acceptance on REAL (non-counting) text — the honest metric. Counting is trivially
+    /// predictable; this drafts an open-ended coding answer and reports mean accepted length
+    /// (tokens/step) + the per-position histogram, the number the research target (~5+/6) is about.
+    /// It does NOT assert bit-identical to greedy decode (the batched-verify prefill path is only
+    /// tolerance-equal to the decode path on subtle tokens — a separate correctness item); it
+    /// measures how well the drafter conditions on real context via the sliding target-hidden window.
+    #[test]
+    #[ignore]
+    fn wave_speculative_realtext_acceptance() -> Result<()> {
+        let _serial = model_test_guard();
+        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
+        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
+        if !path.exists() || !dspark.exists() {
+            eprintln!("[skip] target or DSpark drafter absent");
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
+        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
+        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+
+        let tok_path = crate::models::batch_test::test_helpers::hf_get(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
+        let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").expect("eos");
+        let n_layers = model.num_layers();
+        let max_draft = 5usize;
+        const MAX_NEW: usize = 128;
+
+        let prompt = "<｜begin▁of▁sentence｜><｜User｜>Write a Python function that returns the \
+             nth Fibonacci number, with a short docstring.<｜Assistant｜>";
+        let ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| candle::Error::msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+
+        let mut session = model.create_batched_session(BatchedConfig::default())?;
+        let seq = session.create_sequence()?;
+        let prompt_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+        let step = model.forward_wave(
+            &mut session,
+            &[],
+            &[],
+            &[seq],
+            std::slice::from_ref(&prompt_t),
+            &[],
+            &[],
+            0,
+            n_layers,
+            None,
+        )?;
+        session.advance_sequence(seq, ids.len())?;
+        let mut committed = step
+            .logits
+            .ok_or_else(|| candle::Error::msg("no prefill logits"))?[0]
+            .i(0)?
+            .argmax(0)?
+            .to_scalar::<u32>()?;
+
+        let mut gen = vec![committed];
+        let mut steps = 0usize;
+        let mut accepts: Vec<usize> = Vec::new();
+        let t0 = std::time::Instant::now();
+        while gen.len() < MAX_NEW && committed != eos {
+            steps += 1;
+            let before = gen.len();
+            let next = model.speculative_decode_step(
+                &mut session,
+                seq,
+                committed,
+                max_draft,
+                n_layers,
+                &mut |t| {
+                    gen.push(t);
+                    gen.len() < MAX_NEW && t != eos
+                },
+            )?;
+            accepts.push(gen.len() - before);
+            match next {
+                Some(c) => committed = c,
+                None => break,
+            }
+        }
+        let dt = t0.elapsed().as_secs_f32();
+        let text = tokenizer.decode(&gen, false).unwrap_or_default();
+        let mean = gen.len() as f32 / steps.max(1) as f32;
+        // Histogram of committed-per-step (1 = no draft accepted … max_draft+1 = full block + bonus).
+        let mut hist = vec![0usize; max_draft + 2];
+        for &a in &accepts {
+            hist[a.min(max_draft + 1)] += 1;
+        }
+        eprintln!("[spec-real] continuation={text:?}");
+        eprintln!("[spec-real] per-step accepted: {accepts:?}");
+        eprintln!(
+            "[spec-real] {} tokens, {steps} steps ⇒ {mean:.2} tokens/step (max_draft={max_draft}); \
+             {:.2} tok/s; committed-per-step histogram (idx=tokens): {hist:?}",
+            gen.len(),
+            gen.len() as f32 / dt.max(1e-6),
+        );
+        #[cfg(feature = "profile")]
+        {
+            // Aggregate forward_wave phase timings — dominated by the verify_block prefills, so this
+            // shows WHERE the ~370 ms/step verify goes (attention vs MoE vs compressor/gallery/seal).
+            let snap = crate::models::profile::pipeline_snapshot_and_reset();
+            let mut es = snap.entries.clone();
+            es.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[verify-prof] forward_wave phases (total ms across run, count):");
+            for (name, ms, count) in es.iter().take(24) {
+                eprintln!("  {name:34} {ms:9.1}ms  x{count}");
+            }
+        }
         Ok(())
     }
 

@@ -2275,55 +2275,6 @@ impl CudaStorage {
         T::as_cuda_slice_mut(self)
     }
 
-    /// Copy a range of U32 data from GPU to a host buffer on a specific stream.
-    ///
-    /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy is
-    /// truly asynchronous — the CPU returns immediately and the DMA engine
-    /// handles the transfer.  This is the async DtoH path used for routing
-    /// index transfer without draining the compute pipeline.
-    ///
-    /// `offset` and `elem_count` identify the sub-range of the device slice
-    /// to copy (from `contiguous_offsets` on the tensor layout).  `dst` must
-    /// have at least `elem_count` elements.
-    ///
-    /// Returns `Err` if the storage is not U32.
-    pub fn copy_u32_to_host_on_stream(
-        &self,
-        dst: &mut [u32],
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        offset: usize,
-        elem_count: usize,
-    ) -> Result<()> {
-        match &self.slice {
-            CudaStorageSlice::U32(slice) => {
-                if offset + elem_count > slice.len() {
-                    crate::bail!(
-                        "copy_u32_to_host_on_stream: range {}..{} exceeds slice len {}",
-                        offset,
-                        offset + elem_count,
-                        slice.len(),
-                    );
-                }
-                if dst.len() < elem_count {
-                    crate::bail!(
-                        "copy_u32_to_host_on_stream: dst too small ({} < {})",
-                        dst.len(),
-                        elem_count,
-                    );
-                }
-                let view = slice.slice(offset..offset + elem_count);
-                stream
-                    .memcpy_dtoh(&view, &mut dst[..elem_count])
-                    .map_err(crate::Error::wrap)?;
-                Ok(())
-            }
-            _ => crate::bail!(
-                "copy_u32_to_host_on_stream: expected U32 storage, got {:?}",
-                self.dtype(),
-            ),
-        }
-    }
-
     /// In-place sparse addition - mutates the tensor directly without cloning.
     /// This is 20x+ faster than add_at_indices for large tensors with sparse updates.
     pub fn add_at_indices_mut(

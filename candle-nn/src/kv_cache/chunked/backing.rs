@@ -1186,6 +1186,22 @@ impl ChunkedKvBacking {
         Some(f(&mut it))
     }
 
+    /// Drop the sequence's cached GPU slot-state buffer so the next metadata
+    /// build re-serialises it from the authoritative CPU chunk state (the
+    /// REBUILD path). Needed when host bookkeeping (`set_len` after a
+    /// truncate) has changed slice lens/rope bases without touching the
+    /// serialized buffer — `set_len` deliberately never writes the pinned DMA
+    /// source (see its comment), so a later build's REUSE path would snapshot
+    /// stale lens. The speculative-verify wave calls this before building its
+    /// virtual-slot headers.
+    pub fn invalidate_decode_slot(&self, batch_idx: usize) {
+        if let Ok(mut state) = self.state.write() {
+            if let Some(Some(seq)) = state.sequences.get_mut(batch_idx) {
+                seq.invalidate_gpu_chunks();
+            }
+        }
+    }
+
     pub fn live_chunks_as_sealed(
         &self,
         batch_idx: usize,

@@ -86,3 +86,7 @@ pub use super::arena_table::ArenaLocation;
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 #[cfg(feature = "cuda")]
 pub use alloc::vram_budget_available;
+// Engine-installed KV VRAM reserve (replaces the card-scaled default with the
+// engine's own measured budget).
+#[cfg(feature = "cuda")]
+pub use alloc::set_vram_reserve_bytes;

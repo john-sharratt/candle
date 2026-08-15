@@ -85,6 +85,11 @@ extern "C" {
         // 0 skips the on-device write-len advance (the wave patches the length
         // host-side into a private snapshot); nonzero keeps it (live buffer).
         commit_write_len: i32,
+        // 1 = every slot's token latent is already in the arena (host writeback,
+        // write-len committed) — skip the fused scatter. The speculative-verify
+        // path runs a block's positions as virtual slots over ONE shared writer
+        // slice; per-slot scatters would clobber a single position.
+        pre_scattered: i32,
         // Nullable stage-dump buffer (16608 f32; see kernel doc) — the mirror
         // oracle's stage-by-stage diagnostics.
         dbg: *mut f32,

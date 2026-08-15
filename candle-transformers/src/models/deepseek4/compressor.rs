@@ -369,7 +369,45 @@ pub struct IncrementalCompressor {
     group_idx: usize,
 }
 
+/// A point-in-time copy of an [`IncrementalCompressor`]'s streaming state — the
+/// partial-group buffers, the overlap prev-group halves, and the group counter.
+/// Tensors are immutable in candle, so the clones are `Arc` bumps: taking a
+/// snapshot is O(buffered rows) pointer copies, no data movement. Used by the
+/// speculative-decode verify path to roll the compressor back to the accepted
+/// prefix after a partial accept (rejected draft tokens must not stay absorbed).
+#[derive(Clone)]
+pub struct CompressorState {
+    kv_rows: Vec<Tensor>,
+    score_rows: Vec<Tensor>,
+    prev_kv_group: Option<Tensor>,
+    prev_score_group: Option<Tensor>,
+    group_idx: usize,
+}
+
 impl IncrementalCompressor {
+    /// Snapshot the streaming state (see [`CompressorState`]). Cheap: `Arc`
+    /// clones of the buffered rows + the counter.
+    pub fn state_snapshot(&self) -> CompressorState {
+        CompressorState {
+            kv_rows: self.kv_rows.clone(),
+            score_rows: self.score_rows.clone(),
+            prev_kv_group: self.prev_kv_group.clone(),
+            prev_score_group: self.prev_score_group.clone(),
+            group_idx: self.group_idx,
+        }
+    }
+
+    /// Restore a [`Self::state_snapshot`] — the compressor behaves exactly as it
+    /// did at snapshot time (bit-identical emissions for identical subsequent
+    /// rows; the snapshotted tensors are immutable).
+    pub fn state_restore(&mut self, s: CompressorState) {
+        self.kv_rows = s.kv_rows;
+        self.score_rows = s.score_rows;
+        self.prev_kv_group = s.prev_kv_group;
+        self.prev_score_group = s.prev_score_group;
+        self.group_idx = s.group_idx;
+    }
+
     /// Feed one token's hidden state `x` (`[dim]` / `[1, dim]` / `[1, 1, dim]`) at the next
     /// sequence position and, when it completes a group of `ratio` tokens, return that group's
     /// compressed entry `[1, 1, d]` (post RMSNorm + RoPE). Returns `None` mid-group.
@@ -1083,6 +1121,175 @@ mod tests {
         // Non-overlapping (ratio 3).
         emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 13)?;
         emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 5)?;
+        Ok(())
+    }
+
+    /// The speculative-verify rollback contract: snapshot → absorb a whole verify
+    /// block (accepted prefix + rejected draft tail, crossing a group boundary
+    /// INSIDE the block — the corrupting case) → `state_restore` +
+    /// `emit_groups_projected` over ONLY the accepted prefix must leave the
+    /// compressor in exactly the state of never having seen the rejected tail:
+    /// the replay's emissions AND every later emission (positions and bytes)
+    /// match a reference stream fed the accepted prefix alone.
+    fn snapshot_restore_replay_case(
+        ratio: usize,
+        d: usize,
+        rd: usize,
+        accepted: usize,
+    ) -> Result<()> {
+        let dev = Device::Cpu;
+        let dim = 8usize;
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let rope = RotaryCache::new(rd, 160000.0, 64, 16.0, 32.0, 1.0, &dev)?;
+        let c = Compressor::new(
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (ratio, coff * d), &dev)?,
+            Tensor::randn(0f32, 1.0, d, &dev)?,
+            ratio,
+            d,
+            rd,
+            1e-6,
+        );
+        // Pre-rows: one full group behind (prev-group overlap populated) + a
+        // partial buffer, so the 6-row block crosses the next boundary mid-block.
+        let n_pre = 2 * ratio - 1;
+        let block = 6usize;
+        let tail = 2 * ratio;
+        let pre_x = Tensor::randn(0f32, 1.0, (n_pre, dim), &dev)?;
+        let blk_x = Tensor::randn(0f32, 1.0, (block, dim), &dev)?;
+        let cont_x = Tensor::randn(0f32, 1.0, (tail, dim), &dev)?;
+        let (kv_pre, sc_pre) = c.project_rows(&pre_x)?;
+        let (kv_blk, sc_blk) = c.project_rows(&blk_x)?;
+        let (kv_cont, sc_cont) = c.project_rows(&cont_x)?;
+
+        for roped in [false, true] {
+            let rope_arg = if roped { Some(&rope) } else { None };
+            // Per-row feed helper (matches the live decode/prefill streaming path).
+            let feed = |inc: &mut IncrementalCompressor,
+                        kv: &Tensor,
+                        sc: &Tensor,
+                        range: std::ops::Range<usize>,
+                        ent: &mut Vec<Tensor>,
+                        pos: &mut Vec<u32>|
+             -> Result<()> {
+                for t in range {
+                    let k = kv.narrow(0, t, 1)?;
+                    let s = sc.narrow(0, t, 1)?;
+                    if roped {
+                        if let Some(e) = inc.push_projected_roped(&k, &s, &rope)? {
+                            ent.push(e.reshape((1, d))?);
+                        }
+                    } else if let Some((e, p)) = inc.push_projected(&k, &s)? {
+                        ent.push(e.reshape((1, d))?);
+                        pos.push(p);
+                    }
+                }
+                Ok(())
+            };
+
+            // Reference: pre + accepted prefix + continuation — the rejected tail
+            // never existed. Emissions collected from the accepted prefix onward.
+            let mut r = c.incremental();
+            let (mut r_ent, mut r_pos) = (Vec::new(), Vec::new());
+            feed(
+                &mut r,
+                &kv_pre,
+                &sc_pre,
+                0..n_pre,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            feed(
+                &mut r,
+                &kv_blk,
+                &sc_blk,
+                0..accepted,
+                &mut r_ent,
+                &mut r_pos,
+            )?;
+            feed(&mut r, &kv_cont, &sc_cont, 0..tail, &mut r_ent, &mut r_pos)?;
+
+            // Test: pre → SNAPSHOT → the whole block (draft tail absorbed) →
+            // RESTORE → replay the accepted prefix (the rollback's exact call) →
+            // continuation.
+            let mut t_ = c.incremental();
+            let (mut t_ent, mut t_pos) = (Vec::new(), Vec::new());
+            feed(
+                &mut t_,
+                &kv_pre,
+                &sc_pre,
+                0..n_pre,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            let snap = t_.state_snapshot();
+            feed(
+                &mut t_,
+                &kv_blk,
+                &sc_blk,
+                0..block,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            t_.state_restore(snap);
+            if accepted > 0 {
+                if let Some((e, p)) = t_.emit_groups_projected(
+                    &kv_blk.narrow(0, 0, accepted)?,
+                    &sc_blk.narrow(0, 0, accepted)?,
+                    rope_arg,
+                )? {
+                    let g = e.dim(0)?;
+                    for gi in 0..g {
+                        t_ent.push(e.narrow(0, gi, 1)?);
+                    }
+                    if !roped {
+                        t_pos.extend(p);
+                    }
+                }
+            }
+            feed(&mut t_, &kv_cont, &sc_cont, 0..tail, &mut t_ent, &mut t_pos)?;
+
+            assert_eq!(
+                r_ent.len(),
+                t_ent.len(),
+                "emission count (ratio={ratio}, accepted={accepted}, roped={roped})"
+            );
+            if !roped {
+                assert_eq!(
+                    r_pos, t_pos,
+                    "group positions (ratio={ratio}, accepted={accepted}) — a mismatch means \
+                     group_idx was not rolled back"
+                );
+            }
+            if !r_ent.is_empty() {
+                let a = Tensor::cat(&r_ent, 0)?.flatten_all()?.to_vec1::<f32>()?;
+                let b = Tensor::cat(&t_ent, 0)?.flatten_all()?.to_vec1::<f32>()?;
+                let max_abs = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    max_abs < 1e-6,
+                    "restore+replay diverges from clean absorb \
+                     (ratio={ratio}, accepted={accepted}, roped={roped}): max|Δ| = {max_abs}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_restore_replay_matches_clean_absorb() -> Result<()> {
+        for &ratio in &[4usize, 3] {
+            let (d, rd) = if ratio == 4 { (6, 4) } else { (5, 2) };
+            // accepted = 0 (all drafts rejected), 1 (boundary completes during
+            // replay for ratio 4), mid, and block-1 (max partial).
+            for accepted in [0usize, 1, 3, 5] {
+                snapshot_restore_replay_case(ratio, d, rd, accepted)?;
+            }
+        }
         Ok(())
     }
 

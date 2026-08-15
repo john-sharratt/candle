@@ -2998,6 +2998,7 @@ fn ko_gpu_quantize_dequant_matches_cpu() -> Result<()> {
         })
         .collect();
     for dtype in [
+        GgmlDType::Q2_KO,
         GgmlDType::Q4_KO,
         GgmlDType::Q5_KO,
         GgmlDType::Q6_KO,
@@ -3396,6 +3397,96 @@ fn dense_int8_matches_grouped() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Q2_KO (2-bit affine KO twin) int8 grouped GEMM correctness: the `q2_ko_int8_f32_grouped`
+/// kernel + its 2-bit crumb unpack (`loader/q2_KO.cuh`) must reproduce a CPU f32 reference matmul
+/// over the SAME weights. The weights are built from random f32 via the CPU codec `quantize_ko`
+/// (byte-identical to the GPU `run_quantize_ko`, so exactly what the kernel reads) and the f32
+/// reference uses `dequant_ko` of those bytes — so the 2-bit WEIGHT is identical on both sides,
+/// isolating the kernel's unpack + per-128 (scale,min) fold. The only divergence is the int8
+/// activation quant (well-conditioned uniform activations → ~1%). A wrong crumb unpack, byte
+/// order, or fold produces gross error / NaN, not ~1%. Tile widths 1/8/16/24 exercise the
+/// ceil(m/16) tiling incl. a partial trailing sub-tile (24 > 16).
+#[test]
+fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let nrows = 256usize; // N (output features, mult of 32)
+    let ncols = 512usize; // K (input features, mult of 128)
+    let expert_batches = [1usize, 8, 16, 24];
+    let total_batch: usize = expert_batches.iter().sum();
+    let mut rng = rand::rng();
+    let stream = dev.cuda_stream();
+
+    // Per-expert Q2_KO weights (CPU codec == GPU layout) + their exact f32 dequant.
+    let mut weight_ptrs: Vec<u64> = Vec::new();
+    let mut _storages = Vec::new(); // keep device buffers alive for the launch
+    let mut ref_w: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..expert_batches.len() {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-0.5f32..0.5))
+            .collect();
+        let q2ko = crate::quantized::ko_quant::quantize_ko(&w, nrows, ncols, GgmlDType::Q2_KO);
+        ref_w.push(crate::quantized::ko_quant::dequant_ko(
+            &q2ko,
+            nrows,
+            ncols,
+            GgmlDType::Q2_KO,
+        ));
+        let slice = dev.memcpy_stod(&q2ko)?;
+        let p = {
+            let (p, _g) = slice.device_ptr(&stream);
+            p // guard drops here; the pointer stays valid while `slice` lives in `_storages`
+        };
+        weight_ptrs.push(p);
+        _storages.push(slice);
+    }
+
+    let act_data: Vec<f32> = (0..total_batch * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let q8a128 = quantize_acts_q8a128_test(&dev, &act_data, total_batch, ncols)?;
+    let mut expert_offsets: Vec<i32> = vec![0];
+    for &b in &expert_batches {
+        expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
+    }
+
+    let int8 = grouped_qmatmul(
+        DynamicTensor::Int8(&q8a128),
+        &weight_ptrs,
+        GgmlDType::Q2_KO,
+        nrows,
+        &expert_offsets,
+        &dev,
+    )?;
+    let vi = read_f32_tensor(&dev, &int8)?; // [total_batch, nrows] row-major
+
+    // CPU f32 reference over the same dequantized weights (raw f32 activations).
+    let mut vref = vec![0f32; total_batch * nrows];
+    for (e, _) in expert_batches.iter().enumerate() {
+        let (lo, hi) = (expert_offsets[e] as usize, expert_offsets[e + 1] as usize);
+        for t in lo..hi {
+            for n in 0..nrows {
+                let mut acc = 0f32;
+                for k in 0..ncols {
+                    acc += ref_w[e][n * ncols + k] * act_data[t * ncols + k];
+                }
+                vref[t * nrows + n] = acc;
+            }
+        }
+    }
+    assert_eq!(vi.len(), vref.len());
+    assert!(
+        vi.iter().all(|x| x.is_finite()),
+        "Q2_KO int8 grouped produced non-finite output (broken unpack/fold)"
+    );
+    let rel = rel_l2(&vi, &vref);
+    println!("Q2_KO int8 grouped vs f32 ref: rel_l2 = {rel:.5}");
+    assert!(
+        rel < 0.03,
+        "Q2_KO int8 grouped diverged (rel_l2 = {rel:.5})"
+    );
     Ok(())
 }
 

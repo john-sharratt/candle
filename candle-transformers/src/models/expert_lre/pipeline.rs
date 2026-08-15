@@ -195,7 +195,11 @@ fn startup_two_tier_ko_blockread(
     // Pass 2a — pinned experts: parallel positioned reads DIRECT into the pinned
     // slot bytes (each `p` is unique ⇒ the destination ranges are disjoint).
     let t_pin = std::time::Instant::now();
-    let base = pinned_pool.base_ptr() as usize;
+    // Chunk bases + geometry, carried into the threads as plain integers. Slot `p` lives in chunk
+    // `p / slots_per_chunk` at local offset `(p % slots_per_chunk) * slot_size` — the chunked
+    // PinnedPool's own addressing, inlined so the parallel fill needs no `&pool`.
+    let chunk_ptrs = pinned_pool.chunk_ptrs();
+    let slots_per_chunk = pinned_pool.slots_per_chunk();
     let slot_size = pinned_pool.slot_size();
     let pin_errs: usize = pinned_jobs
         .par_iter()
@@ -214,9 +218,9 @@ fn startup_two_tier_ko_blockread(
                 );
                 // SAFETY: `p` is a unique slot index, so this range does not
                 // overlap any other worker's range; the pool outlives the fill.
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut((base + p * slot_size) as *mut u8, g + u + d)
-                };
+                let slot_base = chunk_ptrs[p / slots_per_chunk] + (p % slots_per_chunk) * slot_size;
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(slot_base as *mut u8, g + u + d) };
                 let ok = read_exact_at(file, &mut dst[..g], r.gate_offset as u64).is_ok()
                     && read_exact_at(file, &mut dst[g..g + u], r.up_offset as u64).is_ok()
                     && read_exact_at(file, &mut dst[g + u..g + u + d], r.down_offset as u64)

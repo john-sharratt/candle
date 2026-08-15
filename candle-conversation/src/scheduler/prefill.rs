@@ -277,7 +277,7 @@ const VRAM_COMPRESS_HYSTERESIS: u64 = 4;
 /// compaction (a 20 s `compact_forced` was the symptom). Env-tunable; the
 /// `candle_nn::kv_cache::compact` timing log shows the moves→ms ratio to tune it.
 const DEFAULT_COMPACT_BASE_MOVES: usize = 4000;
-fn compact_base_moves() -> usize {
+pub(super) fn compact_base_moves() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("CANDLE_VRAM_COMPACT_BASE_MOVES")
@@ -2916,15 +2916,36 @@ impl candle::vram::KvReliefDriver for SchedulerReliefDriver<'_> {
                 // usually plenty of warm turns, so we skip the multi-second wait).
                 let evict_t = std::time::Instant::now();
                 let mut rep = self.sched.evict_cold_tail(want);
-                if rep.bytes < want {
-                    self.flushed |= super::timed_wait(|| {
+                // Under a heavy ingest burst (startup calibration + workspace ingest) the
+                // hot→warm drain — pageable warm at ≈½ PCIe, ~1.4 GB/s in the field — lags the
+                // seal rate, so the first pass finds few warm-backed turns to drop and frees
+                // ~nothing. Rather than give up after a single 1 s flush and escalate to the
+                // no-op Critical rung — which leaves the next KV arena alloc to fail with a
+                // FATAL "quantized arena … insufficient after compaction" that exits the daemon
+                // — pump the drain in bounded 1 s steps, evicting the turns each step makes
+                // warm-backed, until we free `want` or a step makes no progress. This trades a
+                // few seconds of scheduler stall for not crashing, and only fires at the deepest
+                // rung where the alternative is the OOM itself.
+                const COSTLY_FLUSH_STEPS: usize = 6;
+                for _ in 0..COSTLY_FLUSH_STEPS {
+                    if rep.bytes >= want {
+                        break;
+                    }
+                    let flushed = super::timed_wait(|| {
                         self.sched
                             .persist_trigger
                             .flush_blocking(std::time::Duration::from_secs(1))
                     });
+                    self.flushed |= flushed;
                     let more = self.sched.evict_cold_tail(want.saturating_sub(rep.bytes));
                     rep.count += more.count;
                     rep.bytes += more.bytes;
+                    // A drain pass completed but produced nothing evictable AND no more turns
+                    // became warm-backed ⇒ the drain can't make headroom right now; stop
+                    // spinning instead of stalling pointlessly to the step cap.
+                    if !flushed && more.bytes == 0 {
+                        break;
+                    }
                 }
                 let evict_ms = evict_t.elapsed().as_millis() as u64;
                 self.evicted.count += rep.count;

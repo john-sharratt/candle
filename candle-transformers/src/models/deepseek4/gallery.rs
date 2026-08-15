@@ -132,6 +132,15 @@ impl FloatGallery {
         self.len == 0
     }
 
+    /// Roll the gallery back to its first `len` entries. Every reader narrows to
+    /// `self.len` and [`Self::append_batch`] writes rows at `len..`, so entries
+    /// beyond the new length become inert and are overwritten by the next
+    /// append — no buffer surgery needed. Used by the speculative-decode verify
+    /// rollback to drop groups pooled over rejected draft tokens.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
     /// The live attended-entry rows `[len, head_dim]` f32, reconstructed from the
     /// two-region cache (reference/bench only — the live path reads the
     /// two-region directly). Returns exactly what the decode/prefill kernels see.

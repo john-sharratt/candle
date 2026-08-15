@@ -129,6 +129,20 @@ struct Cli {
     /// is UNAUTHENTICATED, so only expose it on a trusted network.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+
+    /// Download the DeepSeek-V4-Flash model + the DSpark speculative-decode
+    /// drafter into `--model-dir`, then exit without starting the daemon. Files
+    /// already on disk are kept — only the missing ones are fetched, so adding the
+    /// drafter to an existing main-model install pulls just the ~10.9 GB DSpark
+    /// GGUF. Runs the same automatic HF fetch as the model download, no manual curl.
+    #[arg(long)]
+    download_deepseek: bool,
+
+    /// Target directory for the DeepSeek-V4-Flash GGUFs (with
+    /// `--download-deepseek`). Defaults to
+    /// `~/.cache/zend/models/deepseek-v4-flash-mxfp4`.
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -220,6 +234,36 @@ async fn main() -> anyhow::Result<()> {
         .with(ws_layer)
         .with(file_layer)
         .init();
+
+    // ── `--download-deepseek`: fetch the model + DSpark drafter, then exit ─────
+    //
+    // A pure network task — resolves the DeepSeek-V4-Flash splits and the DSpark
+    // speculative-decode drafter into `--model-dir` (default under the zend cache),
+    // downloading only what's missing. No GPU, no daemon: run it once to provision a
+    // machine, or to add the drafter to an existing main-model install.
+    if cli.download_deepseek {
+        let dir = cli.model_dir.clone().unwrap_or_else(download::deepseek_dir);
+        let (tx, mut rx) = tokio::sync::watch::channel(String::new());
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let s = rx.borrow().clone();
+                if !s.is_empty() {
+                    tracing::info!("{s}");
+                }
+            }
+        });
+        tracing::info!(
+            "provisioning DeepSeek-V4-Flash + DSpark drafter into {}",
+            dir.display()
+        );
+        let paths = download::ensure_deepseek(&dir, &tx).await?;
+        tracing::info!(
+            "DeepSeek-V4-Flash ready: {} splits + DSpark drafter at {}",
+            paths.splits.len(),
+            paths.dspark.display()
+        );
+        return Ok(());
+    }
 
     // ── GPU poison watchdog ──────────────────────────────────────────────────
     //

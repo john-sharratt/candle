@@ -166,6 +166,58 @@ impl Attention {
         self.output_proj(&o.transpose(1, 2)?.contiguous()?, b, s)
     }
 
+    /// DSpark `graph_dsv4` attention: **non-causal** latent attention with an **injected
+    /// context**. The draft block `x` `[b, s, dim]` forms the queries; the keys/values are
+    /// `[wkv(ctx) ‖ wkv(x)]` — the injected context `ctx` `[n_ctx, dim]` (the encoder's `Hctx`)
+    /// projected by this layer's own `wkv`, concatenated ahead of the block's own KV. There is
+    /// **no causal mask** (block-diffusion: every block position sees the whole context and every
+    /// other block position). `ctx_start` / `q_start` are the absolute RoPE positions of the
+    /// context and the block. SWA-only (the DSpark blocks carry no compressor). Returns
+    /// `[b, s, dim]`. Mirrors the reference `forward` — same `rms_scale`/`rope_last`/`sink_attend`/
+    /// `output_proj` helpers — differing only in the injected KV and the absent causal mask.
+    pub fn forward_injected(
+        &self,
+        x: &Tensor,
+        ctx: &Tensor,
+        rope: &RotaryCache,
+        ctx_start: usize,
+        q_start: usize,
+    ) -> Result<Tensor> {
+        let (b, s, dim) = x.dims3()?;
+        let (h, hd) = (self.n_heads, self.head_dim);
+        let x = x.to_dtype(DType::F32)?;
+        let n_ctx = ctx.dim(0)?;
+        let ctx = ctx.to_dtype(DType::F32)?.reshape((1, n_ctx, dim))?;
+
+        // --- queries from the draft block ---
+        let qr = rms_norm(&self.wq_a.forward(&x)?, &self.q_norm, self.eps)?;
+        let q = self.wq_b.forward(&qr)?.reshape((b, s, h, hd))?;
+        let q = self.rms_scale(&q)?;
+        let q = q.transpose(1, 2)?.contiguous()?; // [b,h,s,hd]
+        let q = self.rope_last(&q, rope, q_start, false)?; // rope by block position
+
+        // --- keys/values: injected context ‖ draft block, both via this layer's wkv ---
+        let kv_b = rms_norm(&self.wkv.forward(&x)?, &self.kv_norm, self.eps)?; // [b,s,hd]
+        let kv_b = self.rope_last(&kv_b, rope, q_start, false)?;
+        let kv_c = rms_norm(&self.wkv.forward(&ctx)?, &self.kv_norm, self.eps)?; // [1,n_ctx,hd]
+        let kv_c = self.rope_last(&kv_c, rope, ctx_start, false)?;
+        let kv_c = kv_c.broadcast_as((b, n_ctx, hd))?;
+        let kv_full = Tensor::cat(&[&kv_c, &kv_b], 1)?; // [b, n_ctx+s, hd]
+        let k = n_ctx + s;
+
+        // --- scores (non-causal: no additive mask) ---
+        let kv_t = kv_full
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, 1, hd, k))?;
+        let scores = (q.contiguous()?.broadcast_matmul(&kv_t)? * self.softmax_scale)?; // [b,h,s,k]
+
+        // --- sink softmax + value gather, de-rotate, grouped output projection ---
+        let o = self.sink_attend(&scores, &kv_full)?; // [b,h,s,hd]
+        let o = self.rope_last(&o, rope, q_start, true)?; // inverse RoPE on the block positions
+        self.output_proj(&o.transpose(1, 2)?.contiguous()?, b, s)
+    }
+
     /// RoPE the trailing `rope_head_dim` dims of a `[.., seq, head_dim]` tensor (seq at
     /// `Minus2`), leaving the leading `nope` dims untouched.
     fn rope_last(

@@ -330,7 +330,8 @@ pub fn paged_latent_decode(
         softmax_scale,
         window_size,
         num_splits_override,
-        true, // tensor-headers path is the live buffer: advance the write-len
+        true,  // tensor-headers path is the live buffer: advance the write-len
+        false, // …and its token is fused-scattered by the kernel
         ws,
         dbg,
     )
@@ -355,6 +356,11 @@ pub fn paged_latent_decode_raw(
     window_size: usize,
     num_splits_override: usize,
     commit_write_len: bool,
+    // Every slot's token latent is already in the arena with the write-len
+    // committed over it (host writeback) — the kernel skips its fused scatter.
+    // The speculative-verify path sets this: a block's positions run as virtual
+    // slots over ONE shared writer slice, where per-slot scatters would clobber.
+    pre_scattered: bool,
     ws: &LatentWorkspace,
     dbg: Option<&Tensor>,
 ) -> Result<Tensor> {
@@ -445,6 +451,7 @@ pub fn paged_latent_decode_raw(
             max_sel as i32,
             num_splits as i32,
             commit_write_len as i32,
+            pre_scattered as i32,
             dbg_p as *mut f32,
             stream.cu_stream() as *mut core::ffi::c_void,
         );
@@ -3564,7 +3571,8 @@ mod tests {
             softmax_scale,
             case.window_size,
             case.num_splits,
-            true, // single-step audit against the live buffer
+            true,  // single-step audit against the live buffer
+            false, // fused scatter writes the token
             &ws,
             None,
         )?;
@@ -3720,6 +3728,7 @@ mod tests {
                 window_size,
                 1,
                 !snapshot, // live buffer commits on-device; snapshot patches host-side
+                false,     // fused scatter writes the token in both modes
                 &ws,
                 None,
             )?;

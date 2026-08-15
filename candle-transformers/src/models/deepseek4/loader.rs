@@ -514,6 +514,40 @@ pub fn load_block(
     ))
 }
 
+/// Load a DSpark drafter block: the mHC-wrapped attention sub-block + its norms, but **no** eager
+/// MoE. The drafter's routed experts are far too large to keep VRAM-resident, so its MoE lives in
+/// the shared [`super::dspark_experts::DsparkStreamingMoe`] (host RAM + a small hot slot set) and is
+/// spliced into the FFN sub-block at forward time. This reads exactly the block's attention/norm/hc
+/// tensors — the `ffn_gate_inp`/`ffn_*_exps`/`ffn_*_shexp` weights are read by the streaming MoE.
+pub fn load_dspark_block(
+    m: &mut GgufModel,
+    cfg: &Config,
+    layer: usize,
+    device: &Device,
+) -> Result<super::dspark::DsparkBlock> {
+    use super::hyper::HyperConnection;
+    let b = format!("blk.{layer}.");
+    let hc = HyperConnection::new(cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps);
+    // Load the backbone attention + mHC mixes as int8 (the target engine's expert/perf mode), not
+    // full precision: the drafter is lossless (every draft is verified against the target), so int8
+    // drafter weights only affect acceptance, never output — and they halve the drafter's VRAM
+    // footprint, which matters on a box where the target already saturates the pinned pool.
+    let hc_attn = load_hc_params(m, &format!("{b}hc_attn"), device, Int8Mode::Performance)?;
+    let hc_ffn = load_hc_params(m, &format!("{b}hc_ffn"), device, Int8Mode::Performance)?;
+    let attn_norm = dequant_f32(m, &format!("{b}attn_norm.weight"), device)?;
+    let ffn_norm = dequant_f32(m, &format!("{b}ffn_norm.weight"), device)?;
+    let attn = load_attention(m, cfg, layer, device, Int8Mode::Performance)?;
+    Ok(super::dspark::DsparkBlock::new(
+        hc,
+        hc_attn,
+        hc_ffn,
+        attn_norm,
+        ffn_norm,
+        attn,
+        cfg.norm_eps,
+    ))
+}
+
 /// Read the `deepseek4.*` metadata into a [`Config`], falling back to the model defaults
 /// for anything the file omits.
 pub fn config_from_gguf(m: &GgufModel) -> Result<Config> {

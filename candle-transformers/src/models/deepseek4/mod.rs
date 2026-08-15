@@ -24,6 +24,8 @@ mod attention;
 pub mod bench;
 mod compressor;
 mod config;
+mod dspark;
+mod dspark_experts;
 #[cfg(feature = "cuda")]
 mod engine;
 #[cfg(feature = "cuda")]
@@ -50,6 +52,9 @@ mod wave;
 pub use attention::{Attention, AttentionParams};
 pub use compressor::Compressor;
 pub use config::{Config, LayerKind};
+#[cfg(feature = "cuda")]
+pub use dspark::DsparkDrafter;
+pub use dspark::{ConfidenceHead, DsparkConfig, MarkovHead};
 pub use footprint::{
     deepseek_kv_footprint, fp16_linear_baseline_bytes, ratio_vs_fp16_linear, KvFootprint,
     CORPUS_DTYPE, WINDOW_KV_DTYPE,

@@ -368,10 +368,11 @@ fn ko_params(dtype: GgmlDType) -> Option<(i32, usize, usize)> {
 /// Bytes in one k1024 chunk (8 rows × 128 K) for a KO dtype.
 pub fn ko_chunk_bytes(dtype: GgmlDType) -> usize {
     match dtype {
-        GgmlDType::Q4_KO => 512 + 32,                    // ql + dm
-        GgmlDType::Q5_KO => 512 + 128 + 32,              // ql + hi + dm
-        GgmlDType::Q6_KO => 512 + 256 + 32,              // ql + crumb + dm
-        GgmlDType::Q8_KO => 1024 + 32,                   // b0 + b1 + dm
+        GgmlDType::Q2_KO => 256 + 32,       // crumb (2-bit values) + dm
+        GgmlDType::Q4_KO => 512 + 32,       // ql + dm
+        GgmlDType::Q5_KO => 512 + 128 + 32, // ql + hi + dm
+        GgmlDType::Q6_KO => 512 + 256 + 32, // ql + crumb + dm
+        GgmlDType::Q8_KO => 1024 + 32,      // b0 + b1 + dm
         GgmlDType::MXFP4_KO => MXFP4_KO_GPU_CHUNK_BYTES, // 512 ql + 32 e + 32 dm
         _ => 0,
     }
@@ -390,6 +391,9 @@ pub fn quantize_ko(w: &[f32], nrows: usize, ncols: usize, dtype: GgmlDType) -> V
     assert_eq!(w.len(), nrows * ncols, "KO quantize: data length mismatch");
     if dtype == GgmlDType::Q8_KO {
         return quantize_q8_ko(w, nrows, ncols);
+    }
+    if dtype == GgmlDType::Q2_KO {
+        return quantize_q2_ko(w, nrows, ncols);
     }
     let (maxq, crumb_bytes, hi_bytes) =
         ko_params(dtype).unwrap_or_else(|| panic!("not a KO dtype: {dtype:?}"));
@@ -501,6 +505,9 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
     if dtype == GgmlDType::Q8_KO {
         return dequant_q8_ko(chunk, nrows, ncols);
     }
+    if dtype == GgmlDType::Q2_KO {
+        return dequant_q2_ko(chunk, nrows, ncols);
+    }
     let (maxq, crumb_bytes, hi_bytes) =
         ko_params(dtype).unwrap_or_else(|| panic!("not a KO dtype: {dtype:?}"));
     let _ = maxq;
@@ -548,6 +555,93 @@ pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) ->
                         }
                         let k = sub * 32 + kk;
                         out[row * ncols + k_blk * 128 + k] = scale * qv as f32 + mn;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Q2_KO: 2-bit affine KO twin — per-128 `(scale, min)`, value 0..3. Layout per 8-row × 128-K
+/// chunk (288 B): a 256 B **crumb** region + 32 B `dm`. The crumb region is byte-identical to the
+/// high-2-bit crumb region `Q6_KO` already carries — for `(lane = r*4 + q3, sub)`, `cr0` at
+/// `lane*8 + sub*2` packs the 4 LOW-half values (`q[sub*32 + q3*4 + j]`, 2 bits at `2j`) and
+/// `cr1` at `+1` the 4 HIGH-half values (`q[sub*32 + 16 + q3*4 + j]`) — but here the crumb IS the
+/// whole value (Q6 stores only the high 2 bits of a 6-bit value). One row's 32 B = one
+/// `block_c_q2_KO_k128`. `dm[r] = (scale, min)` f16 at `256 + r*4`.
+fn quantize_q2_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
+    let k_blocks = ncols / 128;
+    let row_groups = nrows / 8;
+    let dm_base = 256;
+    let chunk_bytes = dm_base + 32; // 288
+    let mut ob = vec![0u8; k_blocks * row_groups * chunk_bytes];
+    for k_blk in 0..k_blocks {
+        for g in 0..row_groups {
+            let cbase = (k_blk * row_groups + g) * chunk_bytes;
+            for r in 0..8 {
+                let row = g * 8 + r;
+                let wbase = row * ncols + k_blk * 128;
+                let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                for kk in 0..128 {
+                    let v = w[wbase + kk];
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+                let scale = ((mx - mn) / 3.0).max(1e-12);
+                let mut q = [0u8; 128];
+                for kk in 0..128 {
+                    q[kk] = (((w[wbase + kk] - mn) / scale).round() as i32).clamp(0, 3) as u8;
+                }
+                for sub in 0..4 {
+                    for q3 in 0..4 {
+                        let lane = r * 4 + q3;
+                        let (mut cr0, mut cr1) = (0u8, 0u8);
+                        for j in 0..4 {
+                            cr0 |= (q[sub * 32 + q3 * 4 + j] & 0x3) << (2 * j);
+                            cr1 |= (q[sub * 32 + 16 + q3 * 4 + j] & 0x3) << (2 * j);
+                        }
+                        ob[cbase + lane * 8 + sub * 2] = cr0;
+                        ob[cbase + lane * 8 + sub * 2 + 1] = cr1;
+                    }
+                }
+                let d = cbase + dm_base + r * 4;
+                ob[d..d + 2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+                ob[d + 2..d + 4].copy_from_slice(&f16::from_f32(mn).to_le_bytes());
+            }
+        }
+    }
+    ob
+}
+
+/// Inverse of [`quantize_q2_ko`] — reconstruct F32 `W = scale·q + min` from the crumb chunk.
+fn dequant_q2_ko(chunk: &[u8], nrows: usize, ncols: usize) -> Vec<f32> {
+    let k_blocks = ncols / 128;
+    let row_groups = nrows / 8;
+    let dm_base = 256;
+    let chunk_bytes = dm_base + 32;
+    let mut out = vec![0f32; nrows * ncols];
+    for k_blk in 0..k_blocks {
+        for g in 0..row_groups {
+            let cbase = (k_blk * row_groups + g) * chunk_bytes;
+            for r in 0..8 {
+                let row = g * 8 + r;
+                let d = cbase + dm_base + r * 4;
+                let scale = f16::from_le_bytes([chunk[d], chunk[d + 1]]).to_f32();
+                let mn = f16::from_le_bytes([chunk[d + 2], chunk[d + 3]]).to_f32();
+                for sub in 0..4 {
+                    for q3 in 0..4 {
+                        let lane = r * 4 + q3;
+                        let cr0 = chunk[cbase + lane * 8 + sub * 2] as u32;
+                        let cr1 = chunk[cbase + lane * 8 + sub * 2 + 1] as u32;
+                        for j in 0..4 {
+                            let v0 = (cr0 >> (2 * j)) & 0x3;
+                            let v1 = (cr1 >> (2 * j)) & 0x3;
+                            let k0 = sub * 32 + q3 * 4 + j;
+                            let k1 = sub * 32 + 16 + q3 * 4 + j;
+                            out[row * ncols + k_blk * 128 + k0] = scale * v0 as f32 + mn;
+                            out[row * ncols + k_blk * 128 + k1] = scale * v1 as f32 + mn;
+                        }
                     }
                 }
             }
@@ -812,6 +906,7 @@ mod tests {
         // (dtype, rel-L2 ceiling) — the per-128 affine quant error (≈1/maxq/√3), shrinking
         // with bit width; matches the dense bench's "vs f32 ground truth" column.
         for &(dtype, ceil) in &[
+            (GgmlDType::Q2_KO, 0.400), // ~0.325 (≈1/3, the 2-bit affine floor — 4 levels)
             (GgmlDType::Q4_KO, 0.080), // ~0.065
             (GgmlDType::Q5_KO, 0.050), // ~0.033
             (GgmlDType::Q6_KO, 0.025), // ~0.017
@@ -827,5 +922,69 @@ mod tests {
             let rel = rel_l2(&de, &w);
             assert!(rel < ceil, "{dtype:?} round-trip rel_l2 {rel:.5} ≥ {ceil}");
         }
+    }
+
+    /// Q2_KO RAW BYTES (per the codec rule — exact bytes, not a tolerance). One 8×128 chunk with
+    /// `w[r][k] = (k % 4)` → per row min=0, max=3, scale=1, `q[k] = k % 4`. Each `(lane, sub)`
+    /// crumb byte then packs values (0,1,2,3) at bit positions (0,2,4,6) = `0b11_10_01_00 = 0xE4`
+    /// for BOTH cr0 (low half) and cr1 (high half), since `q` is periodic mod 4. dm = (1.0, 0.0)
+    /// = f16 `0x3C00`,`0x0000`. Pins the crumb pack + dm layout the CUDA `block_c_q2_KO` loader reads.
+    #[test]
+    fn q2_ko_raw_bytes() {
+        let (nrows, ncols) = (8usize, 128usize);
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|i| ((i % ncols) % 4) as f32)
+            .collect();
+        let chunk = quantize_ko(&w, nrows, ncols, GgmlDType::Q2_KO);
+        assert_eq!(chunk.len(), 288, "one 8×128 chunk = 256 crumb + 32 dm");
+        for (i, b) in chunk[..256].iter().enumerate() {
+            assert_eq!(
+                *b, 0xE4,
+                "crumb byte {i} must be 0xE4 (values 0,1,2,3 packed)"
+            );
+        }
+        for r in 0..8 {
+            let d = 256 + r * 4;
+            assert_eq!(
+                &chunk[d..d + 4],
+                &[0x00, 0x3C, 0x00, 0x00],
+                "dm row {r} = (scale 1.0, min 0.0) f16"
+            );
+        }
+        // On-grid input → dequant is EXACT (scale·q + min with q ∈ {0,1,2,3}, scale=1, min=0).
+        let de = dequant_ko(&chunk, nrows, ncols, GgmlDType::Q2_KO);
+        assert_eq!(de, w, "Q2_KO dequant must be exact on the 4-level grid");
+    }
+
+    /// Q2_KO crumb byte varies correctly with the quantized values: a row whose 128 values step
+    /// 0,1,2,3,0,… but OFFSET so a specific (lane,sub) sees a distinct pattern pins the bit order
+    /// (value j at bits 2j), not just the all-periodic 0xE4 case.
+    #[test]
+    fn q2_ko_crumb_bit_order() {
+        // Row 0, sub 0, q3 0 → low-half K positions 0,1,2,3 with values 3,2,1,0 (reverse) →
+        // cr0 = 3<<0 | 2<<2 | 1<<4 | 0<<6 = 3 | 8 | 16 = 0x1B. Build w so only that quad reverses.
+        let (nrows, ncols) = (8usize, 128usize);
+        let mut w: Vec<f32> = vec![0.0; nrows * ncols];
+        // Give every row full range [0,3] (so scale=1, min=0) via K=4..7 = 0,1,2,3; the tested
+        // quad K=0..3 = 3,2,1,0.
+        for r in 0..nrows {
+            let base = r * ncols;
+            for (k, val) in [3.0f32, 2.0, 1.0, 0.0].iter().enumerate() {
+                w[base + k] = *val;
+            }
+            for (k, val) in [0.0f32, 1.0, 2.0, 3.0].iter().enumerate() {
+                w[base + 4 + k] = *val;
+            }
+        }
+        let chunk = quantize_ko(&w, nrows, ncols, GgmlDType::Q2_KO);
+        // lane = r*4 + q3 = 0 (r=0,q3=0), sub=0 → cr0 at byte 0.
+        assert_eq!(chunk[0], 0x1B, "cr0 for K=0..3 values (3,2,1,0)");
+        // q3=1 → K=4..7 values (0,1,2,3) → cr0 = 0xE4, at lane=1, sub=0 → byte 1*8 = 8.
+        assert_eq!(chunk[8], 0xE4, "cr0 for K=4..7 values (0,1,2,3)");
+        let de = dequant_ko(&chunk, nrows, ncols, GgmlDType::Q2_KO);
+        assert_eq!(de[0], 3.0);
+        assert_eq!(de[1], 2.0);
+        assert_eq!(de[4], 0.0);
+        assert_eq!(de[7], 3.0);
     }
 }

@@ -661,6 +661,16 @@ pub enum GgmlDType {
     /// `QTYPE_MXFP4_KO` / `QType::MXFP4_KO`. See `ko_quant::quantize_mxfp4_ko` +
     /// `loader/mxfp4.cuh`.
     MXFP4_KO = 50,
+
+    /// Lane-major per-128 affine KO twin at **2-bit** — the smallest KO weight. Same
+    /// re-quantized-from-F32 per-128 `(scale, min)` affine format as `Q4_KO`, but each value is
+    /// a 2-bit crumb (0..3): the 128-K tile's quants pack into 32 B (`block_c_q2_KO_k128`,
+    /// `int qs[8]`) vs Q4_KO's 64 B, so a chunk is 288 B / 1024 elems (~2.25 bpw). Its 2-bit
+    /// crumb layout mirrors the high-2-bit crumb region Q6_KO already carries (`cr0`/`cr1` at
+    /// `lane*8 + sub*2`), used here as the whole value. GPU-only (built by requantizing from F32
+    /// on-device, like the other KO twins); read by the `q2_ko_int8_f32_grouped` int8 kernel.
+    /// Value 51 mirrors `QTYPE_Q2_KO` / `QType::Q2_KO`. See `ko_quant::quantize_q2_ko`.
+    Q2_KO = 51,
 }
 
 impl GgmlDType {
@@ -670,7 +680,7 @@ impl GgmlDType {
     pub fn is_ko(self) -> bool {
         matches!(
             self,
-            Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO | Self::MXFP4_KO
+            Self::Q2_KO | Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO | Self::MXFP4_KO
         )
     }
 
@@ -788,6 +798,7 @@ impl GgmlDType {
             48 => Self::Q8_KO,
             49 => Self::MXFP4,
             50 => Self::MXFP4_KO,
+            51 => Self::Q2_KO,
             _ => crate::bail!("unknown dtype discriminant {u}"),
         };
         Ok(dtype)
@@ -871,6 +882,7 @@ impl GgmlDType {
             221 => Self::Q6_KO,
             222 => Self::Q8_KO,
             223 => Self::MXFP4_KO,
+            224 => Self::Q2_KO,
             230 => Self::F64,
             231 => Self::U8,
             232 => Self::I8,
@@ -945,6 +957,7 @@ impl GgmlDType {
             Self::Q6_KO => 221,
             Self::Q8_KO => 222,
             Self::MXFP4_KO => 223,
+            Self::Q2_KO => 224,
         }
     }
 
@@ -1030,6 +1043,11 @@ impl GgmlDType {
             Self::MXFP4_KO => {
                 panic!("MXFP4_KO has no CPU block form; build it via repack from MXFP4 on CUDA")
             }
+            // Q2_KO is a GPU-only lane-major chunk (built by requantizing F32 on-device, or by
+            // `ko_quant::quantize_q2_ko` for the host prepare path) — no host block struct.
+            Self::Q2_KO => {
+                panic!("Q2_KO has no CPU block form; build it via quantize_q2_ko / repack on CUDA")
+            }
         }
     }
     /// The type size for blocks in bytes.
@@ -1096,6 +1114,9 @@ impl GgmlDType {
             // 576-byte GPU chunk per 1024 elements (512 nibbles + 32 E8M0 + 32 dm) → 72 B
             // per 128, keeping bytes == n_blocks × type_size for the [N,K] storage.
             Self::MXFP4_KO => 72,
+            // 288-byte GPU chunk per 1024 elements (256 B of 2-bit crumbs + 32 dm) → 36 B per
+            // 128. `ko_chunk_bytes(Q2_KO) = 288`.
+            Self::Q2_KO => 36,
         }
     }
 
@@ -1150,6 +1171,8 @@ impl GgmlDType {
             Self::MXFP4 => k_quants::QK_MXFP4,
             // K/128 granularity (the collapse is per 128-K tile), like the other KO twins.
             Self::MXFP4_KO => 128,
+            // K/128 granularity like the other KO twins (per-128 affine).
+            Self::Q2_KO => 128,
         }
     }
 }

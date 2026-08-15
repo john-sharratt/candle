@@ -367,6 +367,7 @@ pub fn kernel_attn_decode_step(
         false, // wave hands a private per-token snapshot with the write-len
         // already patched host-side — the on-device commit would only touch a
         // throwaway copy, so skip it.
+        false, // the fused scatter still writes this token (patched write-len)
         &st.ws,
         None,
     )?;

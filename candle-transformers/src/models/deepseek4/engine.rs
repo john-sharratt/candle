@@ -171,6 +171,14 @@ impl Dsv4Engine {
         // `cuMemAllocHost` OOM'd at the page-lock ceiling. 13 GiB gives the resident base + KV +
         // activations room while keeping the VRAM pool large enough that the pinned remainder stays
         // under the ceiling. Cheap to retune now that load is fast.
+        // Headroom kept free of the expert VRAM pool for the resident base + KV + activations, plus
+        // the DSpark drafter (VRAM-resident, ~5.8 GiB) when attached (loaded AFTER the engine — see
+        // `DeepSeekBatched::with_drafter`). 13 GiB is the ceiling here: raising it shrinks the VRAM
+        // expert pool, pushing more target experts into the pinned pool, whose size (overflow + a
+        // mandatory 10% eviction headroom — the pool must never run out, there is no CUDA mmap
+        // reload) then exceeds the ~100 GB WDDM per-process page-lock limit and OOMs `cuMemAllocHost`
+        // (14 GiB → ~101 GB fails; 13 GiB → ~100 GB loads). (Speculative decode is enabled only above
+        // 64 GiB VRAM; smaller cards are clamped by the `free_vram / 2` floor below.)
         let headroom = 13usize << 30;
         let expert_budget = free_vram
             .saturating_sub(headroom)
@@ -407,7 +415,11 @@ impl Dsv4Engine {
         // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
         // The ONE intrinsic wave-path readback: the paged expert cache schedules
         // pinned→VRAM uploads by expert id, so the routing indices must be
-        // host-visible (amortized across every row of the wave).
+        // host-visible (amortized across every row of the wave). A dedicated-routing-stream async
+        // DtoH into a pinned buffer was measured here and REVERTED: neutral on single-session
+        // speculative but −8% on the cfg8 batched gate (589.9→541.0), because the per-layer
+        // event/side-stream/sync overhead over 44 layers × N sessions outweighs the pinned-copy
+        // saving — the readback is a genuine per-layer GPU-catch-up wait, not a hideable flush.
         let t_sort = profile_now();
         super::readback::note_readback();
         let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;

@@ -3377,9 +3377,21 @@ impl Scheduler {
                         .collect();
                     view.demote_turns_to_warm(&keys)
                 };
-                // The demote returned the hot chunks to the pool free-list;
-                // release now-empty arenas so `pool_used` actually drops.
+                // The demote returned the hot chunks to the pool free-list, but they can
+                // land scattered across partially-used arenas, so `release_empty_arenas`
+                // alone frees little — the arenas never go fully empty on their own. Compact
+                // first (consolidate the freed chunks into empty arenas), then release, so
+                // `pool_used` ACTUALLY drops. Without this the 700+ calibration cases' hot
+                // K/V, freed here, stays cudarc-resident and the repo-scan phase's first
+                // prefill OOMs on a card that looks full. Bounded + guarded, so it's cheap
+                // when there's nothing reclaimable.
+                if self.session.can_reclaim_arena() {
+                    let _ = self
+                        .session
+                        .defragment_bounded(prefill::compact_base_moves().saturating_mul(3));
+                }
                 let _ = self.session.release_empty_arenas();
+                self.trim_kv_pool();
                 let _ = response_tx.send(Ok(demoted));
                 true
             }

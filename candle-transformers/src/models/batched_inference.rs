@@ -1233,6 +1233,24 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
+    /// Truncate `seq_idx`'s KV to an exact `target_tokens` count across every backing, and set
+    /// the sequence offset to match. Token-granular counterpart to
+    /// [`Self::truncate_sequence_to_blocks`] — the primitive the generic speculative-decode
+    /// driver uses to roll back the rejected tail of a verified block.
+    pub fn truncate_sequence_to_tokens(
+        &mut self,
+        seq_idx: usize,
+        target_tokens: usize,
+    ) -> Result<()> {
+        for backing in &self.backings {
+            backing.truncate_sequence_to_tokens(seq_idx, target_tokens)?;
+        }
+        if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
+            state.offset = target_tokens;
+        }
+        Ok(())
+    }
+
     /// Quantize the live K/V chunks of each sequence in `seq_indices` in place
     /// using the session's compression policy, then re-seal.
     ///
@@ -3028,6 +3046,232 @@ pub trait ManagedBatchedModel {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveStep>;
+
+    // ── Speculative decoding (model-agnostic hook) ──────────────────────────────
+    //
+    // Three composable methods let ANY model do lossless speculative decoding through the
+    // generic `speculative_decode_step` driver. A model with no drafter inherits the defaults
+    // and `speculative_decode_step` degrades to a single plain decode — so the hook is always
+    // safe to call. A model with a drafter overrides `speculative_draft` (and, for the actual
+    // speedup, `verify_block`). The accepted tokens are always this model's own argmaxes, so the
+    // output is bit-identical to greedy decoding regardless of draft quality.
+
+    /// Draft up to `max_len` speculative next-tokens for `seq` following `committed`, using the
+    /// model's own drafter (e.g. an MTP / DSpark head). Proposals only — the caller verifies them
+    /// and keeps the converging prefix. Default: no drafter → empty (a plain decode step follows).
+    fn speculative_draft(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        committed: u32,
+        max_len: usize,
+    ) -> Result<Vec<u32>> {
+        let _ = (session, seq, committed, max_len);
+        Ok(Vec::new())
+    }
+
+    /// Verify a block of `tokens` for `seq`: append them and return one next-token logits row
+    /// `[1, vocab]` per input token (the model's prediction after each prefix). Default: run the
+    /// tokens as sequential `forward_wave` decode steps — correct for ANY model, but no speedup
+    /// (this is what makes speculative decode *lossless* by default). Models override with a
+    /// single batched forward over the whole block for the throughput win. Advances the sequence
+    /// by `tokens.len()`; the driver truncates back to the accepted length.
+    fn verify_block(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        tokens: &[u32],
+        layer_end: usize,
+    ) -> Result<Vec<Tensor>> {
+        let mut out = Vec::with_capacity(tokens.len());
+        for &tok in tokens {
+            let t = Tensor::from_vec(vec![tok], (1, 1), self.device())?;
+            let step = self.forward_wave(
+                session,
+                &[seq],
+                std::slice::from_ref(&t),
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                layer_end,
+                None,
+            )?;
+            let logits = step.logits.and_then(|mut v| v.pop()).ok_or_else(|| {
+                candle::Error::msg("verify_block: forward_wave produced no logits")
+            })?;
+            session.advance_sequence(seq, 1)?;
+            out.push(logits);
+        }
+        Ok(out)
+    }
+
+    /// Roll `seq` back to exactly `tokens` tokens after a speculative verify — called by the
+    /// driver with `pos + kept` once the accepted prefix is known. Default: the session-level KV
+    /// truncation. A model whose forward maintains per-sequence streaming state OUTSIDE the
+    /// session's KV (compressors, corpus galleries) overrides this to roll that state back in the
+    /// same call — otherwise a partial accept leaves rejected draft tokens absorbed in state the
+    /// truncation can't see, and later attention reads corrupted context.
+    fn truncate_sequence(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        session.truncate_sequence_to_tokens(seq, tokens)
+    }
+
+    /// Verify one block per sequence: append `blocks[i]` to `seqs[i]` and return each sequence's
+    /// per-position next-token logits rows. Default: sequential [`Self::verify_block`] calls —
+    /// correct for any model. A model overrides with ONE multi-sequence forward (all blocks in a
+    /// single wave) for the batched-speculation throughput win: the per-wave fixed costs (MoE
+    /// routing readbacks, expert DMA, launch overhead) then amortize across every session instead
+    /// of being paid once per session. Advances each sequence by its block length; the driver
+    /// truncates back to the accepted lengths.
+    fn verify_blocks(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        blocks: &[Vec<u32>],
+        layer_end: usize,
+    ) -> Result<Vec<Vec<Tensor>>> {
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, &seq) in seqs.iter().enumerate() {
+            out.push(self.verify_block(session, seq, &blocks[i], layer_end)?);
+        }
+        Ok(out)
+    }
+
+    /// One lossless speculative-decode step for `seq` (model-agnostic). `committed` is the last
+    /// accepted token, held OUT of the KV; it is placed at the current sequence offset. Drafts a
+    /// block, verifies `[committed, drafts…]`, accepts the longest prefix whose tokens match this
+    /// model's own argmaxes, and **emits each accepted token to `emit`, one at a time** — the
+    /// model's exact greedy continuation, in order. This is what keeps speculative decode a
+    /// *transparent accelerator*: the caller's main loop runs its normal per-token handling (stop
+    /// sequences, EOS, sampling/steering decisions) on each token exactly as for plain decode,
+    /// instead of the driver re-implementing any of it. `emit` returns `false` to stop generating
+    /// after that token; the driver rolls the KV back to the emitted prefix. Returns
+    /// `Some(next_committed)` — the seed to pass as `committed` on the next call (already emitted,
+    /// held out of the KV) — or `None` when `emit` asked to stop. With no drafter this is one plain
+    /// decode (emits exactly one token). At least one token is always emitted.
+    fn speculative_decode_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seq: usize,
+        committed: u32,
+        max_draft: usize,
+        layer_end: usize,
+        emit: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<Option<u32>> {
+        // The batch-of-1 case of the batched driver — one implementation.
+        let mut emits: Vec<Box<dyn FnMut(u32) -> bool + '_>> = vec![Box::new(emit)];
+        let next = self.speculative_decode_step_batch(
+            session,
+            &[seq],
+            &[committed],
+            max_draft,
+            layer_end,
+            &mut emits,
+        )?;
+        Ok(next[0])
+    }
+
+    /// One lossless speculative-decode step for MANY sequences — semantics identical to running
+    /// [`Self::speculative_decode_step`] once per sequence, with the expensive parts batched:
+    /// every block is verified in ONE `verify_blocks` call (a single wave when the model overrides
+    /// it), and every scored row's argmax runs in ONE kernel + ONE readback (per-row `to_scalar`
+    /// round-trips are a launch-overhead wall at batch width). Each sequence keeps its own emit
+    /// sink and truncates to its own accepted prefix. Returns each sequence's next `committed`
+    /// seed (`None` where its emit stopped).
+    fn speculative_decode_step_batch(
+        &self,
+        session: &mut BatchedInferenceSession,
+        seqs: &[usize],
+        committed: &[u32],
+        max_draft: usize,
+        layer_end: usize,
+        emits: &mut [Box<dyn FnMut(u32) -> bool + '_>],
+    ) -> Result<Vec<Option<u32>>> {
+        if seqs.len() != committed.len() || seqs.len() != emits.len() {
+            candle::bail!(
+                "speculative_decode_step_batch: {} seqs, {} committed, {} emits",
+                seqs.len(),
+                committed.len(),
+                emits.len()
+            );
+        }
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Draft per sequence, then verify every block together.
+        let mut poss = Vec::with_capacity(seqs.len());
+        let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+        for (i, &seq) in seqs.iter().enumerate() {
+            let pos = session.sequence_offset(seq).ok_or_else(|| {
+                candle::Error::msg("speculative_decode_step_batch: unknown sequence")
+            })?;
+            poss.push(pos);
+            let drafts = self.speculative_draft(session, seq, committed[i], max_draft)?;
+            let mut block = Vec::with_capacity(drafts.len() + 1);
+            block.push(committed[i]);
+            block.extend_from_slice(&drafts);
+            blocks.push(block);
+        }
+        let logits = self.verify_blocks(session, seqs, &blocks, layer_end)?;
+
+        // Batched greedy argmax over EVERY scored row of EVERY block: one stacked
+        // [R, vocab] argmax + one readback, split back per sequence.
+        let rows: Vec<Tensor> = logits
+            .iter()
+            .flatten()
+            .map(|t| t.squeeze(0))
+            .collect::<Result<_>>()?;
+        let stacked = Tensor::stack(&rows, 0)?; // [R, vocab]
+        let arg: Vec<u32> = stacked
+            .argmax(candle::D::Minus1)?
+            .to_dtype(DType::U32)?
+            .to_vec1::<u32>()?;
+
+        // Per-sequence accept / emit / rollback — the exact single-seq semantics.
+        let mut next = Vec::with_capacity(seqs.len());
+        let mut cursor = 0usize;
+        for (i, &seq) in seqs.iter().enumerate() {
+            let block = &blocks[i];
+            let n_rows = logits[i].len();
+            let args = &arg[cursor..cursor + n_rows];
+            cursor += n_rows;
+            // Greedy accept: position j's argmax is this model's real token at
+            // pos+j+1. Keep it; stop at the first drafted position whose
+            // proposal the model rejects (that argmax is the correction). If
+            // every draft matches, the final row yields a free bonus token.
+            let mut reals = Vec::with_capacity(block.len());
+            for (j, &a) in args.iter().enumerate() {
+                reals.push(a);
+                if j + 1 < block.len() && a != block[j + 1] {
+                    break;
+                }
+            }
+            // Hand the accepted tokens to this sequence's sink one at a time; it
+            // stops wherever it likes (EOS, a stop sequence, a steering
+            // decision). `kept` counts the tokens it consumed — including the
+            // one it stopped on — and the KV rolls back to exactly that prefix
+            // (the last kept token is held out of the KV for the next step, as
+            // `committed` always is).
+            let mut kept = 0usize;
+            let mut go_on = true;
+            for &t in &reals {
+                kept += 1;
+                if !(emits[i])(t) {
+                    go_on = false;
+                    break;
+                }
+            }
+            self.truncate_sequence(session, seq, poss[i] + kept)?;
+            next.push(if go_on { reals.last().copied() } else { None });
+        }
+        Ok(next)
+    }
 
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {

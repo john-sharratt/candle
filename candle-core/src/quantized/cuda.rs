@@ -297,6 +297,7 @@ fn dtype_to_qtype(dtype: GgmlDType) -> Result<QType> {
         GgmlDType::Q6_KO => QType::Q6_KO,
         GgmlDType::Q8_KO => QType::Q8_KO,
         GgmlDType::MXFP4_KO => QType::MXFP4_KO,
+        GgmlDType::Q2_KO => QType::Q2_KO,
         GgmlDType::Q0_M4 => QType::Q0_M4,
         _ => crate::bail!("unsupported dtype for quantized op: {dtype:?}"),
     })
@@ -3007,6 +3008,11 @@ impl QCudaStorage {
             GgmlDType::MXFP4_KO => {
                 crate::bail!("MXFP4_KO has no CPU dequant path; it is a GPU-only int8 weight")
             }
+            // Q2_KO is a GPU-only lane-major crumb chunk; the shape-aware `ko_quant::dequant_q2_ko`
+            // (test/prepare only) reconstructs it — this flat per-block path does not apply.
+            GgmlDType::Q2_KO => {
+                crate::bail!("Q2_KO has no CPU dequant path; it is a GPU-only int8 weight")
+            }
         }
 
         self.device
@@ -4919,10 +4925,12 @@ fn grouped_matmul_gemx_q8a128(
 /// M and K come from the activation (operand shape / tensor shape); `nrows` is N per
 /// expert, `expert_offsets` partitions the M token rows across `weight_ptrs`.
 /// KO weights and int8 (q8a128) activations are EXCLUSIVELY paired: the int8 tensor-core
-/// kernels read only KO weights, and KO weights are only consumed through the int8 path.
-/// So `DynamicTensor::Int8` must pair with a KO weight and `DynamicTensor::Float` with a
-/// non-KO weight — any cross combination (int8 × non-KO, or float × KO) has no kernel and
-/// is rejected here rather than silently producing garbage.
+/// kernels' per-128 deferred-scale fold reads only KO weights (the per-128 grid), and KO weights
+/// are only consumed through the int8 path. Plain k-quants (Q2_K/Q4_K/…) have finer per-sub
+/// scales the per-128 int8 fold does not apply — they must be re-quantized to a KO twin (`to_ko`)
+/// to run int8; through the FP grouped path they stay non-KO. So `DynamicTensor::Int8` must pair
+/// with a KO weight and `DynamicTensor::Float` with a non-KO weight — any cross combination has
+/// no kernel and is rejected here rather than silently producing garbage.
 fn ensure_qmatmul_pairing(input: &DynamicTensor, weight_dtype: GgmlDType) -> Result<()> {
     let is_int8 = matches!(input, DynamicTensor::Int8(_));
     if weight_dtype.is_ko() != is_int8 {

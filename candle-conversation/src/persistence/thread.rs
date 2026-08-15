@@ -924,7 +924,7 @@ fn run_pass(
     {
         let (dc, db, pc, pb) = conversation.read().warm_backlog_split();
         if pc > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 pinned_skipped = pc,
                 pinned_mib = pb / (1 << 20),

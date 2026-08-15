@@ -52,6 +52,13 @@ latent_decode_kernel(
     float softmax_scale,
     int window_size,
     int max_sel,
+    // Non-zero ⇒ the caller already scattered every slot's token latent into the
+    // arena (host writeback, same store_band_elem encode) and committed the
+    // write-len to cover them — skip the fused scatter. The speculative-verify
+    // path runs a block's positions as virtual slots over one shared writer
+    // slice; letting each slot scatter at the (shared) write-len would clobber
+    // one position with every slot's latent.
+    int pre_scattered,
     // Nullable stage-dump (slot 0 / head-tile 0 / split 0 / tile 0 only), for
     // the mirror oracle's stage-by-stage comparison. Section offsets are
     // NPAL-parameterized (see DBG_* below); at HEAD_DIM=512, KEYS_TILE=8:
@@ -142,9 +149,11 @@ latent_decode_kernel(
     // ─── Fused single-latent scatter (warp 0): write this token's pre-RoPE
     // latent into the writer chunk's FP8 band arenas. K≡V → K bands only. Only
     // when a window ring exists (n_slices>0) — the windowless slot writes no
-    // local chunk. n_slices is block-uniform, so the __syncthreads after is
-    // reached by every thread. ───
-    if (n_slices > 0) {
+    // local chunk. Skipped when the caller pre-scattered the tokens (virtual
+    // verify slots share one writer slice — see the param doc). n_slices and
+    // pre_scattered are block-uniform, so the __syncthreads after is reached
+    // by every thread. ───
+    if (n_slices > 0 && pre_scattered == 0) {
         uint8_t* write_slice_ptr =
             get_slice_mut<HEAD_DIM>(slices_ptr, (int)slot.write_slice, 1);
         const int ws_offset = (int)slice_offset(write_slice_ptr);
@@ -601,6 +610,7 @@ void launch_latent_decode(
     int max_sel,
     int num_splits,  // resolved by the caller (latent_decode_num_splits)
     bool commit_write_len,  // advance the header write-len on-device (live buffer)
+    bool pre_scattered,     // tokens already in the arena — skip the fused scatter
     cudaStream_t stream,
     float* dbg = nullptr    // nullable stage-dump (see kernel doc)
 ) {
@@ -624,7 +634,7 @@ void launch_latent_decode(
     latent_decode_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, 0, stream>>>(
         q, headers, kv_new, nope_i8, nope_scale, comp_rope, comp_idx, comp_cnt,
         comp_pos, q_pos, rope_tab, pa, pm, num_slots, n_q_head, softmax_scale,
-        window_size, max_sel, dbg);
+        window_size, max_sel, pre_scattered ? 1 : 0, dbg);
 
     const int num_rows = num_slots * n_q_head;
     latent_combine_kernel<float, HEAD_DIM, ROPE_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(

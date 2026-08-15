@@ -218,3 +218,171 @@ async fn fetch(
     );
     Ok(())
 }
+
+// ── DeepSeek-V4-Flash + DSpark drafter ──────────────────────────────────────────
+//
+// The main model ships as 4 MXFP4 GGUF splits nested in a same-named subfolder of
+// the bartowski repo; the DSpark speculative-decode drafter is a single 10.9 GB GGUF
+// at the repo root. `ensure_deepseek` fetches whichever are missing into `dir` (flat
+// local names matching the engine's on-disk layout) so first-run — and adding
+// speculative decode to an existing install — needs no manual `curl`.
+
+/// bartowski GGUF repo holding both the main MXFP4 splits and the DSpark drafter.
+const DSV4_REPO: &str = "bartowski/DeepSeek-V4-Flash-0731-GGUF";
+/// Number of main-model GGUF splits.
+const DSV4_SPLITS: usize = 4;
+/// The DSpark drafter filename (identical in the repo root and on disk).
+const DSPARK_FILE: &str = "dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf";
+
+/// One file to fetch: its path *within* the HF repo and the flat local filename it
+/// lands under. The repo nests the main splits in a subfolder, but the engine loads
+/// them flat next to the drafter — so `path_in_repo` and `local_name` differ for the
+/// splits and coincide for the drafter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFile {
+    pub repo: String,
+    pub path_in_repo: String,
+    pub local_name: String,
+}
+
+/// The `i`-th (1-based) main-model split.
+fn dsv4_split(i: usize) -> RemoteFile {
+    let local = format!("DeepSeek-V4-Flash-0731-MXFP4-{i:05}-of-{DSV4_SPLITS:05}.gguf");
+    RemoteFile {
+        repo: DSV4_REPO.to_string(),
+        // The splits live under a same-named subfolder of the repo (the root-level
+        // name 404s — verified against the resolve endpoint).
+        path_in_repo: format!("DeepSeek-V4-Flash-0731-MXFP4/{local}"),
+        local_name: local,
+    }
+}
+
+/// The DSpark drafter (repo root == local name).
+fn dspark_file() -> RemoteFile {
+    RemoteFile {
+        repo: DSV4_REPO.to_string(),
+        path_in_repo: DSPARK_FILE.to_string(),
+        local_name: DSPARK_FILE.to_string(),
+    }
+}
+
+/// The full DeepSeek-V4-Flash source set: the 4 main splits then the DSpark drafter.
+pub fn dsv4_files() -> Vec<RemoteFile> {
+    let mut v: Vec<RemoteFile> = (1..=DSV4_SPLITS).map(dsv4_split).collect();
+    v.push(dspark_file());
+    v
+}
+
+/// The default on-disk directory for the DeepSeek-V4-Flash GGUFs.
+pub fn deepseek_dir() -> PathBuf {
+    cache_dir().join("deepseek-v4-flash-mxfp4")
+}
+
+/// Local paths of the resolved DeepSeek-V4-Flash source files.
+pub struct DeepseekPaths {
+    /// The 4 main MXFP4 GGUF splits (offline `prepare` merges + repacks these).
+    pub splits: Vec<PathBuf>,
+    /// The DSpark speculative-decode drafter GGUF.
+    pub dspark: PathBuf,
+}
+
+/// Ensure the DeepSeek-V4-Flash main splits + the DSpark drafter are present in
+/// `dir`, downloading only whichever are missing from the HF Hub. Files already on
+/// disk are kept, so adding speculative decode to an existing main-model install
+/// pulls just the ~10.9 GB drafter.
+pub async fn ensure_deepseek(
+    dir: &Path,
+    status: &tokio::sync::watch::Sender<String>,
+) -> anyhow::Result<DeepseekPaths> {
+    tokio::fs::create_dir_all(dir).await?;
+    let mut splits = Vec::with_capacity(DSV4_SPLITS);
+    for i in 1..=DSV4_SPLITS {
+        splits.push(ensure_remote_file(dir, &dsv4_split(i), status).await?);
+    }
+    let dspark = ensure_remote_file(dir, &dspark_file(), status).await?;
+    Ok(DeepseekPaths { splits, dspark })
+}
+
+/// Resolve one [`RemoteFile`] into `dir/local_name`: cache-hit when already present
+/// and non-trivially sized, else stream it from `{repo}/resolve/main/{path_in_repo}`.
+async fn ensure_remote_file(
+    dir: &Path,
+    f: &RemoteFile,
+    status: &tokio::sync::watch::Sender<String>,
+) -> anyhow::Result<PathBuf> {
+    let local = dir.join(&f.local_name);
+    let have = tokio::fs::metadata(&local)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    // > 1 MiB guards against a truncated/aborted prior write masquerading as a hit.
+    if have > (1 << 20) {
+        tracing::info!("cache hit: {} ({:.2} GB)", f.local_name, have as f64 / 1e9);
+        status
+            .send(format!(
+                "Found {} ({:.1} GB)",
+                f.local_name,
+                have as f64 / 1e9
+            ))
+            .ok();
+        return Ok(local);
+    }
+    fetch(&hf_url(&f.repo, &f.path_in_repo), &local, None, status).await?;
+    Ok(local)
+}
+
+#[cfg(test)]
+mod deepseek_tests {
+    use super::*;
+
+    #[test]
+    fn split_maps_subfolder_repo_path_to_flat_local() {
+        let s1 = dsv4_split(1);
+        assert_eq!(s1.repo, "bartowski/DeepSeek-V4-Flash-0731-GGUF");
+        assert_eq!(
+            s1.path_in_repo,
+            "DeepSeek-V4-Flash-0731-MXFP4/DeepSeek-V4-Flash-0731-MXFP4-00001-of-00004.gguf"
+        );
+        assert_eq!(
+            s1.local_name,
+            "DeepSeek-V4-Flash-0731-MXFP4-00001-of-00004.gguf"
+        );
+        // The last split uses the same 5-digit zero-padded index/count.
+        assert_eq!(
+            dsv4_split(4).local_name,
+            "DeepSeek-V4-Flash-0731-MXFP4-00004-of-00004.gguf"
+        );
+    }
+
+    #[test]
+    fn dspark_file_is_repo_root() {
+        let d = dspark_file();
+        assert_eq!(d.path_in_repo, "dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
+        assert_eq!(d.path_in_repo, d.local_name, "drafter is flat at the root");
+    }
+
+    #[test]
+    fn full_set_is_four_splits_plus_drafter() {
+        let files = dsv4_files();
+        assert_eq!(files.len(), DSV4_SPLITS + 1);
+        assert_eq!(files.last().unwrap().local_name, DSPARK_FILE);
+        assert!(files[..DSV4_SPLITS]
+            .iter()
+            .all(|f| f.local_name.contains("-of-00004.gguf")));
+    }
+
+    #[test]
+    fn resolve_url_matches_verified_endpoint() {
+        // The exact URLs confirmed (HTTP 200) against the HF resolve endpoint.
+        assert_eq!(
+            hf_url(&dsv4_split(1).repo, &dsv4_split(1).path_in_repo),
+            "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
+             DeepSeek-V4-Flash-0731-MXFP4/DeepSeek-V4-Flash-0731-MXFP4-00001-of-00004.gguf"
+        );
+        assert_eq!(
+            hf_url(&dspark_file().repo, &dspark_file().path_in_repo),
+            "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
+             dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf"
+        );
+    }
+}
