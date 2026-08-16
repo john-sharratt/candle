@@ -122,11 +122,24 @@ fn warm_slots_for(stride: usize, total_experts: usize) -> usize {
         return 0;
     };
     let budget = candle::vram::host_ram_budget(total_ram);
-    // Two ceilings, both real: what the machine is big enough for, and what it
-    // has free this second.
+    // Three ceilings, all real: what the machine is big enough for, what it
+    // has free this second, and how much of it may be PAGE-LOCKED at all.
+    //
+    // The third is the one the first two cannot see. `available` counts
+    // droppable page cache (a 156 GB GGUF mmap reads as "available"), and the
+    // warm budget only nets out pinned memory that already exists — so on a
+    // model whose experts nearly fill host RAM, both ceilings happily size the
+    // tier to the whole expert set. Pinning that much (measured: 148 GB locked
+    // of 194 GB, 66 GB of other commit pushed to pagefile) leaves the OS
+    // thrashing everything that is not the warm tier. Page-locked memory is
+    // capped at HALF the machine: the other half stays pageable for the page
+    // cache (which serves the cold pack reads), activations' host shadows, and
+    // everything else alive on the box.
+    let pinned_cap = (total_ram / 2).saturating_sub(candle::vram::host_pinned_bytes());
     let affordable = budget
         .kv_warm_budget_bytes
-        .min(available.saturating_sub(WARM_TIER_HEADROOM)) as usize;
+        .min(available.saturating_sub(WARM_TIER_HEADROOM))
+        .min(pinned_cap) as usize;
     let slots = (affordable / stride).min(total_experts);
     tracing::info!(
         target: "candle_transformers::expert_lre",
