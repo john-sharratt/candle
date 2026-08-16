@@ -1033,7 +1033,7 @@ impl SequenceState {
     /// sealed chunk — and must be skipped. This is the same selection rule
     /// `set_len` and the position_map use, so the K/V write, the rope base,
     /// and attention all agree on which chunk is the writer.
-    fn decode_write_chunk_idx(&self) -> usize {
+    pub(super) fn decode_write_chunk_idx(&self) -> usize {
         let n = self.chunks.len();
         if n == 0 {
             return 0;

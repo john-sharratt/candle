@@ -955,6 +955,25 @@ impl ChunkedKvBacking {
     /// sequence per layer; sequences with no cached buffer (never decoded, or
     /// cleared by a chunk-boundary append) rebuild fully on the next decode
     /// sync instead.
+    /// Free token capacity of `batch_idx`'s current decode WRITE chunk — how
+    /// many appended tokens it can still hold before the next append crosses
+    /// into a fresh chunk. The caller that extends a slot by `n` tokens uses
+    /// this to pick between the O(1) writer-slice patch (`n` fits) and full
+    /// invalidation (`n` spans into a new chunk, whose serialized
+    /// predecessors would otherwise keep their pre-extension lengths).
+    /// `None` when the slot is unallocated or empty.
+    pub fn decode_writer_room(&self, batch_idx: usize) -> Option<usize> {
+        let state = self.state.read().ok()?;
+        let seq = state.sequences.get(batch_idx)?.as_ref()?;
+        let chunks = seq.chunks_slice();
+        if chunks.is_empty() {
+            return None;
+        }
+        let wi = seq.decode_write_chunk_idx().min(chunks.len() - 1);
+        let cw = &chunks[wi];
+        Some(CHUNK_SIZE.saturating_sub(cw.offset as usize + cw.usage as usize))
+    }
+
     pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;

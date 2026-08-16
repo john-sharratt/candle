@@ -146,15 +146,15 @@ const SPEC_EMA_ALPHA: f32 = 0.25;
 ///
 /// The break-even IS the cost ratio: a drafted step commits `ema` tokens for
 /// one verify wave, a plain step commits 1 token for one decode wave, so
-/// drafting wins iff `ema > verify_cost / decode_cost`. Measured on the
-/// elastic partition (streaming-MoE target, ~44% expert hit rate at cfg8):
-/// realtext code accepted 3.88/step and beat greedy 9.4 vs 8.9 tok/s
-/// (ratio ≈ 3.7); StoryRewrite (thinking prose) accepted ~2.4/step and LOST
-/// 6.4 vs 8.2 — the old threshold of 2.0 kept it drafting through the loss.
-/// 4.0 sits at the measured ratio plus margin: predictable continuations
-/// (code, counting, structured rewrite) clear it, free prose falls back to
-/// plain-cost verify steps and re-probes.
-const SPEC_MIN_ACCEPT: f32 = 4.0;
+/// drafting wins iff `ema > verify_cost / decode_cost`. Measured in RELEASE
+/// on the elastic partition with the writer-slice-patched verify metadata:
+/// a drafted step is ~238 ms against a ~112 ms plain wave — ratio ≈ 2.1
+/// (counting: 20.7 tok/s at 4.92 accepts, 2.32× greedy). 2.3 is that ratio
+/// plus margin; StoryRewrite prose (~3.2-3.7 accepts) clears it and wins,
+/// while genuinely unpredictable text still falls back to plain-cost steps
+/// and re-probes. (An earlier 4.0 was derived from DEV-profile host costs —
+/// the unoptimized serialization inflated the verify side of the ratio.)
+const SPEC_MIN_ACCEPT: f32 = 2.3;
 /// Plain-decode steps between drafted probes while below the threshold. A
 /// probe costs one verify wave (≈ the cost ratio in decode waves), so the
 /// steady fallback overhead is `ratio / interval` — 8 paid ~46% on this box's
@@ -1153,14 +1153,24 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // must expose the block rows physically (part C's set_len becomes a
             // no-op re-set), and each position map must cover
             // [0, resident+s_len). `set_len` deliberately never touches the
-            // serialized slot buffer (see its DMA-race comment), so ALSO
-            // invalidate the cached slot state — forcing the build's REBUILD
-            // path. Otherwise the REUSE arm snapshots slice lens/rope bases
-            // serialized at the PRE-set_len offset (fresh after a
-            // partial-accept truncate) and only the write chunk's len gets
-            // patched: a block spanning the write-chunk boundary then reads
-            // its earlier rows short (stale len) and the next chunk's keys
-            // one position early (stale rope base).
+            // serialized slot buffer (see its DMA-race comment), so the cached
+            // slot state must be brought up to date. Two arms, by whether the
+            // block FITS the current writer chunk:
+            //
+            // * Fits (the common case for a ≤block-size extension): the O(1)
+            //   writer-slice PATCH — only that one slice's length changed.
+            // * Crosses into a fresh chunk: full invalidation. The patch is
+            //   NOT enough here even though `push_chunk` cleared the buffer at
+            //   append time — the standard header build ABOVE re-validated it
+            //   at pre-`set_len` lengths, so the spanned block's earlier rows
+            //   would read short through the stale predecessor slice (this
+            //   exact failure was measured as an acceptance collapse to
+            //   1.4 tok/step with a lossless-assert kill).
+            //
+            // The former unconditional invalidate forced the full 43-layer
+            // re-serialisation on EVERY verify — measured as the bulk of the
+            // verify wave's 3× cost over a plain decode wave (109 ms of
+            // metadata per verify against plain's 0.2 ms).
             // (Each block's write range was capacity-ensured BEFORE the
             // standard header build above, so the writeback snapshot already
             // covers every chunk `set_len` fills here.)
@@ -1170,8 +1180,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let s_len = prefill_lens[pi];
                 let resident = prefill_resident[pi];
                 for backing in session.backings() {
+                    let room = backing.decode_writer_room(vseq).unwrap_or(0);
                     backing.set_len(vseq, resident + s_len);
-                    backing.invalidate_decode_slot(vseq);
+                    if s_len <= room {
+                        backing.refresh_decode_writer_slice(&[(vseq, 0)])?;
+                    } else {
+                        backing.invalidate_decode_slot(vseq);
+                    }
                 }
                 // One virtual slot per block position, concatenated across
                 // sequences in prefill-span order — the SAME row order the
@@ -2283,6 +2298,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         seq: usize,
         committed: u32,
         max_len: usize,
+        cohort: usize,
     ) -> Result<Vec<u32>> {
         let drafter_lock = match &self.drafter {
             Some(d) => d,
@@ -2290,16 +2306,27 @@ impl ManagedBatchedModel for DeepSeekBatched {
         };
         // Rolling-acceptance fallback: while this sequence's accepted/step EMA
         // sits below the economic threshold, skip drafting — the step becomes a
-        // 1-token verify (plain-decode cost, still lossless) — and every
-        // `SPEC_PROBE_INTERVAL` skipped steps run one drafted probe so a
-        // workload shift re-enables speculation.
+        // plain-cost step, still lossless — and every `SPEC_PROBE_INTERVAL`
+        // skipped steps run one drafted probe so a workload shift re-enables
+        // speculation.
+        //
+        // The threshold is WIDTH-AWARE: a plain wave amortizes its launch
+        // floor across every session in the cohort (a cfg-8 plain step costs
+        // ~12 ms/token where a single-session step costs ~112), while a
+        // drafted step pays one serial drafter forward per session plus a
+        // wider verify. Measured break-even (release): ~2.1 accepts at width
+        // 1, ~5.4 at width 8 — near-linear in width, so the gate adds the
+        // measured slope per extra session. At width the cohort therefore
+        // rides the batched plain wave unless the text is VERY predictable,
+        // which is exactly the arithmetic that maximizes tokens/sec.
+        let min_accept = SPEC_MIN_ACCEPT + 0.45 * cohort.saturating_sub(1) as f32;
         {
             let mut stats = self
                 .spec_stats
                 .write()
                 .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
             if let Some(s) = stats.get_mut(&seq) {
-                if s.ema < SPEC_MIN_ACCEPT {
+                if s.ema < min_accept {
                     if s.fallback_steps < SPEC_PROBE_INTERVAL {
                         s.fallback_steps += 1;
                         return Ok(Vec::new());
@@ -2971,6 +2998,9 @@ mod tests {
 
         // ── Greedy baseline: one wave per token. ──
         let (mut gsession, gseq, gfirst) = prefill(&model)?;
+        // Drop the prefill's spans so the snapshot below is pure plain-decode.
+        #[cfg(feature = "profile")]
+        let _ = crate::models::profile::pipeline_snapshot_and_reset();
         let mut greedy = vec![gfirst];
         let mut committed = gfirst;
         let t0 = std::time::Instant::now();
@@ -2999,9 +3029,25 @@ mod tests {
             greedy.push(committed);
         }
         let greedy_dt = t0.elapsed().as_secs_f32();
+        // Per-phase anatomy at IDENTICAL corpus: the greedy snapshot is the
+        // plain decode wave's per-layer cost, the spec snapshot (below) the
+        // verify wave's — their diff is exactly what the decode-shaped-verify
+        // work must collapse.
+        #[cfg(feature = "profile")]
+        {
+            let snap = crate::models::profile::pipeline_snapshot_and_reset();
+            let mut es = snap.entries.clone();
+            es.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[greedy-prof] plain decode waves (total ms, count):");
+            for (name, ms, count) in es.iter().take(28) {
+                eprintln!("  {name:34} {ms:9.1}ms  x{count}");
+            }
+        }
 
         // ── Speculative: drafter + batched verify_block, up to 4 drafts/step. ──
         let (mut ssession, sseq, sfirst) = prefill(&model)?;
+        #[cfg(feature = "profile")]
+        let _ = crate::models::profile::pipeline_snapshot_and_reset();
         let mut spec = vec![sfirst];
         let mut committed = sfirst;
         let mut steps = 0usize;
@@ -3028,6 +3074,16 @@ mod tests {
             }
         }
         let spec_dt = t0.elapsed().as_secs_f32();
+        #[cfg(feature = "profile")]
+        {
+            let snap = crate::models::profile::pipeline_snapshot_and_reset();
+            let mut es = snap.entries.clone();
+            es.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[spec-prof] verify waves + drafts (total ms, count):");
+            for (name, ms, count) in es.iter().take(28) {
+                eprintln!("  {name:34} {ms:9.1}ms  x{count}");
+            }
+        }
         eprintln!("[spec-speedup] per-step committed (1=no draft accepted): {accepts:?}");
 
         let greedy_tps = greedy.len() as f32 / greedy_dt.max(1e-6);

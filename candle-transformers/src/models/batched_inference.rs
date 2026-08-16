@@ -3161,15 +3161,19 @@ pub trait ManagedBatchedModel {
 
     /// Draft up to `max_len` speculative next-tokens for `seq` following `committed`, using the
     /// model's own drafter (e.g. an MTP / DSpark head). Proposals only — the caller verifies them
-    /// and keeps the converging prefix. Default: no drafter → empty (a plain decode step follows).
+    /// and keeps the converging prefix. `cohort` is how many sessions decode in this step's
+    /// wave: a plain wave amortizes its launch floor across all of them, so a drafter's
+    /// economic break-even RISES with width and the gate must know it. Default: no drafter →
+    /// empty (a plain decode step follows).
     fn speculative_draft(
         &self,
         session: &mut BatchedInferenceSession,
         seq: usize,
         committed: u32,
         max_len: usize,
+        cohort: usize,
     ) -> Result<Vec<u32>> {
-        let _ = (session, seq, committed, max_len);
+        let _ = (session, seq, committed, max_len, cohort);
         Ok(Vec::new())
     }
 
@@ -3324,7 +3328,8 @@ pub trait ManagedBatchedModel {
                 candle::Error::msg("speculative_decode_step_batch: unknown sequence")
             })?;
             poss.push(pos);
-            let drafts = self.speculative_draft(session, seq, committed[i], max_draft)?;
+            let drafts =
+                self.speculative_draft(session, seq, committed[i], max_draft, seqs.len())?;
             let mut block = Vec::with_capacity(drafts.len() + 1);
             block.push(committed[i]);
             block.extend_from_slice(&drafts);

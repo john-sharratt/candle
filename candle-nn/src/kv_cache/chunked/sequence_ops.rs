@@ -2117,6 +2117,7 @@ impl ChunkedKvBacking {
             return Ok(());
         }
         let mut cum = 0usize;
+        let mut patch_writer = false;
         for i in 0..n {
             let usage = slot.chunks_slice()[i].usage as usize;
             // The `i + 1` bound keeps the landing at or past the last sealed
@@ -2135,10 +2136,30 @@ impl ChunkedKvBacking {
                 if slot.writer_start_idx() > slot.block_count() {
                     slot.set_writer_start_idx(slot.block_count());
                 }
-                slot.invalidate_gpu_chunks();
-                return Ok(());
+                if i + 1 == n {
+                    // The trim stayed INSIDE the landing chunk — no chunk was
+                    // freed, so the cached decode slot buffer differs from
+                    // host state in exactly one field: that chunk's length.
+                    // Patch the writer slice (below, after the state lock)
+                    // instead of dropping the whole serialized buffer. A
+                    // speculative partial accept trims here on nearly every
+                    // step, and the unconditional invalidate forced the next
+                    // verify's full 43-layer re-serialisation — the patch is
+                    // what lets a partial-accept step keep plain-wave-cost
+                    // metadata.
+                    patch_writer = true;
+                } else {
+                    // Chunks were freed: the serialized chunk count is wrong
+                    // and only a rebuild can fix it.
+                    slot.invalidate_gpu_chunks();
+                }
+                break;
             }
             cum += usage;
+        }
+        drop(state);
+        if patch_writer {
+            self.refresh_decode_writer_slice(&[(batch_idx, 0)])?;
         }
         Ok(())
     }
