@@ -171,8 +171,8 @@ extern "C" void run_paged_latent_decode_bf16(
     int32_t window_size,
     int32_t max_sel,
     int32_t num_splits,
-    int32_t commit_write_len, // 0 = skip the on-device write-len advance (wave)
-    int32_t pre_scattered,    // 1 = tokens already in the arena — skip the fused scatter
+    int32_t commit_rows,  // leading slots that advance the write-len on-device
+    int32_t scatter_rows, // leading slots whose token the kernel fused-scatters
     float* dbg,  // nullable stage-dump (mirror-oracle diagnostics)
     void* stream_ptr
 ) {
@@ -183,7 +183,7 @@ extern "C" void run_paged_latent_decode_bf16(
         (const __nv_bfloat16*)comp_rope, comp_idx, comp_cnt, comp_pos, q_pos,
         sinks, rope_tab, partial_acc, partial_ml,
         num_slots, n_q_head, softmax_scale, window_size, max_sel, num_splits,
-        commit_write_len != 0, pre_scattered != 0, stream, dbg);
+        commit_rows, scatter_rows, stream, dbg);
 }
 
 // SM count for the caller's split-factor policy.

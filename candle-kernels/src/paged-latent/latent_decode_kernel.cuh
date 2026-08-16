@@ -52,13 +52,15 @@ latent_decode_kernel(
     float softmax_scale,
     int window_size,
     int max_sel,
-    // Non-zero ⇒ the caller already scattered every slot's token latent into the
-    // arena (host writeback, same store_band_elem encode) and committed the
-    // write-len to cover them — skip the fused scatter. The speculative-verify
-    // path runs a block's positions as virtual slots over one shared writer
-    // slice; letting each slot scatter at the (shared) write-len would clobber
-    // one position with every slot's latent.
-    int pre_scattered,
+    // Slots `[0, scatter_rows)` fused-scatter their token latent into the
+    // writer chunk; slots at or past the bound were already scattered by the
+    // caller (host writeback, same store_band_elem encode) with the write-len
+    // committed to cover them. The speculative-verify path runs a block's
+    // positions as virtual slots over one shared writer slice — letting each
+    // scatter at the (shared) write-len would clobber one position with every
+    // slot's latent — while a mixed wave's leading PLAIN slots still scatter
+    // their own token. Plain rows always lead, so a prefix bound suffices.
+    int scatter_rows,
     // Nullable stage-dump (slot 0 / head-tile 0 / split 0 / tile 0 only), for
     // the mirror oracle's stage-by-stage comparison. Section offsets are
     // NPAL-parameterized (see DBG_* below); at HEAD_DIM=512, KEYS_TILE=8:
@@ -149,11 +151,11 @@ latent_decode_kernel(
     // ─── Fused single-latent scatter (warp 0): write this token's pre-RoPE
     // latent into the writer chunk's FP8 band arenas. K≡V → K bands only. Only
     // when a window ring exists (n_slices>0) — the windowless slot writes no
-    // local chunk. Skipped when the caller pre-scattered the tokens (virtual
-    // verify slots share one writer slice — see the param doc). n_slices and
-    // pre_scattered are block-uniform, so the __syncthreads after is reached
-    // by every thread. ───
-    if (n_slices > 0 && pre_scattered == 0) {
+    // local chunk. Skipped for slots past `scatter_rows` — the caller
+    // pre-scattered those (virtual verify slots share one writer slice — see
+    // the param doc). n_slices, slot_idx, and scatter_rows are block-uniform,
+    // so the __syncthreads after is reached by every thread. ───
+    if (n_slices > 0 && slot_idx < scatter_rows) {
         uint8_t* write_slice_ptr =
             get_slice_mut<HEAD_DIM>(slices_ptr, (int)slot.write_slice, 1);
         const int ws_offset = (int)slice_offset(write_slice_ptr);
@@ -609,8 +611,14 @@ void launch_latent_decode(
     int window_size,
     int max_sel,
     int num_splits,  // resolved by the caller (latent_decode_num_splits)
-    bool commit_write_len,  // advance the header write-len on-device (live buffer)
-    bool pre_scattered,     // tokens already in the arena — skip the fused scatter
+    // Slots `[0, commit_rows)` get the on-device write-len advance (live
+    // buffers); slots past it hold throwaway host-patched snapshots. Slots
+    // `[0, scatter_rows)` fused-scatter their token; slots past it were
+    // pre-scattered by the caller. Plain rows lead the wave, so both are
+    // prefix bounds: a plain decode wave passes `num_slots` for both, a pure
+    // verify wave passes 0, a mixed wave passes its plain-row count.
+    int commit_rows,
+    int scatter_rows,
     cudaStream_t stream,
     float* dbg = nullptr    // nullable stage-dump (see kernel doc)
 ) {
@@ -634,22 +642,23 @@ void launch_latent_decode(
     latent_decode_kernel<T, HEAD_DIM, ROPE_DIM><<<grid, block, 0, stream>>>(
         q, headers, kv_new, nope_i8, nope_scale, comp_rope, comp_idx, comp_cnt,
         comp_pos, q_pos, rope_tab, pa, pm, num_slots, n_q_head, softmax_scale,
-        window_size, max_sel, pre_scattered ? 1 : 0, dbg);
+        window_size, max_sel, scatter_rows, dbg);
 
     const int num_rows = num_slots * n_q_head;
     latent_combine_kernel<float, HEAD_DIM, ROPE_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
         out, pa, pm, q_pos, sinks, rope_tab, num_rows, n_q_head, num_splits);
 
     // On-device write-len advance: only the live-buffer decode path relies on
-    // this (each step reads the length the previous step committed). The wave
-    // hands the kernel a private per-token header snapshot with the length
-    // already patched host-side, so the commit would only touch a throwaway
-    // copy — skip the launch entirely there.
-    if (commit_write_len) {
+    // this (each step reads the length the previous step committed). Slots past
+    // `commit_rows` hold private host-patched header snapshots — a commit
+    // would only touch a throwaway copy — and plain rows lead the wave, so the
+    // launch covers exactly the leading `commit_rows` slots.
+    const int n_commit = commit_rows < num_slots ? commit_rows : num_slots;
+    if (n_commit > 0) {
         constexpr int COMMIT_THREADS = 128;
-        dim3 commit_grid((num_slots + COMMIT_THREADS - 1) / COMMIT_THREADS);
+        dim3 commit_grid((n_commit + COMMIT_THREADS - 1) / COMMIT_THREADS);
         commit_decode_write_len_kernel<HEAD_DIM><<<commit_grid, COMMIT_THREADS, 0, stream>>>(
-            headers, num_slots, 1);
+            headers, n_commit, 1);
     }
 }
 }  // namespace latent_attn

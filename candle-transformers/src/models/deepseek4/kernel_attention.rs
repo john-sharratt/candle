@@ -363,11 +363,12 @@ pub fn kernel_attn_decode_step(
         &st.rope_tab,
         a.softmax_scale() as f32,
         a.window_size(),
-        0,     // auto split factor
-        false, // wave hands a private per-token snapshot with the write-len
+        0, // auto split factor
+        // The wave hands a private per-token snapshot with the write-len
         // already patched host-side — the on-device commit would only touch a
-        // throwaway copy, so skip it.
-        false, // the fused scatter still writes this token (patched write-len)
+        // throwaway copy, so no slot commits…
+        0,
+        1, // …but the fused scatter still writes this token (patched write-len)
         &st.ws,
         None,
     )?;

@@ -3232,25 +3232,60 @@ pub trait ManagedBatchedModel {
         session.truncate_sequence_to_tokens(seq, tokens)
     }
 
-    /// Verify one block per sequence: append `blocks[i]` to `seqs[i]` and return each sequence's
-    /// per-position next-token logits rows. Default: sequential [`Self::verify_block`] calls —
-    /// correct for any model. A model overrides with ONE multi-sequence forward (all blocks in a
-    /// single wave) for the batched-speculation throughput win: the per-wave fixed costs (MoE
-    /// routing readbacks, expert DMA, launch overhead) then amortize across every session instead
-    /// of being paid once per session. Advances each sequence by its block length; the driver
-    /// truncates back to the accepted lengths.
+    /// One speculative step's whole forward: decode every PLAIN sequence's committed token
+    /// (`plain` = `(seq, committed)` pairs — sequences whose drafter proposed nothing) and verify
+    /// one block per drafted sequence (append `blocks[i]` to `seqs[i]`), returning each plain
+    /// row's logits and each block's per-position next-token logits rows. Default: one batched
+    /// plain decode wave + sequential [`Self::verify_block`] calls — correct for any model. A
+    /// model overrides with ONE wave carrying BOTH cohorts (plain rows leading, verify rows
+    /// trailing): the per-wave fixed costs (MoE routing readbacks, expert DMA, launch overhead)
+    /// then amortize across every session AND the two cohorts stop paying two launch floors per
+    /// step. Advances plain sequences by 1 and drafted sequences by their block length; the
+    /// driver truncates drafted sequences back to the accepted lengths.
     fn verify_blocks(
         &self,
         session: &mut BatchedInferenceSession,
+        plain: &[(usize, u32)],
         seqs: &[usize],
         blocks: &[Vec<u32>],
         layer_end: usize,
-    ) -> Result<Vec<Vec<Tensor>>> {
+    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        let mut plain_out = Vec::with_capacity(plain.len());
+        if !plain.is_empty() {
+            let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
+            let dinputs: Vec<Tensor> = plain
+                .iter()
+                .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), &Device::Cpu))
+                .collect::<Result<_>>()?;
+            let step = self.forward_wave(
+                session,
+                &dseqs,
+                &dinputs,
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                layer_end,
+                None,
+            )?;
+            plain_out = step.logits_owned()?;
+            if plain_out.len() != plain.len() {
+                candle::bail!(
+                    "verify_blocks: plain wave scored {} rows for {} seqs",
+                    plain_out.len(),
+                    plain.len()
+                );
+            }
+            for &(seq, _) in plain {
+                session.advance_sequence(seq, 1)?;
+            }
+        }
         let mut out = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
             out.push(self.verify_block(session, seq, &blocks[i], layer_end)?);
         }
-        Ok(out)
+        Ok((plain_out, out))
     }
 
     /// One lossless speculative-decode step for `seq` (model-agnostic). `committed` is the last
@@ -3339,55 +3374,25 @@ pub trait ManagedBatchedModel {
         let plain: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() == 1).collect();
         let spec: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() > 1).collect();
 
-        // Plain wave: decode every undrafted sequence's committed token in ONE
-        // ordinary decode wave. The decode kernel writes the token itself, so
-        // the sequence advances here and the later uniform truncate is a no-op
-        // for these (kept is always 1).
-        let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
-        if !plain.is_empty() {
-            let dseqs: Vec<usize> = plain.iter().map(|&i| seqs[i]).collect();
-            let dinputs: Vec<Tensor> = plain
-                .iter()
-                .map(|&i| Tensor::from_vec(vec![committed[i]], (1, 1), &Device::Cpu))
-                .collect::<Result<_>>()?;
-            let step = self.forward_wave(
-                session,
-                &dseqs,
-                &dinputs,
-                &[],
-                &[],
-                &[],
-                &[],
-                0,
-                layer_end,
-                None,
-            )?;
-            let mut rows = step.logits_owned()?;
-            if rows.len() != plain.len() {
-                candle::bail!(
-                    "speculative_decode_step_batch: plain wave scored {} rows for {} seqs",
-                    rows.len(),
-                    plain.len()
-                );
-            }
-            for &i in plain.iter().rev() {
-                plain_logits[i] = rows.pop();
-            }
-            for &i in &plain {
-                session.advance_sequence(seqs[i], 1)?;
-            }
-        }
-
-        // Verify wave: every drafted block together.
+        // ONE forward for both cohorts: every undrafted sequence's committed
+        // token decodes as an ordinary plain row (live slot, on-device
+        // write-len commit — the sequence advances inside, and the later
+        // uniform truncate is a no-op for it since kept is always 1) and every
+        // drafted block verifies as virtual rows, in the same wave when the
+        // model overrides `verify_blocks` (one launch floor per step, not
+        // two).
         let t_verify = std::time::Instant::now();
+        let plain_pairs: Vec<(usize, u32)> =
+            plain.iter().map(|&i| (seqs[i], committed[i])).collect();
         let spec_seqs: Vec<usize> = spec.iter().map(|&i| seqs[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec.iter().map(|&i| blocks[i].clone()).collect();
-        let spec_logits = if spec.is_empty() {
-            Vec::new()
-        } else {
-            self.verify_blocks(session, &spec_seqs, &spec_blocks, layer_end)?
-        };
+        let (mut plain_rows, spec_logits) =
+            self.verify_blocks(session, &plain_pairs, &spec_seqs, &spec_blocks, layer_end)?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
+        let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
+        for &i in plain.iter().rev() {
+            plain_logits[i] = plain_rows.pop();
+        }
 
         // Batched greedy argmax over EVERY scored row of BOTH waves: one stacked
         // [R, vocab] argmax + one readback, split back per sequence

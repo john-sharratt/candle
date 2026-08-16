@@ -330,8 +330,10 @@ pub fn paged_latent_decode(
         softmax_scale,
         window_size,
         num_splits_override,
-        true,  // tensor-headers path is the live buffer: advance the write-len
-        false, // …and its token is fused-scattered by the kernel
+        // Tensor-headers path is the live buffer: every slot advances the
+        // write-len on-device and fused-scatters its own token.
+        q.dim(0)?,
+        q.dim(0)?,
         ws,
         dbg,
     )
@@ -355,12 +357,17 @@ pub fn paged_latent_decode_raw(
     softmax_scale: f32,
     window_size: usize,
     num_splits_override: usize,
-    commit_write_len: bool,
-    // Every slot's token latent is already in the arena with the write-len
-    // committed over it (host writeback) — the kernel skips its fused scatter.
-    // The speculative-verify path sets this: a block's positions run as virtual
-    // slots over ONE shared writer slice, where per-slot scatters would clobber.
-    pre_scattered: bool,
+    // Leading slots that advance the write-len on-device (live buffers) —
+    // slots past the bound hold throwaway host-patched snapshots. Plain rows
+    // lead the wave, so a prefix count expresses every wave shape: a plain
+    // decode wave passes the full slot count, a pure verify wave 0, a mixed
+    // wave its plain-row count.
+    commit_rows: usize,
+    // Leading slots whose token the kernel fused-scatters; slots past the
+    // bound were pre-scattered by the caller (host writeback, write-len
+    // committed over them). The speculative-verify rows run as virtual slots
+    // over ONE shared writer slice, where per-slot scatters would clobber.
+    scatter_rows: usize,
     ws: &LatentWorkspace,
     dbg: Option<&Tensor>,
 ) -> Result<Tensor> {
@@ -450,8 +457,8 @@ pub fn paged_latent_decode_raw(
             window_size as i32,
             max_sel as i32,
             num_splits as i32,
-            commit_write_len as i32,
-            pre_scattered as i32,
+            commit_rows as i32,
+            scatter_rows as i32,
             dbg_p as *mut f32,
             stream.cu_stream() as *mut core::ffi::c_void,
         );
@@ -3571,8 +3578,8 @@ mod tests {
             softmax_scale,
             case.window_size,
             case.num_splits,
-            true,  // single-step audit against the live buffer
-            false, // fused scatter writes the token
+            1, // single-step audit against the live buffer: commit…
+            1, // …and fused-scatter the one slot's token
             &ws,
             None,
         )?;
@@ -3727,8 +3734,9 @@ mod tests {
                 softmax_scale,
                 window_size,
                 1,
-                !snapshot, // live buffer commits on-device; snapshot patches host-side
-                false,     // fused scatter writes the token in both modes
+                // Live buffer commits on-device; snapshot patches host-side.
+                if snapshot { 0 } else { 1 },
+                1, // fused scatter writes the token in both modes
                 &ws,
                 None,
             )?;
