@@ -513,6 +513,8 @@ pub fn kernel_attn_prefill_assemble(
     let t_asm = profile_now();
     let ratio_comp = seq.comp.as_ref().map_or(1, |c| c.ratio());
     let l0 = seq.comp.as_ref().map_or(0, |c| c.buffered_len()); // carried partial group
+    let il0 = seq.icomp.as_ref().map_or(0, |c| c.buffered_len());
+    let iratio = seq.icomp.as_ref().map_or(1, |c| c.ratio());
     let base_entries = seq.gallery.as_ref().map_or(0, |g| g.len()); // corpus before this prefill
     let comp_gp = match (seq.comp.as_mut(), comp_slice.as_ref()) {
         (Some(comp), Some((ck, cs))) => comp.assemble_groups(ck, cs)?,
@@ -522,10 +524,20 @@ pub fn kernel_attn_prefill_assemble(
         (Some(ic), Some((ik, is))) => ic.assemble_groups(ik, is)?,
         _ => None,
     };
-    debug_assert_eq!(
-        comp_gp.as_ref().map(|g| g.positions.clone()),
-        icomp_gp.as_ref().map(|g| g.positions.clone()),
-        "comp/icomp group boundaries diverged"
+    // The shared-boundary contract binds comp and icomp ONLY where both exist
+    // (CSA layers, where the indexer keys must group exactly like the attention
+    // entries). An HCA layer has a compressor but NO indexer — its gallery
+    // appends with a 1-wide placeholder key — so `icomp_gp` is always `None`
+    // there and comparing it against a completed comp group is a false alarm
+    // (first observed when a spec-decode run crossed the HCA ratio of 128
+    // generated tokens and completed the layer's first mid-decode group).
+    debug_assert!(
+        seq.icomp.is_none()
+            || comp_gp.as_ref().map(|g| &g.positions) == icomp_gp.as_ref().map(|g| &g.positions),
+        "comp/icomp group boundaries diverged (s={s}, comp l0={l0} r={ratio_comp}, \
+         icomp l0={il0} r={iratio}): {:?} vs {:?}",
+        comp_gp.as_ref().map(|g| &g.positions),
+        icomp_gp.as_ref().map(|g| &g.positions),
     );
     let g_total = comp_gp.as_ref().map_or(0, |g| g.positions.len());
     pipeline_record("pprep:assemble", t_asm);
