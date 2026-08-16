@@ -33,6 +33,7 @@
 mod fingerprint;
 mod header;
 
+use ahash::{HashMap, HashMapExt};
 use candle::direct_io::{round_up_sector, DirectFile, StripeRead};
 use candle::fletcher::fletcher32;
 use candle::quantized::{GgmlDType, Int8Mode};
@@ -42,6 +43,8 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 /// Bytes of the GGUF that go into the identity checksum.
 ///
@@ -127,6 +130,83 @@ impl From<LayerSpans> for RecordLayout {
     }
 }
 
+/// Byte ceiling for [`ColdRecordCache`]: a QUARTER of physical RAM. The
+/// pinned warm tier already claims up to half (`warm_slots_for`), so a
+/// quarter for the pageable cold cache leaves at least a quarter for the
+/// process, the KV warm arenas, and the OS. On the 284B dev box that is
+/// ~47 GiB against a ~51 GiB cold universe (the ~3.9k experts in neither
+/// the warm tier nor VRAM, at 13.2 MiB per record) — a 16 GiB flat cap was
+/// measured to plateau at 1213 records and an 11% hit rate, leaving the
+/// trailing prefill re-reading ~36 GB of NVMe per pass. Insertion simply
+/// stops at the cap — no eviction — because the miss set is stable across
+/// waves, so whichever records filled first keep paying off every wave.
+fn cold_cache_cap() -> usize {
+    match candle::vram::total_physical_ram() {
+        Some(total) => (total / 4) as usize,
+        // No probe on this platform: fall back to a fixed ceiling rather
+        // than either unbounded growth or no cache at all.
+        None => 16 << 30,
+    }
+}
+
+/// See [`ExpertPack::cold_cache`]. Keyed by flat record index.
+struct ColdRecordCache {
+    records: RwLock<HashMap<usize, Box<[u8]>>>,
+    bytes: AtomicUsize,
+    cap: usize,
+}
+
+impl ColdRecordCache {
+    fn new() -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            bytes: AtomicUsize::new(0),
+            cap: cold_cache_cap(),
+        }
+    }
+
+    /// Whether record `idx` is cached. Records are never removed, so a `true`
+    /// stays true — callers may partition on this and copy later.
+    fn contains(&self, idx: usize) -> bool {
+        self.records
+            .read()
+            .expect("cold cache lock poisoned")
+            .contains_key(&idx)
+    }
+
+    /// Copy record `idx` into `dest` if cached. Returns whether it was.
+    fn fill(&self, idx: usize, dest: &mut [u8]) -> bool {
+        let map = self.records.read().expect("cold cache lock poisoned");
+        match map.get(&idx) {
+            Some(rec) if rec.len() == dest.len() => {
+                dest.copy_from_slice(rec);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remember `record` for `idx` (no-op once the cap is reached — the miss
+    /// set is stable, so uncached records just keep reading from the pack).
+    /// The 13 MB copy happens BEFORE the write lock, so concurrent stores
+    /// serialize only on the map insert.
+    fn store(&self, idx: usize, record: &[u8]) {
+        if self.bytes.load(Ordering::Relaxed) + record.len() > self.cap {
+            return;
+        }
+        if self.contains(idx) {
+            return;
+        }
+        let copy = record.to_vec().into_boxed_slice();
+        let mut map = self.records.write().expect("cold cache lock poisoned");
+        if map.contains_key(&idx) {
+            return;
+        }
+        self.bytes.fetch_add(copy.len(), Ordering::Relaxed);
+        map.insert(idx, copy);
+    }
+}
+
 /// One record to fetch in a batch: which expert, and where its bytes go.
 ///
 /// `dest` must be exactly one stride long and 4 KiB-aligned — in practice a
@@ -142,6 +222,25 @@ pub(crate) struct PackRead<'a> {
 pub(crate) struct ExpertPack {
     path: PathBuf,
     reader: DirectFile,
+    /// In-process cache of every record the RUNTIME miss path has read —
+    /// plain pageable memory, filled lazily, never evicted (capacity-bounded
+    /// by [`cold_cache_cap`]). The cold-eligible universe is bounded (the
+    /// experts in neither the pinned warm tier nor VRAM — ~3.9k records
+    /// ≈ 51 GiB on the 284B target) and re-reads on EVERY prefill wave for
+    /// the process lifetime, so after first touch a cold miss is a memcpy
+    /// instead of a physical NVMe round-trip.
+    ///
+    /// Why not the OS page cache: it was measured NOT to retain this set on
+    /// the dev box — with the warm tier pinned the machine runs at free=0,
+    /// and the continuous allocation churn repurposes the pack's standby
+    /// pages between waves (a warm-standby rerun still read at physical
+    /// speed, ~1.9s per 670-token prefill = the post-merge single-session
+    /// prefill regression; the pre-pack GGUF mmap kept its pages because
+    /// mapped views live in the process working set — which is exactly what
+    /// this cache restores, deliberately). The startup fill (`read_many`,
+    /// verified) bypasses the cache: it reads every record exactly once and
+    /// most of it lands pinned in the warm tier.
+    cold_cache: ColdRecordCache,
     /// Where the first record starts — the header padded to a sector.
     records_at: u64,
     stride: usize,
@@ -226,8 +325,9 @@ impl ExpertPack {
     /// Read one expert's record into `dest`, which must be exactly one stride
     /// long and 4 KiB-aligned.
     ///
-    /// This is the miss path when an expert is in neither VRAM nor RAM. It is a
-    /// blocking positioned read that bypasses the page cache, and it does
+    /// This is the miss path when an expert is in neither VRAM nor RAM. The
+    /// first touch is a blocking positioned direct read; every later touch is
+    /// a memcpy from [`Self::cold_cache`] (misses recur every wave). It does
     /// **not** verify the record's checksum — see [`Self::verify`] for the
     /// measurement behind that.
     pub(crate) fn read_into(&self, layer: usize, expert: usize, dest: &mut [u8]) -> Result<()> {
@@ -238,6 +338,10 @@ impl ExpertPack {
                 dest.len()
             );
         }
+        let idx = layer * self.experts_per_layer + expert;
+        if self.cold_cache.fill(idx, dest) {
+            return Ok(());
+        }
         self.reader
             .read_at(self.offset_of(layer, expert), dest)
             .map_err(|e| {
@@ -245,7 +349,9 @@ impl ExpertPack {
                     "expert pack read L{layer}E{expert} from {}: {e}",
                     self.path.display()
                 ))
-            })
+            })?;
+        self.cold_cache.store(idx, dest);
+        Ok(())
     }
 
     /// Read many records at once, each into its own stride-long aligned buffer.
@@ -279,23 +385,61 @@ impl ExpertPack {
                 );
             }
         }
-        let ids: Vec<(usize, usize)> = targets.iter().map(|t| (t.layer, t.expert)).collect();
-        let mut stripes: Vec<StripeRead<'_>> = targets
-            .into_iter()
-            .map(|t| StripeRead {
+        // Runtime (unverified) batches consult the cold cache first: the miss
+        // set recurs every wave, so after first touch most of the batch is
+        // memcpys and only the residue reads the drive. The cache memcpys run
+        // on the rayon pool CONCURRENTLY with the residue's striped direct
+        // reads — a serial 13 MB copy per record was barely faster than the
+        // QD16 NVMe read it replaced. The verified startup fill skips the
+        // cache both ways — it reads every record exactly once and most of
+        // what it reads lands pinned in the warm tier.
+        let mut hits: Vec<(usize, &mut [u8])> = Vec::new();
+        let mut ids: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+        let mut stripes: Vec<StripeRead<'_>> = Vec::with_capacity(targets.len());
+        for t in targets {
+            let idx = t.layer * self.experts_per_layer + t.expert;
+            if !verify && self.cold_cache.contains(idx) {
+                hits.push((idx, t.dest));
+                continue;
+            }
+            ids.push((t.layer, t.expert));
+            stripes.push(StripeRead {
                 file_offset: self.offset_of(t.layer, t.expert),
                 dest: t.dest,
-            })
-            .collect();
-        self.reader
-            .read_stripes_concurrent(&mut stripes)
-            .map_err(|e| {
-                candle::Error::Msg(format!(
-                    "expert pack batch read from {}: {e}",
-                    self.path.display()
-                ))
-            })?;
+            });
+        }
+        let (_, read) = rayon::join(
+            || {
+                hits.into_par_iter().for_each(|(idx, dest)| {
+                    // Records are never removed, so the `contains` above
+                    // guarantees this fills.
+                    self.cold_cache.fill(idx, dest);
+                });
+            },
+            || -> Result<()> {
+                if stripes.is_empty() {
+                    return Ok(());
+                }
+                self.reader
+                    .read_stripes_concurrent(&mut stripes)
+                    .map_err(|e| {
+                        candle::Error::Msg(format!(
+                            "expert pack batch read from {}: {e}",
+                            self.path.display()
+                        ))
+                    })
+            },
+        );
+        read?;
         if !verify {
+            // Parallel stores: the per-record 13 MB copy happens outside the
+            // map lock, so the copies spread across the pool.
+            ids.par_iter()
+                .zip(stripes.par_iter())
+                .for_each(|(&(layer, expert), stripe)| {
+                    self.cold_cache
+                        .store(layer * self.experts_per_layer + expert, stripe.dest);
+                });
             return Ok(());
         }
         // Verified across the pool: this is the whole warm tier, ~14 GB, and a
@@ -361,6 +505,7 @@ impl ExpertPack {
         Ok(Self {
             path: path.to_path_buf(),
             reader,
+            cold_cache: ColdRecordCache::new(),
             records_at,
             stride: got.stride as usize,
             slot_bytes: got.slot_bytes as usize,
@@ -962,6 +1107,69 @@ mod tests {
                 &got[i * stride..(i + 1) * stride],
                 want,
                 "record {i} differs"
+            );
+        }
+        drop(pack);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The runtime paths serve repeats from the in-process cold cache.**
+    /// Proven observably: after a record is read once, clobbering it on disk
+    /// must NOT change what the runtime paths return — the repeat is a memcpy
+    /// from the cache, not a file read. (The verified startup path is exempt:
+    /// it bypasses the cache by design.)
+    #[test]
+    fn a_runtime_reread_is_served_from_the_cold_cache() {
+        let dir = tmp_dir("coldcache");
+        let pack = build(&dir);
+        let stride = pack.stride();
+        let mut scratch = AlignedScratch::new();
+        scratch.ensure(stride).unwrap();
+
+        // First touch fills the cache.
+        let first = {
+            let dest = scratch.as_mut_slice(stride);
+            pack.read_into(1, 1, dest).unwrap();
+            dest.to_vec()
+        };
+
+        // Zero the record's whole region on disk (header/trailer intact).
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pack.path())
+                .unwrap();
+            let stride64 = round_up_sector(SLOT_BYTES) as u64;
+            let header_bytes = round_up_sector(super::open_header_len(2)) as u64;
+            f.seek(SeekFrom::Start(header_bytes + 3 * stride64))
+                .unwrap();
+            f.write_all(&vec![0u8; stride]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Single-record repeat: cache-served, original bytes.
+        {
+            let dest = scratch.as_mut_slice(stride);
+            dest.fill(0xEE);
+            pack.read_into(1, 1, dest).unwrap();
+            assert_eq!(dest, first.as_slice(), "read_into re-read the file");
+        }
+        // Batch repeat: cache-served, original bytes.
+        {
+            let dest = scratch.as_mut_slice(stride);
+            dest.fill(0xEE);
+            pack.read_many_unverified(vec![PackRead {
+                layer: 1,
+                expert: 1,
+                dest,
+            }])
+            .unwrap();
+            let dest = scratch.as_slice(stride);
+            assert_eq!(
+                dest,
+                first.as_slice(),
+                "read_many_unverified re-read the file"
             );
         }
         drop(pack);
