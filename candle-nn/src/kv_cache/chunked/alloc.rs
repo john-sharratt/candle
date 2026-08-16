@@ -27,7 +27,7 @@ use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
 use super::{Arena, ArenaLocation};
-use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::ArenaStorageState;
 use crate::kv_cache::{KvFormat, QuantFormat};
@@ -217,10 +217,16 @@ impl BackingInner {
     /// `(head, palette-band, side)` of `CHUNK_SIZE` tokens.
     ///
     /// The single authority for the number every size-class question is asked
-    /// with, so a model whose `head_dim / N_PALETTE` is not 32 cannot end up
+    /// with, so a model whose `head_dim / n_palette` is not 32 cannot end up
     /// with half its arenas sized from the assumption that it is (audit A9).
+    ///
+    /// Uses the backing's OWN band count (`n_palette()`): a single-latent
+    /// (DeepSeek) backing carries [`LATENT_N_BANDS`] bands of
+    /// `head_dim / LATENT_N_BANDS` dims, so sizing its slots at the GQA
+    /// `head_dim / N_PALETTE` width would quadruple every payload (512/4=128
+    /// vs 512/16=32 dims) and push R16 past the size-class ladder.
     pub(super) fn elems_per_chunk(&self) -> usize {
-        elems_per_chunk((self.head_dim / N_PALETTE).max(1))
+        elems_per_chunk((self.head_dim / self.n_palette()).max(1))
     }
 
     /// The arena key a chunk of `format` allocates from at this geometry.
@@ -693,6 +699,35 @@ impl ChunkedKvBacking {
             }
         }
 
+        // Active formats — this chunk is a writer and will not reach its
+        // configured sealed format until its turn seals and quantizes. GQA
+        // shares the constructor's per-(head, palette) tag `Arc`s; the single
+        // latent builds its own per-BAND tags here (n_palette entries per
+        // head), because its bands genuinely differ: the nope bands carry the
+        // writer format (FP8 E4M3 for the reference config) and the rope tail
+        // bands are pinned BF16 — exactly the two arena runs allocated above.
+        // K≡V, so both sides share one vec.
+        let (k_fmt, v_fmt) = if single_latent {
+            let nope_bands = crate::kv_cache::arena_table::LATENT_NOPE_BANDS.min(np);
+            let on_gpu = matches!(self.inner.storage.default_location(), ArenaLocation::Gpu);
+            let (k_active, _) =
+                crate::kv_cache::active_kv_formats(self.inner.storage.k_format(), on_gpu);
+            let nope_tag = ArenaFormatTag::from_kv_format(k_active).as_u8();
+            let rope_tag = ArenaFormatTag::from_kv_format(KvFormat::Float(DType::BF16)).as_u8();
+            let mut tags = Vec::with_capacity(np * self.inner.n_kv_head);
+            for _h in 0..self.inner.n_kv_head {
+                for p in 0..np {
+                    tags.push(if p < nope_bands { nope_tag } else { rope_tag });
+                }
+            }
+            let tags = std::sync::Arc::new(tags);
+            (tags.clone(), tags)
+        } else {
+            (
+                self.inner.active_k_fmt.clone(),
+                self.inner.active_v_fmt.clone(),
+            )
+        };
         Ok(ChunkWindow {
             gids: HeadGids::from_vec(gids),
             usage,
@@ -701,11 +736,8 @@ impl ChunkedKvBacking {
             v_pal: self.inner.identity_pal.clone(),
             k_scale: self.inner.identity_scale.clone(),
             v_scale: self.inner.identity_scale.clone(),
-            // Active formats (R16 K / F16 V on GPU) — this chunk is a writer
-            // and will not reach its configured sealed format until its turn
-            // seals and quantizes. Shared `Arc`, no per-chunk allocation.
-            k_fmt: self.inner.active_k_fmt.clone(),
-            v_fmt: self.inner.active_v_fmt.clone(),
+            k_fmt,
+            v_fmt,
             // Fresh float writer chunk: transient, no resident record. The host
             // serializer builds per-forward scratch heads for it.
             meta: None,

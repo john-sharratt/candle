@@ -9,6 +9,8 @@
 //! bucketize → gather → GEMM → SwiGLU → GEMM → scatter, all on the GPU, no host round-trip.
 
 #[cfg(feature = "cuda")]
+use candle::cuda_backend::Backing;
+#[cfg(feature = "cuda")]
 use candle::{Result, Tensor};
 
 /// Binary VRAM gate for the drafter's MoE and the speculative-decode enable. Because the Q2_KO
@@ -46,13 +48,12 @@ pub struct DsparkStreamingMoe {
     /// load — MXFP4 → f32 → Q2_KO on the GPU).
     ko_dtype: candle::quantized::GgmlDType,
     gate_shape: (usize, usize), // (inter, dim)
-    down_shape: (usize, usize), // (dim, inter)
     /// Per block: VRAM-resident router + shared expert (small).
     gates: Vec<super::moe::Gate>,
     shared: Vec<super::moe::Expert>,
-    /// Per block: all `n_experts` routed experts, permanently VRAM-resident. Held so their weight
-    /// pointers (below) stay valid for the model's life.
-    slots: Vec<Vec<crate::models::expert_lre::ExpertSlot>>,
+    /// Per block: all `n_experts` routed experts, permanently VRAM-resident. Never read —
+    /// held purely so their weight pointers (below) stay valid for the model's life.
+    _slots: Vec<Vec<crate::models::expert_lre::ExpertSlot>>,
     /// Per block: device-resident `[n_experts]` weight-pointer tables into `slots`, consumed by
     /// `grouped_qmatmul_dev_q8a128` (indexed by `moe_bucketize`'s raw expert-id tile tables).
     gate_ptrs: Vec<cudarc::driver::CudaSlice<u64>>,
@@ -194,10 +195,9 @@ impl DsparkStreamingMoe {
             n_experts: ne,
             ko_dtype,
             gate_shape: (inter, dim),
-            down_shape: (dim, inter),
             gates,
             shared,
-            slots,
+            _slots: slots,
             gate_ptrs,
             up_ptrs,
             down_ptrs,
@@ -247,7 +247,13 @@ impl DsparkStreamingMoe {
             // segments) in one launch, no GPU→CPU round-trip.
             moe_bucketize(&indices, ne, GROUPED_GEMM_TILE_W, &mut ws)?;
             let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + ne);
-            let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &self.cuda_dev)?;
+            let stacked = fused_moe_gather_q8a128(
+                &op,
+                &ws.tok_ids,
+                a_ub,
+                &self.cuda_dev,
+                Backing::Owned,
+            )?;
             let gate_out = grouped_qmatmul_dev_q8a128(
                 &stacked,
                 &self.gate_ptrs[block],
@@ -274,7 +280,12 @@ impl DsparkStreamingMoe {
                 launch_tiles,
                 &self.cuda_dev,
             )?;
-            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &self.cuda_dev)?;
+            let inter_acts = silu_mul_q8a128(
+                &gate_out,
+                &up_out,
+                &self.cuda_dev,
+                Backing::Owned,
+            )?;
             let down_out = grouped_qmatmul_dev_q8a128(
                 &inter_acts,
                 &self.down_ptrs[block],

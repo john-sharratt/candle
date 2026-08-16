@@ -41,7 +41,7 @@ pub fn shared_int8_forward(x: &Tensor, weights: &[&QLinear]) -> Result<Option<Ve
         let q = w
             .int8_qmatmul()
             .expect("all weights checked int8 above via is_int8()");
-        out.push(q.forward_dynamic(op.as_dynamic())?);
+        out.push(q.forward_dynamic(op.as_dynamic(), DType::F32)?);
     }
     Ok(Some(out))
 }

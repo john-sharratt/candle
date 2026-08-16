@@ -181,7 +181,3 @@ pub(crate) use pipeline::slot_bytes_for;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
 };
-// The packaged grouped-expert GEMM (gather → gate/up → SwiGLU → down → deterministic scatter),
-// reused by the DSpark streaming drafter cache.
-#[cfg(feature = "cuda")]
-pub(crate) use compute::compute_experts_grouped;

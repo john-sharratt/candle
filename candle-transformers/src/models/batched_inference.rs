@@ -3201,7 +3201,10 @@ pub trait ManagedBatchedModel {
                 layer_end,
                 None,
             )?;
-            let logits = step.logits.and_then(|mut v| v.pop()).ok_or_else(|| {
+            // Copied off the span (`logits_owned`): the rows are accumulated
+            // across this loop's forwards, so each iteration's span-backed
+            // views would be invalidated by the next forward.
+            let logits = step.logits_owned()?.pop().ok_or_else(|| {
                 candle::Error::msg("verify_block: forward_wave produced no logits")
             })?;
             session.advance_sequence(seq, 1)?;

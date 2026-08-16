@@ -16,10 +16,10 @@ use std::sync::RwLock;
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::batched_inference::{
-    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveStep,
+    BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult, WaveStep,
 };
-use candle::quantized::get_vram_info;
-use candle_nn::kv_cache::{set_vram_reserve_bytes, CHUNK_SIZE};
+use candle_nn::kv_cache::ModelGeometry;
+use candle_nn::kv_cache::CHUNK_SIZE;
 
 use super::attention::rms_norm;
 use super::engine::Dsv4Engine;
@@ -204,31 +204,7 @@ pub struct DeepSeekBatched {
 }
 
 impl DeepSeekBatched {
-    /// Install the KV VRAM reserve from MEASURED post-resident free VRAM. The
-    /// card-scaled default (`total/12` ≈ 6 GiB here) assumes the card is mostly
-    /// KV territory; this engine's residents claim nearly all of it (57 GB
-    /// expert pool + 6.6 GB base, plus ~5.5 GB drafter when speculative decode
-    /// is enabled — the expert pool cannot shrink to compensate, its pinned
-    /// remainder already rides the page-lock ceiling), so the reserve must be
-    /// carved from what actually remains: a sixth of free for the wave's
-    /// transient activations (floored well above the biggest single transient),
-    /// the rest is the KV budget. Called at construction and again after the
-    /// drafter loads (`with_drafter`), so the reserve always reflects the
-    /// current residents.
-    fn install_kv_vram_reserve(_engine: &Dsv4Engine) -> Result<()> {
-        let (free, _total) = get_vram_info()?;
-        let reserve = (free / 6).clamp(96 << 20, 4 << 30);
-        set_vram_reserve_bytes(reserve);
-        eprintln!(
-            "[mem] kv vram reserve = {} MiB (from {} MiB post-resident free)",
-            reserve >> 20,
-            free >> 20
-        );
-        Ok(())
-    }
-
     pub fn new(engine: Dsv4Engine) -> Result<Self> {
-        Self::install_kv_vram_reserve(&engine)?;
         let cfg = engine.cfg();
         let mut layer_static = Vec::with_capacity(cfg.n_layers);
         let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(
@@ -288,9 +264,6 @@ impl DeepSeekBatched {
             .map(|&l| if l >= 1 && l <= n { l - 1 } else { l })
             .collect();
         self.drafter = Some(std::sync::Mutex::new(drafter));
-        // The drafter's VRAM residency (backbone + all-resident expert set)
-        // shrank free VRAM — refresh the KV reserve to the new reality.
-        Self::install_kv_vram_reserve(&self.engine)?;
         Ok(self)
     }
 
@@ -681,6 +654,35 @@ impl ManagedBatchedModel for DeepSeekBatched {
         HEAD_DIM
     }
 
+    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
+        let cfg = self.engine.cfg();
+        ModelGeometry {
+            hidden: cfg.dim,
+            // Per-expert intermediate — the MoE FFN phase is priced per routed
+            // expert row, exactly like the qwen3 geometry.
+            intermediate: cfg.moe_inter_dim,
+            n_head: cfg.n_heads,
+            // Single-latent MLA: one 576-wide latent per token stands for K≡V.
+            n_kv_head: 1,
+            head_dim: HEAD_DIM,
+            experts_per_tok: cfg.n_activated_experts.max(1),
+            n_experts: cfg.n_routed_experts.max(1),
+            act_dtype,
+            // The int8 tensor-core kernels emit F32 before the cast back to
+            // `act_dtype`; both buffers are live at once, so both are planned.
+            accum_dtype: DType::F32,
+        }
+    }
+
+    fn maybe_change_dtype(&self, _dtype: DType) -> Result<()> {
+        // DeepSeek's dtypes are baked at load: norm/compressor constants are
+        // widened to F32 once (`load_compressor`), the attention kernels take
+        // bf16 in and emit F32, and the int8 projections quantize from F32.
+        // There is nothing to re-materialise per session dtype — the forward
+        // accepts the activation dtype the engine was built for.
+        Ok(())
+    }
+
     fn device(&self) -> &Device {
         self.engine.engine_device()
     }
@@ -784,7 +786,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         layer_start: usize,
         layer_end: usize,
         residual_in: Option<Tensor>,
-    ) -> Result<WaveStep> {
+    ) -> Result<WaveResult> {
         if decode_inputs.len() != decode_seqs.len()
             || prefill_inputs.len() != prefill_seqs.len()
             || glue_inputs.len() != glue_seqs.len()
@@ -838,7 +840,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 candle::bail!("deepseek glue is causal-only (fwd_ahead must be 0)");
             }
             let chunks = session.backings()[0]
-                .live_chunks_as_sealed(seq, &[])
+                .live_chunks_as_sealed(seq)
                 .unwrap_or_default();
             let mut block_start = Vec::with_capacity(chunks.len());
             let mut block_off = Vec::with_capacity(chunks.len());
@@ -1805,7 +1807,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         let base_resident = prefill_base[pi] - prefill_base_ev[pi] as usize;
                         let (wslice, wblk): (Vec<u32>, Vec<u32>) = {
                             let chunks = session.backings()[l]
-                                .live_chunks_as_sealed(vseq, &[])
+                                .live_chunks_as_sealed(vseq)
                                 .unwrap_or_default();
                             let mut map: Vec<(u32, u32)> = Vec::with_capacity(s_len);
                             let mut cum = 0usize;
@@ -2001,10 +2003,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // Pause: persist the mHC stream flattened to a plain 3-D hidden
             // shape (opaque to the scheduler).
             let flat = h.reshape((1, total_rows, cfg.hc_mult * cfg.dim))?;
-            return Ok(WaveStep {
+            return Ok(WaveResult::owned(WaveStep {
                 residual: Some(flat),
                 logits: None,
-            });
+            }));
         }
 
         // A batched prefill wrote its tokens via `write_contiguous` (not the
@@ -2110,10 +2112,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
             }
         }
         pipeline_record("deepseek:head_lm", t_head);
-        Ok(WaveStep {
+        Ok(WaveResult::owned(WaveStep {
             residual: None,
             logits: Some(logits_rows),
-        })
+        }))
     }
 
     /// Batched speculative verify: run EVERY sequence's `[committed, drafts…]` block in ONE
@@ -2190,9 +2192,16 @@ impl ManagedBatchedModel for DeepSeekBatched {
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
-        let logits = step
-            .logits
-            .ok_or_else(|| candle::Error::msg("verify_blocks: forward_wave produced no logits"))?;
+        // Copy the rows off the wave's span (`logits_owned`): the driver reads
+        // them after this forward returns — argmax comparison, and on partial
+        // accept a rollback + a NEXT forward — so span-lifetime views would
+        // dangle by then.
+        let logits = step.logits_owned()?;
+        if logits.is_empty() {
+            return Err(candle::Error::msg(
+                "verify_blocks: forward_wave produced no logits",
+            ));
+        }
         let total: usize = blocks.iter().map(|b| b.len()).sum();
         if logits.len() != total {
             candle::bail!(
@@ -2492,9 +2501,10 @@ mod tests {
             t0.elapsed().as_secs_f32()
         );
         session.advance_sequence(seq, ids.len())?;
-        let logits = step
-            .logits
-            .ok_or_else(|| candle::Error::msg("prefill wave produced no logits"))?;
+        let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("prefill wave produced no logits"));
+            }
         let mut next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         // Greedy decode until EOS (bounded) through decode waves. STRICT gate:
@@ -2523,9 +2533,10 @@ mod tests {
             )?;
             session.advance_sequence(seq, 1)?;
             decode_waves += 1;
-            let logits = step
-                .logits
-                .ok_or_else(|| candle::Error::msg("decode wave produced no logits"))?;
+            let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("decode wave produced no logits"));
+            }
             next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
             gen.push(next);
         }
@@ -2630,9 +2641,10 @@ mod tests {
             None,
         )?;
         session.advance_sequence(seq, ids.len())?;
-        let logits = step
-            .logits
-            .ok_or_else(|| candle::Error::msg("prefill produced no logits"))?;
+        let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("prefill produced no logits"));
+            }
         let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         // Speculative decode loop: each step commits ≥1 token (the model's exact
@@ -2708,22 +2720,17 @@ mod tests {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        // Load the ENGINE first so its expert VRAM pool sizes to the full free VRAM (pinned
-        // remainder stays under the page-lock ceiling); the drafter's small int8 backbone + its
-        // lazily-streamed expert slots then live in the target's 13 GB activation headroom. (Loading
-        // the drafter first would shrink the expert pool and spill the target past the pinned
-        // ceiling on this saturated box.)
-        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
-        let (free0, _tot0) = device.mem_get_info()?;
-        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
-        let (free1, _tot1) = device.mem_get_info()?;
-        eprintln!(
-            "[spec-dspark] drafter backbone VRAM footprint = {:.2} GB (free {:.1}→{:.1} GB after engine)",
-            (free0 - free1) as f64 / (1u64 << 30) as f64,
-            free0 as f64 / (1u64 << 30) as f64,
-            free1 as f64 / (1u64 << 30) as f64,
-        );
-        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+        // Combined load: the drafter lands in the DENSE tier (before the span
+        // reservation), so the elastic boundary balances target-experts vs KV
+        // around it — see `Dsv4Engine::load_with_drafter`.
+        let (engine, drafter) = Dsv4Engine::load_with_drafter(
+            &path,
+            Some(&dspark),
+            &device,
+            Int8Mode::Performance,
+        )?;
+        let model =
+            DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -2762,9 +2769,10 @@ mod tests {
             None,
         )?;
         session.advance_sequence(seq, ids.len())?;
-        let logits = step
-            .logits
-            .ok_or_else(|| candle::Error::msg("prefill produced no logits"))?;
+        let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("prefill produced no logits"));
+            }
         let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         let max_draft = 4usize;
@@ -2841,9 +2849,14 @@ mod tests {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
-        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
-        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+        let (engine, drafter) = Dsv4Engine::load_with_drafter(
+            &path,
+            Some(&dspark),
+            &device,
+            Int8Mode::Performance,
+        )?;
+        let model =
+            DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -2885,9 +2898,10 @@ mod tests {
                 None,
             )?;
             session.advance_sequence(seq, ids.len())?;
-            let logits = step
-                .logits
-                .ok_or_else(|| candle::Error::msg("no prefill logits"))?;
+            let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("no prefill logits"));
+            }
             let first = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
             Ok((session, seq, first))
         };
@@ -2914,6 +2928,7 @@ mod tests {
             gsession.advance_sequence(gseq, 1)?;
             committed = step
                 .logits
+                .as_ref()
                 .ok_or_else(|| candle::Error::msg("no decode logits"))?[0]
                 .i(0)?
                 .argmax(0)?
@@ -2996,9 +3011,14 @@ mod tests {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
-        let drafter = super::super::dspark::DsparkDrafter::load(&dspark, &device)?;
-        let model = DeepSeekBatched::new(engine)?.with_drafter(drafter)?;
+        let (engine, drafter) = Dsv4Engine::load_with_drafter(
+            &path,
+            Some(&dspark),
+            &device,
+            Int8Mode::Performance,
+        )?;
+        let model =
+            DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -3039,6 +3059,7 @@ mod tests {
         session.advance_sequence(seq, ids.len())?;
         let mut committed = step
             .logits
+            .as_ref()
             .ok_or_else(|| candle::Error::msg("no prefill logits"))?[0]
             .i(0)?
             .argmax(0)?
@@ -3158,9 +3179,10 @@ mod tests {
                 None,
             )?;
             session.advance_sequence(seq, 1)?;
-            let logits = step
-                .logits
-                .ok_or_else(|| candle::Error::msg("decode wave produced no logits"))?;
+            let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("decode wave produced no logits"));
+            }
             logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()
         };
 
@@ -3244,7 +3266,7 @@ mod tests {
                     l + 1,
                     resid.take(),
                 )?;
-                match step.residual {
+                match step.into_residual() {
                     Some(r) => {
                         res_a[l].push(r.clone());
                         resid = Some(r);
@@ -3274,7 +3296,7 @@ mod tests {
                 l + 1,
                 resid.take(),
             )?;
-            if let Some(r) = step.residual {
+            if let Some(r) = step.into_residual() {
                 res_b.push(r.clone());
                 resid = Some(r);
             }
@@ -3384,7 +3406,7 @@ mod tests {
             None,
         )?;
         session.advance_sequence(seq_b, n)?;
-        let logits_b = step_b.logits.expect("prefill logits")[0].clone();
+        let logits_b = step_b.logits_owned()?.swap_remove(0);
         let next_b = logits_b.i(0)?.argmax(0)?.to_scalar::<u32>()?;
         eprintln!("[state-diff] prefill argmax token={next_b}");
 
@@ -3457,7 +3479,7 @@ mod tests {
             n_layers,
             None,
         )?;
-        let logits = step.logits.expect("decode logits");
+        let logits = step.logits_owned()?;
         let arg_a = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
         let arg_b = logits[1].i(0)?.argmax(0)?.to_scalar::<u32>()?;
         let dl = (logits[0].to_dtype(DType::F32)? - logits[1].to_dtype(DType::F32)?)?
@@ -3532,9 +3554,10 @@ mod tests {
             None,
         )?;
         session.advance_sequence(seq, ids.len())?;
-        let logits = step
-            .logits
-            .ok_or_else(|| candle::Error::msg("prefill wave produced no logits"))?;
+        let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("prefill wave produced no logits"));
+            }
         let mut next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         let mut gen = vec![next];
@@ -3553,9 +3576,10 @@ mod tests {
                 None,
             )?;
             session.advance_sequence(seq, 1)?;
-            let logits = step
-                .logits
-                .ok_or_else(|| candle::Error::msg("decode wave produced no logits"))?;
+            let logits = step.logits_owned()?;
+            if logits.is_empty() {
+                return Err(candle::Error::msg("decode wave produced no logits"));
+            }
             next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
             gen.push(next);
         }

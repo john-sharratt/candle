@@ -60,28 +60,37 @@ use super::types::{CHUNK_SIZE, TARGET_ARENA_BYTES};
 /// The rungs above were sized for the production palette-4 geometry —
 /// `head_dim 128 / N_PALETTE 4 = 32`, so `CHUNK_SIZE(32) * 32 = 1024` elements
 /// a slot. A slot's payload scales with `head_dim`, so the supported dims
-/// {64, 96, 128, 256} need coverage up to `head_dim 256`, where `R16` and `F32`
-/// occupy 8192 B. Only that top rung is added: the intermediate payloads at
-/// those widths round up into existing rungs, which wastes bandwidth on a
-/// non-production geometry rather than adding classes that would strand regions
-/// on the production one. `every_kv_format_maps_to_a_class` pins coverage at
-/// *every* supported dim — it pinned only 128 before, which is how a chunk of
-/// `R16` at `head_dim 256` came to have nowhere to live.
-pub const LADDER: [usize; 14] = [
-    320,  // catch-all: Q0, Q0_V, Q0_X, Q0_M2, Q0_M4, Q1_S, Q1_A, Q2_S, Q2_0
-    384,  // Q2_1
-    448,  // Q3_0
-    512,  // Q3_1
-    576,  // Q4_0
-    640,  // Q4_KS
-    704,  // Q5_0
-    768,  // Q5_1
-    1024, // F8E4M3
-    1088, // Q8_0
-    1152, // Q8_KS, Q8_1
-    2048, // F16, BF16
-    4096, // R16, F32 — and F16/BF16 at head_dim 256
-    8192, // R16, F32 at head_dim 256
+/// {64, 96, 128, 256, 512} need coverage up to `head_dim 512`, where `R16` and
+/// `F32` occupy 16384 B. Only the top rungs are added: the intermediate
+/// payloads at those widths round up into existing rungs, which wastes
+/// bandwidth on a non-production geometry rather than adding classes that
+/// would strand regions on the production one.
+/// `every_kv_format_maps_to_a_class` pins coverage at *every* supported dim —
+/// it pinned only 128 before, which is how a chunk of `R16` at `head_dim 256`
+/// came to have nowhere to live.
+///
+/// `head_dim 512` is DeepSeek's latent width. The single-latent backing runs
+/// its 16×32-dim bands (1024-elem slots) in steady state, but it is
+/// *constructed* at the GQA width — `warm_protected_arenas` mints the writer
+/// arenas at `512 / N_PALETTE = 128` dims before `set_single_latent` drops
+/// them and re-mints at band width — so the construction-time R16 payload
+/// (16384 B) must have a rung to pass through.
+pub const LADDER: [usize; 15] = [
+    320,   // catch-all: Q0, Q0_V, Q0_X, Q0_M2, Q0_M4, Q1_S, Q1_A, Q2_S, Q2_0
+    384,   // Q2_1
+    448,   // Q3_0
+    512,   // Q3_1
+    576,   // Q4_0
+    640,   // Q4_KS
+    704,   // Q5_0
+    768,   // Q5_1
+    1024,  // F8E4M3
+    1088,  // Q8_0
+    1152,  // Q8_KS, Q8_1
+    2048,  // F16, BF16
+    4096,  // R16, F32 — and F16/BF16 at head_dim 256
+    8192,  // R16, F32 at head_dim 256
+    16384, // R16, F32 at head_dim 512 (DeepSeek latent constructed at GQA width)
 ];
 
 /// Raw-gid stride: `raw = region_idx * GID_STRIDE + chunk_idx`.
@@ -262,8 +271,10 @@ mod tests {
     /// the one the model in front of us happens to use.
     ///
     /// Kept in step with the `64 | 96 | 128 | 256` guards in
-    /// `paged_decode_attn` and `paged_prefill_attn_varlen_chunks`.
-    const SUPPORTED_HEAD_DIMS: [usize; 4] = [64, 96, 128, 256];
+    /// `paged_decode_attn` and `paged_prefill_attn_varlen_chunks`; 512 is the
+    /// DeepSeek single-latent width, whose backing passes through the GQA
+    /// geometry at construction (see the ladder's head-dim note).
+    const SUPPORTED_HEAD_DIMS: [usize; 5] = [64, 96, 128, 256, 512];
 
     /// Coverage: every format an arena can hold maps to a class, at every head
     /// dim the kernels accept. A `None` here means a chunk of that format has

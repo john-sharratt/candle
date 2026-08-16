@@ -36,12 +36,14 @@ pub fn band_tags<'a>(
     v_fmt: &'a [u8],
 ) -> impl Iterator<Item = (&'a ChunkGid, ArenaFormatTag)> + 'a {
     gids.as_slice().iter().enumerate().map(move |(i, gid)| {
-        // Slot i is head i/GIDS_PER_HEAD, palette (i%GIDS_PER_HEAD)/2, and the
-        // K or V side by the low bit. Tags are indexed [h*N_PALETTE+p].
-        let h = i / GIDS_PER_HEAD;
-        let rem = i % GIDS_PER_HEAD;
-        let t = h * N_PALETTE + rem / 2;
-        let side = if rem % 2 == 0 { k_fmt } else { v_fmt };
+        // Slot i is `head * (bands * 2) + band * 2 + is_value`, and tags are
+        // indexed `[head * bands + band]` — so the tag index is simply `i / 2`
+        // and the side the low bit, WHATEVER the per-head band count is
+        // (4-band GQA and the 16-band single latent alike). Deriving it
+        // through the global `GIDS_PER_HEAD` stride would mis-map every band
+        // past the fourth on a single-latent window.
+        let t = i / 2;
+        let side = if i % 2 == 0 { k_fmt } else { v_fmt };
         (
             gid,
             side.get(t)

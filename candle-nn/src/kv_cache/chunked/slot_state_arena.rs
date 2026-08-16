@@ -344,7 +344,8 @@ mod tests {
     fn the_top_class_holds_a_deep_sequence() {
         use super::super::meta_pool::chunk_record_bytes;
         const SLICE_HEADER_BYTES: usize = 16;
-        let per_chunk = SLICE_HEADER_BYTES + chunk_record_bytes(4, 128);
+        let per_chunk = SLICE_HEADER_BYTES
+            + chunk_record_bytes(4, 128, crate::kv_cache::arena_table::N_PALETTE);
         assert_eq!(per_chunk, 688, "production (n_kv_head 4, head_dim 128)");
 
         let top = SLOT_STATE_LADDER[SLOT_STATE_LADDER.len() - 1];

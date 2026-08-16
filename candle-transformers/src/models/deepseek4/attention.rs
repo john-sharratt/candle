@@ -13,6 +13,8 @@
 //! RoPE dims are de-rotated (inverse rotation) before the grouped low-rank output
 //! projection.
 
+#[cfg(feature = "cuda")]
+use candle::cuda_backend::Backing;
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::ops::softmax;
 
@@ -401,7 +403,15 @@ impl Attention {
             .to_dtype(DType::F32)?;
         let op = to_dynamic(&o_g, Int8Mode::Performance, &dev)?;
         let offsets: Vec<i32> = (0..=ng).map(|g| (g * bs) as i32).collect();
-        let out = grouped_qmatmul(op.as_dynamic(), &ptrs, wdtype, olr, &offsets, &dev)?; // [ng*bs, olr] f32
+        let out = grouped_qmatmul(
+            op.as_dynamic(),
+            &ptrs,
+            wdtype,
+            olr,
+            &offsets,
+            &dev,
+            Backing::Owned,
+        )?; // [ng*bs, olr] f32
                                                                                          // [ng*bs, olr] -> [ng, bs, olr] -> [bs, ng, olr] -> [b, s, ng*olr]
         let proj = out
             .reshape((ng, bs, olr))?

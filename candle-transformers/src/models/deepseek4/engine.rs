@@ -17,12 +17,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
-use candle::quantized::{get_vram_info, gguf_file, GgmlDType, Int8Mode, MmapRegistration};
+use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration};
 use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
-use crate::models::expert_lre::{ExpertCache, MmapExpertRef, MoeInput};
+use crate::models::expert_lre::{
+    layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
+    MmapExpertRef, MoeInput,
+};
 use crate::models::profile::{pipeline_record, profile_now};
+use candle_nn::kv_cache::WeightZone;
 
 use super::config::Config;
 use super::hyper::{HyperConnection, HyperParams};
@@ -72,9 +76,30 @@ impl Dsv4Engine {
     /// Load the merged single-file GGUF into the resident engine model.
     ///
     /// Non-expert weights load to `device` (VRAM); the routed experts are registered as
-    /// byte-ranges into the page-locked mmap and streamed by the `ExpertCache` (int8-KO when
-    /// `int8mode` is enabled — the 2×-FP16 grouped GEMM path).
+    /// byte-ranges into the mmap and served by the `ExpertCache`'s three tiers (VRAM slots
+    /// leased from the span's weight zone / pinned warm bank / the repacked `.experts.pack`
+    /// on NVMe; int8-KO when `int8mode` is enabled — the 2×-FP16 grouped GEMM path).
     pub fn load(merged_path: &Path, device: &Device, int8mode: Int8Mode) -> Result<Self> {
+        Ok(Self::load_with_drafter(merged_path, None, device, int8mode)?.0)
+    }
+
+    /// [`Self::load`], with the DSpark speculative-decode drafter loaded as part of the
+    /// engine's **dense tier**: the drafter's int8 backbone and its all-resident Q2_KO
+    /// expert set land in VRAM *before* the span reservation is taken, so they are
+    /// permanent residents the reservation measures around — exactly like the attention
+    /// weights. The elastic KV↔expert boundary then balances the *target's* experts
+    /// against KV in whatever the card has left; nothing about the drafter competes with
+    /// the span at runtime. (Loading a drafter after the span would have to live in the
+    /// pool cushion, which the activation peak already owns.)
+    ///
+    /// Returns the drafter alongside the engine; attach it with
+    /// [`super::wave::DeepSeekBatched::with_drafter`].
+    pub fn load_with_drafter(
+        merged_path: &Path,
+        dspark_path: Option<&Path>,
+        device: &Device,
+        int8mode: Int8Mode,
+    ) -> Result<(Self, Option<super::dspark::DsparkDrafter>)> {
         // GgufModel handles config + convenient loading of the resident (non-expert) tensors.
         let mut gguf = GgufModel::open(std::slice::from_ref(&merged_path.to_path_buf()))?;
         let cfg = loader::config_from_gguf(&gguf)?;
@@ -139,92 +164,50 @@ impl Dsv4Engine {
             all_host_refs.push(refs);
         }
 
-        // Size the VRAM hot pool: budget = min(free-headroom, all-experts), slots = budget/max.
-        // A slot holds the REPACKED expert (the MXFP4_KO twin the pool actually stores), not the
-        // native GGUF source — sizing off `*_len` (native) would under-count the slot and let the
-        // pool overshoot free VRAM. Ask `repacked_size_bytes` for the KO twin per projection.
-        let ko_bytes = |shape: &[usize], dt: GgmlDType| -> usize {
-            let kod = dt.to_ko(int8mode).unwrap_or(dt);
-            candle::quantized::repacked_size_bytes(shape[0], shape[1], kod).unwrap_or(0)
-        };
-        let max_expert_size = all_host_refs
-            .iter()
-            .flatten()
-            .map(|r| {
-                ko_bytes(&r.gate_shape, r.gate_dtype)
-                    + ko_bytes(&r.up_shape, r.up_dtype)
-                    + ko_bytes(&r.down_shape, r.down_dtype)
-            })
-            .max()
-            .unwrap_or(0);
+        // ── VRAM governor ──
+        // Balloon to measure the real resident capacity `C`, then install it so
+        // the span reservation, KV admission, and the weight zone all coordinate
+        // through one authority. The reservation (`region_pool`) sizes itself
+        // from `governor.usable()` at first touch — which happens BELOW, after
+        // every dense tensor is resident, so the span takes exactly what is
+        // genuinely left (`docs/elastic_vram_partition.md` §4).
         let total_experts = moe_layers.len() * n_expert;
-        let total_expert_bytes = total_experts * max_expert_size;
-        let (free_vram, _total_vram) = get_vram_info()?;
-        // Reserve for everything that lives OUTSIDE the expert pool and is allocated after it:
-        // the resident base weights (embedding/attention/lm_head/mHC/norms), the KV cache, and
-        // per-forward activations. This is the razor's-edge knob between a device OOM (too small —
-        // base overruns it) and a pinned-host OOM (too large — the shrunken VRAM pool pushes the
-        // 152 GB of experts past the ~95 GB page-lock ceiling). ~152 GB experts vs VRAM+pinned is
-        // near-saturated. 10 GiB proved too small — the resident base OOM'd with only 9.5 GB left.
-        // 152 GB experts vs VRAM+pinned is near-saturated. 10 GiB proved too small — the resident
-        // base OOM'd with only 9.5 GB left; 14 GiB pushed the pinned expert remainder to ~101 GB and
-        // `cuMemAllocHost` OOM'd at the page-lock ceiling. 13 GiB gives the resident base + KV +
-        // activations room while keeping the VRAM pool large enough that the pinned remainder stays
-        // under the ceiling. Cheap to retune now that load is fast.
-        // Headroom kept free of the expert VRAM pool for the resident base + KV + activations, plus
-        // the DSpark drafter (VRAM-resident, ~5.8 GiB) when attached (loaded AFTER the engine — see
-        // `DeepSeekBatched::with_drafter`). 13 GiB is the ceiling here: raising it shrinks the VRAM
-        // expert pool, pushing more target experts into the pinned pool, whose size (overflow + a
-        // mandatory 10% eviction headroom — the pool must never run out, there is no CUDA mmap
-        // reload) then exceeds the ~100 GB WDDM per-process page-lock limit and OOMs `cuMemAllocHost`
-        // (14 GiB → ~101 GB fails; 13 GiB → ~100 GB loads). (Speculative decode is enabled only above
-        // 64 GiB VRAM; smaller cards are clamped by the `free_vram / 2` floor below.)
-        let headroom = 13usize << 30;
-        let expert_budget = free_vram
-            .saturating_sub(headroom)
-            .max(free_vram / 2)
-            .min(total_expert_bytes);
-        let num_slots = if max_expert_size > 0 {
-            (expert_budget / max_expert_size).min(total_experts)
-        } else {
-            0
-        };
         let gb = |b: usize| b as f64 / (1usize << 30) as f64;
-        let num_pinned_est = total_experts.saturating_sub(num_slots) + num_slots / 10;
-        eprintln!(
-            "[mem] free_vram={:.1}GB total_vram={:.1}GB | experts: n={} slot={:.1}MB total={:.1}GB \
-             | budget={:.1}GB headroom={:.1}GB → vram_slots={} (~{:.1}GB), pinned~{} (~{:.1}GB)",
-            gb(free_vram),
-            gb(_total_vram),
-            total_experts,
-            max_expert_size as f64 / 1e6,
-            gb(total_expert_bytes),
-            gb(expert_budget),
-            gb(headroom),
-            num_slots,
-            gb(num_slots * max_expert_size),
-            num_pinned_est,
-            gb(num_pinned_est * max_expert_size),
-        );
-        let free_before_experts = free_vram;
-        let experts = Arc::new(ExpertCache::new(
-            mmap.clone(),
-            all_host_refs,
-            num_slots,
-            device,
-            n_expert,
-            Some(merged_path),
-            None,
-            int8mode,
-        )?);
-        let (free_after_experts, _) = get_vram_info()?;
-        eprintln!(
-            "[mem] after ExpertCache: free_vram={:.1}GB (expert VRAM pool consumed {:.1}GB); \
-             resident_vram_gauge={:.1}GB",
-            gb(free_after_experts),
-            gb(free_before_experts.saturating_sub(free_after_experts)),
-            gb(experts.resident_vram_bytes()),
-        );
+        #[cfg(feature = "cuda")]
+        let gpu_id = match device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+            _ => 0,
+        };
+        #[cfg(feature = "cuda")]
+        if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
+            // DeepSeek's forward still allocates its per-wave transients from
+            // the ordinary CUDA pool (it has not adopted the span's transient
+            // tier), so the cushion the reservation leaves OUTSIDE the span
+            // must cover the activation peak — a wide batched prefill
+            // materialises several GiB. 6 GiB matches the engine's measured
+            // reserve on this card; when the forward moves onto the wave
+            // arenas this drops back to the 512 MiB pool default.
+            let config = candle::vram::GovernorConfig {
+                scratch_margin: 6 << 30,
+                ..Default::default()
+            };
+            match candle::vram::VramGovernor::from_device_with_config(device, gpu_id, config) {
+                Ok(gov) => {
+                    let mut balloon =
+                        candle::vram::balloon::DeviceBalloonAllocator::new(device.clone());
+                    match gov.run_balloon(&mut balloon) {
+                        Ok(c) => eprintln!(
+                            "[mem] VRAM governor installed: capacity C={:.1}GB",
+                            c as f64 / 1e9
+                        ),
+                        Err(e) => eprintln!("[mem] VRAM governor balloon failed: {e}"),
+                    }
+                    candle::vram::install(gov);
+                }
+                Err(e) => eprintln!("[mem] VRAM governor init failed: {e}"),
+            }
+        }
+        let (free_before_dense, _total_vram) = get_vram_info()?;
 
         // ── Resident non-expert weights ──
         // Token embedding stays in HOST RAM: it's a lookup table, read one row per token
@@ -313,9 +296,9 @@ impl Dsv4Engine {
         let (free_after_resident, _) = get_vram_info()?;
         eprintln!(
             "[mem] after resident base: free_vram={:.1}GB (resident consumed {:.1}GB); \
-             ready for KV + activations",
+             span reservation next",
             gb(free_after_resident),
-            gb(free_after_experts.saturating_sub(free_after_resident)),
+            gb(free_before_dense.saturating_sub(free_after_resident)),
         );
 
         let rope_compress = RotaryCache::new(
@@ -337,21 +320,126 @@ impl Dsv4Engine {
             device,
         )?;
 
-        Ok(Self {
-            cfg,
-            embed,
-            layers,
-            hc,
-            hc_head,
-            output_norm,
-            lm_head,
-            rope_compress,
-            rope_swa,
-            experts,
-            _mmap: mmap,
-            _reg: reg,
-            device: device.clone(),
-        })
+        // ── Drafter (dense tier) ──
+        //
+        // Loaded HERE — after the target's dense weights, before the span
+        // reservation — so its backbone + all-resident Q2_KO expert set are
+        // permanent residents the reservation measures around.
+        let drafter = match dspark_path {
+            Some(p) => {
+                let (free_b, _) = get_vram_info()?;
+                let d = super::dspark::DsparkDrafter::load(p, device)?;
+                let (free_a, _) = get_vram_info()?;
+                eprintln!(
+                    "[mem] drafter loaded into the dense tier: {:.2} GB (free {:.1}→{:.1} GB)",
+                    gb(free_b.saturating_sub(free_a)),
+                    gb(free_b),
+                    gb(free_a),
+                );
+                Some(d)
+            }
+            None => None,
+        };
+
+        // ── Reserve the span, then build the expert cache into it ──
+        //
+        // Every dense tensor (and the drafter, when speculative decode is on)
+        // is resident at this point, so the governor's `usable()` reports what
+        // is genuinely left and the reservation (created lazily by the first
+        // `span_end` call) takes it. The weight zone opens at the span's right
+        // edge; its capacity in slots IS the resident-expert count — no byte
+        // budget, no headroom constant (`docs/elastic_vram_partition.md` §4,
+        // `docs/expert_cache_design.md`).
+        #[cfg(feature = "cuda")]
+        let zone = if let Device::Cuda(cuda_dev) = device {
+            use candle_nn::kv_cache::{
+                initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
+            };
+            let stream = cuda_dev.cuda_stream();
+            let geoms = layer_geometries(&all_host_refs, int8mode)?;
+            let slot_bytes = slot_bytes_for(&geoms);
+            let limit_bytes = weight_capacity_bytes(&stream)?;
+            let initial_bytes = initial_weight_bytes(&stream)?;
+            let slots_in = |bytes: usize| {
+                if slot_bytes > 0 {
+                    (bytes / slot_bytes).min(total_experts)
+                } else {
+                    0
+                }
+            };
+            let capacity = slots_in(initial_bytes);
+            let limit = slots_in(limit_bytes);
+            let floor = minimum_resident_slots(n_expert);
+            let zone = WeightZone::new(span_end(&stream)?, slot_bytes, capacity, limit, floor);
+            let regions = set_weight_floor(&stream, zone.frontier_for_capacity())?;
+            eprintln!(
+                "[mem] expert cache opened against the span: slots={capacity} (max {limit}, \
+                 floor {floor}) of {total_experts} experts, slot={:.1}MB → resident {:.1}GB, \
+                 kv_regions={regions}",
+                slot_bytes as f64 / 1e6,
+                gb(capacity * slot_bytes),
+            );
+            zone
+        } else {
+            WeightZone::new(0, 0, 0, 0, 0)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let zone = WeightZone::new(0, 0, total_experts, total_experts, 0);
+        let zone_capacity = zone.capacity();
+        let zone_slot_bytes = zone.slot_bytes();
+
+        let experts = Arc::new(ExpertCache::new(ExpertCacheSetup {
+            mmap: mmap.clone(),
+            host_refs: all_host_refs,
+            zone,
+            device,
+            experts_per_layer: n_expert,
+            gguf_path: merged_path,
+            // Persistent pack beside the GGUF: written once on first boot
+            // (repacked kernel-layout records), authoritative cold tier after.
+            expert_pack_dir: merged_path.parent(),
+            progress: None,
+            int8mode,
+        })?);
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(g) = candle::vram::get(gpu_id) {
+                g.set_class(
+                    candle::vram::AllocClass::Expert,
+                    (zone_capacity * zone_slot_bytes) as u64,
+                );
+            }
+            // Open the shop: a KV arena claim that runs out of ground can buy
+            // more at the price of expert residency (eviction = drop, the pack
+            // re-supplies) instead of refusing.
+            let seller = Arc::downgrade(&experts);
+            candle_nn::kv_cache::set_ground_broker(gpu_id, move |regions| {
+                seller
+                    .upgrade()
+                    .map_or(0, |cache| cache.request_kv_ground(regions))
+            });
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (zone_capacity, zone_slot_bytes);
+
+        Ok((
+            Self {
+                cfg,
+                embed,
+                layers,
+                hc,
+                hc_head,
+                output_norm,
+                lm_head,
+                rope_compress,
+                rope_swa,
+                experts,
+                _mmap: mmap,
+                _reg: reg,
+                device: device.clone(),
+            },
+            drafter,
+        ))
     }
 
     pub fn config(&self) -> &Config {
@@ -464,6 +552,7 @@ impl Dsv4Engine {
             DType::F32,
             &weights_flat,
             assignments,
+            None,
         )?; // [nt, dim] F32
         pipeline_record("moe:submit", t_submit);
         let t_shared = profile_now();

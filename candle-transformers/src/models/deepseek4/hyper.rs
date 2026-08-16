@@ -288,7 +288,7 @@ impl candle::CustomOp1 for SinkhornOp {
     ) -> Result<(candle::CudaStorage, candle::Shape)> {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::CudaStorageSlice;
+        use candle::cuda_backend::{Backing, CudaStorageSlice};
         use candle_kernels::simple::sinkhorn::run_sinkhorn_f32;
 
         let dev = storage.device().clone();
@@ -324,6 +324,7 @@ impl candle::CustomOp1 for SinkhornOp {
         let dst = candle::CudaStorage {
             slice: CudaStorageSlice::F32(out),
             device: dev,
+            backing: Backing::Owned,
         };
         Ok((dst, shape))
     }
