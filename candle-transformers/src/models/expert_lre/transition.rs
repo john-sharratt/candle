@@ -50,8 +50,11 @@ const MIN_OBS: u32 = 64;
 /// volume-control knob for a capacity-bound resident set: prefetching more
 /// than a handful of experts per layer evicts experts the wave needs later,
 /// moving misses around instead of removing them (measured on the 16 GB dev
-/// card: demand-width prefetch doubled the glue wave's wall time).  The
-/// confidence gate keeps the effective depth below this on homogeneous demand.
+/// card: demand-width prefetch doubled the glue wave's wall time; re-measured
+/// at 24 on the 72 GB card's ~3,500-slot set: prediction precision fell
+/// 92%→53% and single-session decode lost ~14% — the knee is a property of
+/// the predictor's tail, not of card capacity).  The confidence gate keeps
+/// the effective depth below this on homogeneous demand.
 const PREFETCH_MAX_K: usize = 8;
 
 /// Relative confidence floor for prefetch: an expert is prefetched only if some

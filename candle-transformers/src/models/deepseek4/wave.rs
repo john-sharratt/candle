@@ -2188,6 +2188,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // compressors/galleries; the driver's `truncate_sequence` consumes each
         // snapshot to roll that state back to the accepted prefix — the KV
         // truncation alone cannot see it.
+        let t_snap = profile_now();
         let mut inputs: Vec<Tensor> = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
             if blocks[i].is_empty() {
@@ -2201,6 +2202,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 &Device::Cpu,
             )?);
         }
+        pipeline_record("verify:snapshot", t_snap);
+        let t_fwd = profile_now();
         *self
             .verify_all_rows
             .write()
@@ -2235,6 +2238,8 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 return Err(e);
             }
         };
+        pipeline_record("verify:forward", t_fwd);
+        let t_post = profile_now();
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
@@ -2263,6 +2268,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             out.push(logits[off..off + b.len()].to_vec());
             off += b.len();
         }
+        pipeline_record("verify:post", t_post);
         Ok(out)
     }
 
