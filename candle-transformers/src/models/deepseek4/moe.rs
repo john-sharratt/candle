@@ -9,6 +9,7 @@
 
 use candle::{DType, Result, Tensor, D};
 use candle_nn::ops::{sigmoid, softmax};
+use std::sync::{Arc, OnceLock};
 
 use super::linear::QLinear;
 
@@ -37,6 +38,13 @@ pub struct Expert {
     w2: QLinear, // down
     w3: QLinear, // up
     swiglu_limit: f64,
+    /// Device-resident `(+L, -L)` clamp bounds, built on first forward.
+    /// `Tensor::clamp(f64)` uploads its scalar as a 4-byte host→device copy
+    /// EVERY call — at one shared-expert forward per layer per wave that was
+    /// tens of thousands of WDDM submissions per run (nsys: the 4-byte H2D
+    /// bucket, backtraced here). Shared through `Arc` so clones reuse the
+    /// cached bounds.
+    bounds: Arc<OnceLock<(Tensor, Tensor)>>,
 }
 
 impl Expert {
@@ -46,19 +54,32 @@ impl Expert {
             w2,
             w3,
             swiglu_limit,
+            bounds: Arc::new(OnceLock::new()),
         }
     }
 
-    /// `w2( silu(clamp(gate, max=L)) * clamp(up, ±L) )`, computed in f32.
+    /// `w2( silu(min(gate, L)) * clamp(up, ±L) )`, computed in f32. The gate's
+    /// clamp is one-sided, so it is a single `minimum` — the former
+    /// `clamp(-inf, L)` also ran a full `maximum(x, -inf)` pass, a whole
+    /// tensor copy that changes nothing.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.to_dtype(DType::F32)?;
         let gate = self.w1.forward(&x)?;
         let up = self.w3.forward(&x)?;
         let (gate, up) = if self.swiglu_limit > 0.0 {
-            let l = self.swiglu_limit;
+            let (hi, lo) = match self.bounds.get() {
+                Some((hi, lo)) => (hi.clone(), lo.clone()),
+                None => {
+                    let l = self.swiglu_limit;
+                    let hi = Tensor::from_vec(vec![l as f32], 1, x.device())?;
+                    let lo = Tensor::from_vec(vec![-l as f32], 1, x.device())?;
+                    let _ = self.bounds.set((hi.clone(), lo.clone()));
+                    (hi, lo)
+                }
+            };
             (
-                gate.clamp(f64::NEG_INFINITY, l)?, // one-sided (max only)
-                up.clamp(-l, l)?,
+                gate.broadcast_minimum(&hi)?,
+                up.broadcast_maximum(&lo)?.broadcast_minimum(&hi)?,
             )
         } else {
             (gate, up)

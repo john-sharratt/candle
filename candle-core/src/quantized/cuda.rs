@@ -5319,11 +5319,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
     let active: usize = (0..num_experts)
         .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
         .count();
-    let avg_rows = if active == 0 {
-        0
-    } else {
-        total_batch / active
-    };
+    let avg_rows = if active == 0 { 0 } else { total_batch / active };
     let n_sub: usize = if !weight_dtype.is_ko() {
         2
     } else if avg_rows >= 96 {

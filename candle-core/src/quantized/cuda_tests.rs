@@ -3815,7 +3815,8 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
         assert_eq!(m2.len(), wide.len());
         let diff = m2.iter().zip(&wide).filter(|(a, b)| a != b).count();
         assert_eq!(
-            diff, 0,
+            diff,
+            0,
             "n_sub={n_sub} diverged from mode-2 on {diff} of {} outputs",
             m2.len()
         );

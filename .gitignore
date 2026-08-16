@@ -81,3 +81,5 @@ uploads/
 # not be ingested into the code_read corpus (it would match every query).
 zend/examples/provenance_queries.json
 /walk/
+# Local nsys/ncu capture datasets (GB-scale, machine-specific).
+/profiles/
