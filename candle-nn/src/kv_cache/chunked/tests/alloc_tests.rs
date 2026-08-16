@@ -1032,9 +1032,7 @@ mod tests {
             for (li, backing) in layers.iter().enumerate() {
                 backing
                     .validate_decode_batch_state(&entries)
-                    .unwrap_or_else(|e| {
-                        panic!("layer {li} was left without a writable tail: {e}")
-                    });
+                    .unwrap_or_else(|e| panic!("layer {li} was left without a writable tail: {e}"));
             }
         }
 
@@ -1059,9 +1057,7 @@ mod tests {
             let chunks = slot.chunks_slice();
             let start = slot.writer_start_idx().min(chunks.len().saturating_sub(1));
             let writer = (start..chunks.len())
-                .find(|&i| {
-                    (chunks[i].offset as usize + chunks[i].usage as usize) < CHUNK_SIZE
-                })
+                .find(|&i| (chunks[i].offset as usize + chunks[i].usage as usize) < CHUNK_SIZE)
                 .unwrap_or(chunks.len().saturating_sub(1));
             let tokens = chunks.iter().map(|c| c.usage as usize).sum();
             (chunks.len(), writer, tokens)
@@ -1098,9 +1094,7 @@ mod tests {
             for (li, backing) in layers.iter().enumerate() {
                 backing
                     .validate_decode_batch_state(&entries)
-                    .unwrap_or_else(|e| {
-                        panic!("layer {li} was left without a writable tail: {e}")
-                    });
+                    .unwrap_or_else(|e| panic!("layer {li} was left without a writable tail: {e}"));
             }
         }
 
@@ -1177,9 +1171,7 @@ mod tests {
             for (li, backing) in layers.iter().enumerate() {
                 backing
                     .validate_decode_batch_state(&entries)
-                    .unwrap_or_else(|e| {
-                        panic!("layer {li} was left without a writable tail: {e}")
-                    });
+                    .unwrap_or_else(|e| panic!("layer {li} was left without a writable tail: {e}"));
             }
         }
     }

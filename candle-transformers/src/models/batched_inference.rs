@@ -3350,8 +3350,18 @@ pub trait ManagedBatchedModel {
                 .iter()
                 .map(|&i| Tensor::from_vec(vec![committed[i]], (1, 1), &Device::Cpu))
                 .collect::<Result<_>>()?;
-            let step =
-                self.forward_wave(session, &dseqs, &dinputs, &[], &[], &[], &[], 0, layer_end, None)?;
+            let step = self.forward_wave(
+                session,
+                &dseqs,
+                &dinputs,
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                layer_end,
+                None,
+            )?;
             let mut rows = step.logits_owned()?;
             if rows.len() != plain.len() {
                 candle::bail!(
@@ -3385,12 +3395,7 @@ pub trait ManagedBatchedModel {
         let rows: Vec<Tensor> = plain
             .iter()
             .map(|&i| plain_logits[i].as_ref().expect("filled above").squeeze(0))
-            .chain(
-                spec_logits
-                    .iter()
-                    .flatten()
-                    .map(|t| t.squeeze(0)),
-            )
+            .chain(spec_logits.iter().flatten().map(|t| t.squeeze(0)))
             .collect::<Result<_>>()?;
         let stacked = Tensor::stack(&rows, 0)?; // [R, vocab]
         let arg: Vec<u32> = stacked
@@ -4019,11 +4024,9 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         let (phase, head_span) = match wave {
             Ok(v) => v,
             Err(e) => {
-                if let Err(rb) = super::wave_admit::rollback_wave_kv(
-                    &mut contexts,
-                    layer_start,
-                    layer_end,
-                ) {
+                if let Err(rb) =
+                    super::wave_admit::rollback_wave_kv(&mut contexts, layer_start, layer_end)
+                {
                     candle::bail!(
                         "wave failed ({e}) and the KV rollback that keeps that failure \
                          recoverable also failed ({rb}) — the affected sequences may hold \

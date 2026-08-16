@@ -974,9 +974,7 @@ fn await_arena_windows<'a>(
         if domain.arena_windows == 0 {
             return map;
         }
-        map = wave_gate()
-            .wait(map)
-            .unwrap_or_else(|e| e.into_inner());
+        map = wave_gate().wait(map).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1393,9 +1391,7 @@ pub fn wave_is_live(ordinal: usize) -> bool {
         .lock()
         .map(|map| {
             map.get(&ordinal).is_some_and(|d| {
-                d.forward_open
-                    || d.live_generations > 0
-                    || d.arenas.iter().any(|a| a.is_live())
+                d.forward_open || d.live_generations > 0 || d.arenas.iter().any(|a| a.is_live())
             })
         })
         .unwrap_or(false)

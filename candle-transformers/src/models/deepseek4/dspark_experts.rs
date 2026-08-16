@@ -247,13 +247,8 @@ impl DsparkStreamingMoe {
             // segments) in one launch, no GPU→CPU round-trip.
             moe_bucketize(&indices, ne, GROUPED_GEMM_TILE_W, &mut ws)?;
             let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + ne);
-            let stacked = fused_moe_gather_q8a128(
-                &op,
-                &ws.tok_ids,
-                a_ub,
-                &self.cuda_dev,
-                Backing::Owned,
-            )?;
+            let stacked =
+                fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &self.cuda_dev, Backing::Owned)?;
             let gate_out = grouped_qmatmul_dev_q8a128(
                 &stacked,
                 &self.gate_ptrs[block],
@@ -280,12 +275,7 @@ impl DsparkStreamingMoe {
                 launch_tiles,
                 &self.cuda_dev,
             )?;
-            let inter_acts = silu_mul_q8a128(
-                &gate_out,
-                &up_out,
-                &self.cuda_dev,
-                Backing::Owned,
-            )?;
+            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &self.cuda_dev, Backing::Owned)?;
             let down_out = grouped_qmatmul_dev_q8a128(
                 &inter_acts,
                 &self.down_ptrs[block],

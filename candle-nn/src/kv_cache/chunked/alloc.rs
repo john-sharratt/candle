@@ -1515,10 +1515,7 @@ impl ChunkedKvBacking {
     /// disagrees. Earliest rather than all of them because a partially-applied
     /// per-layer operation diverges from the point it stopped, so the first
     /// index *is* the boundary, and the layer number says how far it got.
-    fn first_window_divergence(
-        backings: &[ChunkedKvBacking],
-        batch_idx: usize,
-    ) -> Option<String> {
+    fn first_window_divergence(backings: &[ChunkedKvBacking], batch_idx: usize) -> Option<String> {
         let windows = |b: &ChunkedKvBacking| -> Option<Vec<(u16, u32)>> {
             let state = b.state.read().ok()?;
             let slot = state.sequences.get(batch_idx)?.as_ref()?;

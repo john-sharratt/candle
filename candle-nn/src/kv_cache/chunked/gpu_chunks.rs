@@ -152,11 +152,18 @@ impl GpuChunks {
         write_idx: usize,
         write_len: u16,
     ) -> candle::Result<u64> {
-        let host = self.buf.as_slice();
-        let len = host.len();
+        let len = self.buf.as_slice().len();
         if len == 0 {
             return Ok(0);
         }
+        // The live buffer is WRITE-COMBINED pinned memory: CPU reads are
+        // uncached and every pass below (headers copy, records copy, pointer
+        // rebase, debug checksum) re-reads it. Exit WC exactly ONCE with a
+        // single sequential copy and serve all reads from cacheable memory —
+        // this was ~1 ms/layer of scattered WC reads on every verify-wave
+        // metadata build.
+        let host_owned: Vec<u8> = self.buf.as_slice().to_vec();
+        let host: &[u8] = &host_owned;
         let n = self.n_chunks();
         // `write_idx` is `decode_write_chunk_idx()` (always `< host chunk count`);
         // after `sync_decode_gpu_chunks` the serialised buffer holds exactly that
@@ -207,7 +214,13 @@ impl GpuChunks {
                         epoch,
                         n_chunks: n,
                         dev_ptr: ptr,
-                        records_checksum: records_checksum(records_src),
+                        // Only the debug staleness assert reads this; skip the
+                        // byte-loop fingerprint in release.
+                        records_checksum: if cfg!(debug_assertions) {
+                            records_checksum(records_src)
+                        } else {
+                            0
+                        },
                     });
                     ptr
                 }

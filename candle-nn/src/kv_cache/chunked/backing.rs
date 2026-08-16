@@ -745,12 +745,7 @@ impl ChunkedKvBacking {
             let handle = self.inner.meta_pool.allocate()?;
             let mut bytes = vec![0u8; rb];
             super::meta_pool::serialize_kv_heads(
-                &mut bytes,
-                src,
-                n_kv_head,
-                head_dim,
-                n_palette,
-                arena_info,
+                &mut bytes, src, n_kv_head, head_dim, n_palette, arena_info,
             );
             items.push((handle, bytes));
         }
@@ -1183,6 +1178,12 @@ impl ChunkedKvBacking {
 
         let mut results = Vec::with_capacity(batch_entries.len());
         let mut stats = DecodeGpuChunkSyncStats::default();
+        // A speculative-verify wave carries one entry per BLOCK POSITION, so a
+        // sequence appears `block_len` times with an identical (seq, offset)
+        // key — and an identical snapshot. Snapshot once per key and reuse the
+        // copy for the duplicate rows (the state lock is held across the loop,
+        // so nothing can mutate the slot buffer between duplicates).
+        let mut snap_cache: HashMap<(usize, usize), (u64, u32, u32)> = HashMap::new();
         for (i, &(seq_idx, seq_offset)) in batch_entries.iter().enumerate() {
             let t_sync = std::time::Instant::now();
             // Per-entry: a sequence that mutates the arena during this forward
@@ -1192,12 +1193,21 @@ impl ChunkedKvBacking {
             // pre-ensured), so it keeps the zero-copy LIVE pointer + on-device
             // write-len commit — the cheap Qwen/Llama decode path.
             let want_snapshot = snapshot_mask.get(i).copied().unwrap_or(true);
+            if want_snapshot {
+                if let Some(&cached) = snap_cache.get(&(seq_idx, seq_offset)) {
+                    stats.reuses += 1;
+                    results.push(cached);
+                    continue;
+                }
+            }
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
                 let ((live_ptr, n_slices, write_slice), kind) =
                     seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
                 let ptr = if want_snapshot {
-                    seq.snapshot_gpu_chunks_into(generation, seq_offset)?
+                    let ptr = seq.snapshot_gpu_chunks_into(generation, seq_offset)?;
+                    snap_cache.insert((seq_idx, seq_offset), (ptr, n_slices, write_slice));
+                    ptr
                 } else {
                     live_ptr
                 };

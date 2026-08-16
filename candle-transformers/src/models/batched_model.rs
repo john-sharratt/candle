@@ -43,8 +43,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase,
-    ModelGeometry, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, ModelGeometry,
+    WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
 };
 use candle_nn::Module;
 

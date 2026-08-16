@@ -10,7 +10,7 @@
 //! offset 0 for a known index resets that sequence's state, and `prune`
 //! clears everything.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use candle::{DType, Device, Result, Tensor};
@@ -916,10 +916,22 @@ impl ManagedBatchedModel for DeepSeekBatched {
         }
 
         // Sequence offsets (position of the first new token per sequence).
-        let decode_pos: Vec<usize> = decode_seqs
-            .iter()
-            .map(|&s| session.sequence_offset(s).unwrap_or(0))
-            .collect();
+        // A sequence may occupy SEVERAL decode rows (a speculative verify
+        // block: one row per block position); the k-th occurrence sits at
+        // `offset + k`, so consecutive rows of one seq are consecutive
+        // positions — exactly the per-token decode stream, batched.
+        let decode_pos: Vec<usize> = {
+            let mut seen: HashMap<usize, usize> = HashMap::new();
+            decode_seqs
+                .iter()
+                .map(|&s| {
+                    let k = seen.entry(s).or_insert(0);
+                    let p = session.sequence_offset(s).unwrap_or(0) + *k;
+                    *k += 1;
+                    p
+                })
+                .collect()
+        };
         let prefill_base: Vec<usize> = prefill_seqs
             .iter()
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
@@ -945,12 +957,26 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // byte-identical to the never-evicted path.
         let window = cfg.window_size;
         let mut decode_base = vec![0u32; decode_seqs.len()];
-        for (i, (&s, &pos)) in decode_seqs.iter().zip(&decode_pos).enumerate() {
-            let mut bp = 0u32;
-            for backing in session.backings() {
-                bp = backing.evict_window_front(s, window, pos)?;
+        {
+            // Evict once per SEQUENCE at its earliest row (the first
+            // occurrence — occurrences are consecutive positions), exactly the
+            // MIN-position rule the prefill span uses; later rows of the same
+            // seq reuse the slid base.
+            let mut base_of: HashMap<usize, u32> = HashMap::new();
+            for (i, (&s, &pos)) in decode_seqs.iter().zip(&decode_pos).enumerate() {
+                let bp = match base_of.get(&s) {
+                    Some(&bp) => bp,
+                    None => {
+                        let mut bp = 0u32;
+                        for backing in session.backings() {
+                            bp = backing.evict_window_front(s, window, pos)?;
+                        }
+                        base_of.insert(s, bp);
+                        bp
+                    }
+                };
+                decode_base[i] = bp;
             }
-            decode_base[i] = bp;
         }
         let mut prefill_base_ev = vec![0u32; prefill_seqs.len()];
         for (pi, (&s, &base)) in prefill_seqs.iter().zip(&prefill_base).enumerate() {
@@ -1001,27 +1027,27 @@ impl ManagedBatchedModel for DeepSeekBatched {
             }
         };
 
-        // Read once for the whole wave: the sequences (if any) whose prefill
-        // rows are speculative verify blocks. Their attention runs the DECODE
-        // kernel over per-position virtual slots (below, one launch across ALL
-        // blocks), prefill pass 1 stashes their projected compressor rows
-        // (rollback replay source), and the head scores ALL their rows instead
-        // of just the last.
+        // Read once for the whole wave: the sequences (if any) whose DECODE
+        // rows are speculative verify blocks (one row per block position, the
+        // same seq on consecutive rows). Their attention runs the DECODE
+        // kernel over per-position virtual slots with the rows pre-scattered,
+        // the per-row capture stashes their projected compressor rows
+        // (rollback replay source), and the head scores every decode row as
+        // it always does.
         let verify_seqs: Vec<usize> = self
             .verify_all_rows
             .read()
             .map_err(|_| candle::Error::Msg("verify_all_rows lock poisoned".into()))?
             .clone();
         // A verify wave is ALL-verify by construction (`verify_blocks` builds
-        // it); a mixed wave would need per-seq kernel routing.
+        // it); a mixed wave would need per-row kernel routing.
         let is_verify_wave = !verify_seqs.is_empty();
         if is_verify_wave
-            && (prefill_seqs.len() != verify_seqs.len()
-                || !prefill_seqs.iter().all(|s| verify_seqs.contains(s)))
+            && (!prefill_seqs.is_empty() || !decode_seqs.iter().all(|s| verify_seqs.contains(s)))
         {
             candle::bail!(
-                "verify wave: prefill set {:?} != verify set {:?}",
-                prefill_seqs,
+                "verify wave: decode rows {:?} not covered by verify set {:?}",
+                decode_seqs,
                 verify_seqs
             );
         }
@@ -1048,9 +1074,40 @@ impl ManagedBatchedModel for DeepSeekBatched {
             .chain(glue_seqs)
             .copied()
             .collect();
+        // Verify groups: (seq, resident-at-first-row, block_len), one per
+        // sequence, from its CONSECUTIVE decode rows. Empty on plain waves.
+        let verify_groups: Vec<(usize, usize, usize)> = if is_verify_wave {
+            let mut gs: Vec<(usize, usize, usize)> = Vec::new();
+            for (i, &s) in decode_seqs.iter().enumerate() {
+                match gs.last_mut() {
+                    Some(g) if g.0 == s => g.2 += 1,
+                    _ => gs.push((s, decode_resident[i], 1)),
+                }
+            }
+            gs
+        } else {
+            Vec::new()
+        };
+        // Per-group first-row offset into the concatenated decode rows.
+        let verify_row_start: Vec<usize> = {
+            let mut starts = Vec::with_capacity(verify_groups.len());
+            let mut off = 0usize;
+            for &(_, _, s_len) in &verify_groups {
+                starts.push(off);
+                off += s_len;
+            }
+            starts
+        };
         for backing in session.backings() {
+            // Commit each sequence's prefix at its FIRST row's resident offset
+            // — a verify block's later rows are the same seq at +k, and
+            // committing those would advance the prefix over uncommitted
+            // draft positions.
+            let mut committed: HashSet<usize> = HashSet::new();
             for (&s, &resident) in decode_seqs.iter().zip(&decode_resident) {
-                backing.set_len(s, resident);
+                if committed.insert(s) {
+                    backing.set_len(s, resident);
+                }
             }
         }
         let t_meta = profile_now();
@@ -1116,27 +1173,34 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // slots), and a chunk allocated after the snapshot is invisible to the
         // writeback scatter (→ OOB).
         if is_verify_wave {
-            for (pi, &vseq) in prefill_seqs.iter().enumerate() {
+            for &(vseq, resident, s_len) in &verify_groups {
                 for backing in session.backings() {
-                    backing.ensure_for_batch_entries(
-                        &[(vseq, prefill_resident[pi])],
-                        prefill_lens[pi],
-                    )?;
+                    backing.ensure_for_batch_entries(&[(vseq, resident)], s_len)?;
                 }
             }
         }
         let snapshot_seqs: Vec<usize> = prefill_seqs.iter().chain(glue_seqs).copied().collect();
-        let (pm, headers, stride) = session.build_decode_metadata_at(
-            &all_seqs,
-            &generation,
-            &overrides,
-            &non_writer,
-            &snapshot_seqs,
-        )?;
-        let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
-        let snaps = [(pm, headers, stride)];
+        // A verify wave builds NO standard metadata: its rows have no live
+        // decode slot to serialize (the virtual headers below carry everything
+        // the kernel AND the row scatter need), and the dual build was half of
+        // the verify wave's metadata bill.
+        let std_meta = if is_verify_wave {
+            None
+        } else {
+            let (pm, headers, stride) = session.build_decode_metadata_at(
+                &all_seqs,
+                &generation,
+                &overrides,
+                &non_writer,
+                &snapshot_seqs,
+            )?;
+            let headers = headers.ok_or_else(|| candle::Error::Msg("no decode metadata".into()))?;
+            Some((pm, headers, stride))
+        };
         let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
-            let (_, headers, stride) = &snaps[0];
+            let (_, headers, stride) = std_meta
+                .as_ref()
+                .expect("standard metadata is not built on a verify wave");
             headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
         };
 
@@ -1161,7 +1225,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             //   writer-slice PATCH — only that one slice's length changed.
             // * Crosses into a fresh chunk: full invalidation. The patch is
             //   NOT enough here even though `push_chunk` cleared the buffer at
-            //   append time — the standard header build ABOVE re-validated it
+            //   append time — an EARLIER wave's metadata build re-validated it
             //   at pre-`set_len` lengths, so the spanned block's earlier rows
             //   would read short through the stale predecessor slice (this
             //   exact failure was measured as an acceptance collapse to
@@ -1174,11 +1238,9 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // (Each block's write range was capacity-ensured BEFORE the
             // standard header build above, so the writeback snapshot already
             // covers every chunk `set_len` fills here.)
-            let mut entries: Vec<usize> = Vec::with_capacity(prefill_lens.iter().sum());
-            let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(prefill_seqs.len());
-            for (pi, &vseq) in prefill_seqs.iter().enumerate() {
-                let s_len = prefill_lens[pi];
-                let resident = prefill_resident[pi];
+            let mut entries: Vec<usize> = Vec::with_capacity(decode_seqs.len());
+            let mut overrides: Vec<(usize, usize)> = Vec::with_capacity(verify_groups.len());
+            for &(vseq, resident, s_len) in &verify_groups {
                 for backing in session.backings() {
                     let room = backing.decode_writer_room(vseq).unwrap_or(0);
                     backing.set_len(vseq, resident + s_len);
@@ -1189,7 +1251,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     }
                 }
                 // One virtual slot per block position, concatenated across
-                // sequences in prefill-span order — the SAME row order the
+                // sequences in decode-row order — the SAME row order the
                 // batched projection (q rows) and comp_idx use, so header slot
                 // i pairs with q row i in the single launch below.
                 entries.extend((0..s_len).map(|_| vseq));
@@ -1211,6 +1273,12 @@ impl ManagedBatchedModel for DeepSeekBatched {
         let verify_hdr_of = |layer: usize| -> u64 {
             let (_, vhdr, vstride) = verify_meta.as_ref().expect("verify metadata built");
             vhdr.dev_ptr() + (layer as u64) * vstride
+        };
+        // Per-group scatter header: a group's positions share IDENTICAL
+        // headers (committed block write length), so its FIRST row's header
+        // carries the chunk records the row scatter addresses through.
+        let verify_scatter_hdr = |layer: usize, gi: usize| -> u64 {
+            verify_hdr_of(layer) + (verify_row_start[gi] as u64) * 24
         };
         pipeline_record("deepseek:wave_metadata", t_meta);
 
@@ -1410,6 +1478,37 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         entry.absorbed = decode_pos[i] + 1;
                     }
                 }
+                // Verify-path row stash: this layer's projected compressor
+                // rows for each block, kept in the pre-verify snapshot as the
+                // rollback's replay source (`Arc`-clone views over the batched
+                // projection, one narrow per group).
+                if is_verify_wave {
+                    let mut vs = self
+                        .verify_snap
+                        .write()
+                        .map_err(|_| candle::Error::Msg("verify_snap lock poisoned".into()))?;
+                    for (gi, &(vseq, _, s_len)) in verify_groups.iter().enumerate() {
+                        let row0 = verify_row_start[gi];
+                        if let Some(snap) = vs.get_mut(&vseq) {
+                            if let Some(lsnap) = snap.layers.get_mut(l) {
+                                lsnap.comp_rows = match &comp_proj {
+                                    Some((k, sc)) => Some((
+                                        k.narrow(0, row0, s_len)?,
+                                        sc.narrow(0, row0, s_len)?,
+                                    )),
+                                    None => None,
+                                };
+                                lsnap.icomp_rows = match &icomp_proj {
+                                    Some((k, sc)) => Some((
+                                        k.narrow(0, row0, s_len)?,
+                                        sc.narrow(0, row0, s_len)?,
+                                    )),
+                                    None => None,
+                                };
+                            }
+                        }
+                    }
+                }
                 pipeline_record("decode:prep", t_dprep);
 
                 // Batched selection: ONE launch per Stage-1 kernel over EVERY CSA
@@ -1535,26 +1634,94 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // `cache` is the gathered two-region hot cache (built above from
                 // the gallery's pre-built int8 — no per-wave rebuild).
                 let t_dkern = profile_now();
-                let out = super::paged::paged_latent_decode_raw(
-                    &q_all,
-                    hdr_of(l, 0),
-                    &kv_all,
-                    &cache,
-                    &comp_idx,
-                    &comp_cnt,
-                    q_pos_dec,
-                    st.sinks(),
-                    st.rope_tab(),
-                    a.softmax_scale() as f32,
-                    a.window_size(),
-                    0,
-                    // Decode rows use the live persistent buffer, so always commit
-                    // the write-len on-device to advance it for the next step.
-                    true,
-                    false, // the fused scatter writes each slot's token
-                    st.ws(),
-                    None,
-                )?;
+                let out = if is_verify_wave {
+                    // Speculative verify: each block position is a VIRTUAL
+                    // decode slot. The rows are written to the arena FIRST
+                    // (same `store_band_elem` encode the fused scatter uses →
+                    // byte-identical read-back) so later positions read
+                    // earlier ones; causal visibility is the kernel's
+                    // `key_pos <= q_pos` bound; the shared per-group headers
+                    // carry the pre-committed block write length. Each row's
+                    // RESIDENT offset maps to its (slice, in_blk) by WALKING
+                    // the chunk table — positional `off/32` math shears once
+                    // the sliding ring has slid.
+                    for (gi, &(vseq, base_resident, s_len)) in verify_groups.iter().enumerate() {
+                        let row0 = verify_row_start[gi];
+                        let (wslice, wblk): (Vec<u32>, Vec<u32>) = {
+                            let chunks = session.backings()[l]
+                                .live_chunks_as_sealed(vseq)
+                                .unwrap_or_default();
+                            let mut map: Vec<(u32, u32)> = Vec::with_capacity(s_len);
+                            let mut cum = 0usize;
+                            for (si, c) in chunks.iter().enumerate() {
+                                let cnt = c.token_count as usize;
+                                for w in 0..cnt {
+                                    let r = cum + w;
+                                    if r >= base_resident && r < base_resident + s_len {
+                                        map.push((si as u32, c.offset as u32 + w as u32));
+                                    }
+                                }
+                                cum += cnt;
+                            }
+                            if map.len() != s_len {
+                                candle::bail!(
+                                    "verify writeback: chunk walk covered {} of {} block rows \
+                                     (seq {vseq}, base_resident {base_resident}, {} chunks)",
+                                    map.len(),
+                                    s_len,
+                                    chunks.len()
+                                );
+                            }
+                            map.into_iter().unzip()
+                        };
+                        super::paged::paged_latent_glue_scatter(
+                            &kv_all.narrow(0, row0, s_len)?,
+                            verify_scatter_hdr(l, gi),
+                            &Tensor::from_vec(wslice, s_len, &dev)?,
+                            &Tensor::from_vec(wblk, s_len, &dev)?,
+                        )?;
+                    }
+                    super::paged::paged_latent_decode_raw(
+                        &q_all,
+                        verify_hdr_of(l),
+                        &kv_all, // unused (pre_scattered) — ABI slot
+                        &cache,
+                        &comp_idx,
+                        &comp_cnt,
+                        q_pos_dec,
+                        st.sinks(),
+                        st.rope_tab(),
+                        a.softmax_scale() as f32,
+                        a.window_size(),
+                        0,
+                        false, // headers are throwaway snapshots — no commit
+                        true,  // rows pre-written above — skip the fused scatter
+                        st.ws(),
+                        None,
+                    )?
+                } else {
+                    super::paged::paged_latent_decode_raw(
+                        &q_all,
+                        hdr_of(l, 0),
+                        &kv_all,
+                        &cache,
+                        &comp_idx,
+                        &comp_cnt,
+                        q_pos_dec,
+                        st.sinks(),
+                        st.rope_tab(),
+                        a.softmax_scale() as f32,
+                        a.window_size(),
+                        0,
+                        // Decode rows use the live persistent buffer, so always
+                        // commit the write-len on-device to advance it for the
+                        // next step.
+                        true,
+                        false, // the fused scatter writes each slot's token
+                        st.ws(),
+                        None,
+                    )?
+                };
                 pipeline_record("decode:kernel", t_dkern);
                 // Batched output projection: ONE `output_proj` over all decode
                 // rows (`b = n_dec`) instead of a per-session call. `output_proj`
@@ -1602,32 +1769,6 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     let s_len = prefill_lens[pi];
                     let e = state.get_mut(&seq).expect("ensured above");
                     let p = proj.expect("prefill rows imply a projection");
-                    // Verify-path row stash: this layer's projected compressor
-                    // rows for the verify block, kept in the pre-verify snapshot
-                    // as the rollback's replay source (`Arc`-clone views).
-                    if is_verify_wave {
-                        if let Some(vs) = self
-                            .verify_snap
-                            .write()
-                            .map_err(|_| candle::Error::Msg("verify_snap lock poisoned".into()))?
-                            .get_mut(&seq)
-                        {
-                            if let Some(lsnap) = vs.layers.get_mut(l) {
-                                lsnap.comp_rows = match &p.comp_proj {
-                                    Some((k, sc)) => {
-                                        Some((k.narrow(0, off, s_len)?, sc.narrow(0, off, s_len)?))
-                                    }
-                                    None => None,
-                                };
-                                lsnap.icomp_rows = match &p.icomp_proj {
-                                    Some((k, sc)) => {
-                                        Some((k.narrow(0, off, s_len)?, sc.narrow(0, off, s_len)?))
-                                    }
-                                    None => None,
-                                };
-                            }
-                        }
-                    }
                     preps.push(super::kernel_attention::kernel_attn_prefill_assemble(
                         &mut e.layers[l],
                         p,
@@ -1845,102 +1986,24 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let seq_of = Tensor::from_vec(seq_of_host, prefill_total, &dev)?;
                 let new_meta = Tensor::from_vec(new_meta_host, (pf.len(), 4), &dev)?;
                 let q_pos_all = Tensor::cat(&prefill_q_pos.iter().collect::<Vec<_>>(), 0)?;
-                // A speculative-verify block runs its positions as VIRTUAL DECODE
-                // SLOTS — the decode kernel, decode numerics (fp PV, read-time
-                // rope), one launch: the accepted stream is then argmax-consistent
-                // with plain decode, where the prefill kernel's int8-PV envelope
-                // flipped narrow-margin tokens. The block's latents are written
-                // to the arena FIRST (same `store_band_elem` encode the fused
-                // scatter uses → byte-identical read-back), each slot's causal
-                // visibility comes from `key_pos <= q_pos`, and the shared
-                // headers carry the pre-committed block write length.
-                let out = if is_verify_wave {
-                    // Per-seq writeback FIRST: map each block row's RESIDENT
-                    // offset to its (slice, in_blk) by WALKING the chunk table —
-                    // the same walk the position map uses — not positional
-                    // `off/32` math, which shears once the sliding ring has slid
-                    // (front chunks freed/partially evicted ⇒ resident indices
-                    // and 32-aligned block indices diverge). The usages already
-                    // cover each block (`set_len` pre-committed
-                    // `resident + s_len` before the header build).
-                    for (pi, &vseq) in prefill_seqs.iter().enumerate() {
-                        let s_len = prefill_lens[pi];
-                        let base_resident = prefill_base[pi] - prefill_base_ev[pi] as usize;
-                        let (wslice, wblk): (Vec<u32>, Vec<u32>) = {
-                            let chunks = session.backings()[l]
-                                .live_chunks_as_sealed(vseq)
-                                .unwrap_or_default();
-                            let mut map: Vec<(u32, u32)> = Vec::with_capacity(s_len);
-                            let mut cum = 0usize;
-                            for (si, c) in chunks.iter().enumerate() {
-                                let cnt = c.token_count as usize;
-                                for w in 0..cnt {
-                                    let r = cum + w;
-                                    if r >= base_resident && r < base_resident + s_len {
-                                        map.push((si as u32, c.offset as u32 + w as u32));
-                                    }
-                                }
-                                cum += cnt;
-                            }
-                            if map.len() != s_len {
-                                candle::bail!(
-                                    "verify writeback: chunk walk covered {} of {} block rows \
-                                     (seq {vseq}, base_resident {base_resident}, {} chunks)",
-                                    map.len(),
-                                    s_len,
-                                    chunks.len()
-                                );
-                            }
-                            map.into_iter().unzip()
-                        };
-                        super::paged::paged_latent_glue_scatter(
-                            &preps[pi].kv_bf,
-                            hdr_of(l, decode_seqs.len() + pi),
-                            &Tensor::from_vec(wslice, s_len, &dev)?,
-                            &Tensor::from_vec(wblk, s_len, &dev)?,
-                        )?;
-                    }
-                    // ONE decode-kernel launch over every sequence's virtual
-                    // slots: q rows, q_pos, comp_idx/cnt and the header entries
-                    // are all concatenated in the same prefill-span order.
-                    super::paged::paged_latent_decode_raw(
-                        &projref.q_bf, // [Σs, h, hd] bf16 — decode's q layout
-                        verify_hdr_of(l),
-                        &projref.kv_bf, // unused (pre_scattered) — ABI slot
-                        &cache,
-                        &comp_idx,
-                        &comp_cnt,
-                        &q_pos_all,
-                        st.sinks(),
-                        st.rope_tab(),
-                        a.softmax_scale() as f32,
-                        a.window_size(),
-                        0,
-                        false, // headers are throwaway snapshots — no commit
-                        true,  // rows pre-written above — skip the fused scatter
-                        st.ws(),
-                        None,
-                    )?
-                } else {
-                    super::paged::paged_latent_prefill_raw(
-                        &projref.q_bf,
-                        hdr_of(l, decode_seqs.len()),
-                        &q_pos_all,
-                        &seq_of,
-                        &projref.kv_bf,
-                        &new_meta,
-                        &cache,
-                        &comp_idx,
-                        &comp_cnt,
-                        st.sinks(),
-                        st.rope_tab(),
-                        a.softmax_scale() as f32,
-                        a.window_size(),
-                        0,
-                        session.backings()[l].k_format().to_tag(),
-                        st.ws(),
-                    )?
-                };
+                let out = super::paged::paged_latent_prefill_raw(
+                    &projref.q_bf,
+                    hdr_of(l, decode_seqs.len()),
+                    &q_pos_all,
+                    &seq_of,
+                    &projref.kv_bf,
+                    &new_meta,
+                    &cache,
+                    &comp_idx,
+                    &comp_cnt,
+                    st.sinks(),
+                    st.rope_tab(),
+                    a.softmax_scale() as f32,
+                    a.window_size(),
+                    0,
+                    session.backings()[l].k_format().to_tag(),
+                    st.ws(),
+                )?;
                 pipeline_record("prefill:kernel", t_pkern);
                 let t_poutp = profile_now();
                 let o_all = out.reshape((1, prefill_total, a.n_heads(), a.head_dim()))?;
@@ -1949,29 +2012,24 @@ impl ManagedBatchedModel for DeepSeekBatched {
 
                 // Part C: writeback each seq's prompt latents to its arena (deferred —
                 // set_len must run AFTER the batched kernel read the committed prefix).
-                // A verify block already wrote back BEFORE its virtual-slot launch
-                // (the slots read the block rows from the arena) with the length
-                // pre-committed — only its `absorbed` bookkeeping remains.
                 let t_pwb = profile_now();
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
                     let base = prefill_base[pi];
                     let base_resident = base - prefill_base_ev[pi] as usize;
-                    if !is_verify_wave {
-                        let (wslice, wblk): (Vec<u32>, Vec<u32>) = (0..s_len)
-                            .map(|t| {
-                                let off = base_resident + t;
-                                ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
-                            })
-                            .unzip();
-                        super::paged::paged_latent_glue_scatter(
-                            &preps[pi].kv_bf,
-                            hdr_of(l, decode_seqs.len() + pi),
-                            &Tensor::from_vec(wslice, s_len, &dev)?,
-                            &Tensor::from_vec(wblk, s_len, &dev)?,
-                        )?;
-                        session.backings()[l].set_len(seq, base_resident + s_len);
-                    }
+                    let (wslice, wblk): (Vec<u32>, Vec<u32>) = (0..s_len)
+                        .map(|t| {
+                            let off = base_resident + t;
+                            ((off / CHUNK_SIZE) as u32, (off % CHUNK_SIZE) as u32)
+                        })
+                        .unzip();
+                    super::paged::paged_latent_glue_scatter(
+                        &preps[pi].kv_bf,
+                        hdr_of(l, decode_seqs.len() + pi),
+                        &Tensor::from_vec(wslice, s_len, &dev)?,
+                        &Tensor::from_vec(wblk, s_len, &dev)?,
+                    )?;
+                    session.backings()[l].set_len(seq, base_resident + s_len);
                     if l + 1 == n_layers {
                         state.get_mut(&seq).expect("ensured above").absorbed = base + s_len;
                     }
@@ -2093,17 +2151,19 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // lm_head in a SINGLE batched GEMM (was R per-row GEMV launches);
         // bit-identical since each row's logits are independent.
         let hdev = normed.device().clone();
-        // A batched `verify_block` marks one prefill sequence for full scoring — every row of its
-        // block gets a logits row (the per-position next-token prediction the speculative driver
-        // verifies), instead of just the sequence's last row. (`verify_seq` was read once, above
-        // the layer loop.)
+        // Every decode row gets a logits row — on a verify wave that is every
+        // block position (the per-position next-token prediction the
+        // speculative driver verifies), one row per position of each block.
         let mut sel_rows: Vec<u32> = (0..decode_seqs.len() as u32).collect();
         let mut scored_seqs: Vec<usize> = decode_seqs.to_vec();
-        // Absolute token position of each scored row (for the position-keyed target-feature stash).
-        let mut scored_pos: Vec<usize> = decode_seqs
-            .iter()
-            .map(|&s| session.sequence_offset(s).unwrap_or(0))
-            .collect();
+        // Absolute token position of each scored row (for the position-keyed
+        // target-feature stash). `decode_pos` is OCCURRENCE-indexed: a verify
+        // block's k-th row sits at `offset + k`, so each block row's feature is
+        // stashed under its own position — the accepted positions' features are
+        // then present for the NEXT draft's window (a per-row `sequence_offset`
+        // here collapsed every block row onto one key, starving the drafter
+        // right after each multi-token accept).
+        let mut scored_pos: Vec<usize> = decode_pos.clone();
         let mut cursor = decode_seqs.len();
         for (pi, &s_len) in prefill_lens.iter().enumerate() {
             let base = prefill_base[pi];
@@ -2204,18 +2264,27 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // snapshot to roll that state back to the accepted prefix — the KV
         // truncation alone cannot see it.
         let t_snap = profile_now();
-        let mut inputs: Vec<Tensor> = Vec::with_capacity(seqs.len());
+        // DECODE-shaped verify: each block position is one decode ROW of its
+        // sequence (the same seq repeated `block_len` times, tokens one per
+        // row). The wave's decode front-end then does everything a plain
+        // decode step does — batched projection, per-row streaming compressor
+        // capture (exact per-token semantics), batched selection, one gather —
+        // and only the kernel call swaps to the pre-scattered virtual-slot
+        // form. The former prefill-shaped front-end ran the whole prefill
+        // chain per verify (assemble/pool/select/scatter plus a second
+        // metadata build), which cost ~3× a plain decode wave in launches.
+        let mut row_seqs: Vec<usize> = Vec::with_capacity(blocks.iter().map(|b| b.len()).sum());
+        let mut row_inputs: Vec<Tensor> = Vec::with_capacity(row_seqs.capacity());
         for (i, &seq) in seqs.iter().enumerate() {
             if blocks[i].is_empty() {
                 candle::bail!("verify_blocks: empty block for seq {seq}");
             }
             let q_start = session.sequence_offset(seq).unwrap_or(0);
             self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
-            inputs.push(Tensor::from_vec(
-                blocks[i].clone(),
-                (1, blocks[i].len()),
-                &Device::Cpu,
-            )?);
+            for &tok in &blocks[i] {
+                row_seqs.push(seq);
+                row_inputs.push(Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu)?);
+            }
         }
         pipeline_record("verify:snapshot", t_snap);
         let t_fwd = profile_now();
@@ -2226,10 +2295,10 @@ impl ManagedBatchedModel for DeepSeekBatched {
             seqs.to_vec();
         let step = self.forward_wave(
             session,
+            &row_seqs,
+            &row_inputs,
             &[],
             &[],
-            seqs,
-            &inputs,
             &[],
             &[],
             0,
@@ -2592,9 +2661,9 @@ mod tests {
         );
         session.advance_sequence(seq, ids.len())?;
         let logits = step.logits_owned()?;
-            if logits.is_empty() {
-                return Err(candle::Error::msg("prefill wave produced no logits"));
-            }
+        if logits.is_empty() {
+            return Err(candle::Error::msg("prefill wave produced no logits"));
+        }
         let mut next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         // Greedy decode until EOS (bounded) through decode waves. STRICT gate:
@@ -2732,9 +2801,9 @@ mod tests {
         )?;
         session.advance_sequence(seq, ids.len())?;
         let logits = step.logits_owned()?;
-            if logits.is_empty() {
-                return Err(candle::Error::msg("prefill produced no logits"));
-            }
+        if logits.is_empty() {
+            return Err(candle::Error::msg("prefill produced no logits"));
+        }
         let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         // Speculative decode loop: each step commits ≥1 token (the model's exact
@@ -2813,12 +2882,8 @@ mod tests {
         // Combined load: the drafter lands in the DENSE tier (before the span
         // reservation), so the elastic boundary balances target-experts vs KV
         // around it — see `Dsv4Engine::load_with_drafter`.
-        let (engine, drafter) = Dsv4Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &device,
-            Int8Mode::Performance,
-        )?;
+        let (engine, drafter) =
+            Dsv4Engine::load_with_drafter(&path, Some(&dspark), &device, Int8Mode::Performance)?;
         let model =
             DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -2860,9 +2925,9 @@ mod tests {
         )?;
         session.advance_sequence(seq, ids.len())?;
         let logits = step.logits_owned()?;
-            if logits.is_empty() {
-                return Err(candle::Error::msg("prefill produced no logits"));
-            }
+        if logits.is_empty() {
+            return Err(candle::Error::msg("prefill produced no logits"));
+        }
         let mut committed = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         let max_draft = 4usize;
@@ -2939,12 +3004,8 @@ mod tests {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        let (engine, drafter) = Dsv4Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &device,
-            Int8Mode::Performance,
-        )?;
+        let (engine, drafter) =
+            Dsv4Engine::load_with_drafter(&path, Some(&dspark), &device, Int8Mode::Performance)?;
         let model =
             DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -3130,12 +3191,8 @@ mod tests {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        let (engine, drafter) = Dsv4Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &device,
-            Int8Mode::Performance,
-        )?;
+        let (engine, drafter) =
+            Dsv4Engine::load_with_drafter(&path, Some(&dspark), &device, Int8Mode::Performance)?;
         let model =
             DeepSeekBatched::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -3674,9 +3731,9 @@ mod tests {
         )?;
         session.advance_sequence(seq, ids.len())?;
         let logits = step.logits_owned()?;
-            if logits.is_empty() {
-                return Err(candle::Error::msg("prefill wave produced no logits"));
-            }
+        if logits.is_empty() {
+            return Err(candle::Error::msg("prefill wave produced no logits"));
+        }
         let mut next = logits[0].i(0)?.argmax(0)?.to_scalar::<u32>()?;
 
         let mut gen = vec![next];

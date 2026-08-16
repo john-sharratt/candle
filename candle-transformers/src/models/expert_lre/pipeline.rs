@@ -2428,8 +2428,7 @@ impl PipelineState {
         let mut loaded = 0usize;
         #[cfg(feature = "cuda")]
         {
-            let mut loaded_slots: Vec<(usize, usize, ExpertSlot)> =
-                Vec::with_capacity(pairs.len());
+            let mut loaded_slots: Vec<(usize, usize, ExpertSlot)> = Vec::with_capacity(pairs.len());
             let outcome = self.load_experts_batched(target_layer, &pairs, &mut loaded_slots);
             let filled: std::collections::HashSet<usize> =
                 loaded_slots.iter().map(|&(_, s, _)| s).collect();

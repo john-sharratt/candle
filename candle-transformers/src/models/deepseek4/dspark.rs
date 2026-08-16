@@ -277,7 +277,7 @@ impl ConfidenceHead {
     pub fn confidence_dev(&self, h: &Tensor, markov_embed: &Tensor) -> Result<Tensor> {
         let x = Tensor::cat(&[h.clone(), markov_embed.clone()], 0)?; // [hidden + rank]
         let z = x.broadcast_mul(&self.w)?.sum_all()?; // scalar
-        // σ(z) = 1 / (1 + e^(−z)), all tensor ops.
+                                                      // σ(z) = 1 / (1 + e^(−z)), all tensor ops.
         ((z.neg()?.exp()? + 1.0)?.recip()?).reshape(1)
     }
 }

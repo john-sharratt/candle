@@ -412,7 +412,7 @@ impl Attention {
             &dev,
             Backing::Owned,
         )?; // [ng*bs, olr] f32
-                                                                                         // [ng*bs, olr] -> [ng, bs, olr] -> [bs, ng, olr] -> [b, s, ng*olr]
+            // [ng*bs, olr] -> [ng, bs, olr] -> [bs, ng, olr] -> [b, s, ng*olr]
         let proj = out
             .reshape((ng, bs, olr))?
             .transpose(0, 1)?
