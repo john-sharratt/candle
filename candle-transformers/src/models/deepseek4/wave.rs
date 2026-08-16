@@ -142,9 +142,25 @@ struct SpecStats {
 const SPEC_EMA_ALPHA: f32 = 0.25;
 /// Draft only while the acceptance EMA clears this. Below it, a drafted step
 /// loses to plain decode on this box's verify/decode cost ratio.
-const SPEC_MIN_ACCEPT: f32 = 2.0;
-/// Verify-only steps between drafted probes while below the threshold.
-const SPEC_PROBE_INTERVAL: u32 = 8;
+///
+/// The break-even IS the cost ratio: a drafted step commits `ema` tokens for
+/// one verify wave, a plain step commits 1 token for one decode wave, so
+/// drafting wins iff `ema > verify_cost / decode_cost`. Measured on the
+/// elastic partition (streaming-MoE target, ~44% expert hit rate at cfg8):
+/// realtext code accepted 3.88/step and beat greedy 9.4 vs 8.9 tok/s
+/// (ratio ≈ 3.7); StoryRewrite (thinking prose) accepted ~2.4/step and LOST
+/// 6.4 vs 8.2 — the old threshold of 2.0 kept it drafting through the loss.
+/// 4.0 sits at the measured ratio plus margin: predictable continuations
+/// (code, counting, structured rewrite) clear it, free prose falls back to
+/// plain-cost verify steps and re-probes.
+const SPEC_MIN_ACCEPT: f32 = 4.0;
+/// Plain-decode steps between drafted probes while below the threshold. A
+/// probe costs one verify wave (≈ the cost ratio in decode waves), so the
+/// steady fallback overhead is `ratio / interval` — 8 paid ~46% on this box's
+/// ~3.7 ratio and dominated the fallback's throughput; 32 pays ~11% while a
+/// workload shift (prose → code) is still re-detected within a few dozen
+/// tokens.
+const SPEC_PROBE_INTERVAL: u32 = 32;
 
 /// Pre-verify snapshot of one sequence's streaming corpus state, taken by
 /// `verify_block` before its prefill forward. On a partial accept the driver's
@@ -556,7 +572,11 @@ impl DeepSeekBatched {
                 .write()
                 .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
             let s = stats.entry(seq).or_insert(SpecStats {
-                ema: SPEC_MIN_ACCEPT + 1.0,
+                // Seed exactly AT the threshold: the first step drafts (the
+                // gate is a strict `<`), and its measured acceptance decides
+                // immediately — one losing step, not the ~10 an optimistic
+                // seed took to decay below the bar on 64-token sessions.
+                ema: SPEC_MIN_ACCEPT,
                 fallback_steps: 0,
             });
             s.ema = (1.0 - SPEC_EMA_ALPHA) * s.ema + SPEC_EMA_ALPHA * kept;
@@ -793,6 +813,15 @@ impl ManagedBatchedModel for DeepSeekBatched {
         {
             candle::bail!("forward_wave: input/seq length mismatch");
         }
+        // The KV↔expert boundary's GROWING direction, in the one gap it is
+        // legal in: between forwards, before this wave opens any state. Spare
+        // KV regions above the KV side's recent high-water go back to the
+        // weight zone as resident-expert slots — without this the boundary
+        // only ever moves toward KV (`request_kv_ground` buys on the spot) and
+        // expert residency ratchets down across a long run. The shrink
+        // direction needs no call here: a KV claim that runs out buys its
+        // ground itself. Mirrors the blanket `BatchedModel` wave's phase 0.
+        self.engine.experts().reclaim_spare_ground();
         let e = &self.engine;
         let cfg = e.cfg();
         let n_layers = self.num_layers();
@@ -2396,16 +2425,17 @@ mod tests {
         // keep the run inside the harness timeout while still exercising genuine
         // concurrency. The `InferenceMode` is cosmetic: `create_batched_session`
         // forces DeepSeek's single-latent FP8 arena regardless.
-        // NO drafter in this gate. This is the plain prefill/decode throughput +
-        // coherence benchmark; speculative decode is covered by the dedicated
-        // gates (`wave_speculative_*`, tiny prompts). Attaching the ~6 GB
-        // all-resident drafter here leaves ~0 free VRAM beside the 64 GB target
-        // (the expert pool cannot shrink — its pinned remainder rides the
-        // page-lock ceiling), so the cfg8 prefill's transient activations spill
-        // to host via WDDM paging and prefill collapses ~20× (measured 590→29
-        // t/s). Target + resident drafter + wide prefill do not co-fit on this
-        // card; speculative-with-prefill benchmarking needs the free-VRAM
-        // headroom the NVMe expert-offload work will create.
+        //
+        // Drafter + speculative decode are ON. Under the elastic partition the
+        // ~6 GB drafter is a DENSE-tier resident loaded before the span
+        // reservation (`Dsv4Engine::load_with_drafter`), so the span simply
+        // opens smaller and the KV↔expert boundary balances what remains —
+        // the old world's 20× prefill collapse (drafter + wide prefill
+        // spilling transients to host at ~0 free VRAM) is gone by construction:
+        // the pool cushion for activations is carved out before the span, not
+        // fought over after it.
+        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
+            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
         let params = TestParams::new(64, &tokenizer_json, Dialect::deepseek())
             .map_err(|e| candle::Error::msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true) // strip <think>…</think> before validation
@@ -2415,6 +2445,7 @@ mod tests {
             // is actually loaded with (`load_model` uses `Int8Mode::Performance` —
             // int8-KO expert/attention matmuls), not the harness default (`Off`).
             .with_int8mode(Int8Mode::Performance)
+            .with_speculative(5)
             .with_timeout_secs(1800);
 
         // Trailing second `1`: by the end of the sweep the streaming expert
@@ -2435,8 +2466,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         let load_model = || {
-            let engine = Dsv4Engine::load(&path, &device, Int8Mode::Performance)?;
-            DeepSeekBatched::new(engine)
+            let (engine, drafter) = Dsv4Engine::load_with_drafter(
+                &path,
+                dspark.exists().then_some(dspark.as_path()),
+                &device,
+                Int8Mode::Performance,
+            )?;
+            let model = DeepSeekBatched::new(engine)?;
+            match drafter {
+                Some(d) => model.with_drafter(d),
+                None => Ok(model),
+            }
         };
         params.run(configs, load_model)
     }

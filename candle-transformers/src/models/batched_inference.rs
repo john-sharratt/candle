@@ -3310,7 +3310,12 @@ pub trait ManagedBatchedModel {
         if seqs.is_empty() {
             return Ok(Vec::new());
         }
-        // Draft per sequence, then verify every block together.
+        // Draft per sequence. A sequence whose drafter proposes NOTHING (no
+        // drafter, or the acceptance fallback holding it back) takes a PLAIN
+        // decode wave instead of a 1-token verify: the verify path's
+        // snapshot/rollback + slot-rebuild machinery costs measurably more
+        // than a decode wave, which is exactly the loss the fallback exists
+        // to avoid. Drafted sequences still verify together in one wave.
         let mut poss = Vec::with_capacity(seqs.len());
         let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
@@ -3324,29 +3329,84 @@ pub trait ManagedBatchedModel {
             block.extend_from_slice(&drafts);
             blocks.push(block);
         }
-        let logits = self.verify_blocks(session, seqs, &blocks, layer_end)?;
+        let plain: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() == 1).collect();
+        let spec: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() > 1).collect();
 
-        // Batched greedy argmax over EVERY scored row of EVERY block: one stacked
-        // [R, vocab] argmax + one readback, split back per sequence.
-        let rows: Vec<Tensor> = logits
+        // Plain wave: decode every undrafted sequence's committed token in ONE
+        // ordinary decode wave. The decode kernel writes the token itself, so
+        // the sequence advances here and the later uniform truncate is a no-op
+        // for these (kept is always 1).
+        let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
+        if !plain.is_empty() {
+            let dseqs: Vec<usize> = plain.iter().map(|&i| seqs[i]).collect();
+            let dinputs: Vec<Tensor> = plain
+                .iter()
+                .map(|&i| Tensor::from_vec(vec![committed[i]], (1, 1), &Device::Cpu))
+                .collect::<Result<_>>()?;
+            let step =
+                self.forward_wave(session, &dseqs, &dinputs, &[], &[], &[], &[], 0, layer_end, None)?;
+            let mut rows = step.logits_owned()?;
+            if rows.len() != plain.len() {
+                candle::bail!(
+                    "speculative_decode_step_batch: plain wave scored {} rows for {} seqs",
+                    rows.len(),
+                    plain.len()
+                );
+            }
+            for &i in plain.iter().rev() {
+                plain_logits[i] = rows.pop();
+            }
+            for &i in &plain {
+                session.advance_sequence(seqs[i], 1)?;
+            }
+        }
+
+        // Verify wave: every drafted block together.
+        let spec_seqs: Vec<usize> = spec.iter().map(|&i| seqs[i]).collect();
+        let spec_blocks: Vec<Vec<u32>> = spec.iter().map(|&i| blocks[i].clone()).collect();
+        let spec_logits = if spec.is_empty() {
+            Vec::new()
+        } else {
+            self.verify_blocks(session, &spec_seqs, &spec_blocks, layer_end)?
+        };
+
+        // Batched greedy argmax over EVERY scored row of BOTH waves: one stacked
+        // [R, vocab] argmax + one readback, split back per sequence
+        // (plain rows first, then each verify block's rows).
+        let rows: Vec<Tensor> = plain
             .iter()
-            .flatten()
-            .map(|t| t.squeeze(0))
+            .map(|&i| plain_logits[i].as_ref().expect("filled above").squeeze(0))
+            .chain(
+                spec_logits
+                    .iter()
+                    .flatten()
+                    .map(|t| t.squeeze(0)),
+            )
             .collect::<Result<_>>()?;
         let stacked = Tensor::stack(&rows, 0)?; // [R, vocab]
         let arg: Vec<u32> = stacked
             .argmax(candle::D::Minus1)?
             .to_dtype(DType::U32)?
             .to_vec1::<u32>()?;
+        // Per-sequence argmax slices, in `seqs` order: plain rows occupy the
+        // stacked prefix (one row each, in `plain` order), verify blocks follow.
+        let mut row_of: Vec<(usize, usize)> = vec![(0, 0); seqs.len()];
+        for (k, &i) in plain.iter().enumerate() {
+            row_of[i] = (k, 1);
+        }
+        let mut cur = plain.len();
+        for (k, &i) in spec.iter().enumerate() {
+            let n = spec_logits[k].len();
+            row_of[i] = (cur, n);
+            cur += n;
+        }
 
         // Per-sequence accept / emit / rollback — the exact single-seq semantics.
         let mut next = Vec::with_capacity(seqs.len());
-        let mut cursor = 0usize;
         for (i, &seq) in seqs.iter().enumerate() {
             let block = &blocks[i];
-            let n_rows = logits[i].len();
-            let args = &arg[cursor..cursor + n_rows];
-            cursor += n_rows;
+            let (start, n_rows) = row_of[i];
+            let args = &arg[start..start + n_rows];
             // Greedy accept: position j's argmax is this model's real token at
             // pos+j+1. Keep it; stop at the first drafted position whose
             // proposal the model rejects (that argmax is the correction). If
