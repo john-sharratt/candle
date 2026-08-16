@@ -3316,6 +3316,7 @@ pub trait ManagedBatchedModel {
         // snapshot/rollback + slot-rebuild machinery costs measurably more
         // than a decode wave, which is exactly the loss the fallback exists
         // to avoid. Drafted sequences still verify together in one wave.
+        let t_draft = std::time::Instant::now();
         let mut poss = Vec::with_capacity(seqs.len());
         let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
@@ -3329,6 +3330,7 @@ pub trait ManagedBatchedModel {
             block.extend_from_slice(&drafts);
             blocks.push(block);
         }
+        pipeline_record_duration("spec:draft", t_draft.elapsed(), 1);
         let plain: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() == 1).collect();
         let spec: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() > 1).collect();
 
@@ -3362,6 +3364,7 @@ pub trait ManagedBatchedModel {
         }
 
         // Verify wave: every drafted block together.
+        let t_verify = std::time::Instant::now();
         let spec_seqs: Vec<usize> = spec.iter().map(|&i| seqs[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec.iter().map(|&i| blocks[i].clone()).collect();
         let spec_logits = if spec.is_empty() {
@@ -3369,6 +3372,7 @@ pub trait ManagedBatchedModel {
         } else {
             self.verify_blocks(session, &spec_seqs, &spec_blocks, layer_end)?
         };
+        pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
 
         // Batched greedy argmax over EVERY scored row of BOTH waves: one stacked
         // [R, vocab] argmax + one readback, split back per sequence
@@ -3402,6 +3406,7 @@ pub trait ManagedBatchedModel {
         }
 
         // Per-sequence accept / emit / rollback — the exact single-seq semantics.
+        let t_accept = std::time::Instant::now();
         let mut next = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
             let block = &blocks[i];
@@ -3436,6 +3441,7 @@ pub trait ManagedBatchedModel {
             self.truncate_sequence(session, seq, poss[i] + kept)?;
             next.push(if go_on { reals.last().copied() } else { None });
         }
+        pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
         Ok(next)
     }
 
@@ -3538,7 +3544,7 @@ pub trait ManagedBatchedModel {
 /// a wider wave, and whether that wave *fits* is the separate question
 /// [`ManagedBatchedModel::prefill_width_cap`] asks the wave plan. The narrower of
 /// the two wins, so this can lead the span rather than having to trail it.
-const MAX_PREFILL_TOKENS: usize = 8192;
+pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 
 /// Blanket implementation of `ManagedBatchedModel` for `BatchedInference<M>`.
 ///

@@ -20,7 +20,7 @@
 //! The backbone forward with target-KV injection and the draft/verify loop are the
 //! GPU-coupled integration built on top — see `docs/deepseek_v4_speculative_decode.md`.
 
-use candle::{Result, Tensor};
+use candle::{DType, Result, Tensor};
 use candle_nn::ops::softmax_last_dim;
 
 use super::config::Config;
@@ -229,6 +229,19 @@ impl MarkovHead {
         let e = self.w1.narrow(0, prev_token as usize, 1)?;
         e.matmul(&self.w2)?.squeeze(0)
     }
+
+    /// [`Self::embed`] with the previous token as a DEVICE `[1]` u32 tensor —
+    /// the sequential sampler's chained form, which never reads the token back
+    /// to the host. Shape `[1, rank]`.
+    pub fn embed_dev(&self, prev: &Tensor) -> Result<Tensor> {
+        self.w1.index_select(prev, 0)
+    }
+
+    /// [`Self::bias`] from a device `[1, rank]` embedding (from
+    /// [`Self::embed_dev`]). Shape `[vocab]`.
+    pub fn bias_from_embed(&self, e: &Tensor) -> Result<Tensor> {
+        e.matmul(&self.w2)?.squeeze(0)
+    }
 }
 
 /// Confidence head (paper Eq. 7): `cₖ = σ(wᵀ · [hₖ ; W₁[x_{k-1}]])` — the survival
@@ -257,6 +270,15 @@ impl ConfidenceHead {
         let x = Tensor::cat(&[h.clone(), markov_embed.clone()], 0)?; // [hidden + rank]
         let z = x.broadcast_mul(&self.w)?.sum_all()?.to_scalar::<f32>()?;
         Ok(1.0 / (1.0 + (-z).exp()))
+    }
+
+    /// [`Self::confidence`] kept ON DEVICE — returns the survival probability as
+    /// a `[1]` f32 tensor so the sequential sampler's chain never syncs the host.
+    pub fn confidence_dev(&self, h: &Tensor, markov_embed: &Tensor) -> Result<Tensor> {
+        let x = Tensor::cat(&[h.clone(), markov_embed.clone()], 0)?; // [hidden + rank]
+        let z = x.broadcast_mul(&self.w)?.sum_all()?; // scalar
+        // σ(z) = 1 / (1 + e^(−z)), all tensor ops.
+        ((z.neg()?.exp()? + 1.0)?.recip()?).reshape(1)
     }
 }
 
@@ -490,7 +512,7 @@ impl DsparkDrafter {
         committed: u32,
         tau: f32,
     ) -> Result<Vec<u32>> {
-        sample_sequential(
+        sample_sequential_device(
             &self.markov,
             self.confidence.as_ref(),
             self.cfg.block_size,
@@ -502,10 +524,70 @@ impl DsparkDrafter {
     }
 }
 
-/// The DSpark sequential sampler (paper Eq. 4-5-7 + Alg. 1), free of the loaded model so it is
-/// unit-testable. At position `k`: `col = U_k + W₁[prev]·W₂` (Eq. 5), `t = argmax(col)`, and the
-/// survival probability `c_k` (confidence head Eq. 7, else the max-softmax proxy) accumulates
-/// into `∏ c_i`; drafting stops the first time the cumulative product drops below `tau`.
+/// [`sample_sequential`] with the chain kept ON DEVICE: each position's Markov
+/// bias, argmax, and confidence are tensor ops whose data-dependent inputs
+/// (the previous token) stay device-resident, and the whole block's tokens +
+/// confidences come back in ONE transfer at the end. Bit-identical tokens —
+/// the math is the same ops in the same order — but the former per-position
+/// `to_scalar` pair (argmax + confidence) cost TWO full WDDM pipeline drains
+/// per draft position, which made drafting a 5-token block cost more than the
+/// verify wave it fed (~200 ms of the ~330 ms drafted-step wall).
+fn sample_sequential_device(
+    markov: &MarkovHead,
+    confidence: Option<&ConfidenceHead>,
+    block_size: usize,
+    base_logits: &[Tensor],
+    hidden: &[Tensor],
+    committed: u32,
+    tau: f32,
+) -> Result<Vec<u32>> {
+    let gamma = base_logits.len().min(block_size).min(hidden.len());
+    if gamma == 0 {
+        return Ok(Vec::new());
+    }
+    let dev = base_logits[0].device().clone();
+    let mut prev = Tensor::from_vec(vec![committed], 1, &dev)?;
+    let mut toks: Vec<Tensor> = Vec::with_capacity(gamma);
+    let mut confs: Vec<Tensor> = Vec::with_capacity(gamma);
+    for k in 0..gamma {
+        let e = markov.embed_dev(&prev)?; // [1, rank]
+        let col = base_logits[k].broadcast_add(&markov.bias_from_embed(&e)?)?; // [vocab]
+        let t = col.argmax(0)?.reshape(1)?; // device [1] u32
+        let c = match confidence {
+            Some(cf) => cf.confidence_dev(&hidden[k], &e.reshape(markov.rank())?)?,
+            None => softmax_last_dim(&col)?.index_select(&t, 0)?, // [1]
+        };
+        toks.push(t.clone());
+        confs.push(c);
+        prev = t;
+    }
+    // The block's ONLY host syncs: γ tokens + γ confidences, two tiny reads.
+    let toks_h: Vec<u32> = Tensor::cat(&toks, 0)?.to_vec1::<u32>()?;
+    let confs_h: Vec<f32> = Tensor::cat(&confs, 0)?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
+    // Alg. 1's cutoff, exactly as the host form applies it: accumulate the
+    // survival product and keep the longest prefix that clears τ.
+    let mut drafts = Vec::with_capacity(gamma);
+    let mut cum = 1.0f32;
+    for k in 0..gamma {
+        cum *= confs_h[k];
+        if cum < tau {
+            break;
+        }
+        drafts.push(toks_h[k]);
+    }
+    Ok(drafts)
+}
+
+/// The DSpark sequential sampler (paper Eq. 4-5-7 + Alg. 1) in its scalar
+/// host form — the readable reference [`sample_sequential_device`] is held
+/// bit-identical to (`device_sampler_matches_host_reference`). At position
+/// `k`: `col = U_k + W₁[prev]·W₂` (Eq. 5), `t = argmax(col)`, and the
+/// survival probability `c_k` (confidence head Eq. 7, else the max-softmax
+/// proxy) accumulates into `∏ c_i`; drafting stops the first time the
+/// cumulative product drops below `tau`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn sample_sequential(
     markov: &MarkovHead,
@@ -682,6 +764,31 @@ mod tests {
 
         let d_keep0 = sample_sequential(&markov, Some(&conf), 3, &base, &hidden, 0, 0.6)?;
         assert!(d_keep0.is_empty(), "0.5<0.6 → 0 drafts (plain decode)");
+        Ok(())
+    }
+
+    /// The device-chained sampler (the runtime form: no per-position host sync)
+    /// is token-identical to the scalar host reference across taus, with and
+    /// without a confidence head.
+    #[test]
+    fn device_sampler_matches_host_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let markov = fixture_markov(&dev)?;
+        let u = |v: Vec<f32>| Tensor::from_vec(v, 4, &dev).unwrap();
+        let base = vec![
+            u(vec![0., 0., 0., 10.]),
+            u(vec![0.; 4]),
+            u(vec![100., 0., 0., 0.]),
+        ];
+        let hidden = vec![Tensor::zeros(2, DType::F32, &dev)?; 3];
+        let conf = ConfidenceHead::new(Tensor::from_vec(vec![0.3f32, -0.2, 1.0, 0.4], 4, &dev)?);
+        for tau in [0.0f32, 0.3, 0.6, 0.9] {
+            for c in [None, Some(&conf)] {
+                let host = sample_sequential(&markov, c, 3, &base, &hidden, 0, tau)?;
+                let devf = sample_sequential_device(&markov, c, 3, &base, &hidden, 0, tau)?;
+                assert_eq!(host, devf, "tau={tau} conf={}", c.is_some());
+            }
+        }
         Ok(())
     }
 

@@ -17,6 +17,7 @@ use candle::{DType, Device, Result, Tensor};
 
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult, WaveStep,
+    MAX_PREFILL_TOKENS,
 };
 use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -692,6 +693,22 @@ impl ManagedBatchedModel for DeepSeekBatched {
             // `act_dtype`; both buffers are live at once, so both are planned.
             accum_dtype: DType::F32,
         }
+    }
+
+    fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        // DeepSeek's forward takes its transients from the CUDA pool (it has
+        // not adopted the span's wave arenas), so the default cap's FFN-span
+        // pricing bounds a tier this model never allocates from — and at the
+        // 8-way expert fan-out it sliced an 8-prompt fleet into three waves,
+        // tripling the per-wave fixed costs (the per-layer routing readback +
+        // expert-set assembly) that ARE the prefill wall. The engine's pool
+        // cushion is reserved at load for exactly this activation peak, so the
+        // real ceilings are compute saturation and what the KV side can admit.
+        let mut cap = MAX_PREFILL_TOKENS;
+        if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
+            cap = cap.min(kv_fits);
+        }
+        cap
     }
 
     fn maybe_change_dtype(&self, _dtype: DType) -> Result<()> {

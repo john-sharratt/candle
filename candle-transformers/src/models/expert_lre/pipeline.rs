@@ -380,13 +380,19 @@ pub(crate) fn startup_from_pack(
 
 /// Pinned landing buffers the pipeline thread keeps for cold reads.
 ///
-/// Deep enough that a buffer is never waited on in practice: a layer routes to
-/// far fewer experts than this, so a buffer has always been round the ring and
-/// its upload retired long before it comes up again. At one record each that is
-/// ~46 MB of pinned host memory on Qwen3-30B-A3B — a rounding error against the
-/// warm tier, and the thing that keeps a cold miss from stalling the host.
+/// Deep enough that a buffer is never waited on in practice: it must exceed
+/// ONE LAYER'S worst cold burst, not just its routed width. A wide prefill
+/// wave misses tens of experts per layer past the warm tier, and a ring
+/// shallower than that burst rewraps onto buffers whose uploads were
+/// published microseconds earlier — whose events sit behind the copy stream's
+/// ordered-after-compute waits, so each `acquire` becomes a host sync against
+/// compute (measured: a 16-deep ring turned the batched cold read into a 5×
+/// prefill collapse). At 64 records (~0.9 GB pinned on DeepSeek's 14.2 MB
+/// stride) a burst never rewraps within its own layer, and by the next visit
+/// every event has long retired — still a rounding error against the warm
+/// tier, and the thing that keeps a cold miss from stalling the host.
 #[cfg(feature = "cuda")]
-pub(crate) const COLD_STAGING_BUFFERS: usize = 16;
+pub(crate) const COLD_STAGING_BUFFERS: usize = 64;
 
 /// Lay one expert's three projections into a record buffer at their spans.
 ///
@@ -798,6 +804,37 @@ impl ColdStaging {
         Ok(idx)
     }
 
+    /// `n` distinct buffers (each waited-on if its last upload is still in
+    /// flight), for one concurrent batch read. `n` must not exceed the ring.
+    fn acquire_many(&mut self, n: usize) -> Result<Vec<usize>> {
+        if n > self.bufs.len() {
+            candle::bail!(
+                "cold staging: {n} buffers requested, ring holds {}",
+                self.bufs.len()
+            );
+        }
+        (0..n).map(|_| self.acquire()).collect()
+    }
+
+    /// Mutable slices for a set of DISTINCT buffer indices, in the order given —
+    /// the destinations of one `read_many` batch.
+    fn buffers_mut_for(&mut self, idxs: &[usize], len: usize) -> Result<Vec<&mut [u8]>> {
+        let mut taken: Vec<Option<&mut StagingBuf>> = self.bufs.iter_mut().map(Some).collect();
+        idxs.iter()
+            .map(|&i| {
+                taken
+                    .get_mut(i)
+                    .and_then(|s| s.take())
+                    .map(|b| b.as_mut_slice(len))
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "cold staging: buffer {i} requested twice or out of range"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// Record that buffer `idx` is the source of an upload that has not landed.
     fn publish(&mut self, idx: usize, event: CudaEvent) {
         self.events[idx] = Some(event);
@@ -1087,17 +1124,7 @@ impl PipelineState {
         // Hence the explicit unwinding rather than `?`: the error still
         // propagates unchanged, but the slots go back first.
         #[cfg(feature = "cuda")]
-        let outcome = (|| -> Result<()> {
-            // Before any byte moves: the slots below may still be under read by
-            // the previous layer's GEMM.
-            self.order_copies_after_compute()?;
-            for &(expert_idx, slot_idx) in &to_load {
-                let slot_base = self.inner.slot_base(slot_idx);
-                let expert_slot = self.load_expert(moe_idx, expert_idx, slot_base)?;
-                loaded_slots.push((expert_idx, slot_idx, expert_slot));
-            }
-            Ok(())
-        })();
+        let outcome = self.load_experts_batched(moe_idx, &to_load, &mut loaded_slots);
 
         #[cfg(not(feature = "cuda"))]
         let outcome = (|| -> Result<()> {
@@ -1365,6 +1392,102 @@ impl PipelineState {
                 Ok(slot)
             }
         }
+    }
+
+    /// Load a batch of misses for one layer into their reserved slots —
+    /// the shared loader for the demand path (`classify_and_load`) and the
+    /// layer-ahead prefetch.
+    ///
+    /// Cold misses take ONE concurrent striped NVMe read per staging-ring
+    /// chunk (`read_many_unverified` — the same overlapped path the startup
+    /// fill uses, minus its checksum); warm-backed misses follow as
+    /// pinned→VRAM H2Ds pipelined by the copy stream. The former shape — a
+    /// solo unbuffered read per expert, serial on this thread — made a layer
+    /// with k cold misses pay k × (read latency) with the drive idle between
+    /// them.
+    #[cfg(feature = "cuda")]
+    fn load_experts_batched(
+        &mut self,
+        moe_idx: usize,
+        to_load: &[(usize, usize)],
+        loaded_slots: &mut Vec<(usize, usize, ExpertSlot)>,
+    ) -> Result<()> {
+        // Before any byte moves: the slots below may still be under read by
+        // the previous layer's GEMM.
+        self.order_copies_after_compute()?;
+        let cold: Vec<(usize, usize)> = to_load
+            .iter()
+            .copied()
+            .filter(|&(e, _)| self.residency[moe_idx][e].ram.is_none())
+            .collect();
+        if !cold.is_empty() {
+            let Device::Cuda(cd) = self.device.clone() else {
+                candle::bail!("cold expert load requires a CUDA device");
+            };
+            let stream = match &self.copy_stream {
+                Some(cs) => cs.clone(),
+                None => cd.cuda_stream(),
+            };
+            let stride = self.pack.stride();
+            let layout = self.pack.layout(moe_idx);
+            for chunk in cold.chunks(COLD_STAGING_BUFFERS) {
+                let t = profile_now();
+                let idxs = self.cold_staging.acquire_many(chunk.len())?;
+                self.profile.record("cold_acquire", t);
+                let t = profile_now();
+                {
+                    let bufs = self.cold_staging.buffers_mut_for(&idxs, stride)?;
+                    let reads: Vec<PackRead<'_>> = chunk
+                        .iter()
+                        .zip(bufs)
+                        .map(|(&(expert_idx, _), dest)| PackRead {
+                            layer: moe_idx,
+                            expert: expert_idx,
+                            dest,
+                        })
+                        .collect();
+                    self.pack.read_many_unverified(reads)?;
+                }
+                self.profile.record("cold_read", t);
+                for (&(expert_idx, slot_idx), &buf_idx) in chunk.iter().zip(&idxs) {
+                    let slot_base = self.inner.slot_base(slot_idx);
+                    let geom = &self.layer_geometries[moe_idx];
+                    // SAFETY: `slot_base` names a slot the zone handed this
+                    // batch and has not reclaimed; overwriting it is the point.
+                    let slot = unsafe {
+                        build_slot_from_record_on_stream(
+                            self.cold_staging.buffer_ref(buf_idx, stride),
+                            layout,
+                            geom,
+                            &cd,
+                            &stream,
+                            slot_base,
+                            Some(&mut self.profile),
+                        )?
+                    };
+                    // The buffer cannot be written again until this upload lands.
+                    let event = stream.record_event(None).map_err(candle::Error::wrap)?;
+                    self.cold_staging.publish(buf_idx, event);
+                    if let Ok(mut s) = self.stats.lock() {
+                        s.cold_loads += 1;
+                    }
+                    loaded_slots.push((expert_idx, slot_idx, slot));
+                }
+            }
+        }
+        // Warm-backed misses AFTER the cold reads: their pinned→VRAM H2Ds are
+        // pipelined by the copy stream and need no host wait, while an
+        // unbuffered NVMe read issued BEHIND a layer's whole warm H2D burst
+        // contends with the in-flight DMA traffic.
+        for &(expert_idx, slot_idx) in to_load {
+            if self.residency[moe_idx][expert_idx].ram.is_none() {
+                continue;
+            }
+            let slot_base = self.inner.slot_base(slot_idx);
+            let expert_slot = self.load_expert(moe_idx, expert_idx, slot_base)?;
+            loaded_slots.push((expert_idx, slot_idx, expert_slot));
+        }
+        Ok(())
     }
 
     /// Proactive eviction: drop the bottom-N VRAM experts.
@@ -2232,6 +2355,24 @@ impl PipelineState {
             return Ok(CopyBatchFence::noop());
         }
 
+        // Two regimes, by the width of the wave that just computed:
+        //
+        // * A DECODE-width wave routes a handful of experts, so the next
+        //   layer's set is genuinely uncertain — ask the learned transition
+        //   matrix for its confidence-gated top-k.
+        // * A PREFILL-width wave routes most of the layer, and the next layer
+        //   will too — there is nothing to predict. Stream the WHOLE next
+        //   layer while this layer's FFN computes, which is what turns the
+        //   prefill's expert traffic from an on-demand stall inside every
+        //   `submit` into copy-stream DMA overlapped with compute. (Capacity
+        //   comes from the batch eviction below: the victims are layers behind
+        //   the wave, exactly the double-buffer the streaming sweep wants.)
+        // NOTE: a full-next-layer arm for prefill-width waves was measured
+        // here and REGRESSED bulk throughput (cfg8 437→416): the batch runs on
+        // this pipeline thread inside `post_compute`, so the next layer's work
+        // request queues behind ~170 loads instead of overlapping them, and
+        // its evictions churn residents the harness's later prefill waves
+        // reuse. Streaming the next layer needs its reads OFF this thread.
         let predicted = self
             .transition_matrix
             .predict_prefetch(moe_layer_idx, current_expert_ids);
@@ -2273,58 +2414,58 @@ impl PipelineState {
             }
         }
 
-        // Load each miss into a (now-provisioned) free slot. Stops early if the
-        // window couldn't supply enough room — the demand path loads the rest.
-        //
-        // The slots just freed above were occupied by experts of layers behind
-        // the wave, whose GEMMs may still be executing.
-        #[cfg(feature = "cuda")]
-        self.order_copies_after_compute()?;
-        let mut loaded = 0usize;
+        // Load the misses into (now-provisioned) free slots — stopping early if
+        // the window couldn't supply enough room; the demand path loads the
+        // rest. The slots just freed above were occupied by experts of layers
+        // behind the wave, whose GEMMs may still be executing.
+        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(misses.len());
         for &expert_idx in &misses {
-            let slot_idx = match self.inner.take_free() {
-                Some(s) => s,
+            match self.inner.take_free() {
+                Some(slot_idx) => pairs.push((expert_idx, slot_idx)),
                 None => break,
-            };
-
-            let expert_slot = {
-                #[cfg(feature = "cuda")]
-                {
-                    let slot_base = self.inner.slot_base(slot_idx);
-                    match self.load_expert(target_layer, expert_idx, slot_base) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            self.inner.put_free(slot_idx);
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let mmap_bytes: &[u8] = &self.mmap;
-                    let mmap_ref = &self.host_refs[target_layer][expert_idx];
-                    match load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            self.inner.put_free(slot_idx);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            self.inner
-                .install(slot_idx, target_layer, expert_idx, expert_slot);
-
-            #[cfg(feature = "cuda")]
-            {
-                self.residency[target_layer][expert_idx].vram = Some(slot_idx);
             }
-
-            // Track for prediction-precision measurement — validated when the
-            // next layer's work request arrives.
-            self.speculative_loads.insert((target_layer, expert_idx));
-            loaded += 1;
+        }
+        let mut loaded = 0usize;
+        #[cfg(feature = "cuda")]
+        {
+            let mut loaded_slots: Vec<(usize, usize, ExpertSlot)> =
+                Vec::with_capacity(pairs.len());
+            let outcome = self.load_experts_batched(target_layer, &pairs, &mut loaded_slots);
+            let filled: std::collections::HashSet<usize> =
+                loaded_slots.iter().map(|&(_, s, _)| s).collect();
+            for (expert_idx, slot_idx, slot) in loaded_slots {
+                self.inner.install(slot_idx, target_layer, expert_idx, slot);
+                self.residency[target_layer][expert_idx].vram = Some(slot_idx);
+                // Track for prediction-precision measurement — validated when
+                // the next layer's work request arrives.
+                self.speculative_loads.insert((target_layer, expert_idx));
+                loaded += 1;
+            }
+            // A failed batch hands back every slot it never filled — prefetch
+            // is advisory, so the error itself is dropped (the demand path
+            // will load whatever this round missed).
+            if outcome.is_err() {
+                for &(_, slot_idx) in &pairs {
+                    if !filled.contains(&slot_idx) {
+                        self.inner.put_free(slot_idx);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        for &(expert_idx, slot_idx) in &pairs {
+            let mmap_bytes: &[u8] = &self.mmap;
+            let mmap_ref = &self.host_refs[target_layer][expert_idx];
+            match load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode) {
+                Ok(s) => {
+                    self.inner.install(slot_idx, target_layer, expert_idx, s);
+                    self.speculative_loads.insert((target_layer, expert_idx));
+                    loaded += 1;
+                }
+                Err(_) => {
+                    self.inner.put_free(slot_idx);
+                }
+            }
         }
 
         if loaded == 0 {

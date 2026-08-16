@@ -254,6 +254,20 @@ impl ExpertPack {
     /// queue — this is the startup fill, where thousands of records move and
     /// per-read latency would otherwise dominate.
     pub(crate) fn read_many(&self, targets: Vec<PackRead<'_>>) -> Result<()> {
+        self.read_many_impl(targets, true)
+    }
+
+    /// [`Self::read_many`] without the checksum pass — the RUNTIME miss path,
+    /// which shares [`Self::read_into`]'s contract: hot-loop reads skip
+    /// verification (see [`Self::verify`] for the measurement behind that)
+    /// while the startup fill, which reads every record exactly once with idle
+    /// cores, keeps it. Routing the hot loop through the verifying form put a
+    /// full-record checksum on every cold miss and multiplied its latency.
+    pub(crate) fn read_many_unverified(&self, targets: Vec<PackRead<'_>>) -> Result<()> {
+        self.read_many_impl(targets, false)
+    }
+
+    fn read_many_impl(&self, targets: Vec<PackRead<'_>>, verify: bool) -> Result<()> {
         for t in targets.iter() {
             if t.dest.len() != self.stride {
                 candle::bail!(
@@ -281,6 +295,9 @@ impl ExpertPack {
                     self.path.display()
                 ))
             })?;
+        if !verify {
+            return Ok(());
+        }
         // Verified across the pool: this is the whole warm tier, ~14 GB, and a
         // checksum is memory-bound, so one thread would add seconds to startup
         // where the cores are otherwise idle waiting on the drive.
