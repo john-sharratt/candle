@@ -1339,6 +1339,47 @@ extern "C" __global__ void q2_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
     void*, int, int, int, int);
 
+// Wide-Bm (mode-4 / mode-8) grouped twins — KO rows only (14-19): the int8
+// impl is KO-exclusive, and the wide tiles exist for the routed-expert
+// PREFILL regime where those are the only formats in play. The host requests
+// a wide mode only for KO dtypes (cuda.rs), so the null rows are never asked
+// for; a null lookup returns without launching rather than mis-launching.
+#define DECLARE_GROUPED_WIDE(name) \
+    extern "C" __global__ void name##_grouped_m4( \
+        const void*, const void*, const void*, const void*, const void*, \
+        void*, int, int, int, int); \
+    extern "C" __global__ void name##_grouped_m8( \
+        const void*, const void*, const void*, const void*, const void*, \
+        void*, int, int, int, int);
+DECLARE_GROUPED_WIDE(q4_ko_int8_f32)
+DECLARE_GROUPED_WIDE(q5_ko_int8_f32)
+DECLARE_GROUPED_WIDE(q6_ko_int8_f32)
+DECLARE_GROUPED_WIDE(q8_ko_int8_f32)
+DECLARE_GROUPED_WIDE(mxfp4_ko_int8_f32)
+DECLARE_GROUPED_WIDE(q2_ko_int8_f32)
+#undef DECLARE_GROUPED_WIDE
+
+static void* grouped_kernels_int8_m4[20] = {
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    (void*)q4_ko_int8_f32_grouped_m4,    // 14  q4_KO
+    (void*)q5_ko_int8_f32_grouped_m4,    // 15  q5_KO
+    (void*)q6_ko_int8_f32_grouped_m4,    // 16  q6_KO
+    (void*)q8_ko_int8_f32_grouped_m4,    // 17  q8_KO
+    (void*)mxfp4_ko_int8_f32_grouped_m4, // 18  mxfp4_KO
+    (void*)q2_ko_int8_f32_grouped_m4,    // 19  q2_KO
+};
+static void* grouped_kernels_int8_m8[20] = {
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    (void*)q4_ko_int8_f32_grouped_m8,    // 14  q4_KO
+    (void*)q5_ko_int8_f32_grouped_m8,    // 15  q5_KO
+    (void*)q6_ko_int8_f32_grouped_m8,    // 16  q6_KO
+    (void*)q8_ko_int8_f32_grouped_m8,    // 17  q8_KO
+    (void*)mxfp4_ko_int8_f32_grouped_m8, // 18  mxfp4_KO
+    (void*)q2_ko_int8_f32_grouped_m8,    // 19  q2_KO
+};
+
 // [qtype_kernel_row] — same row ordering as grouped_kernels above.
 static void* grouped_kernels_int8[20] = {
     (void*)q4_0_int8_f32_grouped,      // 0   q4_0
@@ -1387,7 +1428,8 @@ extern "C" void run_grouped_quantized_matmul(
     int32_t dst_stride,
     int32_t num_tiles,
     int32_t qtype,
-    int32_t ytype)
+    int32_t ytype,
+    int32_t n_sub)  // int8 token-tile width / 16: 2 (Bm 32), 4 (Bm 64), 8 (Bm 128)
 {
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
     if (kernel_row < 0 || ytype < 0 || ytype > 3 || num_tiles <= 0) {
@@ -1405,8 +1447,20 @@ extern "C" void run_grouped_quantized_matmul(
     //                          INT8-MMA grouped kernel (raw int8 × Q4_K nibbles,
     //                          deferred-scale fold, F32 output). TC-only — callers
     //                          only pass q8a128 when tensor cores exist.
-    void* kfn = (ytype == 3) ? grouped_kernels_int8[kernel_row]      // q8a128 → int8 MMA
-                             : grouped_kernels[kernel_row][ytype];
+    // `n_sub` selects the int8 tile width — the caller sized the tile tables
+    // to 16·n_sub, so a mode without a kernel MUST refuse rather than launch a
+    // narrower kernel that would drop the tiles' upper rows.
+    void* kfn;
+    if (ytype == 3) {
+        switch (n_sub) {
+            case 2: kfn = grouped_kernels_int8[kernel_row]; break;
+            case 4: kfn = grouped_kernels_int8_m4[kernel_row]; break;
+            case 8: kfn = grouped_kernels_int8_m8[kernel_row]; break;
+            default: return;
+        }
+    } else {
+        kfn = grouped_kernels[kernel_row][ytype];
+    }
     if (kfn == nullptr) {
         return;
     }

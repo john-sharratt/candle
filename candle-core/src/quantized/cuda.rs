@@ -4332,6 +4332,7 @@ fn grouped_matmul_gemx_impl<'w>(
                         num_tiles as i32,
                         qtype,
                         ytype as i32,
+                        2, // FP grouped kernels ignore the int8 tile mode
                     );
                 }
             }};
@@ -5271,11 +5272,14 @@ pub fn dequantize_q8a128(
 /// with ytype = Q8A128. The grouped/MoE path has no mode-2 kernel, so it always
 /// runs mode-1 (Q8A128V) regardless of M. Internal building block for the `Int8`
 /// arm of [`grouped_qmatmul`].
-/// Token width of one grouped-GEMM expert tile — the int8 mode-2 (`Bm=32`,
-/// `N_SUB=2`) weight-reuse width the grouped kernel is instantiated with. Every
-/// tile-table builder MUST segment expert buckets at this width: the host
-/// builder below and the device-side `moe_bucketize` kernel both consume it,
-/// and a divergence silently mis-strides the kernel's batch slices.
+/// Token width of one mode-2 (`Bm=32`, `N_SUB=2`) grouped-GEMM expert tile —
+/// the width the DEVICE-side tile builder (`moe_bucketize`) segments at, and
+/// the mode its consumers launch (`n_sub = 2`; the decode regime, where 32 is
+/// already the full reuse win). The host tile builder
+/// (`grouped_matmul_gemx_q8a128_with_mode`) derives its width from the chosen
+/// mode instead (`16·n_sub`, up to `Bm=128` for prefill-scale rows-per-expert);
+/// a builder/launch width divergence silently mis-strides the kernel's batch
+/// slices, so each launch site pairs its table width with its `n_sub`.
 pub const GROUPED_GEMM_TILE_W: usize = 32;
 
 /// Kernel bounds of the MoE bucketize, re-exported so every gate that decides
@@ -5301,21 +5305,81 @@ fn grouped_matmul_gemx_q8a128<'w>(
     if num_experts == 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
     }
+    // Token-tile mode by rows-per-active-expert. The grouped int8 kernel loads
+    // + dequants each expert weight chunk ONCE per tile and sweeps the
+    // m16n8k32 core across the tile's 16-row sub-tiles, so the tile width IS
+    // the weight-reuse factor: at decode's 1–32 rows/expert the 32-wide
+    // mode-2 tile is already optimal (a partial tile costs the same weight
+    // traffic), but at PREFILL's ~100–300 rows/expert it re-streams and
+    // re-dequants every expert 4×+ per launch — measured as the flat
+    // ~0.87 ms/token marginal prefill cost. Wide modes (Bm 64 / 128) exist
+    // for the KO rows (the only int8 formats); thresholds sit at the widths
+    // where the wider tile's weight-traffic saving is guaranteed even for a
+    // final partial tile.
+    let active: usize = (0..num_experts)
+        .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
+        .count();
+    let avg_rows = if active == 0 {
+        0
+    } else {
+        total_batch / active
+    };
+    let n_sub: usize = if !weight_dtype.is_ko() {
+        2
+    } else if avg_rows >= 96 {
+        8
+    } else if avg_rows >= 32 {
+        4
+    } else {
+        2
+    };
+    grouped_matmul_gemx_q8a128_with_mode(
+        act_ptr,
+        weight_ptrs,
+        weight_dtype,
+        nrows,
+        ncols,
+        total_batch,
+        expert_offsets,
+        device,
+        origin,
+        n_sub,
+    )
+}
+
+/// [`grouped_matmul_gemx_q8a128`] with the token-tile mode chosen by the
+/// caller — the test seam that proves the wide modes bit-equal mode-2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
+    act_ptr: u64,
+    weight_ptrs: &[u64],
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    ncols: usize,
+    total_batch: usize,
+    expert_offsets: &[i32],
+    device: &CudaDevice,
+    origin: Backing,
+    n_sub: usize,
+) -> Result<crate::LiveTensor<'w>> {
+    let num_experts = weight_ptrs.len();
+    if num_experts == 0 {
+        crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
+    }
     if nrows % 32 != 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: nrows={nrows} must be a multiple of 32");
     }
     if ncols % 128 != 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: ncols={ncols} must be a multiple of 128");
     }
+    if !matches!(n_sub, 2 | 4 | 8) || (n_sub > 2 && !weight_dtype.is_ko()) {
+        crate::bail!(
+            "grouped_matmul_gemx_q8a128: tile mode n_sub={n_sub} unsupported for {weight_dtype:?}"
+        );
+    }
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
 
-    // Tile tables: ≤32-token tiles per expert — the mode-2 (Bm=32, N_SUB=2) weight-reuse
-    // width. The grouped int8 kernel loads each expert weight ONCE per tile and sweeps the
-    // m16n8k32 core across up to two 16-row token sub-tiles, halving weight reads at the MoE
-    // sweet spot (16–32 tokens/expert). A tile holding ≤16 tokens runs a single sub-tile and
-    // writes nothing for the empty one — identical weight traffic to a 16-wide tile — so 32
-    // is the unconditional width: Qwen3's expert matrices are far past the reuse crossover,
-    // and the partial-sub-tile path is the same one dense prefill already exercises at 128K.
+    let tile_w = 16 * n_sub;
     let mut tile_expert: Vec<i32> = Vec::new();
     let mut tile_b_start: Vec<i32> = Vec::new();
     let mut tile_b_cnt: Vec<i32> = Vec::new();
@@ -5323,7 +5387,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
         let mut s = expert_offsets[e];
         let end = expert_offsets[e + 1];
         while s < end {
-            let cnt = (end - s).min(GROUPED_GEMM_TILE_W as i32);
+            let cnt = (end - s).min(tile_w as i32);
             tile_expert.push(e as i32);
             tile_b_start.push(s);
             tile_b_cnt.push(cnt);
@@ -5379,7 +5443,8 @@ fn grouped_matmul_gemx_q8a128<'w>(
                 nrows as i32, // dst_stride = N
                 num_tiles as i32,
                 qtype,
-                YType::Q8A128 as i32, // the grouped dispatcher picks mode-1/mode-2 per-expert
+                YType::Q8A128 as i32,
+                n_sub as i32,
             );
         }
     }
@@ -5558,6 +5623,8 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
                     launch_tiles as i32,
                     qtype,
                     YType::Q8A128 as i32,
+                    // moe_bucketize builds 32-wide tiles (decode regime).
+                    2,
                 );
             }
             Ok(())

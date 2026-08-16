@@ -432,6 +432,44 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
         vy, dst, ncols_x, nrows_x, y_stride, dst_stride); \
 }
 
+/* Wide-Bm grouped twins for the PREFILL regime (many rows per expert): each
+ * weight chunk's load + dequant is reused across 4 / 8 token sub-tiles, cutting
+ * the per-32-row weight re-streaming that dominates the routed GEMM once
+ * rows-per-expert clears the tile width (decode stays on the N_SUB=2 form —
+ * wide tiles there would MMA mostly zero-padding for the same weight traffic).
+ * Bit-identical per output row to the N_SUB=2 kernel: the K-loop accumulation
+ * order is unchanged; the sub-tile split only regroups which tokens share a
+ * block. Relaxed launch bounds: the wide tiles hold 4·N_SUB accumulators per
+ * thread and 2×(16·N_SUB)×KI8_STRIDE activation smem, so the TC16 10-block
+ * register budget (~51/thread) would spill them.
+ * The host picks the mode from rows-per-expert (cuda.rs
+ * grouped_matmul_gemx_q8a128) and sizes the tile tables to 16·N_SUB. */
+#define INSTANTIATE_KERNEL_GROUPED_INT8_M4(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_grouped_m4( \
+    const uint64_t* __restrict__ weight_ptrs, \
+    const int* __restrict__ tile_expert, \
+    const int* __restrict__ tile_b_start, \
+    const int* __restrict__ tile_b_cnt, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride) { \
+    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 4>( \
+        weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride); \
+}
+
+#define INSTANTIATE_KERNEL_GROUPED_INT8_M8(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_SMALL name##_grouped_m8( \
+    const uint64_t* __restrict__ weight_ptrs, \
+    const int* __restrict__ tile_expert, \
+    const int* __restrict__ tile_b_start, \
+    const int* __restrict__ tile_b_cnt, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride) { \
+    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 8>( \
+        weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride); \
+}
+
 // Generate all 16 TC32 kernels (tc32_0 through tc32_15)
 #define INSTANTIATE_KERNEL_TC32(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0) \

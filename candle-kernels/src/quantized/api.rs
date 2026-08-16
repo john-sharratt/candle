@@ -235,6 +235,10 @@ extern "C" {
         num_tiles: i32,
         qtype: i32,
         ytype: i32,
+        // int8 token-tile width / 16 — 2 (Bm 32), 4 (Bm 64) or 8 (Bm 128).
+        // The tile tables must be built at 16·n_sub; wide modes exist for the
+        // KO rows only (the caller gates on `is_ko`). FP paths ignore it.
+        n_sub: i32,
     );
 
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).

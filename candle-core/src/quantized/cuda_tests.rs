@@ -3717,6 +3717,7 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
         nrows,
         &expert_offsets,
         &dev,
+        Backing::Owned,
     )?;
     let vi = read_f32_tensor(&dev, &int8)?; // [total_batch, nrows] row-major
 
@@ -3745,6 +3746,80 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
         rel < 0.03,
         "Q2_KO int8 grouped diverged (rel_l2 = {rel:.5})"
     );
+    Ok(())
+}
+
+/// The wide-Bm grouped modes (`n_sub` 4 / 8, Bm 64 / 128) are BIT-IDENTICAL to
+/// mode-2: the tile width only regroups which tokens share a block — each output
+/// row's K-loop int32 accumulation order is unchanged, and the loader zero-pads
+/// rows past `b_cnt`, so a partial wide tile computes on zeros and stores
+/// nothing for them. Expert batches straddle every regime: below one sub-tile,
+/// mid-tile partials at each width, and multi-tile (200 rows → 2×128-wide
+/// tiles). Exact f32 equality, not tolerance — the fold multiplies identical
+/// int32 sums by identical scales.
+#[test]
+fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let nrows = 256usize;
+    let ncols = 512usize;
+    let expert_batches = [1usize, 40, 100, 200];
+    let total_batch: usize = expert_batches.iter().sum();
+    let mut rng = rand::rng();
+    let stream = dev.cuda_stream();
+
+    let mut weight_ptrs: Vec<u64> = Vec::new();
+    let mut _storages = Vec::new();
+    for _ in 0..expert_batches.len() {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-0.5f32..0.5))
+            .collect();
+        let ko = crate::quantized::ko_quant::quantize_ko(&w, nrows, ncols, GgmlDType::Q2_KO);
+        let slice = dev.memcpy_stod(&ko)?;
+        let p = {
+            let (p, _g) = slice.device_ptr(&stream);
+            p
+        };
+        weight_ptrs.push(p);
+        _storages.push(slice);
+    }
+
+    let act_data: Vec<f32> = (0..total_batch * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let q8a128 = quantize_acts_q8a128_test(&dev, &act_data, total_batch, ncols)?;
+    let mut expert_offsets: Vec<i32> = vec![0];
+    for &b in &expert_batches {
+        expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
+    }
+
+    let run = |n_sub: usize| -> Result<Vec<f32>> {
+        let out = q8a128.with_device_ptr(&dev, |act_ptr| {
+            crate::quantized::cuda::grouped_matmul_gemx_q8a128_with_mode(
+                act_ptr,
+                &weight_ptrs,
+                GgmlDType::Q2_KO,
+                nrows,
+                ncols,
+                total_batch,
+                &expert_offsets,
+                &dev,
+                Backing::Owned,
+                n_sub,
+            )
+        })?;
+        read_f32_tensor(&dev, &out)
+    };
+    let m2 = run(2)?;
+    for n_sub in [4usize, 8] {
+        let wide = run(n_sub)?;
+        assert_eq!(m2.len(), wide.len());
+        let diff = m2.iter().zip(&wide).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            diff, 0,
+            "n_sub={n_sub} diverged from mode-2 on {diff} of {} outputs",
+            m2.len()
+        );
+    }
     Ok(())
 }
 
@@ -3800,6 +3875,7 @@ fn mxfp4_collapse_cuda_matches_cpu_oracle() -> Result<()> {
         GgmlDType::MXFP4_KO,
         nrows,
         0,
+        crate::DType::F32,
         &dev,
     )?;
     let out_gpu = read_f32_tensor(&dev, &out)?;
@@ -7449,6 +7525,7 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
                     num_tiles,
                     qtype,
                     YType::BF16 as i32,
+                    2, // FP grouped kernels ignore the int8 tile mode
                 );
             }
             Ok(())
@@ -8799,7 +8876,15 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
             _ => unreachable!(),
         };
         let acts = to_dynamic(&act_t, mode, &dev)?;
-        let out = dense_qmatmul(acts.as_dynamic(), wptr, q.dtype(), nrows, wlen, &dev)?;
+        let out = dense_qmatmul(
+            acts.as_dynamic(),
+            wptr,
+            q.dtype(),
+            nrows,
+            wlen,
+            crate::DType::F32,
+            &dev,
+        )?;
         read_f32_tensor(&dev, &out)
     };
 
