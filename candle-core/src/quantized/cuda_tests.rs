@@ -3749,6 +3749,100 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
     Ok(())
 }
 
+/// Single-layer MoE grouped-GEMM replay bench at the DeepSeek-V4-Flash shapes —
+/// the fast iteration loop for routed-GEMM kernel work (256 experts, gate/up
+/// `[2048, 7168]`, down `[7168, 2048]`, MXFP4_KO, top-6 routing). Weight bytes
+/// are random (timing is value-independent); 32 distinct weights per projection
+/// cycle through the expert pointer table so the working set exceeds L2 like
+/// the real 256-expert layer. Two regimes: a cfg8 user-turn wave (~3.9k tokens
+/// × 6 ≈ 23k gathered rows, ~91/expert) and a width-capped cfg20 slice (8192 ×
+/// 6 ≈ 49k rows, ~192/expert). Prints ms/call + effective weight bandwidth per
+/// tile mode. nsys baseline (2026-08-17): m8 ≈ 9.3 ms/call ≈ 15% of DRAM peak —
+/// latency-bound on the depth-1 weight ring.
+#[test]
+#[ignore = "GPU perf bench; run with --ignored --nocapture"]
+fn moe_layer_gemm_bench() -> Result<()> {
+    use std::time::Instant;
+    let dev = CudaDevice::new(0)?;
+    let stream = dev.cuda_stream();
+    let mut rng = rand::rng();
+    let n_experts = 256usize;
+    let n_weights = 32usize;
+    // (label, nrows=N, ncols=K)
+    let shapes = [("gate/up", 2048usize, 7168usize), ("down", 7168, 2048)];
+    let regimes = [("cfg8", 3900usize * 6), ("cfg20", 8192 * 6)];
+
+    for &(label, nrows, ncols) in &shapes {
+        // Random-byte KO weights: [K/128 chunks] × [N/8 row-groups] × 544B.
+        let wbytes = (ncols / 128) * (nrows / 8) * crate::quantized::ko_quant::MXFP4_KO_CHUNK_BYTES;
+        let mut ptrs_pool: Vec<u64> = Vec::new();
+        let mut _keep = Vec::new();
+        for _ in 0..n_weights {
+            let bytes: Vec<u8> = (0..wbytes).map(|_| rng.random::<u8>()).collect();
+            let slice = dev.memcpy_stod(&bytes)?;
+            let p = {
+                let (p, _g) = slice.device_ptr(&stream);
+                p
+            };
+            ptrs_pool.push(p);
+            _keep.push(slice);
+        }
+        let weight_ptrs: Vec<u64> = (0..n_experts).map(|e| ptrs_pool[e % n_weights]).collect();
+
+        for &(regime, total_batch) in &regimes {
+            let per = total_batch / n_experts;
+            let mut expert_offsets: Vec<i32> = vec![0];
+            for e in 0..n_experts {
+                let extra = usize::from(e < total_batch % n_experts);
+                expert_offsets.push(expert_offsets.last().unwrap() + (per + extra) as i32);
+            }
+            let act: Vec<f32> = (0..total_batch * ncols)
+                .map(|_| rng.random_range(-1.0f32..1.0))
+                .collect();
+            let q8 = quantize_acts_q8a128_test(&dev, &act, total_batch, ncols)?;
+
+            for n_sub in [2usize, 4, 8] {
+                let run = || -> Result<()> {
+                    q8.with_device_ptr(&dev, |act_ptr| {
+                        crate::quantized::cuda::grouped_matmul_gemx_q8a128_with_mode(
+                            act_ptr,
+                            &weight_ptrs,
+                            GgmlDType::MXFP4_KO,
+                            nrows,
+                            ncols,
+                            total_batch,
+                            &expert_offsets,
+                            &dev,
+                            Backing::Owned,
+                            n_sub,
+                        )
+                    })?;
+                    Ok(())
+                };
+                for _ in 0..3 {
+                    run()?;
+                }
+                dev.synchronize()?;
+                let iters = 20;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    run()?;
+                }
+                dev.synchronize()?;
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                // Minimum weight traffic: each expert's full matrix once.
+                let min_w_gb = (n_experts * wbytes) as f64 / 1e9;
+                println!(
+                    "{label:>7} {regime}: n_sub={n_sub}  {ms:8.3} ms/call  \
+                     min-weight-BW {:6.1} GB/s  ({total_batch} rows, ~{per}/expert)",
+                    min_w_gb / (ms / 1e3),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The wide-Bm grouped modes (`n_sub` 4 / 8, Bm 64 / 128) are BIT-IDENTICAL to
 /// mode-2: the tile width only regroups which tokens share a block — each output
 /// row's K-loop int32 accumulation order is unchanged, and the loader zero-pads
