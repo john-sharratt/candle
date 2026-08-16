@@ -401,8 +401,8 @@ pub enum PrefillSel {
 /// prompt sequence's rows ([`kernel_attn_prefill_project_batched`]). Every
 /// projection is row-independent, so this is bit-identical to projecting each
 /// sequence separately — the same batching decode's `dprep` already does — but
-/// one GEMM/quantize instead of one per sequence. [`kernel_attn_prefill_assemble`]
-/// slices each sequence's rows back out.
+/// one GEMM/quantize instead of one per sequence. The wave's fleet-batched
+/// assemble (`assemble_groups_batched`) slices each sequence's rows back out.
 pub struct PrefillProj {
     /// Pre-RoPE bf16 query `[total, n_heads, HEAD_DIM]`.
     pub q_bf: Tensor,
@@ -418,8 +418,8 @@ pub struct PrefillProj {
     pub icomp_proj: Option<(Tensor, Tensor)>,
 }
 
-/// The projected + assembled state for ONE prefill sequence
-/// ([`kernel_attn_prefill_assemble`]), consumed by the wave's batched pool +
+/// The projected + assembled state for ONE prefill sequence (built by the
+/// wave from the fleet-batched assemble), consumed by the wave's batched pool +
 /// [`kernel_attn_prefill_select`]. `kv_bf`/`qr_all`/`xs` are slices (views)
 /// of the batched [`PrefillProj`]. (The query goes to the batched kernel straight
 /// from `PrefillProj.q_bf`, so no per-seq query slice is kept here.)
@@ -448,8 +448,8 @@ pub struct PrefillPrep {
 /// the attention query+latent and one `project_rows` for each streaming
 /// compressor, instead of one set per sequence. Uses the layer's shared compressor
 /// weights (`a.compressor()`/`a.indexer().compressor()`); the per-sequence
-/// streaming STATE lives in [`kernel_attn_prefill_assemble`]. Row-independent ⇒
-/// bit-identical to the former per-seq projection.
+/// streaming STATE advances in the wave's fleet-batched assemble.
+/// Row-independent ⇒ bit-identical to the former per-seq projection.
 pub fn kernel_attn_prefill_project_batched(a: &Attention, xs: &Tensor) -> Result<PrefillProj> {
     let (h, hd) = (a.n_heads(), a.head_dim());
     let s = xs.dim(1)?;
@@ -480,85 +480,6 @@ pub fn kernel_attn_prefill_project_batched(a: &Attention, xs: &Tensor) -> Result
         xs,
         comp_proj,
         icomp_proj,
-    })
-}
-
-/// Slice ONE sequence's rows `[off, off+s)` out of the batched [`PrefillProj`] and
-/// run its stateful compressor ASSEMBLE (state advance + deferred group pool),
-/// WITHOUT pooling — the wave pools every sequence together in one launch
-/// ([`Compressor::pool_and_norm`]) before appending + selecting per sequence.
-/// `comp`/`icomp` share group boundaries, so both assemble in lockstep; the state
-/// advances every call (partial rows buffered) even when no group completes.
-/// Bit-identical corpus to the streamed per-token push
-/// (`emit_groups_batched_matches_streamed`).
-pub fn kernel_attn_prefill_assemble(
-    seq: &mut KernelLayerSeqState,
-    proj: &PrefillProj,
-    off: usize,
-    s: usize,
-) -> Result<PrefillPrep> {
-    // This sequence's rows (views of the batched projections). The query is not
-    // sliced — the batched kernel consumes `PrefillProj.q_bf` whole.
-    let kv_bf = proj.kv_bf.narrow(0, off, s)?;
-    let qr_all = proj.qr_all.narrow(1, off, s)?;
-    let xs = proj.xs.narrow(1, off, s)?;
-    let comp_slice = match &proj.comp_proj {
-        Some((k, sc)) => Some((k.narrow(0, off, s)?, sc.narrow(0, off, s)?)),
-        None => None,
-    };
-    let icomp_slice = match &proj.icomp_proj {
-        Some((k, sc)) => Some((k.narrow(0, off, s)?, sc.narrow(0, off, s)?)),
-        None => None,
-    };
-
-    let t_asm = profile_now();
-    let ratio_comp = seq.comp.as_ref().map_or(1, |c| c.ratio());
-    let l0 = seq.comp.as_ref().map_or(0, |c| c.buffered_len()); // carried partial group
-    let il0 = seq.icomp.as_ref().map_or(0, |c| c.buffered_len());
-    let iratio = seq.icomp.as_ref().map_or(1, |c| c.ratio());
-    let base_entries = seq.gallery.as_ref().map_or(0, |g| g.len()); // corpus before this prefill
-    let comp_gp = match (seq.comp.as_mut(), comp_slice.as_ref()) {
-        (Some(comp), Some((ck, cs))) => comp.assemble_groups(ck, cs)?,
-        _ => None,
-    };
-    let icomp_gp = match (seq.icomp.as_mut(), icomp_slice.as_ref()) {
-        (Some(ic), Some((ik, is))) => ic.assemble_groups(ik, is)?,
-        _ => None,
-    };
-    // The shared-boundary contract binds comp and icomp ONLY where both exist
-    // (CSA layers, where the indexer keys must group exactly like the attention
-    // entries). An HCA layer has a compressor but NO indexer — its gallery
-    // appends with a 1-wide placeholder key — so `icomp_gp` is always `None`
-    // there and comparing it against a completed comp group is a false alarm
-    // (first observed when a spec-decode run crossed the HCA ratio of 128
-    // generated tokens and completed the layer's first mid-decode group).
-    debug_assert!(
-        seq.icomp.is_none()
-            || comp_gp.as_ref().map(|g| &g.positions) == icomp_gp.as_ref().map(|g| &g.positions),
-        "comp/icomp group boundaries diverged (s={s}, comp l0={l0} r={ratio_comp}, \
-         icomp l0={il0} r={iratio}): {:?} vs {:?}",
-        comp_gp.as_ref().map(|g| &g.positions),
-        icomp_gp.as_ref().map(|g| &g.positions),
-    );
-    let g_total = comp_gp.as_ref().map_or(0, |g| g.positions.len());
-    pipeline_record("pprep:assemble", t_asm);
-
-    // Each token sees the entries present before this prefill plus the groups
-    // completed through it (`(l0 + t + 1) / ratio`); bounding the select to that
-    // prefix reproduces the per-token incremental gallery exactly.
-    let n_visible: Vec<usize> = (0..s)
-        .map(|t| base_entries + ((l0 + t + 1) / ratio_comp).min(g_total))
-        .collect();
-
-    Ok(PrefillPrep {
-        kv_bf,
-        qr_all,
-        xs,
-        comp_gp,
-        icomp_gp,
-        n_visible,
-        base_entries,
-        g_total,
     })
 }
 
@@ -598,8 +519,8 @@ pub fn kernel_attn_prefill_select(
                 // kept FULLY ON-DEVICE (bit-identical selection to the
                 // per-token loop by `batched_causal_select_matches_per_token`).
                 let t_q = profile_now();
-                let (q_raw, weights) = q_batched
-                    .expect("in-regime CSA prefill select needs the batched query rows");
+                let (q_raw, weights) =
+                    q_batched.expect("in-regime CSA prefill select needs the batched query rows");
                 let q_idx = ix.rope_query_batched(&q_raw, rope, base)?; // [s,h,ih]
                 pipeline_record("psel:query", t_q);
                 let gallery = gallery.expect("CSA layer has a gallery");

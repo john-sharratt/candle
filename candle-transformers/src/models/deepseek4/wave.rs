@@ -27,14 +27,14 @@ use super::engine::Dsv4Engine;
 use super::gallery::{gather_corpus_batched, two_stage_select_batched, FloatGallery};
 use super::kernel_attention::{
     kernel_attn_decode_capture, shortlist_m, DecodeSel, KernelLayerSeqState, KernelLayerStatic,
-    PrefillSel,
+    PrefillPrep, PrefillSel,
 };
 use super::linear::shared_int8_pair;
 use super::paged::{HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
 use crate::models::expert_lre::PipelineStats;
 use crate::models::profile::{pipeline_record, profile_now, ProfileSnapshot};
 
-use super::compressor::{Compressor, GroupPool};
+use super::compressor::{assemble_groups_batched, Compressor, GroupPool, SeqAssemble};
 use super::rope::RotaryCache;
 
 /// Pool EVERY prefill sequence's deferred compressor groups in ONE launch across
@@ -1735,25 +1735,127 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 let xs_all = x.narrow(1, decode_seqs.len(), prefill_total)?;
                 Some(super::kernel_attention::kernel_attn_prefill_project_batched(a, &xs_all)?)
             };
-            // ── Prefill pass 1: per seq, slice the batched projections + run the
-            // stateful compressor ASSEMBLE (state advance + deferred pool inputs).
-            let mut preps: Vec<super::kernel_attention::PrefillPrep> =
-                Vec::with_capacity(prefill_seqs.len());
-            {
-                let proj = proj.as_ref();
+            // ── Prefill pass 1: the compressor ASSEMBLE (state advance +
+            // deferred pool inputs), FLEET-BATCHED. Three phases: (1) per-seq
+            // state snapshots (Arc clones, no device work); (2) ONE batched
+            // assemble per compressor family — ~a dozen device ops for the
+            // whole fleet where the per-seq loop issued ~15 PER SEQUENCE
+            // (measured at width 20: 15.7s of a 29.8s prefill wall, every
+            // enqueue stalling under WDDM submission pressure); (3) per-seq
+            // state install + PrefillPrep assembly (host math + free views).
+            let mut preps: Vec<PrefillPrep> = Vec::with_capacity(prefill_seqs.len());
+            if !prefill_seqs.is_empty() {
+                let p = proj.as_ref().expect("prefill rows imply a projection");
+                let t_asm = profile_now();
+                // Phase 1 — collect. Compressor presence is LAYER-uniform
+                // (every seq's layer state is built from the same layer kind),
+                // so the fleet either all contribute or none do.
+                let mut comp_ins: Vec<SeqAssemble> = Vec::with_capacity(prefill_seqs.len());
+                let mut icomp_ins: Vec<SeqAssemble> = Vec::with_capacity(prefill_seqs.len());
+                let mut l0s: Vec<usize> = Vec::with_capacity(prefill_seqs.len());
+                let mut bases: Vec<usize> = Vec::with_capacity(prefill_seqs.len());
+                let mut ratio_comp = 1usize;
+                let mut off = 0usize;
+                for (pi, &seq) in prefill_seqs.iter().enumerate() {
+                    let s_len = prefill_lens[pi];
+                    let ls = &state.get(&seq).expect("ensured above").layers[l];
+                    if let (Some(c), Some((k, sc))) = (&ls.comp, &p.comp_proj) {
+                        comp_ins.push(c.assemble_input(
+                            &k.narrow(0, off, s_len)?,
+                            &sc.narrow(0, off, s_len)?,
+                        )?);
+                        ratio_comp = c.ratio();
+                    }
+                    if let (Some(ic), Some((k, sc))) = (&ls.icomp, &p.icomp_proj) {
+                        icomp_ins.push(ic.assemble_input(
+                            &k.narrow(0, off, s_len)?,
+                            &sc.narrow(0, off, s_len)?,
+                        )?);
+                    }
+                    l0s.push(ls.comp.as_ref().map_or(0, |c| c.buffered_len()));
+                    bases.push(ls.gallery.as_ref().map_or(0, |g| g.len()));
+                    off += s_len;
+                }
+                // Phase 2 — fleet-wide assemble per compressor family.
+                let comp_outs = if comp_ins.len() == prefill_seqs.len() {
+                    let template = state.get(&prefill_seqs[0]).expect("ensured above").layers[l]
+                        .comp
+                        .as_ref()
+                        .expect("phase 1 collected a comp input for every seq");
+                    Some(assemble_groups_batched(template, &comp_ins)?)
+                } else {
+                    None
+                };
+                let icomp_outs = if icomp_ins.len() == prefill_seqs.len() {
+                    let template = state.get(&prefill_seqs[0]).expect("ensured above").layers[l]
+                        .icomp
+                        .as_ref()
+                        .expect("phase 1 collected an icomp input for every seq");
+                    Some(assemble_groups_batched(template, &icomp_ins)?)
+                } else {
+                    None
+                };
+                // Phase 3 — install state + build each seq's PrefillPrep.
+                let mut comp_outs = comp_outs.map(|v| v.into_iter());
+                let mut icomp_outs = icomp_outs.map(|v| v.into_iter());
                 let mut off = 0usize;
                 for (pi, &seq) in prefill_seqs.iter().enumerate() {
                     let s_len = prefill_lens[pi];
                     let e = state.get_mut(&seq).expect("ensured above");
-                    let p = proj.expect("prefill rows imply a projection");
-                    preps.push(super::kernel_attention::kernel_attn_prefill_assemble(
-                        &mut e.layers[l],
-                        p,
-                        off,
-                        s_len,
-                    )?);
+                    let ls = &mut e.layers[l];
+                    let comp_gp = match comp_outs.as_mut().map(|it| it.next()) {
+                        Some(Some((gp, upd))) => {
+                            ls.comp
+                                .as_mut()
+                                .expect("comp outputs imply a compressor")
+                                .assemble_apply(upd);
+                            gp
+                        }
+                        _ => None,
+                    };
+                    let icomp_gp = match icomp_outs.as_mut().map(|it| it.next()) {
+                        Some(Some((gp, upd))) => {
+                            ls.icomp
+                                .as_mut()
+                                .expect("icomp outputs imply an indexer compressor")
+                                .assemble_apply(upd);
+                            gp
+                        }
+                        _ => None,
+                    };
+                    // The shared-boundary contract binds comp and icomp ONLY
+                    // where both exist (CSA layers): an HCA layer has a
+                    // compressor but no indexer, so its icomp side is always
+                    // absent and only the comp pool exists.
+                    debug_assert!(
+                        ls.icomp.is_none()
+                            || comp_gp.as_ref().map(|g| &g.positions)
+                                == icomp_gp.as_ref().map(|g| &g.positions),
+                        "comp/icomp group boundaries diverged (seq {seq}): {:?} vs {:?}",
+                        comp_gp.as_ref().map(|g| &g.positions),
+                        icomp_gp.as_ref().map(|g| &g.positions),
+                    );
+                    let g_total = comp_gp.as_ref().map_or(0, |g| g.positions.len());
+                    // Each token sees the entries present before this prefill
+                    // plus the groups completed through it; bounding the select
+                    // to that prefix reproduces the per-token incremental
+                    // gallery exactly.
+                    let n_visible: Vec<usize> = (0..s_len)
+                        .map(|t| bases[pi] + ((l0s[pi] + t + 1) / ratio_comp).min(g_total))
+                        .collect();
+                    preps.push(PrefillPrep {
+                        kv_bf: p.kv_bf.narrow(0, off, s_len)?,
+                        qr_all: p.qr_all.narrow(1, off, s_len)?,
+                        xs: p.xs.narrow(1, off, s_len)?,
+                        comp_gp,
+                        icomp_gp,
+                        n_visible,
+                        base_entries: bases[pi],
+                        g_total,
+                    });
                     off += s_len;
                 }
+                pipeline_record("pprep:assemble", t_asm);
             }
             pipeline_record("prefill:prep", t_pprep);
 

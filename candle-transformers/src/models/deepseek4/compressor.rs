@@ -481,6 +481,42 @@ impl IncrementalCompressor {
         self.c.ratio
     }
 
+    /// Snapshot this sequence's streaming state + its new rows as one
+    /// [`SeqAssemble`] for [`assemble_groups_batched`]. Pure `Arc` clones —
+    /// no device work. `kv`/`score` are this sequence's `[n, cd]` slices of
+    /// the wave-batched projection.
+    pub fn assemble_input(&self, kv: &Tensor, score: &Tensor) -> Result<SeqAssemble> {
+        let n = kv.dim(0)?;
+        let mut kv_pieces: Vec<Tensor> = Vec::with_capacity(self.kv_rows.len() + 1);
+        let mut sc_pieces: Vec<Tensor> = Vec::with_capacity(self.score_rows.len() + 1);
+        kv_pieces.extend(self.kv_rows.iter().cloned());
+        sc_pieces.extend(self.score_rows.iter().cloned());
+        kv_pieces.push(kv.clone());
+        sc_pieces.push(score.clone());
+        Ok(SeqAssemble {
+            kv_pieces,
+            sc_pieces,
+            l0: self.kv_rows.len(),
+            n,
+            prev_kv: self.prev_kv_group.clone(),
+            prev_sc: self.prev_score_group.clone(),
+            group_idx: self.group_idx,
+        })
+    }
+
+    /// Install the state advance [`assemble_groups_batched`] computed for this
+    /// sequence — the batched twin of the state writes at the end of
+    /// [`Self::assemble_groups`].
+    pub fn assemble_apply(&mut self, upd: AssembleUpdate) {
+        self.kv_rows = upd.kv_rows;
+        self.score_rows = upd.score_rows;
+        if let (Some(pk), Some(ps)) = (upd.prev_kv, upd.prev_sc) {
+            self.prev_kv_group = Some(pk);
+            self.prev_score_group = Some(ps);
+        }
+        self.group_idx += upd.group_add;
+    }
+
     /// Batched, carried-state-aware group emission: consume `n` pre-projected
     /// rows (`kv`/`score` each `[n, cd]`, from [`Compressor::project_rows`]) and
     /// emit EVERY complete group they form in one batched pool — bit-identical to
@@ -784,6 +820,257 @@ impl IncrementalCompressor {
         let w = self.c.norm_w.to_dtype(DType::F32)?;
         candle_nn::ops::rms_norm(&x, &w, self.c.eps as f32)
     }
+}
+
+/// One sequence's input to [`assemble_groups_batched`]: its carried
+/// partial-group rows + its new projected rows (all `Arc` clones), and the
+/// scalar state the group math needs. Built by
+/// [`IncrementalCompressor::assemble_input`].
+pub struct SeqAssemble {
+    kv_pieces: Vec<Tensor>,
+    sc_pieces: Vec<Tensor>,
+    l0: usize,
+    n: usize,
+    prev_kv: Option<Tensor>,
+    prev_sc: Option<Tensor>,
+    group_idx: usize,
+}
+
+/// One sequence's state advance out of [`assemble_groups_batched`], installed
+/// by [`IncrementalCompressor::assemble_apply`]. `prev_*` are `None` when the
+/// sequence completed no group (the carried prev is kept).
+pub struct AssembleUpdate {
+    kv_rows: Vec<Tensor>,
+    score_rows: Vec<Tensor>,
+    prev_kv: Option<Tensor>,
+    prev_sc: Option<Tensor>,
+    group_add: usize,
+}
+
+/// The whole prompt fleet's compressor ASSEMBLE in ~a dozen device ops —
+/// bit-identical per sequence to [`IncrementalCompressor::assemble_groups`]
+/// called per seq, whose ~15 small launches × N sequences were HALF the
+/// cfg20 prefill wall (15.7s of 29.8s — every enqueue in the per-seq loop
+/// stalls under WDDM submission pressure, and the loop multiplies the stall
+/// points by the fleet width).
+///
+/// Construction: one `cat` builds every sequence's `[carried ++ new]`
+/// combined stream back-to-back; `index_select`s then pull the group rows,
+/// the overlap-prev rows, the retained last-group rows and the remainder
+/// tails for ALL sequences at once (pure row copies — byte-identical to the
+/// per-seq narrows they replace); the one `broadcast_add(ape)` is
+/// row-elementwise. The returned per-seq [`GroupPool`]s are dim-0 NARROW
+/// VIEWS of one fleet-wide pool tensor, in sequence order — exactly the
+/// concatenation `pool_prefill_across_seqs` builds from per-seq pools, so
+/// everything downstream is unchanged.
+///
+/// `template` supplies the layer-shared [`Compressor`] (weights/ape/ratio —
+/// identical across the fleet's per-seq states by construction).
+pub fn assemble_groups_batched(
+    template: &IncrementalCompressor,
+    inputs: &[SeqAssemble],
+) -> Result<Vec<(Option<GroupPool>, AssembleUpdate)>> {
+    let c = &template.c;
+    let r = c.ratio;
+    let cd = c.cd();
+    let d = c.head_dim;
+    let dev = c.device().clone();
+    let n_seq = inputs.len();
+
+    // Per-seq geometry over the concatenated combined stream.
+    let mut c_off = Vec::with_capacity(n_seq); // seq's start row in `comb`
+    let mut groups = Vec::with_capacity(n_seq);
+    let mut cutoff = Vec::with_capacity(n_seq);
+    let mut n_tot = Vec::with_capacity(n_seq);
+    let mut g_off = Vec::with_capacity(n_seq); // seq's start group in the pool
+    let mut off = 0usize;
+    let mut goff = 0usize;
+    for inp in inputs {
+        let nt = inp.l0 + inp.n;
+        let g = nt / r;
+        c_off.push(off);
+        n_tot.push(nt);
+        groups.push(g);
+        cutoff.push(g * r);
+        g_off.push(goff);
+        off += nt;
+        goff += g;
+    }
+    let total_rows = off;
+    let total_groups = goff;
+
+    // 1. Combined stream: every seq's [carried ++ new], back-to-back.
+    let pieces_kv: Vec<&Tensor> = inputs.iter().flat_map(|i| i.kv_pieces.iter()).collect();
+    let pieces_sc: Vec<&Tensor> = inputs.iter().flat_map(|i| i.sc_pieces.iter()).collect();
+    let comb_kv = Tensor::cat(&pieces_kv, 0)?; // [total_rows, cd] owned
+    let comb_sc = Tensor::cat(&pieces_sc, 0)?;
+    debug_assert_eq!(comb_kv.dim(0)?, total_rows);
+
+    // Remainder tails for ALL seqs (also the whole-stream buffer when a seq
+    // completes no group): one select, per-seq row views into it.
+    let mut tail_idx: Vec<u32> = Vec::with_capacity(total_rows - total_groups * r);
+    let mut tail_off = Vec::with_capacity(n_seq);
+    for i in 0..n_seq {
+        tail_off.push(tail_idx.len());
+        for t in cutoff[i]..n_tot[i] {
+            tail_idx.push((c_off[i] + t) as u32);
+        }
+    }
+    let (kv_tails, sc_tails) = if tail_idx.is_empty() {
+        (None, None)
+    } else {
+        let n_tail = tail_idx.len();
+        let it = Tensor::from_vec(tail_idx, n_tail, &dev)?;
+        (
+            Some(comb_kv.index_select(&it, 0)?),
+            Some(comb_sc.index_select(&it, 0)?),
+        )
+    };
+    let tail_views = |src: &Option<Tensor>, i: usize| -> Result<Vec<Tensor>> {
+        let rem = n_tot[i] - cutoff[i];
+        let src = match src {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        (0..rem)
+            .map(|t| src.narrow(0, tail_off[i] + t, 1))
+            .collect()
+    };
+
+    if total_groups == 0 {
+        // No sequence completes a group: everyone buffers its combined rows.
+        let mut out = Vec::with_capacity(n_seq);
+        for i in 0..n_seq {
+            out.push((
+                None,
+                AssembleUpdate {
+                    kv_rows: tail_views(&kv_tails, i)?,
+                    score_rows: tail_views(&sc_tails, i)?,
+                    prev_kv: None,
+                    prev_sc: None,
+                    group_add: 0,
+                },
+            ));
+        }
+        return Ok(out);
+    }
+
+    // 2. Group rows for the whole fleet: [total_groups, r, cd], `ape` added to
+    // the scores before the overlap split (matches `assemble_groups`).
+    let mut grp_idx: Vec<u32> = Vec::with_capacity(total_groups * r);
+    for i in 0..n_seq {
+        for t in 0..cutoff[i] {
+            grp_idx.push((c_off[i] + t) as u32);
+        }
+    }
+    let gi_t = Tensor::from_vec(grp_idx, total_groups * r, &dev)?;
+    let kv_g = comb_kv
+        .index_select(&gi_t, 0)?
+        .reshape((total_groups, r, cd))?;
+    let ape = c.ape.to_dtype(DType::F32)?.reshape((1, r, cd))?;
+    let sc_g = comb_sc
+        .index_select(&gi_t, 0)?
+        .reshape((total_groups, r, cd))?
+        .broadcast_add(&ape)?;
+
+    // 3. Fleet-wide pool.
+    let (pool_kv_all, pool_sc_all) = if c.overlap {
+        // Prev source pool along dim 0: [pad | each seq's carried prev | kv_g].
+        // Group j>0 of a seq takes its group j−1's rows; group 0 takes the
+        // seq's carried prev, or the pad (kv 0 / score −inf) when it has none —
+        // the batch-wise form of `assemble_groups`' prev shift. Full-cd rows
+        // are selected and the halves split after (same bytes, one select).
+        let pad_kv = Tensor::zeros((1, r, cd), DType::F32, &dev)?;
+        let pad_sc = Tensor::full(f32::NEG_INFINITY, (1, r, cd), &dev)?;
+        let mut src_kv: Vec<Tensor> = vec![pad_kv];
+        let mut src_sc: Vec<Tensor> = vec![pad_sc];
+        let mut prev_slot = vec![0u32; n_seq]; // 0 = the pad
+        for (i, inp) in inputs.iter().enumerate() {
+            if let (Some(pk), Some(ps)) = (&inp.prev_kv, &inp.prev_sc) {
+                prev_slot[i] = src_kv.len() as u32;
+                src_kv.push(pk.reshape((1, r, cd))?);
+                src_sc.push(ps.reshape((1, r, cd))?);
+            }
+        }
+        let base = src_kv.len() as u32; // kv_g's group 0 lands here
+        let src_kv_refs: Vec<&Tensor> = src_kv.iter().chain(std::iter::once(&kv_g)).collect();
+        let src_sc_refs: Vec<&Tensor> = src_sc.iter().chain(std::iter::once(&sc_g)).collect();
+        let prev_src_kv = Tensor::cat(&src_kv_refs, 0)?;
+        let prev_src_sc = Tensor::cat(&src_sc_refs, 0)?;
+        let mut pidx: Vec<u32> = Vec::with_capacity(total_groups);
+        for i in 0..n_seq {
+            for j in 0..groups[i] {
+                pidx.push(if j == 0 {
+                    prev_slot[i]
+                } else {
+                    base + (g_off[i] + j - 1) as u32
+                });
+            }
+        }
+        let pi_t = Tensor::from_vec(pidx, total_groups, &dev)?;
+        let prev_kv = prev_src_kv
+            .index_select(&pi_t, 0)?
+            .narrow(D::Minus1, 0, d)?;
+        let prev_sc = prev_src_sc
+            .index_select(&pi_t, 0)?
+            .narrow(D::Minus1, 0, d)?;
+        let curr_kv = kv_g.narrow(D::Minus1, d, d)?;
+        let curr_sc = sc_g.narrow(D::Minus1, d, d)?;
+        (
+            Tensor::cat(&[&prev_kv, &curr_kv], 1)?, // [total_groups, 2r, d]
+            Tensor::cat(&[&prev_sc, &curr_sc], 1)?,
+        )
+    } else {
+        (kv_g.clone(), sc_g.clone())
+    };
+
+    // 4. Retained last-group rows (the next call's overlap prev) for every
+    // seq that completed a group: one select, per-seq views.
+    let active: Vec<usize> = (0..n_seq).filter(|&i| groups[i] > 0).collect();
+    let last_idx: Vec<u32> = active
+        .iter()
+        .map(|&i| (g_off[i] + groups[i] - 1) as u32)
+        .collect();
+    let li_t = Tensor::from_vec(last_idx, active.len(), &dev)?;
+    let last_kv = kv_g.index_select(&li_t, 0)?; // [n_active, r, cd]
+    let last_sc = sc_g.index_select(&li_t, 0)?;
+
+    // 5. Per-seq outputs: pool views + state advance.
+    let mut out = Vec::with_capacity(n_seq);
+    let mut a_slot = 0usize;
+    for i in 0..n_seq {
+        let gp = if groups[i] > 0 {
+            let positions: Vec<u32> = (0..groups[i])
+                .map(|j| ((inputs[i].group_idx + j) * r) as u32)
+                .collect();
+            Some(GroupPool {
+                pool_kv: pool_kv_all.narrow(0, g_off[i], groups[i])?,
+                pool_score: pool_sc_all.narrow(0, g_off[i], groups[i])?,
+                positions,
+            })
+        } else {
+            None
+        };
+        let (prev_kv, prev_sc) = if groups[i] > 0 {
+            let pk = last_kv.narrow(0, a_slot, 1)?.reshape((r, cd))?;
+            let ps = last_sc.narrow(0, a_slot, 1)?.reshape((r, cd))?;
+            a_slot += 1;
+            (Some(pk), Some(ps))
+        } else {
+            (None, None)
+        };
+        out.push((
+            gp,
+            AssembleUpdate {
+                kv_rows: tail_views(&kv_tails, i)?,
+                score_rows: tail_views(&sc_tails, i)?,
+                prev_kv,
+                prev_sc,
+                group_add: groups[i],
+            },
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1121,6 +1408,110 @@ mod tests {
         // Non-overlapping (ratio 3).
         emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 13)?;
         emit_groups_batched_matches_streamed_case(3, 5, 2, 13, 5)?;
+        Ok(())
+    }
+
+    /// [`assemble_groups_batched`] over a staggered fleet is byte-identical,
+    /// per sequence, to [`IncrementalCompressor::assemble_groups`] called per
+    /// seq — pools, positions, AND the retained state (proven behaviorally: a
+    /// second per-seq round through both paths must also match, so the carried
+    /// buffer / overlap prev / group counter advanced identically).
+    fn assemble_batched_matches_per_seq_case(ratio: usize, d: usize) -> Result<()> {
+        let dev = Device::Cpu;
+        let dim = 8usize;
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let c = Compressor::new(
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (coff * d, dim), &dev)?,
+            Tensor::randn(0f32, 1.0, (ratio, coff * d), &dev)?,
+            Tensor::randn(0f32, 1.0, d, &dev)?,
+            ratio,
+            d,
+            2,
+            1e-6,
+        );
+        // Staggered carried state per seq: 0 rows (fresh), a partial group, and
+        // past a completed group (carried prev + partial buffer).
+        let seeds = [0usize, ratio - 1, ratio + 2];
+        // Round-1 row counts: complete ≥1 group, complete none, land mid-group.
+        let lens1 = [2 * ratio + 1, 1, ratio];
+        let lens2 = [ratio, 2 * ratio - 1, ratio + 1];
+
+        let mut inc_a: Vec<IncrementalCompressor> = Vec::new(); // per-seq path
+        let mut inc_b: Vec<IncrementalCompressor> = Vec::new(); // batched path
+        for &p in &seeds {
+            let mut i = c.incremental();
+            if p > 0 {
+                let x = Tensor::randn(0f32, 1.0, (p, dim), &dev)?;
+                let (kv, sc) = c.project_rows(&x)?;
+                i.emit_groups_projected(&kv, &sc, None)?;
+            }
+            inc_b.push(c.incremental());
+            inc_b.last_mut().unwrap().state_restore(i.state_snapshot());
+            inc_a.push(i);
+        }
+
+        let assert_pools = |a: &Option<GroupPool>, b: &Option<GroupPool>, tag: &str| match (a, b) {
+            (None, None) => {}
+            (Some(ga), Some(gb)) => {
+                assert_eq!(ga.positions, gb.positions, "{tag}: positions");
+                let ka = ga.pool_kv.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let kb = gb.pool_kv.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert_eq!(ka, kb, "{tag}: pool_kv bytes");
+                let sa = ga
+                    .pool_score
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let sb = gb
+                    .pool_score
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                assert_eq!(sa, sb, "{tag}: pool_score bytes");
+            }
+            _ => panic!("{tag}: one path emitted a pool, the other did not"),
+        };
+
+        for (round, lens) in [(1, &lens1), (2, &lens2)] {
+            let rows: Vec<(Tensor, Tensor)> = lens
+                .iter()
+                .map(|&n| {
+                    let x = Tensor::randn(0f32, 1.0, (n, dim), &dev)?;
+                    c.project_rows(&x)
+                })
+                .collect::<Result<_>>()?;
+            // Per-seq reference.
+            let gps_a: Vec<Option<GroupPool>> = inc_a
+                .iter_mut()
+                .zip(&rows)
+                .map(|(i, (kv, sc))| i.assemble_groups(kv, sc))
+                .collect::<Result<_>>()?;
+            // Batched.
+            let inputs: Vec<SeqAssemble> = inc_b
+                .iter()
+                .zip(&rows)
+                .map(|(i, (kv, sc))| i.assemble_input(kv, sc))
+                .collect::<Result<_>>()?;
+            let outs = assemble_groups_batched(&inc_b[0], &inputs)?;
+            for (i, (gp_b, upd)) in outs.into_iter().enumerate() {
+                assert_pools(
+                    &gps_a[i],
+                    &gp_b,
+                    &format!("ratio={ratio} round={round} seq={i}"),
+                );
+                inc_b[i].assemble_apply(upd);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_batched_matches_per_seq() -> Result<()> {
+        assemble_batched_matches_per_seq_case(4, 6)?; // overlapping
+        assemble_batched_matches_per_seq_case(3, 5)?; // non-overlapping
         Ok(())
     }
 
