@@ -108,18 +108,23 @@ struct SeqEntry {
 }
 
 /// One layer's slice of a [`VerifySnapshot`]: the pre-verify compressor states +
-/// gallery length, plus the verify block's projected compressor rows (stashed by
-/// `forward_wave` during the verify pass — the replay source for the accepted
-/// prefix).
+/// gallery length, plus the per-ROW-boundary states stashed by `forward_wave`
+/// during the verify pass. Rollback after a partial accept just INSTALLS the
+/// state at the accepted boundary — the wave's own per-row streaming capture
+/// already produced exactly the state a plain decode of the accepted prefix
+/// would have (that is the decode-shaped verify's construction), so no replay
+/// (and none of its per-layer kernel launches) is needed.
 struct LayerVerifySnap {
     comp: Option<super::compressor::CompressorState>,
     icomp: Option<super::compressor::CompressorState>,
     gallery_len: usize,
-    /// `(kv, score)` each `[s, cd]` — the block's rows through this layer's
-    /// attention compressor projection.
-    comp_rows: Option<(Tensor, Tensor)>,
-    /// Same for the indexer compressor (CSA layers).
-    icomp_rows: Option<(Tensor, Tensor)>,
+    /// `(comp, icomp, gallery_len)` AFTER absorbing block row `k`, for each of
+    /// the block's rows in order. `Arc`-clone cheap.
+    row_states: Vec<(
+        Option<super::compressor::CompressorState>,
+        Option<super::compressor::CompressorState>,
+        usize,
+    )>,
 }
 
 /// Rolling speculative-acceptance state for one sequence — the driver-level
@@ -164,9 +169,9 @@ const SPEC_MIN_ACCEPT: f32 = 2.3;
 const SPEC_PROBE_INTERVAL: u32 = 32;
 
 /// Pre-verify snapshot of one sequence's streaming corpus state, taken by
-/// `verify_block` before its prefill forward. On a partial accept the driver's
-/// `truncate_sequence` restores it and replays exactly the accepted prefix's
-/// rows, so the compressors/galleries never retain rejected draft tokens —
+/// `verify_blocks` before its decode-row forward. On a partial accept the
+/// driver's `truncate_sequence` installs the stashed state at the accepted row
+/// boundary, so the compressors/galleries never retain rejected draft tokens —
 /// without this, a rejected tail stays absorbed (wrong rows in the partial-group
 /// buffer, a group pooled over draft tokens in the gallery, `group_idx` advanced)
 /// and the re-decoded positions get absorbed AGAIN as duplicate, shifted groups:
@@ -527,8 +532,7 @@ impl DeepSeekBatched {
                 comp: ls.comp.as_ref().map(|c| c.state_snapshot()),
                 icomp: ls.icomp.as_ref().map(|c| c.state_snapshot()),
                 gallery_len: ls.gallery.as_ref().map_or(0, |g| g.len()),
-                comp_rows: None,
-                icomp_rows: None,
+                row_states: Vec::new(),
             })
             .collect();
         drop(map);
@@ -549,10 +553,10 @@ impl DeepSeekBatched {
     /// Roll `seq`'s streaming corpus state back to `tokens` total absorbed
     /// tokens after a speculative verify. Consumes the pre-verify snapshot: a
     /// full accept (`tokens ≥ base + block_len`) discards it — the absorbed
-    /// block IS the accepted text; a partial accept restores the compressors +
-    /// gallery to the snapshot and replays exactly the accepted prefix's
-    /// stashed rows — bit-identical to having absorbed only those tokens (same
-    /// rows, same state, same pool — `emit_groups_batched_matches_streamed`).
+    /// block IS the accepted text; a partial accept installs the stashed state
+    /// at the accepted row boundary — bit-identical to having absorbed only
+    /// those tokens, because the states ARE the wave's own per-row streaming
+    /// capture (exact per-token decode semantics by construction).
     fn rollback_verify_state(&self, seq: usize, tokens: usize) -> Result<()> {
         let Some(snap) = self
             .verify_snap
@@ -573,11 +577,16 @@ impl DeepSeekBatched {
                 .write()
                 .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
             let s = stats.entry(seq).or_insert(SpecStats {
-                // Seed exactly AT the threshold: the first step drafts (the
-                // gate is a strict `<`), and its measured acceptance decides
-                // immediately — one losing step, not the ~10 an optimistic
-                // seed took to decay below the bar on 64-token sessions.
-                ema: SPEC_MIN_ACCEPT,
+                // Seed ONE accept above the threshold: the session's FIRST
+                // draft conditions on a 1-wide feature window (only the
+                // prefill's last-row feature exists yet) and is the noisiest
+                // step it will ever take — an at-threshold seed let that
+                // single unlucky draft gate speculation for a whole
+                // SPEC_PROBE_INTERVAL (measured: 33 plain steps = 25% of a
+                // 128-token session at plain rate). One accept of margin
+                // absorbs one bad opener; two consecutive misses still gate
+                // within ~2 steps on genuinely unpredictable text.
+                ema: SPEC_MIN_ACCEPT + 1.0,
                 fallback_steps: 0,
             });
             s.ema = (1.0 - SPEC_EMA_ALPHA) * s.ema + SPEC_EMA_ALPHA * kept;
@@ -592,47 +601,38 @@ impl DeepSeekBatched {
         let Some(entry) = map.get_mut(&seq) else {
             return Ok(());
         };
-        for (l, lsnap) in snap.layers.into_iter().enumerate() {
+        for (l, mut lsnap) in snap.layers.into_iter().enumerate() {
             let ls = &mut entry.layers[l];
-            if let (Some(c), Some(s)) = (ls.comp.as_mut(), lsnap.comp) {
+            // Install the streaming state at the accepted boundary: the wave's
+            // own per-row capture already advanced through the accepted prefix
+            // with exact per-token decode semantics, so its row-`k` state IS
+            // the state a plain decode of those tokens produces — no replay,
+            // no per-layer launches. `accepted == 0` installs the pre-block
+            // state; otherwise the state after row `accepted-1`. The gallery
+            // truncates to the recorded length (its appends are append-only
+            // within the wave, so entries from rejected rows sit past it).
+            let (comp_s, icomp_s, glen) = if accepted == 0 {
+                (lsnap.comp, lsnap.icomp, lsnap.gallery_len)
+            } else {
+                if accepted > lsnap.row_states.len() {
+                    candle::bail!(
+                        "verify rollback: {} accepted rows but only {} row-boundary states \
+                         stashed (layer {l})",
+                        accepted,
+                        lsnap.row_states.len()
+                    );
+                }
+                let (c, ic, g) = lsnap.row_states.swap_remove(accepted - 1);
+                (c, ic, g)
+            };
+            if let (Some(c), Some(s)) = (ls.comp.as_mut(), comp_s) {
                 c.state_restore(s);
             }
-            if let (Some(c), Some(s)) = (ls.icomp.as_mut(), lsnap.icomp) {
+            if let (Some(c), Some(s)) = (ls.icomp.as_mut(), icomp_s) {
                 c.state_restore(s);
             }
             if let Some(g) = ls.gallery.as_mut() {
-                g.truncate(lsnap.gallery_len);
-            }
-            if accepted == 0 {
-                continue;
-            }
-            // Replay the accepted prefix through the restored compressors — the
-            // same projected rows the verify forward consumed, so any group they
-            // complete is byte-identical to the one the forward appended.
-            let comp_gp = match (ls.comp.as_mut(), lsnap.comp_rows.as_ref()) {
-                (Some(c), Some((k, sc))) => c.emit_groups_projected(
-                    &k.narrow(0, 0, accepted)?,
-                    &sc.narrow(0, 0, accepted)?,
-                    None,
-                )?,
-                _ => None,
-            };
-            let ikey = match (ls.icomp.as_mut(), lsnap.icomp_rows.as_ref()) {
-                (Some(c), Some((k, sc))) => c.emit_groups_projected(
-                    &k.narrow(0, 0, accepted)?,
-                    &sc.narrow(0, 0, accepted)?,
-                    Some(self.engine.rope_for(l)),
-                )?,
-                _ => None,
-            };
-            if let (Some((entry_t, positions)), Some(g)) = (comp_gp, ls.gallery.as_mut()) {
-                // HCA layers have no indexer: 1-wide placeholder key, matching
-                // the wave's append path.
-                let key_t = match ikey {
-                    Some((k, _)) => k,
-                    None => Tensor::zeros((positions.len(), 1), DType::F32, entry_t.device())?,
-                };
-                g.append_batch(&entry_t, &key_t, &positions)?;
+                g.truncate(glen);
             }
         }
         entry.absorbed = tokens;
@@ -1440,6 +1440,15 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 // query/compressor slices — so the selection batches across all
                 // sessions.
                 let mut sels: Vec<DecodeSel> = Vec::with_capacity(n_dec);
+                // Verify waves: this layer's streaming state at every ROW
+                // boundary (`Arc`-clone cheap), captured as the loop advances —
+                // the rollback installs one of these directly on a partial
+                // accept instead of replaying the accepted rows.
+                let mut row_snaps: Vec<(
+                    Option<super::compressor::CompressorState>,
+                    Option<super::compressor::CompressorState>,
+                    usize,
+                )> = Vec::new();
                 for (i, &seq) in decode_seqs.iter().enumerate() {
                     let xi = xs_dec.narrow(1, i, 1)?; // [1,1,dim]
                     let comp_row = match &comp_proj {
@@ -1474,14 +1483,21 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         rope,
                     )?;
                     sels.push(sel);
+                    if is_verify_wave {
+                        let ls = &entry.layers[l];
+                        row_snaps.push((
+                            ls.comp.as_ref().map(|c| c.state_snapshot()),
+                            ls.icomp.as_ref().map(|c| c.state_snapshot()),
+                            ls.gallery.as_ref().map_or(0, |g| g.len()),
+                        ));
+                    }
                     if l + 1 == n_layers {
                         entry.absorbed = decode_pos[i] + 1;
                     }
                 }
-                // Verify-path row stash: this layer's projected compressor
-                // rows for each block, kept in the pre-verify snapshot as the
-                // rollback's replay source (`Arc`-clone views over the batched
-                // projection, one narrow per group).
+                // Distribute this layer's row-boundary states into each block's
+                // pre-verify snapshot (rows are grouped consecutively, in the
+                // same order as `verify_groups`).
                 if is_verify_wave {
                     let mut vs = self
                         .verify_snap
@@ -1491,20 +1507,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         let row0 = verify_row_start[gi];
                         if let Some(snap) = vs.get_mut(&vseq) {
                             if let Some(lsnap) = snap.layers.get_mut(l) {
-                                lsnap.comp_rows = match &comp_proj {
-                                    Some((k, sc)) => Some((
-                                        k.narrow(0, row0, s_len)?,
-                                        sc.narrow(0, row0, s_len)?,
-                                    )),
-                                    None => None,
-                                };
-                                lsnap.icomp_rows = match &icomp_proj {
-                                    Some((k, sc)) => Some((
-                                        k.narrow(0, row0, s_len)?,
-                                        sc.narrow(0, row0, s_len)?,
-                                    )),
-                                    None => None,
-                                };
+                                lsnap.row_states = row_snaps[row0..row0 + s_len].to_vec();
                             }
                         }
                     }
