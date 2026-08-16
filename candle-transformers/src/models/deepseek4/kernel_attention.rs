@@ -573,6 +573,12 @@ pub fn kernel_attn_prefill_select(
     prep: &PrefillPrep,
     rope: &RotaryCache,
     base: usize,
+    // This sequence's rows of the WAVE-batched indexer query GEMM
+    // (`query_gemm_batched` over the whole prompt span — `(q_raw [s,h,ihd],
+    // weights [s,h])`). The GEMM is row-independent, so batching it across
+    // sequences is bit-identical; only the position-dependent RoPE stays
+    // per-seq here. Required on in-regime CSA layers; ignored otherwise.
+    q_batched: Option<(Tensor, Tensor)>,
 ) -> Result<PrefillSel> {
     let t_sel = profile_now();
     let s = prep.xs.dim(1)?;
@@ -588,14 +594,12 @@ pub fn kernel_attn_prefill_select(
             } else if max_nv <= m.min(1024) {
                 // In-regime: the shortlist covers every token's window, so
                 // two-stage recall degenerates to the exact full Indexer top-k —
-                // one batched query GEMM + one rescore + one argsort, kept FULLY
-                // ON-DEVICE (bit-identical selection to the per-token loop by
-                // `batched_causal_select_matches_per_token`).
+                // the wave-batched query GEMM rows + one rescore + one argsort,
+                // kept FULLY ON-DEVICE (bit-identical selection to the
+                // per-token loop by `batched_causal_select_matches_per_token`).
                 let t_q = profile_now();
-                let (q_raw, weights) = ix.query_gemm_batched(
-                    &prep.xs.reshape((s, ()))?,
-                    &prep.qr_all.reshape((s, ()))?,
-                )?;
+                let (q_raw, weights) = q_batched
+                    .expect("in-regime CSA prefill select needs the batched query rows");
                 let q_idx = ix.rope_query_batched(&q_raw, rope, base)?; // [s,h,ih]
                 pipeline_record("psel:query", t_q);
                 let gallery = gallery.expect("CSA layer has a gallery");

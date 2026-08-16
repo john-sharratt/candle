@@ -1793,6 +1793,19 @@ impl ManagedBatchedModel for DeepSeekBatched {
                 comp_cnt: Tensor,     // [s_len]
             }
             let dev = x.device().clone();
+            // Batched indexer query GEMM over the WHOLE prompt span — two
+            // GEMMs per CSA layer-wave instead of two per SEQUENCE (the
+            // per-seq form was 16 launches at width 8, each one a stall
+            // point under submission pressure). Rows are seq-independent ⇒
+            // bit-identical; each seq's slice ropes at its own base below.
+            let idx_q_all = match (a.indexer(), proj.as_ref()) {
+                (Some(ix), Some(p)) => Some(ix.query_gemm_batched(
+                    &p.xs.reshape((prefill_total, ()))?,
+                    &p.qr_all.reshape((prefill_total, ()))?,
+                )?),
+                _ => None,
+            };
+            let mut row_off = 0usize;
             let mut pf: Vec<PfSeq> = Vec::with_capacity(prefill_seqs.len());
             let mut seq_of_host: Vec<u32> = Vec::with_capacity(prefill_total);
             // Per-seq new-token diagonal metadata, flat {rows, base, start, -} × n_seq.
@@ -1821,12 +1834,21 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         .append_batch(entry_t, &key_t, &gp.positions)?;
                 }
                 pipeline_record("ppush:append", t_pappend);
+                let q_rows = match &idx_q_all {
+                    Some((q_raw, weights)) => Some((
+                        q_raw.narrow(0, row_off, s_len)?,
+                        weights.narrow(0, row_off, s_len)?,
+                    )),
+                    None => None,
+                };
+                row_off += s_len;
                 let sel = super::kernel_attention::kernel_attn_prefill_select(
                     a,
                     entry.layers[l].gallery.as_ref(),
                     prep,
                     rope,
                     base,
+                    q_rows,
                 )?;
                 let t_pgather = profile_now();
                 // Build (gids, LOCAL comp_idx, comp_cnt, g) — same Device/Host
