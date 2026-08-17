@@ -3587,6 +3587,53 @@ pub trait ManagedBatchedModel {
 /// of the two wins, so this can lead the span rather than having to trail it.
 pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 
+/// The width cap plus 25% slack — the ceiling a single prefill slab may
+/// actually reach. The asymmetry is measured: a wave's FIXED cost (~2.37 s —
+/// the full per-layer routing readback + expert sweep) is paid per slab
+/// regardless of width, while the compute-saturation cap is soft — tokens 25%
+/// past it cost the same ~0.87 ms each as the ones before. So a 128-token
+/// straggler slab after an 8192 slab spends a whole fixed sweep on 1.5% of the
+/// tokens (~25% extra wall), where absorbing it into one 8320-token wave costs
+/// per-token rate only.
+pub(crate) fn prefill_slack_cap(width_cap: usize) -> usize {
+    width_cap + width_cap / 4
+}
+
+/// Pack pure-prefill sequences into token-bounded slabs, returned as
+/// `start..end` index ranges over `lens`.
+///
+/// Greedy whole-sequence packing against `width_cap`, with the
+/// [`prefill_slack_cap`] tail rule: at the point a slab would close, if
+/// EVERYTHING still unpacked fits within the slack ceiling it is absorbed into
+/// this final slab instead of becoming one or more remainder waves. Only the
+/// final slab may overshoot, so ordinary slabs still respect the cap; a single
+/// sequence longer than the cap always travels alone and uncut (this packer
+/// never splits inside a sequence).
+pub(crate) fn pack_prefill_slabs(lens: &[usize], width_cap: usize) -> Vec<(usize, usize)> {
+    let slack_cap = prefill_slack_cap(width_cap);
+    let mut slabs = Vec::new();
+    let mut start = 0usize;
+    while start < lens.len() {
+        let mut toks = 0usize;
+        let mut end = start;
+        while end < lens.len() {
+            let l = lens[end];
+            if end > start && toks + l > width_cap {
+                let tail: usize = lens[end..].iter().sum();
+                if toks + tail <= slack_cap {
+                    end = lens.len();
+                }
+                break;
+            }
+            toks += l;
+            end += 1;
+        }
+        slabs.push((start, end));
+        start = end;
+    }
+    slabs
+}
+
 /// Blanket implementation of `ManagedBatchedModel` for `BatchedInference<M>`.
 ///
 /// This allows models using the new `BatchedModelCore` + `BatchedInference` pattern
@@ -3707,20 +3754,15 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             // different spans — `expert_rows` multiplies by `experts_per_tok` —
             // so only the plan can answer this.
             let width_cap = self.prefill_width_cap(session.activation_dtype());
-            if total > width_cap && max_len > 1 && prefill_seqs.len() > 1 {
+            // The entry check uses the SLACK ceiling, not the bare cap, for two
+            // reasons that are one reason: a fleet within 25% of the cap runs as
+            // a single wave (the straggler a bare-cap split would produce costs
+            // the full fixed per-wave sweep for its few tokens), and a slab the
+            // packer emitted WITH slack must not re-slice itself when this
+            // method recurses on it.
+            if total > prefill_slack_cap(width_cap) && max_len > 1 && prefill_seqs.len() > 1 {
                 let mut all_logits: Vec<Tensor> = Vec::with_capacity(prefill_seqs.len());
-                let mut start = 0usize;
-                while start < prefill_seqs.len() {
-                    let mut toks = 0usize;
-                    let mut end = start;
-                    while end < prefill_seqs.len() {
-                        let l = lens[end];
-                        if end > start && toks + l > width_cap {
-                            break;
-                        }
-                        toks += l;
-                        end += 1;
-                    }
+                for (start, end) in pack_prefill_slabs(&lens, width_cap) {
                     let step = self.forward_wave(
                         session,
                         &[],
@@ -3750,7 +3792,6 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                     for t in lg {
                         all_logits.push(t.to_owned_tensor()?);
                     }
-                    start = end;
                 }
                 return Ok(WaveResult::owned(WaveStep {
                     residual: None,
@@ -4217,5 +4258,56 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     }
 }
 
-// ============================================================================
-// Backward Compatibility Aliases
+#[cfg(test)]
+mod slab_tests {
+    use super::{pack_prefill_slabs, prefill_slack_cap};
+
+    #[test]
+    fn straggler_is_absorbed_within_slack() {
+        // 8192 + 128 = 8320 ≤ 10240 slack: ONE slab, no straggler wave.
+        assert_eq!(pack_prefill_slabs(&[8192, 128], 8192), vec![(0, 2)]);
+        // Right at the slack ceiling: still one slab.
+        assert_eq!(pack_prefill_slabs(&[8192, 2048], 8192), vec![(0, 2)]);
+        // One past the ceiling: split.
+        assert_eq!(
+            pack_prefill_slabs(&[8192, 2049], 8192),
+            vec![(0, 1), (1, 2)]
+        );
+    }
+
+    #[test]
+    fn mid_fleet_slabs_respect_the_bare_cap() {
+        // Only the FINAL slab may overshoot: slab 1 closes at the cap because
+        // absorbing the remaining 8500 would blow past the slack ceiling; the
+        // tail then packs together (500 + 8000 = 8500 ≤ 10240 absorbs at ITS
+        // closing point).
+        assert_eq!(
+            pack_prefill_slabs(&[8000, 500, 8000], 8192),
+            vec![(0, 1), (1, 3)]
+        );
+    }
+
+    #[test]
+    fn tail_larger_than_slack_splits_normally() {
+        // 10 × 1030: greedy packs 7 (7210); the 3-seq tail (3090) would land at
+        // 10300 > 10240, so no absorb — but the tail then fits one slab alone.
+        let lens = [1030usize; 10];
+        assert_eq!(pack_prefill_slabs(&lens, 8192), vec![(0, 7), (7, 10)]);
+    }
+
+    #[test]
+    fn oversize_sequences_travel_alone_and_uncut() {
+        // A single sequence past even the slack cap is never split.
+        assert_eq!(pack_prefill_slabs(&[30000], 8192), vec![(0, 1)]);
+        assert_eq!(
+            pack_prefill_slabs(&[30000, 100, 30000], 8192),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn slack_is_a_quarter_of_the_cap() {
+        assert_eq!(prefill_slack_cap(8192), 10240);
+        assert_eq!(prefill_slack_cap(100), 125);
+    }
+}
