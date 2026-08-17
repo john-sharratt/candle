@@ -3034,7 +3034,7 @@ impl QCudaStorage {
             GgmlDType::Q6_KO => deq::<crate::quantized::BlockQ6_KO>(&buffer, block_len, &mut out),
             GgmlDType::Q8_KO => deq::<crate::quantized::BlockQ8_KO>(&buffer, block_len, &mut out),
             // MXFP4_KO is a GPU-only lane-major chunk with no per-128 host block codec; it is
-            // never CPU-dequantized (the collapse fold lives in the int8 kernel).
+            // never CPU-dequantized (the per-sub fold lives in the int8 kernel).
             GgmlDType::MXFP4_KO => {
                 crate::bail!("MXFP4_KO has no CPU dequant path; it is a GPU-only int8 weight")
             }
@@ -3797,6 +3797,45 @@ impl QCudaStorage {
                 "repack_ko: shape [{nrows}, {ncols}] must have nrows % 32 == 0 and ncols % 128 == 0"
             );
         }
+        // MXFP4 → MXFP4_KO is an EXACT byte permutation (nibbles + per-sub E8M0 copied
+        // verbatim, per-row dm baked) — never a dequant/requant, which would re-derive
+        // E8M0 scales lossily and needs a quantize kernel that deliberately does not
+        // exist (`run_quantize_ko` has no MXFP4 arm). Load-time only: pull the native
+        // bytes to the host, reorder with the same routine the engine's prepare path
+        // uses, upload the chunk tensor.
+        if ko_dtype == GgmlDType::MXFP4_KO {
+            if self.dtype != GgmlDType::MXFP4 {
+                crate::bail!(
+                    "repack_ko(MXFP4_KO): source must be MXFP4, got {:?}",
+                    self.dtype
+                );
+            }
+            let need = nrows * (ncols / 32) * GgmlDType::MXFP4.type_size();
+            if self.data.len < need {
+                crate::bail!(
+                    "repack_ko(MXFP4_KO): storage holds {} bytes, need {need}",
+                    self.data.len
+                );
+            }
+            let native = self
+                .device
+                .memcpy_dtov(&self.data.inner.slice(..need))
+                .map_err(crate::Error::wrap)?;
+            let ko =
+                crate::quantized::ko_quant::mxfp4_native_to_ko_gpu_chunk(&native, nrows, ncols);
+            let mut out = unsafe { self.device.alloc::<u8>(ko.len())? };
+            self.device
+                .memcpy_htod(&ko, &mut out.slice_mut(..ko.len()))?;
+            return Ok(Self {
+                data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
+                    inner: out,
+                    len: ko.len(),
+                }),
+                dtype: ko_dtype,
+                device: self.device.clone(),
+                backing: Backing::Owned,
+            });
+        }
         let qtype = dtype_to_qtype(ko_dtype)? as i32;
         let bytes =
             (nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
@@ -4049,9 +4088,9 @@ pub fn repack_to_host(
         return Ok(ggml_bytes.to_vec());
     }
     // MXFP4_KO: the native MXFP4 experts repack by an EXACT byte-reorder (no dequant/requant),
-    // keeping the weights 4-bit. Done on the host straight from the GGUF bytes — the collapse
-    // itself lives in the int8 kernel, so this only permutes nibbles + E8M0 and bakes the per-row
-    // e_max scale. (Bypasses the affine `repack_ko` path below, which is a lossy F32 re-quant.)
+    // keeping the weights 4-bit. Done on the host straight from the GGUF bytes — the per-sub
+    // fold lives in the int8 kernel, so this only permutes nibbles + E8M0 and bakes the per-row
+    // e_max scale. (Bypasses the affine `repack_ko` F32-requant route.)
     if target_dtype == GgmlDType::MXFP4_KO {
         if dtype != GgmlDType::MXFP4 {
             crate::bail!("repack_to_host(MXFP4_KO): source must be MXFP4, got {dtype:?}");

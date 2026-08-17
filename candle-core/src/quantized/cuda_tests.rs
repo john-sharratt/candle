@@ -3918,16 +3918,17 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
     Ok(())
 }
 
-/// The novel MXFP4 exponent-collapse int8 kernel (`loader/mxfp4.cuh`) must reproduce the CPU
-/// oracle `ko_quant::mxfp4_collapse_int8_matmul`. The activation path is shared infrastructure,
-/// so we feed the oracle the DEQUANTIZED q8a128 activations the kernel consumes (re-quantizing
-/// them recovers the exact int8×scale, since each 128-block's max maps to ±127) — isolating the
-/// one thing under test: the in-register weight collapse (four per-32 E8M0 subs → common e_max →
-/// each sub's int8 mantissa shifted right by the exponent difference → single int32 fold, scaled
-/// by the baked per-128 `2^(e_max-128)`). Adversarial per-32 exponent spread forces non-zero
-/// shifts on every tile. Agreement is to FP accumulation order (the int32 sums are exact).
+/// The MXFP4 per-sub int8 kernel (`loader/mxfp4.cuh` + the `is_mxfp4_persub` fold in
+/// `kernel.cuh`) must reproduce the CPU oracle `ko_quant::mxfp4_ko_int8_matmul`. The activation
+/// path is shared infrastructure, so we feed the oracle the DEQUANTIZED q8a128 activations the
+/// kernel consumes (re-quantizing them recovers the exact int8×scale, since each 128-block's max
+/// maps to ±127) — isolating the one thing under test: codebook nibble expansion + one int32 MMA
+/// per 32-K sub, each folded with its own E8M0 scale × the per-128 activation scale. Adversarial
+/// per-32 exponent spread proves the fold is spread-immune (the old shared-scale collapse
+/// truncated here). The int32 sums are exact and the oracle mirrors the kernel's FP fold order;
+/// the residual tolerance covers the q8a128 activation scale's storage rounding.
 #[test]
-fn mxfp4_collapse_cuda_matches_cpu_oracle() -> Result<()> {
+fn mxfp4_persub_cuda_matches_cpu_oracle() -> Result<()> {
     use crate::quantized::ko_quant;
     let dev = CudaDevice::new(0)?;
     let nrows = 256usize; // N (multiple of 8)
@@ -3957,7 +3958,7 @@ fn mxfp4_collapse_cuda_matches_cpu_oracle() -> Result<()> {
 
     // CPU oracle over the 544-byte chunk + the shared activations.
     let chunk544 = ko_quant::quantize_mxfp4_ko(&wf32, nrows, ncols);
-    let out_cpu = ko_quant::mxfp4_collapse_int8_matmul(&chunk544, &act_deq, nrows, ncols, m);
+    let out_cpu = ko_quant::mxfp4_ko_int8_matmul(&chunk544, &act_deq, nrows, ncols, m);
 
     // GPU: the 576-byte chunk (per-row dm baked) through the dense int8 MXFP4_KO kernel.
     let chunk576 = ko_quant::mxfp4_ko_to_gpu_chunk(&chunk544, nrows, ncols);
@@ -3978,11 +3979,11 @@ fn mxfp4_collapse_cuda_matches_cpu_oracle() -> Result<()> {
     assert_eq!(out_gpu.len(), out_cpu.len());
     let rel = rel_l2(&out_gpu, &out_cpu);
     println!(
-        "MXFP4 collapse: CUDA kernel vs CPU oracle rel_l2 = {rel:.3e} (N={nrows} K={ncols} M={m})"
+        "MXFP4 per-sub: CUDA kernel vs CPU oracle rel_l2 = {rel:.3e} (N={nrows} K={ncols} M={m})"
     );
     assert!(
         rel < 1e-4,
-        "CUDA MXFP4 collapse diverged from CPU oracle: rel_l2 = {rel:.6}"
+        "CUDA MXFP4 per-sub fold diverged from CPU oracle: rel_l2 = {rel:.6}"
     );
     Ok(())
 }
@@ -8915,10 +8916,12 @@ fn cuda_mxfp4_qmatmul_dequant_path() -> Result<()> {
     Ok(())
 }
 
-/// MXFP4 weights feed the int8 KO matmul kernel: repacking an MXFP4 weight to its KO twin
-/// (Q6_KO for Performance, Q8_KO for Precision) and running the q8a128 int8 MMA matches the
-/// float baseline (MXFP4 dequant × float activations). This is the "MXFP4 works with our
-/// int8 kernels" end-to-end check — CPU/float baseline vs the CUDA int8 kernel.
+/// MXFP4 weights feed the int8 KO matmul kernel: repacking an MXFP4 weight to MXFP4_KO
+/// (both modes — the exact byte permutation in `repack_ko`) and running the q8a128 int8 MMA
+/// matches the float baseline (MXFP4 dequant × float activations). This is the "MXFP4 works
+/// with our int8 kernels" end-to-end check — CPU/float baseline vs the CUDA int8 kernel.
+/// The per-sub fold is weight-exact, so the kernel must land at the exact per-32 CPU int8
+/// reference (only activation-quant error), not merely inside a loose tolerance.
 #[test]
 fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
     use crate::quantized::{QMatMul, QStorage, QTensor};
@@ -8997,8 +9000,8 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
         assert_eq!(int8.len(), base.len());
         let rel = rel_l2(&int8, &base);
         println!(
-            "MXFP4->{:?} (per-128, {mode:?}) int8 vs float baseline: rel_l2 = {rel:.5} (tol {tol}); \
-             per-128 cost over exact per-32 = {:.5}",
+            "MXFP4->{:?} (per-sub, {mode:?}) int8 vs float baseline: rel_l2 = {rel:.5} (tol {tol}); \
+             per-sub cost over exact per-32 = {:.5}",
             GgmlDType::MXFP4.to_ko(mode)?,
             (rel - rel_per32).max(0.0)
         );

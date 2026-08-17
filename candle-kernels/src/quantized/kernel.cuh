@@ -1797,12 +1797,15 @@ __device__ void grouped_matmul_impl(
 // above; only the activation load, weight unpack, and MMA+fold differ. The
 // contraction runs on the INT8 m16n8k32 tensor core: q8a128 activations (raw int8
 // qs) × quantized weights (raw integers), int32 accumulate, deferred-scale fold to
-// F32 with ONE (scale, min) per 128-K per output row (PER-128, not per-sub). The four
-// k32 sub-MMAs of a 128-K tile collapse into a single int32 BEFORE the scale is applied
-// — that single-accumulator collapse is why the fold is per-128 (a per-sub scale would
-// need a separate accumulator per sub and kill throughput; see the note in
-// loader/gemx_dequant.cuh). Finer-scale sources (Q4_K per-32, Q6_K per-16) are
-// re-quantized to this per-128 KO grid by `to_ko`. See docs/q8_matmul_pipeline.md.
+// F32. Affine KO formats fold with ONE (scale, min) per 128-K per output row: the
+// four k32 sub-MMAs of a 128-K tile collapse into a single int32 BEFORE the scale
+// is applied (finer-scale sources — Q4_K per-32, Q6_K per-16 — are re-quantized to
+// that per-128 grid by `to_ko`; see the note in loader/gemx_dequant.cuh). MXFP4
+// (`is_mxfp4_persub`) instead folds each sub-MMA's int32 with its own E8M0
+// power-of-two scale immediately — the fold drains one reusable accumulator per
+// sub, so it holds no extra registers, and the per-32 scales apply exactly (no
+// re-quantization of an E8M0 format onto an affine grid). See
+// docs/q8_matmul_pipeline.md.
 // =============================================================================
 
 // Activation tile load: global → shared via cp.async (.ca, L1-resident — the tile is re-read
@@ -1878,6 +1881,20 @@ __device__ __forceinline__ void load_warp_chunk_int8(
     }
 }
 
+// MXFP4 runs the PER-SUB fold: the four per-32 subs already MMA separately, so
+// each sub's int32 accumulator folds with its own E8M0 scale `2^(e_sub-128)`
+// in FP32 — the dequant is then a pure codebook expansion (loader/mxfp4.cuh),
+// with no per-element exponent-alignment arithmetic. The affine KO formats
+// keep the single per-128 (d, m) fold.
+template <typename T>
+struct is_mxfp4_persub {
+    static constexpr bool value = false;
+};
+template <>
+struct is_mxfp4_persub<block_c_mxfp4_k1024> {
+    static constexpr bool value = true;
+};
+
 // load_warp_chunk_int8 weight stage, then the int8 MMA + deferred fold per sub.
 // N_SUB = m16 token sub-tiles per block. Mode-1 = 1 (Bm 16); mode-2 = larger Bm so each
 // weight chunk's dequant is reused across N_SUB token sub-tiles (fewer weight re-reads).
@@ -1934,14 +1951,25 @@ __device__ void grouped_matmul_impl_int8(
         cp_async_wait_group<0>();        // tile k_blk (weight + activation) resident
 
         // Inline scales + up-front dequant: read this warp's chunk into registers. Intra-warp
-        // (no barrier needed); frees the weight slot for the next prefetch. The (scale,min) live
-        // in blk.dm[row]; this thread owns rows (threadID*2, threadID*2+1).
+        // (no barrier needed); frees the weight slot for the next prefetch. This thread owns
+        // fold rows (threadID*2, threadID*2+1). Affine formats read the per-128 (scale,min)
+        // pair from blk.dm[row]; MXFP4 reads the four per-sub E8M0 scales per fold row
+        // instead (its per-sub fold below never touches dm).
         const block_c_t* blk = reinterpret_cast<const block_c_t*>(my_slot);
         const int rl = threadID * 2;
-        // dm[rl] and dm[rl+1] are adjacent half2 (8 B, rl*4 is 8-aligned) → ONE int2 LDS.64.
-        const int2 dd = *reinterpret_cast<const int2*>(&blk->dm[rl]);
-        const float2 d0 = __half22float2(*reinterpret_cast<const half2*>(&dd.x));  // (d, m) row rl
-        const float2 d1 = __half22float2(*reinterpret_cast<const half2*>(&dd.y));  // (d, m) row rl+1
+        float2 d0 = make_float2(0.f, 0.f); // (d, m) row rl   — affine fold only
+        float2 d1 = make_float2(0.f, 0.f); // (d, m) row rl+1 — affine fold only
+        float f0[4], f1[4];                // per-sub scales  — mxfp4 fold only
+        if constexpr (is_mxfp4_persub<block_c_t>::value) {
+            gemx_dequant_traits<block_c_t, half, half>::load_sub_scales(my_slot, rl, f0, f1);
+        } else {
+            // dm[rl] and dm[rl+1] are adjacent half2 (8 B, rl*4 is 8-aligned) → ONE int2 LDS.64.
+            const int2 dd = *reinterpret_cast<const int2*>(&blk->dm[rl]);
+            d0 = __half22float2(*reinterpret_cast<const half2*>(&dd.x));
+            d1 = __half22float2(*reinterpret_cast<const half2*>(&dd.y));
+            f0[0] = 0.f; f0[1] = 0.f; f0[2] = 0.f; f0[3] = 0.f;
+            f1[0] = 0.f; f1[1] = 0.f; f1[2] = 0.f; f1[3] = 0.f;
+        }
         // Lane-major dequant: this lane's 4 subs are stored contiguously, so each stream is
         // pulled in ONE wide LDS (ql int4, plus crumb/hi for Q5/Q6, or 2 int4 for Q8) instead
         // of 4 per-sub loads — fewer MIO instructions, still bank-conflict-free.
@@ -1961,30 +1989,53 @@ __device__ void grouped_matmul_impl_int8(
             cp_async_commit();
         }
 
-        // Per-128 collapse, per token sub-tile. The dequanted weight (b_frags, d0/d1) is REUSED
-        // across all N_SUB sub-tiles — that's the mode-2 win (one weight dequant amortized over
-        // N_SUB·16 tokens). Each sub-tile t has its own activation (smem at t*16) and output
-        // frag_c[t*4..]. Two accumulators break the C-dependency chain per sub-tile.
+        // Per token sub-tile. The dequanted weight (b_frags + scales) is REUSED across all
+        // N_SUB sub-tiles — that's the mode-2 win (one weight dequant amortized over
+        // N_SUB·16 tokens). Each sub-tile t has its own activation (smem at t*16) and
+        // output frag_c[t*4..].
         #pragma unroll
         for (int t = 0; t < N_SUB; ++t) {
             const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
             const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
-            int32_t C0[4] = {0, 0, 0, 0};
-            int32_t C1[4] = {0, 0, 0, 0};
-            #pragma unroll
-            for (int sub = 0; sub < 4; sub += 2) {
-                uint32_t a0f[4], a1f[4];
-                fused_attn::load_a_frag_m16k32_ldmatrix(a0f, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
-                fused_attn::load_a_frag_m16k32_ldmatrix(a1f, &smem_A_i8[ab][t * 16][(sub + 1) * 32], KI8_STRIDE, lane);
-                fused_attn::mma_int8_m16n8k32(C0, a0f, b_frags[sub], C0);
-                fused_attn::mma_int8_m16n8k32(C1, a1f, b_frags[sub + 1], C1);
+            if constexpr (is_mxfp4_persub<block_c_t>::value) {
+                // PER-SUB fold: each 32-K sub's exact int32 sum scaled by its own
+                // E8M0 `2^(e_sub-128)` (the activation scale is per-128, so it is
+                // constant across the four subs). One reusable accumulator — the
+                // fold drains it before the next sub's MMA, so this branch holds
+                // no more registers live than the affine one. MXFP4 is centred
+                // (m = 0): no activation-sum term.
+                #pragma unroll
+                for (int sub = 0; sub < 4; ++sub) {
+                    uint32_t af[4];
+                    fused_attn::load_a_frag_m16k32_ldmatrix(af, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
+                    int32_t C[4] = {0, 0, 0, 0};
+                    fused_attn::mma_int8_m16n8k32(C, af, b_frags[sub], C);
+                    frag_c[t * 4 + 0] += (f0[sub] * a0.x) * (float)C[0];
+                    frag_c[t * 4 + 1] += (f1[sub] * a0.x) * (float)C[1];
+                    frag_c[t * 4 + 2] += (f0[sub] * a1.x) * (float)C[2];
+                    frag_c[t * 4 + 3] += (f1[sub] * a1.x) * (float)C[3];
+                }
+            } else {
+                // Affine per-128 fold: two accumulators break the C-dependency
+                // chain per sub-tile; the (d, m) pair folds once over the summed
+                // subs.
+                int32_t C0[4] = {0, 0, 0, 0};
+                int32_t C1[4] = {0, 0, 0, 0};
+                #pragma unroll
+                for (int sub = 0; sub < 4; sub += 2) {
+                    uint32_t a0f[4], a1f[4];
+                    fused_attn::load_a_frag_m16k32_ldmatrix(a0f, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
+                    fused_attn::load_a_frag_m16k32_ldmatrix(a1f, &smem_A_i8[ab][t * 16][(sub + 1) * 32], KI8_STRIDE, lane);
+                    fused_attn::mma_int8_m16n8k32(C0, a0f, b_frags[sub], C0);
+                    fused_attn::mma_int8_m16n8k32(C1, a1f, b_frags[sub + 1], C1);
+                }
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) C0[i] += C1[i];
+                frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0.y;
+                frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0.y;
+                frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1.y;
+                frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1.y;
             }
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) C0[i] += C1[i];
-            frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0.y;
-            frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0.y;
-            frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1.y;
-            frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1.y;
         }
     }
 

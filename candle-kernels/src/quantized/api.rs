@@ -62,11 +62,11 @@ pub enum QType {
     Q5_KO = 46,
     Q6_KO = 47,
     Q8_KO = 48,
-    // Lane-major exponent-collapse MXFP4 for the q8a128 int8 path: the routed
-    // MXFP4 experts, byte-permuted into the KO lane layout with the four per-32 subs of each
-    // 128-K tile collapsed onto their common e_max in-register (so they fold into a single
-    // int32). Stays 4-bit. Value 50 mirrors QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul
-    // kernel, so it is intentionally absent from this kernel-only enum.
+    // Lane-major per-sub MXFP4 for the q8a128 int8 path: the routed MXFP4 experts,
+    // byte-permuted into the KO lane layout; the kernel runs one int32 MMA per 32-K sub and
+    // folds each with its own E8M0 scale in FP — exact. Stays 4-bit. Value 50 mirrors
+    // QTYPE_MXFP4_KO. Native MXFP4 (49) has no matmul kernel, so it is intentionally absent
+    // from this kernel-only enum.
     MXFP4_KO = 50,
     /// Lane-major per-128 affine KO twin at 2-bit — the smallest KO weight (value 0..3, stored
     /// as the 2-bit crumb region Q6_KO carries, used as the whole value). Value 51 mirrors

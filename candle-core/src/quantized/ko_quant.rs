@@ -69,11 +69,11 @@ pub fn quantize_mxfp4_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
 pub const MXFP4_KO_GPU_CHUNK_BYTES: usize = MXFP4_KO_CHUNK_BYTES + 32;
 
 /// Expand the CPU MXFP4_KO chunk (512 `ql` + 32 `e`, from [`quantize_mxfp4_ko`]) into the
-/// on-GPU `block_c_mxfp4_k1024` layout by appending, per 8-row chunk, the collapsed per-row
-/// scale `dm[8]`: `dm[row] = (2^(e_max-128), 0)` where `e_max` is the max of that row's four
-/// per-sub E8M0 bytes — the pure power of two all four subs share after the in-kernel shift.
-/// The kernel recomputes `e_max` from the same `e` bytes for the shifts, so the baked `dm`
-/// stays consistent by construction. `min = 0` (the E2M1 codebook is centred).
+/// on-GPU `block_c_mxfp4_k1024` layout by appending, per 8-row chunk, the per-row scale
+/// `dm[8]`: `dm[row] = (2^(e_max-128), 0)` where `e_max` is the max of that row's four
+/// per-sub E8M0 bytes. The int8 kernel's per-sub fold reads the `e` bytes directly and does
+/// NOT read `dm` — it is baked only so the chunk layout (and the pack-file fingerprint over
+/// it) stays fixed. `min = 0` (the E2M1 codebook is centred).
 pub fn mxfp4_ko_to_gpu_chunk(cpu_chunk: &[u8], nrows: usize, ncols: usize) -> Vec<u8> {
     let n_chunks = (nrows / 8) * (ncols / 128);
     assert_eq!(
@@ -98,13 +98,15 @@ pub fn mxfp4_ko_to_gpu_chunk(cpu_chunk: &[u8], nrows: usize, ncols: usize) -> Ve
     out
 }
 
-/// Reorder **native** MXFP4 GGUF bytes (`[nrows × ncols]`, row-major [`BlockMXFP4`]: `e:u8`
-/// + `qs:[u8;16]`, 17 B / 32 elems) straight into the on-GPU `block_c_mxfp4_k1024` layout —
-/// an **exact** byte permutation (nibbles + E8M0 bytes copied verbatim) plus the per-row
-/// collapsed `dm` bake. Unlike [`quantize_mxfp4_ko`] (which re-quantizes from F32), this takes
-/// the already-quantized experts and only reorders them, so it is lossless vs the source and
-/// keeps the weights 4-bit. `nrows % 8 == 0`, `ncols % 128 == 0`. Returns the 576-B-per-1024
-/// chunk tensor the int8 MXFP4_KO matmul reads.
+/// Reorder **native** MXFP4 GGUF bytes (`[nrows × ncols]`, row-major [`BlockMXFP4`]:
+/// `e:u8` then `qs:[u8;16]`, 17 B / 32 elems) straight into the on-GPU
+/// `block_c_mxfp4_k1024` layout — an **exact** byte permutation (nibbles + E8M0 bytes
+/// copied verbatim) plus the per-row `dm` bake (unread by the kernel — kept for layout
+/// stability, see [`mxfp4_ko_to_gpu_chunk`]). Unlike [`quantize_mxfp4_ko`] (which
+/// re-quantizes from F32), this takes the already-quantized experts and only reorders
+/// them, so it is lossless vs the source and keeps the weights 4-bit. `nrows % 8 == 0`,
+/// `ncols % 128 == 0`. Returns the 576-B-per-1024 chunk tensor the int8 MXFP4_KO matmul
+/// reads.
 pub fn mxfp4_native_to_ko_gpu_chunk(native_bytes: &[u8], nrows: usize, ncols: usize) -> Vec<u8> {
     assert_eq!(
         nrows % 8,
@@ -160,12 +162,15 @@ pub fn mxfp4_native_to_ko_gpu_chunk(native_bytes: &[u8], nrows: usize, ncols: us
     ob
 }
 
-/// Reference **int8** matmul over the MXFP4_KO chunk — the exact CPU baseline the new
-/// int8 tensor-core fold must reproduce. Activations `act` `[m, ncols]` are quantized to
-/// int8 per 128-K block (symmetric, `amax/127`), the weight nibbles are mapped to their
-/// int8 `MXFP4_KVALUES`, and each 32-K sub is accumulated in int32 and scaled by **its own**
-/// per-sub E8M0 weight scale × the per-128 activation scale (no min — symmetric). Returns
-/// `out[m, nrows]`. This is the per-32 fold expressed in scalar Rust.
+/// Reference **int8** matmul over the MXFP4_KO chunk — the exact CPU mirror of the in-kernel
+/// per-sub fold. Activations `act` `[m, ncols]` are quantized to int8 per 128-K block
+/// (symmetric, `amax/127`), the weight nibbles are mapped to their int8 `MXFP4_KVALUES`, and
+/// each 32-K sub is accumulated in int32 and folded with **its own** per-sub E8M0 weight
+/// scale × the per-128 activation scale (no min — symmetric). The FP order mirrors the
+/// kernel operation-for-operation: the coefficient `wscale·ascale` is rounded once, then
+/// FMA'd into the running output (`coeff.mul_add(isum, out)`), sub ascending within each
+/// 128-K block, blocks ascending — the only divergence left against the GPU is the
+/// activation scale's storage representation (q8a128 keeps it in f16). Returns `out[m, nrows]`.
 pub fn mxfp4_ko_int8_matmul(
     chunk: &[u8],
     act: &[f32],
@@ -206,7 +211,6 @@ pub fn mxfp4_ko_int8_matmul(
                 }
                 for t in 0..m {
                     let ascale = a_scale[t * k_blocks + kb];
-                    let mut acc = 0f32;
                     for sub in 0..4 {
                         let mut isum = 0i32;
                         for p in 0..16 {
@@ -220,99 +224,10 @@ pub fn mxfp4_ko_int8_matmul(
                             isum += w0 * a_i8[t * ncols + k0] as i32;
                             isum += w1 * a_i8[t * ncols + k1] as i32;
                         }
-                        // per-sub weight scale × per-128 activation scale (no min term).
-                        acc += isum as f32 * wscale[sub] * ascale;
+                        // Coefficient rounded once, then one FMA — the kernel's exact op order.
+                        let o = &mut out[t * nrows + row];
+                        *o = (wscale[sub] * ascale).mul_add(isum as f32, *o);
                     }
-                    out[t * nrows + row] += acc;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Round `w / 2^shift` to the nearest integer (half away from zero) — the int8-mantissa
-/// down-shift used by the per-128 exponent collapse.
-#[inline]
-fn shift_round(w: i32, shift: u32) -> i32 {
-    if shift == 0 {
-        return w;
-    }
-    let denom = 1i32 << shift;
-    let half = denom >> 1;
-    if w >= 0 {
-        (w + half) / denom
-    } else {
-        -((-w + half) / denom)
-    }
-}
-
-/// Reference **per-128-collapsed** int8 matmul over the MXFP4_KO chunk — the CPU oracle for the
-/// in-kernel MXFP4 dequant. Because the MXFP4 block scale is a *pure power of two* (E8M0), the
-/// four per-32 sub-blocks of each 128-K tile are aligned onto the largest of their four exponents
-/// (`e_max`) by **shifting each sub's int8 mantissas right by the E8M0 byte difference** (= the
-/// exponent difference). All four subs then share one scale `2^(e_max-128)`, so they accumulate
-/// into a **single** int32 (what the per-128 tensor-core fold needs) — no widening, weights stay
-/// 4-bit. The only loss vs [`mxfp4_ko_int8_matmul`] (exact per-32) is the mantissa bits shifted
-/// off the smaller-exponent subs. Returns `out[m, nrows]`.
-pub fn mxfp4_collapse_int8_matmul(
-    chunk: &[u8],
-    act: &[f32],
-    nrows: usize,
-    ncols: usize,
-    m: usize,
-) -> Vec<f32> {
-    let k_blocks = ncols / 128;
-    let row_groups = nrows / 8;
-    let dm_base = 512;
-    let cb = MXFP4_KO_CHUNK_BYTES;
-
-    // Activations → int8 per (token, 128-K block), symmetric amax/127 (same as the per-32 ref).
-    let mut a_i8 = vec![0i8; m * ncols];
-    let mut a_scale = vec![0f32; m * k_blocks];
-    for t in 0..m {
-        for kb in 0..k_blocks {
-            let base = t * ncols + kb * 128;
-            let amax = (0..128).fold(0f32, |mx, i| mx.max(act[base + i].abs()));
-            let scale = (amax / 127.0).max(1e-12);
-            a_scale[t * k_blocks + kb] = scale;
-            for i in 0..128 {
-                a_i8[base + i] = (act[base + i] / scale).round().clamp(-127.0, 127.0) as i8;
-            }
-        }
-    }
-
-    let mut out = vec![0f32; m * nrows];
-    for kb in 0..k_blocks {
-        for g in 0..row_groups {
-            let cbase = (kb * row_groups + g) * cb;
-            for r in 0..8 {
-                let row = g * 8 + r;
-                // The 4 per-sub E8M0 scale bytes; e_max is the largest (E8M0 is monotonic).
-                let e_bytes: [u8; 4] =
-                    std::array::from_fn(|sub| chunk[cbase + dm_base + r * 4 + sub]);
-                let e_max = *e_bytes.iter().max().unwrap();
-                // Per-128 scale = the common power-of-two (×0.5 folded, as in every MXFP4 decode).
-                let dmax = e8m0_to_f32_half(e_max);
-                for t in 0..m {
-                    let ascale = a_scale[t * k_blocks + kb];
-                    // ONE int32 accumulator over all four subs, each shifted onto e_max.
-                    let mut isum = 0i32;
-                    for sub in 0..4 {
-                        let shift = (e_max - e_bytes[sub]) as u32; // byte diff = exponent diff
-                        for p in 0..16 {
-                            let q3 = p / 4;
-                            let i = p % 4;
-                            let qs = chunk[cbase + (r * 4 + q3) * 16 + sub * 4 + i];
-                            let w0 = shift_round(MXFP4_KVALUES[(qs & 0x0F) as usize] as i32, shift);
-                            let w1 = shift_round(MXFP4_KVALUES[(qs >> 4) as usize] as i32, shift);
-                            let k0 = kb * 128 + sub * 32 + p;
-                            let k1 = kb * 128 + sub * 32 + 16 + p;
-                            isum += w0 * a_i8[t * ncols + k0] as i32;
-                            isum += w1 * a_i8[t * ncols + k1] as i32;
-                        }
-                    }
-                    out[t * nrows + row] += isum as f32 * dmax * ascale;
                 }
             }
         }
@@ -742,14 +657,15 @@ mod tests {
         );
     }
 
-    /// The per-128 exponent-collapse (the in-kernel MXFP4 dequant) stays close to both the float
-    /// baseline and the exact per-32 int8. The collapse's *only* extra error vs per-32 is the
-    /// mantissa bits shifted off the smaller-exponent subs — measured here and printed so the
-    /// quality cost is explicit. `--nocapture` to see the numbers.
+    /// The per-sub int8 fold is exact on the weight side regardless of per-128 exponent spread —
+    /// each 32-K sub carries its own E8M0 scale into the fold, so an outlier channel that lands
+    /// the four subs on wildly different exponents costs NOTHING (the failure mode a shared
+    /// per-128 scale would truncate on). Only the 8-bit activation quant contributes error.
+    /// `--nocapture` to see the numbers.
     #[test]
-    fn mxfp4_collapse_tracks_per32_and_float() {
+    fn mxfp4_persub_int8_exact_under_exponent_spread() {
         let (nrows, ncols, m) = (16usize, 256usize, 8usize);
-        // Induce EXPONENT SPREAD (the collapse's only loss source): scale each contiguous 32-block
+        // Induce EXPONENT SPREAD (what a shared per-128 scale would truncate on): scale each contiguous 32-block
         // by a per-block power of two spanning ~6 exponents, so the 4 subs of each 128-tile land on
         // different E8M0 scales — the adversarial case an outlier channel would create. (Uniform
         // random weights give spread 0 → a trivially lossless test that proves nothing.)
@@ -769,7 +685,6 @@ mod tests {
         let chunk = quantize_mxfp4_ko(&w, nrows, ncols);
 
         let per32 = mxfp4_ko_int8_matmul(&chunk, &act, nrows, ncols, m);
-        let collapse = mxfp4_collapse_int8_matmul(&chunk, &act, nrows, ncols, m);
 
         // Float baseline: exact MXFP4-dequant × float activations.
         let wdq = dequant_mxfp4_ko(&chunk, nrows, ncols);
@@ -800,18 +715,19 @@ mod tests {
         }
 
         let rel_per32 = rel_l2(&per32, &base);
-        let rel_collapse = rel_l2(&collapse, &base);
-        let rel_vs_per32 = rel_l2(&collapse, &per32);
-        println!("per-32 int8 vs float:        rel_l2 = {rel_per32:.5}");
-        println!("per-128 collapse vs float:   rel_l2 = {rel_collapse:.5}");
-        println!("collapse vs per-32 (cost):   rel_l2 = {rel_vs_per32:.5}");
+        println!("per-sub int8 vs float:       rel_l2 = {rel_per32:.5}");
         println!("per-128 exponent spread histogram (bins 0..7): {spread_hist:?}");
 
-        // The collapse must stay in the same ballpark as the exact per-32 int8 (a per-128 4-bit
-        // affine's worth of error), not blow up. Tight enough to catch a broken collapse.
+        // Spread must actually be present (else this test proves nothing) …
         assert!(
-            rel_collapse < 0.10,
-            "collapse rel_l2 {rel_collapse:.5} too high vs float baseline"
+            spread_hist[1..].iter().sum::<usize>() > 0,
+            "adversarial weight construction produced zero exponent spread"
+        );
+        // … and the per-sub fold must not care: activation-quant-level error only, same
+        // bound the spread-free test holds.
+        assert!(
+            rel_per32 < 0.02,
+            "per-sub int8 rel_l2 {rel_per32:.5} too high under exponent spread"
         );
     }
 

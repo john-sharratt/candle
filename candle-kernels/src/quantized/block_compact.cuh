@@ -718,11 +718,11 @@ typedef struct __align__(16) {
 static_assert(sizeof(block_c_q4_KO_k128) == 64, "block_c_q4_KO_k128 must be 64 bytes (quant only; scales separate)");
 
 // MXFP4_KO per-128 quant stand-in — the block_compact<> key type for the native-MXFP4
-// exponent-collapse int8 format. Structurally identical to block_c_q4_KO_k128 (64 B of
+// per-sub int8 format. Structurally identical to block_c_q4_KO_k128 (64 B of
 // nibbles) but a DISTINCT type so `block_compact<block_c_mxfp4>` maps to the MXFP4 k1024
 // chunk (not the Q4_KO one). The nibbles are MXFP4 E2M1 codebook indices [0,15], not affine
-// [0,15]; the per-sub E8M0 scales + collapsed per-128 scale ride the k1024 chunk (see
-// block_c_mxfp4_k1024). This type is only used as a template key — never streamed itself.
+// [0,15]; the per-sub E8M0 scales ride the k1024 chunk (see block_c_mxfp4_k1024).
+// This type is only used as a template key — never streamed itself.
 typedef struct __align__(16) {
     int qs[16];   // 0-63: [I0,I2,I1,I3] per sub (same lane interleave as Q4_KO)
     template<typename T>
@@ -960,20 +960,20 @@ typedef block_c_KO_k1024<block_c_q6_KO_k128> block_c_q6_KO_k1024;
 typedef block_c_KO_k1024<block_c_q8_KO_k128> block_c_q8_KO_k1024;
 typedef block_c_KO_k1024<block_c_q2_KO_k128> block_c_q2_KO_k1024;
 
-// MXFP4_KO K/1024 chunk — the native-MXFP4 exponent-collapse int8 format. The 512 B quant
+// MXFP4_KO K/1024 chunk — the native-MXFP4 per-sub int8 format. The 512 B quant
 // region is the SAME lane-major layout as block_c_q4_KO_k1024 (byte for (lane, sub, i) at
 // lane*16 + sub*4 + i, the uint32 packing K[p] | K[p+16]<<4) — but the nibbles are MXFP4
 // E2M1 codebook INDICES [0,15], not affine quants. Each 32-K sub carries its OWN E8M0
-// power-of-two scale byte in `e` (e[row*4 + sub]). The dequant collapses the four per-32
-// subs of a row onto their common largest exponent e_max by shifting each sub's int8
-// mantissa right by (e_max - e_sub), so all four share ONE per-128 scale and fold into a
-// single int32 (see loader/mxfp4.cuh). `dm[row]` is that shared scale precomputed at repack:
-// (2^(e_max-128), 0) — symmetric (E2M1 is centered, no min). Stays 4-bit in storage; the
-// collapse is in-register. `dm` sits at the same struct tail the int8 fold reads (blk->dm[rl]).
+// power-of-two scale byte in `e` (e[row*4 + sub]). The dequant is a pure codebook
+// expansion; the kernel runs one int32 MMA per sub and folds each with its own scale
+// 2^(e_sub-128) in FP (see loader/mxfp4.cuh + the is_mxfp4_persub branch in kernel.cuh)
+// — exact, no mantissa truncation, symmetric (E2M1 is centered, no min). `dm[row]` is a
+// repack-baked per-row (2^(e_max-128), 0) that the int8 fold does NOT read — it stays in
+// the layout so the pack-file format and its fingerprint are unchanged.
 struct __align__(16) block_c_mxfp4_k1024 {
     uint8_t ql[512];   // lane-major MXFP4 nibbles (codebook indices): K[p] | K[p+16]<<4
-    uint8_t e[32];     // per-sub E8M0 scale bytes: e[row*4 + sub]
-    half2   dm[8];     // per-row collapsed scale (2^(e_max-128), 0), precomputed at repack
+    uint8_t e[32];     // per-sub E8M0 scale bytes: e[row*4 + sub] — read by the per-sub fold
+    half2   dm[8];     // repack-baked per-row (2^(e_max-128), 0); unread on the int8 path
 };
 static_assert(sizeof(block_c_mxfp4_k1024) == 576, "block_c_mxfp4_k1024 must be 576 bytes (512 ql + 32 e + 32 dm)");
 
@@ -1311,11 +1311,11 @@ enum QType {
     QTYPE_Q8_KO  = 48,
 
     // Native OCP MXFP4 storage (mirrors GgmlDType::MXFP4); has no matmul kernel of its own
-    // — the routed experts are repacked to the lane-major collapse twin MXFP4_KO below.
+    // — the routed experts are repacked to the lane-major per-sub twin MXFP4_KO below.
     QTYPE_MXFP4    = 49,
-    // Lane-major exponent-collapse MXFP4 for the q8a128 int8 path: the four per-32 subs of
-    // each 128-K tile are collapsed onto their common e_max in-register so they fold into a
-    // single int32 (see loader/mxfp4.cuh). Stays 4-bit in storage. First slot past Q8_KO.
+    // Lane-major per-sub MXFP4 for the q8a128 int8 path: one int32 MMA per 32-K sub, each
+    // folded with its own E8M0 scale in FP (see loader/mxfp4.cuh + the is_mxfp4_persub
+    // branch in kernel.cuh) — exact. Stays 4-bit in storage. First slot past Q8_KO.
     QTYPE_MXFP4_KO = 50,
 
     // Lane-major per-128 affine KO twin at 2-bit (value 0..3). Smallest KO weight: 32 B of

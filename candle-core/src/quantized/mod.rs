@@ -711,15 +711,13 @@ pub enum GgmlDType {
     /// for the DeepSeek-V4 routed experts. See [`k_quants::BlockMXFP4`].
     MXFP4 = 49,
 
-    /// Lane-major exponent-collapse MXFP4 for the q8a128 int8 tensor-core matmul — the KO
-    /// twin the MXFP4 routed experts repack to. The E2M1 nibbles are kept **4-bit** (no
-    /// requant to a wider grid): because the E8M0 scale is a pure power of two, the four
-    /// per-32 subs of each 128-K tile are collapsed onto their common `e_max` in-register
-    /// (each sub's int8 mantissa shifted right by the exponent difference) so they fold into
-    /// a single int32, matching the per-128 int8 kernel. Stays 4-bit → fits in RAM where
-    /// Q6_KO/Q8_KO don't, at Q6-equivalent quality. GPU-only; value 50 mirrors
-    /// `QTYPE_MXFP4_KO` / `QType::MXFP4_KO`. See `ko_quant::quantize_mxfp4_ko` +
-    /// `loader/mxfp4.cuh`.
+    /// Lane-major per-sub MXFP4 for the q8a128 int8 tensor-core matmul — the KO twin the
+    /// MXFP4 routed experts repack to (an exact byte permutation of the native blocks; no
+    /// requant). The E2M1 nibbles are kept **4-bit**; the kernel runs one int32 MMA per
+    /// 32-K sub and folds each with its own E8M0 power-of-two scale in FP — the per-32
+    /// scales apply exactly. Stays 4-bit → fits in RAM where Q6_KO/Q8_KO don't. GPU-only;
+    /// value 50 mirrors `QTYPE_MXFP4_KO` / `QType::MXFP4_KO`. See
+    /// `ko_quant::mxfp4_native_to_ko_gpu_chunk` + `loader/mxfp4.cuh`.
     MXFP4_KO = 50,
 
     /// Lane-major per-128 affine KO twin at **2-bit** — the smallest KO weight. Same
@@ -771,9 +769,9 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q5_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
-                // MXFP4 keeps its native 4-bit E2M1 nibbles: the per-32 E8M0 subs collapse
-                // onto their common e_max in-register (no requant to a wider grid), so it
-                // fits in RAM where Q6_KO/Q8_KO don't, at Q6-equivalent quality.
+                // MXFP4 keeps its native 4-bit E2M1 nibbles (exact byte permutation, no
+                // requant to a wider grid; the kernel folds each per-32 E8M0 sub exactly),
+                // so it fits in RAM where Q6_KO/Q8_KO don't, with no weight-side loss.
                 Self::MXFP4 => Self::MXFP4_KO,
                 other => crate::bail!("no KO weight form for {other:?}"),
             }),
@@ -783,8 +781,8 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q6_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
-                // Same 4-bit exponent-collapse twin as Performance — the collapse is already
-                // near-lossless (Q6-equivalent), so there is no wider grid to step up to.
+                // Same 4-bit per-sub twin as Performance — the per-sub fold is already
+                // weight-exact, so there is no wider grid to step up to.
                 Self::MXFP4 => Self::MXFP4_KO,
                 other => crate::bail!("no KO weight form for {other:?}"),
             }),

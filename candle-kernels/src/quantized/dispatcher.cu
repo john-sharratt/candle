@@ -873,7 +873,7 @@ DECL_DENSE_INT8_ALL(q4_ko_int8)
 DECL_DENSE_INT8_ALL(q5_ko_int8)
 DECL_DENSE_INT8_ALL(q6_ko_int8)
 DECL_DENSE_INT8_ALL(q8_ko_int8)
-// MXFP4_KO exponent-collapse twin (row 18).
+// MXFP4_KO per-sub twin (row 18).
 DECL_DENSE_INT8_ALL(mxfp4_ko_int8)
 // Q2_KO 2-bit affine twin (row 19).
 DECL_DENSE_INT8_ALL(q2_ko_int8)
@@ -1330,7 +1330,7 @@ extern "C" __global__ void q6_ko_int8_f32_grouped(
 extern "C" __global__ void q8_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
     void*, int, int, int, int);
-// MXFP4_KO exponent-collapse twin (row 18).
+// MXFP4_KO per-sub twin (row 18).
 extern "C" __global__ void mxfp4_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
     void*, int, int, int, int);

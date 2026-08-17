@@ -1,11 +1,12 @@
 // =============================================================================
 // MXFP4_KO KERNEL INSTANTIATION  (q8a128 INT8-MMA path)
 // =============================================================================
-// Native-MXFP4 exponent-collapse weights × q8a128 int8 activations on the m16n8k32
+// Native-MXFP4 per-sub weights × q8a128 int8 activations on the m16n8k32
 // tensor core. MXFP4_KO is INT8-ONLY (no FP GEMX kernel): the routed
 // MXFP4-trained routed experts only ever run through this path. The int8 kernels
-// (grouped + dense) are fully generic over the block type — the only
-// format-specific code is the collapse dequant in ../loader/mxfp4.cuh.
+// (grouped + dense) are fully generic over the block type — the format-specific
+// code is the codebook dequant + per-sub scale load in ../loader/mxfp4.cuh and
+// the is_mxfp4_persub fold branch in ../kernel.cuh.
 //
 // The grouped (MoE) entry stores F32 (feeds the SwiGLU requantisation); the
 // dense entries store at the consumer's activation dtype (f16/bf16/f32).
