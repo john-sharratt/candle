@@ -1243,7 +1243,7 @@ extern "C" int run_quantized_matmul(
 #define DECLARE_GROUPED(name) \
     extern "C" __global__ void name##_grouped( \
         const void*, const void*, const void*, const void*, \
-        const void*, void*, int, int, int, int);
+        const void*, void*, int, int, int, int, int);
 #define DECLARE_GROUPED3(base) \
     DECLARE_GROUPED(base##_f16) DECLARE_GROUPED(base##_bf16) DECLARE_GROUPED(base##_f32)
 
@@ -1277,67 +1277,67 @@ static void* grouped_kernels[14][3] = {
 // grouped_kernels_int8[row].
 extern "C" __global__ void q4_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q8_0_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q4_0_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q4_1_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q5_0_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q5_1_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q5_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q6_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q3_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q2_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q8_1_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q8_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q_awq_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q_awq_g64_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 // KO byte-permuted twins (rows 14-17).
 extern "C" __global__ void q4_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q5_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q6_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 extern "C" __global__ void q8_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 // MXFP4_KO per-sub twin (row 18).
 extern "C" __global__ void mxfp4_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 // Q2_KO 2-bit affine twin (row 19).
 extern "C" __global__ void q2_ko_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,
-    void*, int, int, int, int);
+    void*, int, int, int, int, int);
 
 // Wide-Bm (mode-4 / mode-8) grouped twins — KO rows only (14-19): the int8
 // impl is KO-exclusive, and the wide tiles exist for the routed-expert
@@ -1347,10 +1347,10 @@ extern "C" __global__ void q2_ko_int8_f32_grouped(
 #define DECLARE_GROUPED_WIDE(name) \
     extern "C" __global__ void name##_grouped_m4( \
         const void*, const void*, const void*, const void*, const void*, \
-        void*, int, int, int, int); \
+        void*, int, int, int, int, int); \
     extern "C" __global__ void name##_grouped_m8( \
         const void*, const void*, const void*, const void*, const void*, \
-        void*, int, int, int, int);
+        void*, int, int, int, int, int);
 DECLARE_GROUPED_WIDE(q4_ko_int8_f32)
 DECLARE_GROUPED_WIDE(q5_ko_int8_f32)
 DECLARE_GROUPED_WIDE(q6_ko_int8_f32)
@@ -1429,7 +1429,8 @@ extern "C" void run_grouped_quantized_matmul(
     int32_t num_tiles,
     int32_t qtype,
     int32_t ytype,
-    int32_t n_sub)  // int8 token-tile width / 16: 2 (Bm 32), 4 (Bm 64), 8 (Bm 128)
+    int32_t n_sub,     // int8 token-tile width / 16: 2 (Bm 32), 4 (Bm 64), 8 (Bm 128)
+    int32_t row_fast)  // grid axis order: 1 = row tiles fast (see kernel entry doc)
 {
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
     if (kernel_row < 0 || ytype < 0 || ytype > 3 || num_tiles <= 0) {
@@ -1466,17 +1467,18 @@ extern "C" void run_grouped_quantized_matmul(
     }
 
     const int row_tiles = (nrows_x + 31) / 32;  // N_TILE = 32
-    // Row tiles on x (the fast axis): consecutively-scheduled blocks share one token
-    // tile's activation slab (L2-resident) and stream each expert's weight rows once
-    // — see quantized_matmul_grouped_entry. Token tiles ride y (bounded: ≤ a few
-    // thousand, far under the 65535 grid.y limit).
-    dim3 grid(row_tiles, num_tiles, 1);
+    // Grid axis order is the caller's per-launch choice (see the kernel entry doc):
+    // row_fast puts row tiles on x so consecutive blocks share one token tile's
+    // activation slab in L2; token-fast is the transpose. Whichever axis carries
+    // the token tiles is bounded (≤ a few thousand, far under the 65535 y limit).
+    dim3 grid = row_fast ? dim3(row_tiles, num_tiles, 1) : dim3(num_tiles, row_tiles, 1);
     dim3 block(WARP_SIZE, 4, 1);  // 128 threads (4 warps × 32)
 
     void* args[] = {
         (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
         (void*)&vy, (void*)&dst,
         (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
+        (void*)&row_fast,
     };
     cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
 }

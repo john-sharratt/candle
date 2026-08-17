@@ -2103,14 +2103,20 @@ static __device__ void quantized_matmul_dense_entry_int8(
 }
 
 // Grouped entry: decode (expert, batch-slice) from device tables and run one tile.
-//   grid = (row_tiles, total_tiles), block = 128 threads (4 warps × 32).
-// ROW TILES ARE THE FAST AXIS deliberately: consecutively-scheduled blocks are the
-// row-tiles of ONE token tile, so they share that tile's activation slab (~hundreds
-// of KB — L2-resident) and together stream each expert's weight rows exactly once.
-// With token tiles fast (the transpose), every row-tile wave re-streamed the WHOLE
-// stacked activation from DRAM (working set between reuses = all tiles × slab >> L2)
-// — ncu measured 12.6 GB of DRAM traffic per prefill-scale launch against a ~2.3 GB
-// minimum. Same blocks, same per-block work: the swap only changes schedule order.
+//   block = 128 threads (4 warps × 32); the GRID AXIS ORDER is a runtime choice:
+//   row_fast != 0 → grid = (row_tiles, total_tiles): consecutively-scheduled blocks
+//     are the row-tiles of ONE token tile, sharing that tile's activation slab
+//     (~hundreds of KB — L2-resident) and together streaming each expert's weight
+//     rows exactly once. The right order when the STACKED activation exceeds L2:
+//     with token tiles fast, every row-tile wave re-streamed the whole activation
+//     from DRAM — ncu measured 12.6 GB per prefill-scale launch vs a ~2.3 GB
+//     minimum.
+//   row_fast == 0 → grid = (total_tiles, row_tiles): token tiles fast, weight rows
+//     shared between consecutive blocks. The candidate order when the whole
+//     activation already fits L2 (residency is then free either way).
+// Both orders run the same blocks with the same per-block work — the choice only
+// changes schedule order, so outputs are bit-identical. The host picks per launch
+// from the activation working set vs L2 (see grouped_grid_row_fast in cuda.rs).
 template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t, int N_SUB = 1>
 static __device__ void quantized_matmul_grouped_entry(
     const uint64_t* __restrict__ weight_ptrs,  // [num_experts] device weight pointers
@@ -2119,11 +2125,11 @@ static __device__ void quantized_matmul_grouped_entry(
     const int* __restrict__ tile_b_cnt,        // [total_tiles] tokens in tile (1..16·N_SUB)
     const act_t* __restrict__ vy,
     output_t* __restrict__ dst,
-    int ncols_x, int nrows_x, int y_stride, int dst_stride)
+    int ncols_x, int nrows_x, int y_stride, int dst_stride, int row_fast)
 {
     using block_c_t = block_compact_t<block_q_t>;
 
-    const int tile = blockIdx.y;
+    const int tile = row_fast ? blockIdx.y : blockIdx.x;
     const int b_cnt = tile_b_cnt[tile];
     // A zero-count tile is padding: device-built tile tables (moe_bucketize.cu)
     // are launched at the `n_tokens × k` upper bound so the host never reads a
@@ -2135,7 +2141,7 @@ static __device__ void quantized_matmul_grouped_entry(
     const block_c_t* weights =
         reinterpret_cast<const block_c_t*>(static_cast<uintptr_t>(weight_ptrs[expert]));
     const int b_start = tile_b_start[tile];
-    const int row_tile_idx = blockIdx.x;
+    const int row_tile_idx = row_fast ? blockIdx.x : blockIdx.y;
 
     // Same decode / grid / store for every activation type; only the smem layout and
     // the per-tile compute differ. q8a128 → INT8 m16n8k32; FP → FP16 m16n8k16. N_SUB

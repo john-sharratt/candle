@@ -54,6 +54,34 @@ fn cached_sm_count(device: &CudaDevice) -> usize {
     *SM_COUNT.get_or_init(|| device.multiprocessor_count().unwrap_or(0))
 }
 
+/// Process-cached L2 size for the grouped grid-order choice — same memoization
+/// rationale (fixed device property, hot-path caller) as [`cached_sm_count`].
+/// `0` on query failure degrades safely: every activation then "exceeds" L2 and
+/// the launch takes the row-fast order, which is the safe default.
+fn cached_l2_bytes(device: &CudaDevice) -> usize {
+    use std::sync::OnceLock;
+    static L2_BYTES: OnceLock<usize> = OnceLock::new();
+    *L2_BYTES.get_or_init(|| device.l2_cache_size().unwrap_or(0))
+}
+
+/// Grid axis order for a grouped launch (see `quantized_matmul_grouped_entry`):
+/// row-tiles-fast whenever the stacked activation cannot stay L2-resident
+/// alongside the streaming weights — token-tiles-fast would then re-stream the
+/// whole activation from DRAM once per row-tile wave (measured 6× DRAM traffic
+/// amplification at prefill scale). When the activation comfortably fits L2,
+/// residency is free under either order and token-tiles-fast keeps consecutive
+/// blocks on the same weight rows instead. The half-L2 threshold leaves the
+/// other half for the weight stream, and `moe_layer_gemm_bench` (both layouts ×
+/// decode/cfg8/cfg20, 96 MiB L2) confirms it classifies every measured band
+/// correctly: token-fast wins at 2.7 MB (decode, +5%) and 48 MB (down cfg8,
+/// +5%); row-fast wins from 100 MB up (+28..40%). Mis-choosing costs 5% on the
+/// token-fast side of the line and 40% on the row-fast side, so the threshold
+/// deliberately sits well below the row-fast danger zone. Both orders are
+/// bit-identical (schedule only) — the crossover is a pure performance band.
+pub(crate) fn grouped_grid_row_fast(act_bytes: usize, device: &CudaDevice) -> bool {
+    act_bytes * 2 > cached_l2_bytes(device)
+}
+
 // ============================================================================
 // Host-Mapped / Pinned Memory Primitives
 // ============================================================================
@@ -4338,6 +4366,11 @@ fn grouped_matmul_gemx_impl<'w>(
             packed.extend_from_slice(&x.to_le_bytes());
         }
         let ring = table_ring(device)?;
+        let y_elem = match ytype {
+            YType::F32 => 4usize,
+            _ => 2, // F16 / BF16
+        };
+        let row_fast = grouped_grid_row_fast(total_batch * k * y_elem, device) as i32;
 
         macro_rules! dispatch_grouped {
             ($y_data:expr) => {{
@@ -4372,6 +4405,7 @@ fn grouped_matmul_gemx_impl<'w>(
                             qtype,
                             ytype as i32,
                             2, // FP grouped kernels ignore the int8 tile mode
+                            row_fast,
                         );
                     }
                 })?;
@@ -5377,6 +5411,8 @@ fn grouped_matmul_gemx_q8a128<'w>(
     } else {
         2
     };
+    // q8a128 activations are ~1 B/elem (int8 qs + per-128 scales).
+    let row_fast = grouped_grid_row_fast(total_batch * ncols, device);
     grouped_matmul_gemx_q8a128_with_mode(
         act_ptr,
         weight_ptrs,
@@ -5388,11 +5424,13 @@ fn grouped_matmul_gemx_q8a128<'w>(
         device,
         origin,
         n_sub,
+        row_fast,
     )
 }
 
-/// [`grouped_matmul_gemx_q8a128`] with the token-tile mode chosen by the
-/// caller — the test seam that proves the wide modes bit-equal mode-2.
+/// [`grouped_matmul_gemx_q8a128`] with the token-tile mode AND grid axis order
+/// chosen by the caller — the test seam that proves the wide modes and both
+/// grid orders bit-equal mode-2.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
     act_ptr: u64,
@@ -5405,6 +5443,7 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
     device: &CudaDevice,
     origin: Backing,
     n_sub: usize,
+    row_fast: bool,
 ) -> Result<crate::LiveTensor<'w>> {
     let num_experts = weight_ptrs.len();
     if num_experts == 0 {
@@ -5489,6 +5528,7 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
                     qtype,
                     YType::Q8A128 as i32,
                     n_sub as i32,
+                    row_fast as i32,
                 );
             }
         })?;
@@ -5658,6 +5698,8 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
         let (te, _g1) = tile_expert.device_ptr(&stream);
         let (tbs, _g2) = tile_b_start.device_ptr(&stream);
         let (tbc, _g3) = tile_b_cnt.device_ptr(&stream);
+        // q8a128 activations are ~1 B/elem.
+        let row_fast = grouped_grid_row_fast(total_batch * ncols, device) as i32;
         op.with_device_ptr(device, |act_ptr| {
             unsafe {
                 run_grouped_quantized_matmul(
@@ -5676,6 +5718,7 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
                     YType::Q8A128 as i32,
                     // moe_bucketize builds 32-wide tiles (decode regime).
                     2,
+                    row_fast,
                 );
             }
             Ok(())

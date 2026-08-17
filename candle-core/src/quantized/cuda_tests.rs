@@ -3770,7 +3770,13 @@ fn moe_layer_gemm_bench() -> Result<()> {
     let n_weights = 32usize;
     // (label, nrows=N, ncols=K)
     let shapes = [("gate/up", 2048usize, 7168usize), ("down", 7168, 2048)];
-    let regimes = [("cfg8", 3900usize * 6), ("cfg20", 8192 * 6)];
+    // decode = 64 sessions × top-6 ≈ 2 rows/expert: the small-activation band where
+    // the grid-order choice could flip (the whole activation fits L2 trivially).
+    let regimes = [
+        ("decode", 64usize * 6),
+        ("cfg8", 3900 * 6),
+        ("cfg20", 8192 * 6),
+    ];
 
     for &(label, nrows, ncols) in &shapes {
         // Random-byte KO weights: [K/128 chunks] × [N/8 row-groups] × 544B.
@@ -3802,41 +3808,45 @@ fn moe_layer_gemm_bench() -> Result<()> {
             let q8 = quantize_acts_q8a128_test(&dev, &act, total_batch, ncols)?;
 
             for n_sub in [2usize, 4, 8] {
-                let run = || -> Result<()> {
-                    q8.with_device_ptr(&dev, |act_ptr| {
-                        crate::quantized::cuda::grouped_matmul_gemx_q8a128_with_mode(
-                            act_ptr,
-                            &weight_ptrs,
-                            GgmlDType::MXFP4_KO,
-                            nrows,
-                            ncols,
-                            total_batch,
-                            &expert_offsets,
-                            &dev,
-                            Backing::Owned,
-                            n_sub,
-                        )
-                    })?;
-                    Ok(())
-                };
-                for _ in 0..3 {
-                    run()?;
+                for row_fast in [true, false] {
+                    let run = || -> Result<()> {
+                        q8.with_device_ptr(&dev, |act_ptr| {
+                            crate::quantized::cuda::grouped_matmul_gemx_q8a128_with_mode(
+                                act_ptr,
+                                &weight_ptrs,
+                                GgmlDType::MXFP4_KO,
+                                nrows,
+                                ncols,
+                                total_batch,
+                                &expert_offsets,
+                                &dev,
+                                Backing::Owned,
+                                n_sub,
+                                row_fast,
+                            )
+                        })?;
+                        Ok(())
+                    };
+                    for _ in 0..3 {
+                        run()?;
+                    }
+                    dev.synchronize()?;
+                    let iters = 20;
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        run()?;
+                    }
+                    dev.synchronize()?;
+                    let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                    // Minimum weight traffic: each expert's full matrix once.
+                    let min_w_gb = (n_experts * wbytes) as f64 / 1e9;
+                    let lay = if row_fast { "rowF" } else { "tokF" };
+                    println!(
+                        "{label:>7} {regime}: n_sub={n_sub} {lay}  {ms:8.3} ms/call  \
+                         min-weight-BW {:6.1} GB/s  ({total_batch} rows, ~{per}/expert)",
+                        min_w_gb / (ms / 1e3),
+                    );
                 }
-                dev.synchronize()?;
-                let iters = 20;
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    run()?;
-                }
-                dev.synchronize()?;
-                let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-                // Minimum weight traffic: each expert's full matrix once.
-                let min_w_gb = (n_experts * wbytes) as f64 / 1e9;
-                println!(
-                    "{label:>7} {regime}: n_sub={n_sub}  {ms:8.3} ms/call  \
-                     min-weight-BW {:6.1} GB/s  ({total_batch} rows, ~{per}/expert)",
-                    min_w_gb / (ms / 1e3),
-                );
             }
         }
     }
@@ -3886,7 +3896,7 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
         expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
     }
 
-    let run = |n_sub: usize| -> Result<Vec<f32>> {
+    let run = |n_sub: usize, row_fast: bool| -> Result<Vec<f32>> {
         let out = q8a128.with_device_ptr(&dev, |act_ptr| {
             crate::quantized::cuda::grouped_matmul_gemx_q8a128_with_mode(
                 act_ptr,
@@ -3899,21 +3909,29 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
                 &dev,
                 Backing::Owned,
                 n_sub,
+                row_fast,
             )
         })?;
         read_f32_tensor(&dev, &out)
     };
-    let m2 = run(2)?;
-    for n_sub in [4usize, 8] {
-        let wide = run(n_sub)?;
-        assert_eq!(m2.len(), wide.len());
-        let diff = m2.iter().zip(&wide).filter(|(a, b)| a != b).count();
-        assert_eq!(
-            diff,
-            0,
-            "n_sub={n_sub} diverged from mode-2 on {diff} of {} outputs",
-            m2.len()
-        );
+    // Both grid axis orders must be bit-identical too (schedule order only) —
+    // every (mode, order) combination lands on the same outputs.
+    let m2 = run(2, true)?;
+    for n_sub in [2usize, 4, 8] {
+        for row_fast in [true, false] {
+            if n_sub == 2 && row_fast {
+                continue; // the reference itself
+            }
+            let wide = run(n_sub, row_fast)?;
+            assert_eq!(m2.len(), wide.len());
+            let diff = m2.iter().zip(&wide).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                diff,
+                0,
+                "n_sub={n_sub} row_fast={row_fast} diverged from mode-2 on {diff} of {} outputs",
+                m2.len()
+            );
+        }
     }
     Ok(())
 }
@@ -7622,6 +7640,7 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
                     qtype,
                     YType::BF16 as i32,
                     2, // FP grouped kernels ignore the int8 tile mode
+                    1, // row-fast grid order
                 );
             }
             Ok(())

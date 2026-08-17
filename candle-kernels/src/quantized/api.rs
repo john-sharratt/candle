@@ -219,8 +219,10 @@ extern "C" {
     /// - `vy`: stacked activations `[total_batch, K]`
     /// - `dst`: stacked output `[total_batch, N]`
     ///
-    /// `ncols_x = K`, `nrows_x = N`, `y_stride = K`, `dst_stride = N`. The grid is
-    /// `(num_tiles, ceil(N/32))` — one block per (expert-tile, row-tile), one launch.
+    /// `ncols_x = K`, `nrows_x = N`, `y_stride = K`, `dst_stride = N`. One block per
+    /// (expert-tile, row-tile), one launch; `row_fast` picks the grid axis order
+    /// (1 = row tiles on x, the L2-friendly order when the stacked activation
+    /// exceeds L2 — both orders are bit-identical, schedule only).
     pub fn run_grouped_quantized_matmul(
         weight_ptrs: *const c_void,
         tile_expert: *const c_void,
@@ -239,6 +241,7 @@ extern "C" {
         // The tile tables must be built at 16·n_sub; wide modes exist for the
         // KO rows only (the caller gates on `is_ko`). FP paths ignore it.
         n_sub: i32,
+        row_fast: i32,
     );
 
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).
