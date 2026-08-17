@@ -5320,9 +5320,17 @@ fn grouped_matmul_gemx_q8a128<'w>(
         .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
         .count();
     let avg_rows = if active == 0 { 0 } else { total_batch / active };
+    // Mode choice is BENCH-derived (`moe_layer_gemm_bench`, real shapes:
+    // 256 experts, gate/up [2048,7168] / down [7168,2048] MXFP4_KO): at
+    // ~91 rows/expert Bm-128 wins (29.3 vs 36.3 ms), but at ~192 rows/expert
+    // Bm-64 beats Bm-128 (52.9 vs 60.3 ms) — the widest tile loses more
+    // occupancy than its extra reuse pays back once several tiles per expert
+    // exist. The bands encode those two measured points.
     let n_sub: usize = if !weight_dtype.is_ko() {
         2
-    } else if avg_rows >= 96 {
+    } else if avg_rows >= 128 {
+        4
+    } else if avg_rows >= 64 {
         8
     } else if avg_rows >= 32 {
         4
