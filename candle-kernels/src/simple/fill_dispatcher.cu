@@ -44,6 +44,14 @@ extern "C" __global__ void fill_bf16(__nv_bfloat16*, __nv_bfloat16, size_t);
 extern "C" __global__ void fill_f8_e4m3(__nv_fp8_e4m3*, __nv_fp8_e4m3, size_t);
 
 // =============================================================================
+// Forward declarations: arange kernels (integer iota, all are __global__)
+// Signature: (buf, start, step, numel)
+// =============================================================================
+extern "C" __global__ void arange_u8(uint8_t*, uint8_t, uint8_t, size_t);
+extern "C" __global__ void arange_u32(uint32_t*, uint32_t, uint32_t, size_t);
+extern "C" __global__ void arange_i64(int64_t*, int64_t, int64_t, size_t);
+
+// =============================================================================
 // Forward declarations: copy2d kernels (all are __global__)
 // Signature: (src, dst, d1, d2, src_s, dst_s)
 // =============================================================================
@@ -141,6 +149,37 @@ extern "C" void run_fill_op(
         case 7: // i64
             fill_i64<<<grid, BLOCK_SIZE>>>((int64_t*)buf, (int64_t)value_bits, numel);
             break;
+    }
+}
+
+// =============================================================================
+// Dispatcher for arange operation (integer iota)
+// =============================================================================
+// buf[i] = start + i*step, exact integer arithmetic. INTEGER dtypes only
+// (5=u8, 6=u32, 7=i64): float aranges keep the host build, whose repeated-
+// addition rounding this closed form would not reproduce bit-for-bit.
+
+extern "C" void run_arange_op(
+    int32_t dtype,
+    void* buf,
+    uint64_t start_bits,
+    uint64_t step_bits,
+    size_t numel
+) {
+    if (numel == 0) return;
+    unsigned int grid = grid_size(numel);
+
+    switch (dtype) {
+        case 5: // u8
+            arange_u8<<<grid, BLOCK_SIZE>>>((uint8_t*)buf, (uint8_t)start_bits, (uint8_t)step_bits, numel);
+            break;
+        case 6: // u32
+            arange_u32<<<grid, BLOCK_SIZE>>>((uint32_t*)buf, (uint32_t)start_bits, (uint32_t)step_bits, numel);
+            break;
+        case 7: // i64
+            arange_i64<<<grid, BLOCK_SIZE>>>((int64_t*)buf, (int64_t)start_bits, (int64_t)step_bits, numel);
+            break;
+        default: return; // float dtypes deliberately unsupported — callers must not reach here
     }
 }
 

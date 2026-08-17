@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
+use candle_kernels::simple::fill::{run_arange_op, FillDType};
+use cudarc::driver::DevicePtr;
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +37,11 @@ pub struct CudaDevice {
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
+    /// Memoized device copies of small layout/info tables (dims+strides blobs the
+    /// strided kernels read). Keyed by contents: identical tables share one device
+    /// buffer instead of re-uploading per launch — the per-launch tiny H2D copies
+    /// were a measured WDDM submission storm. See [`Self::info_table`].
+    info_tables: Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -128,6 +135,95 @@ impl CudaDevice {
         Ok(Uploaded {
             slice: std::mem::ManuallyDrop::new(dst),
             backing,
+        })
+    }
+
+    /// Device copy of a small layout/info table (a dims/strides blob a strided kernel
+    /// reads), memoized by contents: the same table returns the same device buffer
+    /// instead of re-uploading. Launch-descriptor tables repeat across launches —
+    /// per-call uploads of them were a measured WDDM submission storm (tens of
+    /// thousands of 24-128 B copies per wave sweep), so steady-state waves must hit
+    /// the cache and perform NO upload at all.
+    ///
+    /// Cache entries are pool-owned (`Backing::Owned`), never arena leases: a cached
+    /// table outlives any single wave, and kernels only read it — the same legality
+    /// as reading pool-resident weights from a wave launch. A cache MISS allocates
+    /// from the pool mid-wave; misses only happen the first time a layout shape is
+    /// seen, so the steady-state wave path stays allocation-free. The map is cleared
+    /// wholesale when it grows past a bound (shape-dependent tables accumulate over
+    /// a long uptime); in-flight users hold their own `Arc`, so clearing is safe and
+    /// a re-upload is trivial.
+    pub fn info_table(&self, info: &[usize]) -> Result<Arc<Uploaded<usize>>> {
+        let mut cache = self.info_tables.lock().unwrap();
+        if let Some(t) = cache.get(info) {
+            return Ok(t.clone());
+        }
+        if cache.len() >= 8192 {
+            cache.clear();
+        }
+        let slice = self.memcpy_stod(info)?;
+        let t = Arc::new(Uploaded {
+            slice: std::mem::ManuallyDrop::new(slice),
+            backing: Backing::Owned,
+        });
+        cache.insert(info.to_vec(), t.clone());
+        Ok(t)
+    }
+
+    /// Generate an integer arange (`buf[i] = start + i*step`, exact integer arithmetic)
+    /// directly on the device — no host-side build, no tiny H2D upload. `Tensor::arange`
+    /// index tensors are hot-path gather indices, and per-call host uploads of them were
+    /// a measured WDDM submission storm. Integer dtypes only (U8/U32/I64); float aranges
+    /// keep the host build (its repeated-addition rounding is the documented semantics,
+    /// which the kernel's closed form would not reproduce bit-for-bit). Start/step are
+    /// passed as bits per `run_arange_op`.
+    pub fn arange_int(
+        &self,
+        dtype: DType,
+        start_bits: u64,
+        step_bits: u64,
+        len: usize,
+    ) -> Result<CudaStorage> {
+        let launch = |ptr: u64, fill_dtype: FillDType| unsafe {
+            run_arange_op(
+                fill_dtype as i32,
+                ptr as *mut std::ffi::c_void,
+                start_bits,
+                step_bits,
+                len,
+            );
+        };
+        let slice = match dtype {
+            DType::U8 => {
+                let s = unsafe { self.alloc::<u8>(len)? };
+                {
+                    let (ptr, _g) = s.device_ptr(&self.stream);
+                    launch(ptr, FillDType::U8);
+                }
+                CudaStorageSlice::U8(s)
+            }
+            DType::U32 => {
+                let s = unsafe { self.alloc::<u32>(len)? };
+                {
+                    let (ptr, _g) = s.device_ptr(&self.stream);
+                    launch(ptr, FillDType::U32);
+                }
+                CudaStorageSlice::U32(s)
+            }
+            DType::I64 => {
+                let s = unsafe { self.alloc::<i64>(len)? };
+                {
+                    let (ptr, _g) = s.device_ptr(&self.stream);
+                    launch(ptr, FillDType::I64);
+                }
+                CudaStorageSlice::I64(s)
+            }
+            _ => crate::bail!("arange_int: integer dtypes only, got {dtype:?}"),
+        };
+        Ok(CudaStorage {
+            slice,
+            device: self.clone(),
+            backing: Backing::Owned,
         })
     }
 }
@@ -328,6 +424,7 @@ impl CudaDevice {
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            info_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -492,6 +589,7 @@ impl BackendDevice for CudaDevice {
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            info_tables: Arc::new(Mutex::new(HashMap::new())),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -591,8 +689,7 @@ impl BackendDevice for CudaDevice {
             slice
         } else {
             let layout = Layout::contiguous(shape);
-            // A freshly-created uniform tensor: nothing to inherit from.
-            super::run_affine_ffi(&slice, self, &layout, up - lo, lo, Backing::Owned)?
+            super::run_affine_ffi(&slice, self, &layout, up - lo, lo)?
         };
         Ok(CudaStorage {
             slice,

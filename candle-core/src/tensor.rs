@@ -666,6 +666,39 @@ impl<'w> LiveTensor<'w> {
         if D::is_zero(&step) {
             bail!("step cannot be zero")
         }
+        // Integer aranges generate ON DEVICE where the backend supports it: these are
+        // hot-path gather indices, and building them on the host costs a tiny H2D
+        // upload per call (a measured WDDM submission storm). `start + i*step` is
+        // exact integer arithmetic — identical values to the accumulation loop below.
+        // Float aranges always take the host path: its repeated-addition rounding is
+        // the documented semantics, which the closed form would not reproduce.
+        let int_bits = |v: D| -> Option<u64> {
+            match v.to_scalar() {
+                crate::scalar::Scalar::U8(x) => Some(x as u64),
+                crate::scalar::Scalar::U32(x) => Some(x as u64),
+                crate::scalar::Scalar::I64(x) => Some(x as u64),
+                _ => None,
+            }
+        };
+        if let (Some(start_bits), Some(step_bits)) = (int_bits(start), int_bits(step)) {
+            // Count without materializing — the same loop semantics as the host build.
+            let mut len = 0usize;
+            let mut current = start;
+            if step >= D::zero() {
+                while current < end {
+                    len += 1;
+                    current += step;
+                }
+            } else {
+                while current > end {
+                    len += 1;
+                    current += step;
+                }
+            }
+            if let Some(storage) = device.arange_int_native(D::DTYPE, start_bits, step_bits, len)? {
+                return Ok(from_storage(storage, len, BackpropOp::none(), false));
+            }
+        }
         let mut data = vec![];
         let mut current = start;
         if step >= D::zero() {

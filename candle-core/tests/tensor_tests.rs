@@ -128,6 +128,19 @@ fn arange(device: &Device) -> Result<()> {
         Tensor::arange_step(5i64, 0i64, -1, device)?.to_vec1::<i64>()?,
         [5, 4, 3, 2, 1],
     );
+    assert_eq!(
+        Tensor::arange(3u32, 9u32, device)?.to_vec1::<u32>()?,
+        [3, 4, 5, 6, 7, 8],
+    );
+    assert_eq!(
+        Tensor::arange_step(7u32, 24u32, 5, device)?.to_vec1::<u32>()?,
+        [7, 12, 17, 22],
+    );
+    // Empty range: len 0, still a valid rank-1 tensor.
+    assert_eq!(
+        Tensor::arange(4u32, 4u32, device)?.to_vec1::<u32>()?,
+        [0u32; 0],
+    );
 
     if !device.is_metal() {
         assert_eq!(

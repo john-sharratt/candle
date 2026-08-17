@@ -88,6 +88,20 @@ extern "C" {
     /// - `numel`: Number of elements
     pub fn run_fill_op(dtype: i32, buf: *mut c_void, value_bits: u64, numel: usize);
 
+    /// Dispatches to the appropriate arange (integer iota) kernel.
+    ///
+    /// Writes `buf[i] = start + i*step` (exact integer arithmetic) into a contiguous
+    /// buffer of `numel` elements. INTEGER dtypes only (U8/U32/I64) — float aranges
+    /// keep the host build, whose repeated-addition rounding this closed form would
+    /// not reproduce bit-for-bit. Start/step are passed as bits like `run_fill_op`.
+    pub fn run_arange_op(
+        dtype: i32,
+        buf: *mut c_void,
+        start_bits: u64,
+        step_bits: u64,
+        numel: usize,
+    );
+
     /// Dispatches to the appropriate copy2d kernel.
     ///
     /// 2D strided copy operation.

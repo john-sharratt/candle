@@ -14,6 +14,19 @@ extern "C" __global__ void fill_i64(int64_t *buf, int64_t value, const size_t nu
 extern "C" __global__ void fill_f32(float *buf, float value, const size_t numel) { fill_with(buf, value, numel); }
 extern "C" __global__ void fill_f64(double *buf, double value, const size_t numel) { fill_with(buf, value, numel); }
 
+// Integer iota: buf[i] = start + i*step. Exact integer arithmetic — identical values to
+// a host-side accumulation loop, generated on-device so index tensors (`Tensor::arange`)
+// never round-trip through a host build + tiny H2D upload.
+template<typename T>
+__device__ void arange_with(T *buf, T start, T step, const size_t numel) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        buf[i] = (T)(start + (T)i * step);
+    }
+}
+extern "C" __global__ void arange_u8(uint8_t *buf, uint8_t start, uint8_t step, const size_t numel) { arange_with(buf, start, step, numel); }
+extern "C" __global__ void arange_u32(uint32_t *buf, uint32_t start, uint32_t step, const size_t numel) { arange_with(buf, start, step, numel); }
+extern "C" __global__ void arange_i64(int64_t *buf, int64_t start, int64_t step, const size_t numel) { arange_with(buf, start, step, numel); }
+
 template<typename T>
 __device__ void copy2d(const T *src, T *dst, uint32_t d1, uint32_t d2, uint32_t src_s, uint32_t dst_s) {
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;

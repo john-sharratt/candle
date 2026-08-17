@@ -509,6 +509,24 @@ impl Device {
         }
     }
 
+    /// Backend-native integer arange (`out[i] = start + i*step`), if this device can
+    /// generate it without a host build + upload. `None` means the caller must fall
+    /// back to the host path (CPU, Metal). Start/step are the integer's value bits.
+    pub(crate) fn arange_int_native(
+        &self,
+        dtype: DType,
+        start_bits: u64,
+        step_bits: u64,
+        len: usize,
+    ) -> Result<Option<Storage>> {
+        match self {
+            Device::Cuda(device) => Ok(Some(Storage::Cuda(
+                device.arange_int(dtype, start_bits, step_bits, len)?,
+            ))),
+            _ => Ok(None),
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),

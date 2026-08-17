@@ -112,6 +112,7 @@ use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits};
 use float8::F8E4M3;
 use half::{bf16, f16};
+use std::sync::Arc;
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
@@ -124,6 +125,10 @@ pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Out, OutS, S};
 
 pub enum SlicePtrOrNull<T> {
     Ptr(Uploaded<T>),
+    /// A cache-shared table ([`CudaDevice::info_table`]) — same launch-arg shape as
+    /// `Ptr`, but the buffer is owned by the device's info-table cache and shared
+    /// across launches, so there is nothing to free here.
+    Shared(Arc<Uploaded<T>>),
     Null,
 }
 
@@ -131,6 +136,7 @@ impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
             SlicePtrOrNull::Ptr(slice) => builder.arg(&**slice),
+            SlicePtrOrNull::Shared(slice) => builder.arg(&***slice),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -153,17 +159,15 @@ impl crate::scalar::Scalar {
 }
 
 impl SlicePtrOrNull<usize> {
-    /// The dims/stride blob a strided kernel reads, taken from `origin`'s arena.
-    ///
-    /// Built on the host, so there is no operand for provenance to follow — but
-    /// the blob is consumed by the same launch as the tensor it describes, so it
-    /// belongs on that tensor's span. Passing the operand's backing in is what
-    /// says so.
-    pub fn params_from_layout(dev: &CudaDevice, l: &Layout, origin: Backing) -> Result<Self> {
+    /// The dims/stride blob a strided kernel reads, served from the device's
+    /// memoized info-table cache ([`CudaDevice::info_table`]): layouts repeat
+    /// across launches, so the steady state is a cache hit with no upload and
+    /// no allocation at all.
+    pub fn params_from_layout(dev: &CudaDevice, l: &Layout) -> Result<Self> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.memcpy_stod_from(&[l.dims(), l.stride()].concat(), origin)?)
+            SlicePtrOrNull::Shared(dev.info_table(&[l.dims(), l.stride()].concat())?)
         };
         Ok(ds)
     }
@@ -396,7 +400,6 @@ fn run_affine_ffi(
     layout: &Layout,
     mul: f64,
     add: f64,
-    origin: Backing,
 ) -> Result<CudaStorageSlice> {
     let shape = layout.shape();
     let dims = shape.dims();
@@ -405,10 +408,10 @@ fn run_affine_ffi(
     let stream = dev.cuda_stream();
 
     // Prepare dims/strides info for non-contiguous tensors
-    let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
+    let info: Option<Arc<Uploaded<usize>>> = if layout.is_contiguous() {
         None
     } else {
-        Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
+        Some(dev.info_table(&[dims, layout.stride()].concat())?)
     };
     let info_ptr = match &info {
         Some(s) => {
@@ -484,7 +487,6 @@ fn run_unary_param_ffi(
     layout: &Layout,
     op: i32,
     param: f64,
-    origin: Backing,
 ) -> Result<CudaStorageSlice> {
     let shape = layout.shape();
     let dims = shape.dims();
@@ -493,10 +495,10 @@ fn run_unary_param_ffi(
     let stream = dev.cuda_stream();
 
     // Prepare dims/strides info for non-contiguous tensors
-    let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
+    let info: Option<Arc<Uploaded<usize>>> = if layout.is_contiguous() {
         None
     } else {
-        Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
+        Some(dev.info_table(&[dims, layout.stride()].concat())?)
     };
     let info_ptr = match &info {
         Some(s) => {
@@ -591,7 +593,7 @@ impl Map1 for Im2Col1D {
         let dims = shape.dims();
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
-        let ds = dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?;
+        let ds = dev.info_table(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
 
         // Get dtype for FFI dispatcher
@@ -658,7 +660,7 @@ impl Map1 for Im2Col {
         let dims = shape.dims();
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
-        let ds = dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?;
+        let ds = dev.info_table(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
 
         // Get dtype for FFI dispatcher
@@ -743,7 +745,7 @@ impl Map1Any for FastReduce<'_> {
         let dtype_i32 = dtype_to_fast_reduce_dtype(dtype);
 
         let stream = dev.cuda_stream();
-        let ds = dev.memcpy_stod_from(&[dims.as_slice(), stride.as_slice()].concat(), origin)?;
+        let ds = dev.info_table(&[dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
 
         if return_index {
@@ -940,10 +942,10 @@ impl<U: UnaryOpT> Map1 for U {
             let dtype_i32 = dtype_to_unary_dtype(dtype);
 
             // Prepare dims/strides info for non-contiguous tensors
-            let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
+            let info: Option<Arc<Uploaded<usize>>> = if layout.is_contiguous() {
                 None
             } else {
-                Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), origin)?)
+                Some(dev.info_table(&[dims, layout.stride()].concat())?)
             };
 
             let src_slice = &src.slice(start_offset..);
@@ -1013,7 +1015,7 @@ impl Map1 for IndexSelect<'_> {
 
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.memcpy_stod_from(&[ids_dims, ids_l.stride()].concat(), origin)?;
+        let ds = dev.info_table(&[ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -1596,7 +1598,7 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1661,7 +1663,7 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1775,7 +1777,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1841,7 +1843,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1916,7 +1918,7 @@ impl Map1 for Pool2D {
 
         // SAFETY: Set later by running the kernel.
         let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
 
         let stream = dev.cuda_stream();
         {
@@ -1989,7 +1991,7 @@ impl Map1 for UpsampleNearest2D {
 
         // SAFETY: Set later by running the kernel.
         let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
-        let ds = dev.memcpy_stod_from(&ds, origin)?;
+        let ds = dev.info_table(&ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
 
@@ -2087,10 +2089,8 @@ impl Map2 for WhereCond<'_> {
         let shape = ids_l.shape();
         let dims = shape.dims();
         let el = shape.elem_count();
-        let ds = dev.memcpy_stod_from(
-            &[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat(),
-            origin,
-        )?;
+        let ds =
+            dev.info_table(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
 
@@ -2233,13 +2233,12 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
             let dtype_i32 = dtype_to_binary_dtype(dtype);
 
             // Prepare dims and strides info for non-contiguous tensors
-            let info: Option<Uploaded<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
-                None
-            } else {
-                Some(
-                    dev.memcpy_stod_from(&[dims, lhs_l.stride(), rhs_l.stride()].concat(), origin)?,
-                )
-            };
+            let info: Option<Arc<Uploaded<usize>>> =
+                if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+                    None
+                } else {
+                    Some(dev.info_table(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+                };
 
             let lhs_slice = &lhs.slice(lhs_start..);
             let rhs_slice = &rhs.slice(rhs_start..);
@@ -2323,10 +2322,10 @@ impl Map2Any for Cmp {
         let dtype_i32 = dtype_to_binary_dtype(dtype);
 
         // Prepare dims and strides info for non-contiguous tensors
-        let info: Option<Uploaded<usize>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+        let info: Option<Arc<Uploaded<usize>>> = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod_from(&[dims, lhs_l.stride(), rhs_l.stride()].concat(), origin)?)
+            Some(dev.info_table(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
 
         let lhs_slice = &lhs.slice(lhs_start..);
@@ -3603,10 +3602,10 @@ impl BackendStorage for CudaStorage {
         let stream = dev.cuda_stream();
 
         // Prepare dims/strides info for non-contiguous tensors
-        let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
+        let info: Option<Arc<Uploaded<usize>>> = if layout.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), self.backing)?)
+            Some(dev.info_table(&[dims, layout.stride()].concat())?)
         };
         let info_ptr = match &info {
             Some(s) => {
@@ -3710,10 +3709,10 @@ impl BackendStorage for CudaStorage {
         let dst_dtype_i32 = dtype_to_cast(dtype);
 
         // Prepare dims/strides info for non-contiguous tensors
-        let info: Option<Uploaded<usize>> = if layout.is_contiguous() {
+        let info: Option<Arc<Uploaded<usize>>> = if layout.is_contiguous() {
             None
         } else {
-            Some(dev.memcpy_stod_from(&[dims, layout.stride()].concat(), self.backing)?)
+            Some(dev.info_table(&[dims, layout.stride()].concat())?)
         };
 
         // Use a helper macro to reduce repetition and properly scope the guards
@@ -3895,7 +3894,7 @@ impl BackendStorage for CudaStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = run_affine_ffi(&self.slice, &device, layout, mul, add, self.backing)?;
+        let slice = run_affine_ffi(&self.slice, &device, layout, mul, add)?;
         Ok(Self {
             slice,
             device,
@@ -3906,14 +3905,8 @@ impl BackendStorage for CudaStorage {
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         use kernels::simple::unary::UnaryParamOp;
         let device = self.device().clone();
-        let slice = run_unary_param_ffi(
-            &self.slice,
-            &device,
-            layout,
-            UnaryParamOp::Powf as i32,
-            e,
-            self.backing,
-        )?;
+        let slice =
+            run_unary_param_ffi(&self.slice, &device, layout, UnaryParamOp::Powf as i32, e)?;
         Ok(Self {
             slice,
             device,
@@ -3930,7 +3923,6 @@ impl BackendStorage for CudaStorage {
             layout,
             UnaryParamOp::Elu as i32,
             alpha,
-            self.backing,
         )?;
         Ok(Self {
             slice,
@@ -4040,14 +4032,11 @@ impl BackendStorage for CudaStorage {
 
         // Prepare dims and strides info for non-contiguous rhs
         // Note: lhs is guaranteed contiguous, but rhs may not be
-        let info: Option<Uploaded<usize>> = if rhs_l.is_contiguous() {
+        let info: Option<Arc<Uploaded<usize>>> = if rhs_l.is_contiguous() {
             None
         } else {
             // Only need dims and rhs_strides since lhs is contiguous
-            Some(device.memcpy_stod_from(
-                &[dims, lhs_l.stride(), rhs_l.stride()].concat(),
-                self.backing,
-            )?)
+            Some(device.info_table(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
 
         // Get lhs slice with offset for mutable access
@@ -4984,7 +4973,7 @@ impl BackendStorage for CudaStorage {
                     let stream = dev.cuda_stream();
 
                     // Prepare dims/strides info for non-contiguous tensors
-                    let info = dev.memcpy_stod(&[dims, src_l.stride()].concat())?;
+                    let info = dev.info_table(&[dims, src_l.stride()].concat())?;
                     let (info_ptr, _info_guard) = info.device_ptr(&stream);
 
                     let (src_ptr, _src_guard) = src.device_ptr(&stream);

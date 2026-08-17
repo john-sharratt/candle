@@ -20,6 +20,16 @@ impl CudaDevice {
     pub fn new_with_stream(_: usize) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
     }
+
+    pub fn arange_int(
+        &self,
+        _dtype: crate::DType,
+        _start_bits: u64,
+        _step_bits: u64,
+        _len: usize,
+    ) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
 }
 
 impl crate::backend::BackendStorage for CudaStorage {
