@@ -1928,12 +1928,17 @@ __device__ void grouped_matmul_impl_int8(
     const int threadID = lane & 3;
 
     // Software-pipelined load. Per-warp weight slot (RING_I8=1, reused — the dequant drains it to
-    // registers, freeing it for the next prefetch) + double-buffered activations (ping-pong). Each
-    // iteration prefetches tile k+1's weight chunk AND activation tile in ONE cp.async group, so
-    // their loads run during tile k's MMA; the activation barrier then waits only for warp skew,
-    // not load latency. No WAR barrier — the next tile lands in the other activation buffer.
-    // (Single-buffering mode-2's larger activation was measured to regress 7–14% at M=4096 — the
-    // intra-block overlap beats the occupancy it would buy back, so both modes double-buffer.)
+    // registers, freeing it for the next prefetch) + activation buffering by mode:
+    //   N_SUB ≤ 4: DOUBLE-buffered (ping-pong) — tile k+1's weight AND activation prefetch in one
+    //     cp.async group during tile k's MMA; the barrier waits only for warp skew, not load
+    //     latency. (Single-buffering mode-2 was measured to regress 7-14% at M=4096: at its
+    //     ~66% occupancy the intra-block overlap beats the occupancy the smem would buy back.)
+    //   N_SUB = 8: SINGLE-buffered — the 128-token double buffer costs ~35 KB of smem and caps
+    //     the kernel at 2 blocks/SM (ncu: 16.7% occupancy, nothing saturated — latency-bound).
+    //     Halving it doubles resident blocks; the exposed activation reload (L2-served, ~85% hit)
+    //     is covered by the extra block-level parallelism. Weight prefetch still overlaps the MMA
+    //     (the slot is freed by the dequant); only the activation reload waits on a WAR barrier.
+    constexpr int ABUF = (N_SUB >= 8) ? 1 : 2;
     constexpr int CB = int8_chunk_bytes<block_c_t>::value;   // one 8-row chunk
     uint8_t* my_slot = smem_W_flat + warp_id * CB;
 
@@ -1946,8 +1951,8 @@ __device__ void grouped_matmul_impl_int8(
     }
 
     for (int k_blk = 0; k_blk < k_blocks; ++k_blk) {
-        const int ab = k_blk & 1;        // this tile's activation buffer
-        const int nb = (k_blk + 1) & 1;  // next tile's buffer (held tile k-1, already consumed)
+        const int ab = (ABUF == 1) ? 0 : (k_blk & 1); // this tile's activation buffer
+        const int nb = (ABUF == 1) ? 0 : ((k_blk + 1) & 1); // next tile's buffer
         cp_async_wait_group<0>();        // tile k_blk (weight + activation) resident
 
         // Inline scales + up-front dequant: read this warp's chunk into registers. Intra-warp
@@ -1979,14 +1984,23 @@ __device__ void grouped_matmul_impl_int8(
         __syncthreads();  // RAW: tile k activation visible to all warps; also guarantees tile
                           // k-1's MMA (which read buffer nb) finished before we prefetch into nb.
 
-        // Prefetch tile k+1: weight chunk into the freed slot + activation into buffer nb, ONE
-        // cp.async group. Both overlap the MMA below (registers + buffer ab only). WAR-safe:
-        // slot freed by the dequant above; buffer nb consumed before the barrier above.
-        if (k_blk + 1 < k_blocks) {
-            load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
-            load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
-                                           smem_A_i8[nb], smem_A_ds[nb]);
-            cp_async_commit();
+        if constexpr (ABUF == 2) {
+            // Prefetch tile k+1: weight chunk into the freed slot + activation into buffer nb,
+            // ONE cp.async group. Both overlap the MMA below (registers + buffer ab only).
+            // WAR-safe: slot freed by the dequant above; buffer nb consumed before the barrier.
+            if (k_blk + 1 < k_blocks) {
+                load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
+                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
+                                               smem_A_i8[nb], smem_A_ds[nb]);
+                cp_async_commit();
+            }
+        } else {
+            // Single buffer: only the weight prefetch overlaps the MMA (its slot is already
+            // free). The activation reload waits for the WAR barrier after the sub-tile loop.
+            if (k_blk + 1 < k_blocks) {
+                load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
+                cp_async_commit();
+            }
         }
 
         // Per token sub-tile. The dequanted weight (b_frags + scales) is REUSED across all
@@ -2035,6 +2049,16 @@ __device__ void grouped_matmul_impl_int8(
                 frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0.y;
                 frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1.y;
                 frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1.y;
+            }
+        }
+
+        if constexpr (ABUF == 1) {
+            // WAR: every warp is done reading tile k's activation — safe to reload in place.
+            __syncthreads();
+            if (k_blk + 1 < k_blocks) {
+                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
+                                               smem_A_i8[0], smem_A_ds[0]);
+                cp_async_commit();
             }
         }
     }
@@ -2119,8 +2143,11 @@ static __device__ void quantized_matmul_grouped_entry(
     // the once-loaded weight over each 16-row sub-tile, partial sub-tiles writing nothing.
     if constexpr (std::is_same_v<act_t, block_q8a128>) {
         constexpr int BATCH_I8 = N_SUB * 16;
-        __shared__ __align__(16) int8_t smem_A_i8[2][BATCH_I8][KI8_STRIDE];   // double-buffered
-        __shared__ __align__(16) half2 smem_A_ds[2][BATCH_I8];
+        // Activation buffering matches the impl: double for N_SUB ≤ 4, single for N_SUB = 8
+        // (the 128-token double buffer capped occupancy at 2 blocks/SM — see the impl note).
+        constexpr int ABUF = (N_SUB >= 8) ? 1 : 2;
+        __shared__ __align__(16) int8_t smem_A_i8[ABUF][BATCH_I8][KI8_STRIDE];
+        __shared__ __align__(16) half2 smem_A_ds[ABUF][BATCH_I8];
         __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_c_t>::value];
         // KO-only int8 impl (inline-scale k1024). Non-KO → discarded (no-op kernel).
         if constexpr (is_scale_separate<block_c_t>::value) {

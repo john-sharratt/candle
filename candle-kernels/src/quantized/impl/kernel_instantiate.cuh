@@ -458,7 +458,7 @@ extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_grouped_m4( \
 }
 
 #define INSTANTIATE_KERNEL_GROUPED_INT8_M8(name, qk, qi, block_type, vdr, dst_t) \
-extern "C" __global__ void LAUNCH_BOUNDS_SMALL name##_grouped_m8( \
+extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
     const uint64_t* __restrict__ weight_ptrs, \
     const int* __restrict__ tile_expert, \
     const int* __restrict__ tile_b_start, \
