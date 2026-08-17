@@ -2079,7 +2079,14 @@ static __device__ void quantized_matmul_dense_entry_int8(
 }
 
 // Grouped entry: decode (expert, batch-slice) from device tables and run one tile.
-//   grid = (total_tiles, row_tiles), block = 128 threads (4 warps × 32).
+//   grid = (row_tiles, total_tiles), block = 128 threads (4 warps × 32).
+// ROW TILES ARE THE FAST AXIS deliberately: consecutively-scheduled blocks are the
+// row-tiles of ONE token tile, so they share that tile's activation slab (~hundreds
+// of KB — L2-resident) and together stream each expert's weight rows exactly once.
+// With token tiles fast (the transpose), every row-tile wave re-streamed the WHOLE
+// stacked activation from DRAM (working set between reuses = all tiles × slab >> L2)
+// — ncu measured 12.6 GB of DRAM traffic per prefill-scale launch against a ~2.3 GB
+// minimum. Same blocks, same per-block work: the swap only changes schedule order.
 template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t, int N_SUB = 1>
 static __device__ void quantized_matmul_grouped_entry(
     const uint64_t* __restrict__ weight_ptrs,  // [num_experts] device weight pointers
@@ -2092,7 +2099,7 @@ static __device__ void quantized_matmul_grouped_entry(
 {
     using block_c_t = block_compact_t<block_q_t>;
 
-    const int tile = blockIdx.x;
+    const int tile = blockIdx.y;
     const int b_cnt = tile_b_cnt[tile];
     // A zero-count tile is padding: device-built tile tables (moe_bucketize.cu)
     // are launched at the `n_tokens × k` upper bound so the host never reads a
@@ -2104,7 +2111,7 @@ static __device__ void quantized_matmul_grouped_entry(
     const block_c_t* weights =
         reinterpret_cast<const block_c_t*>(static_cast<uintptr_t>(weight_ptrs[expert]));
     const int b_start = tile_b_start[tile];
-    const int row_tile_idx = blockIdx.y;
+    const int row_tile_idx = blockIdx.x;
 
     // Same decode / grid / store for every activation type; only the smem layout and
     // the per-tile compute differ. q8a128 → INT8 m16n8k32; FP → FP16 m16n8k16. N_SUB

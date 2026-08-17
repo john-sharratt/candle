@@ -1466,7 +1466,11 @@ extern "C" void run_grouped_quantized_matmul(
     }
 
     const int row_tiles = (nrows_x + 31) / 32;  // N_TILE = 32
-    dim3 grid(num_tiles, row_tiles, 1);
+    // Row tiles on x (the fast axis): consecutively-scheduled blocks share one token
+    // tile's activation slab (L2-resident) and stream each expert's weight rows once
+    // — see quantized_matmul_grouped_entry. Token tiles ride y (bounded: ≤ a few
+    // thousand, far under the 65535 grid.y limit).
+    dim3 grid(row_tiles, num_tiles, 1);
     dim3 block(WARP_SIZE, 4, 1);  // 128 threads (4 warps × 32)
 
     void* args[] = {

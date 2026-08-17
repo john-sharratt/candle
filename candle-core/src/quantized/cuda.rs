@@ -41,6 +41,7 @@ use candle_kernels::quantized::{
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
 
 use super::int8_matmul_mode::q8a128_dense_use_mode2;
+use super::table_ring::table_ring;
 
 /// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
 /// device property; querying the driver attribute on every matmul would add an FFI call to the hot
@@ -4306,16 +4307,19 @@ fn grouped_matmul_gemx_impl<'w>(
         }
     }
     let num_tiles = tile_expert.len();
+    // Token tiles ride grid.y (row tiles are the fast axis for L2 reuse).
+    if num_tiles > 65535 {
+        crate::bail!("grouped_matmul_gemx: num_tiles={num_tiles} exceeds grid.y max 65535");
+    }
 
     {
         let stream = device.cuda_stream();
 
-        // Pack the weight-pointer array + all 3 i32 tile tables into ONE buffer
-        // and upload with a SINGLE memcpy — 4 tiny H2D copies collapse to 1,
-        // which is where most of the per-call dispatch overhead lives at small
-        // token counts. weight_ptrs (u64) go first (8-aligned at the cudaMalloc
-        // base); the three i32 tables follow at 4-aligned offsets. The kernel
-        // reads each table via base + offset.
+        // Pack the weight-pointer array + all 3 i32 tile tables into ONE blob.
+        // weight_ptrs (u64) go first (8-aligned at the 16-aligned ring slot);
+        // the three i32 tables follow at 4-aligned offsets. The kernel reads
+        // each table via base + offset, IN PLACE from the device-mapped pinned
+        // table ring — no per-launch H2D copy, no device allocation.
         let off_te = num_experts * 8;
         let off_tbs = off_te + num_tiles * 4;
         let off_tbc = off_tbs + num_tiles * 4;
@@ -4333,16 +4337,7 @@ fn grouped_matmul_gemx_impl<'w>(
         for &x in &tile_b_cnt {
             packed.extend_from_slice(&x.to_le_bytes());
         }
-        // The tile tables are read by the same launch as the activation they
-        // dispatch over, so they belong on the same span. A host-built table has
-        // no device operand to inherit from, so it names the arena the caller
-        // already resolved for this call's output.
-        let tables_dev = device.memcpy_stod_from(&packed, activations.backing)?;
-        let (base, _tg) = tables_dev.device_ptr(&stream);
-        let wptr_ptr = base;
-        let te_ptr = base + off_te as u64;
-        let tbs_ptr = base + off_tbs as u64;
-        let tbc_ptr = base + off_tbc as u64;
+        let ring = table_ring(device)?;
 
         macro_rules! dispatch_grouped {
             ($y_data:expr) => {{
@@ -4356,24 +4351,30 @@ fn grouped_matmul_gemx_impl<'w>(
                     }
                 };
                 let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                unsafe {
-                    run_grouped_quantized_matmul(
-                        wptr_ptr as *const std::ffi::c_void,
-                        te_ptr as *const std::ffi::c_void,
-                        tbs_ptr as *const std::ffi::c_void,
-                        tbc_ptr as *const std::ffi::c_void,
-                        y_ptr as *const std::ffi::c_void,
-                        dst_ptr as *mut std::ffi::c_void,
-                        k as i32,     // ncols_x = K
-                        nrows as i32, // nrows_x = N
-                        k as i32,     // y_stride = K (stacked activations)
-                        nrows as i32, // dst_stride = N (stacked output)
-                        num_tiles as i32,
-                        qtype,
-                        ytype as i32,
-                        2, // FP grouped kernels ignore the int8 tile mode
-                    );
-                }
+                ring.with_table(&packed, |base| {
+                    let wptr_ptr = base;
+                    let te_ptr = base + off_te as u64;
+                    let tbs_ptr = base + off_tbs as u64;
+                    let tbc_ptr = base + off_tbc as u64;
+                    unsafe {
+                        run_grouped_quantized_matmul(
+                            wptr_ptr as *const std::ffi::c_void,
+                            te_ptr as *const std::ffi::c_void,
+                            tbs_ptr as *const std::ffi::c_void,
+                            tbc_ptr as *const std::ffi::c_void,
+                            y_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            k as i32,     // ncols_x = K
+                            nrows as i32, // nrows_x = N
+                            k as i32,     // y_stride = K (stacked activations)
+                            nrows as i32, // dst_stride = N (stacked output)
+                            num_tiles as i32,
+                            qtype,
+                            ytype as i32,
+                            2, // FP grouped kernels ignore the int8 tile mode
+                        );
+                    }
+                })?;
             }};
         }
 
@@ -5438,12 +5439,15 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
         }
     }
     let num_tiles = tile_expert.len();
+    // Token tiles ride grid.y (row tiles are the fast axis for L2 reuse).
+    if num_tiles > 65535 {
+        crate::bail!("grouped_matmul_gemx_q8a128: num_tiles={num_tiles} exceeds grid.y max 65535");
+    }
 
     let (dst_ptr, owned_dst, out_backing) =
         resolve_typed_out::<f32>(origin, device, nrows * total_batch)?;
 
     {
-        let stream = device.cuda_stream();
         let off_te = num_experts * 8;
         let off_tbs = off_te + num_tiles * 4;
         let off_tbc = off_tbs + num_tiles * 4;
@@ -5461,35 +5465,33 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
         for &x in &tile_b_cnt {
             packed.extend_from_slice(&x.to_le_bytes());
         }
-        // The tile tables are read by the same launch as the activation they
-        // dispatch over, so they belong on the same span. A host-built table has
-        // no device operand to inherit from, so it names the arena the caller
-        // already resolved for this call's output.
-        let tables_dev = device.memcpy_stod_from(&packed, origin)?;
-        let (base, _tg) = tables_dev.device_ptr(&stream);
-        let wptr_ptr = base;
-        let te_ptr = base + off_te as u64;
-        let tbs_ptr = base + off_tbs as u64;
-        let tbc_ptr = base + off_tbc as u64;
-        unsafe {
-            crate::set_kernel_breadcrumb("run_grouped_quantized_matmul", file!(), line!());
-            run_grouped_quantized_matmul(
-                wptr_ptr as *const std::ffi::c_void,
-                te_ptr as *const std::ffi::c_void,
-                tbs_ptr as *const std::ffi::c_void,
-                tbc_ptr as *const std::ffi::c_void,
-                act_ptr as *const std::ffi::c_void,
-                dst_ptr as *mut std::ffi::c_void,
-                ncols as i32, // ncols_x = K
-                nrows as i32, // nrows_x = N
-                ncols as i32, // y_stride (unused by int8 kernel; ABI)
-                nrows as i32, // dst_stride = N
-                num_tiles as i32,
-                qtype,
-                YType::Q8A128 as i32,
-                n_sub as i32,
-            );
-        }
+        // The kernel reads the descriptor blob IN PLACE from the device-mapped
+        // pinned table ring — no per-launch H2D copy, no device allocation.
+        table_ring(device)?.with_table(&packed, |base| {
+            let wptr_ptr = base;
+            let te_ptr = base + off_te as u64;
+            let tbs_ptr = base + off_tbs as u64;
+            let tbc_ptr = base + off_tbc as u64;
+            unsafe {
+                crate::set_kernel_breadcrumb("run_grouped_quantized_matmul", file!(), line!());
+                run_grouped_quantized_matmul(
+                    wptr_ptr as *const std::ffi::c_void,
+                    te_ptr as *const std::ffi::c_void,
+                    tbs_ptr as *const std::ffi::c_void,
+                    tbc_ptr as *const std::ffi::c_void,
+                    act_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    ncols as i32, // ncols_x = K
+                    nrows as i32, // nrows_x = N
+                    ncols as i32, // y_stride (unused by int8 kernel; ABI)
+                    nrows as i32, // dst_stride = N
+                    num_tiles as i32,
+                    qtype,
+                    YType::Q8A128 as i32,
+                    n_sub as i32,
+                );
+            }
+        })?;
     }
 
     let out_shape: Shape = vec![total_batch, nrows].into();
@@ -5618,6 +5620,12 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
     }
     if launch_tiles == 0 {
         crate::bail!("grouped_qmatmul_dev_q8a128: launch_tiles must be > 0");
+    }
+    // Token tiles ride grid.y (row tiles are the fast axis for L2 reuse).
+    if launch_tiles > 65535 {
+        crate::bail!(
+            "grouped_qmatmul_dev_q8a128: launch_tiles={launch_tiles} exceeds grid.y max 65535"
+        );
     }
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
     let total_batch = op.rows;
