@@ -70,6 +70,13 @@ pub struct PipelineStats {
     /// show the model's time-varying resident-expert footprint. Seeded at cache
     /// construction and refreshed by the pipeline thread each classify.
     pub resident_vram_bytes: usize,
+    /// Gauge: span bytes the weight zone could concede to the KV side on demand
+    /// — `(capacity − floor) × slot_bytes`. The elastic boundary already cedes
+    /// this ground to stuck KV claims (`request_kv_ground`); publishing it lets
+    /// the prefill width cap count it as admissible instead of pre-slicing the
+    /// fleet at whatever happens to be standing free. Refreshed by the pipeline
+    /// thread each classify, like `resident_vram_bytes`.
+    pub zone_cedeable_bytes: usize,
 }
 
 impl PipelineStats {
@@ -85,16 +92,26 @@ impl PipelineStats {
             .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
-    /// Reset the per-interval tallies. The three **gauges** —
-    /// `resident_vram_bytes`, `warm_slots`, `total_experts` — survive it: they
-    /// describe the cache's shape rather than what it did since the last reset,
-    /// and an inline-mode cache (which never re-seeds them via a classify) would
-    /// otherwise read 0 forever.
+    /// Reset the per-interval tallies. The **gauges** —
+    /// `resident_vram_bytes`, `zone_cedeable_bytes`, `warm_slots`,
+    /// `total_experts` — survive it: they describe the cache's shape rather
+    /// than what it did since the last reset, and an inline-mode cache (which
+    /// never re-seeds them via a classify) would otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
-            let gauges = (s.resident_vram_bytes, s.warm_slots, s.total_experts);
+            let gauges = (
+                s.resident_vram_bytes,
+                s.zone_cedeable_bytes,
+                s.warm_slots,
+                s.total_experts,
+            );
             *s = Self::default();
-            (s.resident_vram_bytes, s.warm_slots, s.total_experts) = gauges;
+            (
+                s.resident_vram_bytes,
+                s.zone_cedeable_bytes,
+                s.warm_slots,
+                s.total_experts,
+            ) = gauges;
         }
     }
 

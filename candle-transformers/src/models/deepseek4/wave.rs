@@ -703,12 +703,24 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // tripling the per-wave fixed costs (the per-layer routing readback +
         // expert-set assembly) that ARE the prefill wall. The engine's pool
         // cushion is reserved at load for exactly this activation peak, so the
-        // real ceilings are compute saturation and what the KV side can admit.
+        // real ceilings are compute saturation and what the KV side can admit
+        // — which includes the expert ground the elastic boundary would cede
+        // (`reclaimable_kv_bytes` below).
         let mut cap = MAX_PREFILL_TOKENS;
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
             cap = cap.min(kv_fits);
         }
         cap
+    }
+
+    fn reclaimable_kv_bytes(&self) -> usize {
+        // The weight zone's capacity above its floor: `request_kv_ground` cedes
+        // it to stuck KV claims, so a prefill wave sized against it is
+        // admissible even when few KV regions stand free. Without this the
+        // pure-prefill slicer sized ingest sweeps against the ~332 load-time
+        // regions (~6.5k tokens) while ~39 GB of cedeable expert span sat
+        // uncounted; `MAX_PREFILL_TOKENS` remains the ceiling above.
+        self.engine.experts().cedeable_span_bytes()
     }
 
     fn maybe_change_dtype(&self, _dtype: DType) -> Result<()> {
@@ -2674,12 +2686,17 @@ mod tests {
             .with_speculative(5)
             .with_timeout_secs(1800);
 
+        // `16` is the wide-wave amortization config: at 8 contexts the fixed
+        // expert sweep still dominates the wall, so 16 is where the marginal
+        // per-token cost — and anything quietly serial in the wave — shows up
+        // as a bulk-t/s plateau instead of the ~2× the extra width should buy.
+        //
         // Trailing second `1`: by the end of the sweep the streaming expert
-        // cache's Markov transition matrix is warm (learned from the 1+4+8
+        // cache's Markov transition matrix is warm (learned from the 1+4+8+16
         // runs), so this final single-session pass reads the STEADY-STATE
         // single-token decode rate — the leading `1` reads it cold (predictor
         // untrained), and the gap between the two is the prefetch payoff.
-        let configs = [1usize, 4, 8, 1]
+        let configs = [1usize, 4, 8, 16, 1]
             .into_iter()
             .map(|n| TestConfig {
                 mode: InferenceMode::BF16,

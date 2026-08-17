@@ -1195,10 +1195,20 @@ impl PipelineState {
                     .unwrap_or(0);
                 occupied * slot_bytes
             };
+            // Ground the zone could concede to the KV side (capacity above its
+            // floor) — the prefill width cap reads this through the stats
+            // snapshot so it can admit waves the boundary would make room for.
+            let cedeable = self
+                .inner
+                .zone
+                .capacity()
+                .saturating_sub(self.inner.zone.min_capacity())
+                * self.inner.zone.slot_bytes();
             if let Ok(mut s) = self.stats.lock() {
                 s.expert_hits += num_hits;
                 s.expert_misses += num_loaded;
                 s.dma_loads += num_loaded;
+                s.zone_cedeable_bytes = cedeable;
                 #[cfg(feature = "cuda")]
                 {
                     s.resident_vram_bytes = resident_vram;

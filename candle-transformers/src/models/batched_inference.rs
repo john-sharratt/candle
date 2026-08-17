@@ -3057,7 +3057,17 @@ pub trait ManagedBatchedModel {
         if per_row_all_layers == 0 {
             return None;
         }
-        let rows = free.saturating_mul(candle_nn::kv_cache::REGION_BYTES) / per_row_all_layers;
+        // Admissible KV = what stands free PLUS what the model's elastic
+        // boundary would cede to a stuck claim ([`Self::reclaimable_kv_bytes`]).
+        // Counting only the free regions under-reports capacity by whatever the
+        // weight side happens to be holding above its floor (tens of GB on the
+        // streamed-expert engine) and pre-slices pure-prefill sweeps against a
+        // number the first stuck claim would have doubled. The result is still
+        // bounded above by `MAX_PREFILL_TOKENS` in the callers.
+        let kv_bytes = free
+            .saturating_mul(candle_nn::kv_cache::REGION_BYTES)
+            .saturating_add(self.reclaimable_kv_bytes());
+        let rows = kv_bytes / per_row_all_layers;
         // **Never zero.** A width cap of nought is not a narrow wave, it is no
         // wave — and once the KV side is full it would be permanent: no forward
         // runs, so nothing completes, so nothing is freed, so the cap stays at
@@ -3065,6 +3075,16 @@ pub trait ManagedBatchedModel {
         // claim and the relief pass behind it, both of which need a forward to
         // have been attempted.
         Some(rows.max(1))
+    }
+
+    /// KV-side bytes this model's memory layout could free ON DEMAND beyond
+    /// what stands free — e.g. an elastic weight/KV boundary that cedes expert
+    /// ground to a stuck KV claim. Counted by [`Self::kv_width_cap`] when
+    /// sizing a prefill wave, so the wave is sliced against what the partition
+    /// CAN admit, not what it happens to have standing free. `0` for models
+    /// with a static layout (nothing to cede).
+    fn reclaimable_kv_bytes(&self) -> usize {
+        0
     }
 
     /// Re-materialise every norm weight in the activation dtype — see
@@ -3551,14 +3571,20 @@ pub trait ManagedBatchedModel {
 ///
 /// This is a *throughput* limit, not a memory one: beyond roughly this width the
 /// prefill kernels are compute-bound, so a wider forward costs the same per token
-/// and slicing above it is free. A multiple of 32, for kernel utilisation.
+/// and slicing above it costs only the per-slab fixed wave overhead. A multiple
+/// of 32, for kernel utilisation. (16384 was tried against the [1,4,8,16,1]
+/// sweep and measured as a no-op there — that path's waves are shaped by the
+/// scheduler's turn admission, not this slicer — so the value stays at the
+/// established compute-saturation point until the pure-prefill ingest path is
+/// measured wider.)
 ///
 /// **It reserves nothing.** The transient tier is
 /// `WAVE_ATTN_BYTES + WAVE_FFN_BYTES + MIGRATION_STAGING_CAP_BYTES`, carved once
 /// at first use whatever this value is. Raising it does not cost VRAM; it permits
 /// a wider wave, and whether that wave *fits* is the separate question
-/// [`ManagedBatchedModel::prefill_width_cap`] asks the wave plan. The narrower of
-/// the two wins, so this can lead the span rather than having to trail it.
+/// [`ManagedBatchedModel::prefill_width_cap`] asks the wave plan (the KV-admission
+/// cap and the activation-pool cushion still bound the real wave). The narrower
+/// of the two wins, so this can lead the span rather than having to trail it.
 pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 
 /// Blanket implementation of `ManagedBatchedModel` for `BatchedInference<M>`.

@@ -1264,6 +1264,17 @@ impl ExpertCache {
         PipelineStats::snapshot(&self.stats)
     }
 
+    /// Span bytes the weight zone could concede to the KV side on demand —
+    /// the gauge the pipeline thread publishes each classify
+    /// (`PipelineStats::zone_cedeable_bytes`). Feeds the prefill width cap:
+    /// the elastic boundary cedes this ground to stuck KV claims
+    /// (`request_kv_ground`), so a wave sized against it is admissible even
+    /// when little KV ground is standing free. Reads 0 before the first
+    /// classify — the cold-start waves are far below any cap that matters.
+    pub fn cedeable_span_bytes(&self) -> usize {
+        PipelineStats::snapshot(&self.stats).zone_cedeable_bytes
+    }
+
     /// Reset all pipeline telemetry counters to zero.
     pub fn reset_expert_stats(&self) {
         PipelineStats::reset(&self.stats);
