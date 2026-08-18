@@ -959,6 +959,12 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        // The span is sized from the governor's measured capacity — without
+        // one, the governor-less test constant cannot hold a 32-layer model's
+        // arena floor plus the wave transient tier.
+        #[cfg(feature = "cuda")]
+        super::batched_model::ensure_vram_governor(device);
+
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
         let used_before = super::batched_model::driver_used_bytes(device);
@@ -1199,6 +1205,12 @@ impl ModelWeights {
         // Parse GGUF metadata from mmap (23x faster than reading from File!)
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // The span is sized from the governor's measured capacity — without
+        // one, the governor-less test constant cannot hold a 32-layer model's
+        // arena floor plus the wave transient tier.
+        #[cfg(feature = "cuda")]
+        super::batched_model::ensure_vram_governor(device);
 
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]

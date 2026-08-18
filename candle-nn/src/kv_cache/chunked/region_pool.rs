@@ -1500,12 +1500,22 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
         Placed::At(base) => Ok(base),
         Placed::Short(still_short) => {
             let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
+            let (span_bytes, floor_off, live_off, total, live) = with_pool(stream, |pool| {
+                Ok((
+                    pool.span_bytes,
+                    pool.weight_floor.saturating_sub(pool.span_base),
+                    pool.live_end().saturating_sub(pool.span_base),
+                    pool.total,
+                    pool.live,
+                ))
+            })?;
             candle::bail!(
                 "wave transient tier needs {len} B below the weight floor and is \
-                 {still_short} regions into ground live KV arenas hold. The weight side \
-                 could not concede them — it is at its own floor, the fewest slots the \
-                 expert cache can serve a token with — so this wave is too wide for a \
-                 partition that has nothing left to trade."
+                 {still_short} regions into ground live KV arenas hold, which cannot \
+                 move. The weight side could not concede them — it is at its own \
+                 floor — so this wave is too wide for a partition that has nothing \
+                 left to trade. (span {span_bytes} B, weight floor at +{floor_off} B, \
+                 arena frontier at +{live_off} B, {live}/{total} regions live)"
             )
         }
     }

@@ -105,6 +105,45 @@ pub(crate) fn driver_used_bytes(device: &Device) -> usize {
     }
 }
 
+/// Install the VRAM governor for `device` if none is registered yet.
+///
+/// **Every model loader must call this before anything allocates**: the KV
+/// region span is sized from the governor's balloon-measured capacity, and
+/// without one it falls back to the small governor-less test constant
+/// (`TEST_SPAN_BYTES`), which cannot hold a many-layer model's
+/// per-(layer × size-class) arena floor plus the wave transient tier —
+/// measured on Llama-2 7B F32: 146 live regions (~2.3 GiB of arenas) against
+/// a ~3 GiB span left the ~1 GiB tier 22 regions short of placeable.
+/// Idempotent (keyed on the device ordinal), so co-loaded models share one
+/// governor; failures degrade to a warning because a missing governor is
+/// survivable on small workloads and the span sizing reports its own refusal
+/// on large ones.
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_vram_governor(device: &Device) {
+    let gpu_id = match device.location() {
+        candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        _ => return,
+    };
+    if candle::vram::get(gpu_id).is_some() {
+        return;
+    }
+    match candle::vram::VramGovernor::from_device(device, gpu_id) {
+        Ok(gov) => {
+            let mut balloon = candle::vram::balloon::DeviceBalloonAllocator::new(device.clone());
+            match gov.run_balloon(&mut balloon) {
+                Ok(c) => tracing::info!(
+                    target: "candle_core::vram",
+                    "VRAM governor installed: capacity C={:.1}GB",
+                    c as f64 / 1e9
+                ),
+                Err(e) => tracing::warn!("VRAM governor balloon failed: {e}"),
+            }
+            candle::vram::install(gov);
+        }
+        Err(e) => tracing::warn!("VRAM governor init failed: {e}"),
+    }
+}
+
 /// The load-time shapes a wave's transient buffers are sized from.
 ///
 /// Deliberately **width-free**: a wave's row count is an argument to the sizing

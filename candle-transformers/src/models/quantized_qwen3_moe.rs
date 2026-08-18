@@ -1764,24 +1764,7 @@ impl ModelWeights {
             _ => 0,
         };
         #[cfg(feature = "cuda")]
-        if matches!(device, Device::Cuda(_)) && candle::vram::get(gpu_id).is_none() {
-            match candle::vram::VramGovernor::from_device(device, gpu_id) {
-                Ok(gov) => {
-                    let mut balloon =
-                        candle::vram::balloon::DeviceBalloonAllocator::new(device.clone());
-                    match gov.run_balloon(&mut balloon) {
-                        Ok(c) => tracing::info!(
-                            target: "candle_core::vram",
-                            "VRAM governor installed: capacity C={:.1}GB",
-                            c as f64 / 1e9
-                        ),
-                        Err(e) => tracing::warn!("VRAM governor balloon failed: {e}"),
-                    }
-                    candle::vram::install(gov);
-                }
-                Err(e) => tracing::warn!("VRAM governor init failed: {e}"),
-            }
-        }
+        super::batched_model::ensure_vram_governor(device);
 
         // Running total of the DENSE (non-expert) weight bytes this load puts on
         // the device — every tensor that goes through `load_tensor`, which is all
