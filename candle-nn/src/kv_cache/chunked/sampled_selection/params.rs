@@ -295,7 +295,7 @@ pub const PRODUCTION_K_QREL_HIGH_THRESHOLDS: [f32; 11] = [
     0.021735, // C7  (provisional)
     0.018771, // C8  (provisional)
     0.025236, // C9  (provisional)
-    0.031321, // C10 (provisional)
+    0.028884, // C10 (re-derived 2026-08-16, see the C10 note on the LOW table)
 ];
 
 #[rustfmt::skip]
@@ -310,7 +310,19 @@ pub const PRODUCTION_K_QREL_LOW_THRESHOLDS: [f32; 11] = [
     0.248296, // C7  (provisional)
     0.284827, // C8  (provisional)
     0.274433, // C9  (provisional)
-    0.453389, // C10 (provisional)
+    // C10: re-derived 2026-08-16 against the current unsloth Qwen3-8B-Q6_K
+    // snapshot. The original C10 row (K_HIGH 0.031321, K_LOW 0.453389,
+    // V_HIGH 0.024824, V_LOW 0.653093) was tuned 2026-05-05 against the
+    // April upload of that file; unsloth replaced the GGUF on May 9 and
+    // May 13, and against the replacement those values fail the gate's
+    // C10×5 StoryRewrite config 1/5 (deterministically, both int8 modes).
+    // Derivation: geometric interpolation from the C9 row (t=0) to the old
+    // C10 row (t=1), hi and lo probed separately. Measured pass/fail edges:
+    // hi in (0.75, 0.875], lo in (0.5, 0.625]. These values sit one 0.125
+    // step inside each edge — hi at t=0.625, lo at t=0.375 — trading the
+    // old 7.51x for 6.21x compression at 5/5 quality with margin on both
+    // sides, so a small upstream drift does not put the row back on an edge.
+    0.331283, // C10
 ];
 
 /// V high (strict) q-relevance error thresholds passed to the CUDA selection kernel.
@@ -327,7 +339,7 @@ pub const PRODUCTION_V_QREL_HIGH_THRESHOLDS: [f32; 11] = [
     0.024000, // C7
     0.022167, // C8
     0.023852, // C9
-    0.024824, // C10
+    0.024455, // C10 (re-derived 2026-08-16, see the C10 note on the K LOW table)
 ];
 
 /// V low (lenient) q-relevance error thresholds passed to the CUDA selection kernel.
@@ -344,7 +356,7 @@ pub const PRODUCTION_V_QREL_LOW_THRESHOLDS: [f32; 11] = [
     0.187766, // C7
     0.215390, // C8
     0.250035, // C9
-    0.653093, // C10
+    0.358398, // C10 (re-derived 2026-08-16, see the C10 note on the K LOW table)
 ];
 
 /// Mirror of the CUDA `k_threshold_scaled` device function.
