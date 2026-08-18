@@ -68,6 +68,10 @@ pub struct PipelineStats {
     /// prefetcher should issue earlier (deepen N); late ≈ 0 with falling
     /// precision means it should shallow back.
     pub late_loads: usize,
+    /// **Gauge**: the dynamic load-ahead depth `N` as of the last pass
+    /// boundary — how many layers ahead the speculative prefetcher currently
+    /// issues for.
+    pub prefetch_depth: usize,
     /// Total MoE work requests processed.
     pub work_requests: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
@@ -101,9 +105,10 @@ impl PipelineStats {
 
     /// Reset the per-interval tallies. The **gauges** —
     /// `resident_vram_bytes`, `zone_cedeable_bytes`, `warm_slots`,
-    /// `total_experts` — survive it: they describe the cache's shape rather
-    /// than what it did since the last reset, and an inline-mode cache (which
-    /// never re-seeds them via a classify) would otherwise read 0 forever.
+    /// `total_experts`, `prefetch_depth` — survive it: they describe the
+    /// cache's shape rather than what it did since the last reset, and an
+    /// inline-mode cache (which never re-seeds them via a classify) would
+    /// otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
             let gauges = (
@@ -111,6 +116,7 @@ impl PipelineStats {
                 s.zone_cedeable_bytes,
                 s.warm_slots,
                 s.total_experts,
+                s.prefetch_depth,
             );
             *s = Self::default();
             (
@@ -118,6 +124,7 @@ impl PipelineStats {
                 s.zone_cedeable_bytes,
                 s.warm_slots,
                 s.total_experts,
+                s.prefetch_depth,
             ) = gauges;
         }
     }

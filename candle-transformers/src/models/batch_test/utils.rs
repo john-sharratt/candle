@@ -1873,6 +1873,10 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.late_loads)),
             ),
             (
+                "Load-ahead N",
+                Box::new(|s: &PipelineStats| format!("{}", s.prefetch_depth)),
+            ),
+            (
                 "Fence stalls",
                 Box::new(|s: &PipelineStats| format!("{}", s.fence_stalls)),
             ),

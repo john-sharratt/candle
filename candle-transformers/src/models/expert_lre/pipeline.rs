@@ -104,6 +104,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // ============================================================================
+// Dynamic load-ahead (prefetch depth N) controller constants
+// ============================================================================
+
+/// Upper clamp on the dynamic prefetch depth `N`. Adjacent-chained prediction
+/// compounds precision per hop (~0.95×/hop from the 93–97% steady state), so
+/// beyond a few hops the extra DMA is mostly waste even when latency-bound.
+const PREFETCH_DEPTH_MAX: usize = 4;
+
+/// Deepen only when the pass's achieved copy bandwidth sits below this
+/// fraction of the empirical ceiling. Late loads WITHOUT slack mean the link
+/// is saturated — bandwidth-bound, not latency-bound — and issuing earlier
+/// would only queue more bytes in front of the ones already late.
+const PREFETCH_BW_SLACK: f32 = 0.8;
+
+/// Shallow back when a pass finishes with zero late loads and its prediction
+/// precision fell below this floor: the extra hops are landing in time but
+/// loading the wrong experts, so the depth is buying waste, not coverage.
+const PREFETCH_PRECISION_FLOOR: f32 = 0.8;
+
+// ============================================================================
 // Page-cache management helpers (legacy, only for non-CUDA mmap path)
 // ============================================================================
 
@@ -1019,6 +1039,29 @@ pub(crate) struct PipelineState {
     /// implies completion of everything enqueued before it), and at most one
     /// entry per target layer ever exists.
     pub(crate) prefetch_fences: Vec<(usize, CopyBatchFence)>,
+    /// Dynamic load-ahead depth `N`: how many layers ahead of the wave the
+    /// speculative prefetcher issues for. Starts at 1; adapted once per pass
+    /// by [`PipelineState::adapt_prefetch_depth`] on the late-load /
+    /// bandwidth-slack signals, clamped to `1..=PREFETCH_DEPTH_MAX`.
+    pub(crate) prefetch_depth: usize,
+    /// Wall-clock start of the current forward pass (set at each pass
+    /// boundary) — the denominator of the achieved-bandwidth measurement.
+    pub(crate) pass_started: Option<std::time::Instant>,
+    /// Copy-stream bytes enqueued this pass: demand misses + speculative
+    /// prefetch + hint loads, priced at the zone's slot size.
+    pub(crate) pass_dma_bytes: usize,
+    /// In-flight prefetched experts that were late this pass (the per-pass
+    /// slice of [`PipelineStats::late_loads`]).
+    pub(crate) pass_late: usize,
+    /// Per-pass prediction precision counters `(hits, total)` — the per-pass
+    /// slice of `predicted_hits` / `predicted_total`.
+    pub(crate) pass_pred: (usize, usize),
+    /// Empirical achieved-bandwidth ceiling: running max of per-pass achieved
+    /// GB/s. Self-calibrating and inclusive of every real-world overhead
+    /// (WDDM, copy-stream contention), unlike the theoretical PCIe link rate,
+    /// which is never reachable here and would make the controller
+    /// over-deepen chasing it.
+    pub(crate) bw_ceiling_gbps: f32,
     /// Prediction accuracy counters: (hints_sent, hits_in_actual_set).
     pub(crate) hint_stats: (usize, usize),
     /// Timing accumulator for pipeline spans.
@@ -1187,6 +1230,7 @@ impl PipelineState {
             }
             return Err(e);
         }
+        self.pass_dma_bytes += loaded_slots.len() * self.inner.zone.slot_bytes();
 
         // ── Record single fence event ──
         let fence = {
@@ -1594,6 +1638,60 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Adapt the load-ahead depth `N` at a pass boundary, from the pass that
+    /// just finished:
+    ///
+    /// * **Deepen** (`N+1`, ≤ [`PREFETCH_DEPTH_MAX`]) when the pass had late
+    ///   loads AND bandwidth slack — prefetches were issued but did not land
+    ///   in time while the link had headroom, so issuing a layer earlier
+    ///   converts the latency into overlap. Late loads WITHOUT slack are
+    ///   bandwidth-bound: deepening would only queue more bytes ahead of the
+    ///   ones already late.
+    /// * **Shallow** (`N−1`, ≥ 1) when the pass had zero late loads and its
+    ///   prediction precision fell below [`PREFETCH_PRECISION_FLOOR`] — the
+    ///   depth is landing in time but loading the wrong experts.
+    ///
+    /// The bandwidth reference is the EMPIRICAL running max of per-pass
+    /// achieved GB/s ([`Self::bw_ceiling_gbps`]) rather than the theoretical
+    /// PCIe rate: WDDM and copy-stream contention make the theoretical number
+    /// unreachable, and a controller chasing it would deepen forever.
+    ///
+    /// Runs at every pass boundary; prefill passes self-select out of both
+    /// arms in practice — their wide DMA saturates the link (no slack) and
+    /// their compute window hides latency (no late loads) — so the depth is
+    /// effectively steered by the decode-shaped passes, as intended.
+    fn adapt_prefetch_depth(&mut self) {
+        let elapsed = self.pass_started.take().map(|t| t.elapsed().as_secs_f32());
+        let late = self.pass_late;
+        let bytes = self.pass_dma_bytes;
+        let (pred_hits, pred_total) = self.pass_pred;
+        self.pass_late = 0;
+        self.pass_dma_bytes = 0;
+        self.pass_pred = (0, 0);
+
+        let Some(dt) = elapsed else { return };
+        if dt <= 0.0 {
+            return;
+        }
+        let achieved_gbps = bytes as f32 / dt / 1e9;
+        if achieved_gbps > self.bw_ceiling_gbps {
+            self.bw_ceiling_gbps = achieved_gbps;
+        }
+        let slack = achieved_gbps < PREFETCH_BW_SLACK * self.bw_ceiling_gbps;
+
+        if late > 0 && slack {
+            self.prefetch_depth = (self.prefetch_depth + 1).min(PREFETCH_DEPTH_MAX);
+        } else if late == 0
+            && pred_total > 0
+            && (pred_hits as f32) < PREFETCH_PRECISION_FLOOR * pred_total as f32
+        {
+            self.prefetch_depth = self.prefetch_depth.saturating_sub(1).max(1);
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.prefetch_depth = self.prefetch_depth;
+        }
+    }
+
     /// Process a single MoE work request: classify, DMA, compute, return output.
     pub(crate) fn process_request(&mut self, req: MoeWorkRequest) -> Result<Tensor> {
         if let Ok(mut s) = self.stats.lock() {
@@ -1605,7 +1703,11 @@ impl PipelineState {
             if req.moe_layer_idx <= last {
                 self.transition_matrix.reset_pass();
                 self.drain_prefetch_fences()?;
+                self.adapt_prefetch_depth();
             }
+        }
+        if self.pass_started.is_none() {
+            self.pass_started = Some(std::time::Instant::now());
         }
         self.last_moe_layer_idx = Some(req.moe_layer_idx);
 
@@ -1625,6 +1727,8 @@ impl PipelineState {
                 .count();
             self.hint_stats.0 += spec_for_layer.len();
             self.hint_stats.1 += hits;
+            self.pass_pred.0 += hits;
+            self.pass_pred.1 += spec_for_layer.len();
             if let Ok(mut s) = self.stats.lock() {
                 s.predicted_total += spec_for_layer.len();
                 s.predicted_hits += hits;
@@ -1662,6 +1766,7 @@ impl PipelineState {
         let t = profile_now();
         let late = self.wait_prefetch_fences_through(req.moe_layer_idx)?;
         if late && !spec_for_layer.is_empty() {
+            self.pass_late += spec_for_layer.len();
             if let Ok(mut s) = self.stats.lock() {
                 s.late_loads += spec_for_layer.len();
             }
@@ -1826,9 +1931,9 @@ impl PipelineState {
         // by then). An inline wait would serialize the prefetch on the pipe
         // thread and stall the next layer's work behind it.
         let t = profile_now();
-        if let Ok(prefetch_fence) = self.speculative_prefetch(moe_layer_idx, expert_ids) {
-            self.record_prefetch_fence(moe_layer_idx + 1, prefetch_fence);
-        }
+        // Advisory: a failed hop is dropped — the demand path loads whatever
+        // the chain missed. Each hop records its own fence internally.
+        let _ = self.speculative_prefetch(moe_layer_idx, expert_ids);
         self.profile.record("pipe_prefetch", t);
 
         // ── End-of-pass: score decay ──
@@ -2325,6 +2430,7 @@ impl PipelineState {
             if let Ok(mut s) = self.stats.lock() {
                 s.hint_loads += loaded_count;
             }
+            self.pass_dma_bytes += loaded_count * self.inner.zone.slot_bytes();
             // Fence the batch: hint loads install their slots IMMEDIATELY (so
             // the next work request classifies them as hits), but the H2D
             // copies are still in flight on the copy stream. Without a fence a
@@ -2359,62 +2465,81 @@ impl PipelineState {
         }
     }
 
-    /// Speculatively prefetch the experts the next MoE layer will need.
+    /// Speculatively prefetch the experts the next `prefetch_depth` MoE
+    /// layers will need, one confidence-gated hop at a time.
     ///
-    /// `predict_prefetch` chooses the set — the confidence-gated transition
-    /// prediction for a sparse (decode) source, or the *whole* next layer for a
-    /// dense (prefill) source so it can be double-buffered during this layer's
-    /// compute. Misses are loaded into free slots; when the cache is full, ONE
-    /// batched eviction (`evict_for_prefetch_batch`) frees the deficit from the
-    /// safest furthest-window victims (the just-computed "behind" layers / the
-    /// wave tail at the pinned boundary), D2H-ing each to the pinned pool. The
-    /// pinned head layers (`< PINNED_LAYERS`) are never prefetched — they are
-    /// always resident. Prefetched experts are tracked in `speculative_loads` so
-    /// the next layer's work request can score prediction precision.
+    /// Prediction stays ADJACENT — each hop asks the shared transition matrix
+    /// to predict `target` from the previous hop's set (hop 1 from the layer's
+    /// actual routing, hop 2 from hop 1's prediction, …), so precision
+    /// compounds per hop and the chain self-terminates the moment a hop
+    /// returns no confident prediction. Mispredictions cost slots and
+    /// bandwidth, never correctness — the demand path loads whatever the
+    /// chain missed. Each hop's DMA batch is fenced under ITS OWN target
+    /// layer in the fence ring, so a layer's compute blocks only on the
+    /// copies it will actually read, never on the deeper hops.
+    ///
+    /// The depth is the dynamic load-ahead `N` (see
+    /// [`Self::adapt_prefetch_depth`]) — 1 in steady state, deepened only
+    /// when late loads show the single-hop DMA is not landing in time.
+    ///
+    /// Two regimes, by the width of the wave that just computed:
+    ///
+    /// * A DECODE-width wave routes a handful of experts, so the next
+    ///   layer's set is genuinely uncertain — the confidence-gated top-k.
+    /// * A PREFILL-width wave routes most of the layer, and the next layer
+    ///   will too. NOTE: a full-next-layer arm for prefill-width waves was
+    ///   measured here and REGRESSED bulk throughput (cfg8 437→416): the
+    ///   batch runs on this pipeline thread inside `post_compute`, so the
+    ///   next layer's work request queues behind ~170 loads instead of
+    ///   overlapping them. Streaming the next layer needs its reads OFF this
+    ///   thread.
     fn speculative_prefetch(
         &mut self,
         moe_layer_idx: usize,
         current_expert_ids: &[usize],
+    ) -> Result<()> {
+        let mut source: Vec<usize> = current_expert_ids.to_vec();
+        for hop in 1..=self.prefetch_depth {
+            let target_layer = moe_layer_idx + hop;
+            if target_layer >= self.num_moe_layers {
+                break;
+            }
+            let predicted = self
+                .transition_matrix
+                .predict_prefetch(target_layer - 1, &source);
+            if predicted.is_empty() {
+                // No confident basis — nothing to load here and nothing to
+                // chain the next hop from.
+                break;
+            }
+            // Don't LOAD into a pinned layer — its experts are always
+            // resident (layers 0..PINNED_LAYERS run first every pass with no
+            // compute to hide a reload, so they stay permanently pinned). The
+            // prediction still chains through it.
+            if target_layer >= PINNED_LAYERS {
+                let fence = self.prefetch_into(moe_layer_idx, target_layer, &predicted)?;
+                self.record_prefetch_fence(target_layer, fence);
+            }
+            source = predicted;
+        }
+        Ok(())
+    }
+
+    /// Load the non-resident members of `predicted` into `target_layer`'s
+    /// slots from the warm/cold tiers, returning one fence covering the
+    /// batch's copy-stream DMA. Misses are loaded into free slots; when the
+    /// cache is full, ONE batched eviction (`evict_for_prefetch_batch`) frees
+    /// the deficit from the safest furthest-window victims behind
+    /// `issue_layer` — the wave's actual position — (the just-computed
+    /// "behind" layers; the wave tail at the pinned boundary). Prefetched
+    /// experts are tracked in `speculative_loads` so the target layer's work
+    /// request can score prediction precision.
+    fn prefetch_into(
+        &mut self,
+        issue_layer: usize,
+        target_layer: usize,
+        predicted: &[usize],
     ) -> Result<CopyBatchFence> {
-        let target_layer = moe_layer_idx + 1;
-        if target_layer >= self.num_moe_layers {
-            return Ok(CopyBatchFence::noop());
-        }
-
-        // Don't prefetch a pinned layer — its experts are always resident, so the
-        // load would be a NOOP. Layers 0..PINNED_LAYERS run first every pass with
-        // no compute to hide a reload, so they stay permanently pinned and are
-        // never prefetched. The first real prefetch is the pinned boundary: at
-        // layer PINNED_LAYERS-1 we prefetch layer PINNED_LAYERS.
-        if target_layer < PINNED_LAYERS {
-            return Ok(CopyBatchFence::noop());
-        }
-
-        // Two regimes, by the width of the wave that just computed:
-        //
-        // * A DECODE-width wave routes a handful of experts, so the next
-        //   layer's set is genuinely uncertain — ask the learned transition
-        //   matrix for its confidence-gated top-k.
-        // * A PREFILL-width wave routes most of the layer, and the next layer
-        //   will too — there is nothing to predict. Stream the WHOLE next
-        //   layer while this layer's FFN computes, which is what turns the
-        //   prefill's expert traffic from an on-demand stall inside every
-        //   `submit` into copy-stream DMA overlapped with compute. (Capacity
-        //   comes from the batch eviction below: the victims are layers behind
-        //   the wave, exactly the double-buffer the streaming sweep wants.)
-        // NOTE: a full-next-layer arm for prefill-width waves was measured
-        // here and REGRESSED bulk throughput (cfg8 437→416): the batch runs on
-        // this pipeline thread inside `post_compute`, so the next layer's work
-        // request queues behind ~170 loads instead of overlapping them, and
-        // its evictions churn residents the harness's later prefill waves
-        // reuse. Streaming the next layer needs its reads OFF this thread.
-        let predicted = self
-            .transition_matrix
-            .predict_prefetch(moe_layer_idx, current_expert_ids);
-        if predicted.is_empty() {
-            return Ok(CopyBatchFence::noop());
-        }
-
         // Misses: predicted experts not already resident in VRAM.
         let misses: Vec<usize> = predicted
             .iter()
@@ -2424,7 +2549,7 @@ impl PipelineState {
                     .inner
                     .key_to_slot
                     .get(&(target_layer, e))
-                    .map_or(false, |&s| self.inner.slots[s].is_some())
+                    .is_some_and(|&s| self.inner.slots[s].is_some())
             })
             .collect();
         if misses.is_empty() {
@@ -2441,7 +2566,7 @@ impl PipelineState {
             let need = misses.len().saturating_sub(self.inner.free_len());
             if need > 0 {
                 for (slot_idx, evicted_key) in
-                    self.inner.evict_for_prefetch_batch(moe_layer_idx, need)
+                    self.inner.evict_for_prefetch_batch(issue_layer, need)
                 {
                     self.note_eviction(evicted_key);
                     self.inner.put_free(slot_idx);
@@ -2522,16 +2647,17 @@ impl PipelineState {
         if let Ok(mut s) = self.stats.lock() {
             s.prefetch_loads += loaded;
         }
+        self.pass_dma_bytes += loaded * self.inner.zone.slot_bytes();
         // Prefetch funnel diagnostic: how demand narrows to actual loads —
-        // sources → transition predictions → non-resident misses → DMA'd.
-        // A wide wave stalling on demand DMA with `loaded ≈ 0` here means the
-        // predictor (not the load path) is the bottleneck. TRACE, not debug:
-        // it fires once per MoE layer per forward (up to 48 lines per decoded
-        // token), which floods a debug-level log.
+        // transition predictions → non-resident misses → DMA'd. A wide wave
+        // stalling on demand DMA with `loaded ≈ 0` here means the predictor
+        // (not the load path) is the bottleneck. TRACE, not debug: it fires
+        // once per MoE layer per forward (up to 48 lines per decoded token),
+        // which floods a debug-level log.
         tracing::trace!(
             target: "candle_transformers::expert_lre::prefetch",
-            layer = moe_layer_idx,
-            sources = current_expert_ids.len(),
+            layer = target_layer,
+            issued_at = issue_layer,
             predicted = predicted.len(),
             misses = misses.len(),
             loaded,
