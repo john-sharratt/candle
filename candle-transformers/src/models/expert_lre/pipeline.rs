@@ -1089,17 +1089,31 @@ impl PipelineState {
         }
 
         // Exact-demand eviction: free EXACTLY what this layer's misses need
-        // beyond the standing free list, in one batch scan scored at the real
-        // current layer, with this layer's hits off-limits. Eviction is a pure
-        // drop (cold pack authoritative, warm tier immutable), so nothing is
-        // gained by doing it ahead of demand — and the headroom guessing this
-        // replaces (per-layer drip + end-of-pass rate EMA) over-evicted by its
-        // estimate error and scored mid-pass victims as if the pass were at
+        // beyond the standing free list, in one batch scan preferring victims
+        // from the window of layers directly behind the wave, with this layer's
+        // hits AND the in-flight prefetch installs off-limits. Eviction is a
+        // pure drop (cold pack authoritative, warm tier immutable), so nothing
+        // is gained by doing it ahead of demand — and the headroom guessing
+        // this replaces (per-layer drip + end-of-pass rate EMA) over-evicted by
+        // its estimate error and scored mid-pass victims as if the pass were at
         // layer 0.
         let deficit = miss_ids.len().saturating_sub(self.inner.free_len());
         if deficit > 0 {
-            let hit_slots: Vec<usize> = hits.iter().map(|&(_, s)| s).collect();
-            for key in self.inner.demand_eviction(moe_idx, deficit, &hit_slots) {
+            // Protect set: this layer's hits (about to be computed with), plus
+            // every speculative install whose target layer has not consumed it
+            // yet (`speculative_loads` entries clear when their layer's request
+            // arrives). A just-installed prefetch has score ≈ 0 until its
+            // prediction validates — unprotected, it would be the first victim
+            // and its DMA a pure waste.
+            let mut protect: Vec<usize> = hits.iter().map(|&(_, s)| s).collect();
+            for &(layer, expert) in self.speculative_loads.iter() {
+                if let Some(&slot_idx) = self.inner.key_to_slot.get(&(layer, expert)) {
+                    if self.inner.slots[slot_idx].is_some() {
+                        protect.push(slot_idx);
+                    }
+                }
+            }
+            for key in self.inner.demand_eviction(moe_idx, deficit, &protect) {
                 #[cfg(feature = "cuda")]
                 self.note_eviction(Some(key));
                 #[cfg(not(feature = "cuda"))]
