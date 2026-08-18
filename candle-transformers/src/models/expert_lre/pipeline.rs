@@ -998,17 +998,27 @@ pub(crate) struct PipelineState {
     /// Set of `(layer_idx, expert_idx)` pairs speculatively loaded via Hint.
     /// Cleared when the corresponding Work request arrives.
     pub(crate) speculative_loads: HashSet<(usize, usize)>,
-    /// Fence covering the most recent speculative DMA batch — prefetch loads
-    /// (recorded in `post_compute`) and hint loads (recorded in
-    /// `process_hint`). Recorded WITHOUT waiting — the DMA overlaps the
-    /// forward thread's next-layer attention — and awaited at the next work
-    /// request's compute phase BEFORE hits are computed, by which point it has
-    /// usually already signalled. Speculatively-loaded slots install (and so
-    /// classify as hits) while their H2D is still in flight, so this wait is
-    /// what keeps a hit from computing on half-copied expert bytes; waiting
-    /// inline at load time instead would serialize the DMA on the pipe
-    /// thread, stalling the next layer's work behind it.
-    pub(crate) pending_prefetch_fence: CopyBatchFence,
+    /// Fences covering in-flight speculative DMA batches, keyed by TARGET
+    /// layer — prefetch loads (recorded in `post_compute` for `L+1`) and hint
+    /// loads (recorded in `process_hint` for the hinted layer). Recorded
+    /// WITHOUT waiting — the DMA overlaps the forward thread's next-layer
+    /// attention — and awaited when the covered layer's own work request
+    /// arrives, BEFORE its hits are computed, by which point it has usually
+    /// already signalled. Speculatively-loaded slots install (and so classify
+    /// as hits) while their H2D is still in flight, so this wait is what keeps
+    /// a hit from computing on half-copied expert bytes; waiting inline at
+    /// load time instead would serialize the DMA on the pipe thread, stalling
+    /// the next layer's work behind it.
+    ///
+    /// Per-layer keying is the load-ahead locking model: with prefetch depth
+    /// N, a layer blocks only on the fence for ITS experts, never on DMAs
+    /// issued for layers further ahead (a single latest-fence slot would
+    /// serialize the main stream behind every outstanding target). All
+    /// speculative copies share the one copy stream, so replacing a same-key
+    /// fence with a later event is safe (a later event on the same stream
+    /// implies completion of everything enqueued before it), and at most one
+    /// entry per target layer ever exists.
+    pub(crate) prefetch_fences: Vec<(usize, CopyBatchFence)>,
     /// Prediction accuracy counters: (hints_sent, hits_in_actual_set).
     pub(crate) hint_stats: (usize, usize),
     /// Timing accumulator for pipeline spans.
@@ -1321,7 +1331,7 @@ impl PipelineState {
     ///
     /// The load paths get this from [`CopyBatchFence`]: the batch records an
     /// event and whoever computes on the result waits for it
-    /// (`prefetch_fence`, `classified.fence`, `pending_prefetch_fence`). A
+    /// (`prefetch_fence`, `classified.fence`, `prefetch_fences`). A
     /// relocation has no such consumer — it is not answering a work request, it
     /// runs at end of pass and hands its slots to whatever comes next — so it
     /// waits here instead, immediately, rather than threading a fence to a
@@ -1530,6 +1540,60 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Record `fence` as covering the in-flight speculative DMAs whose
+    /// TARGET is `target_layer`. A no-op fence is dropped (nothing to
+    /// cover). A same-key entry is replaced — all speculative copies share
+    /// the one copy stream, so a later event implies completion of
+    /// everything enqueued before it.
+    fn record_prefetch_fence(&mut self, target_layer: usize, fence: CopyBatchFence) {
+        if !fence.is_real() {
+            return;
+        }
+        if let Some(entry) = self
+            .prefetch_fences
+            .iter_mut()
+            .find(|(l, _)| *l == target_layer)
+        {
+            entry.1 = fence;
+        } else {
+            self.prefetch_fences.push((target_layer, fence));
+        }
+    }
+
+    /// Wait (GPU-side) every prefetch fence whose target layer is at or
+    /// behind `layer`, removing them from the ring; fences for layers still
+    /// ahead stay pending so their DMAs keep overlapping compute. Returns
+    /// true when `layer`'s OWN fence had not yet signalled at the moment of
+    /// the wait — the prefetch was issued but did not land in time (a late
+    /// load, the latency-bound signal for the load-ahead controller).
+    fn wait_prefetch_fences_through(&mut self, layer: usize) -> Result<bool> {
+        let mut late = false;
+        let mut i = 0;
+        while i < self.prefetch_fences.len() {
+            if self.prefetch_fences[i].0 <= layer {
+                let (l, fence) = self.prefetch_fences.swap_remove(i);
+                if l == layer && !fence.is_complete() {
+                    late = true;
+                }
+                fence.wait(&self.device)?;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(late)
+    }
+
+    /// Wait every outstanding prefetch fence, whatever its target. Runs at a
+    /// pass boundary: the new pass reuses the same layer indices, so an
+    /// unconsumed fence from the old pass would otherwise sit ahead of the
+    /// wave and never be waited before its slots are computed as hits.
+    fn drain_prefetch_fences(&mut self) -> Result<()> {
+        for (_, fence) in std::mem::take(&mut self.prefetch_fences) {
+            fence.wait(&self.device)?;
+        }
+        Ok(())
+    }
+
     /// Process a single MoE work request: classify, DMA, compute, return output.
     pub(crate) fn process_request(&mut self, req: MoeWorkRequest) -> Result<Tensor> {
         if let Ok(mut s) = self.stats.lock() {
@@ -1540,6 +1604,7 @@ impl PipelineState {
         if let Some(last) = self.last_moe_layer_idx {
             if req.moe_layer_idx <= last {
                 self.transition_matrix.reset_pass();
+                self.drain_prefetch_fences()?;
             }
         }
         self.last_moe_layer_idx = Some(req.moe_layer_idx);
@@ -1586,15 +1651,21 @@ impl PipelineState {
         let classified = self.classify_and_load(req.moe_layer_idx, &req.expert_ids)?;
         self.profile.record("pipe_classify_load", t);
 
-        // ── Wait for the deferred speculative-prefetch fence BEFORE computing
-        // hits: a speculatively-loaded expert is installed (and classifies as a
-        // hit) while its H2D may still be in flight. The DMA overlapped the
-        // forward thread's attention window, so this is usually already
-        // signalled. ──
+        // ── Wait for this layer's deferred speculative-prefetch fence BEFORE
+        // computing hits: a speculatively-loaded expert is installed (and
+        // classifies as a hit) while its H2D may still be in flight. The DMA
+        // overlapped the forward thread's attention window, so this is usually
+        // already signalled; when it is NOT, the prefetch was issued too late
+        // to hide the latency — counted as late loads (one per in-flight
+        // install for the layer). Fences targeting layers still ahead are left
+        // pending so their DMAs keep overlapping compute. ──
         let t = profile_now();
-        let prefetch_fence =
-            std::mem::replace(&mut self.pending_prefetch_fence, CopyBatchFence::noop());
-        prefetch_fence.wait(&self.device)?;
+        let late = self.wait_prefetch_fences_through(req.moe_layer_idx)?;
+        if late && !spec_for_layer.is_empty() {
+            if let Ok(mut s) = self.stats.lock() {
+                s.late_loads += spec_for_layer.len();
+            }
+        }
         self.profile.record("pipe_prefetch_fence", t);
 
         // Helper: extract (token_ids, weight_ids) for a given expert.
@@ -1756,7 +1827,7 @@ impl PipelineState {
         // thread and stall the next layer's work behind it.
         let t = profile_now();
         if let Ok(prefetch_fence) = self.speculative_prefetch(moe_layer_idx, expert_ids) {
-            self.pending_prefetch_fence = prefetch_fence;
+            self.record_prefetch_fence(moe_layer_idx + 1, prefetch_fence);
         }
         self.profile.record("pipe_prefetch", t);
 
@@ -2259,15 +2330,19 @@ impl PipelineState {
             // copies are still in flight on the copy stream. Without a fence a
             // hit whose bytes are half-copied computes a garbage expert
             // contribution — an intermittent, hard-to-attribute quality bug.
-            // Recording into `pending_prefetch_fence` reuses the deferred-fence
-            // wait that runs before the next request's hit compute; replacing
-            // an older pending fence is safe because a later event on the same
-            // copy stream implies completion of everything enqueued before it.
+            // Recording into the fence ring under the hinted layer reuses the
+            // deferred wait that runs before that layer's hit compute;
+            // replacing an older same-key fence is safe because a later event
+            // on the same copy stream implies completion of everything
+            // enqueued before it.
             #[cfg(feature = "cuda")]
             if let (Some(cs), Device::Cuda(_)) = (&self.copy_stream, &self.device) {
                 match cs.record_event(None) {
                     Ok(event) => {
-                        self.pending_prefetch_fence = CopyBatchFence { event: Some(event) };
+                        self.record_prefetch_fence(
+                            layer_idx,
+                            CopyBatchFence { event: Some(event) },
+                        );
                     }
                     // No event → no deferred cover for the in-flight copies.
                     // Fall back to draining the copy stream inline: rare and

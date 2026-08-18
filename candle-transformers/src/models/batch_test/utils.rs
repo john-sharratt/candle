@@ -1869,6 +1869,10 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{:.1}%", s.prediction_precision())),
             ),
             (
+                "Late loads",
+                Box::new(|s: &PipelineStats| format!("{}", s.late_loads)),
+            ),
+            (
                 "Fence stalls",
                 Box::new(|s: &PipelineStats| format!("{}", s.fence_stalls)),
             ),

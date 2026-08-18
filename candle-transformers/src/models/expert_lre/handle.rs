@@ -640,7 +640,7 @@ impl ExpertCache {
             transition_matrix,
             last_moe_layer_idx: None,
             speculative_loads: HashSet::new(),
-            pending_prefetch_fence: CopyBatchFence::noop(),
+            prefetch_fences: Vec::new(),
             hint_stats: (0, 0),
             profile: ProfileAccumulator::new(),
             stats: stats.clone(),
