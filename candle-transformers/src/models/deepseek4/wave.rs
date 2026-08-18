@@ -217,6 +217,15 @@ pub struct DeepSeekBatched {
     /// back to verify-only (plain-decode-cost) steps while acceptance is below the economic
     /// threshold, with periodic probe steps so a workload shift re-enables drafting.
     spec_stats: RwLock<HashMap<usize, SpecStats>>,
+    /// Shared expert-miss tracker for the graduated draft width: `(last global
+    /// expert hits, last global expert misses, miss-rate EMA)`. Deltas of the
+    /// expert pipeline's counters between drafted steps give the recent
+    /// verify-wave miss rate; the EMA shaves the draft block down while the
+    /// cache is missing hard (every drafted token widens the verify wave's
+    /// routed-expert union, so at high miss rates draft width is a direct
+    /// expert-DMA multiplier). Global across sequences — the cache pressure it
+    /// measures is global.
+    spec_miss: RwLock<(usize, usize, f32)>,
     /// The target-model layer indices (0-based) whose per-token hidden states condition the DSpark
     /// drafter (paper Eq. 2, `dflash.target_layers`). Empty when no drafter is attached. When set,
     /// `forward_wave` captures `head_reduce(h)` at each of these layers and stashes their
@@ -254,6 +263,7 @@ impl DeepSeekBatched {
             verify_all_rows: RwLock::new(Vec::new()),
             verify_snap: RwLock::new(HashMap::new()),
             spec_stats: RwLock::new(HashMap::new()),
+            spec_miss: RwLock::new((0, 0, 0.0)),
             target_layers: Vec::new(),
         })
     }
@@ -2508,23 +2518,72 @@ impl ManagedBatchedModel for DeepSeekBatched {
         // rides the batched plain wave unless the text is VERY predictable,
         // which is exactly the arithmetic that maximizes tokens/sec.
         let min_accept = SPEC_MIN_ACCEPT + 0.45 * cohort.saturating_sub(1) as f32;
-        {
+        let accept_ema = {
             let mut stats = self
                 .spec_stats
                 .write()
                 .map_err(|_| candle::Error::Msg("spec_stats lock poisoned".into()))?;
-            if let Some(s) = stats.get_mut(&seq) {
-                if s.ema < min_accept {
-                    if s.fallback_steps < SPEC_PROBE_INTERVAL {
-                        s.fallback_steps += 1;
-                        return Ok(Vec::new());
+            match stats.get_mut(&seq) {
+                Some(s) => {
+                    if s.ema < min_accept {
+                        if s.fallback_steps < SPEC_PROBE_INTERVAL {
+                            s.fallback_steps += 1;
+                            return Ok(Vec::new());
+                        }
+                        s.fallback_steps = 0; // probe this step
+                    } else {
+                        s.fallback_steps = 0;
                     }
-                    s.fallback_steps = 0; // probe this step
-                } else {
-                    s.fallback_steps = 0;
+                    s.ema
                 }
+                // Fresh sequence: optimistic seed (matches the SpecStats
+                // insert) → full-width first draft.
+                None => SPEC_MIN_ACCEPT + 1.0,
             }
-        }
+        };
+
+        // ── Graduated draft width K ──
+        //
+        // Between "full speculation" and the plain-decode fallback above sits
+        // a continuum: every drafted token widens the verify wave's
+        // routed-expert union, so at high expert-miss rates draft width is a
+        // direct expert-DMA multiplier, and drafting far past the sequence's
+        // measured acceptance only buys rejected rows that still pay that
+        // cost. Two shaves, both measured:
+        //
+        // * Acceptance cap: the block never exceeds `ceil(EMA + 1)` — one
+        //   token of headroom above the measured accepted/step, so a
+        //   predictable stretch can still ratchet the EMA (and with it K)
+        //   back up to full width, while a sagging sequence narrows its
+        //   verify waves BEFORE the binary gate has to shut speculation off.
+        // * Miss shave: the shared verify-wave expert-miss EMA takes off up
+        //   to 2 more tokens as it climbs past 50% — speculating less under
+        //   cache pressure trades speculative reach for expert-DMA certainty.
+        //
+        // Lossless either way — K shapes cost and acceptance ceiling, never
+        // output. K ≥ 1 keeps probes meaningful; the τ confidence schedule
+        // below can still shorten the block further on its own signal.
+        let miss_ema = {
+            let st = self.engine.experts().expert_stats();
+            let mut g = self
+                .spec_miss
+                .write()
+                .map_err(|_| candle::Error::Msg("spec_miss lock poisoned".into()))?;
+            let (last_hits, last_misses, ema) = *g;
+            let dh = st.expert_hits.saturating_sub(last_hits);
+            let dm = st.expert_misses.saturating_sub(last_misses);
+            let ema = if dh + dm > 0 {
+                let rate = dm as f32 / (dh + dm) as f32;
+                SPEC_EMA_ALPHA * rate + (1.0 - SPEC_EMA_ALPHA) * ema
+            } else {
+                ema
+            };
+            *g = (st.expert_hits, st.expert_misses, ema);
+            ema
+        };
+        let k_accept = (accept_ema + 1.0).ceil() as usize;
+        let miss_shave = ((miss_ema - 0.5).max(0.0) * 4.0).round() as usize;
+        let draft_cap = k_accept.saturating_sub(miss_shave).clamp(1, max_len);
         // The block's first position (where `committed` will sit). The drafter conditions on a
         // sliding WINDOW of the last `window_size` target hiddens ending at `q_start-1` (the position
         // whose argmax produced `committed`) — matching DSparkAttention's main_kv ring. Gather the
@@ -2586,7 +2645,7 @@ impl ManagedBatchedModel for DeepSeekBatched {
             q_start,
             DSPARK_TAU,
         )?;
-        Ok(drafts.into_iter().take(max_len).collect())
+        Ok(drafts.into_iter().take(draft_cap).collect())
     }
 }
 
