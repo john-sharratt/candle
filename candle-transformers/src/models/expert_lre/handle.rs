@@ -619,6 +619,44 @@ impl ExpertCache {
             None
         };
 
+        // Arc-share the two source tiers and the geometry table with the
+        // off-thread expert streamer (both are immutable from here on), and
+        // spawn it — it owns its own staging ring and CUDA stream, so a
+        // whole-layer prefill stream never runs its reads on the pipeline
+        // thread. All-resident caches have nothing to stream.
+        #[cfg(feature = "cuda")]
+        let pack = Arc::new(pack);
+        #[cfg(feature = "cuda")]
+        let warm = Arc::new(warm);
+        #[cfg(feature = "cuda")]
+        let layer_geometries = Arc::new(layer_geometries);
+        #[cfg(feature = "cuda")]
+        let streamer = if all_resident {
+            None
+        } else if let Device::Cuda(cuda_dev) = device {
+            match cuda_dev.cuda_context().new_stream() {
+                Ok(stream) => {
+                    super::streamer::spawn_streamer_thread(super::streamer::StreamerCtx {
+                        pack: pack.clone(),
+                        warm: warm.clone(),
+                        layer_geometries: layer_geometries.clone(),
+                        cuda_dev: cuda_dev.clone(),
+                        stream,
+                        stats: stats.clone(),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "candle_transformers::expert_lre",
+                        "streamer stream unavailable ({e}); expert streaming disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let state = PipelineState {
             inner,
             device: device.clone(),
@@ -640,6 +678,12 @@ impl ExpertCache {
             transition_matrix,
             last_moe_layer_idx: None,
             speculative_loads: HashSet::new(),
+            #[cfg(feature = "cuda")]
+            streamer,
+            #[cfg(feature = "cuda")]
+            pending_streams: HashMap::new(),
+            #[cfg(feature = "cuda")]
+            stream_loads: HashSet::new(),
             prefetch_fences: Vec::new(),
             prefetch_depth: 1,
             pass_started: None,

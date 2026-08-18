@@ -72,6 +72,9 @@ pub struct PipelineStats {
     /// boundary — how many layers ahead the speculative prefetcher currently
     /// issues for.
     pub prefetch_depth: usize,
+    /// Experts loaded by the off-thread whole-layer streamer (their bytes
+    /// also count in `warm_loads` / `cold_loads` / `dma_loads` by source).
+    pub stream_loads: usize,
     /// Total MoE work requests processed.
     pub work_requests: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×

@@ -440,6 +440,15 @@ impl Drop for WarmPool {
 #[cfg(feature = "cuda")]
 unsafe impl Send for WarmPool {}
 
+// SAFETY: after the startup fill the pool is immutable by design (this file's
+// module doc: "static, immutable, a stratified subset") — the mutating
+// accessors (`slot_mut`, `span_mut`) are only reachable through `&mut self`,
+// and the pool is shared read-only via `Arc` (which makes `&mut` unreachable)
+// between the pipeline thread and the expert streamer. Concurrent `slot_ref`
+// reads of stable pinned memory are race-free.
+#[cfg(feature = "cuda")]
+unsafe impl Sync for WarmPool {}
+
 #[cfg(test)]
 mod tests {
     use super::stratified_membership;

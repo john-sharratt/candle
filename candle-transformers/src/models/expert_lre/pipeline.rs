@@ -78,6 +78,8 @@ use super::compute::QMatMul;
 use super::pack::{ExpertPack, PackRead, PackWriter, RecordLayout};
 #[cfg(feature = "cuda")]
 use super::pinned::{ExpertResidency, LayerGeometry, WarmPool};
+#[cfg(feature = "cuda")]
+use super::streamer::{StreamDone, StreamJob, StreamPlan, StreamerHandle};
 use super::transition::TransitionMatrix;
 #[cfg(not(feature = "cuda"))]
 use super::types::MoeInput;
@@ -99,7 +101,7 @@ use candle::{Device, Result, Tensor};
 use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, weight_floor_after};
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaEvent, CudaStream};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -125,6 +127,12 @@ const PREFETCH_LATE_FLOOR: usize = 2;
 /// batch — the measured full-next-layer dead end (cfg8 437→416) — while its
 /// long compute window already hides single-hop latency (late ≈ 0 at width).
 const PREFETCH_MULTI_HOP_MAX_SOURCES: usize = 32;
+
+/// Upper bound on one whole-layer stream plan. Bounds the plan's bus time to
+/// roughly one prefill layer's compute window (~64 slots × ~14 MB ≈ 0.9 GB ≈
+/// tens of ms at effective PCIe rates) — a bigger plan cannot land before its
+/// layer's request and only queues bytes in front of the demand path.
+const STREAM_MAX_JOBS: usize = 64;
 
 /// Deepen only when the pass's achieved copy bandwidth sits below this
 /// fraction of the empirical ceiling. Late loads WITHOUT slack mean the link
@@ -682,7 +690,7 @@ unsafe fn build_slot_from_repacked_on_stream_inner(
 ///
 /// As [`build_slot_from_repacked_with_device`].
 #[cfg(feature = "cuda")]
-unsafe fn build_slot_from_record_on_stream(
+pub(crate) unsafe fn build_slot_from_record_on_stream(
     record: &[u8],
     layout: RecordLayout,
     geom: &LayerGeometry,
@@ -840,7 +848,7 @@ impl ColdStaging {
 
     /// `n` distinct buffers (each waited-on if its last upload is still in
     /// flight), for one concurrent batch read. `n` must not exceed the ring.
-    fn acquire_many(&mut self, n: usize) -> Result<Vec<usize>> {
+    pub(crate) fn acquire_many(&mut self, n: usize) -> Result<Vec<usize>> {
         if n > self.bufs.len() {
             candle::bail!(
                 "cold staging: {n} buffers requested, ring holds {}",
@@ -852,7 +860,7 @@ impl ColdStaging {
 
     /// Mutable slices for a set of DISTINCT buffer indices, in the order given —
     /// the destinations of one `read_many` batch.
-    fn buffers_mut_for(&mut self, idxs: &[usize], len: usize) -> Result<Vec<&mut [u8]>> {
+    pub(crate) fn buffers_mut_for(&mut self, idxs: &[usize], len: usize) -> Result<Vec<&mut [u8]>> {
         let mut taken: Vec<Option<&mut StagingBuf>> = self.bufs.iter_mut().map(Some).collect();
         idxs.iter()
             .map(|&i| {
@@ -870,7 +878,7 @@ impl ColdStaging {
     }
 
     /// Record that buffer `idx` is the source of an upload that has not landed.
-    fn publish(&mut self, idx: usize, event: CudaEvent) {
+    pub(crate) fn publish(&mut self, idx: usize, event: CudaEvent) {
         self.events[idx] = Some(event);
     }
 
@@ -878,7 +886,7 @@ impl ColdStaging {
         self.bufs[idx].as_mut_slice(len)
     }
 
-    fn buffer_ref(&self, idx: usize, len: usize) -> &[u8] {
+    pub(crate) fn buffer_ref(&self, idx: usize, len: usize) -> &[u8] {
         self.bufs[idx].as_slice(len)
     }
 }
@@ -1004,12 +1012,15 @@ pub(crate) struct PipelineState {
     /// Secondary CUDA stream for DMA overlap.
     #[cfg(feature = "cuda")]
     pub(crate) copy_stream: Option<Arc<CudaStream>>,
-    /// The cold tier: every expert, always, in kernel-ready form.
+    /// The cold tier: every expert, always, in kernel-ready form. `Arc`
+    /// because the expert streamer reads it concurrently (positioned direct
+    /// reads + interior-locked record cache — `&self` throughout).
     #[cfg(feature = "cuda")]
-    pub(crate) pack: ExpertPack,
-    /// The warm tier: a stratified subset of the pack, pinned. Filled once.
+    pub(crate) pack: Arc<ExpertPack>,
+    /// The warm tier: a stratified subset of the pack, pinned. Filled once,
+    /// immutable after; `Arc`-shared read-only with the expert streamer.
     #[cfg(feature = "cuda")]
-    pub(crate) warm: WarmPool,
+    pub(crate) warm: Arc<WarmPool>,
     /// Pinned landing buffers for reads that miss both resident tiers.
     #[cfg(feature = "cuda")]
     pub(crate) cold_staging: ColdStaging,
@@ -1017,9 +1028,10 @@ pub(crate) struct PipelineState {
     /// over the pack, not a choice of one place.
     #[cfg(feature = "cuda")]
     pub(crate) residency: Vec<Vec<ExpertResidency>>,
-    /// Per-layer geometry (shapes, dtypes, repacked sizes).
+    /// Per-layer geometry (shapes, dtypes, repacked sizes). `Arc`-shared with
+    /// the expert streamer.
     #[cfg(feature = "cuda")]
-    pub(crate) layer_geometries: Vec<LayerGeometry>,
+    pub(crate) layer_geometries: Arc<Vec<LayerGeometry>>,
     /// Number of MoE layers.
     pub(crate) num_moe_layers: usize,
     /// True when all experts fit in VRAM — disables eviction & pinned pool.
@@ -1076,6 +1088,27 @@ pub(crate) struct PipelineState {
     /// which is never reachable here and would make the controller
     /// over-deepen chasing it.
     pub(crate) bw_ceiling_gbps: f32,
+    /// The off-thread expert streamer (whole-layer prefill streaming); `None`
+    /// when all experts are resident or its staging ring could not be
+    /// allocated. See `streamer.rs` for the protocol.
+    #[cfg(feature = "cuda")]
+    pub(crate) streamer: Option<StreamerHandle>,
+    /// In-flight stream plans keyed by TARGET layer — the receiver half of
+    /// each plan's one-shot outcome channel. Joined (blocking recv) when the
+    /// target layer's work request arrives, drained at pass boundaries. At
+    /// most one entry per layer (the issuer refuses a second plan while one
+    /// is pending).
+    #[cfg(feature = "cuda")]
+    pub(crate) pending_streams: HashMap<usize, mpsc::Receiver<StreamDone>>,
+    /// `(layer, expert)` pairs whose slots were installed at stream-issue
+    /// time and whose bytes may still be in flight. Kept out of
+    /// `speculative_loads` so whole-layer streaming does not poison the
+    /// transition predictor's precision statistics; protected from demand
+    /// eviction exactly like the speculative set, and cleared when the target
+    /// layer's request arrives (successful entries become ordinary residents;
+    /// failed ones were uninstalled at join).
+    #[cfg(feature = "cuda")]
+    pub(crate) stream_loads: HashSet<(usize, usize)>,
     /// Prediction accuracy counters: (hints_sent, hits_in_actual_set).
     pub(crate) hint_stats: (usize, usize),
     /// Timing accumulator for pipeline spans.
@@ -1164,23 +1197,35 @@ impl PipelineState {
         // this replaces (per-layer drip + end-of-pass rate EMA) over-evicted by
         // its estimate error and scored mid-pass victims as if the pass were at
         // layer 0.
-        let deficit = miss_ids.len().saturating_sub(self.inner.free_len());
-        if deficit > 0 {
-            // Protect set: this layer's hits (about to be computed with), plus
-            // every speculative install whose target layer has not consumed it
-            // yet (`speculative_loads` entries clear when their layer's request
-            // arrives). A just-installed prefetch has score ≈ 0 until its
-            // prediction validates — unprotected, it would be the first victim
-            // and its DMA a pure waste.
-            let mut protect: Vec<usize> = hits.iter().map(|&(_, s)| s).collect();
-            for &(layer, expert) in self.speculative_loads.iter() {
-                if let Some(&slot_idx) = self.inner.key_to_slot.get(&(layer, expert)) {
-                    if self.inner.slots[slot_idx].is_some() {
-                        protect.push(slot_idx);
-                    }
+        // Protect set: this layer's hits (about to be computed with), plus
+        // every in-flight speculative/streamed install whose target layer has
+        // not consumed it yet (both sets clear when their layer's request
+        // arrives). A just-installed prefetch has score ≈ 0 until its
+        // prediction validates — unprotected, it would be the first victim
+        // and its DMA a pure waste. For STREAMED installs protection is also
+        // a matter of correctness: their bytes move on the streamer's stream,
+        // so re-tenanting one from this thread's copy stream is an unordered
+        // write race.
+        let mut protect: std::collections::HashSet<usize> = hits.iter().map(|&(_, s)| s).collect();
+        #[cfg(feature = "cuda")]
+        let in_flight_iter = self
+            .speculative_loads
+            .iter()
+            .chain(self.stream_loads.iter());
+        #[cfg(not(feature = "cuda"))]
+        let in_flight_iter = self.speculative_loads.iter();
+        for &(layer, expert) in in_flight_iter {
+            if let Some(&slot_idx) = self.inner.key_to_slot.get(&(layer, expert)) {
+                if self.inner.slots[slot_idx].is_some() {
+                    protect.insert(slot_idx);
                 }
             }
-            for key in self.inner.demand_eviction(moe_idx, deficit, &protect) {
+        }
+
+        let deficit = miss_ids.len().saturating_sub(self.inner.free_len());
+        if deficit > 0 {
+            let protect_list: Vec<usize> = protect.iter().copied().collect();
+            for key in self.inner.demand_eviction(moe_idx, deficit, &protect_list) {
                 #[cfg(feature = "cuda")]
                 self.note_eviction(Some(key));
                 #[cfg(not(feature = "cuda"))]
@@ -1192,7 +1237,7 @@ impl PipelineState {
         // `allocate_slot` takes its free path; its per-miss eviction scans
         // remain only as the backstop for a scan that came up short.
         for expert_idx in miss_ids {
-            let (slot_idx, evicted_key) = self.inner.allocate_slot(moe_idx)?;
+            let (slot_idx, evicted_key) = self.inner.allocate_slot(moe_idx, &protect)?;
             #[cfg(feature = "cuda")]
             self.note_eviction(evicted_key);
             #[cfg(not(feature = "cuda"))]
@@ -1652,6 +1697,204 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Issue a whole-layer stream plan for `issue_layer + 1` — the
+    /// prefill-width analogue of the transition-matrix prefetch. Every
+    /// non-resident expert of the target layer gets a slot (capacity from the
+    /// behind-window batch eviction, then the free list; partial coverage is
+    /// fine — the demand path loads the rest), the slot VIEW is installed
+    /// immediately (so classify sees the experts as hits and never
+    /// double-loads), and the byte-moving goes to the streamer thread with a
+    /// compute-order event. The plan is joined when the target layer's
+    /// request arrives ([`Self::join_stream_for`]).
+    #[cfg(feature = "cuda")]
+    fn stream_next_layer(&mut self, issue_layer: usize) {
+        let target_layer = issue_layer + 1;
+        if target_layer >= self.num_moe_layers
+            || target_layer < PINNED_LAYERS
+            || self.streamer.is_none()
+            || self.pending_streams.contains_key(&target_layer)
+        {
+            return;
+        }
+        let Device::Cuda(cd) = self.device.clone() else {
+            return;
+        };
+
+        // Candidate misses: non-resident experts of the target layer that the
+        // model has ROUTED TO BEFORE (score > 0), highest-scored first, capped
+        // at what the compute window can carry. Streaming the literal whole
+        // layer was measured here: hit rate rose (57→62% at config-8) but the
+        // never-routed tail pushed total DMA volume up ~25% and the bus — not
+        // the thread — is the constraint, so every config regressed and
+        // virtually every stream fenced late. The score filter drops the
+        // never-routed tail; the cap bounds a plan's bus time to roughly one
+        // layer's compute window. Sources resolved NOW (the streamer carries
+        // no residency state).
+        let n_experts = self.residency[target_layer].len();
+        let mut misses: Vec<(usize, f32, Option<usize>)> = (0..n_experts)
+            .filter(|&e| {
+                !self
+                    .inner
+                    .key_to_slot
+                    .get(&(target_layer, e))
+                    .is_some_and(|&s| self.inner.slots[s].is_some())
+            })
+            .filter_map(|e| {
+                let score = self.inner.score(target_layer, e);
+                (score > 0.0).then(|| (e, score, self.residency[target_layer][e].ram))
+            })
+            .collect();
+        if misses.is_empty() {
+            return;
+        }
+        misses.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        misses.truncate(STREAM_MAX_JOBS);
+        let misses: Vec<(usize, Option<usize>)> =
+            misses.into_iter().map(|(e, _, ram)| (e, ram)).collect();
+
+        // Capacity: behind-window victims first (the double-buffer — the
+        // layers the wave just left), then whatever the free list holds.
+        // `take_free` stopping early bounds the plan to what the window could
+        // supply.
+        let need = misses.len().saturating_sub(self.inner.free_len());
+        if need > 0 {
+            for (slot_idx, evicted_key) in self.inner.evict_for_prefetch_batch(issue_layer, need) {
+                self.note_eviction(evicted_key);
+                self.inner.put_free(slot_idx);
+            }
+        }
+
+        let mut jobs: Vec<StreamJob> = Vec::with_capacity(misses.len());
+        for (expert_idx, warm_slot) in misses {
+            let Some(slot_idx) = self.inner.take_free() else {
+                break;
+            };
+            let slot_base = self.inner.slot_base(slot_idx);
+            // SAFETY: `slot_base` names the slot just taken from the zone.
+            // The view is pure geometry + address — the streamer moves the
+            // bytes underneath it, fenced before this layer computes.
+            let view = match unsafe {
+                build_slot_view(&self.layer_geometries[target_layer], &cd, slot_base)
+            } {
+                Ok(v) => v,
+                Err(_) => {
+                    self.inner.put_free(slot_idx);
+                    continue;
+                }
+            };
+            self.inner.install(slot_idx, target_layer, expert_idx, view);
+            self.residency[target_layer][expert_idx].vram = Some(slot_idx);
+            self.stream_loads.insert((target_layer, expert_idx));
+            jobs.push(StreamJob {
+                expert_idx,
+                slot_idx,
+                slot_base,
+                warm_slot,
+            });
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        // Order the streamer's writes after the compute that may still be
+        // reading the evicted tenants' bytes.
+        let after = cd.cuda_stream().record_event(None).ok();
+        let (done_tx, done_rx) = mpsc::channel::<StreamDone>();
+        let n_jobs = jobs.len();
+        let plan = StreamPlan {
+            target_layer,
+            jobs,
+            after,
+            done_tx,
+        };
+        let sent = self.streamer.as_ref().is_some_and(|s| s.send(plan));
+        if sent {
+            self.pending_streams.insert(target_layer, done_rx);
+            tracing::trace!(
+                target: "candle_transformers::expert_lre::streamer",
+                target_layer,
+                jobs = n_jobs,
+                "whole-layer stream issued"
+            );
+        } else {
+            // Streamer gone (thread died): take back every installed view so
+            // the demand path reloads honestly.
+            self.rollback_stream_installs(target_layer);
+        }
+    }
+
+    /// Join the pending stream plan for `layer`, if any: blocks until the
+    /// streamer has finished ENQUEUEING (usually already done — the reads
+    /// overlapped the previous layer's compute), uninstalls any failed jobs,
+    /// and records the plan's fence in the prefetch ring so the existing
+    /// wait-at-need path covers the still-in-flight DMA. Returns the number
+    /// of streamed installs for the layer (for late-load attribution).
+    #[cfg(feature = "cuda")]
+    fn join_stream_for(&mut self, layer: usize) -> usize {
+        let Some(rx) = self.pending_streams.remove(&layer) else {
+            return 0;
+        };
+        let t = profile_now();
+        match rx.recv() {
+            Ok(done) => {
+                for (expert_idx, slot_idx) in done.failed {
+                    if self.inner.slot_to_key[slot_idx] == Some((layer, expert_idx)) {
+                        self.inner.evict(slot_idx);
+                        self.inner.zone.release(slot_idx);
+                        self.residency[layer][expert_idx].vram = None;
+                    }
+                    self.stream_loads.remove(&(layer, expert_idx));
+                }
+                self.pass_dma_bytes += done.bytes;
+                self.record_prefetch_fence(layer, CopyBatchFence { event: done.fence });
+            }
+            Err(_) => {
+                // Streamer died mid-plan: nothing enqueued reliably — take
+                // every install back.
+                self.rollback_stream_installs(layer);
+            }
+        }
+        self.profile.record("stream_join", t);
+        let streamed = self
+            .stream_loads
+            .iter()
+            .filter(|&&(l, _)| l == layer)
+            .count();
+        self.stream_loads.retain(|&(l, _)| l != layer);
+        streamed
+    }
+
+    /// Uninstall every still-tracked streamed slot for `layer` — the plan
+    /// failed or the streamer died, so the views must not be computed with.
+    #[cfg(feature = "cuda")]
+    fn rollback_stream_installs(&mut self, layer: usize) {
+        let entries: Vec<(usize, usize)> = self
+            .stream_loads
+            .iter()
+            .copied()
+            .filter(|&(l, _)| l == layer)
+            .collect();
+        for (l, expert_idx) in entries {
+            if let Some(&slot_idx) = self.inner.key_to_slot.get(&(l, expert_idx)) {
+                self.inner.evict(slot_idx);
+                self.inner.zone.release(slot_idx);
+                self.residency[l][expert_idx].vram = None;
+            }
+            self.stream_loads.remove(&(l, expert_idx));
+        }
+    }
+
+    /// Join EVERY pending stream at a pass boundary — the new pass reuses the
+    /// same layer indices, so an unjoined plan's fence would otherwise never
+    /// be waited before its slots compute as hits.
+    #[cfg(feature = "cuda")]
+    fn drain_streams(&mut self) {
+        let layers: Vec<usize> = self.pending_streams.keys().copied().collect();
+        for layer in layers {
+            self.join_stream_for(layer);
+        }
+    }
+
     /// Adapt the load-ahead depth `N` at a pass boundary, from the pass that
     /// just finished:
     ///
@@ -1716,6 +1959,10 @@ impl PipelineState {
         if let Some(last) = self.last_moe_layer_idx {
             if req.moe_layer_idx <= last {
                 self.transition_matrix.reset_pass();
+                // Streams first: joining records their fences into the ring
+                // the next line drains.
+                #[cfg(feature = "cuda")]
+                self.drain_streams();
                 self.drain_prefetch_fences()?;
                 self.adapt_prefetch_depth();
             }
@@ -1765,9 +2012,36 @@ impl PipelineState {
         self.transition_matrix
             .observe(req.moe_layer_idx, &req.expert_ids);
 
+        // ── Join this layer's stream plan (if any) BEFORE classifying:
+        // failed jobs must be uninstalled so they classify as honest misses,
+        // and the plan's fence must be in the ring before the wait below. ──
+        #[cfg(feature = "cuda")]
+        let streamed = self.join_stream_for(req.moe_layer_idx);
+        #[cfg(not(feature = "cuda"))]
+        let streamed = 0usize;
+
         let t = profile_now();
         let classified = self.classify_and_load(req.moe_layer_idx, &req.expert_ids)?;
         self.profile.record("pipe_classify_load", t);
+
+        // ── Whole-layer streaming for the NEXT layer, issued HERE — after
+        // this layer's misses took their slots, before its compute — so the
+        // streamer's reads overlap this layer's entire DMA + grouped-GEMM
+        // window plus the forward thread's next attention pass. Issued from
+        // post_compute (after the response) the only overlap was the
+        // attention pass, and virtually every stream joined late. Only for
+        // prefill-width waves: a wave routing at least half the layer means
+        // the next layer will too — nothing to predict. Decode-width waves
+        // take the transition-matrix prefetch in post_compute instead. ──
+        #[cfg(feature = "cuda")]
+        if self.streamer.is_some()
+            && !self.all_resident
+            && req.expert_ids.len() * 2 >= self.residency[req.moe_layer_idx].len().max(1)
+        {
+            let t = profile_now();
+            self.stream_next_layer(req.moe_layer_idx);
+            self.profile.record("stream_issue", t);
+        }
 
         // ── Wait for this layer's deferred speculative-prefetch fence BEFORE
         // computing hits: a speculatively-loaded expert is installed (and
@@ -1779,10 +2053,11 @@ impl PipelineState {
         // pending so their DMAs keep overlapping compute. ──
         let t = profile_now();
         let late = self.wait_prefetch_fences_through(req.moe_layer_idx)?;
-        if late && !spec_for_layer.is_empty() {
-            self.pass_late += spec_for_layer.len();
+        let in_flight = spec_for_layer.len() + streamed;
+        if late && in_flight > 0 {
+            self.pass_late += in_flight;
             if let Ok(mut s) = self.stats.lock() {
-                s.late_loads += spec_for_layer.len();
+                s.late_loads += in_flight;
             }
         }
         self.profile.record("pipe_prefetch_fence", t);
@@ -1938,16 +2213,27 @@ impl PipelineState {
             return;
         }
 
-        // ── Speculative prefetch for next MoE layer ──
-        // The fence is NOT awaited here: the DMA runs on the copy stream while
-        // the forward thread computes the next layer's attention, and the next
-        // work request's compute phase waits on it (usually already signalled
-        // by then). An inline wait would serialize the prefetch on the pipe
+        // ── Speculative prefetch for the next MoE layer (decode-width) ──
+        // Prefill-width waves are handled by the whole-layer streamer, issued
+        // BEFORE this layer's compute (see `process_request`) so its reads
+        // get the full compute window; a stream already pending makes this a
+        // no-op regardless (the issuer refuses duplicates). The fence is NOT
+        // awaited here: the DMA runs on the copy stream while the forward
+        // thread computes the next layer's attention, and the next work
+        // request's compute phase waits on it (usually already signalled by
+        // then). An inline wait would serialize the prefetch on the pipe
         // thread and stall the next layer's work behind it.
         let t = profile_now();
-        // Advisory: a failed hop is dropped — the demand path loads whatever
-        // the chain missed. Each hop records its own fence internally.
-        let _ = self.speculative_prefetch(moe_layer_idx, expert_ids);
+        #[cfg(feature = "cuda")]
+        let stream_pending = self.pending_streams.contains_key(&(moe_layer_idx + 1));
+        #[cfg(not(feature = "cuda"))]
+        let stream_pending = false;
+        if !stream_pending {
+            // Advisory: a failed hop is dropped — the demand path loads
+            // whatever the chain missed. Each hop records its own fence
+            // internally.
+            let _ = self.speculative_prefetch(moe_layer_idx, expert_ids);
+        }
         self.profile.record("pipe_prefetch", t);
 
         // ── End-of-pass: score decay ──
@@ -2140,6 +2426,15 @@ impl PipelineState {
             );
             return Ok(0);
         }
+        // In-flight stream plans hold slot addresses the retraction is about
+        // to relocate or drop — and their byte-moves run on the STREAMER's
+        // stream, which the compute-stream quiesce below does not cover until
+        // the plan's copies are at least enqueued. Join them first: after the
+        // join every streamed slot is an ordinary resident (or uninstalled),
+        // and its fence sits in the ring where the context synchronize
+        // completes it.
+        #[cfg(feature = "cuda")]
+        self.drain_streams();
         self.quiesce_before_handover()?;
 
         // The zone decides who moves and who goes; this performs it.

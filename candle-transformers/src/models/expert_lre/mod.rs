@@ -157,6 +157,8 @@ mod matmul_baseline;
 mod pack;
 mod pinned;
 mod pipeline;
+#[cfg(feature = "cuda")]
+mod streamer;
 mod transition;
 mod types;
 

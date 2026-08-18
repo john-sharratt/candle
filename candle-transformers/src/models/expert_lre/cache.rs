@@ -410,9 +410,16 @@ impl ExpertCacheInner {
     ///    overlap to hide DMA latency.
     /// Returns `(slot_idx, evicted_key)`. `evicted_key` is `None` when a free
     /// slot was available and nothing was displaced.
+    ///
+    /// `protect` lists slots that must not be victims — the caller's hits and
+    /// in-flight speculative/streamed installs. The latter matter here for
+    /// more than waste: a streamed slot's bytes move on the STREAMER's
+    /// stream, so re-tenanting it from this thread's copy stream is an
+    /// unordered write race, not a benign overwrite.
     pub(crate) fn allocate_slot(
         &mut self,
         current_layer: usize,
+        protect: &std::collections::HashSet<usize>,
     ) -> Result<(usize, Option<(usize, usize)>)> {
         // ── Try free slots first ──
         //
@@ -430,7 +437,10 @@ impl ExpertCacheInner {
 
         for (slot_idx, key) in self.slot_to_key.iter().enumerate() {
             if let Some((moe_layer, _)) = key {
-                if *moe_layer < PINNED_LAYERS || *moe_layer >= current_layer {
+                if *moe_layer < PINNED_LAYERS
+                    || *moe_layer >= current_layer
+                    || protect.contains(&slot_idx)
+                {
                     continue;
                 }
                 let es = self.slot_eviction_score(slot_idx, current_layer);
@@ -447,13 +457,15 @@ impl ExpertCacheInner {
             return Ok((victim, self.evict(victim)));
         }
 
-        // ── Global score-based fallback (respects pinning) ──
+        // ── Global score-based fallback (respects pinning + protection) ──
         // Pick the slot with the lowest eviction score globally.
         let victim = self
             .slot_to_key
             .iter()
             .enumerate()
-            .filter(|(_, k)| k.map_or(false, |(layer, _)| layer >= PINNED_LAYERS))
+            .filter(|(idx, k)| {
+                k.map_or(false, |(layer, _)| layer >= PINNED_LAYERS) && !protect.contains(idx)
+            })
             .min_by(|(idx_a, _), (idx_b, _)| {
                 let sa = self.slot_eviction_score(*idx_a, current_layer);
                 let sb = self.slot_eviction_score(*idx_b, current_layer);
@@ -690,7 +702,9 @@ mod tests {
             occupy(&mut inner, slot, layer, slot % experts_per_layer, 0, 0.0);
         }
         assert!(
-            inner.allocate_slot(PINNED_LAYERS).is_ok(),
+            inner
+                .allocate_slot(PINNED_LAYERS, &Default::default())
+                .is_ok(),
             "a zone sized to the pinned working set always has one slot the \
              scan is allowed to take"
         );
@@ -703,7 +717,9 @@ mod tests {
             occupy(&mut starved, slot, layer, slot % experts_per_layer, 0, 0.0);
         }
         assert!(
-            starved.allocate_slot(PINNED_LAYERS).is_err(),
+            starved
+                .allocate_slot(PINNED_LAYERS, &Default::default())
+                .is_err(),
             "below the floor every resident slot is pinned and nothing can be freed"
         );
     }
@@ -743,7 +759,7 @@ mod tests {
         occupy(&mut inner, 3, 10, 103, 4, 5.0);
         assert!(inner.free_len() == 0);
 
-        let (slot, evicted_key) = inner.allocate_slot(20).unwrap();
+        let (slot, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(evicted_key, Some((10, 102)));
         assert_eq!(slot, 2);
     }
@@ -845,6 +861,21 @@ mod tests {
     }
 
     #[test]
+    fn allocate_slot_backstop_never_takes_a_protected_slot() {
+        // The per-miss backstop must skip in-flight installs even when they
+        // are the lowest-scored slots on the card: a streamed slot's bytes
+        // move on another stream, so re-tenanting it is a write race.
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 36, 100, 1, 0.0); // in-flight stream install, protected
+        occupy(&mut inner, 1, 40, 101, 2, 9.0); // hot, but the only legal victim
+        let protect: std::collections::HashSet<usize> = [0].into_iter().collect();
+        let (slot, evicted_key) = inner.allocate_slot(35, &protect).unwrap();
+        assert_eq!(evicted_key, Some((40, 101)), "protected slot skipped");
+        assert_eq!(slot, 1);
+        assert!(inner.key_to_slot.contains_key(&(36, 100)));
+    }
+
+    #[test]
     fn allocate_slot_global_fallback_prefers_furthest_future() {
         // No behind-layer candidates (everything resident is ahead of the
         // wave), equal frequency: the corrected position factor evicts the
@@ -853,7 +884,7 @@ mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 36, 100, 1, 2.0); // L+1 — about to be routed, kept
         occupy(&mut inner, 1, 45, 101, 2, 2.0); // L+10 — furthest future → victim
-        let (slot, evicted_key) = inner.allocate_slot(35).unwrap();
+        let (slot, evicted_key) = inner.allocate_slot(35, &Default::default()).unwrap();
         assert_eq!(evicted_key, Some((45, 101)));
         assert_eq!(slot, 1);
     }
@@ -957,7 +988,7 @@ mod tests {
         occupy(&mut inner, 1, 1, 101, 2, 0.0);
         occupy(&mut inner, 2, 2, 102, 3, 0.0);
         // Every resident expert is pinned → no legal victim → error.
-        assert!(inner.allocate_slot(5).is_err());
+        assert!(inner.allocate_slot(5, &Default::default()).is_err());
     }
 
     /// An expert with no warm copy costs an NVMe read to bring back, so it is
@@ -969,7 +1000,7 @@ mod tests {
         occupy(&mut inner, 1, 10, 51, 5, 1.0); // cold-only, same temperature
         inner.set_warm_backed(&[(10, 50)]);
 
-        let (_, evicted_key) = inner.allocate_slot(20).unwrap();
+        let (_, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(
             evicted_key,
             Some((10, 50)),
@@ -986,7 +1017,7 @@ mod tests {
         occupy(&mut inner, 1, 10, 51, 5, 1.0); // cold-only and cold
         inner.set_warm_backed(&[(10, 50)]);
 
-        let (_, evicted_key) = inner.allocate_slot(20).unwrap();
+        let (_, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(
             evicted_key,
             Some((10, 51)),
@@ -1017,7 +1048,7 @@ mod tests {
         occupy(&mut inner, 0, 10, 50, 9, 9.0);
         occupy(&mut inner, 1, 10, 51, 1, 0.0);
 
-        let (_, evicted_key) = inner.allocate_slot(20).unwrap();
+        let (_, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(
             evicted_key,
             Some((10, 51)),
@@ -1034,7 +1065,7 @@ mod tests {
         occupy(&mut inner, 0, 10, 50, 5, 5.0); // behind, hot
         occupy(&mut inner, 1, 30, 51, 0, 0.0); // ahead, cold
 
-        let (_, evicted_key) = inner.allocate_slot(20).unwrap();
+        let (_, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(
             evicted_key,
             Some((10, 50)),

@@ -1877,6 +1877,10 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.prefetch_depth)),
             ),
             (
+                "Streamed loads",
+                Box::new(|s: &PipelineStats| format!("{}", s.stream_loads)),
+            ),
+            (
                 "Fence stalls",
                 Box::new(|s: &PipelineStats| format!("{}", s.fence_stalls)),
             ),
