@@ -18,6 +18,9 @@
 //! P7 layer; this reference keeps entries in full precision, which is strictly within
 //! the QAT tolerance (the same choice vLLM's BF16 fallback makes).
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::ops::softmax;
 
@@ -847,6 +850,164 @@ pub struct AssembleUpdate {
     group_add: usize,
 }
 
+/// The fleet's assemble GEOMETRY — every host-side quantity and device index
+/// tensor derivable from the per-seq `(carried, new, has_prev)` shape alone,
+/// independent of the layer's actual data.
+///
+/// The same wave calls [`assemble_groups_batched`] once per LAYER, and the
+/// geometry is layer-invariant by construction: every layer's compressor has
+/// consumed the same token stream, so carried-tail lengths, group counts and
+/// prev-presence match across the wave's layers. Building the indices per call
+/// cost 4 host-vec builds + 4 tiny H2D uploads + 2 pad fills, × layers ×
+/// compressor families; the cache pays that once per wave shape and every
+/// other layer-call hits.
+struct AssembleGeom {
+    groups: Vec<usize>,
+    cutoff: Vec<usize>,
+    n_tot: Vec<usize>,
+    g_off: Vec<usize>,
+    total_rows: usize,
+    total_groups: usize,
+    tail_off: Vec<usize>,
+    /// Combined-stream index of every remainder-tail row (`None`: no tails).
+    tail_it: Option<Tensor>,
+    /// Combined-stream index of every group row (`None`: no completed groups).
+    gi_t: Option<Tensor>,
+    /// Overlap only: each group's prev-source slot in `[pad | prevs | kv_g]`.
+    pi_t: Option<Tensor>,
+    /// Pool index of each group-completing seq's LAST group (its next prev).
+    li_t: Option<Tensor>,
+    /// Overlap only: the group-0 pad rows (kv 0 / score −inf), `[1, r, cd]`.
+    pad_kv: Option<Tensor>,
+    pad_sc: Option<Tensor>,
+}
+
+/// Cache key: the template's `(ratio, cd, overlap)` plus every seq's
+/// `(carried, new, has_prev)` — equal keys imply identical geometry.
+type AssembleGeomKey = (usize, usize, bool, Vec<(usize, usize, bool)>);
+
+/// Process-wide geometry cache, bounded like `CudaDevice::info_table`
+/// (cleared wholesale past the cap — entries are a handful of tiny device
+/// tensors and rebuilding is one call's work). Single-accelerator assumption,
+/// like `cached_sm_count` in candle-core: the cached index tensors live on
+/// the one device this fork targets.
+fn assemble_geom_cache() -> &'static Mutex<HashMap<AssembleGeomKey, Arc<AssembleGeom>>> {
+    static CACHE: OnceLock<Mutex<HashMap<AssembleGeomKey, Arc<AssembleGeom>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_assemble_geom(
+    r: usize,
+    cd: usize,
+    overlap: bool,
+    seqs: &[(usize, usize, bool)],
+    dev: &Device,
+) -> Result<AssembleGeom> {
+    let n_seq = seqs.len();
+    let mut c_off = Vec::with_capacity(n_seq);
+    let mut groups = Vec::with_capacity(n_seq);
+    let mut cutoff = Vec::with_capacity(n_seq);
+    let mut n_tot = Vec::with_capacity(n_seq);
+    let mut g_off = Vec::with_capacity(n_seq);
+    let mut off = 0usize;
+    let mut goff = 0usize;
+    for &(l0, n, _) in seqs {
+        let nt = l0 + n;
+        let g = nt / r;
+        c_off.push(off);
+        n_tot.push(nt);
+        groups.push(g);
+        cutoff.push(g * r);
+        g_off.push(goff);
+        off += nt;
+        goff += g;
+    }
+    let total_rows = off;
+    let total_groups = goff;
+
+    let mut tail_idx: Vec<u32> = Vec::with_capacity(total_rows - total_groups * r);
+    let mut tail_off = Vec::with_capacity(n_seq);
+    for i in 0..n_seq {
+        tail_off.push(tail_idx.len());
+        for t in cutoff[i]..n_tot[i] {
+            tail_idx.push((c_off[i] + t) as u32);
+        }
+    }
+    let tail_it = if tail_idx.is_empty() {
+        None
+    } else {
+        let n_tail = tail_idx.len();
+        Some(Tensor::from_vec(tail_idx, n_tail, dev)?)
+    };
+
+    let (gi_t, pi_t, li_t, pad_kv, pad_sc) = if total_groups == 0 {
+        (None, None, None, None, None)
+    } else {
+        let mut grp_idx: Vec<u32> = Vec::with_capacity(total_groups * r);
+        for i in 0..n_seq {
+            for t in 0..cutoff[i] {
+                grp_idx.push((c_off[i] + t) as u32);
+            }
+        }
+        let gi_t = Tensor::from_vec(grp_idx, total_groups * r, dev)?;
+
+        let (pi_t, pad_kv, pad_sc) = if overlap {
+            // Prev-source slot per group over `[pad | each seq's carried prev
+            // | kv_g]`: group j>0 takes its group j−1; group 0 takes the seq's
+            // carried prev, or slot 0 (the pad) when it has none.
+            let mut prev_slot = vec![0u32; n_seq];
+            let mut next = 1u32;
+            for (i, &(_, _, has_prev)) in seqs.iter().enumerate() {
+                if has_prev {
+                    prev_slot[i] = next;
+                    next += 1;
+                }
+            }
+            let base = next;
+            let mut pidx: Vec<u32> = Vec::with_capacity(total_groups);
+            for i in 0..n_seq {
+                for j in 0..groups[i] {
+                    pidx.push(if j == 0 {
+                        prev_slot[i]
+                    } else {
+                        base + (g_off[i] + j - 1) as u32
+                    });
+                }
+            }
+            let pi_t = Tensor::from_vec(pidx, total_groups, dev)?;
+            let pad_kv = Tensor::zeros((1, r, cd), DType::F32, dev)?;
+            let pad_sc = Tensor::full(f32::NEG_INFINITY, (1, r, cd), dev)?;
+            (Some(pi_t), Some(pad_kv), Some(pad_sc))
+        } else {
+            (None, None, None)
+        };
+
+        let last_idx: Vec<u32> = (0..n_seq)
+            .filter(|&i| groups[i] > 0)
+            .map(|i| (g_off[i] + groups[i] - 1) as u32)
+            .collect();
+        let n_active = last_idx.len();
+        let li_t = Tensor::from_vec(last_idx, n_active, dev)?;
+        (Some(gi_t), pi_t, Some(li_t), pad_kv, pad_sc)
+    };
+
+    Ok(AssembleGeom {
+        groups,
+        cutoff,
+        n_tot,
+        g_off,
+        total_rows,
+        total_groups,
+        tail_off,
+        tail_it,
+        gi_t,
+        pi_t,
+        li_t,
+        pad_kv,
+        pad_sc,
+    })
+}
+
 /// The whole prompt fleet's compressor ASSEMBLE in ~a dozen device ops —
 /// bit-identical per sequence to [`IncrementalCompressor::assemble_groups`]
 /// called per seq, whose ~15 small launches × N sequences were HALF the
@@ -862,7 +1023,9 @@ pub struct AssembleUpdate {
 /// row-elementwise. The returned per-seq [`GroupPool`]s are dim-0 NARROW
 /// VIEWS of one fleet-wide pool tensor, in sequence order — exactly the
 /// concatenation `pool_prefill_across_seqs` builds from per-seq pools, so
-/// everything downstream is unchanged.
+/// everything downstream is unchanged. The index tensors + geometry come from
+/// the per-shape [`AssembleGeom`] cache — layer-invariant within a wave, so
+/// only the wave's first layer-call builds them.
 ///
 /// `template` supplies the layer-shared [`Compressor`] (weights/ape/ratio —
 /// identical across the fleet's per-seq states by construction).
@@ -877,27 +1040,41 @@ pub fn assemble_groups_batched(
     let dev = c.device().clone();
     let n_seq = inputs.len();
 
-    // Per-seq geometry over the concatenated combined stream.
-    let mut c_off = Vec::with_capacity(n_seq); // seq's start row in `comb`
-    let mut groups = Vec::with_capacity(n_seq);
-    let mut cutoff = Vec::with_capacity(n_seq);
-    let mut n_tot = Vec::with_capacity(n_seq);
-    let mut g_off = Vec::with_capacity(n_seq); // seq's start group in the pool
-    let mut off = 0usize;
-    let mut goff = 0usize;
-    for inp in inputs {
-        let nt = inp.l0 + inp.n;
-        let g = nt / r;
-        c_off.push(off);
-        n_tot.push(nt);
-        groups.push(g);
-        cutoff.push(g * r);
-        g_off.push(goff);
-        off += nt;
-        goff += g;
-    }
-    let total_rows = off;
-    let total_groups = goff;
+    // Geometry + index tensors from the per-shape cache (layer-invariant
+    // within a wave — the key IS the verification that the shape matches).
+    let key: AssembleGeomKey = (
+        r,
+        cd,
+        c.overlap,
+        inputs
+            .iter()
+            .map(|i| (i.l0, i.n, i.prev_kv.is_some()))
+            .collect(),
+    );
+    let geom = {
+        let mut cache = assemble_geom_cache().lock().unwrap();
+        if let Some(g) = cache.get(&key) {
+            g.clone()
+        } else {
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            let g = Arc::new(build_assemble_geom(r, cd, c.overlap, &key.3, &dev)?);
+            cache.insert(key, g.clone());
+            g
+        }
+    };
+    let AssembleGeom {
+        groups,
+        n_tot,
+        cutoff,
+        g_off,
+        total_rows,
+        total_groups,
+        tail_off,
+        ..
+    } = &*geom;
+    let (total_rows, total_groups) = (*total_rows, *total_groups);
 
     // 1. Combined stream: every seq's [carried ++ new], back-to-back.
     let pieces_kv: Vec<&Tensor> = inputs.iter().flat_map(|i| i.kv_pieces.iter()).collect();
@@ -908,23 +1085,12 @@ pub fn assemble_groups_batched(
 
     // Remainder tails for ALL seqs (also the whole-stream buffer when a seq
     // completes no group): one select, per-seq row views into it.
-    let mut tail_idx: Vec<u32> = Vec::with_capacity(total_rows - total_groups * r);
-    let mut tail_off = Vec::with_capacity(n_seq);
-    for i in 0..n_seq {
-        tail_off.push(tail_idx.len());
-        for t in cutoff[i]..n_tot[i] {
-            tail_idx.push((c_off[i] + t) as u32);
-        }
-    }
-    let (kv_tails, sc_tails) = if tail_idx.is_empty() {
-        (None, None)
-    } else {
-        let n_tail = tail_idx.len();
-        let it = Tensor::from_vec(tail_idx, n_tail, &dev)?;
-        (
-            Some(comb_kv.index_select(&it, 0)?),
-            Some(comb_sc.index_select(&it, 0)?),
-        )
+    let (kv_tails, sc_tails) = match &geom.tail_it {
+        None => (None, None),
+        Some(it) => (
+            Some(comb_kv.index_select(it, 0)?),
+            Some(comb_sc.index_select(it, 0)?),
+        ),
     };
     let tail_views = |src: &Option<Tensor>, i: usize| -> Result<Vec<Tensor>> {
         let rem = n_tot[i] - cutoff[i];
@@ -957,19 +1123,16 @@ pub fn assemble_groups_batched(
 
     // 2. Group rows for the whole fleet: [total_groups, r, cd], `ape` added to
     // the scores before the overlap split (matches `assemble_groups`).
-    let mut grp_idx: Vec<u32> = Vec::with_capacity(total_groups * r);
-    for i in 0..n_seq {
-        for t in 0..cutoff[i] {
-            grp_idx.push((c_off[i] + t) as u32);
-        }
-    }
-    let gi_t = Tensor::from_vec(grp_idx, total_groups * r, &dev)?;
+    let gi_t = geom
+        .gi_t
+        .as_ref()
+        .expect("total_groups > 0 implies group indices");
     let kv_g = comb_kv
-        .index_select(&gi_t, 0)?
+        .index_select(gi_t, 0)?
         .reshape((total_groups, r, cd))?;
     let ape = c.ape.to_dtype(DType::F32)?.reshape((1, r, cd))?;
     let sc_g = comb_sc
-        .index_select(&gi_t, 0)?
+        .index_select(gi_t, 0)?
         .reshape((total_groups, r, cd))?
         .broadcast_add(&ape)?;
 
@@ -980,40 +1143,25 @@ pub fn assemble_groups_batched(
         // seq's carried prev, or the pad (kv 0 / score −inf) when it has none —
         // the batch-wise form of `assemble_groups`' prev shift. Full-cd rows
         // are selected and the halves split after (same bytes, one select).
-        let pad_kv = Tensor::zeros((1, r, cd), DType::F32, &dev)?;
-        let pad_sc = Tensor::full(f32::NEG_INFINITY, (1, r, cd), &dev)?;
-        let mut src_kv: Vec<Tensor> = vec![pad_kv];
-        let mut src_sc: Vec<Tensor> = vec![pad_sc];
-        let mut prev_slot = vec![0u32; n_seq]; // 0 = the pad
-        for (i, inp) in inputs.iter().enumerate() {
+        // The slot indices (`pi_t`) come from the geometry cache; the source
+        // rows are per-call data, ordered to match the cached slot numbering.
+        let pad_kv = geom.pad_kv.as_ref().expect("overlap implies pads");
+        let pad_sc = geom.pad_sc.as_ref().expect("overlap implies pads");
+        let mut src_kv: Vec<Tensor> = vec![pad_kv.clone()];
+        let mut src_sc: Vec<Tensor> = vec![pad_sc.clone()];
+        for inp in inputs.iter() {
             if let (Some(pk), Some(ps)) = (&inp.prev_kv, &inp.prev_sc) {
-                prev_slot[i] = src_kv.len() as u32;
                 src_kv.push(pk.reshape((1, r, cd))?);
                 src_sc.push(ps.reshape((1, r, cd))?);
             }
         }
-        let base = src_kv.len() as u32; // kv_g's group 0 lands here
         let src_kv_refs: Vec<&Tensor> = src_kv.iter().chain(std::iter::once(&kv_g)).collect();
         let src_sc_refs: Vec<&Tensor> = src_sc.iter().chain(std::iter::once(&sc_g)).collect();
         let prev_src_kv = Tensor::cat(&src_kv_refs, 0)?;
         let prev_src_sc = Tensor::cat(&src_sc_refs, 0)?;
-        let mut pidx: Vec<u32> = Vec::with_capacity(total_groups);
-        for i in 0..n_seq {
-            for j in 0..groups[i] {
-                pidx.push(if j == 0 {
-                    prev_slot[i]
-                } else {
-                    base + (g_off[i] + j - 1) as u32
-                });
-            }
-        }
-        let pi_t = Tensor::from_vec(pidx, total_groups, &dev)?;
-        let prev_kv = prev_src_kv
-            .index_select(&pi_t, 0)?
-            .narrow(D::Minus1, 0, d)?;
-        let prev_sc = prev_src_sc
-            .index_select(&pi_t, 0)?
-            .narrow(D::Minus1, 0, d)?;
+        let pi_t = geom.pi_t.as_ref().expect("overlap implies prev indices");
+        let prev_kv = prev_src_kv.index_select(pi_t, 0)?.narrow(D::Minus1, 0, d)?;
+        let prev_sc = prev_src_sc.index_select(pi_t, 0)?.narrow(D::Minus1, 0, d)?;
         let curr_kv = kv_g.narrow(D::Minus1, d, d)?;
         let curr_sc = sc_g.narrow(D::Minus1, d, d)?;
         (
@@ -1026,14 +1174,12 @@ pub fn assemble_groups_batched(
 
     // 4. Retained last-group rows (the next call's overlap prev) for every
     // seq that completed a group: one select, per-seq views.
-    let active: Vec<usize> = (0..n_seq).filter(|&i| groups[i] > 0).collect();
-    let last_idx: Vec<u32> = active
-        .iter()
-        .map(|&i| (g_off[i] + groups[i] - 1) as u32)
-        .collect();
-    let li_t = Tensor::from_vec(last_idx, active.len(), &dev)?;
-    let last_kv = kv_g.index_select(&li_t, 0)?; // [n_active, r, cd]
-    let last_sc = sc_g.index_select(&li_t, 0)?;
+    let li_t = geom
+        .li_t
+        .as_ref()
+        .expect("total_groups > 0 implies last-group indices");
+    let last_kv = kv_g.index_select(li_t, 0)?; // [n_active, r, cd]
+    let last_sc = sc_g.index_select(li_t, 0)?;
 
     // 5. Per-seq outputs: pool views + state advance.
     let mut out = Vec::with_capacity(n_seq);
