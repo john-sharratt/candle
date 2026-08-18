@@ -2755,6 +2755,152 @@ mod tests {
         Ok(())
     }
 
+    /// In-kernel RoPE over a CACHED prefix, both pairings. The arena stores
+    /// UNROTATED K and the kernel ropes each cached column at its absolute
+    /// position on read — a path the no-prefix pairing test cannot reach. The
+    /// reference rotates prefix K at positions `0..prefix_len` and the new
+    /// segment at `prefix_len..`, then runs plain attention over the
+    /// concatenation. LLaMA's multi-turn flow (system turn, then user turn
+    /// over the sealed prefix) runs exactly this shape with the interleaved
+    /// pairing.
+    #[test]
+    fn correctness_prefill_rope_pairings_with_prefix() -> Result<()> {
+        let _gpu = gpu_serial();
+        use candle_nn::kv_cache::ChunkedKvBacking;
+
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::F16;
+
+        for &(n_head, n_kv_head, head_dim, prefix_len, new_len, interleaved, label) in &[
+            (8, 8, 64, 32, 8, false, "half-split hd64 prefix=32"),
+            (32, 8, 128, 40, 12, false, "half-split GQA hd128 prefix=40"),
+            (8, 8, 64, 32, 8, true, "interleaved hd64 prefix=32"),
+            (32, 8, 128, 40, 12, true, "interleaved GQA hd128 prefix=40"),
+            (
+                32,
+                8,
+                128,
+                130,
+                24,
+                true,
+                "interleaved multi-chunk prefix=130",
+            ),
+        ] {
+            let b_sz = 1;
+            let total_kv = prefix_len + new_len;
+
+            let prefix_k =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, prefix_len, head_dim), &device)?
+                    .to_dtype(dtype)?;
+            let prefix_v =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, prefix_len, head_dim), &device)?
+                    .to_dtype(dtype)?;
+            let new_q = Tensor::randn(0f32, 1f32, (1, n_head, new_len, head_dim), &device)?
+                .to_dtype(dtype)?;
+            let new_k = Tensor::randn(0f32, 1f32, (1, n_kv_head, new_len, head_dim), &device)?
+                .to_dtype(dtype)?
+                .contiguous()?;
+            let new_v = Tensor::randn(0f32, 1f32, (1, n_kv_head, new_len, head_dim), &device)?
+                .to_dtype(dtype)?
+                .contiguous()?;
+
+            // Arena holds the prefix UNROTATED — the kernel ropes it on read.
+            let backing =
+                ChunkedKvBacking::new(b_sz, n_kv_head, head_dim, dtype, &device, total_kv)?;
+            backing.ensure_for_offset(0, 0, total_kv)?;
+            backing.write_contiguous(0, 0, &prefix_k, &prefix_v)?;
+
+            let mut cache0 = KvCache::new(2, 4096);
+            cache0.force_dtype(dtype);
+            cache0.set_chunked_backing(&backing, 0, None)?;
+            cache0.set_current_seq_len(prefix_len)?;
+
+            let offsets = [prefix_len];
+            let mut caches: [&mut KvCache; 1] = [&mut cache0];
+            let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
+            let generation = backing.begin_stager_generation_required();
+
+            let rope_cs = make_test_rope_cs(head_dim, 16, &device)?;
+            let out = paged_prefill_uniform(
+                &mut caches,
+                &offsets,
+                &new_q,
+                &new_k,
+                &new_v,
+                b_sz,
+                new_len,
+                n_head,
+                n_kv_head,
+                head_dim,
+                None,
+                &rope_zeros,
+                &rope_cs,
+                interleaved,
+                &generation,
+            )?;
+            assert_eq!(out.len(), 1);
+            let paged_out = &out[0];
+
+            // Reference: rotate prefix + new K at their absolute positions,
+            // Q at prefix_len.., then plain attention over the concatenation.
+            let half = head_dim / 2;
+            let inv_freq = make_test_inv_freq(head_dim, &device)?.to_vec1::<f32>()?;
+            let table = |lo: usize, hi: usize| -> Result<(Tensor, Tensor)> {
+                let n = hi - lo;
+                let mut cos_v = vec![0f32; n * half];
+                let mut sin_v = vec![0f32; n * half];
+                for (row, pos) in (lo..hi).enumerate() {
+                    for i in 0..half {
+                        let angle = pos as f64 * inv_freq[i] as f64;
+                        cos_v[row * half + i] = angle.cos() as f32;
+                        sin_v[row * half + i] = angle.sin() as f32;
+                    }
+                }
+                Ok((
+                    Tensor::from_vec(cos_v, (n, half), &device)?,
+                    Tensor::from_vec(sin_v, (n, half), &device)?,
+                ))
+            };
+            let rot = |x: &Tensor, lo: usize, hi: usize| -> Result<Tensor> {
+                let (cos, sin) = table(lo, hi)?;
+                let x32 = x.to_dtype(DType::F32)?.contiguous()?;
+                if interleaved {
+                    candle_nn::rotary_emb::rope_i(&x32, &cos, &sin)
+                } else {
+                    candle_nn::rotary_emb::rope(&x32, &cos, &sin)
+                }
+            };
+            let pk_r = rot(&prefix_k, 0, prefix_len)?;
+            let nk_r = rot(&new_k, prefix_len, total_kv)?;
+            let q_r = rot(&new_q, prefix_len, total_kv)?;
+            let full_k = Tensor::cat(&[&pk_r, &nk_r], 2)?;
+            let full_v = Tensor::cat(
+                &[
+                    &prefix_v.to_dtype(DType::F32)?,
+                    &new_v.to_dtype(DType::F32)?,
+                ],
+                2,
+            )?;
+            let ref_out = reference_attention(
+                &q_r, &full_k, &full_v, n_head, n_kv_head, head_dim, prefix_len,
+            )?;
+
+            let paged_f32 = paged_out.to_dtype(DType::F32)?;
+            let mae = mean_abs_error(&paged_f32, &ref_out)?;
+            let max_err = max_abs_error(&paged_f32, &ref_out)?;
+            assert!(
+                mae < 0.05,
+                "[{label}] rope prefix-prefill mean error: {mae}"
+            );
+            assert!(
+                max_err < 0.2,
+                "[{label}] rope prefix-prefill max error: {max_err}"
+            );
+            println!("[{label}] rope prefix-prefill OK: mae={mae:.4e} max_err={max_err:.4e}");
+        }
+        Ok(())
+    }
+
     /// Regression: prefix palette ROUTING across mixed per-slice maps.
     ///
     /// The prefix is a sealed partial chunk 0 (`p` tokens, identity palette

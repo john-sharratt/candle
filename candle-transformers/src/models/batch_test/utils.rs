@@ -769,9 +769,27 @@ impl TestParams {
             .map(|tokens| self.tokens_to_tensor(tokens))
             .collect::<Result<Vec<_>>>()?;
 
+        // Throughput repeats re-prefill the SAME user tokens on the SAME
+        // sequences. The wave-entry offset reconciler advances any offset that
+        // is behind its physical backing, so a naive re-run APPENDS the prompt
+        // again instead of overwriting it — after N repeats the model would see
+        // the story N times and the system prompt would be drowned out of the
+        // attention window. Truncate each sequence back to its pre-prompt
+        // length between repeats so every repeat is a true re-prefill from
+        // identical state; the final repeat leaves exactly one prompt in KV.
+        let repeat_base_offsets: Vec<usize> = sequence_indices
+            .iter()
+            .map(|&i| session.sequence_offset(i).unwrap_or(0))
+            .collect();
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
-        for _repeat in 0..config.num_repeats.max(1) {
+        let mut repeat_base_logits: Option<Vec<Tensor>> = None;
+        for repeat in 0..config.num_repeats.max(1) {
+            if repeat > 0 {
+                for (&seq_idx, &base) in sequence_indices.iter().zip(repeat_base_offsets.iter()) {
+                    session.truncate_sequence_to_tokens(seq_idx, base)?;
+                }
+            }
             let nl = model.num_layers();
             let logits_vec = model
                 .forward_wave(
@@ -787,6 +805,32 @@ impl TestParams {
                     None,
                 )?
                 .logits_owned()?;
+
+            // Idempotence gate: with the truncate above, every repeat runs the
+            // same tokens from the same state through the same kernels, so the
+            // logits must be bit-identical. Any drift means repeat state leaked
+            // (offset/backing divergence) and the throughput numbers are
+            // measuring a different workload than reported.
+            match &repeat_base_logits {
+                None => repeat_base_logits = Some(logits_vec.clone()),
+                Some(base) => {
+                    for (i, (a, b)) in base.iter().zip(logits_vec.iter()).enumerate() {
+                        let d = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                            .abs()?
+                            .flatten_all()?
+                            .max(0)?
+                            .to_scalar::<f32>()?;
+                        if d != 0.0 {
+                            candle::bail!(
+                                "prompt repeat {} session {} is not idempotent: \
+                                 logits max|delta| = {d:e} vs repeat 0",
+                                repeat,
+                                i
+                            );
+                        }
+                    }
+                }
+            }
 
             for (logits, run) in logits_vec.into_iter().zip(runs.iter_mut()) {
                 run.logits = logits;
