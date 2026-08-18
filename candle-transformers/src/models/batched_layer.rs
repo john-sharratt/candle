@@ -854,7 +854,8 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         // prefix-attention kernel (docs/archived/prefill_optimization.md) —
         // GQA-packed M, slice-aligned tiles, int8 MMA directly over the
         // quantized arena, split-KV for the short-q/long-prefix regime.
-        // Head dims outside {64, 128} and interleaved RoPE fail loudly in
+        // Both RoPE pairings are applied in-kernel (half-split and
+        // interleaved); head dims outside {64, 128} fail loudly in
         // paged_prefill_attn_varlen_chunks.
         _ => paged_prefill_batched(
             wave,

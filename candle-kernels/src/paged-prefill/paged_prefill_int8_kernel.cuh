@@ -89,8 +89,11 @@ constexpr int I8_ROW_TILES = I8_WARPS / 2;
 constexpr int I8_M_ROWS = I8_ROW_TILES * 16; // 64 M-rows per block
 constexpr int I8_TILE_TOK = 32;              // one chunk-slice per tile
 
-/// cos/sin lookup, same table layout as the FP16 kernel:
-/// rope_cs[pos*HD + 2i] = cos, [.. + 2i + 1] = sin for pair (i, i + HD/2).
+/// cos/sin lookup, same FREQUENCY-indexed table as the decode kernels:
+/// rope_cs[pos*HD + 2i] = cos_i, [.. + 2i + 1] = sin_i for frequency i in
+/// [0, HD/2). The table is pairing-agnostic — the half-split pairing
+/// (d, d + HD/2) reads frequency d, the interleaved pairing (2i, 2i + 1)
+/// reads frequency d >> 1.
 template <int HEAD_DIM>
 __device__ __forceinline__ void i8_rope_cs(
     int pos, int d_idx, const float* __restrict__ rope_cs, float& c, float& s)
@@ -98,6 +101,45 @@ __device__ __forceinline__ void i8_rope_cs(
     const float* e = rope_cs + (int64_t)pos * HEAD_DIM + d_idx * 2;
     c = __ldg(e);
     s = __ldg(e + 1);
+}
+
+/// Apply RoPE in place over a register window `x[N_WIN]` where lane `l` holds
+/// dims {l + 32w : w in 0..N_WIN} of one head row.
+///
+/// Half-split (`rope_interleaved == 0`, Qwen/GPT-NeoX): pair (d, d + HD/2)
+/// lives IN-THREAD as windows (w, w + N_WIN/2) — pure register math.
+/// Interleaved (`== 1`, LLaMA/GPT-J): pair (2i, 2i + 1) spans lanes
+/// (even, odd) of the SAME window (32 | 32w keeps dim parity = lane parity),
+/// so one `lane ^ 1` shuffle per window fetches the partner — the same
+/// exchange the decode kernels' `apply_rope_interleaved_f32` uses.
+///
+/// Callers must be warp-uniform (every lane executes the shuffle): all three
+/// call sites guard on warp-uniform row/token conditions.
+template <int HEAD_DIM, int N_WIN>
+__device__ __forceinline__ void i8_apply_rope(
+    float (&x)[N_WIN], int pos, int lane, int rope_interleaved,
+    const float* __restrict__ rope_cs)
+{
+    if (rope_interleaved) {
+        const float sign = (lane & 1) ? 1.f : -1.f;
+        #pragma unroll
+        for (int w = 0; w < N_WIN; ++w) {
+            int d = lane + 32 * w;
+            float c, s;
+            i8_rope_cs<HEAD_DIM>(pos, d >> 1, rope_cs, c, s);
+            float partner = __shfl_sync(0xffffffffu, x[w], lane ^ 1);
+            x[w] = x[w] * c + sign * partner * s;
+        }
+    } else {
+        #pragma unroll
+        for (int w = 0; w < N_WIN / 2; ++w) {
+            float c, s;
+            i8_rope_cs<HEAD_DIM>(pos, lane + 32 * w, rope_cs, c, s);
+            float lo = x[w], hi = x[w + N_WIN / 2];
+            x[w] = lo * c - hi * s;
+            x[w + N_WIN / 2] = lo * s + hi * c;
+        }
+    }
 }
 
 template <typename QT>
@@ -260,7 +302,7 @@ paged_prefill_int8_kernel(
     float softmax_scale,
     const uint32_t* __restrict__ rope_offsets,
     const float* __restrict__ rope_cs,
-    int rope_interleaved,               // 0 only in v1 (asserted host-side)
+    int rope_interleaved,               // 0 = half-split pairing, 1 = interleaved (LLaMA)
     // Split-KV: grid.z = batch_size × num_splits. Shard s of a sequence
     // processes tiles (sealed AND fresh — one shared ordinal space) with
     // ordinal ≡ s (mod num_splits). num_splits == 1 stores O directly;
@@ -443,15 +485,7 @@ paged_prefill_int8_kernel(
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = qt_to_f32<QT>(qrow[lane + 32 * w]);
             int pos = prefix_len + tok + (int)rope_base;
-            #pragma unroll
-            for (int w = 0; w < N_WIN / 2; ++w) {
-                int d = lane + 32 * w;
-                float c, s;
-                i8_rope_cs<HEAD_DIM>(pos, d, rope_cs, c, s);
-                float lo = x[w], hi = x[w + N_WIN / 2];
-                x[w] = lo * c - hi * s;
-                x[w + N_WIN / 2] = lo * s + hi * c;
-            }
+            i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
         } else {
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = 0.f;
@@ -695,14 +729,7 @@ paged_prefill_int8_kernel(
                                              s_ext_scl[0][p], SUB);
                     }
                     int pos = cur + j + (int)rope_base;
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN / 2; ++w) {
-                        float c, s;
-                        i8_rope_cs<HEAD_DIM>(pos, lane + 32 * w, rope_cs, c, s);
-                        float lo = x[w], hi = x[w + N_WIN / 2];
-                        x[w] = lo * c - hi * s;
-                        x[w + N_WIN / 2] = lo * s + hi * c;
-                    }
+                    i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
                 } else {
                     #pragma unroll
                     for (int w = 0; w < N_WIN; ++w) x[w] = 0.f;
@@ -831,14 +858,7 @@ paged_prefill_int8_kernel(
                         v[w] = qt_to_f32<QT>(vr[lane + 32 * w]);
                     }
                     int pos = cur + j + (int)rope_base;
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN / 2; ++w) {
-                        float c, s;
-                        i8_rope_cs<HEAD_DIM>(pos, lane + 32 * w, rope_cs, c, s);
-                        float lo = x[w], hi = x[w + N_WIN / 2];
-                        x[w] = lo * c - hi * s;
-                        x[w + N_WIN / 2] = lo * s + hi * c;
-                    }
+                    i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
                 } else {
                     #pragma unroll
                     for (int w = 0; w < N_WIN; ++w) { x[w] = 0.f; v[w] = 0.f; }

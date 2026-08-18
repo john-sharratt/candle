@@ -1182,14 +1182,12 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
     rope_interleaved: bool,
     max_q_len: usize,
 ) -> Result<LiveTensor<'w>> {
-    // The kernel's in-thread RoPE pairing needs head_dim % 64 == 0 with the
-    // non-interleaved half-split pairing (Qwen/GPT2 style), and head_dim
-    // 256's staging slabs exceed the 25.6 KB 4-blocks/SM union-arena budget.
+    // The kernel handles both RoPE pairings (half-split in-thread; interleaved
+    // via a lane^1 partner shuffle — see `i8_apply_rope`). head_dim stays
+    // {64, 128}: 256's staging slabs exceed the 25.6 KB 4-blocks/SM
+    // union-arena budget.
     if head_dim != 64 && head_dim != 128 {
         candle::bail!("paged-prefill-int8 supports head_dim 64 or 128 (got {head_dim})")
-    }
-    if rope_interleaved {
-        candle::bail!("paged-prefill-int8 does not support interleaved RoPE")
     }
 
     let q = q.to_dtype(compute_dtype)?;
@@ -2106,8 +2104,7 @@ mod tests {
         Tensor::zeros((head_dim / 2,), DType::F32, device)
     }
 
-    /// Build a rope_cs table from inv_freq for decode tests.
-    #[allow(dead_code)]
+    /// Build a rope_cs table from inv_freq for the in-kernel RoPE tests.
     fn make_test_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
         let inv_freq = make_test_inv_freq(head_dim, device)?;
         super::compute_rope_cs(&inv_freq, max_blocks, head_dim, device)
@@ -2311,6 +2308,8 @@ mod tests {
     }
 
     /// Helper: run paged prefill and return output in (1, n_head, seq_len, head_dim) shape.
+    /// Identity RoPE (zero table) — the shape/GQA correctness tests compare
+    /// against a rope-free reference.
     fn run_paged_prefill(
         q: &Tensor,
         k: &Tensor,
@@ -2322,6 +2321,29 @@ mod tests {
         head_dim: usize,
         offset: usize,
         dtype: DType,
+    ) -> Result<Tensor> {
+        let rope_cs = make_zero_rope_cs(head_dim, 16, q.device())?;
+        run_paged_prefill_with_rope(
+            q, k, v, b_sz, seq_len, n_head, n_kv_head, head_dim, offset, dtype, &rope_cs, false,
+        )
+    }
+
+    /// [`run_paged_prefill`] with a caller-supplied RoPE table and pairing —
+    /// the harness for the in-kernel RoPE correctness tests.
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_prefill_with_rope(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        offset: usize,
+        dtype: DType,
+        rope_cs: &Tensor,
+        rope_interleaved: bool,
     ) -> Result<Tensor> {
         // Stand in for the scheduler and for `wave_admit`: the prefill entry
         // neither creates a backing nor claims chunks of its own any more, so a
@@ -2358,8 +2380,8 @@ mod tests {
             head_dim,
             None,
             &rope_zeros,
-            &make_zero_rope_cs(head_dim, 16, q.device())?,
-            false, // rope_interleaved
+            rope_cs,
+            rope_interleaved,
             &generation,
         )?;
         assert_eq!(out.len(), 1);
@@ -2538,6 +2560,96 @@ mod tests {
                 "[{label}] F16 prefill max error too large: {max_err}"
             );
             println!("[{label}] F16 prefill OK: mae={mae:.4e} max_err={max_err:.4e}");
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Prefill correctness: in-kernel RoPE, both pairings, real table
+    // ------------------------------------------------------------------
+
+    /// The kernel applies RoPE internally from the frequency-indexed cos/sin
+    /// table; the reference applies the same rotation on the host
+    /// (`rotary_emb::rope` for the half-split pairing, `rope_i` for the
+    /// interleaved LLaMA pairing) and then runs plain attention. Both pairings
+    /// share one table — the pairing only changes which dims form a pair.
+    /// The identity-RoPE tests above cover shapes/GQA; this one covers the
+    /// rotation itself, which they zero out.
+    #[test]
+    fn correctness_prefill_rope_pairings() -> Result<()> {
+        let _gpu = gpu_serial();
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::F16;
+
+        for &(n_head, n_kv_head, head_dim, seq_len, interleaved, label) in &[
+            (8, 8, 64, 32, false, "half-split hd64"),
+            (32, 8, 128, 64, false, "half-split GQA hd128"),
+            (8, 8, 64, 32, true, "interleaved hd64"),
+            (32, 8, 128, 64, true, "interleaved GQA hd128 (llama2 shape)"),
+            (32, 8, 128, 4, true, "interleaved short"),
+        ] {
+            let b_sz = 1;
+            let q = Tensor::randn(0f32, 1f32, (b_sz, n_head, seq_len, head_dim), &device)?
+                .to_dtype(dtype)?;
+            let k = Tensor::randn(0f32, 1f32, (b_sz, n_kv_head, seq_len, head_dim), &device)?
+                .to_dtype(dtype)?
+                .contiguous()?;
+            let v = Tensor::randn(0f32, 1f32, (b_sz, n_kv_head, seq_len, head_dim), &device)?
+                .to_dtype(dtype)?
+                .contiguous()?;
+
+            let rope_cs = make_test_rope_cs(head_dim, 16, &device)?;
+            let paged_out = run_paged_prefill_with_rope(
+                &q,
+                &k,
+                &v,
+                b_sz,
+                seq_len,
+                n_head,
+                n_kv_head,
+                head_dim,
+                0,
+                dtype,
+                &rope_cs,
+                interleaved,
+            )?;
+
+            // Host reference: same inv_freq, same positions (0..seq_len),
+            // rotation applied to full-precision Q/K before plain attention.
+            let half = head_dim / 2;
+            let inv_freq = make_test_inv_freq(head_dim, &device)?.to_vec1::<f32>()?;
+            let mut cos_v = vec![0f32; seq_len * half];
+            let mut sin_v = vec![0f32; seq_len * half];
+            for t in 0..seq_len {
+                for i in 0..half {
+                    let angle = t as f64 * inv_freq[i] as f64;
+                    cos_v[t * half + i] = angle.cos() as f32;
+                    sin_v[t * half + i] = angle.sin() as f32;
+                }
+            }
+            let cos = Tensor::from_vec(cos_v, (seq_len, half), &device)?;
+            let sin = Tensor::from_vec(sin_v, (seq_len, half), &device)?;
+            let q32 = q.to_dtype(DType::F32)?.contiguous()?;
+            let k32 = k.to_dtype(DType::F32)?.contiguous()?;
+            let (q_r, k_r) = if interleaved {
+                (
+                    candle_nn::rotary_emb::rope_i(&q32, &cos, &sin)?,
+                    candle_nn::rotary_emb::rope_i(&k32, &cos, &sin)?,
+                )
+            } else {
+                (
+                    candle_nn::rotary_emb::rope(&q32, &cos, &sin)?,
+                    candle_nn::rotary_emb::rope(&k32, &cos, &sin)?,
+                )
+            };
+            let ref_out = reference_attention(&q_r, &k_r, &v, n_head, n_kv_head, head_dim, 0)?;
+
+            let paged_f32 = paged_out.to_dtype(DType::F32)?;
+            let mae = mean_abs_error(&paged_f32, &ref_out)?;
+            let max_err = max_abs_error(&paged_f32, &ref_out)?;
+            assert!(mae < 0.05, "[{label}] rope prefill mean error: {mae}");
+            assert!(max_err < 0.2, "[{label}] rope prefill max error: {max_err}");
+            println!("[{label}] rope prefill OK: mae={mae:.4e} max_err={max_err:.4e}");
         }
         Ok(())
     }
