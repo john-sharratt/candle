@@ -112,6 +112,20 @@ use std::sync::{mpsc, Arc, Mutex};
 /// beyond a few hops the extra DMA is mostly waste even when latency-bound.
 const PREFETCH_DEPTH_MAX: usize = 4;
 
+/// Deepen only when a pass accumulated at least this many late-load experts.
+/// A single straggler in one pass is noise — deepening the GLOBAL depth on it
+/// puts extra hop batches on the pipe thread for every subsequent layer,
+/// which costs wide waves more than the one late expert ever did.
+const PREFETCH_LATE_FLOOR: usize = 2;
+
+/// Chained hops beyond `L+1` are issued only for decode-narrow source sets
+/// (at most this many routed experts). A prefill-width wave routes hundreds
+/// of experts per layer; running multi-hop loads for it on the pipe thread
+/// inside `post_compute` queues the next layer's work request behind the
+/// batch — the measured full-next-layer dead end (cfg8 437→416) — while its
+/// long compute window already hides single-hop latency (late ≈ 0 at width).
+const PREFETCH_MULTI_HOP_MAX_SOURCES: usize = 32;
+
 /// Deepen only when the pass's achieved copy bandwidth sits below this
 /// fraction of the empirical ceiling. Late loads WITHOUT slack mean the link
 /// is saturated — bandwidth-bound, not latency-bound — and issuing earlier
@@ -1679,7 +1693,7 @@ impl PipelineState {
         }
         let slack = achieved_gbps < PREFETCH_BW_SLACK * self.bw_ceiling_gbps;
 
-        if late > 0 && slack {
+        if late >= PREFETCH_LATE_FLOOR && slack {
             self.prefetch_depth = (self.prefetch_depth + 1).min(PREFETCH_DEPTH_MAX);
         } else if late == 0
             && pred_total > 0
@@ -2498,8 +2512,17 @@ impl PipelineState {
         moe_layer_idx: usize,
         current_expert_ids: &[usize],
     ) -> Result<()> {
+        // Depth beyond the adjacent layer only for decode-narrow waves: wide
+        // (prefill-shaped) sources hide single-hop latency under their compute
+        // window, and their multi-hop batches would run on this pipe thread
+        // ahead of the next work request (the measured dead end).
+        let depth = if current_expert_ids.len() <= PREFETCH_MULTI_HOP_MAX_SOURCES {
+            self.prefetch_depth
+        } else {
+            1
+        };
         let mut source: Vec<usize> = current_expert_ids.to_vec();
-        for hop in 1..=self.prefetch_depth {
+        for hop in 1..=depth {
             let target_layer = moe_layer_idx + hop;
             if target_layer >= self.num_moe_layers {
                 break;
