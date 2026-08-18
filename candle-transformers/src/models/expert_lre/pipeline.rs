@@ -31,7 +31,7 @@
 //!
 //! ## 2. Demote (VRAM → RAM): prefetch pages from SSD before needed
 //!
-//! When an expert is evicted from VRAM (`evict()` or `end_of_pass_eviction`),
+//! When an expert is evicted from VRAM (`evict()` or `demand_eviction`),
 //! we know it will eventually be loaded again.  At eviction time we can
 //! proactively ask the OS to start paging-in the mmap region for experts
 //! that are *predicted* to be needed soon (from the transition matrix or
@@ -1015,15 +1015,6 @@ pub(crate) struct PipelineState {
     pub(crate) profile: ProfileAccumulator,
     /// Shared telemetry counters (always-on).
     pub(crate) stats: Arc<Mutex<PipelineStats>>,
-    // ── Adaptive eviction rate tracking ──
-    /// Cache misses accumulated in the current forward pass.
-    pub(crate) pass_misses: usize,
-    /// Drip evictions performed in the current forward pass.
-    pub(crate) pass_drip_evicts: usize,
-    /// EMA-smoothed end-of-pass eviction rate.  Seed 0.07.
-    pub(crate) eviction_rate: f32,
-    /// EMA-smoothed drip headroom fraction.  Seed 0.02.
-    pub(crate) drip_headroom: f32,
     // ── Non-CUDA legacy device-direct mmap path ──
     // Under CUDA every expert (FP and int8/KO) is staged through the pack file,
     // so these fields back only the non-CUDA `load_from_mmap` reload path.
@@ -1073,6 +1064,9 @@ impl PipelineState {
         #[cfg(not(feature = "cuda"))]
         let n_experts = self.host_refs[moe_idx].len();
 
+        // Walk 1: split hits from misses WITHOUT allocating — the miss count is
+        // what sizes the eviction, so it must be known before any slot moves.
+        let mut miss_ids: Vec<usize> = Vec::new();
         for &expert_idx in expert_ids {
             if expert_idx >= n_experts {
                 tracing::warn!(
@@ -1091,14 +1085,37 @@ impl PipelineState {
                     continue;
                 }
             }
+            miss_ids.push(expert_idx);
+        }
 
-            // Cache miss — allocate a slot (layer-aware eviction)
+        // Exact-demand eviction: free EXACTLY what this layer's misses need
+        // beyond the standing free list, in one batch scan scored at the real
+        // current layer, with this layer's hits off-limits. Eviction is a pure
+        // drop (cold pack authoritative, warm tier immutable), so nothing is
+        // gained by doing it ahead of demand — and the headroom guessing this
+        // replaces (per-layer drip + end-of-pass rate EMA) over-evicted by its
+        // estimate error and scored mid-pass victims as if the pass were at
+        // layer 0.
+        let deficit = miss_ids.len().saturating_sub(self.inner.free_len());
+        if deficit > 0 {
+            let hit_slots: Vec<usize> = hits.iter().map(|&(_, s)| s).collect();
+            for key in self.inner.demand_eviction(moe_idx, deficit, &hit_slots) {
+                #[cfg(feature = "cuda")]
+                self.note_eviction(Some(key));
+                #[cfg(not(feature = "cuda"))]
+                let _ = key;
+            }
+        }
+
+        // Walk 2: assign slots — the free list now covers the misses, so
+        // `allocate_slot` takes its free path; its per-miss eviction scans
+        // remain only as the backstop for a scan that came up short.
+        for expert_idx in miss_ids {
             let (slot_idx, evicted_key) = self.inner.allocate_slot(moe_idx)?;
             #[cfg(feature = "cuda")]
             self.note_eviction(evicted_key);
             #[cfg(not(feature = "cuda"))]
             let _ = evicted_key;
-
             to_load.push((expert_idx, slot_idx));
         }
         self.profile.record("cl_classify", t);
@@ -1180,7 +1197,6 @@ impl PipelineState {
         {
             let num_hits = hits.len();
             let num_loaded = loaded.len();
-            self.pass_misses += num_loaded;
             // Refresh the live resident-expert VRAM gauge from the current slot
             // occupancy (rises on install above, falls on evict elsewhere), so the
             // whole-card decomposition tracks experts paging VRAM↔pinned RAM.
@@ -1500,25 +1516,6 @@ impl PipelineState {
         Ok(())
     }
 
-    /// Proactive eviction: drop the bottom-N VRAM experts.
-    ///
-    /// Called to maintain VRAM headroom so real misses find free slots without
-    /// triggering inline eviction scans. Nothing bounds `count` but the slots
-    /// that exist — this used to be clamped by free pinned slots, because an
-    /// eviction needed somewhere to put the bytes.
-    #[cfg(feature = "cuda")]
-    fn drip_evict(&mut self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let evicted = self
-            .inner
-            .end_of_pass_eviction(count as f32 / self.inner.slots.len().max(1) as f32);
-        for key in evicted {
-            self.note_eviction(Some(key));
-        }
-    }
-
     /// Process a single MoE work request: classify, DMA, compute, return output.
     pub(crate) fn process_request(&mut self, req: MoeWorkRequest) -> Result<Tensor> {
         if let Ok(mut s) = self.stats.lock() {
@@ -1749,76 +1746,19 @@ impl PipelineState {
         }
         self.profile.record("pipe_prefetch", t);
 
-        // ── Drip eviction (adaptive headroom) ──
-        // Skip all eviction when every expert is resident in VRAM — there
-        // is nothing to rotate and evicting would only cause needless DMA.
-        #[cfg(feature = "cuda")]
-        if !self.all_resident {
-            let vram_slots = self.inner.num_slots();
-            let free = self.inner.free_len();
-            let target_free = ((vram_slots as f32 * self.drip_headroom).ceil() as usize).max(1);
-            if free < target_free {
-                let deficit = target_free - free;
-                let t = profile_now();
-                self.drip_evict(deficit);
-                self.pass_drip_evicts += deficit;
-                self.profile.record("pipe_drip_evict", t);
-            }
-        }
-
-        // ── End-of-pass: score decay + adaptive batch eviction ──
+        // ── End-of-pass: score decay ──
+        // Eviction is EXACT-DEMAND now: classify counts each layer's misses
+        // before any load and frees precisely the deficit in one batch scan
+        // ([`ExpertCacheInner::demand_eviction`]), scored at the wave's real
+        // layer with the layer's hits protected. There is nothing left to do
+        // between layers or between passes — eviction is a pure drop (cold
+        // pack authoritative, warm tier immutable), so pre-freeing bought no
+        // copy-hiding, and the headroom/rate estimators this replaces both
+        // over-evicted by their estimate error and scored mid-pass victims as
+        // if the pass were at layer 0.
         if moe_layer_idx + 1 == self.num_moe_layers {
             // Decay all expert scores (exponential forgetting).
             self.inner.decay_scores(0.85);
-
-            // Compute adaptive eviction rate based on pass demand.
-            let occupied = self
-                .inner
-                .slots
-                .iter()
-                .filter(|s| s.is_some())
-                .count()
-                .max(1);
-
-            let target_free = ((self.pass_misses as f32 * 1.15).ceil() as usize).max(1);
-            let raw_rate = target_free as f32 / occupied as f32;
-            let clamped = raw_rate.clamp(0.01, 0.20);
-            // EMA smooth: 70% old + 30% new.
-            self.eviction_rate = self.eviction_rate * 0.7 + clamped * 0.3;
-
-            // Adaptive drip headroom based on drip pressure.
-            let drip_pressure =
-                self.pass_drip_evicts as f32 / (self.num_moe_layers as f32).max(1.0);
-            let raw_headroom = if drip_pressure > 0.5 {
-                self.drip_headroom * 1.1
-            } else if drip_pressure < 0.1 {
-                self.drip_headroom * 0.95
-            } else {
-                self.drip_headroom
-            };
-            self.drip_headroom = raw_headroom.clamp(0.005, 0.05);
-
-            // Skip heavy eviction when the cache already has enough
-            // free headroom. This keeps single-token generation fast when
-            // the cache is stable (few misses → free slots accumulate).
-            let free_slots = self.inner.free_len();
-            let do_eviction = free_slots < target_free;
-
-            let t = profile_now();
-            #[cfg(feature = "cuda")]
-            if !self.all_resident && do_eviction {
-                let desired = ((occupied as f32 * self.eviction_rate).ceil() as usize).max(1);
-                let fraction = desired as f32 / occupied as f32;
-                for key in self.inner.end_of_pass_eviction(fraction) {
-                    self.note_eviction(Some(key));
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            if do_eviction {
-                let evicted = self.inner.end_of_pass_eviction(self.eviction_rate);
-                let _ = evicted;
-            }
-            self.profile.record("pipe_eviction", t);
 
             // **The boundary does not move from here.**
             //
@@ -1837,10 +1777,6 @@ impl PipelineState {
             // (`batched_model::forward_wave` phase 0 → `reclaim_spare_ground`).
             // The KV side's own direction is unchanged — it buys at the claim,
             // through `request_kv_ground`, and does not wait for a pass to end.
-
-            // Reset per-pass adaptive counters.
-            self.pass_misses = 0;
-            self.pass_drip_evicts = 0;
         }
     }
 

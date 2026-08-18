@@ -8,16 +8,21 @@
 //!
 //! Frequency-dominated, layer-aware, with pinning.  In brief:
 //!
-//! 1. **End-of-pass batch eviction** — after the last MoE layer, evict the
-//!    lowest-scored occupied slots to create free headroom for the next pass.
-//! 2. **Layer-aware forced eviction** — on a miss with no free slot, prefer
-//!    evicting a low-scored expert from a layer already executed this pass
-//!    (behind the wave, so it can never cascade), then fall back to the global
-//!    lowest-scored victim.
+//! 1. **Exact-demand batch eviction** — classify counts a layer's misses
+//!    before any load and evicts exactly `misses − free` bottom-scored slots
+//!    in one scan ([`ExpertCacheInner::demand_eviction`]), scored at the
+//!    wave's real layer with the layer's own hits protected. Eviction is a
+//!    pure drop (the cold pack holds every expert; the warm tier is
+//!    immutable), so there is no copy to hide and nothing to do ahead of
+//!    time.
+//! 2. **Layer-aware forced eviction** — the per-miss backstop when the batch
+//!    scan could not free enough (pathological): prefer evicting a low-scored
+//!    expert from a layer already executed this pass (behind the wave, so it
+//!    can never cascade), then fall back to the global lowest-scored victim.
 //! 3. **Early-layer pinning** — the first [`PINNED_LAYERS`] layers are never
 //!    evicted (they run first every pass with no compute to hide a reload).
-//! 4. **Free-slot-only prefetch** — speculative prefetch never evicts
-//!    (enforced by the pipeline, not this module).
+//! 4. **Windowed prefetch eviction** — speculative prefetch makes room only
+//!    from the furthest-behind layers ([`PREFETCH_EVICT_WINDOW`]).
 //!
 //! ## Score table
 //!
@@ -549,18 +554,41 @@ impl ExpertCacheInner {
     /// Returns the evicted `(moe_layer, expert_idx)` keys so the caller can
     /// clear their VRAM residency. Their bytes are already in the cold tier and
     /// often in the warm one, so nothing is copied.
-    pub(crate) fn end_of_pass_eviction(&mut self, fraction: f32) -> Vec<(usize, usize)> {
-        // Collect (slot_idx, eviction_score) for all non-pinned occupied slots.
-        // Use current_layer = 0 since we're at end of pass / about to start
-        // a new pass.
+    /// Batch-evict EXACTLY `count` victims (or as many as exist) so a layer's
+    /// misses find free slots — the demand-sized replacement for the retired
+    /// headroom guessing (per-layer drip + end-of-pass rate EMA). The caller is
+    /// classify, which knows the exact deficit before any load, so eviction
+    /// happens only on layers whose misses exceed the free list and never
+    /// over-evicts.
+    ///
+    /// `current_layer` feeds the position factor with the wave's REAL position
+    /// (the retired paths scored mid-pass victims as if the pass were at layer
+    /// 0, under-protecting the layers immediately ahead of the wave).
+    /// `protect` lists slot indices that must not be victims — the current
+    /// layer's just-classified hits, which the layer is about to compute with
+    /// (their distance-0 position factor would otherwise make them PREFERRED
+    /// victims).
+    ///
+    /// One O(slots) scan + an O(n) `select_nth` partition per call, the same
+    /// amortization the batch paths always had.
+    pub(crate) fn demand_eviction(
+        &mut self,
+        current_layer: usize,
+        count: usize,
+        protect: &[usize],
+    ) -> Vec<(usize, usize)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let protected: std::collections::HashSet<usize> = protect.iter().copied().collect();
         let mut candidates: Vec<(usize, f32)> = self
             .slot_to_key
             .iter()
             .enumerate()
             .filter_map(|(idx, key)| {
                 key.and_then(|(layer, _)| {
-                    if layer >= PINNED_LAYERS {
-                        Some((idx, self.slot_eviction_score(idx, 0)))
+                    if layer >= PINNED_LAYERS && !protected.contains(&idx) {
+                        Some((idx, self.slot_eviction_score(idx, current_layer)))
                     } else {
                         None
                     }
@@ -572,9 +600,7 @@ impl ExpertCacheInner {
             return Vec::new();
         }
 
-        let evict_count = ((candidates.len() as f32 * fraction).ceil() as usize)
-            .max(1)
-            .min(candidates.len());
+        let evict_count = count.min(candidates.len());
 
         // O(n) partial sort: partition so that candidates[..evict_count]
         // contains the lowest-scored elements (in arbitrary order).
@@ -706,19 +732,20 @@ mod tests {
     }
 
     #[test]
-    fn end_of_pass_evicts_lowest_scored() {
-        // End-of-pass drops the lowest-scored non-pinned slot and keeps the hot
-        // ones; pinned layers are never considered.
+    fn demand_eviction_evicts_lowest_scored() {
+        // The exact-demand scan drops the lowest-scored non-pinned slot and
+        // keeps the hot ones; pinned layers are never considered.
         let mut inner = cache(4);
         occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned (layer < PINNED_LAYERS)
         occupy(&mut inner, 1, 10, 101, 2, 5.0);
         occupy(&mut inner, 2, 20, 102, 3, 0.2); // coldest non-pinned
         occupy(&mut inner, 3, 30, 103, 4, 4.0);
 
-        let _ = inner.end_of_pass_eviction(0.1); // ceil(3 × 0.1) = 1 of 3 non-pinned
-        assert!(
-            !inner.key_to_slot.contains_key(&(20, 102)),
-            "coldest non-pinned expert not evicted"
+        let evicted = inner.demand_eviction(35, 1, &[]);
+        assert_eq!(
+            evicted,
+            vec![(20, 102)],
+            "coldest non-pinned expert evicted"
         );
         assert!(inner.key_to_slot.contains_key(&(10, 101)));
         assert!(inner.key_to_slot.contains_key(&(30, 103)));
@@ -726,6 +753,33 @@ mod tests {
             inner.key_to_slot.contains_key(&(1, 100)),
             "pinned layer was evicted"
         );
+        assert_eq!(inner.free_len(), 1, "exactly the demanded count freed");
+    }
+
+    #[test]
+    fn demand_eviction_protects_the_layer_hits() {
+        // The current layer's hits sit at position factor 0.5 (distance 0), so
+        // without protection they would be the preferred victims of their own
+        // layer's miss deficit. The protect list must exclude them.
+        let mut inner = cache(3);
+        occupy(&mut inner, 0, 20, 100, 1, 0.1); // this layer's HIT — coldest, protected
+        occupy(&mut inner, 1, 10, 101, 2, 5.0);
+        occupy(&mut inner, 2, 30, 102, 3, 0.2); // coldest unprotected → the victim
+        let evicted = inner.demand_eviction(20, 1, &[0]);
+        assert_eq!(evicted, vec![(30, 102)], "protected hit slot spared");
+        assert!(inner.key_to_slot.contains_key(&(20, 100)));
+    }
+
+    #[test]
+    fn demand_eviction_caps_at_the_candidates() {
+        // Asking for more than the non-pinned population frees what exists and
+        // no more — the per-miss backstop in `allocate_slot` covers the rest.
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned
+        occupy(&mut inner, 1, 10, 101, 2, 0.2);
+        let evicted = inner.demand_eviction(20, 5, &[]);
+        assert_eq!(evicted, vec![(10, 101)]);
+        assert!(inner.key_to_slot.contains_key(&(1, 100)), "pinned survives");
     }
 
     #[test]

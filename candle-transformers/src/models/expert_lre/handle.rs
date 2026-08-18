@@ -644,10 +644,6 @@ impl ExpertCache {
             hint_stats: (0, 0),
             profile: ProfileAccumulator::new(),
             stats: stats.clone(),
-            pass_misses: 0,
-            pass_drip_evicts: 0,
-            eviction_rate: 0.07,
-            drip_headroom: 0.02,
             #[cfg(not(feature = "cuda"))]
             mmap,
             #[cfg(not(feature = "cuda"))]
