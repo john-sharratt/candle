@@ -4,7 +4,7 @@
 //! then free it. See `docs/elastic_vram_partition.md` §5.
 
 use super::budget::GovernorConfig;
-use super::reading::VramProbe;
+use super::reading::{ProbeKind, VramProbe, VramReading};
 use crate::{DType, Device, Result, Tensor};
 
 /// A source of touched device memory the balloon can claim and release. Abstracted
@@ -30,8 +30,33 @@ pub trait BalloonAllocator {
 /// which on a 16 GiB card means 818 MiB and on a 96 GiB card means 4.9 GiB, for
 /// no reason that scales. What has to be left is a fixed working margin for the
 /// display driver and the OS, and that is an absolute quantity.
+///
+/// This is the CEILING of a claim, not its residency bound — the growth loop
+/// additionally stops when the probe's live headroom falls to the reserve
+/// (see [`balloon_measure`]), which on WDDM is what actually limits `C`.
 pub fn capacity_target(total: u64, reserve: u64) -> u64 {
     total.saturating_sub(reserve)
+}
+
+/// The residency wobble margin for a reading.
+///
+/// On a WDDM budget reading ([`ProbeKind::Dxgi`]) the startup budget is a
+/// dynamic target, not a floor — desktop activity dips it by gigabytes at
+/// runtime and WDDM demotes rather than re-promotes, so a capacity set right
+/// under the startup budget still thrashes (measured: budget − 512 MiB scored
+/// 89.9 t/s on the widest config and hard-OOMed the following run; ~4 GB
+/// under budget ran stable best-ever). A sixteenth of the budget, floored at
+/// the absolute reserve, scales that slack with the card: ~4.4 GiB on the
+/// 73 GiB dev card, under a GiB on a 16 GiB one — where a fixed 4 GiB would
+/// cost a quarter of the card.
+///
+/// Everywhere else the refusal mechanism is honest and the margin is just the
+/// configured reserve.
+pub fn wobble_margin(reading: &VramReading, config: &GovernorConfig) -> u64 {
+    match reading.source {
+        ProbeKind::Dxgi => (reading.headroom / 16).max(config.capacity_reserve),
+        _ => config.capacity_reserve,
+    }
 }
 
 /// Grow the balloon until it reaches [`capacity_target`], or until the driver
@@ -61,18 +86,61 @@ pub fn capacity_target(total: u64, reserve: u64) -> u64 {
 /// that, at the cost of re-failing at every doubling once the ceiling is close;
 /// the bound is a fraction of a second and the failure path is the one that
 /// matters, so it stays monotone.
+///
+/// # The live-headroom stop: WDDM's refusal never comes
+///
+/// On WDDM, `cuMemAlloc` + memset succeed PAST the OS's residency budget —
+/// the memory manager silently demotes pages to system RAM instead of
+/// refusing, so a loop that waits for a refusal measures COMMIT, not
+/// residency. Measured on the 73,045 MiB RTX PRO 5000 (per-process DXGI
+/// budget 71,977 MiB): the refusal-only balloon claimed 72,574 MiB with zero
+/// refusals; the widest sweep config then spent that `C`, WDDM demoted 2–5 GB
+/// of live pages, and identical runs scored 141↔900 t/s depending on WHICH
+/// pages the OS chose (page-fault signature: big-buffer spans inflated
+/// 6–20×, small-buffer spans flat; the `\GPU Adapter Memory` counter trace
+/// put demotion onset within ~1 GiB of the budget).
+///
+/// So the loop ALSO stops when the probe's live headroom falls to the wobble
+/// margin below. On the DXGI probe headroom is `Budget − CurrentUsage` — the
+/// OS's residency promise — and it is read fresh each chunk because the
+/// budget GROWS as the balloon's touches demote other processes' cold pages:
+/// a startup snapshot would under-measure a contended card exactly where the
+/// balloon matters most. On the plain CUDA probe headroom is free device
+/// memory and the refusal arrives as before.
+///
+/// # The wobble margin: the budget itself over-promises
+///
+/// The startup budget is a dynamic target, not a floor — desktop activity
+/// (DWM composition, a browser paint) dips it by gigabytes at runtime, and
+/// WDDM demotes rather than re-promotes, so a `C` set right under the
+/// startup budget still thrashes. Measured on the same card: `C` at budget
+/// − 512 MiB (74.9 GB) scored 89.9 t/s on the widest config and hard-OOMed
+/// the following run; `C` ~4 GB under budget ran {880, 889, 867, 888} —
+/// stable best-ever. The margin scales with the budget (1/16th, floored at
+/// the absolute reserve) because a fixed number cannot serve both a 73 GiB
+/// card (needs ~4 GiB) and a 16 GiB one (where 4 GiB is a quarter of the
+/// card): the budget the OS grants and the amount it later claws back both
+/// grow with the card its co-tenants render against.
 pub fn balloon_measure(
     probe: &dyn VramProbe,
     alloc: &mut dyn BalloonAllocator,
     config: &GovernorConfig,
 ) -> Result<u64> {
-    let total = probe.read()?.total;
-    let target = capacity_target(total, config.capacity_reserve);
+    let first = probe.read()?;
+    let target = capacity_target(first.total, config.capacity_reserve);
+    let margin = wobble_margin(&first, config);
     let min_chunk = config.balloon_min_chunk.max(1);
     let mut chunk = config.balloon_chunk.max(min_chunk);
     let mut reserved = 0u64;
     while reserved < target {
-        let want = chunk.min(target - reserved);
+        // Live residency bound: how much the OS will still keep resident for
+        // us beyond what the balloon already holds, minus the wobble margin.
+        let headroom = probe.read()?.headroom;
+        let room = headroom.saturating_sub(margin);
+        if room == 0 {
+            break;
+        }
+        let want = chunk.min(target - reserved).min(room);
         if want == 0 {
             break;
         }

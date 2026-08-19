@@ -43,6 +43,8 @@ pub use host_probe::{
     total_physical_ram, HostPerf, HostRamBudget,
 };
 pub use managed::is_oom;
+#[cfg(all(windows, feature = "cuda"))]
+pub use probe_dxgi::DxgiProbe;
 pub use reading::{BudgetWatchHandle, ProbeKind, VramProbe, VramReading};
 
 use std::collections::HashMap;
@@ -218,7 +220,16 @@ impl VramGovernor {
     pub fn run_balloon(&self, alloc: &mut dyn BalloonAllocator) -> Result<u64> {
         let reading = self.probe.read()?;
         let target = balloon::capacity_target(reading.total, self.config.capacity_reserve);
-        if reading.headroom >= target {
+        // The same wobble margin the growth loop applies (see
+        // `balloon::wobble_margin`): the fast path may only skip the balloon
+        // when the headroom clears the target WITH that slack, otherwise a
+        // WDDM system whose idle budget momentarily exceeds `total − reserve`
+        // would take the uncapped target here and land `C` in demotion
+        // territory. On non-WDDM probes the margin is the reserve itself and
+        // the condition reduces to the old `headroom ≥ target` (target already
+        // holds the reserve back).
+        let margin = balloon::wobble_margin(&reading, &self.config);
+        if reading.headroom.saturating_sub(margin) >= target {
             let c = reading.headroom.min(target);
             self.record_capacity(c);
             tracing::info!(
