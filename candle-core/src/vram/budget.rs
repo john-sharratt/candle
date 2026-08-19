@@ -119,12 +119,27 @@ const DEFAULT_SCRATCH_MARGIN_MB: u64 = 512;
 ///
 /// Distinct from [`DEFAULT_SCRATCH_MARGIN_MB`], which is memory *we* keep
 /// outside the reservation for our own CUDA pool. This one is memory we never
-/// claim at all. They are the same size by coincidence, not by derivation, and
-/// the invariant that used to tie them together
-/// (`the_balloon_reserve_does_not_double_book_the_scratch_cushion`) was pinning
-/// a relationship that only existed because the old term was documented as "a
-/// cap on what the balloon may try" rather than as a reserve.
-const DEFAULT_CAPACITY_RESERVE_MB: u64 = 512;
+/// claim at all.
+///
+/// **5 GiB because WDDM never refuses — it demotes.** The balloon's growth
+/// loop treats allocation failure as the ceiling, but on WDDM `cuMemAlloc` +
+/// memset succeed PAST physical residency: the OS silently pages GPU
+/// allocations to system memory instead of refusing. Measured on the 73,415
+/// MiB RTX PRO 5000: with a 512 MiB reserve the balloon reached its full
+/// target (C = 76.1 GB) with zero refusals, the widest sweep config then
+/// legitimately spent that budget (dedicated usage to 76.5 GB, sampled via
+/// `\GPU Adapter Memory\Dedicated Usage`), and WDDM demoted ~2-5 GB of live
+/// pages to host — WHICH pages is up to the OS, so identical runs scored
+/// 141↔900 t/s depending on whether hot prefill transients or cold weights
+/// got demoted (the spans touching the biggest buffers inflated 6-20× while
+/// small-buffer spans stayed flat: the page-fault signature). The same trace
+/// shows the safe band: steady state at 70.5-71.3 GB dedicated ran with flat
+/// shared usage and full speed. 5 GiB caps the budget at ~71.9 GB on this
+/// card — inside that band — trading ~2.5% of expert slots for the residency
+/// the partition's arithmetic assumes it has. The reserve is what covers the
+/// OS's residency working margin; the refusal the balloon waits for never
+/// comes on WDDM.
+const DEFAULT_CAPACITY_RESERVE_MB: u64 = 5120;
 const DEFAULT_BALLOON_CHUNK_MB: u64 = 256;
 /// One VMM allocation granule on every device this runs on. `Reservation`
 /// queries the real value at run time; the balloon cannot, because it runs
