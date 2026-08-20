@@ -411,9 +411,39 @@ impl CudaDevice {
         Ok(())
     }
 
+    /// Turn off cudarc's per-argument cross-stream event tracking, BEFORE the
+    /// first allocation (only slices created after the call are affected).
+    ///
+    /// With tracking on, EVERY `device_ptr`/`device_ptr_mut` extraction —
+    /// several per kernel launch — records a `CudaEvent` on drop and stream-
+    /// waits the slice's prior read/write events once the process is in
+    /// multi-stream mode. Measured over one decode-heavy gate: 1.54M
+    /// `cuEventRecord` + 2.69M `cuStreamWaitEvent` + 1M `cuEventDestroy`
+    /// (~3.6 events per kernel, ~4.5s of host time) for 428k launches — on
+    /// WDDM, where host submission time IS the decode wall.
+    ///
+    /// Safety of turning it off: this engine orders every cross-stream
+    /// interaction EXPLICITLY at the producer/consumer pair — the expert
+    /// pipeline's `CopyBatchFence` ring and `order_copies_after_compute` /
+    /// `order_compute_after_copies`, the cold-staging ring's publish events,
+    /// the streamer's compute-order + plan fences, the DtoH readback events,
+    /// and the `TableRing` half fences. Compute itself runs on ONE stream per
+    /// device, where ordering is implicit. cudarc's per-argument events are a
+    /// second, redundant safety net over those explicit fences; a
+    /// cross-stream path added WITHOUT an explicit fence is a bug here by
+    /// design (and what the bit-exact gates + the Fletcher-32 golden
+    /// checksums exist to catch).
+    fn disable_per_arg_event_tracking(context: &std::sync::Arc<cudarc::driver::CudaContext>) {
+        // SAFETY: called before any allocation on this context, so no slice
+        // predates the setting (the documented hazard is mixing tracked and
+        // untracked slices).
+        unsafe { context.disable_event_tracking() };
+    }
+
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
+        Self::disable_per_arg_event_tracking(&context);
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
@@ -579,6 +609,7 @@ impl BackendDevice for CudaDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
+        Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
