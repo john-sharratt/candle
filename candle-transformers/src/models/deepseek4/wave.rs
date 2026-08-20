@@ -1434,15 +1434,21 @@ impl ManagedBatchedModel for DeepSeekBatched {
                     Some(ix) => Some(ix.compressor().project_rows(&xs_dec)?),
                     None => None,
                 };
-                // Batched indexer query projection (CSA layers have an indexer):
-                // one GEMM over all decode rows for `wq_b` + `weights_proj`; the
-                // position-dependent RoPE stays per session (each slot's decode
-                // position differs). Bit-identical per row to `query_space`.
+                // Batched indexer query projection AND rope (CSA layers have an
+                // indexer): one GEMM over all decode rows for `wq_b` +
+                // `weights_proj`, then ONE rope chain over all rows at their
+                // per-row slot positions (`rope_query_at`) — the per-row
+                // narrow/reshape/rope chain was ~5 launches × rows × CSA
+                // layers of pure WDDM submission tax. Bit-identical per row to
+                // `query_space`.
                 let idx_query = match a.indexer() {
                     Some(ix) => {
                         let qr_2d = qr_all.reshape((n_dec, ()))?;
                         let xs_2d = xs_dec.reshape((n_dec, ()))?;
-                        Some((ix, ix.query_gemm_batched(&xs_2d, &qr_2d)?))
+                        let (q_raw, weights) = ix.query_gemm_batched(&xs_2d, &qr_2d)?;
+                        let pos32: Vec<u32> = decode_pos.iter().map(|&p| p as u32).collect();
+                        let q_roped = ix.rope_query_at(&q_raw, rope, &pos32)?; // [n_dec,h,hd]
+                        Some((ix, q_roped, weights))
                     }
                     None => None,
                 };
@@ -1472,13 +1478,13 @@ impl ManagedBatchedModel for DeepSeekBatched {
                         Some((k, s)) => Some((k.narrow(0, i, 1)?, s.narrow(0, i, 1)?)),
                         None => None,
                     };
-                    // Per-session RoPE of this slot's batched indexer query.
+                    // This slot's row of the batched, already-roped indexer
+                    // query — bare views into the batched tensors.
                     let (q_idx_i, w_i) = match &idx_query {
-                        Some((ix, (q_raw, weights))) => {
-                            let row = q_raw
+                        Some((ix, q_roped, weights)) => {
+                            let qi = q_roped
                                 .narrow(0, i, 1)?
                                 .reshape((ix.n_heads(), ix.head_dim()))?;
-                            let qi = ix.rope_query(&row, rope, decode_pos[i])?;
                             let wi = weights.narrow(0, i, 1)?.reshape(ix.n_heads())?;
                             (Some(qi), Some(wi))
                         }

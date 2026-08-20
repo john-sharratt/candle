@@ -150,6 +150,32 @@ impl Indexer {
             .reshape((s, h, hd))
     }
 
+    /// As [`Self::rope_query_batched`] but at ARBITRARY per-row positions —
+    /// the decode wave's shape, where each row is a different session decoding
+    /// at its own slot position. ONE rope chain over all rows instead of a
+    /// narrow + reshape + rope chain per row. Row `t` is bit-identical to
+    /// [`Self::rope_query`] at `positions[t]`.
+    pub fn rope_query_at(
+        &self,
+        q_raw: &Tensor,
+        rope: &RotaryCache,
+        positions: &[u32],
+    ) -> Result<Tensor> {
+        let (h, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        let s = q_raw.dim(0)?;
+        debug_assert_eq!(s, positions.len());
+        let q = q_raw
+            .reshape((1, s, h, hd))?
+            .transpose(1, 2)?
+            .contiguous()?; // [1,h,s,hd]
+        let q_nope = q.narrow(D::Minus1, 0, hd - rd)?;
+        let q_rope = rope.apply_positions(&q.narrow(D::Minus1, hd - rd, rd)?, positions, false)?;
+        Tensor::cat(&[&q_nope, &q_rope], D::Minus1)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((s, h, hd))
+    }
+
     /// A streaming compressor over the Indexer's own key space — the kernel
     /// path drives this directly (`push_raw`) to feed the `FloatGallery`.
     pub fn incremental_compressor(&self) -> super::compressor::IncrementalCompressor {

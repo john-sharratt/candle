@@ -44,6 +44,9 @@ pub mod scatter_op;
 pub mod moe_bucketize;
 pub mod moe_scatter;
 
+// Fused MoE router epilogue: score → +bias → top-k → normalize in one launch
+pub mod router_topk;
+
 // R16 KV gather: single-kernel replacement for per-chunk memcpy_dtov
 pub mod gather_r16_kv;
 

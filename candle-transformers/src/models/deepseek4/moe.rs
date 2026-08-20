@@ -127,6 +127,27 @@ impl Gate {
     pub fn route(&self, x: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         let x = x.to_dtype(DType::F32)?;
         let logits = self.weight.forward(&x)?; // [nt, ne]
+
+        // Fused epilogue for ELEMENTWISE score functions on CUDA: score →
+        // +bias → top-k → gather → normalize → ×route_scale in ONE launch,
+        // replacing ~15 elementwise/sort/gather launches per MoE layer per
+        // wave (pure WDDM submission tax; the ops themselves are µs of GPU
+        // work). Bit-exact against the chain below — see `router_topk.cu` for
+        // the contract and `fused_route_matches_eager` for the proof. Softmax
+        // scores need a cross-expert reduction whose summation order the
+        // eager path fixes, and hash layers select by table: both keep the
+        // chain.
+        #[cfg(feature = "cuda")]
+        if self.tid2eid.is_none()
+            && matches!(
+                self.score_func,
+                ScoreFunc::Sigmoid | ScoreFunc::SqrtSoftplus
+            )
+            && matches!(x.device(), candle::Device::Cuda(_))
+        {
+            return self.route_fused(&logits);
+        }
+
         let scores = match self.score_func {
             ScoreFunc::Softmax => softmax(&logits, D::Minus1)?,
             ScoreFunc::Sigmoid => sigmoid(&logits)?,
@@ -156,6 +177,90 @@ impl Gate {
         };
         let weights = (weights * self.route_scale)?;
         Ok((weights, indices))
+    }
+
+    /// The fused-kernel arm of [`Self::route`] — one `run_router_topk` launch
+    /// over the gate logits. CUDA + elementwise score functions only (the
+    /// dispatch in `route` guards this).
+    #[cfg(feature = "cuda")]
+    fn route_fused(&self, logits: &Tensor) -> Result<(Tensor, Tensor)> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::Storage;
+        use candle_kernels::simple::router_topk::{
+            run_router_topk, MAX_EXPERTS, MAX_TOPK, SCORE_SIGMOID, SCORE_SQRT_SOFTPLUS,
+        };
+        let (nt, ne) = logits.dims2()?;
+        if ne > MAX_EXPERTS || self.top_k > MAX_TOPK {
+            candle::bail!(
+                "route_fused: shape outside kernel bounds (ne {ne} ≤ {MAX_EXPERTS}, \
+                 k {} ≤ {MAX_TOPK})",
+                self.top_k
+            );
+        }
+        let dev = match logits.device() {
+            candle::Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("route_fused requires CUDA"),
+        };
+        let stream = dev.cuda_stream();
+        let logits = logits.contiguous()?;
+        let bias = match &self.bias {
+            Some(b) => Some(b.to_dtype(DType::F32)?.contiguous()?),
+            None => None,
+        };
+        let func = match self.score_func {
+            ScoreFunc::Sigmoid => SCORE_SIGMOID,
+            ScoreFunc::SqrtSoftplus => SCORE_SQRT_SOFTPLUS,
+            ScoreFunc::Softmax => candle::bail!("route_fused: softmax keeps the eager chain"),
+        };
+        // Fully overwritten by the kernel — allocate uninitialised.
+        let out_w = Tensor::empty((nt, self.top_k), DType::F32, logits.device())?;
+        let out_i = Tensor::empty((nt, self.top_k), DType::U32, logits.device())?;
+        {
+            let (sl, _) = logits.storage_and_layout();
+            let (sw, _) = out_w.storage_and_layout();
+            let (si, _) = out_i.storage_and_layout();
+            let (lp, _g1) = match &*sl {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream),
+                _ => unreachable!(),
+            };
+            let (wp, _g2) = match &*sw {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream),
+                _ => unreachable!(),
+            };
+            let (ip, _g3) = match &*si {
+                Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.device_ptr(&stream),
+                _ => unreachable!(),
+            };
+            // Guards must outlive the launch: hold both the storage ref and
+            // the device-ptr lease for the optional bias.
+            let bias_sl = bias.as_ref().map(|b| b.storage_and_layout());
+            let bias_lease = match &bias_sl {
+                Some((sb, _)) => match &**sb {
+                    Storage::Cuda(c) => Some(c.as_cuda_slice::<f32>()?.device_ptr(&stream)),
+                    _ => unreachable!(),
+                },
+                None => None,
+            };
+            let bp = bias_lease.as_ref().map_or(0, |(p, _g)| *p);
+            let code = unsafe {
+                run_router_topk(
+                    lp as *const core::ffi::c_void,
+                    bp as *const core::ffi::c_void,
+                    nt as i32,
+                    ne as i32,
+                    self.top_k as i32,
+                    func,
+                    self.route_scale as f32,
+                    wp as *mut core::ffi::c_void,
+                    ip as *mut core::ffi::c_void,
+                    stream.cu_stream() as *mut core::ffi::c_void,
+                )
+            };
+            if code != 0 {
+                candle::bail!("router_topk launch failed: cuda error {code}");
+            }
+        }
+        Ok((out_w, out_i))
     }
 
     /// A dense `[n_tokens, n_experts]` routing matrix (weight at selected experts, 0
@@ -230,6 +335,72 @@ mod tests {
 
     fn dense(w: Tensor) -> QLinear {
         QLinear::from_weight(w)
+    }
+
+    /// The fused router epilogue is BIT-IDENTICAL to the eager op chain, for
+    /// both elementwise score functions, with and without a selection bias —
+    /// weights byte-for-byte, indices exactly (real logits are tie-free, so
+    /// the kernel's lowest-id tie rule never diverges from the sort's order).
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_route_matches_eager() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let (nt, ne, dim, k) = (7usize, 256usize, 32usize, 8usize);
+        let w = Tensor::randn(0f32, 1.0, (ne, dim), &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (nt, dim), &dev)?;
+        let ids = Tensor::zeros(nt, DType::U32, &dev)?;
+        for (func, bias) in [
+            (ScoreFunc::SqrtSoftplus, None),
+            (
+                ScoreFunc::SqrtSoftplus,
+                Some(Tensor::randn(0f32, 0.1, ne, &dev)?),
+            ),
+            (ScoreFunc::Sigmoid, None),
+            (
+                ScoreFunc::Sigmoid,
+                Some(Tensor::randn(0f32, 0.1, ne, &dev)?),
+            ),
+        ] {
+            let gate = Gate::new(dense(w.clone()), bias, None, k, ne, func, 2.5);
+            let logits = gate.weight.forward(&x.to_dtype(DType::F32)?)?;
+            let (fw, fi) = gate.route_fused(&logits)?;
+            // The eager chain, forced: same logits through the op sequence
+            // `route` uses when the fused arm is unavailable.
+            let scores = match gate.score_func {
+                ScoreFunc::Softmax => unreachable!(),
+                ScoreFunc::Sigmoid => candle_nn::ops::sigmoid(&logits)?,
+                ScoreFunc::SqrtSoftplus => softplus(&logits)?.sqrt()?,
+            };
+            let sel = match &gate.bias {
+                Some(b) => scores.broadcast_add(&b.to_dtype(DType::F32)?)?,
+                None => scores.clone(),
+            };
+            let order = sel.arg_sort_last_dim(false)?;
+            let indices = order.narrow(D::Minus1, 0, k)?.contiguous()?.to_dtype(DType::U32)?;
+            let weights = scores.gather(&indices, D::Minus1)?;
+            let denom = weights.sum_keepdim(D::Minus1)?;
+            let weights = (weights.broadcast_div(&denom)? * gate.route_scale)?;
+
+            assert_eq!(
+                fi.to_vec2::<u32>()?,
+                indices.to_vec2::<u32>()?,
+                "{func:?} bias={} indices diverged",
+                gate.bias.is_some()
+            );
+            let fw_v: Vec<Vec<f32>> = fw.to_vec2()?;
+            let ew_v: Vec<Vec<f32>> = weights.to_vec2()?;
+            for (r, (a, b)) in fw_v.iter().zip(ew_v.iter()).enumerate() {
+                for (c, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "{func:?} bias={} weight [{r},{c}] {x} vs {y}",
+                        gate.bias.is_some()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn rand_expert(dim: usize, inter: usize, dev: &Device, limit: f64) -> Result<Expert> {
