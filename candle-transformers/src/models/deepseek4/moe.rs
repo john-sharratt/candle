@@ -348,7 +348,6 @@ mod tests {
         let (nt, ne, dim, k) = (7usize, 256usize, 32usize, 8usize);
         let w = Tensor::randn(0f32, 1.0, (ne, dim), &dev)?;
         let x = Tensor::randn(0f32, 1.0, (nt, dim), &dev)?;
-        let ids = Tensor::zeros(nt, DType::U32, &dev)?;
         for (func, bias) in [
             (ScoreFunc::SqrtSoftplus, None),
             (

@@ -630,7 +630,7 @@ pub fn prefill_replay_probe<M: ManagedBatchedModel>(
     let mut session = model.create_batched_session(BatchedConfig::default())?;
     let seq = session.create_sequence()?;
 
-    let mut once = |session: &mut BatchedInferenceSession| -> Result<Vec<u32>> {
+    let once = |session: &mut BatchedInferenceSession| -> Result<Vec<u32>> {
         session.truncate_sequence_to_tokens(seq, 0)?;
         let prompt = Tensor::new(prompt_ids, device)?.unsqueeze(0)?;
         let t = {

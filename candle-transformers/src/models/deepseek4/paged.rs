@@ -2870,8 +2870,6 @@ mod tests {
     /// with window `[0..i)` + incoming token `i` — the prefill inherits the
     /// decode's whole proven oracle chain (mirror, float reference, arena
     /// equivalence) row by row.
-    #[test]
-    #[ignore]
     /// **The prefill attention kernel must return the same bits twice.**
     ///
     /// Its QK band-collapse sums one contribution per band across NPAL warps
@@ -2976,6 +2974,8 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore]
     fn prefill_rows_equal_decode_steps() -> Result<()> {
         let softmax_scale = (HEAD_DIM as f64).powf(-0.5) as f32;
         // n=80 spans THREE 32-token chunks (0..31 | 32..63 | 64..79), so the
